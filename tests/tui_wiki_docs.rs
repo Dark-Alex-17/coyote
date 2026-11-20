@@ -1107,10 +1107,12 @@ fn tui_page_quotes_the_code() {
     let dropped = literal_with(tui, "queued line(s)").replace("{dropped}", "<n>");
     let running = literal_with(tui, "Running {tool}").replace("{tool}", "<tool>");
     let thinking = literal_with(tui, "Thinking for ").replace("{}", "<n>");
-    let interrupt = literal_with(tui, "Esc to interrupt").replace("{state}  ", "");
+    let interrupt = literal_with(tui, "Esc to interrupt")
+        .trim_start()
+        .to_string();
     let footer_text = fn_body(
         tui,
-        "fn text(&self, (agents, jobs): (usize, usize)) -> String {",
+        "fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {",
     );
     let mut footer: Vec<String> = string_literals(&footer_text)
         .iter()

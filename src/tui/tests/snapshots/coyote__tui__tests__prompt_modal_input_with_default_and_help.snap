@@ -1,5 +1,5 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: frame
 ---
 "                                                                                "
@@ -19,7 +19,7 @@ expression: frame
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 "                                                                                "
 "AWS region:                                                                     "
 "Where your secrets live (e.g. us-east-1, eu-west-2)                             "

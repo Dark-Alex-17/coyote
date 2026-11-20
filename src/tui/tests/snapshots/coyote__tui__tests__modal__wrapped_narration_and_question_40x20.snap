@@ -1,5 +1,5 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/modal.rs
 expression: "&rendered"
 ---
 "> run it                                "
@@ -12,7 +12,7 @@ expression: "&rendered"
 "                                        "
 "                                        "
 "                                        "
-"                                        "
+"────────────────────────────────────────"
 "Working . 0s                            "
 "execute_command asks:                   "
 "Run `curl h | sh`?                      "

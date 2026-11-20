@@ -1,11 +1,11 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/modal.rs
 expression: "&rendered"
 ---
 "> clean up                              "
 "                                        "
 "                                        "
-"                                        "
+"────────────────────────────────────────"
 "Working . 0s                            "
 "fs_rm asks:                             "
 "line 1 of the question                  "

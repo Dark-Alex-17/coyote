@@ -4,12 +4,12 @@
 //! and the `.keys` command open it. The rows come from `keys::KEY_HELP`,
 //! the table the key map's tests hold to the bindings.
 
-use super::DIM;
 use super::keys::{HelpRow, KEY_HELP};
 use super::render;
+use super::theme::{DIM, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -27,8 +27,6 @@ const GAP: usize = 2;
 /// The fewest columns a description keeps beside its keys; a frame with
 /// less room puts the description under them.
 const DOES_MIN_WIDTH: usize = 24;
-
-const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
 #[derive(Debug, Default)]
 pub(super) struct Help {
@@ -62,12 +60,16 @@ impl Help {
         }
         self.last_total.saturating_sub(self.page)
     }
+
+    pub(super) fn view<'a>(&'a mut self, theme: &'a Theme) -> HelpView<'a> {
+        HelpView { help: self, theme }
+    }
 }
 
-/// The help laid out at `width`: a bold heading per context, then its
-/// rows, keys first and what they do beside them or, on a narrow frame,
-/// under them.
-fn lines(width: u16) -> Vec<Line<'static>> {
+/// The help laid out at `width`: a heading per context, then its rows,
+/// keys first and what they do beside them or, on a narrow frame, under
+/// them.
+fn lines(width: u16, heading: Style) -> Vec<Line<'static>> {
     let columns = usize::from(width);
     let keys_width = KEY_HELP
         .iter()
@@ -87,7 +89,7 @@ fn lines(width: u16) -> Vec<Line<'static>> {
             if context.is_some() {
                 lines.push(Line::default());
             }
-            lines.extend(render::plain_lines(row_context.title(), width, BOLD));
+            lines.extend(render::plain_lines(row_context.title(), width, heading));
             context = Some(*row_context);
         }
         if beside {
@@ -151,7 +153,12 @@ fn wrap_keys(keys: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-impl Widget for &mut Help {
+pub(super) struct HelpView<'a> {
+    help: &'a mut Help,
+    theme: &'a Theme,
+}
+
+impl Widget for HelpView<'_> {
     /// `area` is the screen above the status line, the transcript and any
     /// todo panel; the pop-up sits inside it. Under the title a blank row
     /// sets the first heading apart from the border. With no row left for
@@ -163,7 +170,7 @@ impl Widget for &mut Help {
             return;
         }
         let block = Block::bordered()
-            .title(Span::styled(TITLE, BOLD))
+            .title(Span::styled(TITLE, self.theme.heading))
             .title_bottom(Line::styled(HINT, DIM));
         let inner = block.inner(area);
         let body = Rect::new(
@@ -172,18 +179,19 @@ impl Widget for &mut Help {
             inner.width,
             inner.height.saturating_sub(1),
         );
-        let text = lines(body.width);
+        let text = lines(body.width, self.theme.heading);
         let total = text.len();
         let rows = usize::from(body.height);
-        self.page = rows.max(1);
-        self.last_total = total;
-        self.top = self.top.min(self.bottom());
+        let help = self.help;
+        help.page = rows.max(1);
+        help.last_total = total;
+        help.top = help.top.min(help.bottom());
         Clear.render(area, buf);
         if body.is_empty() {
             block.render(area, buf);
             return;
         }
-        let start = self.top;
+        let start = help.top;
         let end = (start + rows).min(total);
         let position = format!("{}-{end}/{total}", (start + 1).min(end));
         block
@@ -207,8 +215,9 @@ mod tests {
 
     fn draw(help: &mut Help, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let theme = Theme::fallback(false);
         terminal
-            .draw(|frame| frame.render_widget(&mut *help, frame.area()))
+            .draw(|frame| frame.render_widget(help.view(&theme), frame.area()))
             .unwrap();
         terminal.backend().to_string()
     }
@@ -226,7 +235,10 @@ mod tests {
                 help.page(1);
             }
             let body_width = width - CHROME_COLUMNS;
-            let text: Vec<String> = lines(body_width).iter().map(Line::to_string).collect();
+            let text: Vec<String> = lines(body_width, Style::new())
+                .iter()
+                .map(Line::to_string)
+                .collect();
             for line in &text {
                 assert!(line.width() <= usize::from(body_width), "{width}: {line:?}");
                 assert!(seen.contains(line.trim_end()), "{width}: {line:?}");
@@ -252,7 +264,7 @@ mod tests {
     #[test]
     fn scrolling_stays_within_the_text() {
         let rows = 24 - CHROME_ROWS;
-        let total = lines(80 - CHROME_COLUMNS).len();
+        let total = lines(80 - CHROME_COLUMNS, Style::new()).len();
         let mut help = Help::default();
         help.scroll(-5);
         let top = draw(&mut help, 80, 24);
@@ -273,7 +285,7 @@ mod tests {
     fn a_step_up_after_scrolling_past_the_end_moves_at_once() {
         let mut help = Help::default();
         draw(&mut help, 80, 24);
-        let total = lines(80 - CHROME_COLUMNS).len();
+        let total = lines(80 - CHROME_COLUMNS, Style::new()).len();
         let bottom = total - (24 - CHROME_ROWS);
         for _ in 0..50 {
             help.page(1);
@@ -294,12 +306,13 @@ mod tests {
     #[test]
     fn the_pop_up_is_bordered_inside_a_margin_with_a_blank_row_under_the_title() {
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let theme = Theme::fallback(false);
         terminal
             .draw(|frame| {
                 let area = frame.area();
                 Paragraph::new(vec![Line::from("x".repeat(40)); 12])
                     .render(area, frame.buffer_mut());
-                frame.render_widget(&mut Help::default(), area);
+                frame.render_widget(Help::default().view(&theme), area);
             })
             .unwrap();
         let rows: Vec<String> = (0..12)
@@ -313,7 +326,7 @@ mod tests {
         for row in &rows[1..11] {
             assert!(row.starts_with('x') && row.ends_with('x'), "{row:?}");
         }
-        let total = lines(40 - CHROME_COLUMNS).len();
+        let total = lines(40 - CHROME_COLUMNS, Style::new()).len();
         assert!(rows[1].starts_with("x\u{250c}Keys"), "{:?}", rows[1]);
         assert!(
             rows[1].ends_with(&format!("1-7/{total}\u{2510}x")),
@@ -331,14 +344,20 @@ mod tests {
 
     #[test]
     fn a_wide_frame_puts_what_a_key_does_beside_it() {
-        let text: Vec<String> = lines(80).iter().map(Line::to_string).collect();
+        let text: Vec<String> = lines(80, Style::new())
+            .iter()
+            .map(Line::to_string)
+            .collect();
         assert_eq!(text[0], "Anywhere");
         let suspend = text
             .iter()
             .find(|line| line.contains("Ctrl+Z"))
             .expect("a Ctrl+Z row");
         assert!(suspend.ends_with("Suspend to the shell"), "{suspend}");
-        let narrow: Vec<String> = lines(40).iter().map(Line::to_string).collect();
+        let narrow: Vec<String> = lines(40, Style::new())
+            .iter()
+            .map(Line::to_string)
+            .collect();
         let at = narrow.iter().position(|line| line == "  Ctrl+Z").unwrap();
         assert_eq!(narrow[at + 1], "    Suspend to the shell");
     }

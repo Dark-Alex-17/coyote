@@ -4596,7 +4596,8 @@ mod binary {
     /// command: pasted as three lines and submitted, `.info` yields its table
     /// in the transcript instead of going to the model as a prompt (a dry-run
     /// reply would only echo the fence back). The table is taller than the
-    /// screen, so the rows checked are its last ones.
+    /// screen, so the rows checked are its last ones, on a screen taller
+    /// than the default so they all fit above the composer.
     #[test]
     #[serial]
     fn a_fenced_dot_command_runs_as_a_command_and_not_as_a_prompt() {
@@ -4606,6 +4607,7 @@ mod binary {
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        repaint(&mut pty, 60, 100);
         pty.read_for(Duration::from_millis(300));
         let before = pty.raw().len();
         pty.send(b"\x1b[200~:::\r.info\r:::\x1b[201~").unwrap();

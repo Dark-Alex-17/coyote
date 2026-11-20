@@ -1,5 +1,5 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: "&frame"
 ---
 "> plan it                                             ┌Todo────────────────────┐"
@@ -18,8 +18,8 @@ expression: "&frame"
 "                                                      │                        │"
 "                                                      │                        │"
 "                                                      │                        │"
-"                                                      │                        │"
 "                                                      └────────────────────────┘"
+"────────────────────────────────────────────────────────────────────────────────"
 "? = keys  Alt+T = tasks  Ctrl+X = todo                                          "
 "────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "

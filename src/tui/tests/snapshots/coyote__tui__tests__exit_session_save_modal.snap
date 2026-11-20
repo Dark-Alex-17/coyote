@@ -1,5 +1,5 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: harness.draw()
 ---
 "> .exit session                                                                 "
@@ -21,7 +21,7 @@ expression: harness.draw()
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 "Working . 0s                                                                    "
 "Save session?                                                                   "
 "y = yes  n = no  Enter = no  Esc = cancel                                       "

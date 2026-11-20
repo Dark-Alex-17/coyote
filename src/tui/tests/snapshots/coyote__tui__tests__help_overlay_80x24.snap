@@ -1,9 +1,9 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: "&frame"
 ---
 "                                                                                "
-" ┌Keys────────────────────────────────────────────────────────────────1-13/134┐ "
+" ┌Keys────────────────────────────────────────────────────────────────1-12/134┐ "
 " │                                                                            │ "
 "┌│Anywhere                                                                    │┐"
 "││  Ctrl+Z                                  Suspend to the shell              ││"
@@ -17,9 +17,9 @@ expression: "&frame"
 "││                                          when scrolled                     ││"
 "└│  Mouse wheel                             Scroll the transcript             │┘"
 " │                                                                            │ "
-" │Composer                                                                    │ "
 " └j/k scroll  PgUp/Dn page  Esc close─────────────────────────────────────────┘ "
 "                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 "                                                                                "
 "────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "

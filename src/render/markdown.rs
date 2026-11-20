@@ -712,6 +712,22 @@ impl MarkdownRender {
         self.wrap_width = width;
     }
 
+    /// The theme's heading colour, `Reset` when no theme is loaded.
+    pub(crate) fn heading_color(&self) -> Color {
+        self.styles.heading.0
+    }
+
+    /// The theme's horizontal rule colour, `Reset` when no theme is loaded.
+    pub(crate) fn hrule_color(&self) -> Color {
+        self.styles.hrule
+    }
+
+    /// An RGB colour as this terminal can show it: unchanged under
+    /// truecolor, the nearest 256-colour palette entry otherwise.
+    pub(crate) fn rgb_color(&self, r: u8, g: u8, b: u8) -> Color {
+        convert_color(SyntectColor { r, g, b, a: 0xff }, self.options.truecolor)
+    }
+
     pub fn render(&mut self, text: &str) -> String {
         text.split('\n')
             .filter_map(|line| self.render_line_mut(line))

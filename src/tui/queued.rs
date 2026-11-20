@@ -3,8 +3,8 @@
 //! model did not get, and every command, is submitted on its own once the
 //! turn ends.
 
-use super::DIM;
 use super::bottom_pane::first_line;
+use super::theme::Theme;
 use crate::events::Event;
 use crate::supervisor::notification::{NotificationQueue, SystemNotification};
 use ratatui::buffer::Buffer;
@@ -111,28 +111,32 @@ pub(super) fn preview_rows(queued: &[QueuedLine]) -> u16 {
 }
 
 /// The strip above the composer: `pending: N`, then the newest entries'
-/// first lines with how much follows, all dim.
-pub(super) struct QueuedPreview<'a>(pub(super) &'a [QueuedLine]);
+/// first lines with how much follows, in a style apart from the header.
+pub(super) struct QueuedPreview<'a> {
+    pub(super) queued: &'a [QueuedLine],
+    pub(super) theme: &'a Theme,
+}
 
 impl Widget for QueuedPreview<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let area = area.intersection(*buf.area());
-        if area.is_empty() || self.0.is_empty() {
+        let queued = self.queued;
+        if area.is_empty() || queued.is_empty() {
             return;
         }
-        let shown = self.0.len().min(PREVIEW_ENTRIES);
+        let shown = queued.len().min(PREVIEW_ENTRIES);
         let mut lines = vec![Line::from(Span::styled(
-            format!("pending: {}", self.0.len()),
-            DIM,
+            format!("pending: {}", queued.len()),
+            self.theme.queued_header,
         ))];
-        lines.extend(self.0[self.0.len() - shown..].iter().map(|line| {
+        lines.extend(queued[queued.len() - shown..].iter().map(|line| {
             let (first, tail) = first_line(&line.text);
             let shown = if tail.is_empty() {
                 first
             } else {
                 format!("{first}  {tail}")
             };
-            Line::from(Span::styled(shown, DIM))
+            Line::from(Span::styled(shown, self.theme.queued_text))
         }));
         Paragraph::new(lines).render(area, buf);
     }
@@ -238,7 +242,11 @@ mod tests {
         assert_eq!(preview_rows(&queued), 4);
         let area = Rect::new(0, 0, 12, 4);
         let mut buf = Buffer::empty(area);
-        QueuedPreview(&queued).render(area, &mut buf);
+        QueuedPreview {
+            queued: &queued,
+            theme: &Theme::fallback(false),
+        }
+        .render(area, &mut buf);
         let rows: Vec<String> = (0..4)
             .map(|y| {
                 (0..12)

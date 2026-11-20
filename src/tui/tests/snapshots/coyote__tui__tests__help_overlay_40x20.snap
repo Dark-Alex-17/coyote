@@ -1,9 +1,9 @@
 ---
-source: src/tui/mod.rs
-expression: "&frame"
+source: src/tui/tests/mod.rs
+expression: frame
 ---
-"┌──────────────────────────────────────┐"
-"│┌Keys─────────────────────────1-9/220┐│"
+"│ coyote X.Y.Z │"
+"│┌Keys─────────────────────────1-8/220┐│"
 "││                                    ││"
 "││Anywhere                            ││"
 "││  Ctrl+Z                            ││"
@@ -13,9 +13,9 @@ expression: "&frame"
 "││                                    ││"
 "││Transcript, also under a question   ││"
 "││  Ctrl+X                            ││"
-"││    Show or hide the todo panel     ││"
 "│└j/k scroll  PgUp/Dn page  Esc close─┘│"
 "└──────────────────────────────────────┘"
+"────────────────────────────────────────"
 "                                        "
 "────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"

@@ -869,6 +869,7 @@ mod tests {
     use super::*;
     use crate::config::CommandPrefix;
     use crate::tui::composer::Composer;
+    use crate::tui::theme::Theme;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
@@ -3218,7 +3219,7 @@ mod tests {
         composer.move_cursor(ViMotion::Back);
         let area = Rect::new(0, 0, 20, 3);
         composer
-            .view(CommandPrefix::Dot, &[], true, false)
+            .view(CommandPrefix::Dot, &[], &Theme::fallback(true), false)
             .render(area, &mut Buffer::empty(area));
         composer
     }

@@ -1,6 +1,8 @@
 use super::keys::ModalKind;
 use super::sink::unattended_answer;
-use super::{App, DIM, TRANSCRIPT_MIN_ROWS, escalation_kind, new_field, render, roster};
+use super::{
+    App, DIM, FIXED_ROWS, TRANSCRIPT_MIN_ROWS, escalation_kind, new_field, render, roster,
+};
 use crate::events::{NoticeKind, Origin};
 use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, input_default_text};
 use ratatui::buffer::Buffer;
@@ -269,11 +271,11 @@ impl PendingPrompt {
         lines
     }
 
-    /// Rows the question may take on a frame `height` tall: the status
-    /// row, the footer, the modal's origin, middle and hint rows are
-    /// fixed, and `TRANSCRIPT_MIN_ROWS` stay with the transcript.
+    /// Rows the question may take on a frame `height` tall: the frame's
+    /// fixed rows and the modal's origin, middle and hint rows are taken,
+    /// and `TRANSCRIPT_MIN_ROWS` stay with the transcript.
     fn question_cap(&self, width: u16, height: u16) -> u16 {
-        let fixed = 2
+        let fixed = FIXED_ROWS
             + TRANSCRIPT_MIN_ROWS
             + self.hint_rows(width)
             + self.origin_rows()
@@ -288,7 +290,8 @@ impl PendingPrompt {
         if matches!(self.kind(), ModalKind::Confirm { .. }) {
             return 0;
         }
-        let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width) + self.origin_rows();
+        let fixed =
+            1 + FIXED_ROWS + TRANSCRIPT_MIN_ROWS + self.hint_rows(width) + self.origin_rows();
         row_count(self.list_len()).clamp(1, height.saturating_sub(fixed).max(1))
     }
 

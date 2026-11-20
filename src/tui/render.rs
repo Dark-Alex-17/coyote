@@ -288,6 +288,10 @@ impl Renderer {
         })
     }
 
+    pub(super) fn markdown_render(&self) -> &MarkdownRender {
+        &self.markdown
+    }
+
     /// Markdown laid out at `width` by the renderer itself: it wraps prose
     /// and lists on word boundaries and sizes tables to fit, where wrapping
     /// its painted output afterwards would break border rows mid-cell. Code

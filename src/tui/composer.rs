@@ -3,15 +3,14 @@
 //! over the field after the textarea has drawn it, green when it names
 //! something that would run and red when it does not.
 
-use super::DIM;
 use super::keys::ViMotion;
-use crate::config::{AppConfig, CommandPrefix};
-use crate::render::RenderOptions;
+use super::theme::{DIM, Theme};
+use crate::config::CommandPrefix;
 use crate::repl::{CommandSpan, classify_command};
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
@@ -21,44 +20,12 @@ pub(super) const NORMAL_TAG: &str = " NORMAL ";
 /// Text rows the field shows, before the rule above them.
 const MIN_ROWS: u16 = 3;
 const MAX_ROWS: u16 = 8;
-const KNOWN_COLOR: Color = Color::Green;
-const UNKNOWN_COLOR: Color = Color::Red;
-/// How far each channel of the theme's background moves towards the text
-/// so the field reads as its own surface.
-const SURFACE_NUDGE: u8 = 12;
-const DARK_FALLBACK: Color = Color::Indexed(236);
-const LIGHT_FALLBACK: Color = Color::Indexed(254);
 
 fn placeholder(prefix: CommandPrefix) -> String {
     format!(
         "Type a prompt or a {}command; Enter sends",
         prefix.display()
     )
-}
-
-/// The field's fill: the transcript theme's background nudged a step
-/// towards the text, which only an RGB-capable terminal can show; every
-/// other case gets a fixed grey on the theme's side of the scale.
-pub(super) fn field_background(config: &AppConfig, options: &RenderOptions) -> Color {
-    let light = config.light_theme();
-    let fallback = if light { LIGHT_FALLBACK } else { DARK_FALLBACK };
-    if !options.truecolor {
-        return fallback;
-    }
-    let Some(settings) = options.theme.as_ref().map(|theme| &theme.settings) else {
-        return fallback;
-    };
-    let Some(base) = settings.background.or(settings.line_highlight) else {
-        return fallback;
-    };
-    let nudge = |channel: u8| {
-        if light {
-            channel.saturating_sub(SURFACE_NUDGE)
-        } else {
-            channel.saturating_add(SURFACE_NUDGE)
-        }
-    };
-    Color::Rgb(nudge(base.r), nudge(base.g), nudge(base.b))
 }
 
 pub(super) struct Composer {
@@ -241,14 +208,14 @@ impl Composer {
         &'a self,
         prefix: CommandPrefix,
         extra_known: &[&str],
-        no_color: bool,
+        theme: &'a Theme,
         vi_normal: bool,
     ) -> ComposerView<'a> {
         let first_line = self.textarea.lines().first().map(String::as_str);
         ComposerView {
             composer: self,
             command: first_line.and_then(|line| classify_command(line, prefix, extra_known)),
-            no_color,
+            theme,
             vi_normal,
         }
     }
@@ -257,7 +224,7 @@ impl Composer {
 pub(super) struct ComposerView<'a> {
     composer: &'a Composer,
     command: Option<CommandSpan>,
-    no_color: bool,
+    theme: &'a Theme,
     vi_normal: bool,
 }
 
@@ -285,14 +252,11 @@ impl ComposerView<'_> {
         if end <= start {
             return;
         }
-        let mut style = Style::new().add_modifier(Modifier::BOLD);
-        if !self.no_color {
-            style = style.fg(if span.known {
-                KNOWN_COLOR
-            } else {
-                UNKNOWN_COLOR
-            });
-        }
+        let style = if span.known {
+            self.theme.known_command
+        } else {
+            self.theme.unknown_command
+        };
         buf.set_style(Rect::new(inner.x + start, inner.y, end - start, 1), style);
     }
 }
@@ -312,9 +276,7 @@ impl Widget for ComposerView<'_> {
         if inner.is_empty() {
             return;
         }
-        if !self.no_color {
-            buf.set_style(inner, Style::new().bg(self.composer.background));
-        }
+        buf.set_style(inner, self.theme.surface(self.composer.background));
         (&self.composer.textarea).render(inner, buf);
         if let Some(span) = &self.command {
             self.paint_command(span, inner, buf);
@@ -325,18 +287,20 @@ impl Widget for ComposerView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
     use ratatui::symbols::line::HORIZONTAL;
-    use syntect::highlighting::{Color as SyntectColor, Theme, ThemeSettings};
 
     const AREA: Rect = Rect::new(0, 0, 20, 4);
     const BACKGROUND: Color = Color::Indexed(236);
+    const KNOWN_COLOR: Color = Color::Green;
+    const UNKNOWN_COLOR: Color = Color::Red;
 
     fn render(text: &str, prefix: CommandPrefix, extra_known: &[&str], no_color: bool) -> Buffer {
         let mut composer = Composer::new(BACKGROUND, prefix);
         composer.set_text(text);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(prefix, extra_known, no_color, false)
+            .view(prefix, extra_known, &Theme::fallback(no_color), false)
             .render(AREA, &mut buf);
         buf
     }
@@ -440,7 +404,7 @@ mod tests {
         composer.set_text(&[".info x", "a", "b", "c", "d", "e"].join("\n"));
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(CommandPrefix::Dot, &[], false, false)
+            .view(CommandPrefix::Dot, &[], &Theme::fallback(false), false)
             .render(AREA, &mut buf);
         assert!(composer.textarea.scroll_offset().0 > 0);
         assert!(first_row(&buf).iter().all(|cell| !cell.1));
@@ -451,7 +415,7 @@ mod tests {
         let composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(CommandPrefix::Dot, &[], false, true)
+            .view(CommandPrefix::Dot, &[], &Theme::fallback(false), true)
             .render(AREA, &mut buf);
         let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains(NORMAL_TAG), "{top:?}");
@@ -593,35 +557,5 @@ mod tests {
         assert_eq!(composer.rows(), 6);
         composer.set_text(&["x"; 20].join("\n"));
         assert_eq!(composer.rows(), MAX_ROWS + 1);
-    }
-
-    #[test]
-    fn the_background_follows_the_theme_only_under_truecolor() {
-        let dark = AppConfig::default();
-        let light = AppConfig {
-            theme: Some("light".to_string()),
-            ..Default::default()
-        };
-        let plain = RenderOptions::new(None, None, false, false, false);
-        assert_eq!(field_background(&dark, &plain), DARK_FALLBACK);
-        assert_eq!(field_background(&light, &plain), LIGHT_FALLBACK);
-
-        let theme = Theme {
-            settings: ThemeSettings {
-                background: Some(SyntectColor {
-                    r: 30,
-                    g: 31,
-                    b: 32,
-                    a: 255,
-                }),
-                ..ThemeSettings::default()
-            },
-            ..Theme::default()
-        };
-        let mut themed = RenderOptions::new(Some(theme), None, false, false, false);
-        assert_eq!(field_background(&dark, &themed), DARK_FALLBACK);
-        themed.truecolor = true;
-        assert_eq!(field_background(&dark, &themed), Color::Rgb(42, 43, 44));
-        assert_eq!(field_background(&light, &themed), Color::Rgb(18, 19, 20));
     }
 }

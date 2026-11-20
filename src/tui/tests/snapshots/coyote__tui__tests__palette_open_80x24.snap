@@ -1,8 +1,7 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: frame
 ---
-"                                                                                "
 "                                                                                "
 "┌──────────────────────────────────────────────────────────────────────────────┐"
 "│ coyote X.Y.Z │"
@@ -17,6 +16,7 @@ expression: frame
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                                                "
 "                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 "Alt+T = tasks  Ctrl+X = todo                                                    "
 ".info             Show system info                                              "
 ".info mcp-server  Show an MCP server's tool filters and effective catalog       "

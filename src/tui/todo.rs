@@ -2,11 +2,11 @@
 //! transcript on Ctrl+X. The list is read from the context between turns and
 //! from `TodoUpdated` events while one runs.
 
-use super::{DIM, render};
+use super::render;
+use super::theme::{DIM, Theme};
 use crate::config::todo::TodoItem;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
 /// Narrowest frame that keeps a transcript beside the panel; under it
@@ -48,9 +48,18 @@ impl TodoPanel {
     pub(super) fn width_beside(width: u16) -> Option<u16> {
         (width >= SPLIT_MIN_WIDTH).then(|| (width / 3).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH))
     }
+
+    pub(super) fn view<'a>(&'a self, theme: &'a Theme) -> TodoView<'a> {
+        TodoView { panel: self, theme }
+    }
 }
 
-impl Widget for &TodoPanel {
+pub(super) struct TodoView<'a> {
+    panel: &'a TodoPanel,
+    theme: &'a Theme,
+}
+
+impl Widget for TodoView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let area = area.intersection(*buf.area());
         if area.is_empty() {
@@ -63,21 +72,22 @@ impl Widget for &TodoPanel {
             return;
         }
         let mut lines = Vec::new();
-        if !self.goal.is_empty() {
+        let panel = self.panel;
+        if !panel.goal.is_empty() {
             lines.extend(render::plain_lines(
-                &self.goal,
+                &panel.goal,
                 inner.width,
-                Style::new().add_modifier(Modifier::BOLD),
+                self.theme.heading,
             ));
         }
-        if self.items.is_empty() {
+        if panel.items.is_empty() {
             lines.extend(render::plain_lines("(no todos)", inner.width, DIM));
         }
-        for item in &self.items {
+        for item in &panel.items {
             let (mark, style) = if item.done {
-                ("x", DIM)
+                ("x", self.theme.todo_done)
             } else {
-                (" ", Style::new())
+                (" ", self.theme.todo_open)
             };
             lines.extend(render::plain_lines(
                 &format!("[{mark}] {}", item.desc),

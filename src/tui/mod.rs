@@ -32,6 +32,7 @@ mod roster;
 mod run_loop;
 mod sink;
 mod terminal;
+mod theme;
 mod todo;
 mod transcript;
 
@@ -48,7 +49,7 @@ use bottom_pane::{
     View,
 };
 use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow};
-use composer::{Composer, field_background};
+use composer::Composer;
 use control::{ControlRequest, cancel_report, is_plain_session_id};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, TermInput};
@@ -65,9 +66,9 @@ use queued::{QueuedLine, QueuedPreview, remove_sent};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui_textarea::TextArea;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
@@ -80,6 +81,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use theme::{ChromeKind, DIM, Theme, chrome_style, field_background};
 use todo::TodoPanel;
 use tokio::task::JoinSet;
 use transcript::{Transcript, WHEEL_LINES};
@@ -124,6 +126,9 @@ const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
 /// does not fit is clipped with a marker and cannot be approved until the
 /// terminal is tall enough.
 const TRANSCRIPT_MIN_ROWS: u16 = 4;
+/// Rows of the frame that are always drawn whatever else shows: the status
+/// row and the footer.
+const FIXED_ROWS: u16 = 2;
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
 /// The UI's own command, spelled without its sigil: it opens the key help
@@ -137,38 +142,28 @@ const IDLE_STATUS: &str = "Alt+T = tasks  Ctrl+X = todo";
 /// before it.
 const IDLE_STATUS_WITH_HELP: &str = "? = keys  Alt+T = tasks  Ctrl+X = todo";
 
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
-const IDLE_HINT: Style = DIM.add_modifier(Modifier::ITALIC);
-/// The completion popup in the REPL's colours: command names green as its
-/// highlighter paints a known command, descriptions yellow and the
-/// selected row green, bold and reversed as its completion menu draws them.
-const PALETTE_NAME: Style = Style::new().fg(Color::Green);
-const PALETTE_KIND: Style = Style::new().fg(Color::Cyan);
-const PALETTE_DESCRIPTION: Style = Style::new().fg(Color::Yellow);
-const PALETTE_SELECTED: Style = Style::new()
-    .fg(Color::Green)
-    .add_modifier(Modifier::BOLD)
-    .add_modifier(Modifier::REVERSED);
-
-/// The UI's own fixed colours. `no_color` keeps the attributes and drops
-/// the colour, which is what `NO_COLOR` asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChromeKind {
-    Notice(NoticeKind),
-    Error,
+/// The idle hint as key and label spans: each `key = label` entry's key
+/// in one style, the rest in the other.
+fn hint_spans(hint: &'static str, theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, entry) in hint.split("  ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", theme.hint_label));
+        }
+        let (key, label) = entry.split_at(entry.find(" = ").unwrap_or(entry.len()));
+        spans.push(Span::styled(key, theme.hint_key));
+        if !label.is_empty() {
+            spans.push(Span::styled(label, theme.hint_label));
+        }
+    }
+    spans
 }
 
-fn chrome_style(kind: ChromeKind, no_color: bool) -> Style {
-    let (colour, style) = match kind {
-        ChromeKind::Notice(NoticeKind::ToolWarning) => (Some(Color::Yellow), Style::new()),
-        ChromeKind::Notice(NoticeKind::Routing) => (None, Style::new()),
-        ChromeKind::Notice(_) => (None, DIM),
-        ChromeKind::Error => (Some(Color::Red), Style::new()),
-    };
-    match colour {
-        Some(colour) if !no_color => style.fg(colour),
-        _ => style,
-    }
+/// Rows of the rule under the transcript on a frame `area_height` tall
+/// whose bottom pane takes `bottom_rows`: none when drawing it would leave
+/// the transcript no row, so a short frame gives the row to the bottom pane.
+fn rule_rows(area_height: u16, bottom_rows: u16) -> u16 {
+    u16::from(area_height > FIXED_ROWS + bottom_rows + 1)
 }
 
 /// The footer's left half, read from the context only while the UI holds
@@ -194,7 +189,7 @@ impl FooterInfo {
         }
     }
 
-    fn text(&self, (agents, jobs): (usize, usize)) -> String {
+    fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(who) = &self.who {
             parts.push(who.clone());
@@ -207,7 +202,19 @@ impl FooterInfo {
         );
         parts.push(format!("agents {agents}"));
         parts.push(format!("jobs {jobs}"));
-        parts.join(" . ")
+        parts
+    }
+
+    /// The fields joined by ` . `, which is drawn in a style of its own.
+    fn line(&self, counts: (usize, usize), theme: &Theme) -> Line<'static> {
+        let mut spans = Vec::new();
+        for (i, part) in self.parts(counts).into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" . ", theme.footer_separator));
+            }
+            spans.push(Span::styled(part, theme.footer_field));
+        }
+        Line::from(spans)
     }
 }
 
@@ -349,6 +356,7 @@ pub(crate) struct App {
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
+    theme: Theme,
     /// The enabled macros as (name, description), refreshed with the
     /// context since a turn can enable or shadow one: the typed-command
     /// highlight accepts them as known and the palette lists them.
@@ -429,6 +437,7 @@ impl App {
         let options = config.render_options()?;
         let background = field_background(&config, &options);
         let renderer = Renderer::new(options)?;
+        let theme = Theme::new(renderer.markdown_render(), renderer.no_color);
         let history_file = history_file(&config, footer.session.as_deref());
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
@@ -451,6 +460,7 @@ impl App {
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
+            theme,
             macros: Vec::new(),
             view: View::Composer,
             palette_snapshot: PaletteSnapshot::EMPTY,
@@ -480,6 +490,7 @@ impl App {
     #[cfg(test)]
     fn set_no_color(&mut self, no_color: bool) {
         self.renderer.no_color = no_color;
+        self.theme = Theme::new(self.renderer.markdown_render(), no_color);
     }
 
     pub(crate) fn composer_text(&self) -> String {
@@ -513,6 +524,7 @@ impl App {
             }) {
                 Ok((mut renderer, background)) => {
                     renderer.no_color = self.renderer.no_color;
+                    self.theme = Theme::new(renderer.markdown_render(), renderer.no_color);
                     self.renderer = renderer;
                     self.transcript.forget_layout();
                     if let Some(pager) = self.pager_mut() {
@@ -1510,14 +1522,17 @@ impl App {
         &cells[..end.min(cells.len())]
     }
 
-    /// Every state is dim and the idle hint is italic as well. The
+    /// Every turn state is dim and the idle hint is italic instead. The
     /// terminal backend only rewrites cells whose symbol or style changed,
     /// so a shared style would let a turn's first frame skip the letters
     /// it has in common with the hint and leave a torn word in the output
     /// stream. Modifiers survive `NO_COLOR`, so this holds there too.
-    fn status_text(&self) -> Option<Span<'static>> {
+    fn status_text(&self) -> Option<Line<'static>> {
         if self.exiting {
-            return Some(Span::styled("Leaving...", DIM));
+            return Some(Line::from(Span::styled(
+                "Leaving...",
+                self.theme.status_runtime,
+            )));
         }
         let Some(turn) = self.turn.as_ref() else {
             // The key help takes the chords the idle hint names.
@@ -1529,7 +1544,7 @@ impl App {
             } else {
                 IDLE_STATUS
             };
-            return Some(Span::styled(status, IDLE_HINT));
+            return Some(Line::from(hint_spans(status, &self.theme)));
         };
         let now = self.clock.now();
         let secs = |since: Instant| now.duration_since(since).as_secs();
@@ -1544,11 +1559,11 @@ impl App {
                 secs(turn.started)
             )
         };
+        let mut spans = vec![Span::styled(state, self.theme.status_runtime)];
         if self.prompts.is_empty() && !matches!(self.overlay, Some(Overlay::Help(_))) {
-            Some(Span::styled(format!("{state}  Esc to interrupt"), DIM))
-        } else {
-            Some(Span::styled(state, DIM))
+            spans.push(Span::styled("  Esc to interrupt", self.theme.status_key));
         }
+        Some(Line::from(spans))
     }
 
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
@@ -1561,11 +1576,11 @@ impl App {
     /// The rows the band above the composer takes from the transcript:
     /// what the view asks for, or the queued-lines preview when no view
     /// is open, within what the frame can give once the composer, the
-    /// status and footer rows and the transcript's minimum have theirs.
+    /// fixed rows and the transcript's minimum have theirs.
     fn band_rows(&self, area: Rect) -> u16 {
         let room = area
             .height
-            .saturating_sub(self.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
+            .saturating_sub(self.composer.rows() + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
         let wanted = match self.view {
             View::Composer => queued::preview_rows(&self.queued),
             _ => self.view.band_rows(),
@@ -1592,10 +1607,12 @@ impl App {
         if let View::Roster(roster) = &mut self.view {
             roster.refresh(self.roster_sources.rows());
         }
-        let [upper, status, bottom, footer] = Layout::vertical([
+        let bottom_rows = self.bottom_pane_rows(area);
+        let [upper, rule, status, bottom, footer] = Layout::vertical([
             Constraint::Min(0),
+            Constraint::Length(rule_rows(area.height, bottom_rows)),
             Constraint::Length(1),
-            Constraint::Length(self.bottom_pane_rows(area)),
+            Constraint::Length(bottom_rows),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -1615,12 +1632,20 @@ impl App {
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
         if let Some(todo) = todo {
-            frame.render_widget(&self.todo, todo);
+            frame.render_widget(self.todo.view(&self.theme), todo);
         }
         if let Some(Overlay::Help(help)) = self.overlay.as_mut() {
-            frame.render_widget(help, upper);
+            frame.render_widget(help.view(&self.theme), upper);
         }
 
+        // A line between the transcript and the status row, so the
+        // transcript's last line never reads as part of the hint under it.
+        frame.render_widget(
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(self.theme.rule),
+            rule,
+        );
         frame.render_widget(StatusStrip(self.status_text()), status);
 
         let modal_areas = match self.prompts.front() {
@@ -1636,11 +1661,17 @@ impl App {
                 ])
                 .areas(bottom);
                 match &self.view {
-                    View::Composer => frame.render_widget(QueuedPreview(&self.queued), band),
+                    View::Composer => frame.render_widget(
+                        QueuedPreview {
+                            queued: &self.queued,
+                            theme: &self.theme,
+                        },
+                        band,
+                    ),
                     View::Palette(palette) => frame.render_widget(
                         PaletteView {
                             state: palette,
-                            no_color: self.renderer.no_color,
+                            theme: &self.theme,
                         },
                         band,
                     ),
@@ -1661,7 +1692,7 @@ impl App {
                     self.composer.view(
                         self.config.command_prefix,
                         &macro_names,
-                        self.renderer.no_color,
+                        &self.theme,
                         self.vi_mode == Some(ViMode::Normal),
                     ),
                     field,
@@ -1674,7 +1705,9 @@ impl App {
 
         frame.render_widget(
             FooterBar {
-                left: self.footer.text(self.roster_sources.running_counts()),
+                left: self
+                    .footer
+                    .line(self.roster_sources.running_counts(), &self.theme),
                 right: render::styled_line(&self.usage),
             },
             footer,
@@ -1700,7 +1733,7 @@ impl App {
     }
 }
 
-struct StatusStrip(Option<Span<'static>>);
+struct StatusStrip(Option<Line<'static>>);
 
 impl Widget for StatusStrip {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -1709,13 +1742,13 @@ impl Widget for StatusStrip {
             return;
         }
         if let Some(text) = self.0 {
-            Paragraph::new(Line::from(text)).render(area, buf);
+            Paragraph::new(text).render(area, buf);
         }
     }
 }
 
 struct FooterBar {
-    left: String,
+    left: Line<'static>,
     right: Line<'static>,
 }
 
@@ -1725,7 +1758,7 @@ impl Widget for FooterBar {
         if area.is_empty() {
             return;
         }
-        Paragraph::new(Line::from(Span::styled(self.left, DIM))).render(area, buf);
+        Paragraph::new(self.left).render(area, buf);
         if self.right.width() > 0 {
             Paragraph::new(self.right.patch_style(DIM))
                 .right_aligned()

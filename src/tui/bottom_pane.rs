@@ -7,12 +7,11 @@
 use super::cells::{Cell, RewindBarrier};
 use super::history::ComposerHistory;
 use super::roster::RosterState;
-use super::{DIM, PALETTE_DESCRIPTION, PALETTE_KIND, PALETTE_NAME, PALETTE_SELECTED};
+use super::theme::{DIM, PLAIN_ROWS, RowStyles, Theme};
 use crate::config::{CommandPrefix, RequestContext, StateFlags};
 use crate::repl::{command_candidates, macro_candidates, split_line};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashSet;
@@ -409,28 +408,6 @@ impl RewindState {
     }
 }
 
-/// How a list's columns and its highlighted row are painted.
-struct RowStyles {
-    name: Style,
-    kind: Style,
-    description: Style,
-    highlight: Style,
-}
-
-const PLAIN_ROWS: RowStyles = RowStyles {
-    name: Style::new(),
-    kind: DIM,
-    description: DIM,
-    highlight: Style::new().add_modifier(Modifier::REVERSED),
-};
-
-const PALETTE_ROWS: RowStyles = RowStyles {
-    name: PALETTE_NAME,
-    kind: PALETTE_KIND,
-    description: PALETTE_DESCRIPTION,
-    highlight: PALETTE_SELECTED,
-};
-
 /// Draws a list's rows: the first column padded to its widest entry,
 /// the second dim after it, the highlighted row reversed.
 pub(super) fn render_rows(
@@ -518,11 +495,10 @@ pub(super) fn render_header(line: Line<'_>, area: Rect, buf: &mut Buffer) -> Rec
 }
 
 /// The palette's band: `name` padded to a column, then the kind when a
-/// row has one, then the description, in the REPL's colours unless
-/// `no_color` is set.
+/// row has one, then the description, in the theme's palette colours.
 pub(super) struct PaletteView<'a> {
     pub(super) state: &'a PaletteState,
-    pub(super) no_color: bool,
+    pub(super) theme: &'a Theme,
 }
 
 impl Widget for PaletteView<'_> {
@@ -539,12 +515,7 @@ impl Widget for PaletteView<'_> {
                 )
             })
             .collect();
-        let styles = if self.no_color {
-            &PLAIN_ROWS
-        } else {
-            &PALETTE_ROWS
-        };
-        render_columns(&rows, styles, self.state.highlight, area, buf);
+        render_columns(&rows, &self.theme.palette, self.state.highlight, area, buf);
     }
 }
 
@@ -600,7 +571,7 @@ mod tests {
     use crate::repl::ReplCompleter;
     use crate::testing::TestConfigDirGuard;
     use parking_lot::RwLock;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -995,7 +966,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         PaletteView {
             state: palette,
-            no_color,
+            theme: &Theme::fallback(no_color),
         }
         .render(area, &mut buf);
         let lines = buffer_lines(&buf, 30, height);

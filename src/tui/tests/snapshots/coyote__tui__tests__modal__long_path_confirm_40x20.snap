@@ -1,12 +1,12 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/modal.rs
 expression: "&rendered"
 ---
 "> remove it                             "
 "                                        "
 "                                        "
 "                                        "
-"                                        "
+"────────────────────────────────────────"
 "Working . 0s                            "
 "fs_rm asks:                             "
 "Remove '/tmp/                           "

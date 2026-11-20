@@ -26,6 +26,7 @@ use events::ManualClock;
 use keys::ModalKind;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::{Color, Modifier};
 use serde_json::Value;
 use serial_test::serial;
 use std::future::Future;
@@ -1685,6 +1686,112 @@ fn a_drawn_error_cell_follows_the_no_color_switch() {
     }
 }
 
+/// The colour and attributes of the cell where `needle` starts in the
+/// last frame drawn, searched from the bottom up so the chrome under the
+/// transcript is found before the welcome block's text above it.
+fn style_at(harness: &Harness, needle: &str) -> (Color, Modifier) {
+    let buffer = harness.terminal.backend().buffer();
+    let area = buffer.area;
+    let chars: Vec<String> = needle.chars().map(String::from).collect();
+    for y in (0..area.height).rev() {
+        for x in 0..area.width {
+            let fits = usize::from(area.width - x) >= chars.len();
+            if fits
+                && (x..)
+                    .zip(&chars)
+                    .all(|(column, c)| buffer[(column, y)].symbol() == c.as_str())
+            {
+                let cell = &buffer[(x, y)];
+                return (cell.fg, cell.modifier);
+            }
+        }
+    }
+    panic!("no cell starts {needle:?}:\n{buffer:?}");
+}
+
+/// The chrome's parts as drawn: the rule, the idle hint, the footer and
+/// the todo panel on an idle frame, then the status row and the queued
+/// preview during a turn.
+fn chrome_styles(no_color: bool) -> Vec<(&'static str, (Color, Modifier))> {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(no_color);
+    harness.app.todo.set("ship it".to_string(), todo_items());
+    harness.app.todo.toggle();
+    let idle = harness.draw();
+    let rule_row = screen_row(&harness, IDLE_STATUS_WITH_HELP) - 1;
+    assert!(
+        row_text(&harness, rule_row) == ratatui::symbols::line::HORIZONTAL.repeat(80),
+        "{idle}"
+    );
+    let rule = harness.terminal.backend().buffer()[(0, rule_row)].clone();
+    let mut styles = vec![
+        ("rule", (rule.fg, rule.modifier)),
+        ("hint key", style_at(&harness, "? = keys")),
+        ("hint label", style_at(&harness, "= keys")),
+        ("footer field", style_at(&harness, "openai:test-model")),
+        ("footer separator", style_at(&harness, ". no session")),
+        ("todo goal", style_at(&harness, "ship it")),
+        ("todo done", style_at(&harness, "[x] wire")),
+        ("todo open", style_at(&harness, "[ ] snapshot")),
+    ];
+    harness.app.begin_turn("read it", false);
+    harness
+        .app
+        .handle_msg(UiMsg::ToolRunning(Some("fs_read".to_string())));
+    harness.app.queued.push(QueuedLine {
+        text: "later q2w".to_string(),
+        command: false,
+    });
+    harness.draw();
+    styles.extend([
+        ("runtime", style_at(&harness, "Running fs_read")),
+        ("interrupt key", style_at(&harness, "Esc to interrupt")),
+        ("queued header", style_at(&harness, "pending: 1")),
+        ("queued text", style_at(&harness, "later q2w")),
+    ]);
+    styles
+}
+
+/// Each distinction the chrome draws carries a colour rather than an
+/// attribute alone, and the rule takes the theme's rule colour.
+#[test]
+fn the_chrome_parts_are_told_apart_by_colour() {
+    let styles = chrome_styles(false);
+    let fg = |name: &str| {
+        styles
+            .iter()
+            .find(|(part, _)| *part == name)
+            .map(|(_, (fg, _))| *fg)
+            .unwrap()
+    };
+    assert_eq!(Some(fg("rule")), Theme::fallback(false).rule.fg);
+    assert_ne!(fg("rule"), Color::Reset);
+    assert_ne!(fg("todo goal"), Color::Reset);
+    for (a, b) in [
+        ("hint key", "hint label"),
+        ("footer field", "hint key"),
+        ("footer field", "hint label"),
+        ("footer field", "footer separator"),
+        ("runtime", "interrupt key"),
+        ("queued header", "queued text"),
+        ("todo done", "todo open"),
+    ] {
+        assert_ne!(fg(a), fg(b), "{a} and {b} share a colour: {styles:?}");
+    }
+}
+
+/// Under `NO_COLOR` the same parts lose every colour and keep the
+/// attributes they are drawn with in colour.
+#[test]
+fn no_color_strips_the_chrome_colours_and_keeps_the_attributes() {
+    let coloured = chrome_styles(false);
+    let plain = chrome_styles(true);
+    for ((name, (_, modifier)), (_, (fg, plain_modifier))) in coloured.iter().zip(&plain) {
+        assert_eq!(*fg, Color::Reset, "{name}");
+        assert_eq!(plain_modifier, modifier, "{name}");
+    }
+}
+
 /// What a prompt turn printed around the modal becomes a notice with
 /// its escapes removed; the spinner's glyph is text and stays.
 #[test]
@@ -2551,6 +2658,7 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
         text: "later".to_string(),
         command: false,
     }];
+    let theme = Theme::fallback(false);
     let mut widgets: Vec<(&str, Draw<'_>)> = vec![
         (
             "transcript (welcome)",
@@ -2583,14 +2691,14 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
         (
             "status strip",
             Box::new(|area, buf| {
-                StatusStrip(Some(Span::styled("thinking for 3s", DIM))).render(area, buf);
+                StatusStrip(Some(Line::styled("thinking for 3s", DIM))).render(area, buf);
             }),
         ),
         (
             "footer bar",
             Box::new(|area, buf| {
                 FooterBar {
-                    left: "openai:test-model . no session".to_string(),
+                    left: Line::from("openai:test-model . no session"),
                     right: Line::from("in 10 out 20"),
                 }
                 .render(area, buf);
@@ -2614,14 +2722,14 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
         ),
         (
             "todo panel",
-            Box::new(|area, buf| (&todo).render(area, buf)),
+            Box::new(|area, buf| todo.view(&theme).render(area, buf)),
         ),
         (
             "palette band",
             Box::new(|area, buf| {
                 PaletteView {
                     state: &palette,
-                    no_color: false,
+                    theme: &theme,
                 }
                 .render(area, buf)
             }),
@@ -2636,7 +2744,13 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
         ),
         (
             "queued preview",
-            Box::new(|area, buf| QueuedPreview(&queued).render(area, buf)),
+            Box::new(|area, buf| {
+                QueuedPreview {
+                    queued: &queued,
+                    theme: &theme,
+                }
+                .render(area, buf)
+            }),
         ),
     ];
     let screen = Rect::new(0, 0, 10, 3);
@@ -3080,13 +3194,18 @@ fn the_palette_band_sits_above_the_rule_and_keeps_the_transcript_minimum() {
         IDLE_STATUS,
         "the status row sits between the transcript and the band\n{frame}"
     );
+    assert!(
+        row_text(&harness, COMPOSER_RULE_ROW - rows - 2)
+            .starts_with(ratatui::symbols::line::HORIZONTAL),
+        "the rule sits between the transcript and the status row\n{frame}"
+    );
 
-    harness.resize(80, 12);
+    harness.resize(80, 13);
     harness.render();
-    let room = 12 - (harness.app.composer.rows() + 2 + TRANSCRIPT_MIN_ROWS);
-    assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 12)), room);
+    let room = 13 - (harness.app.composer.rows() + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
+    assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 13)), room);
     let frame = harness.terminal.backend().to_string();
-    let band_top = 12 - 1 - harness.app.composer.rows() - room;
+    let band_top = 13 - 1 - harness.app.composer.rows() - room;
     assert!(row_text(&harness, band_top).starts_with('.'), "{frame}");
     assert!(
         row_text(&harness, band_top + room - 1).contains("(+"),
@@ -3597,6 +3716,31 @@ fn the_interrupt_hint_yields_to_an_open_modal() {
     let rendered = harness.draw();
     assert!(rendered.contains("Enter = no"), "{rendered}");
     harness.press(KeyCode::Esc);
+}
+
+#[test]
+fn the_rule_gives_its_row_to_a_confirm_on_a_five_row_frame() {
+    let rule = ratatui::symbols::line::HORIZONTAL;
+    let mut harness = Harness::standalone(40, 5);
+    harness.app.begin_turn("ask", false);
+    let _asker = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
+    let rendered = harness.draw();
+    assert!(rendered.contains("Proceed? tui-x7x"), "{rendered}");
+    assert!(rendered.contains("y = yes"), "{rendered}");
+    assert!(
+        (0..5).all(|y| row_text(&harness, y) != rule.repeat(40)),
+        "{rendered}"
+    );
+    harness.press(KeyCode::Esc);
+
+    let mut harness = Harness::standalone(80, 24);
+    let rendered = harness.draw();
+    let status_row = screen_row(&harness, IDLE_STATUS_WITH_HELP);
+    assert_eq!(
+        row_text(&harness, status_row - 1),
+        rule.repeat(80),
+        "{rendered}"
+    );
 }
 
 /// The text from `signature` to the first column-zero closing brace,
@@ -4466,7 +4610,7 @@ fn the_idle_status_names_only_keys_the_help_lists() {
 /// or a band open above the composer takes it as typing.
 #[test]
 fn the_idle_status_drops_the_help_key_where_it_types() {
-    let status = |harness: &Harness| harness.app.status_text().map(|span| span.content);
+    let status = |harness: &Harness| harness.app.status_text().map(|line| line.to_string());
     let mut harness = Harness::standalone(80, 24);
     assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS_WITH_HELP));
     harness.type_text("draft");
@@ -4650,7 +4794,7 @@ fn the_key_help_pops_up_over_the_transcript_wide_and_narrow() {
         assert!(status.trim_matches(['"', ' ']).is_empty(), "{frame}");
         assert_eq!(open[0], closed[0], "{frame}");
         assert_eq!(open[first_below - 2], closed[first_below - 2], "{frame}");
-        insta::assert_snapshot!(name, &frame);
+        assert_welcome_snapshot(name, &frame);
     }
 }
 

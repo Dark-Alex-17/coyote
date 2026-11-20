@@ -1,5 +1,5 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: first_delta
 ---
 "> hello                                                                         "
@@ -19,7 +19,7 @@ expression: first_delta
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 "Working . 0s  Esc to interrupt                                                  "
 "────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "

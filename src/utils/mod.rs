@@ -279,17 +279,15 @@ pub fn dimmed_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    let color = TOOL_DIM_COLOR.get().copied().unwrap_or(Color::Fixed(243));
-    color.paint(input).to_string()
+    tool_dim_color().paint(input).to_string()
 }
 
 pub fn cyan_bold_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
     nu_ansi_term::Style::new()
-        .fg(color)
+        .fg(tool_fn_color())
         .bold()
         .paint(input)
         .to_string()
@@ -311,8 +309,22 @@ pub fn magenta_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    let color = TOOL_KEY_COLOR.get().copied().unwrap_or(Color::Fixed(133));
-    color.paint(input).to_string()
+    tool_key_color().paint(input).to_string()
+}
+
+/// The muted colour of a tool call line's punctuation, as the theme set it.
+pub(crate) fn tool_dim_color() -> Color {
+    TOOL_DIM_COLOR.get().copied().unwrap_or(Color::Fixed(243))
+}
+
+/// The colour of a tool call line's function name.
+pub(crate) fn tool_fn_color() -> Color {
+    TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73))
+}
+
+/// The colour of a tool call line's argument names.
+pub(crate) fn tool_key_color() -> Color {
+    TOOL_KEY_COLOR.get().copied().unwrap_or(Color::Fixed(133))
 }
 
 pub fn multiline_text(input: &str) -> String {
