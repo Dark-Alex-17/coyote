@@ -3,8 +3,10 @@
 
 Runs ONLY the caller-declared verification commands (verification_commands)
 in the project dir and records the outcomes as `exec_results` — a list of
-{cmd, exit, duration_s, tail} records. Criterion branches cite this record;
-they never execute anything themselves.
+{cmd, exit, duration_s, tail} records. Each run record also carries
+`pass_condition` from pass_condition.py: whether the criteria and the request
+hold the command to exit 0 or state some other condition for it. Criterion
+branches cite this record; they never execute anything themselves.
 
 NO auto-detection: undeclared commands mean a "none declared" marker
 (fail-visible, not fail-guessed). Any runner error degrades into an
@@ -59,10 +61,23 @@ is pre-existing only when the base run is red (and did not time out) with
 the same exit code, the current run was not killed by a signal, and either
 every currently failing test id already failed on the base, or neither run
 named a test id and the failure output hashes alike. The red record gains
-`baseline`: {"status": "pre-existing" | "regression" | "not-run", "exit",
-"note"}. not-run means no comparison happened (no diff base, deadline spent,
-worktree or helper failure, base run timed out); it blocks like a
-regression, so a missing comparison never passes.
+`baseline`: {"status": "pre-existing" | "regression" | "not-run" |
+"tree-state", "exit", "note"}. not-run means no comparison happened (no diff
+base, deadline spent, worktree or helper failure, base run timed out); it
+blocks like a regression, so a missing comparison never passes.
+When `git status --porcelain` lists anything, every red record that did not
+time out first runs once more, inside the same deadline and in the same
+subdirectory, in a second detached worktree (hooks disabled the same way) of a
+snapshot commit of the live tree: HEAD plus every tracked and untracked file
+that is not ignored, built through a temporary GIT_INDEX_FILE and commit-tree,
+so the real index and refs are never touched. A command that exits 0 there
+gets baseline status "tree-state" and no base run: it is red only in the
+uncommitted live tree. Any other snapshot outcome (red, timed out, no snapshot,
+deadline spent) keeps the live run's classification against the base, with
+", candidate tree dirty" appended to its note; the snapshot's own output is
+never compared with the base, since ignored files missing from both clean
+checkouts would fake a match. Snapshot runs are never saved. Both worktrees
+are removed together.
 
 Process hygiene: commands run through the shell. On POSIX each command gets
 its own session (start_new_session) and a timeout SIGKILLs the whole process
@@ -102,6 +117,11 @@ import sys
 import tempfile
 import time
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pass_condition import resolve  # noqa: E402
+
 try:
     import fcntl
 except ImportError:  # non-POSIX (Windows): advisory flock unavailable
@@ -119,6 +139,16 @@ GATE_LIB = os.path.join(
 GIT_CLEANUP_TIMEOUT_SECS = 20
 GATE_CALL_MIN_TIMEOUT_SECS = 10
 BASE_RUN_FORMAT = 1
+TREE_STATE_NOTE = (
+    "candidate tree dirty: red only in the live tree; the same content on a clean checkout exits 0"
+)
+DIRTY_TREE_NOTE = ", candidate tree dirty"
+SNAPSHOT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "adversary",
+    "GIT_AUTHOR_EMAIL": "adversary@localhost.invalid",
+    "GIT_COMMITTER_NAME": "adversary",
+    "GIT_COMMITTER_EMAIL": "adversary@localhost.invalid",
+}
 
 
 def acquire_stack_lock():
@@ -366,7 +396,7 @@ def left(deadline):
     return deadline - time.monotonic()
 
 
-def git_text(args, cwd, timeout):
+def git_text(args, cwd, timeout, env=None):
     r = subprocess.run(
         ["git", "-C", cwd, *args],
         capture_output=True,
@@ -374,6 +404,7 @@ def git_text(args, cwd, timeout):
         encoding="utf-8",
         errors="replace",
         timeout=max(timeout, 1),
+        env=env,
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
@@ -394,6 +425,67 @@ def remove_worktree(top, path):
     cleanup_git(top, ["worktree", "prune"])
     shutil.rmtree(path, ignore_errors=True)
     cleanup_git(top, ["worktree", "prune"])
+
+
+def add_worktree(top, path, commit, work, deadline):
+    """A detached worktree of `commit` at `path`, added without running the user's git hooks."""
+    hooks = os.path.join(work, "no-hooks")
+    os.makedirs(hooks, exist_ok=True)
+    git_text(
+        ["-c", f"core.hooksPath={hooks}", "worktree", "add", "--detach", path, commit],
+        top,
+        left(deadline),
+    )
+
+
+def tree_dirty(top, deadline):
+    try:
+        return bool(git_text(["--no-optional-locks", "status", "--porcelain"], top, left(deadline)))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
+def snapshot_commit(top, work, deadline):
+    """A commit of the live tree whose parent is HEAD, built in a temporary index."""
+    env = dict(os.environ, GIT_INDEX_FILE=os.path.join(work, "snapshot-index"), **SNAPSHOT_IDENTITY)
+    git_text(["read-tree", "HEAD"], top, left(deadline), env)
+    git_text(["add", "-A"], top, left(deadline), env)
+    tree = git_text(["write-tree"], top, left(deadline), env)
+    return git_text(
+        ["commit-tree", "--no-gpg-sign", "-p", "HEAD", "-m", "adversary snapshot", tree],
+        top,
+        left(deadline),
+        env,
+    )
+
+
+def rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, saved_runs, worktrees):
+    """Run each red command once more on a snapshot of a dirty live tree and give the
+    ones that exit 0 there a tree-state baseline; return the reds this applied to."""
+    if left(deadline) <= 0 or not tree_dirty(top, deadline):
+        return []
+    tree = os.path.join(work, "snapshot")
+    try:
+        commit = snapshot_commit(top, work, deadline)
+        worktrees.append(tree)
+        add_worktree(top, tree, commit, work, deadline)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"WARN: no snapshot of the dirty tree to rerun red commands in: {e}\n")
+        return reds
+    snap_proj = os.path.join(tree, subdir)
+    for i in reds:
+        remaining = left(deadline)
+        if remaining <= 0 or not os.path.isdir(snap_proj):
+            break
+        cmd = results[i]["cmd"]
+        if run_one(cmd, snap_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix)["exit"] == 0:
+            saved = load_base_run(saved_runs, cmd)
+            results[i]["baseline"] = {
+                "status": "tree-state",
+                "exit": saved[0] if saved else None,
+                "note": TREE_STATE_NOTE,
+            }
+    return reds
 
 
 # A saved base run freezes one sample of a flaky base: later rounds compare
@@ -468,7 +560,8 @@ def save_base_run(saved_runs, cmd, base, base_path, deadline):
 
 def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
     """Give every red record a `baseline` from one run at the diff base, reusing a saved
-    run of the same command on the same base tree instead of running it again."""
+    run of the same command on the same base tree instead of running it again, unless a
+    snapshot of a dirty live tree shows the red is tree state."""
     reds = [i for i, r in enumerate(results) if not r.get("skipped") and r.get("exit") != 0]
     for i in reds:
         if results[i]["exit"] == -1:
@@ -493,14 +586,29 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
         for i in reds:
             results[i]["baseline"] = not_run(f"the project's git repository could not be read: {e}")
         return
+    saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
+    worktrees = []
+    try:
+        dirty = rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, saved_runs, worktrees)
+        reds = [i for i in reds if "baseline" not in results[i]]
+        if reds:
+            compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, deadline, work, saved_runs, worktrees)
+    finally:
+        for tree in worktrees:
+            remove_worktree(top, tree)
+    for i in dirty:
+        baseline = results[i]["baseline"]
+        if baseline["status"] != "tree-state":
+            baseline["note"] += DIRTY_TREE_NOTE
 
+
+def compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, deadline, work, saved_runs, worktrees):
     def compare(i, base, base_path):
         try:
             results[i]["baseline"] = classify(results[i], outputs[i], base, base_path, deadline)
         except GateUnavailable as e:
             results[i]["baseline"] = dict(not_run(f"baseline comparison unavailable: {e}"), exit=base["exit"])
 
-    saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
     misses = []
     for i in reds:
         saved = load_base_run(saved_runs, results[i]["cmd"])
@@ -521,37 +629,29 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
     if not misses:
         return
     tree = os.path.join(work, "base")
-    hooks = os.path.join(work, "no-hooks")
+    worktrees.append(tree)
     try:
-        try:
-            os.mkdir(hooks)
-            git_text(
-                ["-c", f"core.hooksPath={hooks}", "worktree", "add", "--detach", tree, diff_base],
-                top,
-                left(deadline),
-            )
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            for i in misses:
-                results[i]["baseline"] = not_run(f"the diff-base worktree could not be created: {e}")
-            return
-        base_proj = os.path.join(tree, subdir)
+        add_worktree(top, tree, diff_base, work, deadline)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         for i in misses:
-            remaining = left(deadline)
-            if remaining <= 0:
-                results[i]["baseline"] = not_run("the deadline was spent before this command's baseline run")
-                continue
-            if not os.path.isdir(base_proj):
-                results[i]["baseline"] = not_run(f"the project directory {subdir!r} does not exist at the diff base")
-                continue
-            base_path = os.path.join(work, f"base-{i}.txt")
-            base = run_one(results[i]["cmd"], base_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix, base_path)
-            if base["exit"] == -1:
-                results[i]["baseline"] = not_run("the command timed out on the diff base")
-                continue
-            save_base_run(saved_runs, results[i]["cmd"], base, base_path, deadline)
-            compare(i, base, base_path)
-    finally:
-        remove_worktree(top, tree)
+            results[i]["baseline"] = not_run(f"the diff-base worktree could not be created: {e}")
+        return
+    base_proj = os.path.join(tree, subdir)
+    for i in misses:
+        remaining = left(deadline)
+        if remaining <= 0:
+            results[i]["baseline"] = not_run("the deadline was spent before this command's baseline run")
+            continue
+        if not os.path.isdir(base_proj):
+            results[i]["baseline"] = not_run(f"the project directory {subdir!r} does not exist at the diff base")
+            continue
+        base_path = os.path.join(work, f"base-{i}.txt")
+        base = run_one(results[i]["cmd"], base_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix, base_path)
+        if base["exit"] == -1:
+            results[i]["baseline"] = not_run("the command timed out on the diff base")
+            continue
+        save_base_run(saved_runs, results[i]["cmd"], base, base_path, deadline)
+        compare(i, base, base_path)
 
 
 def emit_pipeline_fault(state, msg):
@@ -608,6 +708,7 @@ def main():
             results.append(
                 run_one(cmd, proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix, outputs[i])
             )
+            results[-1]["pass_condition"] = resolve(cmd, state.get("criteria"), state.get("initial_prompt"))
         try:
             attach_baselines(results, outputs, state, proj, prefix, deadline, work)
         except Exception as e:  # noqa: BLE001 -- the recorded runs outlive a baseline failure
