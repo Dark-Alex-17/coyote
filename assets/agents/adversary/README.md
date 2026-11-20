@@ -83,9 +83,12 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
 - Each run record carries a `pass_condition`. A criterion or request line names a command only
   through a backticked span equal to it (whitespace and quote characters normalised). The
   condition is `stated` when no naming line says the command passes or exits 0 and the clause
-  after at least one naming span positively states another condition ("prints nothing", "no
-  output", "is empty", "absent", "does not exist", "exits 1"), otherwise `exit 0`. That clause
-  ends at the next backticked span, a `.` or `;` followed by whitespace, or the end of the line.
+  after at least one naming span makes the command the subject of another condition: an optional
+  modal ("must", "should", "is expected to"), then the condition ("prints nothing", "returns no
+  output", "is empty", "does not exist", "exits 1"); otherwise `exit 0`. A clause saying what the
+  command checks ("checks the CLI exits 1", "covers the absent-file case") states nothing. That
+  clause ends at the next backticked span, a `.` or `;` followed by whitespace, or the end of the
+  line.
   A command named nowhere (the caller's build/test/lint contract), only in passing
   ("Verification commands: `x`") or inside a longer span is held to exit 0. The verdict
   recomputes it from the criteria and the request, never from the record. A red run held to exit

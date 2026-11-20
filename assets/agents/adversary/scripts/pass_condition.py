@@ -7,10 +7,14 @@ treated as one character. A line that mentions the command without backticks,
 or inside a longer span (`x --all | grep y`), does not name it. A naming line
 states exit 0 when its prose (the line without any of its backticked spans)
 matches CRITERION_PASS_RE and not CRITERION_FAIL_RE. A naming span states
-another condition when its own clause matches STATED_RE (no output, a file
-absent, exit 1); the clause runs from the end of the span to the next
-backticked span, a '.' or ';' followed by whitespace, or the end of the line,
-so a second command on the same line does not lend its condition. The
+another condition when its own clause opens with STATED_RE, which makes the
+command the subject of the condition: an optional modal ("must", "is
+expected to"), then the condition itself ("prints nothing", "exits 1", "does
+not exist"). A clause describing what the command checks ("checks the CLI
+exits 1", "covers the absent-file case") states nothing about the command.
+The clause runs from the end of the span to the next backticked span, a '.'
+or ';' followed by whitespace, or the end of the line, so a second command on
+the same line does not lend its condition. The
 condition is "stated" only when no naming line states exit 0 and at least one
 naming span states another condition; it is "exit 0" otherwise, so a command
 named in passing ("run `x` after each edit") or named nowhere (the caller's
@@ -23,16 +27,20 @@ import re
 CRITERION_PASS_RE = re.compile(r"\b(pass(es|ing)?|succeed(s|ed)?|green|exits?\s+(with\s+)?(code\s+|status\s+)?0)\b", re.I)
 CRITERION_FAIL_RE = re.compile(r"\b(fail(s|ed)?|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9]|non-?zero|rejected|refuse[sd]?)\b", re.I)
 # Matched against normalised prose, where an apostrophe has become a double quote.
-# Words that ordinary instructions use in passing ("if it fails", "the missing
-# case") are left out: a request line carrying them must not release a red run.
-# "<verb> no <word>" takes only nouns for output, so "reports no warnings" stays
-# a claim about the command succeeding.
+# Anchored at the start of the clause after the naming span, so a condition
+# word later in the clause ("when the list is empty") never counts. "<verb> no
+# <word>" takes only nouns for output, so "reports no warnings" stays a claim
+# about the command succeeding.
 STATED_RE = re.compile(
-    r"\b((prints?|outputs?|shows?|returns?|reports?|lists?|finds?)\s+"
-    r"(nothing|no\s+(output|match(es)?|lines?|results?|hits?|files?|changes?|differences?|diff))"
-    r"|no\s+(output|match(es)?|lines|results)|is\s+empty|empty\s+output"
-    r"|absent|does\s+not\s+exist|doesn\"t\s+exist|not\s+present"
-    r"|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9])\b",
+    r"(\"s\s+)?(output\s+)?"
+    r"((must|should|shall|will|needs?\s+to|has\s+to|is\s+expected\s+to|is\s+required\s+to)\s+)?"
+    r"((prints?|outputs?|shows?|returns?|reports?|lists?|finds?|produces?|gives?|has)\s+"
+    r"(nothing|empty\s+output"
+    r"|no\s+(output|match(es)?|lines?|results?|hits?|files?|changes?|differences?|diff))"
+    r"|(is|be)\s+(empty|absent|not\s+present)"
+    r"|(does\s+not|doesn\"t|not)\s+exist"
+    r"|returns?\s+(exit\s+)?(code|status)\s+[1-9]\d*"
+    r"|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9]\d*)\b",
     re.I,
 )
 EXIT_0 = "exit 0"
@@ -85,7 +93,7 @@ def resolve(cmd, criteria, request):
                 continue
             first = first or bounded(line)
             passes = passes or states_exit_0(normalise(SPAN_RE.sub(" ", line)))
-            other = other or any(STATED_RE.search(clause_after(line, m.end())) for m in naming)
+            other = other or any(STATED_RE.match(clause_after(line, m.end())) for m in naming)
             if cid is not None and cid not in ids:
                 ids.append(cid)
     condition = STATED if other and not passes else EXIT_0
