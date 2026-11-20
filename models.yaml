@@ -1001,7 +1001,7 @@
     max_input_tokens: 262144
     input_price: 0.0
     output_price: 0.0
-    cache_read_price: 0.05
+    cache_read_price: 0.0425
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -3579,10 +3579,10 @@
   - name: anthropic.claude-fable-5-2
     type: chat
     max_input_tokens: 1000000
-    input_price: 8.0
-    output_price: 40.0
-    cache_read_price: 0.2
-    cache_write_price: 10.0
+    input_price: 8.8
+    output_price: 44.0
+    cache_read_price: 0.22
+    cache_write_price: 11.0
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3714,10 +3714,10 @@
   - name: anthropic.claude-haiku-5-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 0.1
-    output_price: 0.5
-    cache_read_price: 0.01
-    cache_write_price: 0.125
+    input_price: 0.11
+    output_price: 0.55
+    cache_read_price: 0.011
+    cache_write_price: 0.1375
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3859,10 +3859,10 @@
   - name: anthropic.claude-sonnet-5-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 2.0
-    output_price: 10.0
-    cache_read_price: 0.1
-    cache_write_price: 2.5
+    input_price: 2.2
+    output_price: 11.0
+    cache_read_price: 0.11
+    cache_write_price: 2.75
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3940,10 +3940,10 @@
   - name: anthropic.claude-opus-5-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 4.0
-    output_price: 20.0
-    cache_read_price: 0.2
-    cache_write_price: 5.0
+    input_price: 4.4
+    output_price: 22.0
+    cache_read_price: 0.22
+    cache_write_price: 5.5
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -4215,10 +4215,10 @@
   - name: anthropic.claude-fable-5-1
     type: chat
     max_input_tokens: 1000000
-    input_price: 10.0
-    output_price: 50.0
-    cache_read_price: 0.25
-    cache_write_price: 12.5
+    input_price: 11.0
+    output_price: 55.0
+    cache_read_price: 0.275
+    cache_write_price: 13.75
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -4337,10 +4337,10 @@
   - name: anthropic.claude-opus-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -4658,10 +4658,10 @@
   - name: anthropic.claude-sonnet-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 2.0
-    output_price: 10.0
-    cache_read_price: 0.2
-    cache_write_price: 2.5
+    input_price: 2.2
+    output_price: 11.0
+    cache_read_price: 0.22
+    cache_write_price: 2.75
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -4772,10 +4772,10 @@
   - name: anthropic.claude-fable-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 10.0
-    output_price: 50.0
-    cache_read_price: 1.0
-    cache_write_price: 12.5
+    input_price: 11.0
+    output_price: 55.0
+    cache_read_price: 1.1
+    cache_write_price: 13.75
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -4838,10 +4838,10 @@
   - name: anthropic.claude-opus-4-8
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -4965,10 +4965,10 @@
   - name: anthropic.claude-opus-4-7
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -6135,7 +6135,7 @@
     input_price: 0.06
     output_price: 0.24
     cache_read_price: 0.015
-    cache_write_price: 0.06
+    cache_write_price: 0.0
     max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
@@ -6145,7 +6145,7 @@
     input_price: 0.035
     output_price: 0.14
     cache_read_price: 0.00875
-    cache_write_price: 0.035
+    cache_write_price: 0.0
     max_output_tokens: 10000
     supports_function_calling: true
   - name: amazon.nova-pro-v1:0
@@ -6154,7 +6154,7 @@
     input_price: 0.8
     output_price: 3.2
     cache_read_price: 0.2
-    cache_write_price: 0.8
+    cache_write_price: 0.0
     max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
@@ -6232,7 +6232,7 @@
     input_price: 0.06
     output_price: 0.24
     cache_read_price: 0.015
-    cache_write_price: 0.06
+    cache_write_price: 0.0
     max_output_tokens: 5120
     supports_vision: true
     supports_function_calling: true
@@ -6242,7 +6242,7 @@
     input_price: 0.035
     output_price: 0.14
     cache_read_price: 0.00875
-    cache_write_price: 0.035
+    cache_write_price: 0.0
     max_output_tokens: 5120
     supports_function_calling: true
   - name: us.amazon.nova-pro-v1:0
@@ -6251,7 +6251,7 @@
     input_price: 0.8
     output_price: 3.2
     cache_read_price: 0.2
-    cache_write_price: 0.8
+    cache_write_price: 0.0
     max_output_tokens: 5120
     supports_vision: true
     supports_function_calling: true
@@ -8440,9 +8440,9 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.062
+    input_price: 0.1
     output_price: 0.3
-    cache_read_price: 0.035
+    cache_read_price: 0.05
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
@@ -8467,15 +8467,15 @@
     max_input_tokens: 1048576
     input_price: 0.9
     output_price: 1.5
-    cache_read_price: 0.25
+    cache_read_price: 0.2
     max_output_tokens: 393216
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.111
-    output_price: 4.44
-    cache_read_price: 0.097
+    input_price: 0.22
+    output_price: 9.5
+    cache_read_price: 0.17
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash
@@ -8490,10 +8490,10 @@
   - name: deepseek/deepseek-v4.1-flash-1017
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.003
-    max_output_tokens: 393216
+    input_price: 0.036
+    output_price: 0.5
+    cache_read_price: 0.01
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash-1017:batch
@@ -8969,9 +8969,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -9311,9 +9311,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9556,9 +9556,9 @@
   - name: moonshotai/kimi-k2.7-code
     type: chat
     max_input_tokens: 262144
-    input_price: 0.66
-    output_price: 3.5
-    cache_read_price: 0.16
+    input_price: 0.6
+    output_price: 3.0
+    cache_read_price: 0.12
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -10780,10 +10780,9 @@
   - name: openai/gpt-oss-120b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.075
-    max_output_tokens: 65536
+    input_price: 0.09
+    output_price: 0.36
+    max_output_tokens: 117964
     supports_function_calling: true
   - name: openai/gpt-oss-120b:batch
     type: chat
@@ -10866,13 +10865,13 @@
   - name: openrouter/auto-beta
     type: chat
     max_input_tokens: 2000000
-    max_output_tokens: 64000
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
   - name: openrouter/auto-code
     type: chat
     max_input_tokens: 2000000
-    max_output_tokens: 64000
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
   - name: openrouter/bodybuilder
@@ -11133,9 +11132,9 @@
   - name: qwen/qwen3.5-27b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.195
-    output_price: 1.56
-    max_output_tokens: 65536
+    input_price: 0.26
+    output_price: 2.6
+    max_output_tokens: 81920
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-35b-a3b
@@ -11159,10 +11158,9 @@
   - name: qwen/qwen3.5-9b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.142
-    output_price: 0.208
-    cache_read_price: 0.127
-    max_output_tokens: 40960
+    input_price: 0.17
+    output_price: 0.25
+    max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-flash-02-23
@@ -11570,14 +11568,6 @@
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
-  - name: thinkingmachines/inkling-2-small:free
-    type: chat
-    max_input_tokens: 1048576
-    input_price: 0.0
-    output_price: 0.0
-    max_output_tokens: 131072
-    supports_vision: true
-    supports_function_calling: true
   - name: thinkingmachines/inkling-small
     type: chat
     max_input_tokens: 524288
@@ -11599,7 +11589,7 @@
   - name: typesafe/jev-router
     type: chat
     max_input_tokens: 1000000
-    max_output_tokens: 64000
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
   - name: unbiased/pareto-26.10
@@ -11736,15 +11726,6 @@
     output_price: 4.8
     cache_read_price: 0.4
     max_output_tokens: 450000
-    supports_vision: true
-    supports_function_calling: true
-  - name: x-ai/grok-build-0.1
-    type: chat
-    max_input_tokens: 256000
-    input_price: 1.0
-    output_price: 2.0
-    cache_read_price: 0.2
-    max_output_tokens: 230400
     supports_vision: true
     supports_function_calling: true
   - name: xiaomi/mimo-v2.5
@@ -12000,18 +11981,18 @@
   - name: ~deepseek/deepseek-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.035
-    output_price: 0.15
-    cache_read_price: 0.0015
+    input_price: 0.036
+    output_price: 0.5
+    cache_read_price: 0.01
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0999
+    input_price: 0.198
     output_price: 8.0
-    cache_read_price: 0.0999
+    cache_read_price: 0.2
     max_output_tokens: 393216
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
@@ -12045,7 +12026,7 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.1824
+    input_price: 0.1805
     output_price: 11.0055
     cache_read_price: 0.18
     max_output_tokens: 943718
