@@ -70,9 +70,10 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   lists anything, a snapshot commit of that pre-run tree (HEAD plus every tracked and untracked
   file that is not ignored) is built through a temporary index, so the real index and refs are
   untouched; its objects stay unreferenced in the repository's object store. After the commands
-  run, the live tree is written the same way and its tree id compared with the pre-run one
-  (HEAD's tree on a clean tree). When they differ, no red run gets `tree-state` and each note ends
-  `the declared commands modified the tree`. Otherwise each red command that did not time out
+  run, a dirty live tree is written the same way and its tree id compared with the pre-run one;
+  on a clean tree `git status --porcelain` is read again. When the tree changed, no red run gets
+  `tree-state` and each note ends `the declared commands modified the tree`. Otherwise, on a
+  dirty tree, each red command that did not time out
   runs once more, inside the same deadline, in a detached worktree of the pre-run snapshot. A
   command that exits 0 there gets baseline `tree-state`: it is red only because the change is
   uncommitted. Any other snapshot outcome keeps the live run's classification against the base,
@@ -92,8 +93,9 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   above). A red run whose condition parsed criteria state blocks unless every criterion naming it
   ends MET or INSPECTED, and its complaint names those criteria and statuses. A red run whose
   condition only the request states blocks, and its complaint quotes the request line. A stated
-  run whose criteria are met and a `tree-state` run are listed under
-  `Advisory red runs (not blocking):`.
+  run whose criteria are met is listed under `Advisory red runs (not blocking):`, and so is a
+  `tree-state` run unless a criterion naming it ends neither MET nor INSPECTED (one about the
+  uncommitted tree itself, say), which blocks and names those criteria and statuses.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
   criterion checks judge the criteria it covers like an execution criterion no recorded run covers
   (below), naming the command and that it was skipped for time. The report's `Criteria:` line
