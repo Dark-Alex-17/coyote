@@ -3039,10 +3039,11 @@ mod tests {
         }
 
         /// The relay holds the resource in flight, so only the token can end the post
-        /// before the default transfer timeout.
+        /// before the default transfer timeout. The cancel comes once the advertisement
+        /// has reached the relay, so it lands on a transfer the transport tracks, and the
+        /// time is taken from the cancel to the post's return.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn cancelling_a_held_transfer_is_cancelled_promptly() {
-            const CANCEL_AFTER: Duration = Duration::from_millis(500);
             const PROMPT: Duration = Duration::from_secs(10);
             let mut post = Post::start_relayed(1, 2000).await;
 
@@ -3052,16 +3053,43 @@ mod tests {
                 Received::Packet { .. }
             ));
 
+            // Signing, encrypting and stamping run before the send and are not what the
+            // token interrupts, so they are done before the clock starts.
+            let prepared = prepare_envelope(
+                &post.sender,
+                &recipient_of(&post.recipient),
+                &post.learned,
+                &message(&[b'z'; 100_000]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
             let mut client_events = post.client.transport.resource_events();
-            let held = post.relay.as_ref().unwrap().hold().await;
+            let relay = post.relay.as_ref().unwrap();
+            let held = relay.hold().await;
+            let before = relay.chunks.load(Ordering::SeqCst);
+            let chunks = relay.chunks.clone();
             let cancel = post.cancel.clone();
-            tokio::spawn(async move {
-                sleep(CANCEL_AFTER).await;
+            let canceller = tokio::spawn(async move {
+                wait_until("the advertisement to reach the relay", || {
+                    chunks.load(Ordering::SeqCst) > before
+                })
+                .await;
+                let at = StdInstant::now();
                 cancel.cancel();
+                at
             });
-            let started = StdInstant::now();
-            let outcome = post.propagate(&message(&[b'z'; 100_000])).await.err();
-            let elapsed = started.elapsed();
+            let outcome = send_envelope(
+                &post.client.transport,
+                &post.learned,
+                &prepared,
+                post.cancel.clone(),
+                &post.options,
+            )
+            .await
+            .err();
+            let returned = StdInstant::now();
+            let elapsed = returned.saturating_duration_since(canceller.await.unwrap());
             assert_eq!(outcome, Some(PropagationError::Cancelled));
             assert!(
                 elapsed < PROMPT && PROMPT < post.options.transfer_timeout,

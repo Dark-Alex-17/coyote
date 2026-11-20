@@ -152,6 +152,7 @@ impl Home {
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
+        default_dispositions(&mut cmd);
         cmd
     }
 
@@ -176,6 +177,33 @@ impl Home {
 impl Drop for Home {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Starts `cmd` with the signals the script handles at their default dispositions, as a
+/// container starts it. A launcher that ignored one (`nohup` ignores HUP, a background
+/// job of a non-interactive shell INT and QUIT) passes that on through every exec, and
+/// a POSIX shell can neither trap nor reset a signal ignored when it started, so the
+/// signal tests would judge the launcher rather than the script.
+fn default_dispositions(cmd: &mut Command) {
+    // SAFETY: the closure runs between fork and exec and only calls signal(2), which is
+    // async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            for signal in [
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGUSR1,
+                libc::SIGUSR2,
+            ] {
+                if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
     }
 }
 
@@ -758,7 +786,9 @@ fn rnsd_gets_its_scoped_environment_and_a_term_after_the_main_command_returns() 
 }
 
 /// A daemon that ignores TERM is KILLed after the bounded wait and the script still
-/// exits with the main command's status.
+/// exits with the main command's status. The main command returns only once the stub
+/// has armed its trap: a TERM that reached it before then would kill it at once, with
+/// no wait to bound. The wait is timed from that moment.
 #[test]
 fn a_daemon_that_ignores_term_is_killed_after_the_bounded_wait() {
     let home = Home::new("rnsd-stubborn");
@@ -770,9 +800,40 @@ fn a_daemon_that_ignores_term_is_killed_after_the_bounded_wait() {
             log = log.display()
         ),
     );
+    let mut child = home
+        .command(
+            &[],
+            &[
+                "sh",
+                "-c",
+                "until grep -q started \"$0\" 2>/dev/null; do sleep 0.05; done; exit 8",
+                log.to_str().unwrap(),
+            ],
+        )
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let pgid = child.id();
+    let group = Group(pgid);
+    let stderr = Capture::start(child.stderr.take().unwrap());
+    let deadline = Instant::now() + WATCHDOG;
+    while !home.rnsd_recorded().contains("started\n") {
+        assert!(
+            Instant::now() < deadline,
+            "the stand-in rnsd did not start within {WATCHDOG:?}:\n{}",
+            stderr.so_far()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let started = Instant::now();
-    let (code, _, stderr) = run(home.command(&[], &["sh", "-c", "sleep 0.3; exit 8"]));
+    let status = wait_bounded(&mut child, || stderr.so_far());
     let elapsed = started.elapsed();
+    let stderr = stderr.finish(pgid);
+    drop(group);
+    let code = status.code().unwrap_or(-1);
     assert_eq!(code, 8, "{stderr}");
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
@@ -852,19 +913,34 @@ fn a_main_command_that_returns_before_setsid_execs_rnsd_still_stops_the_child() 
 
 /// A TERM swallowed by the child before it became rnsd (the forked shell still carries
 /// this shell's trap handler for an instant) must not cost the 5 s KILL escalation: the
-/// stop phase re-sends TERM once a second. The shim arms a one-shot trap at once and
-/// sleeps past the main command's exit, so the first TERM is absorbed; it then exec's the
-/// stub, which arms its own trap; without the re-send the stub idles until the KILL and
-/// the entrypoint warns.
+/// stop phase re-sends TERM once a second. The shim arms a trap at once and waits for
+/// the first TERM, which it absorbs; it then exec's the stub at once, which arms its own
+/// trap well before the next TERM; without the re-send the stub idles until the KILL and
+/// the entrypoint warns. The main command returns only once the shim has armed its
+/// trap, so the first TERM is the one the shim absorbs rather than one that kills it
+/// before it got that far.
 #[test]
 fn a_term_swallowed_before_the_child_became_rnsd_is_sent_again() {
     let home = Home::new("absorbed-term");
+    let armed = home.path().join("shim.armed");
     home.write_executable(
         "setsid",
-        "#!/bin/sh\ntrap 'trap - TERM' TERM\nsleep 0.5\nexec \"$@\"\n",
+        &format!(
+            "#!/bin/sh\nabsorbed=\ntrap 'absorbed=1' TERM\n: > '{}'\n\
+             while [ -z \"$absorbed\" ]; do sleep 0.05; done\ntrap - TERM\nexec \"$@\"\n",
+            armed.display()
+        ),
     );
     let mut child = home
-        .command(&[], &["sh", "-c", "sleep 0.2; exit 4"])
+        .command(
+            &[],
+            &[
+                "sh",
+                "-c",
+                "until [ -e \"$0\" ]; do sleep 0.05; done; exit 4",
+                armed.to_str().unwrap(),
+            ],
+        )
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -875,6 +951,15 @@ fn a_term_swallowed_before_the_child_became_rnsd_is_sent_again() {
     let group = Group(pgid);
     let stdout = Capture::start(child.stdout.take().unwrap());
     let stderr = Capture::start(child.stderr.take().unwrap());
+    let deadline = Instant::now() + WATCHDOG;
+    while !armed.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the stand-in setsid did not arm its trap within {WATCHDOG:?}:\n{}",
+            stderr.so_far()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let started = Instant::now();
     let status = wait_bounded(&mut child, || {
         format!("stdout:\n{}\nstderr:\n{}", stdout.so_far(), stderr.so_far())
@@ -1005,6 +1090,18 @@ fn the_wrapper_outlives_every_signal_tini_forwards_to_the_group() {
     wait_for(&log, "the stand-in rnsd's start line");
     for signal in ["HUP", "QUIT", "USR1"] {
         group.signal(signal);
+        // The next signal goes once this one's trap has run, so two traps never wait on
+        // the same `sleep` together.
+        let handled = format!("got-{signal}");
+        let deadline = Instant::now() + WATCHDOG;
+        while !read(&stdout_path).contains(&handled) {
+            assert!(
+                Instant::now() < deadline,
+                "the main command did not run its {signal} trap within {WATCHDOG:?}:\n{}",
+                read(&stdout_path)
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
         thread::sleep(Duration::from_millis(400));
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -1189,13 +1286,22 @@ fn a_crlf_template_renders_byte_identically_to_the_lf_one_with_every_stanza() {
 /// The parent's few builtins between the `&` and the old trap site always beat the
 /// child's exec chain, so this checks that the trap is armed by then rather than the
 /// order of the two lines: it fails only when the trap is missing altogether.
+/// The main command ends once the stub reports ready, so the TERM that follows reaches
+/// a stub that can record it.
 #[test]
 fn a_term_landing_during_the_rnsd_spawn_leaves_the_wrapper_alive() {
     let home = Home::new("term-at-spawn");
     home.write_executable("setsid", "#!/bin/sh\nkill -s TERM \"$PPID\"\nexec \"$@\"\n");
     let stderr_path = home.path().join("spawn.stderr");
     let mut child = home
-        .command(&[], &["sh", "-c", "sleep 0.5; echo main-finished; exit 7"])
+        .command(
+            &[],
+            &[
+                "sh",
+                "-c",
+                &home.after_rnsd_ready("echo main-finished; exit 7"),
+            ],
+        )
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1314,6 +1420,7 @@ fn the_stop_phase_owns_a_live_child_of_any_name_and_nothing_else() {
     );
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(&matrix);
+    default_dispositions(&mut cmd);
     let (code, stdout, stderr) = run(cmd);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(

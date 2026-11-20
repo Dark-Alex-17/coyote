@@ -155,9 +155,10 @@ const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
 /// How long a node on `lan` or `local` waits before it suggests a TCP relay for a LAN
 /// that reaches no other host, and how often it reads the LAN counts again until it
 /// has settled.
-const LAN_PEERLESS_GRACE_SECS: u64 = 120;
-/// The idle line for a LAN that stayed silent through `LAN_PEERLESS_GRACE_SECS`.
-const LAN_SILENT_HINT: &str = "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
+const LAN_SILENT_GRACE_SECS: u64 = 120;
+/// The idle line for a LAN that stayed silent through `LAN_SILENT_GRACE_SECS`: its
+/// count read zero, or no count could be read and nothing was heard over it.
+const LAN_SILENT_HINT: &str = "No other Coyote host found on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -4116,7 +4117,7 @@ fn reconcile_tcp_after_lag(
 /// told once, and its redials are not told at all. The watcher holds
 /// no peer-controlled state: a fixed list from the node's own config, two flags, a
 /// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
-/// when the node or its slot is gone. Every `LAN_PEERLESS_GRACE_SECS` until its
+/// when the node or its slot is gone. Every `LAN_SILENT_GRACE_SECS` until its
 /// `LanSilentHint` settles, the watcher also reads the LAN counts and asks it whether to
 /// print `LAN_SILENT_HINT`.
 async fn watch_interfaces(
@@ -4137,7 +4138,7 @@ async fn watch_interfaces(
     let Some(mut events) = events else {
         return;
     };
-    let grace = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
+    let grace = Duration::from_secs(LAN_SILENT_GRACE_SECS);
     let mut lan_silent_ticks = interval_at(tokio::time::Instant::now() + grace, grace);
     // A host waking from sleep reads the LAN once, not once per tick it slept through.
     lan_silent_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -4150,17 +4151,22 @@ async fn watch_interfaces(
                 let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
                     return;
                 };
-                let joined_at = runtime.joined_at();
-                let now = SystemTime::now();
-                let peers_known = knows_peers(runtime.peers().snapshot().iter().map(|peer| peer.last_seen), now);
-                let lan = tokio::select! {
+                let hint = tokio::select! {
                     () = cancel.cancelled() => return,
-                    lan = runtime.lan_readings(ReadEffort::Patient) => lan,
+                    hint = lan_silent.read_and_tick(
+                        || runtime.lan_readings(ReadEffort::Patient),
+                        || LanSilentInputs {
+                            elapsed: runtime.joined_at().elapsed().unwrap_or_default(),
+                            knows_peers: knows_peers(
+                                runtime.peers().snapshot().iter().map(|peer| peer.last_seen),
+                                SystemTime::now(),
+                            ),
+                            interfaces: runtime.interface_states(),
+                        },
+                    ) => hint,
                 };
-                let relayed = on_relay(&runtime.interface_states(), lan.relay_online);
-                let elapsed = joined_at.elapsed().unwrap_or_default();
-                if let Some(hint) = lan_silent.tick(elapsed, &lan.readings, peers_known, relayed) {
-                    info!("Mesh heard no other host on the LAN within {LAN_PEERLESS_GRACE_SECS}s; suggested a TCP relay");
+                if let Some(hint) = hint {
+                    info!("Mesh found no other host on the LAN within {LAN_SILENT_GRACE_SECS}s; suggested a TCP relay");
                     slot.push_idle(IdleNotify {
                         source: Source::Relay,
                         text: hint.into(),
@@ -4301,7 +4307,7 @@ pub(super) enum LanVerdict {
 /// Whether `LAN_SILENT_HINT` is due, from one reading per LAN interface. A count above
 /// zero anywhere settles it, and so does a node that knows a peer (`knows_peers`) or
 /// sits on a relay (`on_relay`), since it already reaches the mesh, and a node with no
-/// LAN interface at all. Otherwise, once `LAN_PEERLESS_GRACE_SECS` are up, it is told
+/// LAN interface at all. Otherwise, once `LAN_SILENT_GRACE_SECS` are up, it is told
 /// when every LAN interface counts zero or reads `Unknown`.
 pub(super) fn lan_silent_verdict(
     elapsed: Duration,
@@ -4315,7 +4321,7 @@ pub(super) fn lan_silent_verdict(
     if counted_a_host || readings.is_empty() || knows_peers || on_relay {
         return LanVerdict::Settle;
     }
-    if elapsed < Duration::from_secs(LAN_PEERLESS_GRACE_SECS) {
+    if elapsed < Duration::from_secs(LAN_SILENT_GRACE_SECS) {
         return LanVerdict::Wait;
     }
     LanVerdict::Tell
@@ -4343,13 +4349,46 @@ fn on_relay(interfaces: &[InterfaceStatus], rnsd_relay_online: bool) -> bool {
 /// once `lan_silent_verdict` settles it, so a host row swept hours later does not make
 /// the LAN silent.
 #[derive(Default)]
-struct LanSilentHint {
+pub(super) struct LanSilentHint {
     settled: bool,
 }
 
+/// What one tick of the silent-LAN check reads besides the LAN counts.
+pub(super) struct LanSilentInputs {
+    /// Time since the node joined.
+    pub elapsed: Duration,
+    /// Whether the peer table holds a row within `PEER_TTL`, as `knows_peers` reads it.
+    pub knows_peers: bool,
+    /// Every configured interface with its state, for `on_relay`.
+    pub interfaces: Vec<InterfaceStatus>,
+}
+
 impl LanSilentHint {
-    fn settled(&self) -> bool {
+    pub(super) fn settled(&self) -> bool {
         self.settled
+    }
+
+    /// One tick of the watcher: one read of the LAN counts by `read`, then the verdict on
+    /// them with `inputs`, taken once the counts are in. A settled hint reads nothing.
+    pub(super) async fn read_and_tick<F>(
+        &mut self,
+        read: impl FnOnce() -> F,
+        inputs: impl FnOnce() -> LanSilentInputs,
+    ) -> Option<&'static str>
+    where
+        F: Future<Output = LanReadings>,
+    {
+        if self.settled {
+            return None;
+        }
+        let lan = read().await;
+        let inputs = inputs();
+        self.tick(
+            inputs.elapsed,
+            &lan.readings,
+            inputs.knows_peers,
+            on_relay(&inputs.interfaces, lan.relay_online),
+        )
     }
 
     /// The hint, the one time it is due.
@@ -19449,13 +19488,13 @@ mod tests {
         use super::*;
         use LanReading::{Count, Unknown};
 
-        const GRACE: Duration = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
+        const GRACE: Duration = Duration::from_secs(LAN_SILENT_GRACE_SECS);
 
         /// Every LAN interface counting no host or reading `Unknown`, on a node that
         /// knows no peer and sits on no relay, tells the hint at the grace and later.
         #[test]
         fn the_hint_is_due_at_the_grace_when_every_lan_interface_is_silent() {
-            assert_eq!(LAN_PEERLESS_GRACE_SECS, 120);
+            assert_eq!(LAN_SILENT_GRACE_SECS, 120);
             for readings in [
                 &[Count(0)][..],
                 &[Unknown],
@@ -19723,7 +19762,7 @@ mod tests {
         fn the_hint_points_at_the_deployment_page_section() {
             assert_eq!(
                 LAN_SILENT_HINT,
-                "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
+                "No other Coyote host found on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
             );
         }
     }

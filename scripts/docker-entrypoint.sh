@@ -220,12 +220,26 @@ rc=$?
 # signal swallowed there never reaches rnsd. So TERM is re-sent once a second
 # while the child lives (rnsd exits on the first one it receives, so a running
 # daemon sees only one). Only a child this script signalled is waited on.
+# The wait is read off the clock, not counted in polls: on a starved CPU each poll
+# takes longer than its sleep, and a count would stretch the 5 s past the stop
+# timeout of the container runtime. Where `date` gives nothing (a group signal can
+# end it mid-read), five polls count as a second. The re-send stays every fifth poll,
+# so TERMs are at least a second apart however the clock ticks.
 if rnsd_alive; then
   # kill -0 succeeds on an exited-but-unreaped child; the loop ends early only
   # because the shell reaps the background rnsd while waiting on the foreground
   # sleep (dash, bash and ash all do). Do not replace it with a fixed sleep.
+  started=$(date +%s 2>/dev/null) || started=
   polls=0
-  while [ "$polls" -lt 25 ] && rnsd_alive; do
+  while rnsd_alive; do
+    now=$(date +%s 2>/dev/null) || now=
+    if [ -n "$started" ] && [ -n "$now" ]; then
+      waited=$((now - started))
+    else
+      waited=$((polls / 5))
+    fi
+    # Whole seconds: past 5 means more than 5 s have gone by.
+    [ "$waited" -gt 5 ] && break
     if [ $((polls % 5)) -eq 0 ]; then
       kill -s TERM "$rnsd_pid" 2>/dev/null
     fi

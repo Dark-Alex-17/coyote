@@ -384,6 +384,16 @@ pub(crate) async fn open_link(
         Ok(Err(err)) if err.kind() == ErrorKind::TimedOut => {
             Some(deadline.activation_expired(path))
         }
+        // Another request on this link closes it only once its own deadline is up and no
+        // waiter's deadline is later, so a waiter that sees that close has run out too.
+        // `bound_activation` polls the wait before its timer, so the close can arrive here
+        // just ahead of this request's own expiry. A close seen with the deadline up is
+        // this request's activation timeout; the link is already closed.
+        Ok(Err(err))
+            if err.kind() == ErrorKind::ConnectionAborted && deadline.remaining().is_zero() =>
+        {
+            return Err(deadline.activation_expired(path));
+        }
         // The transport reports a link that closed before it activated as soon as it
         // closes. A close at the link's own establishment timeout is the peer not
         // answering in time, as this request's deadline running out is; any other close

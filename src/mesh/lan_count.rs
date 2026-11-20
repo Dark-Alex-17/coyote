@@ -480,10 +480,12 @@ mod tests {
 
     type Reply = Result<Vec<InterfaceHosts>, RpcError>;
 
-    /// Answers each call with the next scripted reply and records each call's budget.
+    /// Answers each call with the next scripted reply and records each call's budget and
+    /// when it came.
     struct Scripted {
         replies: parking_lot::Mutex<VecDeque<Reply>>,
         budgets: parking_lot::Mutex<Vec<Duration>>,
+        asked_at: parking_lot::Mutex<Vec<tokio::time::Instant>>,
         /// Held by a test to keep a call in flight until the test lets it answer.
         gate: Mutex<()>,
     }
@@ -493,12 +495,19 @@ mod tests {
             Arc::new(Self {
                 replies: parking_lot::Mutex::new(replies.into_iter().collect()),
                 budgets: parking_lot::Mutex::new(Vec::new()),
+                asked_at: parking_lot::Mutex::new(Vec::new()),
                 gate: Mutex::new(()),
             })
         }
 
         fn calls(&self) -> usize {
             self.budgets.lock().len()
+        }
+
+        /// The time between each call and the next, in call order.
+        fn gaps(&self) -> Vec<Duration> {
+            let asked_at = self.asked_at.lock();
+            asked_at.windows(2).map(|pair| pair[1] - pair[0]).collect()
         }
     }
 
@@ -511,6 +520,7 @@ mod tests {
             budget: Duration,
         ) -> Reply {
             self.budgets.lock().push(budget);
+            self.asked_at.lock().push(tokio::time::Instant::now());
             let _open = self.gate.lock().await;
             self.replies
                 .lock()
@@ -665,6 +675,132 @@ mod tests {
             lan_silent_verdict(grace, &readings, false, false),
             LanVerdict::Settle
         );
+    }
+
+    /// A reader on the real retry wait, at `dir`.
+    fn paced_reader_at(dir: &Path, source: Arc<Scripted>) -> RnsdLanReader {
+        RnsdLanReader::with_source(
+            RnsdLocator {
+                dir_override: Some(dir.to_path_buf()),
+            },
+            "default",
+            source,
+            RPC_RETRY_WAIT,
+        )
+    }
+
+    /// The silent-LAN watcher's tick on a paused clock, counting rnsd calls. A tick makes
+    /// at most `RPC_ATTEMPTS` calls, `RPC_RETRY_WAIT` apart, and stops at the first answer.
+    /// Once the line is told or settled, no tick calls again. A key rnsd refuses ends the
+    /// calls for the run. The quick read `.mesh status` takes makes one call on
+    /// `QUICK_RPC_BUDGET`, or none while a tick's read is under way.
+    #[tokio::test(start_paused = true)]
+    async fn each_silent_lan_tick_bounds_its_rnsd_calls_and_none_follow_once_it_settles() {
+        use crate::mesh::node::{LanSilentHint, LanSilentInputs};
+        let grace = Duration::from_secs(120);
+        let at = |elapsed: Duration| {
+            move || LanSilentInputs {
+                elapsed,
+                knows_peers: false,
+                interfaces: Vec::new(),
+            }
+        };
+
+        let dir = keyed_dir("lan-count-tick-told");
+        let source = Scripted::new([
+            Err(refused()),
+            Err(RpcError::Timeout),
+            Err(refused()),
+            Err(refused()),
+            Ok(vec![auto(0)]),
+        ]);
+        let reader = paced_reader_at(&dir.path, source.clone());
+        let read = || lan_readings(None, &[], Some(&reader), ReadEffort::Patient);
+        let mut hint = LanSilentHint::default();
+        assert_eq!(
+            hint.read_and_tick(read, at(grace / 2)).await,
+            None,
+            "an unknown count before the grace waits"
+        );
+        assert!(!hint.settled());
+        assert_eq!(source.calls(), RPC_ATTEMPTS as usize);
+        assert_eq!(source.gaps(), [RPC_RETRY_WAIT; 2]);
+        assert_eq!(*source.budgets.lock(), [RPC_BUDGET; 3]);
+
+        tokio::time::advance(grace).await;
+        assert!(
+            hint.read_and_tick(read, at(grace)).await.is_some(),
+            "a zero count at the grace tells the line"
+        );
+        assert_eq!(source.calls(), 5, "the tick stopped at the answer");
+        assert_eq!(source.gaps()[2..], [grace, RPC_RETRY_WAIT]);
+        for tick in 2..5 {
+            tokio::time::advance(grace).await;
+            assert_eq!(hint.read_and_tick(read, at(grace * tick)).await, None);
+        }
+        assert_eq!(source.calls(), 5, "no call once the line was told");
+
+        let dir = keyed_dir("lan-count-tick-settled");
+        let source = Scripted::new([Ok(vec![auto(2)])]);
+        let reader = paced_reader_at(&dir.path, source.clone());
+        let read = || lan_readings(None, &[], Some(&reader), ReadEffort::Patient);
+        let mut hint = LanSilentHint::default();
+        assert_eq!(hint.read_and_tick(read, at(grace)).await, None);
+        assert!(hint.settled(), "a counted host settles it");
+        for tick in 2..5 {
+            tokio::time::advance(grace).await;
+            assert_eq!(hint.read_and_tick(read, at(grace * tick)).await, None);
+        }
+        assert_eq!(source.calls(), 1, "no call once it settled");
+
+        let dir = keyed_dir("lan-count-tick-refused");
+        let source = Scripted::new([Err(RpcError::Authentication)]);
+        let reader = paced_reader_at(&dir.path, source.clone());
+        let read = || lan_readings(None, &[], Some(&reader), ReadEffort::Patient);
+        let mut hint = LanSilentHint::default();
+        assert_eq!(hint.read_and_tick(read, at(grace / 4)).await, None);
+        tokio::time::advance(grace).await;
+        assert_eq!(hint.read_and_tick(read, at(grace / 2)).await, None);
+        assert!(!hint.settled());
+        tokio::time::advance(grace).await;
+        assert!(
+            hint.read_and_tick(read, at(grace)).await.is_some(),
+            "an unknown count at the grace, with no peer and no relay, tells the line"
+        );
+        assert_eq!(source.calls(), 1, "no call after the key was refused");
+        assert_eq!(
+            reader.read_quick().await,
+            RnsdReading::UNKNOWN,
+            "nor from .mesh status"
+        );
+        assert_eq!(source.calls(), 1);
+
+        let dir = keyed_dir("lan-count-tick-status");
+        let source = Scripted::new([Err(refused()), Ok(vec![auto(3)]), Ok(vec![auto(1)])]);
+        let reader = Arc::new(paced_reader_at(&dir.path, source.clone()));
+        assert_eq!(reader.read_quick().await, RnsdReading::UNKNOWN);
+        assert_eq!(
+            *source.budgets.lock(),
+            [QUICK_RPC_BUDGET],
+            "one call, no retry"
+        );
+        assert_eq!(reader.read_quick().await.lan, Some(LanReading::Count(3)));
+        let held = source.gate.lock().await;
+        let tick = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.read().await }
+        });
+        while source.calls() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            reader.read_quick().await.lan,
+            Some(LanReading::Count(3)),
+            "the cached count while a tick's read is under way"
+        );
+        assert_eq!(source.calls(), 3);
+        drop(held);
+        assert_eq!(tick.await.unwrap().lan, Some(LanReading::Count(1)));
     }
 
     #[tokio::test]

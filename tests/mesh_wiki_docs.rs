@@ -11054,8 +11054,8 @@ fn folded_section(page: &str, heading: &str) -> String {
 
 /// The silent-LAN section says how the LAN host count is read, in the order and with the
 /// keys the code uses, and when the line comes or stays quiet: a known peer or a relay
-/// keeps it away. The `.mesh status` page quotes the LAN line in the words `.mesh status`
-/// prints.
+/// keeps it away. It quotes the line's first sentence as `LAN_SILENT_HINT` words it. The
+/// `.mesh status` page quotes the LAN line in the words `.mesh status` prints.
 #[test]
 fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
     let repl = read(repo_root().join("src/repl/mesh.rs"));
@@ -11081,11 +11081,26 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
             "src/mesh/lan_count.rs no longer reads {literal}"
         );
     }
+    let node = read(repo_root().join("src/mesh/node.rs"));
+    let hint = node
+        .split_once("const LAN_SILENT_HINT: &str = \"")
+        .and_then(|(_, rest)| rest.split_once("\";"))
+        .map(|(hint, _)| hint)
+        .expect("src/mesh/node.rs defines LAN_SILENT_HINT");
+    let first_sentence = hint
+        .split_once(". ")
+        .map(|(sentence, _)| format!("{sentence}."))
+        .expect("LAN_SILENT_HINT has more than one sentence");
 
     let Some(wiki) = wiki_dir() else { return };
     let silent = folded_section(
         &read(wiki.join("Mesh-Deployment.md")),
         "## When the LAN is silent",
+    );
+    let quoted = format!("`[mesh:relay] {first_sentence}`");
+    assert!(
+        silent.contains(&quoted),
+        "Mesh-Deployment.md's silent-LAN section does not quote the line as the code prints it: {quoted}"
     );
     for needle in [
         "`/etc/reticulum`, then `~/.config/reticulum`, then `~/.reticulum`",
@@ -11109,6 +11124,7 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         "whatever other interfaces it has",
         "does not make the LAN reach anyone",
         "no `private` relay is configured",
+        "No other host has been heard on your LAN",
     ] {
         assert!(
             !silent.contains(stale),

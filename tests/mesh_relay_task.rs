@@ -8,7 +8,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
@@ -41,8 +41,21 @@ macro_rules! pwsh_or_skip {
 struct Scenario {
     dir: PathBuf,
     code: i32,
+    /// The signal that ended pwsh, where it died of one.
+    signal: Option<i32>,
     stdout: String,
     stderr: String,
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 impl Scenario {
@@ -53,6 +66,11 @@ impl Scenario {
             .as_nanos();
         let dir = env::temp_dir().join(format!("coyote-mesh-relay-task-{name}-{unique}"));
         fs::create_dir_all(&dir).unwrap();
+        // pwsh keeps per-user caches (the module analysis cache, and the startup JIT
+        // profile under the XDG cache dir) that each process rewrites, unlocked, as it
+        // exits. The tests run their pwsh processes in parallel, and one that starts while
+        // another rewrites a cache can die at startup, so each run gets caches of its own.
+        let cache = dir.join("cache");
         let Output {
             status,
             stdout,
@@ -76,12 +94,18 @@ impl Scenario {
             .arg("-Scenario")
             .arg(name)
             .current_dir(repo_root())
+            .env("XDG_CACHE_HOME", &cache)
+            .env(
+                "PSModuleAnalysisCachePath",
+                cache.join("ModuleAnalysisCache"),
+            )
             .stdin(Stdio::null())
             .output()
             .expect("spawn pwsh");
         Scenario {
             dir,
             code: status.code().unwrap_or(-1),
+            signal: exit_signal(&status),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
@@ -89,8 +113,11 @@ impl Scenario {
 
     fn transcript(&self) -> String {
         format!(
-            "exit {}\nstdout:\n{}\nstderr:\n{}\ncalls:\n{}",
+            "exit {}{}\nstdout:\n{}\nstderr:\n{}\ncalls:\n{}",
             self.code,
+            self.signal
+                .map(|signal| format!(" (killed by signal {signal})"))
+                .unwrap_or_default(),
             self.stdout,
             self.stderr,
             self.calls()

@@ -411,7 +411,20 @@ fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
     loop {
         let captures = session
             .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
-            .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
+            .unwrap_or_else(|err| {
+                // What came instead, so a timeout says what the REPL printed.
+                session.set_expect_timeout(Some(Duration::from_secs(1)));
+                let mut pending = String::new();
+                while let Ok(rest) = session.expect(Regex(r"(?s).+")) {
+                    pending.push_str(&strip_escapes(rest.as_bytes()));
+                }
+                let tail = pending.len().saturating_sub(2000);
+                let pending = pending.get(tail..).unwrap_or(&pending);
+                panic!(
+                    "waiting for {pattern:?}: {err}; read before it: {:?}; pending: {pending:?}",
+                    strip_escapes(&before)
+                )
+            });
         let involved = captures.as_bytes();
         let split = captures.before().len();
         let query = b"\x1b[6n";
@@ -432,6 +445,20 @@ fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
             }
             before.extend_from_slice(involved);
             continue;
+        }
+        // A query that came in the same read as the match, ahead of it, is answered
+        // too: left unanswered it would cost the REPL its query timeout and leave every
+        // later reply one behind.
+        let mut from = 0;
+        while let Some(at) = involved[from..split]
+            .windows(query.len())
+            .position(|window| window == query)
+        {
+            let at = from + at;
+            session
+                .send(cursor_position_reply(&involved[..at]))
+                .expect("reply to the cursor position query");
+            from = at + query.len();
         }
         before.extend_from_slice(&involved[..split]);
         return (before, involved[split..].to_vec());
@@ -5502,6 +5529,34 @@ fn a_dialing_local_entry_logs_its_unchanged_dial_failure_once_not_every_redial()
 /// it will get.
 fn people_command(session: &mut Target, line: &str) -> String {
     session.send(format!("{line}\r")).expect("type the command");
+    read_through_prompt(session, line)
+}
+
+/// As `people_command`, but `line` is typed and its whole echo awaited before Enter is
+/// pressed, and the time from Enter to the next prompt comes back with the transcript.
+/// The echo repaints the prompt once per keystroke, which on a loaded host can take
+/// seconds that the command itself does not.
+fn timed_people_command(session: &mut Target, line: &str) -> (String, Duration) {
+    session.send(line).expect("type the command");
+    wait_for(session, &echoed(line));
+    let entered = Instant::now();
+    session.send("\r").expect("press Enter");
+    let out = read_through_prompt(session, line);
+    (out, entered.elapsed())
+}
+
+/// A regex for `line` as the editor paints it: the highlighter may put colour codes
+/// between any two characters.
+fn echoed(line: &str) -> String {
+    line.chars()
+        .map(|c| literally(&c.to_string()))
+        .collect::<Vec<_>>()
+        .join(r"(\x1b\[[0-9;]*m)*")
+}
+
+/// The rest of `people_command`: answers the cursor position queries and returns the
+/// transcript after the echoed `line` through the next prompt.
+fn read_through_prompt(session: &mut Target, line: &str) -> String {
     let query = b"\x1b[6n";
     let mut seen = Vec::new();
     let mut asked = false;
@@ -6822,14 +6877,11 @@ fn a_sigkilled_sibling_session_reads_ended_and_status_of_it_fails_at_once() {
         format!(".mesh people status {sib8}"),
         ".mesh people status sib".to_string(),
     ] {
-        // A local read of the same token just before, as the pty round trip (typing
-        // included) a refusal at once would take on a host as loaded as it is now.
-        let asked = Instant::now();
-        let _ = people_command(&mut mine, &line.replacen(" status ", " info ", 1));
-        let control = asked.elapsed();
-        let asked = Instant::now();
-        let out = people_command(&mut mine, &line);
-        let waited = asked.elapsed();
+        // A local read of the same token just before, as the pty round trip a refusal
+        // at once would take on a host as loaded as it is now. Both are timed from
+        // Enter: the echo of the typed line is the editor's, not the command's.
+        let (_, control) = timed_people_command(&mut mine, &line.replacen(" status ", " info ", 1));
+        let (out, waited) = timed_people_command(&mut mine, &line);
         assert!(out.contains(ended), "{line}: {out:?}");
         timings.push((line, waited, control));
     }
