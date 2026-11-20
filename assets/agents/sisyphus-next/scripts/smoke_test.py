@@ -708,12 +708,9 @@ _led = gates.consult_route(base_state(escalation=escalation("design_choice", "Ho
 check("answers: a navigator answer opening with an option's own text picks it and keeps the rest as its note",
       _led["_next"] == "apply_answer"
       and _led["last_answer"] == "Narrow the scope first (say how): proceed with the 4 code files and leave out the notes file")
-_comma = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 3, but keep the logs"))
-_comma_stop = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 2, but keep the logs"))
-check("answers: a navigator 'Option 3, but ...' picks option 3 with the qualification as its note, never re-asked; "
-      "the same qualification on a stop option is read by the reply interpreter",
-      _comma["_next"] == "apply_answer" and _comma["last_answer"] == "Narrow the scope: but keep the logs"
-      and _comma_stop["_next"] == "interpret_reply" and _comma_stop["last_answer_text"] == "Option 2, but keep the logs")
+_comma = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 2, but keep the logs"))
+check("answers: a navigator 'Option 2, but ...' picks option 2 with the qualification as its note, never re-asked",
+      _comma["_next"] == "apply_answer" and _comma["last_answer"] == "Abort the run: but keep the logs")
 _cmp = gates.consult_route(base_state(escalation=pd2, consult_result=(
     "CONSULT: ANSWER 2 \u2014 Continue; the criterion is amended: missing seats or seats < 1 \u2192 400")))
 check("answers: a compared value in a navigator's note ('seats < 1') is not another option number",

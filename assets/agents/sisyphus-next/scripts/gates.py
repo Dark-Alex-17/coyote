@@ -1695,8 +1695,9 @@ def consult_route(state):
             # "Narrow the scope first: only the code files" opens with an option's own text; its note goes with it
             led, note = split_option_led(value, options, True)
             choice = _pick_with_note(value, options) or (f"{led}: {note}" if led and note else led)
-        # a stop the navigator qualifies in its own words is read, never taken as picked: the words may undo it
-        qualified_stop = bool(choice and options and _is_stop_text(choice)
+        # a plan_defect Stop the navigator qualifies in its own words is read, never taken as picked: the words may
+        # clear the plan, which the fix-round option covers
+        qualified_stop = bool(kind == "plan_defect" and choice and options and _is_stop_text(choice)
                               and _stated_reason(choice, options) != NO_STATED_REASON)
         if choice and not qualified_stop:
             u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0,
