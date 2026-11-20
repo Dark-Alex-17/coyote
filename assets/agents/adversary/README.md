@@ -66,24 +66,34 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   `pre-existing` failures are listed under `Pre-existing failures (not blocking):`; `regression`
   and `not-run` (no diff base, deadline spent, worktree or helper failure, the command timed out
   here or on the base) block, and the complaint names the outcome.
-- When the project's tree is dirty (`git status --porcelain` lists anything), each red command
-  that did not time out first runs once more, inside the same deadline, in a second detached
-  worktree of a snapshot commit of the live tree (HEAD plus every tracked and untracked file that
-  is not ignored), built through a temporary index so the real index and refs are untouched. A
+- Before the first declared command runs, the runner reads `git status --porcelain`. When it
+  lists anything, a snapshot commit of that pre-run tree (HEAD plus every tracked and untracked
+  file that is not ignored) is built through a temporary index, so the real index and refs are
+  untouched; its objects stay unreferenced in the repository's object store. After the commands
+  run, the live tree is written the same way and its tree id compared with the pre-run one
+  (HEAD's tree on a clean tree). When they differ, no red run gets `tree-state` and each note ends
+  `the declared commands modified the tree`. Otherwise each red command that did not time out
+  runs once more, inside the same deadline, in a detached worktree of the pre-run snapshot. A
   command that exits 0 there gets baseline `tree-state`: it is red only because the change is
-  uncommitted (a regenerate-then-`git diff --exit-code` check, for example). Any other snapshot
-  outcome keeps the live run's classification against the base, and its note ends
-  `candidate tree dirty`. Snapshot runs are never saved to `coyote-baselines`.
-- Each run record carries a `pass_condition`: `stated` when no criterion or request line naming
-  the command says it passes or exits 0 and at least one positively states another condition
-  ("prints nothing", "no output", "is empty", "absent", "does not exist", "exits 1"),
-  otherwise `exit 0`. A command named nowhere (the caller's build/test/lint contract) or only in
-  passing ("Verification commands: `x`") is held to exit 0. The
-  verdict recomputes it from the criteria and the request, never from the record. A red run held to
-  exit 0 blocks as above. A red run whose condition a parsed criterion states blocks unless every
-  criterion naming it ends MET or INSPECTED, and its complaint names those criteria and statuses.
-  Such a run whose criteria are met, one whose condition only the request states (left to the
-  holistic pass), and a `tree-state` run are listed under `Advisory red runs (not blocking):`.
+  uncommitted. Any other snapshot outcome keeps the live run's classification against the base,
+  and its note ends `candidate tree dirty`. When `git status` fails or `core.sparseCheckout` is
+  true, no snapshot is taken and the note ends `candidate tree state unknown`. Snapshot runs are
+  never saved to `coyote-baselines`.
+- Each run record carries a `pass_condition`. A criterion or request line names a command only
+  through a backticked span equal to it (whitespace and quote characters normalised). The
+  condition is `stated` when no naming line says the command passes or exits 0 and the clause
+  after at least one naming span positively states another condition ("prints nothing", "no
+  output", "is empty", "absent", "does not exist", "exits 1"), otherwise `exit 0`. That clause
+  ends at the next backticked span, a `.` or `;` followed by whitespace, or the end of the line.
+  A command named nowhere (the caller's build/test/lint contract), only in passing
+  ("Verification commands: `x`") or inside a longer span is held to exit 0. The verdict
+  recomputes it from the criteria and the request, never from the record. A red run held to exit
+  0 blocks as above, and so does one that timed out or was killed by a signal (exit 128 or
+  above). A red run whose condition parsed criteria state blocks unless every criterion naming it
+  ends MET or INSPECTED, and its complaint names those criteria and statuses. A red run whose
+  condition only the request states blocks, and its complaint quotes the request line. A stated
+  run whose criteria are met and a `tree-state` run are listed under
+  `Advisory red runs (not blocking):`.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
   criterion checks judge the criteria it covers like an execution criterion no recorded run covers
   (below), naming the command and that it was skipped for time. The report's `Criteria:` line

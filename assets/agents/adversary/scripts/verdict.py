@@ -8,11 +8,14 @@ verification runs, and zero implementation-debris hits from debris_lint.py.
 A red run (nonzero exit or timeout) blocks unless run_checks.py found the
 same failure on the diff base (baseline status "pre-existing"); those are
 reported in their own section. A red run whose baseline status is
-"tree-state" (it exits 0 on a snapshot of the live tree) does not block, and
-neither does one whose pass condition, recomputed from the criteria and the
-request by pass_condition.py, is stated as something other than exit 0, when
-no parsed criterion names it or every criterion naming it ends MET or
-INSPECTED; both are reported as advisory red runs. A command the runner's deadline skipped is
+"tree-state" (it exits 0 on a snapshot of the pre-run tree) does not block,
+and neither does one whose pass condition, recomputed from the criteria and
+the request by pass_condition.py, is stated as something other than exit 0,
+when parsed criteria name it and every one of them ends MET or INSPECTED;
+both are reported as advisory red runs. A stated red run that no parsed
+criterion names blocks, and so does a red run that timed out (exit -1) or was
+killed by a signal (exit 128 or above), whatever its stated condition. A
+command the runner's deadline skipped is
 reported as not run and does not block by itself: the criterion checks judge
 the criteria it covers. An ENVIRONMENT runner-error marker blocks when
 commands were declared, since the declared commands never ran.
@@ -326,12 +329,12 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
     sentinel). A "pre-existing" one is reported in its own section and a
     "tree-state" one is advisory. For the rest the pass condition is recomputed
     from `criteria` and `request`, never read from the record, so a recorded
-    run replays the same. A red run held to exit 0 blocks and the complaint
-    names the baseline outcome. One whose pass condition a parsed criterion
-    states blocks unless every criterion naming it has a final status MET or
-    INSPECTED in `verdicts`, and is otherwise advisory with their evidence as
-    the reason; one named only in the request is advisory, left to the
-    holistic pass. A record the deadline skipped is
+    run replays the same. A red run held to exit 0, timed out or killed by a
+    signal blocks and the complaint names the baseline outcome. One whose pass
+    condition a parsed criterion states blocks unless every criterion naming
+    it has a final status MET or INSPECTED in `verdicts`, and is otherwise
+    advisory with their evidence as the reason; one whose condition only the
+    request states blocks. A record the deadline skipped is
     not a run and yields nothing here. An "ENVIRONMENT: ..." runner-error
     marker with a non-empty declaration is one complaint: the declared
     commands never ran. Other string markers ("none declared",
@@ -368,8 +371,8 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
             advisory.append(f"- `{cmd}` -- {outcome} -- {baseline_text(r)}")
             continue
         condition = resolve(cmd, criteria, request)
-        if condition["condition"] == STATED:
-            blocks, text = stated_red(r, outcome, condition["criteria"], by_id)
+        if condition["condition"] == STATED and not killed_or_timed_out(code):
+            blocks, text = stated_red(r, outcome, condition, by_id)
             (out if blocks else advisory).append(text)
             continue
         out.append(
@@ -379,14 +382,20 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
     return out, advisory
 
 
-def stated_red(record, outcome, ids, by_id):
+def killed_or_timed_out(code):
+    return type(code) is int and (code == -1 or code >= 128)
+
+
+def stated_red(record, outcome, condition, by_id):
     """(blocks, text) for a red run whose pass condition is stated as something other than
-    exit 0 by the parsed criteria `ids`, or only by the request when `ids` is empty."""
+    exit 0 by the parsed criteria naming it, or only by the request when none does."""
     cmd = record.get("cmd", "?")
+    ids = condition["criteria"]
     if not ids:
-        return False, (
-            f"- `{cmd}` -- {outcome} -- its pass condition is stated only in the request, "
-            f"judged by the holistic pass -- {baseline_text(record)}"
+        return True, (
+            f"Verification run `{cmd}` -- {outcome} (recorded FAIL; its pass condition is stated "
+            f"only in the request (\"{condition['line']}\") and no acceptance criterion names it; "
+            f"{baseline_text(record)})"
         )
     naming = [(cid, final_status(by_id.get(cid))) for cid in ids]
     if all(status in ("MET", "INSPECTED") for _, status in naming):
