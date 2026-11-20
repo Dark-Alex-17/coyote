@@ -65,19 +65,17 @@ impl OwnerGuard {
     /// Hands the terminal to the loop on the current thread, reachable
     /// through `tx`; the shell has it back once the guard drops.
     pub(super) fn tui(tx: UnboundedSender<UiMsg>) -> Self {
-        replace_owner(Owner::Tui(Lender {
-            tx,
-            thread: std::thread::current().id(),
-        }));
         Self {
-            restore: Owner::Shell,
+            restore: replace_owner(Owner::Tui(Lender {
+                tx,
+                thread: std::thread::current().id(),
+            })),
         }
     }
 
-    /// A UI that owns the terminal but whose inbox is closed, the way it
-    /// is during teardown. The loop thread is not the caller's, so a lend
-    /// fails as not lending rather than as a wait on itself. Tests using it
-    /// must serialize (`#[serial]`).
+    /// A UI that owns the terminal but whose inbox is gone, so every lend
+    /// fails as not lending; its loop thread is not the caller's, so never
+    /// as a wait on itself. Tests using it must serialize (`#[serial]`).
     #[cfg(test)]
     pub(crate) fn tui_for_test() -> Self {
         static FOREIGN_THREAD: std::sync::OnceLock<ThreadId> = std::sync::OnceLock::new();
@@ -86,7 +84,6 @@ impl OwnerGuard {
         Self::lending_for_test(tx, thread)
     }
 
-    /// A UI whose loop on `thread` reads `tx`.
     #[cfg(test)]
     pub(super) fn lending_for_test(tx: UnboundedSender<UiMsg>, thread: ThreadId) -> Self {
         Self {

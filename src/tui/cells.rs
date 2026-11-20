@@ -353,7 +353,6 @@ pub(super) struct OutputTail {
     pub(super) full: FullOutput,
 }
 
-/// The parts a job row and an agent row share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TaskRow<S> {
     pub(super) status: S,

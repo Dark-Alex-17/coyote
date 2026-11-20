@@ -534,9 +534,11 @@ fn arm_chords(pattern: &str, guard: &str, action: &str) -> Vec<String> {
 
 /// An arm line of a keyed block that binds no named key: a wildcard that
 /// swallows the key or hands it on as typing, the close of a multi-line
-/// modal pattern, or an arm on the screen layer rather than the key.
+/// modal pattern, or an arm on the screen layer that names no key.
 fn non_key_arm(line: &str) -> bool {
-    if matches!(line, ") => match code {" | ") => {") || line.starts_with("Layer::") {
+    if matches!(line, ") => match code {" | ") => {")
+        || (line.starts_with("Layer::") && !line.contains("KeyCode::"))
+    {
         return true;
     }
     let Some(rest) = line.strip_prefix('_') else {

@@ -45,7 +45,8 @@ fn the_lent_tty_fd_is_cloexec() {
 
 /// The terminal duplicate is taken once per process: a later
 /// `remember_tty`, after the owner has come and gone, keeps the same
-/// descriptor, or keeps none if none could be taken.
+/// descriptor, or keeps none if none could be taken. It stays taken for
+/// the rest of the test process.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -85,6 +86,20 @@ fn nested_owner_guards_restore_the_owner_they_replaced() {
 
 #[test]
 #[serial]
+fn the_loop_guard_restores_the_owner_it_replaced() {
+    let outer = OwnerGuard::tui_for_test();
+    let (tx, _rx) = unbounded_channel();
+    let inner = OwnerGuard::tui(tx);
+    assert!(ensure_terminal_lendable().is_ok());
+    drop(inner);
+    assert!(active());
+    assert!(ensure_terminal_lendable().is_err());
+    drop(outer);
+    assert!(!active());
+}
+
+#[test]
+#[serial]
 fn an_owner_guard_restores_the_owner_when_its_scope_panics() {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _tui_on = OwnerGuard::tui_for_test();
@@ -95,9 +110,9 @@ fn an_owner_guard_restores_the_owner_when_its_scope_panics() {
     assert!(!active());
 }
 
-/// With the UI owning the terminal but its inbox closed (as during
-/// teardown), `.edit` on a file fails outright: no editor is spawned
-/// onto the capture pipe (the name given is not a program at all).
+/// With the UI owning the terminal but its inbox gone, `.edit` on a file
+/// fails outright: no editor is spawned onto the capture pipe (the name
+/// given is not a program at all).
 #[test]
 #[serial]
 fn edit_file_without_a_lender_fails_without_spawning_an_editor() {

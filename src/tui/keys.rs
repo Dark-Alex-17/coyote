@@ -641,7 +641,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             | ModalKind::Checkbox,
         ) => {
             let answerable = ctx.idle_ok && ctx.question_fully_shown;
-            let checkbox = ctx.modal == Some(ModalKind::Checkbox);
+            let checkbox = modal == Some(ModalKind::Checkbox);
             match code {
                 KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
                 KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Interrupted),
