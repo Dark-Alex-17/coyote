@@ -12463,7 +12463,7 @@ mod tests {
     fn interrupt_policy_is_not_owned_while_the_tui_is_active() {
         let root = create_test_ctx();
         assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         assert_eq!(root.interrupt_policy(), UserInterrupt::NotOwned);
     }
 
@@ -12482,7 +12482,7 @@ mod tests {
         assert!(!crate::tui::active());
         assert_eq!(ctx.ui_kind(), UiKind::Tui);
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::NotOwned);
     }
 
@@ -12508,7 +12508,7 @@ mod tests {
     fn upsert_skill_under_the_tui_without_a_lender_fails_before_scaffolding_the_file() {
         let _guard = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let err = ctx
             .upsert_skill(&ctx.app.config, "tui-refused-skill")
             .unwrap_err();
@@ -12533,7 +12533,7 @@ mod tests {
         let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
         ensure_parent_exists(&rag_path).unwrap();
         write(&rag_path, "driver: yaml\n").unwrap();
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let scripted = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Selected(
             "not-an-offered-model".to_string(),
         )]));
@@ -12565,7 +12565,7 @@ mod tests {
     fn use_rag_without_a_name_and_without_a_tty_refuses_before_removing_the_temp_rag() {
         let _guard = HelperConfigDirGuard::new();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let mut ctx = create_test_ctx();
         let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
         ensure_parent_exists(&rag_path).unwrap();
@@ -12598,7 +12598,7 @@ mod tests {
 
         let _guard = HelperConfigDirGuard::new();
         let _script = crate::config::conflict::prompt_script::install(&[]);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let mut ctx = create_test_ctx();
         let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
         ensure_parent_exists(&rag_path).unwrap();
@@ -12642,7 +12642,7 @@ mod tests {
         session.set_name("tui-refused-session".into());
         let path = ctx.session_file_for(session.name(), session.scope());
         ctx.session = Some(session);
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let app = ctx.app.config.clone();
         assert_no_lender_under_the_tui(ctx.edit_session(&app).unwrap_err());
         assert!(
@@ -12664,7 +12664,7 @@ mod tests {
             name: "tui-refused-agent".to_string(),
             ..AgentConfig::default()
         }));
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let app = ctx.app.config.clone();
         assert_no_lender_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
         let path = paths::agent_config_file("tui-refused-agent");
@@ -12698,7 +12698,7 @@ mod tests {
                 .await
                 .unwrap()
         })));
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let err = run_async(ctx.edit_rag_docs(utils::create_abort_signal())).unwrap_err();
         assert_no_lender_under_the_tui(err);
         let leftovers = temp.leftovers();
@@ -12720,7 +12720,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let prompter = Arc::new(ScriptedPrompter::new(Vec::new()));
         ctx.prompter = prompter.clone();
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
 
         assert_no_lender_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
         assert_no_lender_under_the_tui(ctx.new_role(&app, "tui-refused-role").unwrap_err());
@@ -15384,7 +15384,7 @@ mod tests {
     #[serial]
     fn use_session_after_an_exchange_asks_through_the_prompter_under_the_tui() {
         let _guard = HelperConfigDirGuard::new();
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 

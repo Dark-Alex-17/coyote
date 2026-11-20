@@ -300,7 +300,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_choice_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("replace".into())]);
 
         let choice = select_choice("Conflict on example.yaml", &prompter).unwrap();
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     #[serial]
     fn headless_select_choice_is_a_typed_select_refusal_with_nothing_on_stdout() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let (saved, mut reader) = crate::testing::capture_stdout();
 
         let err = select_choice("Conflict on example.yaml", &HeadlessPrompter).unwrap_err();
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_answer_outside_the_offered_options_is_an_error() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("maybe".into())]);
         let mut sticky = StickyMode::None;
 
@@ -367,10 +367,10 @@ mod tests {
     #[serial]
     fn menu_can_use_terminal_is_true_under_the_tui_whatever_the_tty() {
         let _script = prompt_script::install_non_interactive();
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         assert!(menu_can_use_terminal());
 
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         assert!(!menu_can_use_terminal());
     }
 
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     #[serial]
     fn menu_can_use_terminal_needs_only_a_stdout_tty_outside_the_tui() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         assert_eq!(menu_can_use_terminal(), *IS_STDOUT_TERMINAL);
 
         let forced_on = prompt_script::install(&[]);
@@ -389,7 +389,7 @@ mod tests {
         let _forced_off = prompt_script::install_non_interactive();
         assert!(!menu_can_use_terminal());
 
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         assert!(menu_can_use_terminal());
     }
 
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     #[serial]
     fn menu_can_use_terminal_stays_open_with_a_stdout_tty_and_piped_stdin() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _stdout_tty = prompt_script::install(&[]);
         let _stdin = crate::testing::pipe_stdin();
 
@@ -459,7 +459,7 @@ mod tests {
     #[serial]
     fn under_the_tui_a_forced_non_tty_still_asks_through_the_prompter() {
         let _script = prompt_script::install_non_interactive();
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let mut sticky = StickyMode::None;
 
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("replace".into())]);

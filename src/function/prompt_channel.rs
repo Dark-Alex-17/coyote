@@ -2729,7 +2729,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         );
         let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
         let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         assert_eq!(probe_ui_env().await, json!({"output": "tui"}));
     }
 

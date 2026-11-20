@@ -1,4 +1,3 @@
-use super::active;
 use super::sink::{LendJob, UiMsg};
 use crate::events::NoticeKind;
 use anyhow::{Result, anyhow, bail};
@@ -6,12 +5,27 @@ use std::process::Stdio;
 #[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::{Mutex, mpsc};
+use std::thread::ThreadId;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// The loop's inbox while `run` owns the terminal, for work elsewhere in
-/// the process that needs the terminal in its normal modes, and the
-/// thread the loop runs on: a lend from that thread would wait on itself.
-static LENDER: Mutex<Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>> = Mutex::new(None);
+/// Who has the terminal: `Tui` while `run` owns it, the shell otherwise.
+#[derive(Clone)]
+pub(crate) enum Owner {
+    Shell,
+    Tui(Lender),
+}
+
+/// The loop's inbox, for work elsewhere in the process that needs the
+/// terminal in its normal modes, and the thread the loop runs on: a lend
+/// from that thread would wait on itself.
+#[derive(Clone)]
+pub(crate) struct Lender {
+    tx: UnboundedSender<UiMsg>,
+    thread: ThreadId,
+}
+
+/// `RequestContext::ui_kind` reads it through `active`.
+static OWNER: Mutex<Owner> = Mutex::new(Owner::Shell);
 
 /// A duplicate of the terminal taken before the screen was entered.
 /// During a turn fds 1 and 2 are pointed at the capture pipe for the
@@ -20,17 +34,74 @@ static LENDER: Mutex<Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>> = 
 #[cfg(unix)]
 static TTY_OUT: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
 
-pub(super) fn set_lender(tx: Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)>) {
-    *LENDER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = tx;
-}
-
-fn lender() -> Option<(UnboundedSender<UiMsg>, std::thread::ThreadId)> {
-    LENDER
+pub(crate) fn owner() -> Owner {
+    OWNER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+fn replace_owner(owner: Owner) -> Owner {
+    std::mem::replace(
+        &mut *OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        owner,
+    )
+}
+
+/// Holds the terminal's owner for the guard's lifetime and puts `restore`
+/// back on drop, including on panic.
+pub(crate) struct OwnerGuard {
+    restore: Owner,
+}
+
+impl OwnerGuard {
+    /// Hands the terminal to the loop on the current thread, reachable
+    /// through `tx`; the shell has it back once the guard drops.
+    pub(super) fn tui(tx: UnboundedSender<UiMsg>) -> Self {
+        replace_owner(Owner::Tui(Lender {
+            tx,
+            thread: std::thread::current().id(),
+        }));
+        Self {
+            restore: Owner::Shell,
+        }
+    }
+
+    /// A UI that owns the terminal but whose inbox is closed, the way it
+    /// is during teardown. The loop thread is not the caller's, so a lend
+    /// fails as not lending rather than as a wait on itself. Restores the
+    /// previous owner on drop; tests using it must serialize (`#[serial]`).
+    #[cfg(test)]
+    pub(crate) fn tui_for_test() -> Self {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let thread = std::thread::spawn(|| {}).thread().id();
+        Self::lending_for_test(tx, thread)
+    }
+
+    /// A UI whose loop on `thread` reads `tx`. Restores the previous owner
+    /// on drop.
+    #[cfg(test)]
+    pub(super) fn lending_for_test(tx: UnboundedSender<UiMsg>, thread: ThreadId) -> Self {
+        Self {
+            restore: replace_owner(Owner::Tui(Lender { tx, thread })),
+        }
+    }
+
+    /// The shell owns the terminal. Restores the previous owner on drop.
+    #[cfg(test)]
+    pub(crate) fn shell_for_test() -> Self {
+        Self {
+            restore: replace_owner(Owner::Shell),
+        }
+    }
+}
+
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        replace_owner(std::mem::replace(&mut self.restore, Owner::Shell));
+    }
 }
 
 /// Takes the terminal duplicate for `TtyHandles::stdio`. Returns the
@@ -95,7 +166,9 @@ pub(super) const NOT_LENDING: &str = "the TUI is not lending its terminal";
 /// write a file before opening the editor on it and must not leave that
 /// file behind when the lend cannot happen.
 pub(crate) fn ensure_terminal_lendable() -> Result<()> {
-    if active() && lender().is_none() {
+    if let Owner::Tui(lender) = owner()
+        && lender.tx.is_closed()
+    {
         bail!(NOT_LENDING);
     }
     Ok(())
@@ -104,7 +177,10 @@ pub(crate) fn ensure_terminal_lendable() -> Result<()> {
 /// Puts a notice in the transcript from anywhere in the process, the
 /// loop's own thread included. False when no UI is running to show it.
 pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
-    lender().is_some_and(|(tx, _)| tx.send(UiMsg::Notice { kind, text }).is_ok())
+    match owner() {
+        Owner::Tui(lender) => lender.tx.send(UiMsg::Notice { kind, text }).is_ok(),
+        Owner::Shell => false,
+    }
 }
 
 /// Runs `job` with the terminal released to it (alternate screen left,
@@ -116,7 +192,11 @@ pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
 pub(crate) fn lend_terminal<T: Send + 'static>(
     job: impl FnOnce(&TtyHandles) -> T + Send + 'static,
 ) -> Result<T> {
-    let Some((tx, loop_thread)) = lender() else {
+    let Owner::Tui(Lender {
+        tx,
+        thread: loop_thread,
+    }) = owner()
+    else {
         bail!(NOT_LENDING);
     };
     if std::thread::current().id() == loop_thread {

@@ -10062,7 +10062,7 @@ local_hello() {\n\
     #[serial]
     fn sessionless_interrupt_in_the_full_screen_ui_leaves_background_tasks_running() {
         let _sink = test_sink::install();
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let marker = "sessionless-tui-interrupt-k4q";
         run_async(async {
             let mut ctx = sessionless_interruptible_ctx(marker);

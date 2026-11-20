@@ -201,7 +201,6 @@ mod tests {
     use crate::prompt::{
         HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
     };
-    use crate::testing::AtomicFlagGuard;
     use serial_test::serial;
 
     const CARGO_INSTALLED: &str = "/home/u/.cargo/bin/coyote";
@@ -285,7 +284,7 @@ mod tests {
     #[test]
     #[serial]
     fn package_managed_update_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
 
         update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter, ".").unwrap();
@@ -310,7 +309,7 @@ mod tests {
     #[test]
     #[serial]
     fn closing_the_package_managed_question_aborts_the_update() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         for answer in [PromptAnswer::Cancelled, PromptAnswer::Interrupted] {
             let prompter = ScriptedPrompter::new(vec![answer.clone()]);
 
@@ -332,7 +331,7 @@ mod tests {
     #[serial]
     fn package_managed_update_without_a_tty_is_refused() {
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let prompter = ScriptedPrompter::refusing();
 
         let err = update_binary_at(
@@ -357,7 +356,7 @@ mod tests {
     #[test]
     #[serial]
     fn package_managed_update_under_the_tui_with_no_human_is_refused() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
 
         let err = update_binary_at(
             PathBuf::from(CARGO_INSTALLED),

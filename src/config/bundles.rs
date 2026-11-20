@@ -1250,7 +1250,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_bundle_name_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let dir = TempStoreDir::new("bundles-collision-confirm");
         let mut store = dir.store();
         store
@@ -1292,7 +1292,7 @@ mod tests {
     #[test]
     #[serial]
     fn without_a_terminal_a_colliding_bundle_name_qualifies_without_asking() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let dir = TempStoreDir::new("bundles-collision-no-tty");
         let mut store = dir.store();

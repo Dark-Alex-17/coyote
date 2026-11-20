@@ -368,7 +368,7 @@ impl Vault {
 mod tests {
     use super::*;
     use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
-    use crate::testing::{AtomicFlagGuard, TempLocalVault};
+    use crate::testing::TempLocalVault;
     use serial_test::serial;
 
     /// Secret entry asks for the value through the prompter, so under the
@@ -377,7 +377,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn secret_entry_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let store = TempLocalVault::new("tui-entry");
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Text("s3cret".to_string()),
@@ -411,7 +411,7 @@ mod tests {
     #[serial]
     async fn without_a_terminal_secret_entry_is_refused_before_asking_and_writes_nothing() {
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let store = TempLocalVault::new("no-terminal");
         let prompter = ScriptedPrompter::refusing();
 

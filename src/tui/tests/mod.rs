@@ -29,6 +29,7 @@ use ratatui::backend::TestBackend;
 use serde_json::Value;
 use serial_test::serial;
 use std::future::Future;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 fn plain_config() -> Arc<AppConfig> {
@@ -4081,7 +4082,7 @@ fn every_other_stdin_reader_checks_the_tui_flag() {
 #[tokio::test]
 #[serial]
 async fn a_file_writing_loader_still_runs_under_the_tui() {
-    let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+    let _tui_on = crate::tui::OwnerGuard::tui_for_test();
     let source = crate::utils::temp_file("-loader-source-", ".txt");
     std::fs::write(&source, "loaded under the tui x7x\n").unwrap();
     let loaded = crate::utils::run_loader_command(

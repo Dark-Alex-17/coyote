@@ -485,7 +485,7 @@ mod tests {
     #[test]
     #[serial]
     fn under_the_tui_a_spawned_spinner_is_inert() {
-        let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui = crate::tui::OwnerGuard::tui_for_test();
         let cleared = Arc::new(AtomicUsize::new(0));
         let spinner = spawn_spinner_with(SpinnerInner::observed(cleared.clone()), "Thinking");
         std::thread::sleep(FRAME_INTERVAL * 2);
@@ -511,7 +511,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn under_the_tui_the_task_runs_bare_and_still_aborts_on_the_signal() {
-        let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui = crate::tui::OwnerGuard::tui_for_test();
         let abort_signal = create_abort_signal();
         set_ctrlc_soon(&abort_signal);
         let (_, spinner_rx) = Spinner::create("Thinking");

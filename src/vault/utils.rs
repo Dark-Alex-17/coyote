@@ -545,7 +545,6 @@ mod tests {
     use super::*;
     use crate::config::conflict::prompt_script;
     use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
-    use crate::testing::AtomicFlagGuard;
     use anyhow::Error;
     use serde_json::json;
     use serial_test::serial;
@@ -774,7 +773,7 @@ mod tests {
     #[test]
     #[serial]
     fn provider_prompts_under_the_tui_ask_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
 
         let choice = ScriptedPrompter::new(vec![PromptAnswer::Selected(
             "local - encrypted file on this machine".to_string(),
@@ -916,7 +915,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_missing_password_file_is_created_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let dir = TempDir::new("create");
         let mut vault = dir.local_vault("configured");
         let chosen = dir.0.join("chosen");
@@ -961,7 +960,7 @@ mod tests {
     #[test]
     #[serial]
     fn the_created_password_file_line_names_the_chosen_path() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let dir = TempDir::new("create-note");
         let mut vault = dir.local_vault("configured");
         let chosen = dir.0.join("chosen");
@@ -1126,7 +1125,7 @@ mod tests {
     #[test]
     #[serial]
     fn without_a_terminal_no_vault_password_file_is_written() {
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
         let dir = TempDir::new("no-tty");
         let configured = dir.0.join("configured");

@@ -1,13 +1,11 @@
 use super::control::{TurnOutcome, spawn_control_request, spawn_exit, spawn_turn};
 use super::events::SystemClock;
-use super::lend::{TtyHandles, remember_tty, set_lender};
+use super::lend::{OwnerGuard, TtyHandles, remember_tty};
 use super::queued::{carry_over, reconcile_queue, take_user_messages};
 use super::rewind::apply_rewind;
 use super::sink::{LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use super::terminal::Screen;
-use super::{
-    App, CONTROL_TASK_WAIT, Command, FooterInfo, TUI_ACTIVE, dump, events, queued, redirect, render,
-};
+use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, redirect, render};
 use crate::config::RequestContext;
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command};
@@ -42,23 +40,6 @@ pub(super) const EXIT_TEARDOWN_WAIT: Duration = CONTROL_TASK_WAIT
 /// loop.
 const TYPEAHEAD_GRACE: Duration = Duration::from_millis(5);
 pub(super) const TYPEAHEAD_LIMIT: usize = 50;
-
-struct ActiveGuard;
-
-impl ActiveGuard {
-    fn set(lender: UnboundedSender<UiMsg>) -> Self {
-        set_lender(Some((lender, std::thread::current().id())));
-        TUI_ACTIVE.store(true, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        TUI_ACTIVE.store(false, Ordering::SeqCst);
-        set_lender(None);
-    }
-}
 
 struct BusSubscription(SubscriptionId);
 
@@ -430,7 +411,7 @@ pub fn ensure_tty() -> Result<()> {
 pub async fn run(mut ctx: RequestContext) -> Result<()> {
     ensure_tty()?;
     let (tx, rx) = unbounded_channel();
-    let _active = ActiveGuard::set(tx.clone());
+    let _owner = OwnerGuard::tui(tx.clone());
     let auto_cancel = Arc::new(AtomicBool::new(false));
     let sink = Arc::new(TuiSink::new(tx.clone()));
     ctx.ui = Arc::clone(&sink) as Arc<dyn crate::turn::UiSink>;

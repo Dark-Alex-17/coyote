@@ -1848,7 +1848,7 @@ mod tests {
     fn without_a_tty_a_missing_required_variable_is_reported_not_asked() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
         let _acp = AtomicFlagGuard::set(&ACP_SERVER, false);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
         let variables = vec![AgentVariable {
@@ -2942,7 +2942,7 @@ nodes: {}
     #[serial_test::serial]
     async fn declining_the_rag_confirm_under_the_tui_starts_without_rag() {
         let _guard = TestConfigDirGuard::new("agent-rag-confirm");
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let name = unique("rag_confirm");
         let agent_dir = paths::agent_data_dir(&name);
         create_dir_all(&agent_dir).unwrap();
@@ -2979,7 +2979,7 @@ nodes: {}
     #[serial_test::serial]
     async fn cancelling_the_rag_confirm_cancels_the_agent_init() {
         let _guard = TestConfigDirGuard::new("agent-rag-cancel");
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let name = unique("rag_cancel");
         let agent_dir = paths::agent_data_dir(&name);
         create_dir_all(&agent_dir).unwrap();
@@ -3019,7 +3019,7 @@ nodes: {}
     #[serial_test::serial]
     async fn accepting_the_rag_confirm_under_the_tui_goes_on_to_build_the_knowledge_base() {
         let _guard = TestConfigDirGuard::new("agent-rag-accept");
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let name = unique("rag_accept");
         let agent_dir = paths::agent_data_dir(&name);
         create_dir_all(&agent_dir).unwrap();
@@ -3070,7 +3070,7 @@ nodes: {}
     #[serial_test::serial]
     async fn without_a_terminal_the_rag_question_is_skipped_and_the_agent_starts() {
         let _guard = TestConfigDirGuard::new("agent-rag-no-tty");
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let name = unique("rag_no_tty");
         let agent_dir = paths::agent_data_dir(&name);
@@ -3107,7 +3107,7 @@ nodes: {}
     #[serial_test::serial]
     async fn with_piped_stdin_the_rag_question_is_asked_and_the_sync_hooks_fire() {
         let _guard = TestConfigDirGuard::new("agent-rag-piped-stdin");
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _stdout_tty = crate::config::conflict::prompt_script::install(&[]);
         let _stdin = testing::pipe_stdin();
         let _sink = crate::hooks::test_sink::install();
@@ -3220,7 +3220,7 @@ nodes: {}
     #[serial_test::serial]
     async fn declining_a_rag_node_confirm_under_the_tui_fails_the_init() {
         let _guard = TestConfigDirGuard::new("agent-rag-node-confirm");
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let name = unique("rag_node_confirm");
         let agent_dir = paths::agent_data_dir(&name);
         create_dir_all(&agent_dir).unwrap();
@@ -3266,7 +3266,7 @@ nodes: {}
     #[serial_test::serial]
     async fn cancelling_a_rag_node_confirm_under_the_tui_fails_the_init() {
         let _guard = TestConfigDirGuard::new("agent-rag-node-cancel");
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let name = unique("rag_node_cancel");
         let agent_dir = paths::agent_data_dir(&name);
         create_dir_all(&agent_dir).unwrap();
@@ -3315,7 +3315,7 @@ nodes: {}
     #[serial_test::serial]
     async fn without_a_terminal_an_unbuilt_rag_node_is_refused_without_asking() {
         let _guard = TestConfigDirGuard::new("agent-rag-node-no-tty");
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let name = unique("rag_node_no_tty");
         let agent_dir = paths::agent_data_dir(&name);
@@ -3366,7 +3366,7 @@ nodes: {}
     #[serial_test::serial]
     async fn a_headless_run_with_an_unbuilt_rag_node_names_the_node_in_the_refusal() {
         let _guard = TestConfigDirGuard::new("agent-rag-node-headless");
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install(&[]);
         let name = unique("rag_node_headless");
         let agent_dir = paths::agent_data_dir(&name);

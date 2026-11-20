@@ -55,6 +55,9 @@ use events::{Clock, FrameScheduler, TermInput};
 use help::Help;
 use history::ComposerHistory;
 use keys::{Action, KeyContext, PagerMode, PopupKind, ViMode};
+#[cfg(test)]
+pub(crate) use lend::OwnerGuard;
+use lend::{Owner, owner};
 pub(crate) use lend::{TtyHandles, ensure_terminal_lendable, lend_terminal, notice};
 use modal::{PendingPrompt, PromptModal};
 use pager::{Pager, PagerView};
@@ -75,18 +78,14 @@ use sink::{AgentOutcome, LendJob, UiMsg};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use todo::TodoPanel;
 use tokio::task::JoinSet;
 use transcript::{Transcript, WHEEL_LINES};
 
-/// Set while `run` owns the terminal; `RequestContext::ui_kind` reads it.
-pub(crate) static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn active() -> bool {
-    TUI_ACTIVE.load(Ordering::SeqCst)
+    matches!(owner(), Owner::Tui(_))
 }
 
 /// How long the composer must have been untouched before a bare hotkey

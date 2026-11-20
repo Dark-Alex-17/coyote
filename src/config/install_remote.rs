@@ -3294,7 +3294,7 @@ mod tests {
     #[serial]
     fn merge_non_tty_conflict_aborts_without_force() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let dir = fresh_temp_dir("merge-non-tty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -3332,7 +3332,7 @@ mod tests {
     #[serial]
     fn merge_conflict_under_the_tui_asks_through_the_prompter() {
         let _guard = TestVaultConfigGuard::new("merge-tui");
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let dir = fresh_temp_dir("merge-tui-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -3386,7 +3386,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancelling_the_mcp_conflict_question_keeps_the_local_server() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
         let mut notes = Vec::new();
 
@@ -3413,7 +3413,7 @@ mod tests {
     #[test]
     #[serial]
     fn interrupting_the_mcp_conflict_question_aborts_the_merge() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
         let mut unanswered = false;
         let mut notes = Vec::new();
@@ -3439,7 +3439,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_unanswered_mcp_conflict_keeps_every_later_conflict_local_without_asking() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
         let mut unanswered = false;
         let mut notes = Vec::new();
@@ -3496,7 +3496,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_mcp_conflict_question_keeps_the_local_server() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let script = conflict::prompt_script::install(&[]);
         let mut notes = Vec::new();
 
@@ -3538,7 +3538,7 @@ mod tests {
     #[serial]
     fn merge_conflict_under_the_tui_rename_answer_keeps_both_servers() {
         let _guard = TestVaultConfigGuard::new("merge-tui-rename");
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let dir = fresh_temp_dir("merge-tui-rename-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -3677,7 +3677,7 @@ mod tests {
     #[serial]
     fn handle_missing_secrets_defers_all_in_non_tty() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let missing = vec![
             "COYOTE_TEST_STEP4_A".to_string(),
             "COYOTE_TEST_STEP4_B".to_string(),
@@ -3692,7 +3692,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_missing_secrets_under_the_tui_asks_per_secret_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let guard = TestVaultConfigGuard::new("secrets-tui");
         let password_file = guard.path.join("vault-pass");
         fs::write(
@@ -3735,7 +3735,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_missing_secret_question_defers_every_secret() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let guard = TestVaultConfigGuard::new("secrets-headless");
         let password_file = guard.path.join("vault-pass");
@@ -3845,7 +3845,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancelling_the_vault_question_defers_this_and_every_later_secret() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let guard = TestVaultConfigGuard::new("secrets-cancel");
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
@@ -3885,7 +3885,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancelling_inside_the_vault_wizard_defers_this_and_every_later_secret() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let guard = TestVaultConfigGuard::new("secrets-cancel-inside");
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
@@ -3934,7 +3934,7 @@ mod tests {
     #[test]
     #[serial]
     fn interrupting_the_vault_questions_aborts_the_install() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let guard = TestVaultConfigGuard::new("secrets-interrupt");
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
@@ -3986,7 +3986,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_obsolete_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Selected("delete".into()),
@@ -4023,7 +4023,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_obsolete_with_no_human_keeps_the_file() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let mut sticky = None;
         let mut notes = Vec::new();
 
@@ -4046,7 +4046,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_obsolete_file_question_keeps_the_file() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let mut notes = Vec::new();
@@ -4067,7 +4067,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_obsolete_with_a_forced_non_tty_keeps_without_asking() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install_non_interactive();
         let mut sticky = None;
 
@@ -4088,7 +4088,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancelling_the_obsolete_file_question_keeps_the_file() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
@@ -4114,7 +4114,7 @@ mod tests {
     #[test]
     #[serial]
     fn interrupting_the_obsolete_file_question_aborts_the_update() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
@@ -4685,7 +4685,7 @@ mod tests {
     #[serial]
     fn apply_plan_records_files_written_before_a_mid_run_abort() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("prov-abort");
         let src_dir = fresh_temp_dir("prov-abort-src-");
         let src_new = src_dir.join("new.yaml");
@@ -4928,7 +4928,7 @@ mod tests {
     #[serial]
     fn builtin_asset_install_writes_no_provenance() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("prov-builtin");
 
         config::install_assets(
@@ -4947,7 +4947,7 @@ mod tests {
     #[serial]
     fn builtin_hooks_category_installs_example_scripts() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("prov-hooks");
         let hooks_key = get_env_name("hooks_dir");
         let previous_hooks = env::var_os(&hooks_key);
@@ -4988,7 +4988,7 @@ mod tests {
         use crate::config::bundles::hash_bytes;
 
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("upd-refresh");
         let src_root = fresh_temp_dir("upd-refresh-src-");
         let repo = src_root.join("bundle");
@@ -5020,7 +5020,7 @@ mod tests {
     #[serial]
     fn update_with_yes_keeps_modified_files_and_updates_the_rest() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("upd-yes");
         let src_root = fresh_temp_dir("upd-yes-src-");
         let repo = src_root.join("bundle");
@@ -5062,7 +5062,7 @@ mod tests {
     #[serial]
     fn update_takes_remote_for_owned_unmodified_mcp_entries() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("upd-mcp-auto");
         let src_root = fresh_temp_dir("upd-mcp-auto-src-");
         let repo = src_root.join("bundle");
@@ -5205,7 +5205,7 @@ mod tests {
     #[serial]
     fn update_bails_non_interactively_on_unowned_conflict() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("upd-unowned");
         let src_root = fresh_temp_dir("upd-unowned-src-");
         let repo = src_root.join("bundle");
@@ -5324,7 +5324,7 @@ mod tests {
     #[serial]
     fn update_keeps_modified_obsolete_files_non_interactively() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("upd-obsolete-keep");
         let src_root = fresh_temp_dir("upd-obsolete-keep-src-");
         let repo = src_root.join("bundle");
@@ -5512,7 +5512,7 @@ mod tests {
     #[serial]
     fn handle_obsolete_keeps_modified_files_non_interactively() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("upd-obsolete-mod");
         let dir = paths::config_dir();
         let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -6214,7 +6214,7 @@ mod tests {
     #[serial]
     fn uninstall_shorthand_with_multiple_matches_bails_non_interactively() {
         let _script = conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _guard = TestVaultConfigGuard::new("uninst-short-multi");
         let mut store = BundleStore::load().unwrap();
         store
@@ -6844,7 +6844,7 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_refuses_non_interactive_without_yes() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install_non_interactive();
         let _guard = TestVaultConfigGuard::new("uninst-non-tty");
         let mut store = BundleStore::load().unwrap();
@@ -6871,7 +6871,7 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let _guard = TestVaultConfigGuard::new("uninst-tui");
         let mut store = BundleStore::load().unwrap();
         store
@@ -6902,7 +6902,7 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_candidate_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let _guard = TestVaultConfigGuard::new("uninst-candidate-tui");
         let mut store = BundleStore::load().unwrap();
         store
@@ -6954,7 +6954,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_uninstall_action_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Selected("delete".into()),
@@ -7013,7 +7013,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_uninstall_action_with_no_human_keeps_the_file() {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let mut sticky = None;
         let mut notes = Vec::new();
 
@@ -7040,7 +7040,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_uninstall_question_keeps_the_file() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let mut notes = Vec::new();
@@ -7068,7 +7068,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_headless_uninstall_prints_the_kept_note_once() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let dir = fresh_temp_dir("uninst-headless-once-");
         let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -7125,7 +7125,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_all_on_the_files_loop_does_not_carry_into_the_mcp_loop() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let guard = TestVaultConfigGuard::new("uninst-delete-all-files-only");
         let mut store = BundleStore::load().unwrap();
@@ -7198,7 +7198,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancelling_the_uninstall_question_keeps_the_file() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
@@ -7237,7 +7237,7 @@ mod tests {
     #[test]
     #[serial]
     fn interrupting_the_uninstall_question_aborts_the_uninstall() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
@@ -7260,7 +7260,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_uninstall_candidate_with_a_forced_non_tty_bails_without_asking() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = conflict::prompt_script::install_non_interactive();
         let _guard = TestVaultConfigGuard::new("uninst-candidate-non-tty");
         let mut store = BundleStore::load().unwrap();

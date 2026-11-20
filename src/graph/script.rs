@@ -330,7 +330,7 @@ mod tests {
         }
         let _acp_off = crate::testing::AtomicFlagGuard::set(&crate::utils::ACP_SERVER, false);
         let _headless_off = crate::testing::AtomicFlagGuard::set(&crate::utils::HEADLESS, false);
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let (dir, path) = write_script(
             r#"#!/bin/bash
 printf '{"ui": "%s"}' "$COYOTE_UI"

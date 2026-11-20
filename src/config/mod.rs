@@ -2305,7 +2305,7 @@ hooks:
         use crate::prompt::ScriptedPrompter;
 
         let _guard = TestConfigDirGuard::new("install-builtins-hooks-yes");
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         install_builtins(&prompt_script::Scripted).unwrap();
         let notify = paths::hooks_dir().join("notify.sh");
         fs::write(&notify, "# local edit").unwrap();
@@ -2327,7 +2327,7 @@ hooks:
     fn confirm_asset_overwrite_under_the_tui_asks_through_the_prompter() {
         use crate::prompt::{PromptAction, PromptAnswer, ScriptedPrompter};
 
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
 
         let proceed = confirm_asset_overwrite(
@@ -2374,7 +2374,7 @@ hooks:
         use crate::prompt::ScriptedPrompter;
 
         let _guard = TestConfigDirGuard::new("install-builtins-no-tty");
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
 
@@ -2399,7 +2399,7 @@ hooks:
         use crate::prompt::ScriptedPrompter;
 
         let _guard = TestConfigDirGuard::new("install-builtins-yes");
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
         let edited = paths::macros_dir().join("record-miss.yaml");
@@ -2422,7 +2422,7 @@ hooks:
         use crate::config::conflict::prompt_script;
 
         let _guard = TestConfigDirGuard::new("create-config-no-tty");
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
         let config_path = _guard.path.join("config.yaml");
 

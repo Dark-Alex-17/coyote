@@ -2185,7 +2185,7 @@ echo_pkce_in_token_exchange: true
     #[serial]
     fn ask_paste_input_refuses_without_a_terminal_before_asking() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _no_tty = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
 
@@ -2202,7 +2202,7 @@ echo_pkce_in_token_exchange: true
     #[serial]
     fn ensure_paste_can_be_asked_refuses_without_a_terminal() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _no_tty = prompt_script::install_non_interactive();
 
         let err = ensure_paste_can_be_asked("client-x").unwrap_err();
@@ -2248,7 +2248,7 @@ echo_pkce_in_token_exchange: true
     #[serial]
     async fn paste_flow_without_a_terminal_refuses_before_building_the_authorize_url() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _no_tty = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
 

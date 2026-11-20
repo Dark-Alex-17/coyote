@@ -1145,7 +1145,7 @@ mod tests {
     #[serial]
     fn resolve_oauth_client_without_a_tty_is_refused_before_any_prompt() {
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let clients = [oauth_client("work"), oauth_client("home")];
         let prompter = ScriptedPrompter::refusing();
 

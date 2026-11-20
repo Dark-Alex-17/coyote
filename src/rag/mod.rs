@@ -2525,7 +2525,7 @@ mod tests {
         HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
     };
     use crate::sandbox::kit;
-    use crate::testing::{AtomicFlagGuard, TempLocalVault};
+    use crate::testing::TempLocalVault;
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3044,7 +3044,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_failed_document_under_the_tui_asks_whether_to_continue_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-tui-failed-doc");
         let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
 
@@ -3071,7 +3071,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn continuing_past_a_failed_document_under_the_tui_goes_on_with_the_rest() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let (_dir, mut rag, paths, loaders) =
             rag_with_a_failing_document("sync-tui-failed-doc-continue");
         let accepted = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
@@ -3090,7 +3090,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_failed_document_under_the_tui_without_a_human_is_a_needs_human_refusal() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let (_dir, mut rag, paths, loaders) =
             rag_with_a_failing_document("sync-tui-failed-doc-headless");
 
@@ -3107,7 +3107,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_failed_document_without_a_tty_aborts_the_sync_without_asking() {
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-no-tty-failed-doc");
         let prompter = ScriptedPrompter::refusing();
@@ -3138,7 +3138,7 @@ mod tests {
     #[test]
     #[serial]
     fn wizard_prompts_under_the_tui_ask_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
 
         // Under musl the driver question is not asked at all.
         #[cfg(not(target_env = "musl"))]
@@ -3239,7 +3239,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_extractor_model_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let model = chat_model("test-chat");
         let pad = model.id().len().max(EXTRACTOR_SKIP.len());
         let skip_row = SelectOption::new(
@@ -3277,7 +3277,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn a_missing_api_key_secret_under_the_tui_is_offered_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let store = TempLocalVault::new("attach-secret");
 
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
@@ -3301,7 +3301,7 @@ mod tests {
     #[test]
     #[serial]
     fn ask_qdrant_host_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let prompter = ScriptedPrompter::new(vec![text("qdrant.example:6333")]);
         assert_eq!(ask_qdrant_host(&prompter).unwrap(), "qdrant.example:6333");
         let [req] = prompter.requests().try_into().unwrap();
@@ -3317,7 +3317,7 @@ mod tests {
     #[test]
     #[serial]
     fn headless_ask_qdrant_host_is_a_typed_input_refusal_with_nothing_on_stdout() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let (saved, mut reader) = crate::testing::capture_stdout();
 
         let err = ask_qdrant_host(&HeadlessPrompter).unwrap_err();
@@ -3340,7 +3340,7 @@ mod tests {
     #[test]
     #[serial]
     fn ask_api_key_secret_name_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let keyed = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), text("MY_KEY")]);
         assert_eq!(
             ask_api_key_secret_name(&keyed).unwrap(),
@@ -3367,7 +3367,7 @@ mod tests {
     #[test]
     #[serial]
     fn choose_collection_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let collections = vec!["docs".to_string(), "notes".to_string()];
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("notes".to_string())]);
         assert_eq!(
@@ -3386,7 +3386,7 @@ mod tests {
     #[test]
     #[serial]
     fn confirm_empty_collection_under_the_tui_asks_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let accepted = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
         confirm_empty_collection(&accepted, "docs").unwrap();
         let [req] = accepted.requests().try_into().unwrap();
@@ -3418,7 +3418,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn attach_under_the_tui_asks_driver_host_and_api_key_through_the_prompter() {
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let store = TempLocalVault::new("attach-wizard");
         let dir = TempDir::new("attach-wizard-rag");
         let prompter = ScriptedPrompter::new(vec![
@@ -3495,7 +3495,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn init_without_a_terminal_is_refused_before_any_prompt() {
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let dir = TempDir::new("init-no-tty");
         let prompter = ScriptedPrompter::refusing();
@@ -3528,7 +3528,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn attach_without_a_terminal_is_refused_before_any_prompt() {
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let store = TempLocalVault::new("attach-no-tty");
         let dir = TempDir::new("attach-no-tty-rag");
@@ -3559,7 +3559,7 @@ mod tests {
     #[serial]
     async fn init_with_config_without_a_terminal_and_no_embedding_model_is_refused_before_any_prompt()
      {
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let dir = TempDir::new("init-config-no-tty");
         let doc = dir.path.join("doc.txt");

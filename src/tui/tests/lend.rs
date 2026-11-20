@@ -1,13 +1,15 @@
 use super::*;
-use crate::tui::lend::NOT_LENDING;
 #[cfg(unix)]
-use crate::tui::lend::{dup_tty_out, set_lender};
+use crate::tui::lend::dup_tty_out;
+use crate::tui::lend::{NOT_LENDING, OwnerGuard};
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 
 /// Registers a lender on its own thread that runs every job it is
 /// sent, the way the loop does with the screen released, and counts
-/// them; unregistered when the guard drops.
+/// them; the previous owner is back when the guard drops.
 #[cfg(unix)]
-fn test_lender() -> (LenderGuard, Arc<std::sync::atomic::AtomicUsize>) {
+fn test_lender() -> (OwnerGuard, Arc<std::sync::atomic::AtomicUsize>) {
     let (tx, mut rx) = unbounded_channel();
     let lent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = Arc::clone(&lent);
@@ -19,18 +21,7 @@ fn test_lender() -> (LenderGuard, Arc<std::sync::atomic::AtomicUsize>) {
             }
         }
     });
-    set_lender(Some((tx, lender.thread().id())));
-    (LenderGuard, lent)
-}
-
-#[cfg(unix)]
-struct LenderGuard;
-
-#[cfg(unix)]
-impl Drop for LenderGuard {
-    fn drop(&mut self) {
-        set_lender(None);
-    }
+    (OwnerGuard::lending_for_test(tx, lender.thread().id()), lent)
 }
 
 /// The loop's copy of the terminal is close-on-exec: a tool child
@@ -52,14 +43,13 @@ fn the_lent_tty_fd_is_cloexec() {
     assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
 }
 
-/// With the UI flag up but no loop lending the terminal (the flag
-/// outlives the loop during teardown), `.edit` on a file fails
-/// outright: no editor is spawned onto the capture pipe (the name
-/// given is not a program at all).
+/// With the UI owning the terminal but its inbox closed (as during
+/// teardown), `.edit` on a file fails outright: no editor is spawned
+/// onto the capture pipe (the name given is not a program at all).
 #[test]
 #[serial]
 fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
-    let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+    let _tui_on = OwnerGuard::tui_for_test();
     let err = crate::utils::edit_file(
         "definitely-not-an-editor-x7x",
         std::path::Path::new("/dev/null"),
@@ -72,7 +62,7 @@ fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
 #[test]
 #[serial]
 fn run_command_without_a_lender_fails_without_spawning_a_child() {
-    let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+    let _tui_on = OwnerGuard::tui_for_test();
     let err =
         crate::utils::run_command("definitely-not-a-shell-x7x", &["-c", "true"], None).unwrap_err();
     assert_eq!(err.to_string(), NOT_LENDING);
@@ -85,7 +75,6 @@ fn run_command_without_a_lender_fails_without_spawning_a_child() {
 #[test]
 #[serial]
 fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
-    let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
     let (_lender, lent) = test_lender();
     let code = crate::utils::run_command("sh", &["-c", "exit 7"], None).unwrap();
     assert_eq!(code, 7);

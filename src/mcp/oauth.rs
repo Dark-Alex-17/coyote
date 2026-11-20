@@ -807,7 +807,7 @@ mod tests {
     #[serial]
     fn ask_client_id_refuses_without_a_terminal_before_asking() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _no_tty = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
 
@@ -849,7 +849,7 @@ mod tests {
     #[serial]
     async fn run_mcp_oauth_flow_refuses_without_a_terminal_before_discovery_or_the_prompter() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
-        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _no_tty = crate::config::conflict::prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
 

@@ -1759,7 +1759,6 @@ mod tests {
     #[cfg(unix)]
     mod tui_document_commands {
         use super::*;
-        use crate::testing::AtomicFlagGuard;
         use serial_test::serial;
 
         /// Under the full-screen UI a document command that reads stdin gets
@@ -1768,7 +1767,7 @@ mod tests {
         #[test]
         #[serial]
         fn a_document_command_under_the_tui_reads_no_stdin() {
-            let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+            let _tui_on = crate::tui::OwnerGuard::tui_for_test();
             let started = std::time::Instant::now();
 
             let output = run_async(run_document_command("cat -; echo done-k2m"));
@@ -1792,7 +1791,7 @@ mod tests {
             pid_file: &std::path::Path,
             ready: impl Fn(&str) -> Option<i32>,
         ) -> (i32, std::time::Duration) {
-            let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+            let _tui_on = crate::tui::OwnerGuard::tui_for_test();
             let script_file = pid_file.with_extension("sh");
             fs::write(&script_file, script).unwrap();
             let command = format!("exec sh '{}'", script_file.display());

@@ -499,7 +499,7 @@ mod tests {
     #[test]
     #[serial]
     fn without_a_terminal_missing_mcp_secrets_are_refused_before_asking() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
 
         let err = refuse_missing_secrets_without_a_terminal("github", &["GH_TOKEN", "GH_USER"])
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     #[serial]
     fn with_a_terminal_missing_mcp_secrets_go_on_to_be_asked_for() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install(&[]);
 
         refuse_missing_secrets_without_a_terminal("github", &["GH_TOKEN"]).unwrap();
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     #[serial]
     fn without_a_terminal_removing_an_mcp_server_is_refused_before_asking() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
         let dir = config_dir_with_server("remove", "github");
         let before = mcp_json(&dir);
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     #[serial]
     fn without_a_terminal_overwriting_an_mcp_server_is_refused_before_asking() {
-        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
         let dir = config_dir_with_server("overwrite", "github");
         let before = mcp_json(&dir);

@@ -406,7 +406,7 @@ mod tests {
     /// pid is on disk, and checks the caller gets the abort promptly and
     /// the loader process is gone, not left behind to finish on its own.
     async fn assert_aborted_loader_is_reaped(loader: &str, pid_file: &Path) {
-        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let abort_signal = create_abort_signal();
         let aborter = abort_signal.clone();
         let pid_path = pid_file.to_path_buf();
@@ -507,7 +507,11 @@ mod tests {
     #[serial]
     async fn a_file_loader_reads_eof_from_stdin_under_every_ui() {
         for tui in [false, true] {
-            let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, tui);
+            let _tui = if tui {
+                crate::tui::OwnerGuard::tui_for_test()
+            } else {
+                crate::tui::OwnerGuard::shell_for_test()
+            };
             let loaded = tokio::time::timeout(
                 Duration::from_secs(5),
                 run_loader_command("unused", "txt", "sh -c 'cat - > \"$2\"' loader"),

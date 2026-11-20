@@ -75,7 +75,7 @@ mod tests {
         let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
         assert_eq!(ctx.ui_kind(), UiKind::Repl);
 
-        let tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let tui_on = crate::tui::OwnerGuard::tui_for_test();
         assert_eq!(ctx.ui_kind(), UiKind::Tui);
         assert_eq!(ctx.ui_kind().as_str(), "tui");
         drop(tui_on);
@@ -89,7 +89,7 @@ mod tests {
     fn headless_outranks_the_tui_flag() {
         let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
         let _headless_on = AtomicFlagGuard::set(&HEADLESS, true);
-        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
         let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
         assert_eq!(ctx.ui_kind(), UiKind::Headless);
     }
