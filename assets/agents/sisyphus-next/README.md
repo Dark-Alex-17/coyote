@@ -178,7 +178,7 @@ no earlier turns, `assess` does so straight away.
 Typed replies: a reply to an escalation is matched to an option by number or text first. The
 first reply that names no option goes to the `interpret_reply` llm node with the question,
 the reply and the instructions the kind accepts (`ACCEPTED_INSTRUCTIONS`: `answer` for
-`clarify` and `design_ask`, `design` for `design_choice`, `amendment` for `plan_defect`,
+`clarify` and `design_ask`, `design` for `design_choice`, `amendment` and `fix` for `plan_defect`,
 `recipe` for `probe_gap`, `rescope` for `scope_breach`, `path` for `handoff_confirm` and
 `handoff_path`, `answer` for `clarify_cap`, `here` for `sizing_cap`). `interpret_route` acts
 on the verdict: an option counts only when the
@@ -373,6 +373,12 @@ is a tag. `other:` and `deleted:` items are human-attention lines and are record
 during review and NOT adopted, in the report and the publish text; an unavailable list, or a
 path that is not one line free of control characters (skipped, never quoted), is an attention
 line too.
+
+Every gauntlet prompt names, above the plan block, the probe-written tests still in the
+worktree and not committed (the adoption round's own line names those it adopts), so the lanes
+review them as part of the change rather than as leftover files. Whenever the worktree is
+uncommitted the prompt also says so, since the work stays uncommitted until it is published
+while the diff base is a commit.
 
 At the top of `pr_gate` each probe-written path is settled against the last passing round's
 `code_tree`: one still in the worktree and unchanged since that tree was reviewed by that round

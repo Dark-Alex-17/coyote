@@ -620,6 +620,14 @@ s2, u = chain(base_state(escalation=pd, last_answer_text=text, reply_verdict="in
                          reply_value="drop the 5xx criterion", spec_text="AC"), "interpret_route", "apply_answer")
 check("interpret_route -> apply_answer: an accepted free-form instruction keeps the owner's words verbatim, never a stop",
       u["_next"] == "build_gauntlet_prompt" and text in s2["spec_text"] and s2["reply_interpreted"] is False)
+_pd_with_fix = escalation("plan_defect", "q", [pd["options"][1], option("Not a plan defect: fix round (state the fix)"),
+                                               pd["options"][0]])
+s2, u = chain(base_state(escalation=_pd_with_fix, last_answer_text="leave the criterion, commit the probe file first",
+                         reply_verdict="instruction", reply_instruction="fix", reply_value="commit the probe file"),
+              "interpret_route", "apply_answer")
+check("interpret_route -> apply_answer: a typed fix instruction on a plan_defect is a fix round with the owner's words",
+      u["_next"] == "compose_fix" and s2["fix_source"] == "plan_defect_fix"
+      and s2["fix_note"] == "leave the criterion, commit the probe file first", (u.get("_next"), s2.get("fix_note")))
 s2, u = chain(base_state(escalation=pd, last_answer_text="stop"), "parse_answer", "apply_answer")
 check("apply_answer: a whole-reply stop is a stop", u["_next"] == "end_blocked" and aa("plan_defect", "Stop.")["_next"] == "end_blocked")
 PD_CONT = pd["options"][1]["text"]
@@ -1639,28 +1647,36 @@ u = gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lan
 check("triage_route: B10 review rounds exhausted -> review_exhausted escalation", u["escalation"]["kind"] == "review_exhausted")
 u = gates.triage_route(base_state(triage=[{"finding": "USAGE_PROBE: INCONCLUSIVE no recipe", "action": "fix", "lane": "probe"}], review_rounds=0))
 check("triage_route: probe INCONCLUSIVE is an environment gap escalation, never a coder fix", u["escalation"]["kind"] == "probe_gap")
-u = gates.triage_route(base_state(triage=[{"finding": "criterion 3 is impossible as written", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]))
-check("triage_route: plan-is-root-cause -> plan_defect escalation", u["escalation"]["kind"] == "plan_defect")
-_PD_TRI = [{"finding": "criterion 3 is impossible as written", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]
+u = gates.triage_route(base_state(triage=[{"finding": "criterion 3 is impossible as written", "action": "escalate", "lane": "adversary", "reason": "plan root cause", "kind": "plan_defect"}]))
+check("triage_route: the triage model's plan_defect kind -> plan_defect escalation", u["escalation"]["kind"] == "plan_defect")
+_PD_TRI = [{"finding": "criterion 3 is impossible as written", "action": "escalate", "lane": "adversary", "reason": "plan root cause", "kind": "plan_defect"}]
+_PD_ACCEPT = "Accept the plan defect unresolved and proceed (state the reason)"
 _pd_open = {n: gates.triage_route(base_state(triage=_PD_TRI, plan_defect_continues=n))["escalation"] for n in (0, STRIKE_LIMIT)}
-check("triage_route: plan_defect recommends continuing until STRIKE_LIMIT continues, then stopping, the count in the evidence",
+check("triage_route: plan_defect recommends continuing until STRIKE_LIMIT continues, then accepting, never stopping, "
+      "the count in the evidence",
       [o["text"] for o in _pd_open[0]["options"] if o["recommended"]] == [gates.PLAN_DEFECT_CONTINUE]
       and f"0/{STRIKE_LIMIT} continues used in this run" in _pd_open[0]["options"][0]["evidence"]
-      and [o["text"] for o in _pd_open[STRIKE_LIMIT]["options"] if o["recommended"]] == [gates.PLAN_DEFECT_STOP], _pd_open)
+      and [o["text"] for o in _pd_open[STRIKE_LIMIT]["options"] if o["recommended"]] == [_PD_ACCEPT]
+      and any(f"{STRIKE_LIMIT}/{STRIKE_LIMIT} continues used in this run" in o["evidence"]
+              for o in _pd_open[STRIKE_LIMIT]["options"])
+      and all(gates.PLAN_DEFECT_STOP in [o["text"] for o in e["options"]] for e in _pd_open.values()), _pd_open)
 _pd_headless = {}
 for _n, _esc in _pd_open.items():
     _pick = gates.parse_answer(base_state(escalation=_esc, last_answer_text=_lib.HEADLESS_GUIDANCE))
     _pd_headless[_n] = gates.apply_answer(base_state(escalation=_esc, last_answer=_pick["last_answer"], spec_text="AC",
                                                      plan_defect_continues=_n))
 check("apply_answer: a headless plan_defect continues below the cap with the adversary's finding as the amendment, "
-      "labeled as the default, counted, and stops at the cap",
+      "labeled as the default and counted",
       _pd_headless[0]["_next"] == "build_gauntlet_prompt" and _pd_headless[0].get("plan_defect_continues") == 1
       and _pd_headless[0]["spec_text"].endswith(
           "AMENDED by default (no amendment was stated; resolves the adversary's finding): "
           f"{gates.PLAN_DEFECT_CONTINUE}: criterion 3 is impossible as written")
       and "AMENDED by the user" not in _pd_headless[0]["spec_text"]
-      and any("plan amendment (default, no amendment stated): " in d for d in _pd_headless[0]["decisions"])
-      and _pd_headless[STRIKE_LIMIT]["_next"] == "end_blocked", _pd_headless)
+      and any("plan amendment (default, no amendment stated): " in d for d in _pd_headless[0]["decisions"]), _pd_headless)
+check("apply_answer: a headless plan_defect at the cap accepts the defect unresolved and proceeds, never end_blocked",
+      _pd_headless[STRIKE_LIMIT].get("_next") == "observability_gate"
+      and any("criterion 3 is impossible as written" in f for f in _pd_headless[STRIKE_LIMIT].get("follow_ups", []))
+      and "plan_defect_continues" not in _pd_headless[STRIKE_LIMIT], _pd_headless[STRIKE_LIMIT])
 _PD_LONG = "x" * 1000 + "the finding's end"
 _pd_long = gates.apply_answer(base_state(escalation=dict(_pd_open[0], evidence=_PD_LONG),
                                          last_answer=gates.PLAN_DEFECT_CONTINUE, spec_text="AC"))
@@ -1685,6 +1701,99 @@ u = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer="Continue;
 check("apply_answer: a stated plan_defect amendment is recorded as stated and counted",
       u.get("plan_defect_continues") == 2
       and u["spec_text"].endswith("AMENDED by the user: Continue; treat the criterion as amended: drop AC3"), u)
+# recorded plan_defect cells: the adversary blamed the plan for a red command the plan was not at fault for
+_PD_STOP_TEXT = "Stop; the plan needs amending (report it)"
+_PD_CONT_TEXT = "Continue; treat the criterion as amended (state the amendment)"
+_PD_FIX_TEXT = "Not a plan defect: fix round (state the fix)"
+_DIRTY_FINDING = ("adversary: DIVERGES -- complaint 1: Verification run `make check-generate` \u2014 exit 2 (recorded FAIL; "
+                  "a red declared command that did not already fail on the diff base blocks CONFORMS; baseline on the "
+                  "diff base: regression, base exit 0, the command passed on the diff base)")
+_DIRTY_ESC = {"kind": "plan_defect",
+              "question": "The adversary reports the PLAN itself as the root cause (impossible or contradictory "
+                          "criterion). Never fixed by changing scope: amend the plan, or stop?",
+              "options": [{"text": _PD_STOP_TEXT, "recommended": True, "evidence": ""},
+                          {"text": _PD_CONT_TEXT, "recommended": False,
+                           "evidence": "the criterion is amended in place with the stated amendment; 3/3 continues "
+                                       "used in this run"}],
+              "data": {"multiple_choice": True, "recommended_count": 1}, "evidence": _DIRTY_FINDING}
+_DIRTY_SUBS = [{"title": f"subtask {i}", "outcome": "o", "acceptance_criteria": ["`make check-generate` exits 0"]}
+               for i in (1, 2, 3)]
+_DIRTY_STATE = dict(plan_defect_continues=STRIKE_LIMIT, answer_source="navigator", subtasks=_DIRTY_SUBS, subtask_index=2)
+_STOP_NOT_DEFECTIVE = (f"{_PD_STOP_TEXT}: 1 \u2014 the plan is not defective; check-generate fails only because subtask 2's "
+                       "changes and the probe file are uncommitted (Makefile:29 requires a clean `git status "
+                       "--porcelain`). Report it so the owner can commit, fold in or delete the probe test, and re-verify.")
+_a_state, _a = chain(base_state(escalation=_DIRTY_ESC, last_answer=_STOP_NOT_DEFECTIVE, **_DIRTY_STATE), "apply_answer")
+check("apply_answer: a reply picking Stop that says the plan is not defective goes to a fix round with its text, "
+      "never end_blocked",
+      _a.get("_next") == "compose_fix" and _a_state.get("fix_source") == "plan_defect_fix"
+      and "Makefile:29" in gates.compose_fix(_a_state)["fix_instructions"], _a.get("_next"))
+_DIRTY_TRI = [{"finding": _DIRTY_FINDING, "action": "escalate", "lane": "adversary", "reason": "plan root cause",
+               "kind": "plan_defect"}]
+_dirty_cap = gates.triage_route(base_state(triage=_DIRTY_TRI, **_DIRTY_STATE)).get("escalation", {})
+check("triage_route: a plan_defect at the cap never recommends Stop",
+      _dirty_cap.get("kind") == "plan_defect"
+      and _PD_STOP_TEXT not in [o["text"] for o in _dirty_cap.get("options", []) if o["recommended"]], _dirty_cap)
+_dirty_pick = gates.parse_answer(base_state(escalation=_dirty_cap, last_answer_text=_lib.HEADLESS_GUIDANCE))
+_dirty_accept = gates.apply_answer(base_state(escalation=_dirty_cap, last_answer=_dirty_pick.get("last_answer"), **_DIRTY_STATE))
+check("apply_answer: a headless plan_defect at the cap in a subtask accepts the finding as a follow-up and moves to the "
+      "next subtask",
+      _dirty_accept.get("_next") == "next_subtask"
+      and any(_DIRTY_FINDING in f for f in _dirty_accept.get("follow_ups", [])), _dirty_accept)
+_NAV_RAW = ("This isn't a plan defect, and neither option fits. The run shouldn't stop, and it shouldn't amend a "
+            "criterion that's correct. ... **Answer:** Don't stop and don't amend. Go back to a normal fix round: 1. "
+            "Move the checks in `web/changeplan_probe_test.ext` that the new test lacks into the downgrade test in "
+            "`web/server_test.ext`, then delete the probe file. 2. Commit the subtask 2 changes the same way subtask "
+            "1 was committed. 3. Re-run `./run-tests` and `make check-generate`, and quote both exit codes.")
+_NAV_READ = ("Not a plan defect (the dirty working tree is the cause). Fix round: move the probe test's checks into "
+             "server_test.ext, delete web/changeplan_probe_test.ext, commit the subtask 2 changes as subtask 1 did, "
+             "then re-run ./run-tests and make check-generate and quote both exit codes.")
+_b_state, _b = chain(base_state(escalation=_dirty_cap, last_answer=_NAV_READ, **_DIRTY_STATE), "apply_answer", "compose_fix")
+_b_raw = gates.apply_answer(base_state(escalation=_dirty_cap, last_answer=_NAV_RAW, **_DIRTY_STATE))
+check("apply_answer: the navigator's not-a-plan-defect reply is offered as a fix option and reaches a fix round "
+      "with its fix, raw or interpreted",
+      _PD_FIX_TEXT in [o["text"] for o in _dirty_cap.get("options", [])]
+      and _b_state.get("fix_source") == "plan_defect_fix"
+      and "delete web/changeplan_probe_test.ext" in _b_state.get("fix_instructions", "")
+      and _b_raw.get("_next") == "compose_fix" and "changeplan_probe_test.ext" in _b_raw.get("fix_note", ""),
+      (_b.get("_next"), _b_raw.get("_next")))
+_fix_bare = gates.apply_answer(base_state(escalation=_dirty_cap, last_answer=_PD_FIX_TEXT, **_DIRTY_STATE))
+check("apply_answer: a bare fix pick is counted, and its fix round works the adversary's whole finding",
+      _fix_bare.get("_next") == "compose_fix" and _fix_bare.get("fix_note") == _DIRTY_FINDING
+      and _fix_bare.get("plan_defect_continues") == STRIKE_LIMIT + 1
+      and any("past the cap at the user's pick" in d for d in _fix_bare.get("decisions", [])), _fix_bare)
+check("apply_answer: only a reply saying the plan is not defective turns a Stop into a fix round",
+      all(gates.apply_answer(base_state(escalation=_DIRTY_ESC, last_answer=t, **_DIRTY_STATE)).get("_next") == "compose_fix"
+          for t in ("not a plan defect", "the plan is not defective", "this isn\u2019t a plan defect",
+                    "1: the plan is fine, the tree is dirty", "the criterion isn't defective"))
+      and all(gates.apply_answer(base_state(escalation=_DIRTY_ESC, last_answer=t, **_DIRTY_STATE)).get("_next") == "end_blocked"
+              for t in ("1", "stop", "Stop; the plan is defective", "1: the plan needs a new criterion")))
+_ROUND_FINDING = ("adversary: DIVERGES -- complaint 1: Verification run `grep -nE 'float32|float64|math\\.Round' "
+                  "src/coupon.ext src/discount.ext` \u2014 exit 2 (recorded FAIL; ... baseline on the diff base: "
+                  "regression, base exit 2, the failure output differs from the diff base's)")
+_ROUND_SUBS = [{"title": "subtask 1", "outcome": "o",
+                "acceptance_criteria": ["`grep -nE 'float32|float64|math\\.Round' src/coupon.ext` prints nothing"]},
+               {"title": "subtask 2", "outcome": "o"}]
+_round_esc = escalation("plan_defect", "q", [option(_PD_CONT_TEXT, True), option(_PD_STOP_TEXT)], evidence=_ROUND_FINDING)
+_round_pick = gates.parse_answer(base_state(escalation=_round_esc, last_answer_text=_lib.HEADLESS_GUIDANCE))
+_d_state, _d = chain(base_state(escalation=_round_esc, last_answer=_round_pick.get("last_answer"), subtasks=_ROUND_SUBS,
+                                subtask_index=1, plan_defect_continues=0), "apply_answer")
+check("apply_answer: a default amendment naming a command the criteria do not is a note, never an amendment; the run "
+      "goes on, counted",
+      _d.get("_next") == "build_gauntlet_prompt" and _d_state.get("plan_defect_continues") == 1
+      and not _d_state["subtasks"][0].get("amendments") and "src/discount.ext" in str(_d_state["subtasks"][0].get("notes"))
+      and any("plan note (default, not applied" in d for d in _d_state.get("decisions", []))
+      and "src/discount.ext" not in gates._subtask_spec(_d_state)[0], _d_state["subtasks"][0])
+_known = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `make check-generate` exit 2"),
+                                       last_answer=_PD_CONT_TEXT, subtasks=_DIRTY_SUBS, subtask_index=2))
+check("apply_answer: a default amendment naming only commands the criteria quote is still applied",
+      _known.get("_next") == "build_gauntlet_prompt" and _known["subtasks"][1].get("amendments")
+      and not _known["subtasks"][1].get("notes"), _known.get("subtasks"))
+_plan_word = [{"finding": "criterion 2 contradicts the plan", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]
+check("triage_route: an escalated finding naming the plan is plan_defect only when the triage model says so",
+      gates.triage_route(base_state(triage=_plan_word))["escalation"]["kind"] == "yellow_findings"
+      and gates.triage_route(base_state(triage=[dict(_plan_word[0], kind="bogus")]))["escalation"]["kind"] == "yellow_findings"
+      and gates.triage_route(base_state(triage=[dict(_plan_word[0], kind="finding")]))["escalation"]["kind"] == "yellow_findings"
+      and gates.triage_route(base_state(triage=[dict(_plan_word[0], kind="plan_defect")]))["escalation"]["kind"] == "plan_defect")
 u = gates.triage_route(base_state(triage=[{"finding": "🟡 maybe", "action": "escalate", "lane": "code-review"}]))
 check("triage_route: unsure yellow -> fix-or-accept escalation", u["escalation"]["kind"] == "yellow_findings")
 u = gates.triage_route(base_state(triage=[], gauntlet_blockers=["b1", "b2"], last_script_error="llm died"))
@@ -5621,6 +5730,30 @@ with scenario("build_gauntlet: the adoption round omits the recipe, names the ad
           and any(l.startswith("Probe-written tests adopted into the change under review (written in review round 2")
                   and l.endswith(": tests/new.test.ts") for l in _gp[:5]), _gp)
     _a1.update(probe_adoption=u.get("probe_adoption"), round_heads=u["round_heads"])
+with scenario("build_gauntlet: an ordinary round labels the probe-written tests still uncommitted as part of the "
+              "change and states the tree is uncommitted, above the plan block") as name:
+    _L = adopt_repo("label-a", "web/changeplan_probe_test.ext", "web/old_probe_test.ext")
+    _lbl = dict(git_root=_L, project_dir=_L, spec_text="AC: the tree check exits 0",
+                probe_tests=[{"path": "web/changeplan_probe_test.ext", "round": 1},
+                             {"path": "web/gone_probe_test.ext", "round": 1},
+                             {"path": "web/old_probe_test.ext", "round": 1}],
+                round_heads=[{"round": 1, "head": "h", "verdict": "BLOCKED"}])
+    subprocess.run(["git", "-C", _L, "add", "web/old_probe_test.ext"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", _L, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"],
+                   check=True, capture_output=True)
+    _gp = gates.build_gauntlet_prompt(base_state(**fresh(_lbl)))["gauntlet_prompt"].splitlines()
+    _plan_at = next(i for i, l in enumerate(_gp) if l.startswith("Plan / acceptance criteria:"))
+    _probe_at = [i for i, l in enumerate(_gp) if l.startswith("Probe-written tests in the change under review")]
+    _tree_at = [i for i, l in enumerate(_gp) if l.startswith("Tree state: ")]
+    check(name, len(_probe_at) == 1 and _probe_at[0] < _plan_at
+          and _gp[_probe_at[0]].endswith("round 1; part of the change, not leftover files): web/changeplan_probe_test.ext")
+          and len(_tree_at) == 1 and _tree_at[0] < _plan_at and "probe-written tests included" in _gp[_tree_at[0]], _gp)
+with scenario("build_gauntlet: no probe label and no tree-state line once the tree is committed") as name:
+    subprocess.run(["git", "-C", _L, "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", _L, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2"],
+                   check=True, capture_output=True)
+    _gp = gates.build_gauntlet_prompt(base_state(**fresh(_lbl)))["gauntlet_prompt"]
+    check(name, "Probe-written tests in the change" not in _gp and "Tree state: " not in _gp, _gp)
 with scenario("route_gauntlet: the adoption round passes -> pr_gate") as name:
     u = gates.route_gauntlet(base_state(**{**fresh(_a1), "gauntlet_result": passed}))
     check(name, u.get("_next") == "pr_gate" and "probe tests: adoption round 3 passed" in u.get("decisions", []),
