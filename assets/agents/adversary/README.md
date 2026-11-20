@@ -74,9 +74,11 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   uncommitted (a regenerate-then-`git diff --exit-code` check, for example). Any other snapshot
   outcome keeps the live run's classification against the base, and its note ends
   `candidate tree dirty`. Snapshot runs are never saved to `coyote-baselines`.
-- Each run record carries a `pass_condition`: `exit 0` when no criterion or request line names
-  the command (the caller's build/test/lint contract) or a naming line says it passes or exits 0,
-  otherwise `stated` (the criterion states another condition, such as "prints nothing"). The
+- Each run record carries a `pass_condition`: `stated` when no criterion or request line naming
+  the command says it passes or exits 0 and at least one positively states another condition
+  ("prints nothing", "no output", "is empty", "absent", "does not exist", "exits 1", "fails"),
+  otherwise `exit 0`. A command named nowhere (the caller's build/test/lint contract) or only in
+  passing ("Verification commands: `x`") is held to exit 0. The
   verdict recomputes it from the criteria and the request, never from the record. A red run held to
   exit 0 blocks as above. A red run whose condition a parsed criterion states blocks unless every
   criterion naming it ends MET or INSPECTED, and its complaint names those criteria and statuses.
