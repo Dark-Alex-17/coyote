@@ -3356,7 +3356,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ask_owner_poll", "timeout", 0),
     ("assess", "max_iterations", 20),
     ("assess", "timeout", 900),
-    ("base_check", "timeout", 360),
+    ("base_check", "timeout", 480),
     ("bookkeeping_judge", "timeout", 300),
     ("bookkeeping_scan", "timeout", 60),
     ("build_gauntlet_prompt", "timeout", 60),

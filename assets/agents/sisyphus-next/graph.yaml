@@ -2254,9 +2254,9 @@ nodes:
       tip. Fresh or unchecked -> the flip (owner) or the report; moved -> the base_moved question (owner) or an
       attention line (report). Never merges.
     script: scripts/base_check.py
-    # BASE_FETCH_SECS (60) + 3 x GH_CALL_SECS (90: the PR read, then the flip and its re-read) + 30 margin for the
-    # read-only git calls, BASE_GIT_SECS (2) each
-    timeout: 360
+    # BASE_FETCH_SECS (60) + 3 x GH_CALL_SECS (90: the PR read, then the flip and its re-read) + 150 for the
+    # read-only git calls, 15 of BASE_GIT_SECS (10) at most
+    timeout: 480
     fallback: final_report
 
   ci_diagnose:
