@@ -84,7 +84,13 @@ When that second write fails, each note gains ", candidate tree dirty, whether
 the declared commands modified it is unknown" and nothing is rerun.
 When the tree changed, the declared commands modified it (a regenerate-then-diff
 command, say), no red record gets "tree-state", and each note gains ", the
-declared commands modified the tree". Otherwise, on a dirty tree, every red
+declared commands modified the tree". When HEAD is not the diff base (both
+resolved with `git rev-parse --verify <rev>^{commit}`; any failure counts as
+not), the uncommitted tree is not the whole change, so nothing is rerun and
+each note gains ", candidate tree dirty beside commits since the diff base"
+instead. A run that commits some work and leaves the rest uncommitted thus
+gets no tree-state release: a false block, never a false pass, so commit
+before review or review the worktree spec. Otherwise, on a dirty tree, every red
 record held to exit 0 that neither timed out nor was killed by a signal (exit
 128 or above) runs once more, inside the same deadline and in
 the same subdirectory, in a second detached worktree (hooks disabled the same
@@ -164,6 +170,7 @@ TREE_STATE_NOTE = (
     "candidate tree dirty: red only in the live tree; the same content on a clean checkout exits 0"
 )
 DIRTY_TREE_NOTE = ", candidate tree dirty"
+DIRTY_BESIDE_COMMITS_NOTE = ", candidate tree dirty beside commits since the diff base"
 UNKNOWN_TREE_NOTE = ", candidate tree state unknown"
 UNKNOWN_CHANGE_NOTE = ", candidate tree dirty, whether the declared commands modified it is unknown"
 MODIFIED_TREE_NOTE = ", the declared commands modified the tree"
@@ -473,6 +480,16 @@ def sparse_checkout(top, deadline):
         return False
 
 
+def head_is_base(top, diff_base, deadline):
+    """Whether HEAD is the diff base, so that the uncommitted tree is the whole change."""
+    try:
+        head = git_text(["rev-parse", "--verify", "HEAD^{commit}"], top, snapshot_budget(deadline))
+        base = git_text(["rev-parse", "--verify", f"{diff_base}^{{commit}}"], top, snapshot_budget(deadline))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+    return bool(head) and head == base
+
+
 def snapshot_tree(top, work, index, deadline):
     """The tree id of HEAD plus the live tree's tracked and untracked, non-ignored files,
     written through the temporary index file `index` under `work`."""
@@ -644,7 +661,8 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work, befo
     if not reds:
         return
     commit, suffix = tree_outcome(before, work, deadline)
-    classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, commit)
+    if classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, commit):
+        suffix = DIRTY_BESIDE_COMMITS_NOTE
     for i in reds:
         baseline = results[i]["baseline"]
         if baseline["status"] != "tree-state":
@@ -652,23 +670,29 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work, befo
 
 
 def classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, commit):
+    """Classify each red record against the diff base, first rerunning those held to exit 0
+    on the snapshot `commit` when HEAD is the diff base. True when a snapshot was declined
+    because HEAD is not the diff base."""
     diff_base = state.get("diff_base")
     diff_base = diff_base.strip() if isinstance(diff_base, str) else ""
     if not diff_base:
         for i in reds:
             results[i]["baseline"] = not_run("no diff base was resolved, so nothing to compare against")
-        return
+        return False
     if left(deadline) <= 0:
         for i in reds:
             results[i]["baseline"] = not_run("the deadline was spent before the baseline run")
-        return
+        return False
     try:
         top = git_text(["rev-parse", "--show-toplevel"], proj, left(deadline))
         subdir = git_text(["rev-parse", "--show-prefix"], proj, left(deadline))
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         for i in reds:
             results[i]["baseline"] = not_run(f"the project's git repository could not be read: {e}")
-        return
+        return False
+    beside_commits = bool(commit) and not head_is_base(top, diff_base, deadline)
+    if beside_commits:
+        commit = None
     saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
     worktrees = []
     try:
@@ -681,6 +705,7 @@ def classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, c
     finally:
         for tree in worktrees:
             remove_worktree(top, tree)
+    return beside_commits
 
 
 def compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, deadline, work, saved_runs, worktrees):
