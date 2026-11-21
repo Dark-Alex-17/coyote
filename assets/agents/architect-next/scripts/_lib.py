@@ -356,7 +356,7 @@ STATE_KEYS = (
     "current_task", "current_unit", "run_branch", "group_index", "pending_fixes", "task_rounds",
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",
     "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",
-    "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands",
+    "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands", "verification_changes",
     "quality_rigor", "quality_surfaces", "round_log", "open_questions", "carried_questions",
     "rigor_proposal", "surfaces_proposal", "quality_evidence", "quality_recorded",
     "checklist_labels", "checklist_findings", "checklist_items", "checklist_done",
@@ -495,6 +495,7 @@ def raise_escalation(state, updates, esc):
     updates["last_answer_text"] = ""
     updates["reask_rounds"] = 0
     updates["reply_interpreted"] = False
+    updates["answer_reason"] = ""
     updates["_next"] = "escalate_gate"
     return updates
 

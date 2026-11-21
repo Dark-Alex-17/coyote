@@ -182,6 +182,8 @@ initial_state:
   # --- orient ---
   conventions_summary: ''
   verification_commands: '[]'
+  verification_proposal: {}
+  verification_changes: []
   local_run_recipe: ''
   consumer_surfaces: []
   convention_discrepancies: []
@@ -283,6 +285,7 @@ initial_state:
   fix_return_to: ''
   fix_origin_return: ''
   fix_note: ''
+  fix_failed_command: ''
   verify_scope: 'task'
   verify_unit: ''
   verify_lane: ''
@@ -348,6 +351,9 @@ initial_state:
   reply_clarify: ''
   reply_accepts: ''
   reply_interpreted: false
+  reply_source: ''
+  answer_reason: ''
+  judge_rulings: {}
   discussion: {}
   discussion_run_id: ''
   discussion_message: ''
@@ -2244,13 +2250,61 @@ nodes:
     fallback: interpret_route
     next: interpret_route
 
+  headless_judge:
+    id: headless_judge
+    type: llm
+    description: >-
+      Decide a question no human is available to answer and that recommends no
+      option: one of its options, or an instruction it accepts, with the reason.
+    instructions: |
+      No human is available and the run has asked you to decide this question.
+      Weigh its evidence and pick the option that best serves the run. Going on
+      is right when the evidence gives a concrete reason the next attempt can
+      succeed; stopping is right when it does not. If the question accepts an
+      instruction and none of the options fits, give that instruction. State
+      your reason in one or two sentences, grounded in the evidence.
+      Output reply_verdict, reply_option (the option's exact text) or
+      reply_instruction and reply_value, reply_reason, and anomalies (anything
+      outside this step's job someone should know; empty is the normal case).
+    prompt: |
+      ## Question, evidence and options
+      {{ask_question}}
+
+      ## The escalation
+      {{escalation}}
+
+      ## Accepted instructions
+      {{reply_accepts}}
+    tools: []
+    timeout: 120
+    output_schema:
+      type: object
+      properties:
+        reply_verdict:
+          type: string
+          enum: [option, instruction]
+        reply_option: { type: string }
+        reply_instruction: { type: string }
+        reply_value: { type: string }
+        reply_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [reply_verdict, reply_reason]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: interpret_route
+    next: interpret_route
+
   interpret_route:
     id: interpret_route
     type: script
     description: >-
       An option or an accepted instruction is applied through apply_answer, a
       discussion goes to choice_park, an unclear reply gets one clarifying
-      question, and an interpreter fault falls back to parse_answer's re-ask.
+      question, and an interpreter fault falls back to parse_answer's re-ask. A
+      headless judge ruling is applied the same way and never re-asked; a faulty
+      ruling gets one more judge turn, then the run ends blocked.
     script: scripts/interpret_route.py
     fallback: end_failure
 
@@ -2260,7 +2314,9 @@ nodes:
     description: >-
       Number or text -> option; the first typed reply that names no option goes to
       interpret_reply; after that, unparseable re-asks (B22) then the free text
-      stands; clears the parked marker; ledgers the decision.
+      stands; clears the parked marker; ledgers the decision. The headless reply
+      takes the recommended option, or with none recommended goes to
+      headless_judge (at most STRIKE_LIMIT rulings per kind and task).
     script: scripts/parse_answer.py
     fallback: end_failure
 

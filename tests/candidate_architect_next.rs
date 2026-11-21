@@ -3093,10 +3093,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4441, 4450],
+        vec![51, 4727, 4736],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4441, 4450] {
+    for line in [4727, 4736] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -5215,6 +5215,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("gate1", "timeout", 3600),
     ("gate2", "max_attempts", 2),
     ("gate2", "timeout", 3600),
+    ("headless_judge", "timeout", 120),
     ("hygiene_create", "timeout", 600),
     ("intake", "timeout", 120),
     ("integrate_findings", "max_iterations", 20),
@@ -5682,6 +5683,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("classify_reply", AnomaliesChannel::Plain),
     ("draft_brief", AnomaliesChannel::Plain),
     ("frame_questions", AnomaliesChannel::Plain),
+    ("headless_judge", AnomaliesChannel::Plain),
     ("integrate_findings", AnomaliesChannel::Plain),
     ("interpret_reply", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
