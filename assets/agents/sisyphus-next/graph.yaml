@@ -1335,7 +1335,8 @@ nodes:
       top-level runs go through ask_owner first when the fork provides it; a
       malformed escalation -> end_blocked instead of a prompt. A multiple-choice
       decision the run already answered once (answered_decisions) is asked at the
-      typed prompt instead of the picker.
+      typed prompt instead of the picker; plan_defect is always asked at the typed
+      prompt, so the engine's no-human reply to it reaches the headless judge.
     script: scripts/ask_dispatch.py
     fallback: end_failure
 
@@ -1525,8 +1526,9 @@ nodes:
       instruction and none of the options fits, give that instruction. State
       your reason in one or two sentences, grounded in the evidence.
       A recommended mark is the gate's default, not a verdict; weigh the evidence.
-      On an option that asks you to state something (an amendment, a fix),
-      give the matching instruction with its text instead of the bare option.
+      On an option that asks you to state something (an amendment, a fix, what
+      to provide, how to narrow), give the matching instruction with its text
+      instead of the bare option; your reason is never taken as that text.
       When the escalation's data carries judge_fault, a previous answer to
       this question was rejected for the reason it states.
       Output reply_verdict, reply_option (the option's exact text) or

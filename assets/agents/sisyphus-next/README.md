@@ -254,8 +254,11 @@ or none recommended keep today's typed prompt (`ask_user`) with their options un
 `handoff_confirm` and `draft_confirm` keep their own approval nodes
 (`OWN_PROMPT_KINDS`). `review_incomplete`, which recommends none of its options, is asked at
 the typed prompt, so a run with no human reaches the headless judge for it instead of an
-approval node's first option. A decision the run already answered once (`answered_decisions`,
-recorded by `apply_answer` when it acts on an answer) is not settled by the recommended default
+approval node's first option. `plan_defect` recommends an option but is asked at the typed
+prompt too (`TYPED_PROMPT_KINDS`): its amend and fix options ask for stated text, and only the
+typed prompt's no-human reply reaches the headless judge. A decision the run already answered once (`answered_decisions`,
+recorded by `apply_answer` whenever the answer settles it, terminal fallbacks included, and
+never when it asks again, interprets or sends the reply to the judge) is not settled by the recommended default
 again: `ask_dispatch` asks a repeated multiple-choice decision at the typed prompt, since the
 engine answers a picker with its recommended option when no human is there, and `parse_answer`
 sends the engine's no-human reply to a repeated decision to the headless judge. A hard trigger
@@ -369,8 +372,12 @@ no amendment never amends: when the ladder, the navigator or the engine's headle
 it, the headless judge rules again (with a `judge_fault` naming the missing amendment, at most
 `STRIKE_LIMIT` times per decision); otherwise it is a fix round on the whole finding. A stated
 amendment is recorded with its author: the user, the navigator, the ladder or the headless
-judge. The judge's own option pick of amend or fix carries no note, since its reason is neither
-an amendment nor a fix.
+judge. The judge's own pick of an option whose stated text is what the run acts on (amend, fix,
+supply the probe, narrow the scope: `STATED_TEXT_OPTIONS`) carries no note, since its reason is
+not that text. A `probe_gap` supply pick that states nothing to provide never starts a coder
+round: when the ladder, the navigator or the engine's headless answer made it, the headless
+judge rules again (with the `PROBE_GAP_NO_SUPPLY` `judge_fault`, under the same
+`STRIKE_LIMIT` cap and never on a hard trigger); otherwise the gap is surfaced as a follow-up.
 
 A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
 attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and

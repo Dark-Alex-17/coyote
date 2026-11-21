@@ -1968,7 +1968,7 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "a = _answered(state, {\"stop\": [\"stop\"], \"skip\": [\"skip\"], \"fix\": [\"fix\", \
                  \"address\"]})",
                 "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is \
-                 interpreted, never a stop",
+                 interpreted, never a stop; a bare stop still stops",
             ),
             (
                 "consume-vehicle",
@@ -2088,14 +2088,14 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "        if truthy(state.get(\"top_level\")):\n            # never silently",
                 "        if False:\n            # never silently",
                 "record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, \
-                 never trimmed",
+                 never trimmed; asked again after the first verdict, at the typed prompt",
             ),
             (
                 "overflow-no-here",
                 "    if planned is None:\n        opts.append(",
                 "    if True:\n        opts.append(",
                 "record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, \
-                 never trimmed",
+                 never trimmed; asked again after the first verdict, at the typed prompt",
             ),
         ],
     );

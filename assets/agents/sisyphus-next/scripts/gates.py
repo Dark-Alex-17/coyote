@@ -1355,6 +1355,7 @@ def _scope_guards(state):
 
 # who wrote a plan amendment: the spec label after "AMENDED by", and the ledger's tag
 AMENDMENT_AUTHORS = {
+    # nothing records it any more; a parked state resumed from an older run can still carry it
     "default": ("default (no amendment was stated; resolves the adversary's finding)", "default, no amendment stated"),
     "judge": ("the headless judge", "headless judge"),
     "ladder": ("the autonomy ladder", "ladder"),
@@ -1559,6 +1560,9 @@ def _decision_key(state, esc):
 # ====================================================================== 2.3
 # escalation kinds whose fixed options have an approval node of their own, never a multiple-choice prompt
 OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm")
+# escalation kinds kept at the typed prompt although an option is recommended: their options ask for stated text a
+# picker reply cannot carry, and only the typed prompt's no-human reply reaches the headless judge
+TYPED_PROMPT_KINDS = ("plan_defect",)
 
 
 def normalize_choices(state, u, esc):
@@ -1569,7 +1573,7 @@ def normalize_choices(state, u, esc):
     recommended keep the first; the recommended option moves first. Nothing is trimmed: a kind with more options, or
     with no recommended one, keeps today's typed prompt and its options as they were.
     """
-    if esc.get("kind") in OWN_PROMPT_KINDS:
+    if esc.get("kind") in OWN_PROMPT_KINDS + TYPED_PROMPT_KINDS:
         return None
     opts = [{"text": str(o.get("text")).strip(), "recommended": truthy(o.get("recommended")),
              "evidence": str(o.get("evidence") or "").strip()}
@@ -1951,6 +1955,9 @@ YELLOW_FIX = "Fix it"
 YELLOW_ACCEPT = "Accept it (recorded)"
 DESIGN_ADOPT = "Adopt the pattern (one more coder round introduces it)"
 DESIGN_KEEP = "Keep the code as shipped (answer recorded, no change)"
+# options a model-made pick can reach whose stated text is what the run acts on (an amendment, a fix, a scope, a
+# recipe); an option that asks only for its reason, like PLAN_DEFECT_ACCEPT, takes a judge's why as that reason
+STATED_TEXT_OPTIONS = (PLAN_DEFECT_CONTINUE, PLAN_DEFECT_FIX, SCOPE_NARROW, PROBE_SUPPLY)
 
 # The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
 ACCEPTED_INSTRUCTIONS = {
@@ -2146,8 +2153,8 @@ def _judge_route(state, u, esc, verdict, shape):
         return u
     line = f"{kind}: {answer} (basis: headless judge: {reason})"
     # an option pick carries the reason as its note, so a branch that records the stated reason records the judge's;
-    # the why behind a plan_defect amend or fix pick is neither an amendment nor a fix, so that pick stays bare
-    bare = kind == "plan_defect" and answer in (PLAN_DEFECT_CONTINUE, PLAN_DEFECT_FIX)
+    # the why behind a pick whose option asks for text to act on is not that text, so that pick stays bare
+    bare = answer in STATED_TEXT_OPTIONS
     picked = f"{answer}: {reason}" if verdict == "option" and not bare else answer
     u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": picked,
               "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False,
@@ -2278,12 +2285,13 @@ def _answered(state, choices):
 
 
 def _unmatched(state, u, esc, answer, exhausted=None):
-    """An answer that names no option goes to interpret_reply once per question, then is asked again.
+    """An answer that names no option goes to interpret_reply once per question, then is asked again; an empty one,
+    which gives the interpreter nothing to read, is asked again straight away.
 
     The one-shot flag lives in the escalation's own data, since parse_answer resets reply_interpreted before
     apply_answer runs."""
     data = as_dict(esc.get("data"))
-    if truthy(data.get("reply_read")):
+    if truthy(data.get("reply_read")) or not (answer or "").strip():
         _reask_unmatched(state, u, esc, answer, exhausted=exhausted)
         return
     kind = esc.get("kind", "")
@@ -2397,6 +2405,15 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
 
 PLAN_DEFECT_NO_AMENDMENT = ("the amend option was taken with no amendment stated; give the amendment instruction with "
                             "its text, the fix instruction with its text, or another option")
+PROBE_GAP_NO_SUPPLY = ("the supply option was taken with nothing stated to provide; give the recipe instruction with "
+                       "what to provide, or another option")
+
+
+def _judge_may_rule(state, esc):
+    """Whether an automatic pick that states none of its option's text goes back to the headless judge: a model made
+    it, the question is no hard trigger, and the judge has rulings left on this decision."""
+    return state.get("answer_source") in ("ladder", "navigator", "headless") and not esc.get("hard_trigger") \
+        and as_int(as_dict(state.get("judge_rulings")).get(_decision_key(state, esc))) < STRIKE_LIMIT
 
 
 def apply_answer(state):
@@ -2644,8 +2661,7 @@ def apply_answer(state):
             ledger(state, u, f"plan defect: accepted unresolved after {used}/{STRIKE_LIMIT} continues: "
                              f"{tail(why, 300)}")
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
-        elif bare_amend and source in ("ladder", "navigator", "headless") and not esc.get("hard_trigger") \
-                and as_int(as_dict(state.get("judge_rulings")).get(_decision_key(state, esc))) < STRIKE_LIMIT:
+        elif bare_amend and _judge_may_rule(state, esc):
             # an automatic pick states no amendment, so the judge rules again with the amendment text or another option
             fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": PLAN_DEFECT_NO_AMENDMENT}}
             u["escalation"] = fixed
@@ -2682,14 +2698,23 @@ def apply_answer(state):
             _unmatched(state, u, esc, answer)
     elif kind == "probe_gap":
         a = _answered(state, {"supply": ["supply", "provide"], "surface": ["surface", "proceed"]})
+        supplied = _stated_reason(answer, options)
         if a is None:
             _unmatched(state, u, esc, answer)
-        elif a == "supply":
-            reason = _stated_reason(answer, options)
+        elif a == "supply" and supplied != NO_STATED_REASON:
             u["fix_source"] = "probe_gap"
-            u["fix_note"] = answer if reason == NO_STATED_REASON else reason
+            u["fix_note"] = supplied
             u["_next"] = "compose_fix"
+        elif a == "supply" and _judge_may_rule(state, esc):
+            # nothing to provide was stated, so the coder would get the option label as its brief
+            fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": PROBE_GAP_NO_SUPPLY}}
+            u["escalation"] = fixed
+            ledger(state, u, f"probe gap: supply picked by the {state.get('answer_source')} with nothing stated to "
+                             f"provide -> headless judge")
+            _to_headless_judge(state, u, fixed)
         else:
+            if a == "supply":
+                ledger(state, u, "probe gap: supply picked with nothing stated to provide -> the gap is surfaced")
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 "Consumer-facing change could not be exercised locally (probe INCONCLUSIVE): "
                 "provide the local-run recipe / fixture and re-probe"]
@@ -3009,7 +3034,7 @@ def apply_answer(state):
         queue = [q for q in as_list(state.get("pr_review_queue")) if isinstance(q, dict)]
         judged = [j for j in as_list(data.get("judgment")) if isinstance(j, dict)]
         noaction = [n for n in as_list(data.get("noaction")) if isinstance(n, dict)]
-        # a stop is the whole reply or the stop option; "please address these, don't stop" is a fix
+        # a stop is the whole reply or the stop option; "please address these, don't stop" names no option, so it is interpreted
         a = "stop" if stop else _answered(state, {"skip": ["skip"], "fix": ["fix", "address"], "stop": ["stop"]})
         skipped = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
                     "reason": "skipped at the owner's say-so"} for j in judged]
