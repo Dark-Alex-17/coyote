@@ -6656,6 +6656,32 @@ with scenario("probe adoption: the adoption round's ledger line says what its pr
     check(name, any("the prompt carries no local-run recipe or usage suites" in d for d in u["decisions"])
           and not any("cannot write tests" in d for d in u["decisions"]), u["decisions"])
 
+# ---------------------------------------------------------------- the coder sees the review's verification commands
+DECLARED = json.dumps(["./check --filter export_order", "./lint"])
+with scenario("render_coder_prompt: the first coder prompt lists the declared verification commands as context") as name:
+    prompt = gates.render_coder_prompt(base_state(verification_commands=DECLARED))["coder_prompt"]
+    context = prompt.split("## CONTEXT", 1)[-1]
+    check(name, "The review reruns these declared verification commands against the change:\n"
+                "- ./check --filter export_order\n- ./lint" in context, prompt[-800:])
+with scenario("render_coder_prompt: a fix round lists the commands the last review ran, criterion commands "
+              "included") as name:
+    fixed = gates.compose_fix(base_state(fix_source="review", fix_items=["adversary: DIVERGES"]))
+    prompt = gates.render_coder_prompt(base_state(**{k: v for k, v in fixed.items() if k != "_next"},
+                                                  verification_commands=DECLARED,
+                                                  review_verification_commands=json.dumps(
+                                                      ["./check --filter export_order", "./lint", "./run-cli export"])))[
+        "coder_prompt"]
+    check(name, "## FIX ROUND 1" in prompt and "- ./run-cli export" in prompt.split("## CONTEXT", 1)[-1], prompt[-800:])
+with scenario("lane_stuck: the same review_key with reworded findings is unchanged review input -> lane_stuck, not a "
+              "new class of findings") as name:
+    heads = [{"round": i + 1, "head": SNAP_HEAD, "code_tree": tree_2, "review_key": "same-inputs",
+              "lane_blockers": {"adversary": [f]}} for i, f in enumerate([A6_FINDING, A6_OTHER])]
+    u = gates.triage_route(base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, review_rounds=1,
+                                      triage=[{"finding": A6_OTHER, "action": "fix", "lane": "adversary"}],
+                                      lane_block_streak={"adversary": 1}, round_heads=heads))
+    check(name, gates._repeat_block(base_state(round_heads=heads), SNAP_REPO, "adversary", [A6_OTHER]) == "unchanged"
+          and u.get("escalation", {}).get("kind") == "lane_stuck", (u.get("_next"), u.get("lane_block_streak")))
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)

@@ -3037,6 +3037,9 @@ def render_coder_prompt(state):
                           "## TASK; later subtasks deliver the rest, and a final whole-task review checks these):", spec]
         else:
             parts += ["", "Acceptance criteria (verbatim):", spec]
+    if commands := _declared_commands(state):
+        parts += ["", "The review reruns these declared verification commands against the change:"]
+        parts += [f"- {c}" for c in commands]
     if state.get("quality_rigor"):
         parts += ["", f"Quality bar: rigor={state.get('quality_rigor')}, surfaces={state.get('quality_surfaces') or ''}"]
     for n in as_list(brief.get("skill_nudges")):
@@ -3055,6 +3058,16 @@ def render_coder_prompt(state):
     write_artifact(state.get("run_dir", ""), f"coder-prompt-{as_int(state.get('fix_round'))}.md", prompt)
     u["_next"] = "check_inbox_pre" if truthy(state.get("parallel_mode")) else "run_coder"
     return u
+
+
+def _declared_commands(state):
+    """The verification commands the review reruns: the last review's list once a review ran, else the declared one."""
+    raw = state.get("review_verification_commands") or state.get("verification_commands") or "[]"
+    try:
+        arr = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    return [c.strip() for c in arr if isinstance(c, str) and c.strip()] if isinstance(arr, list) else []
 
 
 def inbox_route(state):
@@ -4402,6 +4415,9 @@ def _repeat_block(state, root, lane, fixes):
     if len(rounds) < 2:
         return "unknown"
     prev, cur = rounds[-2], rounds[-1]
+    if prev.get("review_key") and prev.get("review_key") == cur.get("review_key"):
+        # the same tree, prompt and verification commands: reworded findings are not a new class
+        return "unchanged"
     before = as_list(as_dict(prev.get("lane_blockers")).get(lane))
     after = as_list(as_dict(cur.get("lane_blockers")).get(lane)) or fixes
     if before and _findings_changed(before, after):
