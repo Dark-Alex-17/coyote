@@ -37238,16 +37238,20 @@ print(json.dumps({
             return;
         }
         // A copy outside assets/agents/adversary/scripts cannot resolve
-        // ../../.shared, which is exactly the broken-install shape.
+        // ../../.shared, which is exactly the broken-install shape. Its
+        // sibling module ships with it, as in any install.
         let dir = utils::temp_file("-debris-orphan-verdict-", "");
         create_dir_all(&dir).unwrap();
         let script = dir.join("verdict.py");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/agents/adversary/scripts/verdict.py"),
-            &script,
-        )
-        .unwrap();
+        for name in ["verdict.py", "pass_condition.py"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets/agents/adversary/scripts")
+                    .join(name),
+                dir.join(name),
+            )
+            .unwrap();
+        }
         let run = |state: serde_json::Value| -> String {
             let out = Command::new("python3")
                 .arg(&script)
