@@ -177,7 +177,7 @@ write(PLAN, PLAN_TEXT)
 
 def base_state(**over):
     s = FIXTURE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
-                        task_granularity="standard", auto_confirm="1")
+                        task_granularity="standard", auto_confirm="1", build_lock="")
     s.update(FIXTURE.normalized())
     s.update({"code_repo_path": CODE, "git_root": CODE, "reference_root_path": TMP, "design_doc_path": DESIGN,
               "run_id": "x", "run_dir": os.path.join(os.environ["ARCHITECT_RUNS_ROOT"], "x"), "decisions": [], "anomalies": [],
@@ -3677,36 +3677,39 @@ def render_inputs(node, state, nodes=None):
 
 
 check("graph: delegate and wave_delegate run sisyphus-next; wave_delegate keeps teammates; their inputs are exactly review_cadence / parallel / "
-      "project_dir / escalation_policy",
+      "project_dir / escalation_policy / build_lock",
       all(NODES.get(n, {}).get("agent") == "sisyphus-next"
-          and sorted(NODES.get(n, {}).get("inputs") or {}) == ["escalation_policy", "parallel", "project_dir", "review_cadence"]
+          and sorted(NODES.get(n, {}).get("inputs") or {}) == ["build_lock", "escalation_policy", "parallel", "project_dir", "review_cadence"]
           for n in ("delegate", "wave_delegate")) and NODES.get("wave_delegate", {}).get("teammates") is True
       and all(SEEDS.get(k) is not None for k in ("delegate_review_cadence", "delegate_parallel", "delegate_project_dir")),
       {n: (NODES.get(n, {}).get("agent"), NODES.get(n, {}).get("inputs")) for n in ("delegate", "wave_delegate")})
 check("graph: delegate inputs - sequential standard -> review_cadence=task, parallel=0, project_dir=the code repo",
       render_inputs("delegate", {**base_state(), **U_SEQ}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE,
-                                                               "escalation_policy": "interactive"},
+                                                               "escalation_policy": "interactive", "build_lock": ""},
       render_inputs("delegate", {**base_state(), **U_SEQ}))
 check("graph: delegate inputs - micro -> review_cadence=batch, parallel=0, project_dir=the code repo",
       render_inputs("delegate", {**base_state(), **U_MICRO}) == {"review_cadence": "batch", "parallel": "0", "project_dir": CODE,
-                                                                 "escalation_policy": "interactive"},
+                                                                 "escalation_policy": "interactive", "build_lock": ""},
       render_inputs("delegate", {**base_state(), **U_MICRO}))
 check("graph: wave_delegate inputs - wave item -> parallel=1, project_dir=the item's worktree, review_cadence=the item's (task)",
       render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}) == {"parallel": "1", "project_dir": WAVE[0]["worktree"], "review_cadence": "task",
-                                                                             "escalation_policy": "interactive"},
+                                                                             "escalation_policy": "interactive", "build_lock": ""},
       render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}))
 check("graph: delegate inputs - a relay resume carries the same inputs as the delegation it resumes (code repo, task cadence, parallel=0)",
       render_inputs("delegate", {**base_state(), **U_RESUME}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE,
-                                                                  "escalation_policy": "interactive"},
+                                                                  "escalation_policy": "interactive", "build_lock": ""},
       render_inputs("delegate", {**base_state(), **U_RESUME}))
 check("graph: delegate inputs - a wave member retried sequentially keeps its worktree as project_dir",
       render_inputs("delegate", {**base_state(), **U_RETRY}) == {"review_cadence": "task", "parallel": "0", "project_dir": WAVE[0]["worktree"],
-                                                                 "escalation_policy": "interactive"},
+                                                                 "escalation_policy": "interactive", "build_lock": ""},
       render_inputs("delegate", {**base_state(), **U_RETRY}))
-policy_in = {(n, p): render_inputs(n, {**base_state(escalation_policy=p), **U_SEQ, "wtask": WAVE[0]})
+LOCK = "flock -w 9 /tmp/x.lock"
+policy_in = {(n, p): render_inputs(n, {**base_state(escalation_policy=p, build_lock=LOCK), **U_SEQ, "wtask": WAVE[0]})
              for n in ("delegate", "wave_delegate") for p in ("autonomous", "interactive")}
-check("graph: delegate and wave_delegate hand the architect's escalation_policy to sisyphus-next, autonomous and interactive alike",
-      all(v.get("escalation_policy") == p for (_, p), v in policy_in.items()), policy_in)
+check("graph: delegate and wave_delegate hand the architect's escalation_policy and build_lock to sisyphus-next, autonomous and interactive alike",
+      all(v.get("escalation_policy") == p and v.get("build_lock") == LOCK for (_, p), v in policy_in.items()), policy_in)
+lock_in = {n: render_inputs(n, {**base_state(build_lock=LOCK), "wtask": WAVE[0]}).get("build_lock") for n in ("run_gauntlet", "wave_gauntlet", "run_adversary")}
+check("graph: run_gauntlet, wave_gauntlet and run_adversary hand the architect's build_lock to their child", all(v == LOCK for v in lock_in.values()), lock_in)
 # The child's own escalate_gate over the delegate inputs: the battery drops LLM_AGENT_VAR_*, so only an input can carry the policy.
 for policy, sn_next in (("autonomous", "ladder_judge"), ("interactive", "ask_dispatch")):
     p, sn_gate = sisyphus_next_call("escalate_gate", {**render_inputs("delegate", {**base_state(escalation_policy=policy), **U_SEQ}),
@@ -5873,8 +5876,8 @@ u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids
                                 task_granularity="micro"))
 micro_wave = [render_inputs("wave_delegate", {**base_state(), "wtask": w}) for w in u["wave"]]
 micro_wave_ok = (len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
-                 and micro_wave == [{"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch", "escalation_policy": "interactive"}
-                                    for w in u["wave"]]
+                 and micro_wave == [{"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch", "escalation_policy": "interactive",
+                                     "build_lock": ""} for w in u["wave"]]
                  and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
 check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree", micro_wave_ok, micro_wave)
 

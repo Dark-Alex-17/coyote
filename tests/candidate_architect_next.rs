@@ -3240,9 +3240,10 @@ fn conformance_nodes_forward_debris_exclude_to_every_reviewer() {
 }
 
 /// The README's `build_lock` row names five agent nodes, the agent each runs,
-/// that each of those agents declares `build_lock` itself, and the engine
-/// paths and test pin that make inheritance a fact. All of them must exist as
-/// named.
+/// and that each of those agents declares `build_lock` itself. A CLI root's
+/// agent variables do not reach agent-node children, so each of the five
+/// passes `build_lock` through `inputs:`, and the two `sisyphus-next`
+/// delegates pass `escalation_policy` the same way.
 #[test]
 fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -3274,14 +3275,25 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
             Some(agent),
             "README says {node} runs {agent}"
         );
-        assert!(
-            nodes[node].get("inputs").is_none()
-                || !nodes[node]["inputs"]
-                    .as_mapping()
-                    .is_some_and(|m| m.contains_key(serde_yaml::Value::from("build_lock"))),
-            "README says no `inputs: build_lock` is needed on {node}; one appeared"
+        assert_eq!(
+            nodes[node]["inputs"]["build_lock"].as_str(),
+            Some("{{build_lock}}"),
+            "README says {node} passes build_lock through inputs: {:?}",
+            nodes[node]
         );
+        if agent == "sisyphus-next" {
+            assert_eq!(
+                nodes[node]["inputs"]["escalation_policy"].as_str(),
+                Some("{{escalation_policy}}"),
+                "{node} must pass escalation_policy through inputs: {:?}",
+                nodes[node]
+            );
+        }
     }
+    assert!(
+        row.contains("each pass `build_lock: '{{build_lock}}'` through `inputs:`"),
+        "the README build_lock row no longer says the five nodes pass it through inputs: {row}"
+    );
     for (agent, file) in [
         ("sisyphus-next", "graph.yaml"),
         ("review-gauntlet", "graph.yaml"),
@@ -3291,27 +3303,6 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         assert!(
             names_of(&vars).contains(&"build_lock"),
             "README says {agent} declares build_lock itself"
-        );
-    }
-
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for (file, needle) in [
-        (
-            "function/agents.rs",
-            "fn run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default",
-        ),
-        ("graph/agent.rs", "run_agent_for_graph"),
-        ("graph/executor.rs", "fn seed_variables"),
-        ("config/request_context.rs", "fn new_for_child"),
-    ] {
-        assert!(
-            row.contains(needle.trim_start_matches("fn ")),
-            "the README build_lock row no longer cites {needle} from `{file}`"
-        );
-        let source = fs::read_to_string(src.join(file)).unwrap();
-        assert!(
-            source.contains(needle),
-            "README cites `{file}` {needle}; it is not there"
         );
     }
 }
@@ -3453,7 +3444,7 @@ fn info_variables(stdout: &str) -> Vec<&str> {
 /// variables block carries `build_lock` with its empty default between
 /// `pr_strategy` and `task_granularity`, and a consumer's
 /// `--agent-variable build_lock <cmd>` is seated over that default (the value
-/// every agent-node child then inherits).
+/// the five `build_lock` child nodes then pass through `inputs:`).
 #[test]
 fn info_by_name_lists_the_graph_and_seats_a_build_lock_override() {
     let scratch = scratch_dir("info");
@@ -5087,23 +5078,36 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
     );
 }
 
-/// `build_lock` reaches every child by variable inheritance, so no node in
-/// the graph threads it through `inputs:`; the variable declaration is the
-/// one line of `graph.yaml` that names it.
+/// A CLI root's agent variables do not reach agent-node children, so the
+/// five nodes whose agents declare `build_lock` thread it through `inputs:`
+/// and no other node does; apart from those inputs, the variable declaration
+/// is the one line of `graph.yaml` that names it.
 #[test]
-fn no_node_threads_build_lock_through_inputs() {
+fn only_the_build_lock_children_thread_it_through_inputs() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
-    for (id, node) in doc["nodes"].as_mapping().unwrap() {
-        assert!(
-            !node["inputs"]
-                .as_mapping()
-                .is_some_and(|m| m.contains_key(serde_yaml::Value::from("build_lock"))),
-            "{id:?} threads build_lock through inputs: {node:?}"
-        );
-    }
+    let threading: BTreeSet<&str> = doc["nodes"]
+        .as_mapping()
+        .unwrap()
+        .iter()
+        .filter(|(_, node)| !node["inputs"]["build_lock"].is_null())
+        .map(|(id, _)| id.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        threading,
+        BTreeSet::from([
+            "delegate",
+            "run_adversary",
+            "run_gauntlet",
+            "wave_delegate",
+            "wave_gauntlet",
+        ]),
+        "the nodes that thread build_lock through inputs"
+    );
     let mentions: Vec<&str> = text.lines().filter(|l| l.contains("build_lock")).collect();
-    assert_eq!(mentions, ["  - name: build_lock"], "graph.yaml");
+    let mut expected = vec!["  - name: build_lock"];
+    expected.extend(["      build_lock: '{{build_lock}}'"; 5]);
+    assert_eq!(mentions, expected, "graph.yaml");
 }
 
 /// The artifact re-entry contract means no session-id ledger and no resume
@@ -5969,13 +5973,13 @@ fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
     );
 }
 
-/// The `build_lock` variable row as it landed with the variable; the
-/// threading row beside it must not reword it.
-const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus-next`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |";
+/// The `build_lock` variable row; the threading row beside it must not
+/// reword it.
+const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` and five nodes' `inputs:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. A CLI root's agent variables do not reach its agent-node children (a child graph seats only its own declared defaults), so `delegate` and `wave_delegate` (`sisyphus-next`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) each pass `build_lock: '{{build_lock}}'` through `inputs:`, as `sisyphus-next` does toward its own children; the engine seeds an input into the child's initial state ahead of its declared defaults, so the architect's value wins. Each of the three agents behind those five nodes declares `build_lock` itself |";
 
-/// Every agent the graph delegates to that declares no `build_lock` receives
-/// the inherited value without consuming it: none of its own files names
-/// the variable or the shared helpers that run a build under it, and the
+/// Every agent the graph delegates to that declares no `build_lock` gets no
+/// `build_lock` input and consumes none: none of its own files names the
+/// variable or the shared helpers that run a build under it, and the
 /// README's threading row says so for exactly those children, librarian
 /// among them as the one graph agent.
 #[test]
