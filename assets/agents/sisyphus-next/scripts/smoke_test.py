@@ -6325,11 +6325,15 @@ with scenario("base control: a second green at the HEAD already checked flips at
     base_seams()
     u = gates.ci_route(base_run_state(checked_run, base_checked_head=scratch_git(checked_run, "rev-parse", "HEAD")))
     check(name, u.get("_next") == "final_report" and os.path.exists(_BASE_READY), u.get("decisions"))
-with scenario("base: an unparseable base_moved answer is asked again, with no git_task and no flip") as name:
+with scenario("base: an unparseable base_moved answer goes to the reply interpreter once, then is asked again, with no "
+              "git_task and no flip") as name:
     unparsed_run, _bare, _push = base_world("unparsed")
     base_seams()
     u = gates.apply_answer(base_run_state(unparsed_run, escalation=base_question("a" * 40), last_answer="banana bread"))
-    check(name, u.get("_next") == "ask_dispatch" and not u.get("git_task") and not os.path.exists(_BASE_READY), u)
+    again = gates.apply_answer(base_run_state(unparsed_run, escalation=u.get("escalation"), last_answer="banana bread"))
+    check(name, u.get("_next") == "interpret_reply" and u.get("last_answer_text") == "banana bread"
+          and again.get("_next") == "ask_dispatch" and not u.get("git_task") and not again.get("git_task")
+          and not os.path.exists(_BASE_READY), (u, again.get("_next")))
 with scenario("base: a tip that is not a local commit, an is-ancestor timeout and an is-ancestor error read unchecked, "
               "never moved") as name:
     _run, _bare, _push = base_world("footgun")
@@ -6476,12 +6480,13 @@ with scenario("base: a base_merge whose pre-merge HEAD left the history (a rebas
     check(name, rebased.get("_next") == "git_ops" and rebased.get("base_merge_retries") == 1
           and "no longer in HEAD's history" in (rebased.get("git_task") or {}).get("text", "")
           and unrecorded.get("_next") == "compose_fix", (rebased, unrecorded.get("_next")))
-with scenario("base: a negated or several-option free-text reply to base_moved is asked again; an exact option still "
-              "integrates") as name:
+with scenario("base: a negated or several-option free-text reply to base_moved goes to the reply interpreter, never "
+              "scanned for keywords; an exact option still integrates") as name:
     replies = {r: gates.apply_answer(base_state(escalation=base_question("a" * 40), last_answer=r))
                for r in ("do not integrate, leave it", "integrate or finish, whichever", "Option 1")}
-    check(name, [replies[r].get("_next") for r in replies] == ["ask_dispatch", "ask_dispatch", "git_ops"]
-          and not replies["do not integrate, leave it"].get("git_task"),
+    check(name, [replies[r].get("_next") for r in replies] == ["interpret_reply", "interpret_reply", "git_ops"]
+          and not replies["do not integrate, leave it"].get("git_task")
+          and not replies["integrate or finish, whichever"].get("git_task"),
           {r: u.get("_next") for r, u in replies.items()})
 with scenario("base: conflicts git_ops already staged are still guarded: the staged path joins base_conflicted and "
               "pr_gate sends the markers back to compose_fix") as name:
@@ -6697,6 +6702,28 @@ with scenario("build_gauntlet: the final whole-task review names no carried fail
     gp = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, final_review=True,
                                                 spec_text="AC1", carried_failures=LATER_RED))["gauntlet_prompt"]
     check(name, "Carried-forward test failures" not in gp and "tests/later_test.ext" not in gp, gp)
+
+# ---------------------------------------------------------------- base answers: options only, words interpreted
+with scenario("base: free text to base_merge_failed and base_markers goes to the reply interpreter once, with the "
+              "flag in the escalation, then is asked again") as name:
+    markers = escalation("base_markers", "q", [option(gates.BASE_RESOLVE, True), option("Leave the PR in draft and report")],
+                         data={"markers": "app.txt:3"})
+    firsts = [gates.apply_answer(base_state(escalation=e, last_answer="leave it in draft, retry later", answer_source=""))
+              for e in (_merge_failed, markers)]
+    agains = [gates.apply_answer(base_state(escalation=f["escalation"], last_answer="leave it in draft, retry later",
+                                            reply_interpreted=False))
+              for f in firsts if f.get("escalation")]
+    check(name, [f.get("_next") for f in firsts] == ["interpret_reply"] * 2
+          and all(f["escalation"]["data"].get("base_interpreted") is True and f.get("reply_author") == "owner"
+                  and f.get("reply_accepts") == gates._accepts_text(f["escalation"]["kind"])
+                  and not f.get("git_task") and not f.get("follow_ups") for f in firsts)
+          and [a.get("_next") for a in agains] == ["ask_dispatch"] * 2,
+          ([f.get("_next") for f in firsts], [a.get("_next") for a in agains]))
+with scenario("base: a navigator's free text to a base question is interpreted as the navigator's") as name:
+    u = gates.apply_answer(base_state(escalation=base_question("a" * 40), last_answer="merge it in",
+                                      answer_source="navigator"))
+    check(name, u.get("_next") == "interpret_reply" and u.get("reply_author") == "navigator"
+          and u.get("reply_source") == "navigator", u)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

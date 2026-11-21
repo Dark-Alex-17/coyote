@@ -2764,7 +2764,7 @@ def apply_answer(state):
         a = _base_answer(state, {"integrate": ["integrate"], "finish": ["finish"],
                                  "leave": ["leave", "draft", "report", "stop"]})
         if a is None and not stop:
-            _reask_unmatched(state, u, esc, answer)
+            _base_unmatched(state, u, esc, answer)
         elif a == "integrate" and not stop:
             root = state.get("git_root") or state.get("project_dir") or "."
             u["git_task"] = {"kind": "base_merge", "return_to": "ci_gate", "tip": tip, "remote": data.get("remote"),
@@ -2802,7 +2802,7 @@ def apply_answer(state):
         task = as_dict(as_dict(esc.get("data")).get("task"))
         a = "leave" if stop else _base_answer(state, {"retry": ["retry"], "leave": ["leave", "draft", "report", "stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer)
+            _base_unmatched(state, u, esc, answer)
         elif a == "retry":
             u["git_task"] = task
             u["base_merge_retries"] = 0
@@ -2818,7 +2818,7 @@ def apply_answer(state):
         a = "leave" if stop else _base_answer(state, {"resolve": ["resolve"],
                                                       "leave": ["leave", "draft", "report", "stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer)
+            _base_unmatched(state, u, esc, answer)
         elif a == "resolve":
             u.update(base_marker_retries=as_int(state.get("base_marker_retries")) + 1, fix_source="base_sync",
                      fix_note=str(as_dict(esc.get("data")).get("markers") or ""))
@@ -5555,24 +5555,31 @@ def _base_round_fits(state):
 
 
 def _base_answer(state, choices):
-    """The key a reply to a base question picks: the option it names exactly first, else the one key its free text
-    names. Free text naming several keys, or one after a negation ("do not integrate"), picks none."""
+    """The key a reply to a base question picks through the option it names (its number, its exact text, or
+    "<option>: <note>"), else None; free text is never scanned for keys."""
     ans = (state.get("last_answer") or "").strip()
     named = _named_option(ans, as_dict(state.get("escalation")).get("options") or [])
-    if named:
-        low = named.lower()
-        return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
-                or next((k for k, words in choices.items() if any(w in low for w in words)), None))
-    said = ans.lower()
-    hits, negated = set(), False
-    for key, words in choices.items():
-        for w in words:
-            for m in re.finditer(re.escape(w), said):
-                if re.search(r"\b(?:not|never|no|don't|dont|without)\W+(?:\w+\W+)?$", said[:m.start()]):
-                    negated = True
-                else:
-                    hits.add(key)
-    return next(iter(hits)) if len(hits) == 1 and not negated else None
+    if not named:
+        return None
+    low = named.lower()
+    return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
+            or next((k for k, words in choices.items() if any(w in low for w in words)), None))
+
+
+def _base_unmatched(state, u, esc, answer):
+    """A reply to a base question that names no option is read by the reply interpreter once per question, then
+    asked again. The flag lives in the escalation, since parse_answer resets reply_interpreted before apply_answer."""
+    data = as_dict(esc.get("data"))
+    if truthy(data.get("base_interpreted")):
+        _reask_unmatched(state, u, esc, answer)
+        return
+    kind = esc.get("kind", "")
+    author = "navigator" if state.get("answer_source") == "navigator" else "owner"
+    u.update({"escalation": {**esc, "data": {**data, "base_interpreted": True}}, "last_answer_text": answer,
+              "reply_accepts": _accepts_text(kind), "reply_author": author, "reply_interpreted": False,
+              "reply_source": "navigator" if author == "navigator" else ""})
+    ledger(state, u, f"apply_answer: {kind}: {tail(answer, 200)!r} names no option -> interpret")
+    u["_next"] = "interpret_reply"
 
 
 def _base_left(state, u, status):
