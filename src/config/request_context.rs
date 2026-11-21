@@ -8466,6 +8466,14 @@ mod tests {
             read_to_string(&source).unwrap(),
             "the installed shared module must be the embedded source"
         );
+        let locator = agents.join(".shared").join("failure_locations.py");
+        let locator_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/.shared/failure_locations.py");
+        assert_eq!(
+            read_to_string(&locator).expect(".shared/failure_locations.py must be installed"),
+            read_to_string(&locator_source).unwrap(),
+            "the installed failure-location parser must be the embedded source"
+        );
 
         let repo = debris_repo();
         for wrapper in [

@@ -1,0 +1,97 @@
+"""Failure locations in a test command's output - the ONE copy of the parser.
+
+Consumers: sisyphus-next/scripts/gates.py (the carried-failure gate and the
+verdict-line locations) and adversary/scripts/run_checks.py (matching a red
+run against the failures its caller declares carried). A failure is
+identified by the repo paths it resolves to (a directory ends in "/"), so
+both consumers key on the same evidence. Pure regex over the output plus one
+`git ls-files` for the repo index; no LLM.
+"""
+import os
+import re
+import subprocess
+
+FAILURE_FILE_RE = re.compile(r"(?<![\w.~@+/-])((?:\.\.?/|/)?[\w.~@+-]+(?:/[\w.~@+-]+)*\.[A-Za-z]\w*):\d+")
+FAILURE_SLASH_RE = re.compile(r"[\w.~@+-]*/[\w./~@+-]*")
+FAILURE_WORD_RE = re.compile(r"\b(?:fail|failed|failure|error)\b", re.I)
+FAILURE_LINE_CAP = 4096
+TRIMMED_MARK = "bytes trimmed: output exceeded"
+RUNNER_BANNER_RE = re.compile(r"\S*: \*\*\* \[[^\]]*\] Error \d+\s*$")
+GIT_SECS = 60
+
+
+def parse_failure_locations(tests):
+    """(token, is_file, line) for every path:LINE token, and every slash token on a line carrying a failure word."""
+    out = []
+    for line in tests.splitlines():
+        line = line[:FAILURE_LINE_CAP]
+        if re.match(r"(?:Ran|Ran in|Exit code):", line):
+            continue
+        out += [(t, True, line) for t in FAILURE_FILE_RE.findall(line)]
+        if FAILURE_WORD_RE.search(line):
+            out += [(t, False, line) for t in FAILURE_SLASH_RE.findall(line)]
+    return out
+
+
+def repo_index(root):
+    """(files, dirs) git knows in the worktree, untracked included, or None when git cannot list them."""
+    try:
+        p = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                           capture_output=True, text=True, timeout=GIT_SECS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    files = {n for n in p.stdout.split("\0") if n.strip()}
+    return files, {f.rsplit("/", i)[0] for f in files for i in range(1, f.count("/") + 1)}
+
+
+def resolve_failure_tokens(root, tokens, index=None):
+    """[{"paths", "evidence"}] for the tokens that name repo paths (a directory ends in "/"), one per distinct set of
+    paths; tokens naming nothing in the repo (toolchain frames, paths outside it) are dropped."""
+    index = index or repo_index(root)
+    if index is None:
+        return []
+    files, dirs = index
+    prefix = os.path.realpath(root).rstrip("/") + "/"
+    found, seen = [], set()
+    for token, is_file, line in tokens:
+        t = token.removeprefix(prefix).removeprefix(root.rstrip("/") + "/").rstrip("/").removesuffix("/...")
+        while t.startswith("./"):
+            t = t[2:]
+        if is_file:
+            paths = sorted(f for f in files if f == t or f.endswith("/" + t))
+        else:
+            parts = [p for p in t.split("/") if p not in ("", ".")]
+            suffixes = ("/".join(parts[i:]) for i in range(len(parts)))
+            paths = next(([s] if s in files else [s + "/"] for s in suffixes if s in files or s in dirs), [])
+        if paths and tuple(paths) not in seen:
+            seen.add(tuple(paths))
+            found.append({"paths": paths, "evidence": line.strip()[:200]})
+    return found
+
+
+def unlocated_failure_lines(root, tests, index):
+    """How many failure-word lines name no repo path, on the line or on the more-indented lines under it; a line of
+    marker words alone (a bare FAIL) or a runner's exit banner (`runner: *** [check] Error 1`) is not counted."""
+    lines = [l[:FAILURE_LINE_CAP] for l in tests.splitlines()]
+    count = 0
+    for i, line in enumerate(lines):
+        words = re.findall(r"[A-Za-z]+", line)
+        if (re.match(r"(?:Ran|Ran in|Exit code):", line) or not FAILURE_WORD_RE.search(line)
+                or all(FAILURE_WORD_RE.fullmatch(w) for w in words) or RUNNER_BANNER_RE.match(line)):
+            continue
+        depth, group = len(line) - len(line.lstrip()), [line]
+        for follow in lines[i + 1:]:
+            if not follow.strip() or len(follow) - len(follow.lstrip()) <= depth:
+                break
+            group.append(follow)
+        tokens = [(t, True, l) for l in group for t in FAILURE_FILE_RE.findall(l)]
+        tokens += [(t, False, l) for l in group for t in FAILURE_SLASH_RE.findall(l)]
+        if not resolve_failure_tokens(root, tokens, index):
+            count += 1
+    return count
+
+
+def failure_key(paths):
+    return tuple(str(p) for p in (paths if isinstance(paths, list) else []))
