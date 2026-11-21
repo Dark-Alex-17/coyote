@@ -2059,6 +2059,31 @@ s.update(gates.interpret_route(s))
 s.update(gates.apply_answer(s))
 check("replay 08/2: the judge picks Stop -> end_blocked with its reason in failure_reason",
       s["_next"] == "end_blocked" and "Nothing in the evidence says another round can land." in s["failure_reason"], s.get("failure_reason"))
+# the recorded unit stopped at Phase F: integration_check past its spent cap, then the canned reply three times
+s = r82(final_integration_strikes=STRIKE_LIMIT, cap_continues={"integration_red:run": STRIKE_LIMIT}, autonomous_digest=[])
+s.update(gates.integration_check(s))
+asked82f = s.get("escalation", {}).get("question", "")
+s["last_answer_text"] = _lib.HEADLESS_GUIDANCE
+s.update(gates.parse_answer(s))
+first82f = s["_next"]
+s.update({"reply_verdict": "option", "reply_option": gates.INTEGRATION_RED_MORE, "reply_reason": R82_JUDGE})
+s.update(gates.interpret_route(s))
+s.update(gates.apply_answer(s))
+check("replay 08/2: Phase F integration_red past the spent cap + headless reply -> the judge's continue, a run-scope round with its reason",
+      gates.CAP_SPENT_NOTE in asked82f and first82f == "headless_judge" and s["_next"] == "fix_round"
+      and s["fix_request"]["return_to"] == "integration_check" and any(R82_JUDGE in i for i in s["fix_request"]["items"])
+      and s["cap_continues"]["integration_red:run"] == STRIKE_LIMIT + 1, (asked82f, first82f, s["_next"], s.get("fix_request")))
+s = r82(verification_proposal=R82_PROPOSAL)
+s.update(gates.integration_check(s))
+kind82f = s.get("escalation", {}).get("kind")
+s["last_answer_text"] = _lib.HEADLESS_GUIDANCE
+s.update(gates.parse_answer(s))
+s.update({"reply_verdict": "option", "reply_option": gates.VERIFY_ADOPT, "reply_reason": "The cited file documents the wrapper as the way to run the checks."})
+s.update(gates.interpret_route(s))
+s.update(gates.apply_answer(s))
+check("replay 08/2: Phase F RED with a proposal -> verification_command; the judge adopts it and only integration_check re-runs",
+      kind82f == "verification_command" and s["_next"] == "integration_check" and json.loads(s["verification_commands"]) == ["true", "./run-checks"]
+      and _lib.as_list(s["verification_changes"])[-1]["by"] == "headless judge", (kind82f, s["_next"], s.get("verification_changes")))
 ts_cl = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl, T1).update({"status": "complete", "worktree": wt0, "branch": WAVE[0]["branch"]})
 git(CODE, "push", "-q", "origin", WAVE[0]["branch"])

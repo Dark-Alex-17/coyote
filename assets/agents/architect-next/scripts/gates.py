@@ -3000,7 +3000,7 @@ def _cited_place_check(state, replacement, reason):
 
 
 def _verification_question(state, u, scope, tid, out, failed):
-    """The verification_command question when the pending proposal replaces the command that just failed; None
+    """The verification_command question when the pending proposal replaces the command that failed; None
     otherwise. A pending proposal is consumed either way."""
     p = as_dict(state.get("verification_proposal"))
     if not p:

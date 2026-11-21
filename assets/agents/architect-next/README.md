@@ -123,23 +123,23 @@ environment assignment, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:777:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
+scripts/_lib.py:778:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
 scripts/gates.py:51:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:4441:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:4450:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:4709:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:4718:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1431:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:1908:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
-scripts/smoke_test.py:2594:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1471:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:2104:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
+scripts/smoke_test.py:2794:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:777` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:778` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:51` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:4441` and `:4450` are an English verb in prompt prose, and
+lockfile names), `gates.py:4709` and `:4718` are an English verb in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -467,6 +467,25 @@ gets up to `STRIKE_LIMIT` (3) re-asks and then stands as typed. A typed existing
 are read from the whole reply or the option it names, never from a word inside prose, so
 a `gate1_stuck` answer such as "the worker should stop retrying" stays an answer and
 `fix/abort-handling` is a valid `branch_name`.
+
+No human and no recommended option: the engine's canned no-human reply takes the recommended
+option when one is marked. When none is, `parse_answer` sends the question to the
+`headless_judge` llm node (`timeout: 120`), which weighs the question's evidence and returns
+an option or an accepted instruction with its reason. `interpret_route` applies the ruling,
+records it in the autonomous digest and carries the reason into the round it starts; a ruling
+that names no offered option or gives no reason gets one more ruling, then the run stops
+blocked with the question. Each kind and task is ruled on at most `STRIKE_LIMIT` (3) times.
+
+Verification commands the project cannot run as declared: a RED integration run (per task
+or at Phase F) hands the fix round the failing command and its exit. If the command cannot
+run here and the project documents another way to run the same check, the fix round reports
+`verification-command: <command> -- <path:line and why>`. At the next RED of that command the
+`verification_command` question asks whether to run the proposed command in its place, keep
+the declared one, or stop; no option is recommended, since the proposer is the fix round. The
+evidence shows the cited lines and whether the command appears in that file. `integration_red`
+also accepts a `verification_command` instruction. An adopted replacement is recorded in
+`verification_changes` and listed in the final report and the PR summary, and every later gate
+runs it.
 
 Delegated discussions: when the sisyphus-next implementer parks its own run on a question
 (its output opens with `SISYPHUS_AWAITING_DISCUSSION` on a line of its own), this run relays
