@@ -260,6 +260,7 @@ initial_state:
   reply_author: owner
   answer_source: ''
   navigator_reasks: 0
+  judge_rulings: {}
   plan_defect_continues: 0
   choice_parks: {}
   discussion: {}
@@ -1360,25 +1361,6 @@ nodes:
       last_answer_text: '{{input}}'
     next: parse_answer
 
-  ask_review_incomplete:
-    id: ask_review_incomplete
-    type: approval
-    description: The one fixed-option escalation - exactly the protocol's three options.
-    question: |
-      {{ask_question}}
-    options:
-      - 'Retry the review again'
-      - 'Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)'
-      - 'Abort this task'
-    routes:
-      'Retry the review again': apply_answer
-      'Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)': apply_answer
-      'Abort this task': apply_answer
-    on_other: parse_answer
-    state_updates:
-      last_answer: '{{choice}}'
-      last_answer_text: '{{choice}}'
-
   ask_choice_2:
     id: ask_choice_2
     type: approval
@@ -1460,7 +1442,10 @@ nodes:
       names no option goes to interpret_reply; after that, unparseable re-asks (B14)
       then the free text stands, except that an empty reply to a multiple-choice
       prompt takes the recommended option; clears the parked marker; ledgers the
-      decision; a malformed escalation -> end_blocked.
+      decision; a malformed escalation -> end_blocked. The engine's no-human reply
+      takes the recommended option; on a question with options and none recommended
+      it goes to headless_judge (at most STRIKE_LIMIT rulings per decision key),
+      except that a hard trigger ends blocked with the question.
     script: scripts/parse_answer.py
     fallback: end_failure
 
@@ -1520,6 +1505,52 @@ nodes:
     fallback: interpret_route
     next: interpret_route
 
+  headless_judge:
+    id: headless_judge
+    type: llm
+    description: >-
+      Decide a question no human is available to answer and that recommends no
+      option: one of its options, or an instruction it accepts, with the reason.
+    instructions: |
+      No human is available and the run has asked you to decide this question.
+      Weigh its evidence and pick the option that best serves the run. Going on
+      is right when the evidence gives a concrete reason the next attempt can
+      succeed; stopping is right when it does not. If the question accepts an
+      instruction and none of the options fits, give that instruction. State
+      your reason in one or two sentences, grounded in the evidence.
+      Output reply_verdict, reply_option (the option's exact text) or
+      reply_instruction and reply_value, reply_reason, and anomalies (anything
+      outside this step's job someone should know; empty is the normal case).
+    prompt: |
+      ## Question, evidence and options
+      {{ask_question}}
+
+      ## The escalation
+      {{escalation}}
+
+      ## Accepted instructions
+      {{reply_accepts}}
+    tools: []
+    timeout: 120
+    output_schema:
+      type: object
+      properties:
+        reply_verdict:
+          type: string
+          enum: [option, instruction]
+        reply_option: { type: string }
+        reply_instruction: { type: string }
+        reply_value: { type: string }
+        reply_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [reply_verdict, reply_reason]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: interpret_route
+    next: interpret_route
+
   interpret_route:
     id: interpret_route
     type: script
@@ -1529,6 +1560,9 @@ nodes:
       question, and an interpreter fault falls back to parse_answer's re-ask.
       The navigator's words that read as no single option go back to the
       navigator once with the clarifying question, then to the owner.
+      A headless_judge ruling (reply_source judge) is applied through apply_answer
+      with its reason in the autonomous digest; a faulty ruling gets one more
+      judge turn, then end_blocked.
     script: scripts/interpret_route.py
     fallback: end_failure
 

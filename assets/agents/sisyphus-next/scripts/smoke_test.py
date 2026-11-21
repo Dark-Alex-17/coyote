@@ -375,7 +375,8 @@ check("consult_route: A5 timeout -> tier 4", u["_next"] == "ask_dispatch")
 u = gates.ask_dispatch(base_state(escalation=esc, top_level=True, owner_away=False))
 check("ask_dispatch: terminal prompt + parked", u["_next"] == "ask_user" and u["parked"] == "design_choice")
 u = gates.ask_dispatch(base_state(escalation=escalation("review_incomplete", "q"), top_level=True))
-check("ask_dispatch: review_incomplete -> approval node", u["_next"] == "ask_review_incomplete")
+check("ask_dispatch: review_incomplete -> the typed prompt, where a no-human reply reaches the headless judge",
+      u["_next"] == "ask_user")
 u = gates.ask_dispatch(base_state(escalation=esc, top_level=True, owner_away=True))
 check("ask_dispatch: away + top-level -> ask_owner when the fork provides it", u["_next"] == ("ask_owner_poll" if gates.OWNER_REMOTE_INPUT else "ask_user"))
 u = gates.ask_dispatch(base_state(escalation=esc, top_level=False, owner_away=True))
@@ -986,8 +987,10 @@ check("choice: options with none recommended keep the typed prompt (ask_user), o
 # the engine's headless answer to a free-text question resolves to the recommended option, never to its words
 HG = _lib.HEADLESS_GUIDANCE
 u2 = gates.parse_answer(base_state(escalation=u["escalation"], last_answer_text=HG))
-check("headless: guidance on a question with no recommended option -> today's path (interpret_reply), no option picked",
-      u2["_next"] == "interpret_reply" and "last_answer" not in u2, u2)
+check("headless: guidance on a question with options and none recommended -> headless_judge, never interpret_reply, "
+      "no option picked",
+      u2["_next"] == "headless_judge" and u2["reply_source"] == "judge"
+      and u2["reply_accepts"] == gates._accepts_text("clarify") and "last_answer" not in u2, u2)
 u2 = gates.parse_answer(base_state(escalation=esc, last_answer_text=f" {HG}\n"))
 check("headless: guidance at the typed prompt -> the recommended option, never interpreted, ledgered",
       u2["_next"] == "apply_answer" and u2["last_answer"] == "A" and any(d.startswith("headless: design_choice:") for d in u2["decisions"]), u2)
@@ -1033,10 +1036,10 @@ check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_us
       and "multiple_choice" not in five["escalation"]["data"]
       and gates.ask_dispatch(base_state(escalation=one["escalation"]))["_next"] == "ask_user")
 own = [gates.raise_escalation(base_state(), {}, escalation(k, "q", [option("A", True), option("B")]))["escalation"]
-       for k in ("handoff_confirm", "draft_confirm", "review_incomplete")]
-check("choice: handoff_confirm, draft_confirm and review_incomplete keep their own approval nodes",
+       for k in ("handoff_confirm", "draft_confirm")]
+check("choice: handoff_confirm and draft_confirm keep their own approval nodes",
       [gates.ask_dispatch(base_state(escalation=e))["_next"] for e in own]
-      == ["confirm_handoff", "confirm_draft", "ask_review_incomplete"]
+      == ["confirm_handoff", "confirm_draft"]
       and not any(e["data"].get("multiple_choice") for e in own))
 u = gates.scope_check(base_state(roster_scope={"TASK-001": ["src/a/"], "TASK-002": ["src/b/"]}, own_scope=["src/a/"],
                                  expected_files=["src/b/x.py"], delegated=True, parallel_mode=True, coder_brief={}))
@@ -6724,6 +6727,61 @@ with scenario("base: a navigator's free text to a base question is interpreted a
                                       answer_source="navigator"))
     check(name, u.get("_next") == "interpret_reply" and u.get("reply_author") == "navigator"
           and u.get("reply_source") == "navigator", u)
+
+# ---------------------------------------------------------------- the headless judge
+JUDGE_WHY = "The lane faulted on a transient timeout, so one more review can complete."
+
+
+def incomplete_review_asked():
+    """A review whose pipeline faulted, raised as review_incomplete and dispatched to its prompt: (state, update)."""
+    return chain(base_state(gauntlet_result="Agent node failed: timeout", round_heads=[{"round": 1, "head": "h"}],
+                            autonomous_digest=[]),
+                 "route_gauntlet", "ask_dispatch")
+
+
+def judge_rules(state, verdict, option_text, reason):
+    state = {**state, "reply_verdict": verdict, "reply_option": option_text, "reply_reason": reason}
+    return {**state, **gates.interpret_route(state)}
+
+
+with scenario("headless judge: review_incomplete, which recommends no option, reaches the judge through the typed "
+              "prompt") as name:
+    st, asked = incomplete_review_asked()
+    st, u = chain({**st, "last_answer_text": HG}, "parse_answer")
+    check(name, st["escalation"]["kind"] == "review_incomplete" and asked["_next"] == "ask_user"
+          and u["_next"] == "headless_judge" and st["judge_rulings"] == {"review_incomplete|s0|sub": 1},
+          (asked.get("_next"), u))
+with scenario("headless judge: a ruling to retry goes through apply_answer, its reason in the autonomous digest") as name:
+    judged = judge_rules(st, "option", "Retry the review again", JUDGE_WHY)
+    applied = gates.apply_answer(judged)
+    check(name, judged["_next"] == "apply_answer" and judged["last_answer"] == "Retry the review again"
+          and applied["_next"] == "build_gauntlet_prompt"
+          and f"review_incomplete: Retry the review again (basis: headless judge: {JUDGE_WHY})" in judged["autonomous_digest"]
+          and not any("clarifying question" in d for d in judged["decisions"]), (judged.get("_next"), applied.get("_next")))
+with scenario("headless judge: a faulty ruling gets one more ruling that carries why, then the run ends blocked with "
+              "the question and its options") as name:
+    first = judge_rules(st, "option", "Rewrite the gauntlet", "it seems best")
+    second = judge_rules(first, "option", "Rewrite the gauntlet", "it seems best")
+    check(name, first["_next"] == "headless_judge" and first["reply_source"] == "judge"
+          and "names no offered option" in first["escalation"]["data"].get("judge_fault", "")
+          and second["_next"] == "end_blocked" and "headless judge gave no usable ruling twice" in second["failure_reason"]
+          and "Retry the review again" in second["failure_reason"], (first.get("_next"), second.get("failure_reason")))
+with scenario("headless judge: a decision the judge has ruled on STRIKE_LIMIT times ends blocked without the "
+              "judge") as name:
+    u = gates.parse_answer({**st, "last_answer_text": HG, "judge_rulings": {"review_incomplete|s0|sub": STRIKE_LIMIT}})
+    check(name, u["_next"] == "end_blocked" and f"has decided this question {STRIKE_LIMIT} times" in u["failure_reason"],
+          u)
+with scenario("headless judge: the judge can pick the option that stops the run") as name:
+    judged = judge_rules(st, "option", "Abort this task", "Every retry faulted the same way; another cannot complete.")
+    applied = gates.apply_answer(judged)
+    check(name, judged["_next"] == "apply_answer" and applied["_next"] == "end_aborted", applied)
+with scenario("headless judge: a hard trigger with no recommended option is never judged; the run ends blocked with "
+              "the question") as name:
+    hard = escalation("design_ask", "Restructure the storage module outside the task?", [option("Yes"), option("No")],
+                      hard_trigger=True)
+    u = gates.parse_answer(base_state(escalation=hard, last_answer_text=HG))
+    check(name, u["_next"] == "end_blocked" and "Restructure the storage module" in u.get("failure_reason", "")
+          and "judge_rulings" not in u, u)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

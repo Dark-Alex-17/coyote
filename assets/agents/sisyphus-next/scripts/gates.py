@@ -25,7 +25,8 @@ from _lib import (  # noqa: E402
     BASE_FETCH_SECS, BASE_GIT_SECS, BASE_SYNC_MAX,
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
     CI_PASS, CI_PENDING, CI_POLL_BACKOFF, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
-    DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
+    DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, HEADLESS_GUIDANCE,
+    OWNER_POLL_MAX,
     ENGINE_VISIT_CAP, POLL_VISIT_BUDGET, CI_NO_CHECKS_SECS,
     OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
@@ -1553,7 +1554,7 @@ def _decision_key(state, esc):
 
 # ====================================================================== 2.3
 # escalation kinds whose fixed options have an approval node of their own, never a multiple-choice prompt
-OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm", "review_incomplete")
+OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm")
 
 
 def normalize_choices(state, u, esc):
@@ -1744,8 +1745,7 @@ def consult_route(state):
     return u
 
 
-_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "handoff_confirm": "confirm_handoff",
-                     "draft_confirm": "confirm_draft",
+_TERMINAL_PROMPTS = {"handoff_confirm": "confirm_handoff", "draft_confirm": "confirm_draft",
                      "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 
 
@@ -1846,6 +1846,9 @@ def parse_answer(state):
         # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
         choice = headless
         ledger(state, u, f"headless: {kind}: no human available -> the recommended option: {tail(choice, 200)}")
+    elif text == HEADLESS_GUIDANCE and options and kind not in OWN_PROMPT_KINDS:
+        # no option is recommended, so a model judge decides; the canned reply is never interpreted or re-asked
+        return _to_headless_judge(state, u, esc)
     elif kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = _bare_pick(text, options) or text
@@ -1880,6 +1883,32 @@ def parse_answer(state):
     u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False})
     ledger(state, u, f"decision: {kind}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
+    return u
+
+
+def _to_headless_judge(state, u, esc):
+    """Send a question with no human and no recommended option to the headless judge, at most STRIKE_LIMIT times per
+    decision, so a run whose judge keeps going on cannot loop forever. A hard trigger is the user's call: no model
+    decides it, so the run stops and reports the question."""
+    kind = esc.get("kind", "")
+    asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
+    if esc.get("hard_trigger"):
+        ledger(state, u, f"headless: {kind}: a hard trigger with no recommended option and no human -> stop and report")
+        u["failure_reason"] = (f"stopped: {kind}: a hard trigger needs a human answer and none is available; the "
+                               f"question was: {tail(asked, 500)}")
+        u["_next"] = "end_blocked"
+        return u
+    key = _decision_key(state, esc)
+    rulings = dict(as_dict(state.get("judge_rulings")))
+    if as_int(rulings.get(key)) >= STRIKE_LIMIT:
+        ledger(state, u, f"headless judge: {key}: already decided {rulings[key]} times -> stop and report")
+        u["failure_reason"] = (f"stopped: {kind}: the headless judge has decided this question {rulings[key]} times; "
+                               f"the question was: {tail(asked, 500)}")
+        u["_next"] = "end_blocked"
+        return u
+    rulings[key] = as_int(rulings.get(key)) + 1
+    u.update({"judge_rulings": rulings, "reply_source": "judge", "reply_accepts": _accepts_text(kind)})
+    u["_next"] = "headless_judge"
     return u
 
 
@@ -1956,10 +1985,12 @@ def _exact_option(reply, options):
 
 
 def interpret_route(state):
-    """Act on the interpreter's reading of a typed reply: an option, an accepted instruction, a discussion, or unclear."""
+    """Act on the interpreter's reading of a typed reply (an option, an accepted instruction, a discussion, or unclear)
+    or on the headless judge's ruling (an option or an accepted instruction, else a judge fault)."""
     u = {}
-    harvest_anomalies(state, u, "interpret_reply")
-    note_script_error(state, u, "interpret_reply")
+    judge = str(state.get("reply_source") or "") == "judge"
+    harvest_anomalies(state, u, "headless_judge" if judge else "interpret_reply")
+    note_script_error(state, u, "headless_judge" if judge else "interpret_reply")
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "")
     text = (state.get("last_answer_text") or "").strip()
@@ -1970,6 +2001,8 @@ def interpret_route(state):
     shape = str(state.get("reply_instruction") or "").strip()
     u.update({"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "",
               "reply_reason": "", "reply_interpreted": True, "reply_source": "", "reply_author": "owner"})
+    if judge:
+        return _judge_route(state, u, esc, verdict, shape)
 
     def decide(answer, how):
         u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})
@@ -2043,6 +2076,50 @@ def _reask_navigator(state, u, esc, text, verdict):
     ledger(state, u, f"interpret: {kind}: the navigator's {said!r} was still not read as one option "
                      f"({verdict or 'no verdict'}) -> owner")
     u["_next"] = "ask_dispatch"
+    return u
+
+
+def _judge_route(state, u, esc, verdict, shape):
+    """Act on the headless judge's ruling. A faulty ruling gets one more judge turn, then the run stops and reports; the
+    judge's question is never re-asked or clarified."""
+    kind, options, data = esc.get("kind", ""), esc.get("options") or [], as_dict(esc.get("data"))
+    reason = tail(str(state.get("reply_reason") or "").strip(), 500)
+    value = str(state.get("reply_value") or "")
+    answer, how = "", ""
+    if not reason:
+        how = "gives no reason"
+    elif verdict == "option":
+        answer = _exact_option(str(state.get("reply_option") or ""), options) or ""
+        how = f"the option {answer!r}" if answer else f"names no offered option ({state.get('reply_option')!r})"
+    elif verdict == "instruction" and shape in ACCEPTED_INSTRUCTIONS.get(kind, ()):
+        answer = _apply_instruction(state, shape, value, value)
+        how = f"the instruction {shape}={tail(value, 120)!r}" + (f", applied as {tail(answer, 120)!r}" if answer
+                                                                 else ", which could not be applied")
+    elif verdict == "instruction":
+        how = f"gives the instruction {shape or '(unnamed)'}, which this question does not accept"
+    else:
+        how = f"has no verdict ({verdict or 'empty'})"
+    if not answer:
+        faults = as_int(data.get("judge_faults"))
+        if faults < RERUN_ONCE:
+            ledger(state, u, f"headless judge: {kind}: the ruling {how} -> one more ruling")
+            retry = {**data, "judge_faults": faults + 1, "judge_fault": f"the ruling {how}"}
+            u.update({"escalation": {**esc, "data": retry}, "reply_source": "judge"})
+            u["_next"] = "headless_judge"
+            return u
+        ledger(state, u, f"headless judge: {kind}: the ruling {how} again -> stop and report")
+        asked = data.get("asked") or esc.get("question", "")
+        u["failure_reason"] = (f"stopped: {kind}: the headless judge gave no usable ruling twice (the ruling {how}); the "
+                               f"question was: {tail(asked, 500)}; options: "
+                               + "; ".join(tail(o.get("text", ""), 200) for o in options))
+        u["_next"] = "end_blocked"
+        return u
+    line = f"{kind}: {answer} (basis: headless judge: {reason})"
+    u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": answer,
+              "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False})
+    ledger(state, u, f"headless judge: {kind}: {how}: {reason}")
+    ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
+    u["_next"] = "apply_answer"
     return u
 
 

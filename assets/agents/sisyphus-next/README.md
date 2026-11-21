@@ -65,6 +65,7 @@ below. Later landings add their own rows.
 | A passing round's own probe tests need no adoption round | `scripts/gates.py` `_note_probe_written` / `_intend_to_add` / `route_gauntlet` / `_start_probe_adoption` / `_adopted_groups` / `_adoption_publish_text` / `_assemble_report` / `build_gauntlet_prompt`, `scripts/smoke_test.py` | Each round's `code_tree` is recorded before its lanes run, so every file a passing round's probe lane wrote read as changed since that round and started an adoption round. `route_gauntlet` now also records `tree_after` when a round ends, and `_start_probe_adoption` adopts, with no extra round, a file the last passing round's own probe lane wrote that is unchanged between that round's `tree_after` and the current tree (Pipeline size and probe-written tests below). Probe-written files are marked intent-to-add, so they are in `git diff <base>` while they stay uncommitted. |
 | The coder sees what the review reruns; identical review input is not a new finding | `scripts/gates.py` `render_coder_prompt` / `_declared_commands` / `_repeat_block`, `scripts/smoke_test.py` | Every coder prompt, the first and each fix round's, names in its CONTEXT the verification commands the review reruns against the change: `review_verification_commands` once a review ran (the declared commands plus the criterion commands the review added), else `verification_commands`. When a lane blocks again and its previous round carried the same non-empty `review_key` (the digest of the worktree tree, the gauntlet prompt and the review verification commands), `_repeat_block` reads the repeat as `unchanged` before it compares the findings' wording, so reworded findings over byte-identical review input raise `lane_stuck` instead of restarting the streak as a new class of findings. |
 | The subtask review sees the carried failures | `scripts/gates.py` `build_gauntlet_prompt` / `_carried_review_section`, `scripts/smoke_test.py` | The carried-forward test failures went into the subtask's task text only, so the gauntlet read a red test a later subtask owns as a fresh regression of the change. During a subtask review with carried failures, the gauntlet prompt now lists them above the `Plan / acceptance criteria:` block, so they are never read as a criterion, each with its owning subtask, and says that one a later subtask owns is expected to stay red and is not a regression of this change. The final whole-task review gets no such section. |
+| The headless judge decides a question that recommends no option | `graph.yaml` the `headless_judge` llm node (`tools: []`, `timeout: 120`, next and fallback `interpret_route`), the `judge_rulings` seed and the `parse_answer` / `interpret_route` descriptions, the `ask_review_incomplete` approval node removed, `scripts/gates.py` `parse_answer` / `_to_headless_judge` / `interpret_route` / `_judge_route` / `OWN_PROMPT_KINDS` / `_TERMINAL_PROMPTS`, `scripts/audit_graph.py`, `scripts/smoke_test.py`, `tests/candidate_sisyphus_next.rs`, `src/config/request_context.rs` | The engine's no-human reply (`HEADLESS_GUIDANCE`, matched as the exact canned text) takes the recommended option. On a question with options and none recommended, `parse_answer` now sends it to the `headless_judge` llm node, as architect-next does, instead of interpreting the canned words: the judge weighs the question's evidence and returns an option or an instruction the kind accepts, with its reason. `interpret_route` reads a judge ruling first (`reply_source` `judge`): a usable one goes through `apply_answer` and into the autonomous digest as `basis: headless judge: <reason>`; a faulty one (no reason, no offered option, an instruction the kind does not accept) gets one more judge turn with the fault in the escalation's data, then the run ends blocked with the question and its options. `judge_rulings` counts rulings per decision key (the key the failed-once rule uses), and at `STRIKE_LIMIT` the run ends blocked without the judge. A hard trigger is never judged: with no recommended option and no human it ends blocked with the question. The kinds with an approval node of their own are not judged; `review_incomplete` lost its approval node, whose first option a run with no human always took, and is asked at the typed prompt so it reaches the judge. |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -118,12 +119,12 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:3338:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:3342:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:3343:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
-scripts/smoke_test.py:3549:             "make: *** [check] Error 1")
-scripts/smoke_test.py:3554:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
-scripts/smoke_test.py:3555:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
+scripts/gates.py:3415:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:3345:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:3346:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:3552:             "make: *** [check] Error 1")
+scripts/smoke_test.py:3557:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
+scripts/smoke_test.py:3558:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
 ```
 
 The lone `gates.py` hit is the English verb `make` in one prompt sentence; the five
@@ -244,8 +245,10 @@ each option's text and evidence under its static label, `Option 1 (recommended)`
 `Option 4`, and the engine adds its own `Other (custom)` choice. That covers every kind with
 options, `clarify`'s LLM-written ones included. Kinds with more than 4 options, fewer than 2
 or none recommended keep today's typed prompt (`ask_user`) with their options untouched;
-`handoff_confirm`, `draft_confirm` and `review_incomplete` keep their own approval nodes
-(`OWN_PROMPT_KINDS`). `parse_answer` counts a label, a number or an option's text as a pick
+`handoff_confirm` and `draft_confirm` keep their own approval nodes
+(`OWN_PROMPT_KINDS`). `review_incomplete`, which recommends none of its options, is asked at
+the typed prompt, so a run with no human reaches the headless judge for it instead of an
+approval node's first option. `parse_answer` counts a label, a number or an option's text as a pick
 only when nothing but punctuation follows it (`_choice_pick`), so "Option 2, but only for
 reads" names no option and, like any typed Other reply, goes through the existing
 `interpret_reply` path: an option, an instruction the kind accepts, a discussion park, or one
