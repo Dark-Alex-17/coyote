@@ -74,9 +74,9 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   on a clean tree `git status --porcelain` is read again. When the tree changed, no red run gets
   `tree-state` and each note ends `the declared commands modified the tree`; when the dirty tree
   cannot be written again, each note ends `candidate tree dirty, whether the declared commands
-  modified it is unknown`. Otherwise, on a dirty tree, each red command that neither timed out
-  nor was killed by a signal (exit 128 or above)
-  runs once more, inside the same deadline, in a detached worktree of the pre-run snapshot. A
+  modified it is unknown`. Otherwise, on a dirty tree, each red command held to exit 0 (a stated condition, such as
+  `prints nothing`, is never rerun) that neither timed out nor was killed by a signal (exit 128
+  or above) runs once more, inside the same deadline, in a detached worktree of the pre-run snapshot. A
   command that exits 0 there gets baseline `tree-state`: it is red only because the change is
   uncommitted. Any other snapshot outcome keeps the live run's classification against the base,
   and its note ends `candidate tree dirty`. When `core.sparseCheckout` is true, a dirty tree
@@ -102,7 +102,7 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   condition only the request states blocks, and its complaint quotes the request line. A stated
   run that exited 0 is gated the same way and is never a green run. A stated
   run whose criteria are met is listed under `Advisory red runs (not blocking):`, and so is a
-  `tree-state` run unless a criterion naming it ends neither MET nor INSPECTED (one about the
+  `tree-state` run held to exit 0 unless a criterion naming it ends neither MET nor INSPECTED (one about the
   uncommitted tree itself, say), which blocks and names those criteria and statuses.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
   criterion checks judge the criteria it covers like an execution criterion no recorded run covers

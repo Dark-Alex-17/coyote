@@ -8,7 +8,8 @@ verification runs, and zero implementation-debris hits from debris_lint.py.
 A red run (nonzero exit or timeout) blocks unless run_checks.py found the
 same failure on the diff base (baseline status "pre-existing"); those are
 reported in their own section. A red run whose baseline status is
-"tree-state" (it exits 0 on a snapshot of the pre-run tree) does not block
+"tree-state" (it exits 0 on a snapshot of the pre-run tree) and whose pass
+condition is exit 0 does not block
 unless a parsed criterion naming it ends neither MET nor INSPECTED, and
 neither does one whose pass condition, recomputed from the criteria and
 the request by pass_condition.py, is stated as something other than exit 0,
@@ -339,16 +340,17 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
     A red run is a record that exited nonzero (including the -1 TIMEOUT
     sentinel). A "pre-existing" one is reported in its own section. A
     red run that timed out or was killed by a signal blocks whatever its
-    baseline. A "tree-state" one blocks unless every criterion naming it ends MET or
-    INSPECTED, and is otherwise advisory. For the rest the pass condition is recomputed
-    from `criteria` and `request`, never read from the record, so a recorded
-    run replays the same. A red run held to exit 0, timed out or killed by a
-    signal blocks and the complaint names the baseline outcome. One whose pass
+    baseline. For the rest the pass condition is recomputed from `criteria`
+    and `request`, never read from the record, so a recorded run replays the
+    same. One whose pass
     condition a parsed criterion states blocks unless every criterion naming
     it has a final status MET or INSPECTED in `verdicts`, and is otherwise
     advisory with their evidence as the reason; one whose condition only the
-    request states blocks. A run that exited 0 under a stated condition is
-    gated the same way. A record the deadline skipped is
+    request states blocks, whatever its baseline status. A run that exited 0
+    under a stated condition is gated the same way. A red run held to exit 0
+    with a "tree-state" baseline blocks unless every criterion naming it ends
+    MET or INSPECTED, and is otherwise advisory. Any other red run blocks and
+    the complaint names the baseline outcome. A record the deadline skipped is
     not a run and yields nothing here. An "ENVIRONMENT: ..." runner-error
     marker with a non-empty declaration is one complaint: the declared
     commands never ran. Other string markers ("none declared",
@@ -386,12 +388,12 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
             continue
         outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
         judged = not killed_or_timed_out(code)
-        if judged and baseline_status(r) == "tree-state":
-            blocks, text = tree_state_red(r, outcome, condition["criteria"], by_id)
-            (out if blocks else advisory).append(text)
-            continue
         if judged and condition["condition"] == STATED:
             blocks, text = stated_red(r, outcome, condition, by_id)
+            (out if blocks else advisory).append(text)
+            continue
+        if judged and baseline_status(r) == "tree-state":
+            blocks, text = tree_state_red(r, outcome, condition["criteria"], by_id)
             (out if blocks else advisory).append(text)
             continue
         out.append(

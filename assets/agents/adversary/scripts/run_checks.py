@@ -85,8 +85,8 @@ the declared commands modified it is unknown" and nothing is rerun.
 When the tree changed, the declared commands modified it (a regenerate-then-diff
 command, say), no red record gets "tree-state", and each note gains ", the
 declared commands modified the tree". Otherwise, on a dirty tree, every red
-record that neither timed out nor was killed by a signal (exit 128 or above)
-runs once more, inside the same deadline and in
+record held to exit 0 that neither timed out nor was killed by a signal (exit
+128 or above) runs once more, inside the same deadline and in
 the same subdirectory, in a second detached worktree (hooks disabled the same
 way) of the pre-run snapshot commit. A command that exits 0 there gets
 baseline status "tree-state", a null exit and no base run: it is red only in
@@ -140,7 +140,7 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pass_condition import resolve  # noqa: E402
+from pass_condition import EXIT_0, resolve  # noqa: E402
 
 try:
     import fcntl
@@ -535,8 +535,8 @@ def tree_outcome(before, work, deadline):
 
 
 def rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, commit, worktrees):
-    """Run each red command once more on the pre-run snapshot `commit` and give the ones
-    that exit 0 there a tree-state baseline."""
+    """Run each red command, all held to exit 0, once more on the pre-run snapshot `commit`
+    and give the ones that exit 0 there a tree-state baseline."""
     if left(deadline) <= 0:
         return
     tree = os.path.join(work, "snapshot")
@@ -553,6 +553,13 @@ def rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, commit
             break
         if run_one(results[i]["cmd"], snap_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix)["exit"] == 0:
             results[i]["baseline"] = {"status": "tree-state", "exit": None, "note": TREE_STATE_NOTE}
+
+
+def held_to_exit_0(record):
+    """Whether the record's pass condition is exit 0. Under a stated one ("prints nothing",
+    say) an exit 0 on the snapshot can itself violate it, so it proves nothing."""
+    condition = record.get("pass_condition")
+    return isinstance(condition, dict) and condition.get("condition") == EXIT_0
 
 
 # A saved base run freezes one sample of a flaky base: later rounds compare
@@ -665,7 +672,7 @@ def classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, c
     saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
     worktrees = []
     try:
-        rerunnable = [i for i in reds if results[i]["exit"] < 128] if commit else []
+        rerunnable = [i for i in reds if results[i]["exit"] < 128 and held_to_exit_0(results[i])] if commit else []
         if rerunnable:
             rerun_on_snapshot(results, rerunnable, top, subdir, prefix, deadline, work, commit, worktrees)
         reds = [i for i in reds if "baseline" not in results[i]]
