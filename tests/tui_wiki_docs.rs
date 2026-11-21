@@ -1112,7 +1112,7 @@ fn tui_page_quotes_the_code() {
         .to_string();
     let footer_text = fn_body(
         tui,
-        "fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {",
+        "fn parts(&self, (agents, jobs): (usize, usize), mouse_capture: bool) -> Vec<String> {",
     );
     let mut footer: Vec<String> = string_literals(&footer_text)
         .iter()
@@ -1120,7 +1120,16 @@ fn tui_page_quotes_the_code() {
         .map(|literal| literal.replace("{agents}", "<n>").replace("{jobs}", "<n>"))
         .collect();
     footer.sort();
-    assert_eq!(footer, ["agents <n>", "jobs <n>", "no session"]);
+    assert_eq!(
+        footer,
+        [
+            "agents <n>",
+            "jobs <n>",
+            "mouse scroll",
+            "mouse select",
+            "no session"
+        ]
+    );
     let bottom = src(&["tui", "bottom_pane.rs"]);
     let search = const_str(&bottom, "SEARCH_LABEL");
     let rewind = literal_with(rewind_code, "Rewind stops at the last ");

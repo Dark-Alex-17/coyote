@@ -3,15 +3,15 @@ source: src/tui/tests/mod.rs
 expression: frame
 ---
 "│ model: openai:test-model             │"
-"│┌Keys─────────────────────────1-7/220┐│"
+"│┌Keys─────────────────────────1-7/226┐│"
 "││                                    ││"
 "││Anywhere                            ││"
 "││  Ctrl+Z                            ││"
 "││    Suspend to the shell            ││"
 "││  Ctrl+L                            ││"
 "││    Redraw the screen               ││"
-"││                                    ││"
-"││Transcript, also under a question   ││"
+"││  Alt+M                             ││"
+"││    Mouse on: the wheel scrolls;    ││"
 "│└j/k scroll  PgUp/Dn page  Esc close─┘│"
 "└──────────────────────────────────────┘"
 "────────────────────────────────────────"

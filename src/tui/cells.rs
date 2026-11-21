@@ -734,6 +734,36 @@ impl Cell {
         }
     }
 
+    fn expanded(&self) -> bool {
+        match self {
+            Cell::Tool { expanded, .. }
+            | Cell::Job {
+                row: TaskRow { expanded, .. },
+                ..
+            }
+            | Cell::Agent {
+                row: TaskRow { expanded, .. },
+                ..
+            } => *expanded,
+            _ => false,
+        }
+    }
+
+    /// The whole output of a tool, job or agent row as Alt+C copies it;
+    /// None for every other cell.
+    pub(super) fn copied_output(&self) -> Option<CopiedOutput> {
+        match self {
+            Cell::Tool { name, tail, .. } => Some(CopiedOutput {
+                from: name.clone(),
+                text: render::plain_text(tail.full.text()),
+                dropped: tail.full.dropped(),
+            }),
+            Cell::Job { tool, row, .. } => Some(row_output(format!("job {tool}"), &row.calls)),
+            Cell::Agent { name, row, .. } => Some(row_output(format!("agent {name}"), &row.calls)),
+            _ => None,
+        }
+    }
+
     /// Every whole-output buffer the cell holds, oldest call first.
     fn full_outputs(&mut self) -> Vec<&mut FullOutput> {
         match self {
@@ -1088,12 +1118,11 @@ fn full_row_lines(
         ));
     }
     for call in calls {
-        let full = &mut call.tail.full;
-        if full.text().is_empty() && full.dropped() == 0 {
+        if !printed(&call.tail.full) {
             continue;
         }
         lines.extend(render::plain_lines(&format!("{}:", call.name), width, DIM));
-        lines.extend_from_slice(full.lines(width));
+        lines.extend_from_slice(call.tail.full.lines(width));
     }
     lines
 }
@@ -1118,6 +1147,51 @@ fn dim_wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
         .into_iter()
         .map(|line| line.patch_style(DIM))
         .collect()
+}
+
+/// A row's whole output with every escape stripped, what it is called in
+/// the notice, and the bytes of it already dropped.
+pub(super) struct CopiedOutput {
+    pub(super) from: String,
+    pub(super) text: String,
+    pub(super) dropped: usize,
+}
+
+/// The row Alt+C copies from: the focused one, or with no focus the
+/// newest open one.
+pub(super) fn copy_target(cells: &[Cell], focus: Option<usize>) -> Option<&Cell> {
+    match focus {
+        Some(index) => cells.get(index),
+        None => cells
+            .iter()
+            .rev()
+            .find(|cell| cell.collapsible() && cell.expanded()),
+    }
+}
+
+/// A job's or agent's calls joined as `full_row_lines` shows them.
+fn row_output(from: String, calls: &[FoldedCall]) -> CopiedOutput {
+    let mut text = String::new();
+    let mut dropped = 0;
+    for call in calls.iter().filter(|call| printed(&call.tail.full)) {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&call.name);
+        text.push_str(":\n");
+        text.push_str(&render::plain_text(call.tail.full.text()));
+        dropped += call.tail.full.dropped();
+    }
+    CopiedOutput {
+        from,
+        text,
+        dropped,
+    }
+}
+
+/// Whether a call printed anything, kept or since dropped.
+fn printed(full: &FullOutput) -> bool {
+    !full.text().is_empty() || full.dropped() > 0
 }
 
 /// What a job's or agent's header names: `<kind> <name> <id>  <state>`,

@@ -1,6 +1,7 @@
 mod control;
 mod lend;
 mod modal;
+mod mouse_and_copy;
 mod rewind;
 mod run_loop;
 
@@ -5211,12 +5212,10 @@ fn footer_counts(harness: &mut Harness) -> String {
     let frame = harness.draw();
     let footer = frame.lines().last().unwrap_or_default();
     let start = footer.find("agents").expect("the footer has its counts");
-    footer[start..]
-        .split("  ")
-        .next()
-        .unwrap()
-        .trim()
-        .to_string()
+    let end = footer
+        .find(" . mouse")
+        .expect("the footer has the mouse mode");
+    footer[start..end].trim().to_string()
 }
 
 /// The turn holds the context while it runs, so the footer counts

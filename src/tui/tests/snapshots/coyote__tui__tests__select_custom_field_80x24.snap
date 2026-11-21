@@ -25,4 +25,4 @@ expression: frame
 "delta                                                                           "
 "────────────────────────────────────────────────────────────────────────────────"
 "Enter = answer  Esc = cancel                                                    "
-"openai:test-model . no session . agents 0 . jobs 0                              "
+"openai:test-model . no session . agents 0 . jobs 0 . mouse scroll               "

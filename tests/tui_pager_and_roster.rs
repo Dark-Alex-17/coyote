@@ -796,6 +796,56 @@ mod transcript {
     }
 
     // ---------------------------------------------------------------------
+    // Alt+M hands the mouse back to the terminal for its own selection and
+    // takes it again; the footer says which it is.
+    // ---------------------------------------------------------------------
+
+    const ALT_M: &[u8] = b"\x1bm";
+
+    #[test]
+    #[serial]
+    fn alt_m_switches_the_mouse_reports_off_and_on_again() {
+        let (_guard, mut pty) = boot("mouse-toggle", &[]);
+        let booted = ctrl_l_repaint(&mut pty);
+        assert!(
+            booted.contains(&squeezed("mouse scroll")),
+            "the footer does not show the mouse scrolling on boot:\n{booted}"
+        );
+
+        let at = pty.raw().len();
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_M).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let off = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
+        assert!(
+            off.contains("\x1b[?1000l"),
+            "Alt+M did not switch the mouse reports off: {off:?}"
+        );
+        let frame = ctrl_l_repaint(&mut pty);
+        assert!(
+            frame.contains(&squeezed("mouse select")),
+            "the footer does not show the terminal's selection:\n{frame}"
+        );
+
+        let at = pty.raw().len();
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_M).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let on = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
+        assert!(
+            on.contains("\x1b[?1000h"),
+            "a second Alt+M did not ask for mouse reports again: {on:?}"
+        );
+        let frame = ctrl_l_repaint(&mut pty);
+        assert!(
+            frame.contains(&squeezed("mouse scroll")),
+            "the footer does not show the mouse scrolling again:\n{frame}"
+        );
+
+        quit(pty);
+    }
+
+    // ---------------------------------------------------------------------
     // A narrower terminal re-wraps the cells in place: every marker is on
     // screen exactly as often as before (user cell plus dry-run echo), never
     // a duplicated row, and growing back restores the original layout.

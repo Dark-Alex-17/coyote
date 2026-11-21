@@ -185,6 +185,11 @@ pub(crate) enum Action {
     OpenEditor,
     /// Repaint from scratch.
     ScheduleFrame,
+    /// Switch mouse reports on (the wheel scrolls) or off (the terminal
+    /// selects text).
+    ToggleMouse,
+    /// Put the focused tool row's whole output on the clipboard.
+    CopyToolOutput,
     Answer(PromptAnswer),
     /// Answer yes and remember it for the tool's later identical prompts.
     AnswerYesForSession,
@@ -342,6 +347,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
     &[
         row(Anywhere, "Ctrl+Z", "Suspend to the shell"),
         row(Anywhere, "Ctrl+L", "Redraw the screen"),
+        row(
+            Anywhere,
+            "Alt+M",
+            "Mouse on: the wheel scrolls; off: the terminal selects text",
+        ),
         row(Transcript, "Ctrl+X", "Show or hide the todo panel"),
         row(Transcript, "PgUp / PgDn", "Scroll the transcript a page"),
         row(
@@ -355,6 +365,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Jump back to the newest output when scrolled",
         ),
         row(Transcript, "Mouse wheel", "Scroll the transcript"),
+        row(
+            Transcript,
+            "Alt+C",
+            "Copy the focused tool call's output, or the newest open one's",
+        ),
         row(
             Composer,
             "Enter",
@@ -571,13 +586,15 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     // A chord's letter is matched case-folded once here: with the kitty
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
-    // Job control and repaint are the terminal's, not the modal's: they
-    // work the same whatever is on screen. So do the keys that only move
-    // the view: a question waiting below does not stop the user reading
-    // what came before it. Keys that act on a row stay with the modal.
+    // Job control, repaint and the mouse mode are the terminal's, not the
+    // modal's: they work the same whatever is on screen. So do the keys
+    // that only move the view or copy from it: a question waiting below
+    // does not stop the user reading what came before it. Keys that act on
+    // a row stay with the modal.
     match code {
         KeyCode::Char('z') if ctrl => return Action::Suspend,
         KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
+        KeyCode::Char('m') if alt && !ctrl => return Action::ToggleMouse,
         _ => {}
     }
     let modal = match ctx.layer() {
@@ -588,6 +605,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     };
     match code {
         KeyCode::Char('x') if ctrl => return Action::ToggleTodo,
+        KeyCode::Char('c') if alt && !ctrl => return Action::CopyToolOutput,
         KeyCode::PageUp => return Action::ScrollPage(-1),
         KeyCode::PageDown => return Action::ScrollPage(1),
         KeyCode::Up if shift => return Action::ScrollLines(-1),
@@ -2350,6 +2368,16 @@ mod tests {
                 ],
             ),
             (
+                H::Anywhere,
+                "Alt+M",
+                vec![
+                    (alt(KeyCode::Char('m')), TYPING, Action::ToggleMouse),
+                    (alt(KeyCode::Char('m')), INPUT, Action::ToggleMouse),
+                    (alt(KeyCode::Char('m')), BROWSE, Action::ToggleMouse),
+                    (alt(KeyCode::Char('m')), HELP, Action::ToggleMouse),
+                ],
+            ),
+            (
                 H::Transcript,
                 "Ctrl+X",
                 vec![
@@ -2386,6 +2414,14 @@ mod tests {
                 ],
             ),
             (H::Transcript, "Mouse wheel", vec![]),
+            (
+                H::Transcript,
+                "Alt+C",
+                vec![
+                    (alt(KeyCode::Char('c')), FOCUSED, Action::CopyToolOutput),
+                    (alt(KeyCode::Char('c')), CONFIRM, Action::CopyToolOutput),
+                ],
+            ),
             (
                 H::Composer,
                 "Enter",
@@ -3568,5 +3604,31 @@ mod tests {
         for (key, ctx) in cases {
             assert_eq!(map_key(key, &ctx), Action::Nothing, "{key:?} in {ctx:?}");
         }
+    }
+
+    /// Alt+M switches the mouse mode whatever is open, typing fields and
+    /// the pager's find included; Alt+C copies wherever the transcript
+    /// keys reach, and the overlays that cover the transcript keep it.
+    #[test]
+    fn alt_m_toggles_the_mouse_everywhere_and_alt_c_copies_from_the_transcript() {
+        let alt_m = press(KeyCode::Char('m'), KeyModifiers::ALT);
+        let shifted_alt_m = press(KeyCode::Char('M'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        for ctx in [
+            IDLE, TYPING, RUNNING, VI_NORMAL, CONFIRM, INPUT, PASSWORD, SELECT, SEARCH, ROSTER,
+            BROWSE, FIND, PICKER, HELP,
+        ] {
+            assert_eq!(map_key(alt_m, &ctx), Action::ToggleMouse, "{ctx:?}");
+            assert_eq!(map_key(shifted_alt_m, &ctx), Action::ToggleMouse, "{ctx:?}");
+        }
+        let alt_c = press(KeyCode::Char('c'), KeyModifiers::ALT);
+        for ctx in [
+            IDLE, TYPING, FOCUSED, RUNNING, VI_NORMAL, CONFIRM, INPUT, SELECT, SEARCH, ROSTER,
+        ] {
+            assert_eq!(map_key(alt_c, &ctx), Action::CopyToolOutput, "{ctx:?}");
+        }
+        for ctx in [BROWSE, PICKER, HELP] {
+            assert_eq!(map_key(alt_c, &ctx), Action::Nothing, "{ctx:?}");
+        }
+        assert_eq!(map_key(alt_c, &FIND), Action::PagerFindChar('c'));
     }
 }

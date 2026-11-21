@@ -19,7 +19,9 @@ mod task_cancel_guard;
 mod variables;
 
 pub use self::abort_signal::*;
-pub use self::clipboard::{ClipboardContent, read_for_paste, set_text};
+pub use self::clipboard::{
+    ClipboardContent, osc52_sequence, read_for_paste, set_text, set_text_native,
+};
 pub use self::command::*;
 pub use self::crypto::*;
 pub use self::cursor_sync::*;

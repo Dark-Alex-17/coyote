@@ -42,9 +42,8 @@ pub fn classify_clipboard(
 
 #[cfg(not(any(target_os = "android", target_os = "emscripten")))]
 mod internal {
-    use super::{ClipboardContent, classify_clipboard};
+    use super::{ClipboardContent, classify_clipboard, osc52_sequence};
     use arboard::Clipboard;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::sync::{LazyLock, Mutex};
@@ -53,16 +52,23 @@ mod internal {
         LazyLock::new(|| Mutex::new(Clipboard::new().ok()));
 
     pub fn set_text(text: &str) -> anyhow::Result<()> {
-        let mut clipboard = CLIPBOARD.lock().unwrap();
-        match clipboard.as_mut() {
-            Some(clipboard) => {
-                clipboard.set_text(text)?;
-                #[cfg(target_os = "linux")]
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                Ok(())
-            }
-            None => set_text_osc52(text),
+        if set_text_native(text)? {
+            Ok(())
+        } else {
+            set_text_osc52(text)
         }
+    }
+
+    /// Ok(false) when there is no system clipboard to write to.
+    pub fn set_text_native(text: &str) -> anyhow::Result<bool> {
+        let mut clipboard = CLIPBOARD.lock().unwrap();
+        let Some(clipboard) = clipboard.as_mut() else {
+            return Ok(false);
+        };
+        clipboard.set_text(text)?;
+        #[cfg(target_os = "linux")]
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(true)
     }
 
     /// A read that fails or comes back empty counts as absent, so the next
@@ -104,8 +110,7 @@ mod internal {
     /// Attempts to set text to clipboard with OSC52 escape sequence
     /// Works in many modern terminals, including over SSH.
     fn set_text_osc52(text: &str) -> anyhow::Result<()> {
-        let encoded = STANDARD.encode(text);
-        let seq = format!("\x1b]52;c;{encoded}\x07");
+        let seq = osc52_sequence(text);
         if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), seq.as_bytes()) {
             return Err(anyhow::anyhow!("Failed to send OSC52 sequence").context(e));
         }
@@ -124,6 +129,10 @@ mod internal {
         Err(anyhow::anyhow!("No clipboard available"))
     }
 
+    pub fn set_text_native(_text: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     pub fn read_for_paste() -> anyhow::Result<ClipboardContent> {
         Err(anyhow::anyhow!("No clipboard available"))
     }
@@ -131,6 +140,26 @@ mod internal {
 
 pub fn set_text(text: &str) -> anyhow::Result<()> {
     internal::set_text(text).context("Failed to copy")
+}
+
+/// Puts `text` on the system clipboard, returning whether there was one.
+/// Writes nothing to the terminal, so the caller decides where an OSC 52
+/// fallback goes.
+pub fn set_text_native(text: &str) -> bool {
+    match internal::set_text_native(text) {
+        Ok(copied) => copied,
+        Err(err) => {
+            debug!("Failed to copy to the system clipboard: {err}");
+            false
+        }
+    }
+}
+
+/// The OSC 52 escape that asks the terminal to put `text` on the clipboard;
+/// works in many modern terminals, including over SSH.
+pub fn osc52_sequence(text: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
 pub fn read_for_paste() -> anyhow::Result<ClipboardContent> {
@@ -201,5 +230,11 @@ mod tests {
             ),
             ClipboardContent::ImagePng(vec![1, 2, 3])
         );
+    }
+
+    #[test]
+    fn the_osc52_sequence_carries_the_text_in_base64() {
+        assert_eq!(osc52_sequence("hi\n"), "\x1b]52;c;aGkK\x07");
+        assert_eq!(osc52_sequence(""), "\x1b]52;c;\x07");
     }
 }

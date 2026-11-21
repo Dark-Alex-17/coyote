@@ -25,4 +25,4 @@ expression: harness.draw()
 "Save session?                                                                   "
 "────────────────────────────────────────────────────────────────────────────────"
 "y = yes  n = no  Enter = no  Esc = cancel                                       "
-"openai:test-model . tui-exit-x7x . agents 0 . jobs 0                            "
+"openai:test-model . tui-exit-x7x . agents 0 . jobs 0 . mouse scroll             "

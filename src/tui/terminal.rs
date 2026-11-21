@@ -146,25 +146,29 @@ impl Command for EnableClickAndWheelReports {
 
 /// The modes switched on when the UI takes the terminal, in order. The
 /// enhancement flags are pushed last, after the alternate screen is up, and
-/// only when the terminal answered the probe.
-pub(crate) fn enter_sequence(enhancement: bool) -> Vec<TerminalStep> {
+/// only when the terminal answered the probe; mouse reports come on only
+/// while `mouse` says the UI wants them over the terminal's own selection.
+pub(crate) fn enter_sequence(enhancement: bool, mouse: bool) -> Vec<TerminalStep> {
     let mut steps = vec![
         TerminalStep::RawMode(true),
         TerminalStep::AlternateScreen(true),
         TerminalStep::CursorHidden(true),
         TerminalStep::BracketedPaste(true),
-        TerminalStep::MouseCapture(true),
     ];
+    if mouse {
+        steps.push(TerminalStep::MouseCapture(true));
+    }
     if enhancement {
         steps.push(TerminalStep::KeyboardEnhancement(true));
     }
     steps
 }
 
-/// The strict mirror of [`enter_sequence`]: the same modes switched off in
-/// reverse order.
+/// The strict mirror of [`enter_sequence`] with mouse reports on: the same
+/// modes switched off in reverse order. Switching the reports off when they
+/// were never on is harmless, and the panic hook cannot know which it was.
 pub(crate) fn leave_sequence(enhancement: bool) -> Vec<TerminalStep> {
-    enter_sequence(enhancement)
+    enter_sequence(enhancement, true)
         .into_iter()
         .rev()
         .map(TerminalStep::inverse)
@@ -605,11 +609,11 @@ fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
 }
 
 /// Switches the terminal into the UI's modes.
-pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()> {
+pub(crate) fn enter(writer: &mut impl Write, enhancement: bool, mouse: bool) -> io::Result<()> {
     install_panic_hook();
     #[cfg(windows)]
     ensure_vt_processing();
-    enter_steps(writer, enter_sequence(enhancement))
+    enter_steps(writer, enter_sequence(enhancement, mouse))
 }
 
 /// Applies `steps` in order. A failing step hands the terminal back through
@@ -881,6 +885,9 @@ fn reenter_if_left<W: Write>(
 pub(crate) struct Screen {
     terminal: Terminal<ScreenBackend<TtyWriter>>,
     enhancement: bool,
+    /// Whether mouse reports are on; every re-entry asks for them again
+    /// only if so.
+    mouse: bool,
     #[cfg(unix)]
     fd: i32,
     #[cfg(windows)]
@@ -924,7 +931,7 @@ impl Screen {
         let input_mode = snapshot_input_mode();
         #[cfg(windows)]
         CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
-        if let Err(err) = enter(terminal.backend_mut(), enhancement) {
+        if let Err(err) = enter(terminal.backend_mut(), enhancement, true) {
             // Taken back before `terminal` drops the writer: the hook must
             // never write to a closed or reused descriptor.
             #[cfg(unix)]
@@ -939,6 +946,7 @@ impl Screen {
         Ok(Self {
             terminal,
             enhancement,
+            mouse: true,
             #[cfg(unix)]
             fd,
             #[cfg(windows)]
@@ -991,7 +999,10 @@ impl Screen {
         // reset the console mode leaves it off for both.
         #[cfg(windows)]
         ensure_vt_processing();
-        if reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))? {
+        if reenter_if_left(
+            &mut self.terminal,
+            enter_sequence(self.enhancement, self.mouse),
+        )? {
             self.arm_panic_hook();
         }
         draw_frame(&mut self.terminal, render)
@@ -1016,6 +1027,23 @@ impl Screen {
         Write::flush(writer)
     }
 
+    /// Turns mouse reports on (the wheel scrolls, a click folds a row) or
+    /// off (the terminal selects text), and keeps the choice for every
+    /// re-entry after.
+    pub(crate) fn set_mouse_capture(&mut self, on: bool) -> io::Result<()> {
+        self.mouse = on;
+        TerminalStep::MouseCapture(on).apply(self.terminal.backend_mut())
+    }
+
+    /// Writes an escape sequence for the terminal itself, such as an OSC 52
+    /// clipboard request, through the dup'd descriptor: fd 1 may be a
+    /// turn's capture pipe.
+    pub(crate) fn write_sequence(&mut self, sequence: &str) -> io::Result<()> {
+        let writer = self.terminal.backend_mut();
+        writer.write_all(sequence.as_bytes())?;
+        Write::flush(writer)
+    }
+
     /// Hands the terminal to `f` in its normal modes (a suspended shell, an
     /// editor), then takes it back: puts the line discipline back to its
     /// pre-UI state so a child that changed it (an editor leaving echo
@@ -1031,7 +1059,7 @@ impl Screen {
         if let Err(err) = self.restore_cooked_modes() {
             warn!("Failed to restore the terminal modes after the terminal was released: {err}");
         }
-        enter(self.terminal.backend_mut(), self.enhancement)?;
+        enter(self.terminal.backend_mut(), self.enhancement, self.mouse)?;
         self.arm_panic_hook();
         repaint_from_scratch(&mut self.terminal)?;
         Ok(value)
@@ -1146,7 +1174,12 @@ mod tests {
     /// out because it would switch the test runner's own tty.
     #[cfg(unix)]
     fn writing_enter_steps() -> Vec<TerminalStep> {
-        enter_sequence(false)
+        writing_enter_steps_with_mouse(true)
+    }
+
+    #[cfg(unix)]
+    fn writing_enter_steps_with_mouse(mouse: bool) -> Vec<TerminalStep> {
+        enter_sequence(false, mouse)
             .into_iter()
             .filter(|step| !matches!(step, TerminalStep::RawMode(_)))
             .collect()
@@ -1166,7 +1199,7 @@ mod tests {
     #[test]
     fn leave_sequence_is_the_strict_mirror_of_enter() {
         for enhancement in [false, true] {
-            let enter = enter_sequence(enhancement);
+            let enter = enter_sequence(enhancement, true);
             let leave = leave_sequence(enhancement);
             assert_eq!(enter.len(), leave.len());
             let mirrored: Vec<TerminalStep> =
@@ -1179,11 +1212,11 @@ mod tests {
             assert_eq!(*leave.last().unwrap(), TerminalStep::RawMode(false));
         }
         assert_eq!(
-            *enter_sequence(true).last().unwrap(),
+            *enter_sequence(true, false).last().unwrap(),
             TerminalStep::KeyboardEnhancement(true)
         );
         assert!(
-            !enter_sequence(false)
+            !enter_sequence(false, true)
                 .iter()
                 .any(|step| matches!(step, TerminalStep::KeyboardEnhancement(_)))
         );
@@ -1202,6 +1235,36 @@ mod tests {
         for mode in [&b"\x1b[?1000l"[..], b"\x1b[?1006l"] {
             assert_eq!(count(&leave, mode), 1, "{leave:?}");
         }
+    }
+
+    /// With mouse reports switched off, entering and re-entering the screen
+    /// leave them off, so the terminal keeps its own text selection; the
+    /// leave still switches them off in case they were on.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn entering_with_the_mouse_off_asks_for_no_reports() {
+        assert!(
+            !enter_sequence(false, false)
+                .iter()
+                .any(|step| matches!(step, TerminalStep::MouseCapture(_)))
+        );
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+        let mut out = Vec::new();
+        enter_steps(&mut out, writing_enter_steps_with_mouse(false)).unwrap();
+        assert_eq!(count(&out, b"\x1b[?1000h"), 0, "{out:?}");
+        assert_eq!(count(&out, b"\x1b[?1049h"), 1, "{out:?}");
+        let mut left = Vec::new();
+        leave(&mut left).unwrap();
+        assert_eq!(count(&left, b"\x1b[?1000l"), 1, "{left:?}");
+
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        assert!(reenter_if_left(&mut terminal, writing_enter_steps_with_mouse(false)).unwrap());
+        let reentered = out.take();
+        assert!(reentered.contains("\x1b[?1049h"), "{reentered:?}");
+        assert!(!reentered.contains("\x1b[?1000h"), "{reentered:?}");
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
     }
 
     /// Without an `enter` on record there is nothing to undo, so `leave`
@@ -1714,7 +1777,7 @@ mod tests {
     fn windows_never_pushes_the_keyboard_enhancement() {
         assert!(!probe_keyboard_enhancement());
         assert!(
-            !enter_sequence(probe_keyboard_enhancement())
+            !enter_sequence(probe_keyboard_enhancement(), true)
                 .iter()
                 .any(|step| matches!(step, TerminalStep::KeyboardEnhancement(_)))
         );
@@ -1932,7 +1995,7 @@ mod tests {
         );
 
         clear_escape_processing();
-        let _ = enter(&mut Vec::new(), false);
+        let _ = enter(&mut Vec::new(), false, true);
         assert_eq!(
             escape_bits(),
             WANTED,

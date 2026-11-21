@@ -337,6 +337,10 @@ impl Transcript {
         self.focus.is_some()
     }
 
+    pub(super) fn focus(&self) -> Option<usize> {
+        self.focus
+    }
+
     /// Moves the view `delta` lines: down towards the bottom when
     /// positive, up when negative. Reaching the bottom resumes following.
     pub(super) fn scroll_lines(&mut self, delta: i32) {

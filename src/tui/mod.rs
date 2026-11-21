@@ -192,7 +192,7 @@ impl FooterInfo {
         }
     }
 
-    fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {
+    fn parts(&self, (agents, jobs): (usize, usize), mouse_capture: bool) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(who) = &self.who {
             parts.push(who.clone());
@@ -205,13 +205,21 @@ impl FooterInfo {
         );
         parts.push(format!("agents {agents}"));
         parts.push(format!("jobs {jobs}"));
+        parts.push(
+            if mouse_capture {
+                "mouse scroll"
+            } else {
+                "mouse select"
+            }
+            .to_string(),
+        );
         parts
     }
 
     /// The fields joined by ` . `, which is drawn in a style of its own.
-    fn line(&self, counts: (usize, usize), theme: &Theme) -> Line<'static> {
+    fn line(&self, counts: (usize, usize), mouse_capture: bool, theme: &Theme) -> Line<'static> {
         let mut spans = Vec::new();
-        for (i, part) in self.parts(counts).into_iter().enumerate() {
+        for (i, part) in self.parts(counts, mouse_capture).into_iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" . ", theme.footer_separator));
             }
@@ -278,6 +286,10 @@ pub(crate) enum Command {
     Suspend,
     OpenEditor,
     Redraw,
+    /// Switch the terminal's mouse reports on or off.
+    SetMouseCapture(bool),
+    /// Put this text on the clipboard.
+    Copy(String),
     /// Take the chosen exchanges out of the session and the transcript
     /// and give the oldest one's prompt back to the composer.
     Rewind(RewindTarget),
@@ -344,6 +356,9 @@ pub(crate) struct App {
     committed_end: usize,
     footer: FooterInfo,
     usage: String,
+    /// Whether the terminal sends mouse reports: the wheel and clicks
+    /// reach the UI, and the terminal's own text selection does not work.
+    mouse_capture: bool,
     last_keystroke: Option<Instant>,
     /// When the front prompt became the front; what Enter on a text
     /// field is settled against, so typing the answer does not postpone
@@ -457,6 +472,7 @@ impl App {
             committed_end: 0,
             footer,
             usage: String::new(),
+            mouse_capture: true,
             last_keystroke: None,
             front_since: None,
             frame_area: None,
@@ -852,6 +868,46 @@ impl App {
         }
     }
 
+    /// The target row's whole output for the loop to put on the
+    /// clipboard, with a notice saying what was copied or why nothing was.
+    fn copy_tool_output(&mut self) -> Option<Command> {
+        let copied = cells::copy_target(self.transcript.cells(), self.transcript.focus())
+            .and_then(Cell::copied_output);
+        let (kind, notice, command) = match copied {
+            None => (
+                NoticeKind::ToolWarning,
+                "No tool call to copy: focus one with Ctrl+Up or a click".to_string(),
+                None,
+            ),
+            Some(copied) if copied.text.is_empty() => (
+                NoticeKind::ToolWarning,
+                format!("Nothing to copy from {}", copied.from),
+                None,
+            ),
+            Some(copied) => {
+                let lines = copied.text.lines().count();
+                let unit = if lines == 1 { "line" } else { "lines" };
+                let mut notice = format!("Copied {lines} {unit} from {}", copied.from);
+                if copied.dropped > 0 {
+                    notice.push_str(&format!(
+                        "; the oldest {} bytes were already dropped",
+                        copied.dropped
+                    ));
+                }
+                // The kind only picks the style: dim, like the engine's
+                // own status notices.
+                (
+                    NoticeKind::Checkpoint,
+                    notice,
+                    Some(Command::Copy(copied.text)),
+                )
+            }
+        };
+        self.transcript
+            .push_notice(self.notice_merge_from(), kind, notice);
+        command
+    }
+
     /// Takes the band's highlighted row: the palette's into the typed
     /// token, the search's into the composer, the rewind picker's to
     /// the loop. The palette with no highlight lets the Enter do what
@@ -1041,6 +1097,11 @@ impl App {
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
             Action::ScheduleFrame => Some(Command::Redraw),
+            Action::ToggleMouse => {
+                self.mouse_capture = !self.mouse_capture;
+                Some(Command::SetMouseCapture(self.mouse_capture))
+            }
+            Action::CopyToolOutput => self.copy_tool_output(),
             Action::Answer(answer) => {
                 self.answer_front(answer);
                 None
@@ -1722,9 +1783,11 @@ impl App {
 
         frame.render_widget(
             FooterBar {
-                left: self
-                    .footer
-                    .line(self.roster_sources.running_counts(), &self.theme),
+                left: self.footer.line(
+                    self.roster_sources.running_counts(),
+                    self.mouse_capture,
+                    &self.theme,
+                ),
                 right: render::styled_line(&self.usage),
             },
             footer,

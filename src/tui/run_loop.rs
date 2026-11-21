@@ -791,6 +791,24 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                         app.schedule_frame();
                     }
+                    Some(Command::SetMouseCapture(on)) => {
+                        if let Err(err) = screen.set_mouse_capture(on) {
+                            warn!("Failed to switch the mouse reports: {err}");
+                        }
+                    }
+                    Some(Command::Copy(text)) => {
+                        // Without a system clipboard the terminal is asked
+                        // to take it, over the screen's own descriptor.
+                        if !crate::utils::set_text_native(&text)
+                            && let Err(err) =
+                                screen.write_sequence(&crate::utils::osc52_sequence(&text))
+                        {
+                            app.handle_msg(UiMsg::Notice {
+                                kind: NoticeKind::ToolWarning,
+                                text: format!("Copy failed: {err}"),
+                            });
+                        }
+                    }
                     Some(Command::Rewind(target)) => {
                         if let Some(ctx) = ctx.as_mut() {
                             apply_rewind(app, ctx, target);
