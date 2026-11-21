@@ -8464,8 +8464,8 @@
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0507
-    output_price: 0.2028
+    input_price: 0.0498
+    output_price: 0.1992
     cache_read_price: 0.001
     max_output_tokens: 393216
     supports_vision: true
@@ -8473,10 +8473,10 @@
   - name: deepseek/deepseek-v4.1-flash-1017
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.036
-    output_price: 0.5
-    cache_read_price: 0.01
-    max_output_tokens: 943718
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.003
+    max_output_tokens: 393216
     supports_vision: true
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash-1017:batch
@@ -8495,14 +8495,6 @@
     output_price: 0.15
     cache_read_price: 0.004
     max_output_tokens: 384000
-    supports_vision: true
-    supports_function_calling: true
-  - name: dots-studio/dots-3-note-preview:free
-    type: chat
-    max_input_tokens: 512000
-    input_price: 0.0
-    output_price: 0.0
-    max_output_tokens: 460800
     supports_vision: true
     supports_function_calling: true
   - name: elorian/glimpse
@@ -9104,14 +9096,6 @@
     output_price: 0.5
     cache_read_price: 0.3
     max_output_tokens: 6000
-  - name: meituan/longcat-2.0
-    type: chat
-    max_input_tokens: 1048756
-    input_price: 0.3
-    output_price: 1.2
-    cache_read_price: 0.006
-    max_output_tokens: 262144
-    supports_function_calling: true
   - name: meta-llama/llama-3.1-70b-instruct
     type: chat
     max_input_tokens: 131072
@@ -9288,9 +9272,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -11325,6 +11309,15 @@
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
+  - name: radixark/daisyrose-27b
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.15
+    output_price: 1.875
+    cache_read_price: 0.0375
+    max_output_tokens: 235929
+    supports_vision: true
+    supports_function_calling: true
   - name: recursive/flint-v1.0:free
     type: chat
     max_input_tokens: 262144
@@ -11534,6 +11527,15 @@
     output_price: 4.05
     cache_read_price: 0.17
     max_output_tokens: 471859
+    supports_vision: true
+    supports_function_calling: true
+  - name: thinkingmachines/inkling-2-mini
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 0.1
+    output_price: 0.4
+    cache_read_price: 0.02
+    max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
   - name: thinkingmachines/inkling-2-small
@@ -11825,9 +11827,9 @@
   - name: z-ai/glm-5.1
     type: chat
     max_input_tokens: 204800
-    input_price: 1.19
-    output_price: 3.74
-    cache_read_price: 0.6
+    input_price: 1.4
+    output_price: 4.4
+    cache_read_price: 0.26
     max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-5.2
