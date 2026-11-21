@@ -1341,13 +1341,24 @@ pub fn composer_row(frame: &str) -> String {
     composer_row_with_footer(frame, "dryrun:dry-model")
 }
 
-/// The roster band of a repainted frame: from its legend down to the rule
-/// under it.
+/// The tasks pop-up's body in a repainted frame: what is drawn after the
+/// top border holding its `Tasks` title and before the bottom border
+/// holding `Esc = close`. The frame is the paint stream, not a grid, so
+/// the body also holds the transcript cells in the margin beside the box.
 pub fn roster_band(frame: &str) -> &str {
-    let legend = frame
-        .rfind("Esc = close")
-        .unwrap_or_else(|| panic!("the roster's legend is not on screen:\n{frame}"));
-    frame[legend..].split('\u{2500}').next().unwrap_or_default()
+    let title = frame
+        .rfind("\u{250c}Tasks")
+        .unwrap_or_else(|| panic!("the tasks pop-up's title is not on screen:\n{frame}"));
+    let after_title = &frame[title..];
+    let body_start = after_title
+        .find('\u{2510}')
+        .map_or(0, |corner| corner + '\u{2510}'.len_utf8());
+    let rest = &after_title[body_start..];
+    let hint = rest
+        .find("Esc = close")
+        .unwrap_or_else(|| panic!("the tasks pop-up's hint is not on screen:\n{frame}"));
+    let body_end = rest[..hint].rfind('\u{2514}').unwrap_or(hint);
+    &rest[..body_end]
 }
 
 /// A tool that records its pid at `pid_file` and then becomes a sleep far

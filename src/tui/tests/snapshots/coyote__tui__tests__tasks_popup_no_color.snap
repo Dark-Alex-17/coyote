@@ -1,0 +1,28 @@
+---
+source: src/tui/tests/mod.rs
+expression: frame
+---
+"                                                                                "
+"                                                                                "
+"┌──────────────────────────────────────────────────────────────────────────────┐"
+"│ coyote X.Y.Z │"
+"│ model: openai:test-model                                                     │"
+"│┌Tasks───────────────────────────────────────────────────────────────────────┐│"
+"││agent planner   agent_planner_0f1e   running                                ││"
+"││agent reviewer  agent_reviewer_1a2b  running                                ││"
+"││ask   reviewer  Ship the fix to main?                                       ││"
+"│└j/k = move  x = cancel  o = open  Enter = answer  Esc = close───────────────┘│"
+"│ Type ".help" for additional help.                                            │"
+"│ Empty prompt: "?" or ".keys" = keys                                          │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+" Type a prompt or a .command; Enter sends                                       "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"openai:test-model . no session . agents 2 . jobs 0 . mouse scroll               "

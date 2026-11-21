@@ -2311,8 +2311,16 @@ def run(out: str) -> str:
             gone,
             "x did not stop the job's process {pid}; roster was {band:?}"
         );
-        // The repaint is the screen's rows in order with the escapes gone:
-        // the transcript's job row, then the roster band under its legend.
+        let open = repainted_frame_showing(&mut pty, "Esc = close", "the tasks pop-up closed");
+        let band = roster_band(&open);
+        assert!(
+            !band.contains("fixture_sleep"),
+            "the roster still lists the cancelled job: {band:?}"
+        );
+
+        // The pop-up covers part of the transcript, so the job row is read
+        // once it is closed.
+        pty.send(b"\x1b").unwrap();
         let after = repainted_frame_showing(&mut pty, "Cancelled job_", "x reported no cancel");
         let at = after
             .find("job fixture_sleep")
@@ -2322,14 +2330,7 @@ def run(out: str) -> str:
             job_row.contains("cancelled"),
             "the job row does not say cancelled after x: {job_row:?}\n{after}"
         );
-        let band = roster_band(&after);
-        assert!(
-            !band.contains("fixture_sleep"),
-            "the roster still lists the cancelled job: {band:?}"
-        );
 
-        pty.send(b"\x1b").unwrap();
-        pty.read_for(Duration::from_millis(400));
         pty.send(b"\x04").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

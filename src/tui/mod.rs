@@ -73,7 +73,7 @@ use ratatui_textarea::TextArea;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
 use rewind::opens_exchange;
-use roster::{RosterRow, RosterSources, RosterState, RosterView};
+use roster::{RosterPopup, RosterRow, RosterSources, RosterState};
 pub use run_loop::{ensure_tty, run};
 use sink::{AgentOutcome, LendJob, UiMsg};
 use std::collections::VecDeque;
@@ -230,10 +230,11 @@ impl FooterInfo {
 }
 
 /// What is drawn over the transcript while open: Ctrl+T's full-screen
-/// pager, or the key help over the transcript's rows.
+/// pager, or the key help or the tasks pop-up over the transcript's rows.
 enum Overlay {
     Pager(Box<Pager>),
     Help(Help),
+    Tasks(RosterState),
 }
 
 impl Overlay {
@@ -241,6 +242,7 @@ impl Overlay {
         match self {
             Overlay::Pager(pager) => OverlayKind::Pager(pager.mode()),
             Overlay::Help(_) => OverlayKind::Help,
+            Overlay::Tasks(_) => OverlayKind::Tasks,
         }
     }
 
@@ -248,6 +250,8 @@ impl Overlay {
         match self {
             Overlay::Pager(pager) => pager.scroll(delta),
             Overlay::Help(help) => help.scroll(delta),
+            // A wheel notch steps one row, as a key does, not a scroll's lines.
+            Overlay::Tasks(roster) => roster.move_highlight(delta.signum()),
         }
     }
 }
@@ -662,7 +666,6 @@ impl App {
             View::Palette(_) => Some(PopupKind::Palette),
             View::HistorySearch(_) => Some(PopupKind::HistorySearch),
             View::Rewind(_) => Some(PopupKind::Rewind),
-            View::Roster(_) => Some(PopupKind::Roster),
         }
     }
 
@@ -691,6 +694,13 @@ impl App {
     fn help_mut(&mut self) -> Option<&mut Help> {
         match &mut self.overlay {
             Some(Overlay::Help(help)) => Some(help),
+            _ => None,
+        }
+    }
+
+    fn roster(&self) -> Option<&RosterState> {
+        match &self.overlay {
+            Some(Overlay::Tasks(roster)) => Some(roster),
             _ => None,
         }
     }
@@ -928,12 +938,6 @@ impl App {
                 self.close_view();
                 chosen
             }
-            View::Roster(roster) => {
-                if let Some(RosterRow::Escalation(ask)) = roster.focused().cloned() {
-                    self.ask_escalation(ask);
-                }
-                None
-            }
             View::Palette(palette) => {
                 if palette.highlighted().is_none() {
                     return if self.turn.is_some() || self.exiting {
@@ -973,9 +977,9 @@ impl App {
                             pager.paste(&text);
                         }
                     }
-                    // The help has the keyboard, so a paste reaches nothing
-                    // under it, as a typed key would not.
-                    Layer::Overlay(OverlayKind::Help) => return None,
+                    // The help and the tasks pop-up have the keyboard, so a
+                    // paste reaches nothing under them, as a typed key would not.
+                    Layer::Overlay(OverlayKind::Help | OverlayKind::Tasks) => return None,
                     // A confirm has no field, and the composer is hidden
                     // under the modal: a paste there would land where the
                     // user cannot see it.
@@ -1202,7 +1206,6 @@ impl App {
                     View::Palette(palette) => palette.move_highlight(delta),
                     View::HistorySearch(search) => search.move_highlight(delta),
                     View::Rewind(rewind) => rewind.move_highlight(delta),
-                    View::Roster(roster) => roster.move_highlight(delta),
                 }
                 None
             }
@@ -1256,9 +1259,9 @@ impl App {
                 None
             }
             Action::ToggleRoster => {
-                self.view = match self.view {
-                    View::Roster(_) => View::Composer,
-                    _ => View::Roster(RosterState::new(self.roster_sources.rows())),
+                self.overlay = match self.overlay {
+                    Some(Overlay::Tasks(_)) => None,
+                    _ => Some(Overlay::Tasks(RosterState::new(self.roster_sources.rows()))),
                 };
                 None
             }
@@ -1287,6 +1290,20 @@ impl App {
             }
             Action::RosterOpen => {
                 self.open_focused_task();
+                None
+            }
+            Action::RosterMove(delta) => {
+                if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
+                    roster.move_highlight(delta);
+                }
+                None
+            }
+            Action::RosterAnswer => {
+                if let Some(RosterRow::Escalation(ask)) =
+                    self.roster().and_then(RosterState::focused).cloned()
+                {
+                    self.ask_escalation(ask);
+                }
                 None
             }
             Action::OpenPager => {
@@ -1359,16 +1376,24 @@ impl App {
         None
     }
 
-    /// Closes the pager and frees the lines it laid out.
+    /// Closes the pager and frees the lines it laid out; a pager opened
+    /// from the tasks pop-up gives the pop-up back.
     fn close_pager(&mut self) {
-        if self.pager().is_some() {
-            self.overlay = None;
-            cells::release_full_output_caches(self.transcript.cells_for_layout().0);
-        }
+        let Some(pager) = self.pager_mut() else {
+            return;
+        };
+        self.overlay = pager.take_tasks().map(Overlay::Tasks);
+        cells::release_full_output_caches(self.transcript.cells_for_layout().0);
     }
 
-    /// Takes the key help's place if it is open.
-    fn open_pager(&mut self, pager: Pager) {
+    /// Takes the overlay's place. Over the tasks pop-up, or in place of a
+    /// pager opened from it, the pager keeps the pop-up to give back.
+    fn open_pager(&mut self, mut pager: Pager) {
+        pager.set_tasks(match self.overlay.take() {
+            Some(Overlay::Tasks(roster)) => Some(roster),
+            Some(Overlay::Pager(mut previous)) => previous.take_tasks(),
+            Some(Overlay::Help(_)) | None => None,
+        });
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
     }
 
@@ -1604,8 +1629,9 @@ impl App {
             )));
         }
         let Some(turn) = self.turn.as_ref() else {
-            // The key help takes the chords the idle hint names.
-            if !self.prompts.is_empty() || matches!(self.overlay, Some(Overlay::Help(_))) {
+            // The key help and the tasks pop-up take the chords the idle
+            // hint names.
+            if !self.prompts.is_empty() || self.covers_transcript() {
                 return None;
             }
             let status = if self.key_context().question_mark_opens_help() {
@@ -1629,10 +1655,16 @@ impl App {
             )
         };
         let mut spans = vec![Span::styled(state, self.theme.status_runtime)];
-        if self.prompts.is_empty() && !matches!(self.overlay, Some(Overlay::Help(_))) {
+        if self.prompts.is_empty() && !self.covers_transcript() {
             spans.push(Span::styled("  Esc to interrupt", self.theme.status_key));
         }
         Some(Line::from(spans))
+    }
+
+    /// Whether the key help or the tasks pop-up is open over the
+    /// transcript, taking Esc and the panel chords.
+    fn covers_transcript(&self) -> bool {
+        matches!(self.overlay, Some(Overlay::Help(_) | Overlay::Tasks(_)))
     }
 
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
@@ -1673,7 +1705,7 @@ impl App {
         }
         // The roster is read on every frame it is up: the tasks move on
         // whether or not the context is in hand.
-        if let View::Roster(roster) = &mut self.view {
+        if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
             roster.refresh(self.roster_sources.rows());
         }
         if let Some(prompt) = self.prompts.front_mut() {
@@ -1706,8 +1738,18 @@ impl App {
         if let Some(todo) = todo {
             frame.render_widget(self.todo.view(&self.theme), todo);
         }
-        if let Some(Overlay::Help(help)) = self.overlay.as_mut() {
-            frame.render_widget(help.view(&self.theme), upper);
+        match self.overlay.as_mut() {
+            Some(Overlay::Help(help)) => frame.render_widget(help.view(&self.theme), upper),
+            Some(Overlay::Tasks(roster)) => frame.render_widget(
+                RosterPopup {
+                    state: roster,
+                    theme: &self.theme,
+                    no_color: self.renderer.no_color,
+                    now: self.clock.now(),
+                },
+                upper,
+            ),
+            Some(Overlay::Pager(_)) | None => {}
         }
 
         // A line between the transcript and the status row, so the
@@ -1755,14 +1797,6 @@ impl App {
                     ),
                     View::HistorySearch(search) => frame.render_widget(SearchView(search), band),
                     View::Rewind(rewind) => frame.render_widget(RewindView(rewind), band),
-                    View::Roster(roster) => frame.render_widget(
-                        RosterView {
-                            state: roster,
-                            no_color: self.renderer.no_color,
-                            now: self.clock.now(),
-                        },
-                        band,
-                    ),
                 }
                 let macro_names: Vec<&str> =
                     self.macros.iter().map(|(name, _)| name.as_str()).collect();
@@ -1796,17 +1830,16 @@ impl App {
 
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
-    /// that was just drawn, and so does an open roster for its next read
-    /// unless the pager covers it. The footer counts tick too while any
-    /// task runs: an agent reports finished before its join handle does,
-    /// and nested spawns send no message. Nothing can spawn while the
-    /// counts are zero and no turn runs, so idle stops there.
+    /// that was just drawn, and so does an open tasks pop-up for its next
+    /// read. The footer counts tick too while any task runs, unless the
+    /// pager covers them: an agent reports finished before its join
+    /// handle does, and nested spawns send no message. Nothing can spawn
+    /// while the counts are zero and no turn runs, so idle stops there.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
         if self.turn.is_some()
-            || (!matches!(self.layer(), Layer::Overlay(OverlayKind::Pager(_)))
-                && (matches!(self.view, View::Roster(_))
-                    || self.roster_sources.running_counts() != (0, 0)))
+            || matches!(self.overlay, Some(Overlay::Tasks(_)))
+            || (self.pager().is_none() && self.roster_sources.running_counts() != (0, 0))
         {
             self.frames.schedule_frame_in(STATUS_TICK);
         }

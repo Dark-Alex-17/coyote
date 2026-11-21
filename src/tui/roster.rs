@@ -1,14 +1,14 @@
 //! The roster, which the UI calls tasks: one row per task the supervisor
 //! runs (spawned agents and background jobs) and one per question an agent
-//! is waiting on the user to answer, as a band over the composer on
+//! is waiting on the user to answer, as a pop-up over the transcript on
 //! Alt+T. The rows are read every frame it is up from the supervisor and
 //! escalation queue the context held when it was last back in the UI's
 //! hands, so they follow a turn that is running.
 
-use super::bottom_pane::{
-    BAND_MAX_ROWS, first_line, render_header, rows_within_cap, step_highlight,
-};
+use super::bottom_pane::{first_line, step_highlight};
 use super::cells::elapsed_text;
+use super::help::MARGIN;
+use super::theme::Theme;
 use super::{ChromeKind, DIM, chrome_style};
 use crate::events::NoticeKind;
 use crate::supervisor::escalation::{EscalationQueue, PendingEscalation};
@@ -18,12 +18,16 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use std::sync::Arc;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
-const HEADER: &str = "Tasks  j/k = move  x = cancel  o = open  Enter = answer  Esc = close";
+const TITLE: &str = "Tasks";
+const HINT: &str = "j/k = move  x = cancel  o = open  Enter = answer  Esc = close";
+/// The hint on a frame too narrow for all of it: the bottom border cuts
+/// it from the right, so the way out comes first.
+const NARROW_HINT: &str = "Esc = close  j/k = move  x = cancel  o = open  Enter = answer";
 const EMPTY: &str = "(no tasks and no questions)";
 
 /// Where the roster reads its rows from: the context's supervisor and
@@ -229,19 +233,60 @@ impl RosterState {
     pub(super) fn focused(&self) -> Option<&RosterRow> {
         self.rows.get(self.highlight()?)
     }
-
-    pub(super) fn band_rows(&self) -> u16 {
-        1 + rows_within_cap(self.rows.len().max(1)).min(BAND_MAX_ROWS - 1)
-    }
 }
 
-/// The roster's band: the key legend, then one row per task or question
-/// with the highlighted one reversed, scrolled to keep it in view.
-pub(super) struct RosterView<'a> {
+/// The tasks pop-up over the transcript, framed like the key help: a
+/// title, the rows, and the keys on the bottom border. It is as tall as
+/// its rows within `area` less the margin, and centred in it.
+pub(super) struct RosterPopup<'a> {
     pub(super) state: &'a RosterState,
+    pub(super) theme: &'a Theme,
     pub(super) no_color: bool,
     /// What a job's running time is counted to.
     pub(super) now: Instant,
+}
+
+impl Widget for RosterPopup<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let area = area.intersection(*buf.area()).inner(MARGIN);
+        if area.is_empty() {
+            return;
+        }
+        let rows = u16::try_from(self.state.rows.len().max(1)).unwrap_or(u16::MAX);
+        let height = rows.saturating_add(2).min(area.height);
+        let area = Rect::new(
+            area.x,
+            area.y + (area.height - height) / 2,
+            area.width,
+            height,
+        );
+        let hint = if HINT.width() + 2 <= usize::from(area.width) {
+            HINT
+        } else {
+            NARROW_HINT
+        };
+        let block = Block::bordered()
+            .title(Span::styled(TITLE, self.theme.heading))
+            .title_bottom(Line::styled(hint, DIM));
+        let inner = block.inner(area);
+        Clear.render(area, buf);
+        block.render(area, buf);
+        RosterView {
+            state: self.state,
+            no_color: self.no_color,
+            now: self.now,
+        }
+        .render(inner, buf);
+    }
+}
+
+/// The roster's rows: one per task or question with the highlighted one
+/// reversed, scrolled to keep it in view.
+struct RosterView<'a> {
+    state: &'a RosterState,
+    no_color: bool,
+    /// What a job's running time is counted to.
+    now: Instant,
 }
 
 impl Widget for RosterView<'_> {
@@ -250,16 +295,12 @@ impl Widget for RosterView<'_> {
         if area.is_empty() {
             return;
         }
-        let rows_area = render_header(Line::from(Span::styled(HEADER, DIM)), area, buf);
-        if rows_area.is_empty() {
-            return;
-        }
         let rows = &self.state.rows;
         if rows.is_empty() {
-            Paragraph::new(Line::from(Span::styled(EMPTY, DIM))).render(rows_area, buf);
+            Paragraph::new(Line::from(Span::styled(EMPTY, DIM))).render(area, buf);
             return;
         }
-        let height = usize::from(rows_area.height);
+        let height = usize::from(area.height);
         let highlight = self.state.highlight();
         let start = highlight.unwrap_or(0).saturating_sub(height - 1);
         // Widths over every row, so scrolling does not move the columns.
@@ -278,8 +319,8 @@ impl Widget for RosterView<'_> {
             .unwrap_or(0);
         let visible = &rows[start..(start + height).min(rows.len())];
         for (offset, row) in visible.iter().enumerate() {
-            let y = rows_area.y + u16::try_from(offset).unwrap_or(u16::MAX);
-            let line_area = Rect::new(rows_area.x, y, rows_area.width, 1);
+            let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
+            let line_area = Rect::new(area.x, y, area.width, 1);
             let style = row.style(self.no_color);
             let label = row.label();
             let pad = label_width.saturating_sub(label.width());
@@ -388,9 +429,9 @@ pub(super) mod tests {
         let terminal = draw(&state, 80, 24, false);
         insta::assert_snapshot!("roster_mixed_80x24", terminal.backend().to_string());
         let buf = terminal.backend().buffer();
-        assert!(buf[(0, 2)].modifier.contains(Modifier::REVERSED));
-        assert!(!buf[(0, 1)].modifier.contains(Modifier::REVERSED));
-        assert_eq!(buf[(0, 3)].fg, Color::Yellow);
+        assert!(buf[(0, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(0, 2)].fg, Color::Yellow);
         let terminal = draw(&state, 40, 12, false);
         insta::assert_snapshot!("roster_mixed_40x12", terminal.backend().to_string());
     }
@@ -411,12 +452,12 @@ pub(super) mod tests {
                 assert_eq!(buf[(x, y)].fg, Color::Reset, "({x}, {y}) is coloured");
             }
         }
-        assert!(buf[(0, 2)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(0, 1)].modifier.contains(Modifier::REVERSED));
     }
 
     /// The highlight follows its row through a refresh. When that row
-    /// goes, nothing is focused or reversed until a move picks a row. A
-    /// band too short for every row keeps the highlighted one in view.
+    /// goes, nothing is focused or reversed until a move picks a row. An
+    /// area too short for every row keeps the highlighted one in view.
     #[test]
     fn a_refresh_keeps_the_highlight_on_its_row_and_the_view_follows_it() {
         let mut state = mixed();
@@ -448,9 +489,9 @@ pub(super) mod tests {
             TaskRowStatus::Running,
         )]);
         assert!(state.focused().is_none());
-        let terminal = draw(&state, 40, 3, false);
+        let terminal = draw(&state, 40, 2, false);
         let buf = terminal.backend().buffer();
-        assert!(!buf[(0, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
         state.move_highlight(1);
         assert_eq!(
             state.focused().map(RosterRow::id),
@@ -458,11 +499,10 @@ pub(super) mod tests {
         );
         state.refresh(Vec::new());
         assert!(state.focused().is_none());
-        assert_eq!(state.band_rows(), 2);
 
         let mut state = mixed();
         state.move_highlight(5);
-        let terminal = draw(&state, 40, 3, false);
+        let terminal = draw(&state, 40, 2, false);
         let shown: String = terminal.backend().to_string();
         assert!(shown.contains("ask"), "{shown}");
         assert!(!shown.contains("agent"), "{shown}");

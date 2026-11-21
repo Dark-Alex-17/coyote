@@ -19,7 +19,7 @@ const TITLE: &str = "Keys";
 /// narrowest frame the help is drawn at.
 const HINT: &str = "j/k scroll  PgUp/Dn page  Esc close";
 /// The transcript left showing around the pop-up.
-const MARGIN: Margin = Margin::new(1, 1);
+pub(super) const MARGIN: Margin = Margin::new(1, 1);
 /// Columns before a row's keys.
 const INDENT: usize = 2;
 /// Columns between the keys and what they do.

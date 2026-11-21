@@ -657,7 +657,8 @@ impl App {
 
     pub(super) fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
         self.close_view();
-        // A question is never left waiting behind the pager or the help.
+        // A question is never left waiting behind the pager, the help or
+        // the tasks pop-up, nor behind the pop-up a closed pager gives back.
         self.close_pager();
         self.overlay = None;
         let becomes_front = self.prompts.is_empty();

@@ -1366,8 +1366,8 @@ fn the_status_row_ticks_once_a_second_while_a_turn_runs() {
     assert_eq!(harness.app.frames.due_at(), None);
 }
 
-/// An open roster asks for a read every tick, but not while the pager
-/// covers it and nothing of it is drawn.
+/// An open tasks pop-up asks for a read every tick, but not while the
+/// pager it opened covers it and nothing of it is drawn.
 #[test]
 fn the_roster_ticks_only_while_no_pager_covers_it() {
     let mut harness = Harness::standalone(80, 24);
@@ -1376,7 +1376,8 @@ fn the_roster_ticks_only_while_no_pager_covers_it() {
     harness.app.frame_drawn();
     assert!(harness.app.frames.due_at().is_some(), "no roster tick");
 
-    harness.app.overlay = Some(Overlay::Pager(Box::new(Pager::root())));
+    harness.app.handle_key(ctrl(KeyCode::Char('t')));
+    assert!(harness.app.pager().is_some());
     harness.render();
     harness.app.frame_drawn();
     assert_eq!(harness.app.frames.due_at(), None);
@@ -1388,7 +1389,7 @@ fn ctrl_g_neither_opens_the_roster_nor_types() {
     let mut harness = Harness::standalone(80, 24);
     harness.type_text("draft");
     harness.app.handle_key(ctrl(KeyCode::Char('g')));
-    assert!(!matches!(harness.app.view, View::Roster(_)));
+    assert!(harness.app.roster().is_none());
     assert_eq!(harness.app.composer_text(), "draft");
 }
 
@@ -4959,6 +4960,212 @@ fn the_status_row_under_the_key_help_offers_no_interrupt() {
     let frame = harness.draw();
     assert!(frame.contains("Working . 0s"), "{frame}");
     assert!(!frame.contains("Esc to interrupt"), "{frame}");
+}
+
+fn agent_named(id: &str, name: &str, session_id: Option<&str>) -> crate::supervisor::AgentHandle {
+    crate::supervisor::AgentHandle {
+        agent_name: name.to_string(),
+        session_id: session_id.map(str::to_string),
+        ..running_agent(id)
+    }
+}
+
+/// A harness whose context runs two agents and holds a question from
+/// one of them. The receiver keeps the question's asker waiting, so
+/// the question keeps its row.
+fn harness_with_tasks(
+    ctx: &mut RequestContext,
+) -> (Harness, tokio::sync::oneshot::Receiver<String>) {
+    let tasks = supervisor();
+    tasks
+        .write()
+        .register(agent_named("agent_planner_0f1e", "planner", None))
+        .unwrap();
+    tasks
+        .write()
+        .register(agent_named(
+            "agent_reviewer_1a2b",
+            "reviewer",
+            Some("reviewer-x7x"),
+        ))
+        .unwrap();
+    ctx.supervisor = Some(tasks);
+    let queue = ctx.ensure_root_escalation_queue();
+    let reply = escalate_as(&queue, "esc_9c0d", "Ship the fix to main?");
+    let mut harness = Harness::for_ctx(ctx);
+    harness.app.sync_from_ctx(ctx);
+    (harness, reply)
+}
+
+/// The rows of the open tasks pop-up's frame: the top border with the
+/// title and the bottom border with the keys, by index into `rows`.
+fn tasks_box(rows: &[&str]) -> (usize, usize) {
+    let top = rows
+        .iter()
+        .position(|row| row.contains("\u{250c}Tasks"))
+        .unwrap_or_else(|| panic!("no top border with the title:\n{}", rows.join("\n")));
+    let bottom = (top..rows.len())
+        .find(|&y| rows[y].contains('\u{2514}'))
+        .unwrap_or_else(|| panic!("no bottom border:\n{}", rows.join("\n")));
+    (top, bottom)
+}
+
+/// The tasks pop-up sits in the transcript's rows like the key help:
+/// the title on its top border, the keys ending in `Esc = close` on its
+/// bottom one, as tall as its rows and centred, with the rows below
+/// the status row as they were. A narrow frame puts `Esc = close`
+/// first so the border's cut keeps it.
+#[test]
+#[serial]
+fn the_tasks_popup_is_framed_over_the_transcript_wide_and_narrow() {
+    run_async(async {
+        let mut ctx = chat_ctx();
+        let (mut harness, _reply) = harness_with_tasks(&mut ctx);
+        harness.app.set_no_color(false);
+        for (width, height, name) in [(80, 24, "tasks_popup_80x24"), (40, 20, "tasks_popup_40x20")]
+        {
+            harness.resize(width, height);
+            let closed: Vec<String> = harness.draw().lines().map(str::to_string).collect();
+            harness.app.handle_key(alt(KeyCode::Char('t')));
+            let frame = harness.draw();
+            let open: Vec<&str> = frame.lines().collect();
+            let (top, bottom) = tasks_box(&open);
+            assert_eq!(bottom - top, 4, "three rows inside the border:\n{frame}");
+            assert!(open[bottom].contains("Esc = close"), "{frame}");
+            if width == 40 {
+                assert!(open[bottom].contains("\u{2514}Esc = close"), "{frame}");
+            }
+            for row in &open[top + 1..bottom] {
+                assert!(row.contains('\u{2502}'), "{frame}");
+            }
+            let below = usize::from(harness.app.composer.rows(width)) + 1;
+            let first_below = open.len() - below;
+            let rule = first_below - 2;
+            let space_above = top;
+            let space_below = rule - bottom - 1;
+            assert!(space_above.abs_diff(space_below) <= 1, "{frame}");
+            assert_eq!(open[first_below..], closed[first_below..], "{frame}");
+            let title = &harness.terminal.backend().buffer()[(2, u16::try_from(top).unwrap())];
+            assert_eq!(title.symbol(), "T");
+            assert!(title.modifier.contains(Modifier::BOLD), "{title:?}");
+            assert_ne!(title.fg, Color::Reset, "{title:?}");
+            assert_welcome_snapshot(name, &frame);
+            assert_eq!(harness.press(KeyCode::Esc), None);
+            assert!(harness.app.roster().is_none());
+        }
+    });
+}
+
+/// Under `NO_COLOR` the pop-up keeps its text, the bold title and the
+/// reversed focus, and loses every colour.
+#[test]
+#[serial]
+fn the_tasks_popup_drops_its_colours_under_no_color() {
+    run_async(async {
+        let mut ctx = chat_ctx();
+        let (mut harness, _reply) = harness_with_tasks(&mut ctx);
+        harness.app.set_no_color(true);
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+        let frame = harness.draw();
+        assert_welcome_snapshot("tasks_popup_no_color", &frame);
+        let open: Vec<&str> = frame.lines().collect();
+        let (top, bottom) = tasks_box(&open);
+        let top = u16::try_from(top).unwrap();
+        let bottom = u16::try_from(bottom).unwrap();
+        let buffer = harness.terminal.backend().buffer();
+        for y in top..=bottom {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                assert_eq!(
+                    (cell.fg, cell.bg),
+                    (Color::Reset, Color::Reset),
+                    "({x}, {y}):\n{frame}"
+                );
+            }
+        }
+        assert!(buffer[(2, top)].modifier.contains(Modifier::BOLD));
+        assert!(buffer[(2, top + 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(2, top + 2)].modifier.contains(Modifier::REVERSED));
+    });
+}
+
+/// `o` on an agent's row opens its thread in the pager over the
+/// pop-up; closing the pager brings the pop-up back with that row still
+/// focused, and the wheel moves the focus a row a notch. A pager opened
+/// from the composer closes to nothing, and a question arriving closes
+/// the pager and the pop-up it holds.
+#[test]
+#[serial]
+fn closing_a_thread_opened_from_the_tasks_popup_returns_to_it() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-tasks-return");
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 7 }));
+        let (mut harness, _reply) = harness_with_tasks(&mut ctx);
+        let focused = |harness: &Harness| harness.app.focused_task().map(|task| task.id);
+        let wheel = |kind: MouseEventKind| {
+            TermInput::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+        harness.draw();
+        harness.press(KeyCode::Char('j'));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_reviewer_1a2b"));
+        harness.press(KeyCode::Char('o'));
+        assert!(harness.app.pager().is_some_and(|pager| !pager.shows_root()));
+        assert!(harness.app.roster().is_none());
+        harness.draw();
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.pager().is_none());
+        assert_eq!(focused(&harness).as_deref(), Some("agent_reviewer_1a2b"));
+        let frame = harness.draw();
+        let open: Vec<&str> = frame.lines().collect();
+        let (_, bottom) = tasks_box(&open);
+        assert!(open[bottom].contains("Esc = close"), "{frame}");
+
+        harness.app.handle_input(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_planner_0f1e"));
+        harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_reviewer_1a2b"));
+
+        harness.app.handle_key(ctrl(KeyCode::Char('t')));
+        harness.press(KeyCode::Char('q'));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_reviewer_1a2b"));
+        harness.press(KeyCode::Esc);
+        harness.app.handle_key(ctrl(KeyCode::Char('t')));
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.overlay.is_none());
+
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+        harness.press(KeyCode::Char('o'));
+        let (reply, _answer) = mpsc::channel();
+        harness.app.enqueue_prompt(confirm_request(None), reply);
+        assert!(harness.app.overlay.is_none());
+    });
+}
+
+/// While the tasks pop-up is up mid-turn the status row keeps the
+/// turn's progress but not `Esc to interrupt`: Esc closes the pop-up
+/// and leaves the turn running.
+#[test]
+fn esc_closes_the_tasks_popup_and_the_status_row_offers_no_interrupt_under_it() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("work", false);
+    assert!(harness.draw().contains("Esc to interrupt"));
+    harness.app.handle_key(alt(KeyCode::Char('t')));
+    let frame = harness.draw();
+    assert!(frame.contains("(no tasks and no questions)"), "{frame}");
+    assert!(frame.contains("Working . 0s"), "{frame}");
+    assert!(!frame.contains("Esc to interrupt"), "{frame}");
+    assert_eq!(harness.press(KeyCode::Esc), None);
+    assert!(harness.app.roster().is_none());
+    assert!(harness.app.turn.is_some());
+    assert!(harness.draw().contains("Esc to interrupt"));
 }
 
 /// `.keys` opens the key help under the active prefix, between turns

@@ -19,7 +19,8 @@
 //!
 //! There is no lib target, so the code side of each check is read from the
 //! repo's text. The keys table is compared with the match arms of `map_key`,
-//! `vi_normal` and `pager_key` in `src/tui/keys.rs`: each arm whose pattern
+//! `vi_normal`, `help_key`, `tasks_key` and `pager_key` in `src/tui/keys.rs`:
+//! each arm whose pattern
 //! names a key and whose action is not `Action::Nothing` becomes one
 //! (context, chord) pair, the context taken from the arm's block (see
 //! `key_context_marker`) and the chord from the pattern and the modifier
@@ -425,9 +426,8 @@ fn tool_events() -> Vec<(String, String)> {
 }
 
 /// The context a line of keys.rs opens, if it opens one: `Some(None)` for a
-/// line that leaves every keyed block behind. `current` is the context the
-/// line is read in; only the roster block is closed by its own `},`.
-fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'static str>> {
+/// line that leaves every keyed block behind.
+fn key_context_marker(line: &str) -> Option<Option<&'static str>> {
     let opened = match line {
         _ if line.starts_with("pub(crate) fn map_key(") => Some("Anywhere"),
         "let modal = match ctx.layer() {" => Some("Transcript"),
@@ -435,10 +435,9 @@ fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'stat
         "ModalKind::Input" => Some("Text field"),
         "custom_field_open: false," => Some("List"),
         "None => match code {" => Some("Composer"),
-        _ if line.starts_with("_ if ctx.popup == Some(PopupKind::Roster)") => Some("Roster"),
-        "}," if current == Some("Roster") => Some("Composer"),
         _ if line.starts_with("fn vi_normal(") => Some("Vim mode"),
         _ if line.starts_with("fn help_key(") => Some("Key help"),
+        _ if line.starts_with("fn tasks_key(") => Some("Roster"),
         _ if line.starts_with("PagerMode::Find =>") => Some("Transcript view find"),
         _ if line.starts_with("PagerMode::Picker =>") => Some("Thread picker"),
         _ if line.starts_with("PagerMode::Browse =>") => Some("Transcript view"),
@@ -590,7 +589,7 @@ fn key_bindings() -> BTreeSet<Binding> {
             }
             continue;
         }
-        if let Some(next) = key_context_marker(line, context) {
+        if let Some(next) = key_context_marker(line) {
             context = next;
             continue;
         }

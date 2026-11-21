@@ -1,4 +1,3 @@
-use super::bottom_pane::View;
 use super::cells::{Cell, LineCache, ToolStatus};
 use super::pager::{Pager, ThreadRow};
 use super::redirect::FdRedirect;
@@ -474,11 +473,8 @@ impl App {
     }
 
     pub(super) fn focused_task(&self) -> Option<TaskRow> {
-        match &self.view {
-            View::Roster(roster) => match roster.focused() {
-                Some(RosterRow::Task(task)) => Some(task.clone()),
-                _ => None,
-            },
+        match self.roster()?.focused() {
+            Some(RosterRow::Task(task)) => Some(task.clone()),
             _ => None,
         }
     }

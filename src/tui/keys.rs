@@ -34,9 +34,6 @@ pub(crate) enum PopupKind {
     /// Typing goes into the band's filter line.
     HistorySearch,
     Rewind,
-    /// The running tasks and the questions waiting on the user; letters
-    /// act on the highlighted row and never reach the composer.
-    Roster,
 }
 
 /// What the full-screen pager is taking keys for.
@@ -56,6 +53,9 @@ pub(crate) enum OverlayKind {
     Pager(PagerMode),
     /// Covers the transcript; the bottom pane stays in sight under it.
     Help,
+    /// The running tasks and the questions waiting on the user, over the
+    /// transcript like the help; letters act on the highlighted row.
+    Tasks,
 }
 
 /// The layer that takes the keys: whichever of these is open first, in
@@ -139,8 +139,8 @@ pub(crate) struct KeyContext {
     pub(crate) focused: bool,
     pub(crate) popup: Option<PopupKind>,
     pub(crate) vi: Option<ViMode>,
-    /// The pager or the key help; either takes every key but the
-    /// terminal's own.
+    /// The pager, the key help or the tasks pop-up; each takes every key
+    /// but the terminal's own.
     pub(crate) overlay: Option<OverlayKind>,
 }
 
@@ -230,6 +230,7 @@ pub(crate) enum Action {
     /// The `d` of `dd`: the second press deletes the cursor's line.
     ViDeleteLine,
     ToggleTodo,
+    /// Open the tasks pop-up, or close it when it is open.
     ToggleRoster,
     /// Open the key help, or close it when it is open.
     ToggleHelp,
@@ -241,6 +242,10 @@ pub(crate) enum Action {
     RosterCancel,
     /// Show the highlighted roster row's transcript in the pager.
     RosterOpen,
+    /// Move the roster's highlight by this many rows, down when positive.
+    RosterMove(i32),
+    /// Ask the question on the roster's highlighted row in the modal.
+    RosterAnswer,
     OpenPager,
     ClosePager,
     /// Move the pager's text by this many lines, down when positive.
@@ -308,7 +313,7 @@ impl HelpContext {
             HelpContext::TurnRunning => "While a turn runs",
             HelpContext::Question => "Question",
             HelpContext::Bands => "Palette, history search and rewind",
-            HelpContext::Roster => "Tasks (the roster)",
+            HelpContext::Roster => "Tasks pop-up",
             HelpContext::ViNormal => "Vim mode",
             HelpContext::Pager => "Transcript view",
             HelpContext::PagerFind => "Transcript view find",
@@ -397,7 +402,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Edit the line in $VISUAL or $EDITOR, between turns",
         ),
         row(Composer, "Ctrl+T", "Open the transcript view"),
-        row(Composer, "Alt+T", "Show or hide tasks (the roster)"),
+        row(Composer, "Alt+T", "Show or hide the tasks pop-up"),
         row(Composer, "?", "Show this help, on an empty composer"),
         row(
             Composer,
@@ -535,10 +540,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         ),
         row(Roster, "Enter", "Answer the highlighted question"),
         row(Roster, "Ctrl+T", "Open the transcript view"),
+        row(Roster, "Mouse wheel", "Move between the rows"),
         row(
             Roster,
             "Esc / Ctrl+C / Ctrl+D / Alt+T",
-            "Close tasks (the roster)",
+            "Close the tasks pop-up",
         ),
         row(ViNormal, "h / j / k / l", "Move the cursor"),
         row(ViNormal, "w / b", "Next or previous word"),
@@ -600,6 +606,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let modal = match ctx.layer() {
         Layer::Overlay(OverlayKind::Pager(mode)) => return pager_key(key, code, mode),
         Layer::Overlay(OverlayKind::Help) => return help_key(key, code),
+        Layer::Overlay(OverlayKind::Tasks) => return tasks_key(key, code),
         Layer::Modal(modal) => Some(modal),
         Layer::Band(_) | Layer::Composer => None,
     };
@@ -694,19 +701,6 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             // Readline's split: EOF only on an empty line; with a draft the
             // chord reaches the textarea, which deletes forward.
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
-            // The draft, the focus and the queue are out of sight under the
-            // roster: only the band's own keys do anything.
-            _ if ctx.popup == Some(PopupKind::Roster) => match code {
-                KeyCode::Esc => Action::ClosePopup,
-                KeyCode::Up | KeyCode::BackTab if !ctrl && !alt => Action::PaletteMove(-1),
-                KeyCode::Down | KeyCode::Tab if !ctrl && !alt => Action::PaletteMove(1),
-                KeyCode::Enter => Action::PaletteAccept,
-                KeyCode::Char('j') if !ctrl => Action::PaletteMove(1),
-                KeyCode::Char('k') if !ctrl => Action::PaletteMove(-1),
-                KeyCode::Char('x') if !ctrl => Action::RosterCancel,
-                KeyCode::Char('o') if !ctrl => Action::RosterOpen,
-                _ => Action::Nothing,
-            },
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
             KeyCode::Up if alt => Action::EditQueued,
@@ -819,6 +813,26 @@ fn help_key(key: KeyEvent, code: KeyCode) -> Action {
         KeyCode::Up | KeyCode::Char('k') => Action::HelpScroll(-1),
         KeyCode::PageDown => Action::HelpPage(1),
         KeyCode::PageUp => Action::HelpPage(-1),
+        _ => Action::Nothing,
+    }
+}
+
+/// The tasks pop-up's keys: they act on the highlighted row, and nothing
+/// under the pop-up is reached.
+fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match code {
+        KeyCode::Esc => Action::ToggleRoster,
+        KeyCode::Char('c' | 'd') if ctrl => Action::ToggleRoster,
+        KeyCode::Char('t') if ctrl => Action::OpenPager,
+        KeyCode::Char('t') if alt => Action::ToggleRoster,
+        _ if ctrl || alt => Action::Nothing,
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Action::RosterMove(-1),
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Action::RosterMove(1),
+        KeyCode::Enter => Action::RosterAnswer,
+        KeyCode::Char('x') => Action::RosterCancel,
+        KeyCode::Char('o') => Action::RosterOpen,
         _ => Action::Nothing,
     }
 }
@@ -1932,6 +1946,12 @@ mod tests {
             (overlay, None, popup, help),
             (overlay, modal, None, help),
             (overlay, modal, popup, help),
+            (
+                Some(OverlayKind::Tasks),
+                modal,
+                popup,
+                Layer::Overlay(OverlayKind::Tasks),
+            ),
         ];
         for (overlay, modal, popup, expected) in cases {
             assert_eq!(
@@ -1957,7 +1977,7 @@ mod tests {
             ..IDLE
         };
         let roster = KeyContext {
-            popup: Some(PopupKind::Roster),
+            overlay: Some(OverlayKind::Tasks),
             ..IDLE
         };
         let confirm = KeyContext {
@@ -2010,32 +2030,47 @@ mod tests {
         }
     }
 
-    /// With the roster up its letters act on the highlighted row and no
-    /// other letter reaches the composer; the focus and queue chords do
-    /// nothing either. Esc and the quit chords close it, Enter answers
-    /// the row even mid-turn.
+    /// With the tasks pop-up up its letters act on the highlighted row
+    /// and no other key reaches the composer or the transcript under it.
+    /// Esc, the quit chords and Alt+T close it, Enter answers the row even
+    /// mid-turn, and Ctrl+T opens the pager over it.
     #[test]
-    fn roster_keys() {
+    fn tasks_keys() {
         let roster = KeyContext {
-            popup: Some(PopupKind::Roster),
+            overlay: Some(OverlayKind::Tasks),
             ..IDLE
         };
         let running = KeyContext {
             turn_running: true,
             ..roster
         };
+        let typing = KeyContext {
+            composer_empty: false,
+            ..roster
+        };
         let cases = [
-            (plain(KeyCode::Char('j')), roster, Action::PaletteMove(1)),
-            (plain(KeyCode::Char('k')), roster, Action::PaletteMove(-1)),
-            (plain(KeyCode::Down), roster, Action::PaletteMove(1)),
-            (plain(KeyCode::Up), roster, Action::PaletteMove(-1)),
+            (plain(KeyCode::Char('j')), roster, Action::RosterMove(1)),
+            (plain(KeyCode::Char('k')), roster, Action::RosterMove(-1)),
+            (plain(KeyCode::Down), roster, Action::RosterMove(1)),
+            (plain(KeyCode::Up), roster, Action::RosterMove(-1)),
+            (plain(KeyCode::Tab), roster, Action::RosterMove(1)),
+            (
+                press(KeyCode::BackTab, KeyModifiers::SHIFT),
+                roster,
+                Action::RosterMove(-1),
+            ),
             (plain(KeyCode::Char('x')), roster, Action::RosterCancel),
             (plain(KeyCode::Char('x')), running, Action::RosterCancel),
             (plain(KeyCode::Char('o')), roster, Action::RosterOpen),
             (plain(KeyCode::Char('a')), roster, Action::Nothing),
+            (plain(KeyCode::Char('?')), roster, Action::Nothing),
+            (plain(KeyCode::Char('q')), roster, Action::Nothing),
             (plain(KeyCode::Backspace), roster, Action::Nothing),
             (ctrl('u'), roster, Action::Nothing),
             (ctrl('w'), roster, Action::Nothing),
+            (ctrl('x'), roster, Action::Nothing),
+            (ctrl('o'), roster, Action::Nothing),
+            (plain(KeyCode::PageUp), roster, Action::Nothing),
             (plain(KeyCode::Left), roster, Action::Nothing),
             (plain(KeyCode::Home), roster, Action::Nothing),
             (
@@ -2053,12 +2088,25 @@ mod tests {
                 roster,
                 Action::Nothing,
             ),
-            (plain(KeyCode::Enter), roster, Action::PaletteAccept),
-            (plain(KeyCode::Enter), running, Action::PaletteAccept),
-            (plain(KeyCode::Esc), roster, Action::ClosePopup),
-            (plain(KeyCode::Esc), running, Action::ClosePopup),
-            (ctrl('c'), running, Action::ClosePopup),
-            (ctrl('x'), roster, Action::ToggleTodo),
+            (plain(KeyCode::Enter), roster, Action::RosterAnswer),
+            (plain(KeyCode::Enter), running, Action::RosterAnswer),
+            (plain(KeyCode::Esc), roster, Action::ToggleRoster),
+            (plain(KeyCode::Esc), running, Action::ToggleRoster),
+            (ctrl('c'), running, Action::ToggleRoster),
+            (ctrl('c'), typing, Action::ToggleRoster),
+            (ctrl('d'), typing, Action::ToggleRoster),
+            (
+                press(KeyCode::Char('t'), KeyModifiers::ALT),
+                running,
+                Action::ToggleRoster,
+            ),
+            (ctrl('t'), running, Action::OpenPager),
+            (ctrl('z'), roster, Action::Suspend),
+            (
+                press(KeyCode::Char('m'), KeyModifiers::ALT),
+                roster,
+                Action::ToggleMouse,
+            ),
             (
                 plain(KeyCode::Char('x')),
                 IDLE,
@@ -2239,7 +2287,7 @@ mod tests {
         ..IDLE
     };
     const ROSTER: KeyContext = KeyContext {
-        popup: Some(PopupKind::Roster),
+        overlay: Some(OverlayKind::Tasks),
         ..IDLE
     };
     const RUNNING_ROSTER: KeyContext = KeyContext {
@@ -2313,10 +2361,7 @@ mod tests {
                 &[PALETTE, RUNNING_PALETTE, SEARCH, REWIND],
                 [&composer[..], &[H::Bands]].concat(),
             ),
-            (
-                &[ROSTER, RUNNING_ROSTER],
-                vec![H::Anywhere, H::Transcript, H::Roster],
-            ),
+            (&[ROSTER, RUNNING_ROSTER], vec![H::Anywhere, H::Roster]),
             (
                 &[VI_NORMAL, VI_NORMAL_EMPTY, VI_NORMAL_SCROLLED],
                 [&composer[..], &[H::ViNormal]].concat(),
@@ -2787,12 +2832,12 @@ mod tests {
                 H::Roster,
                 "j / k / Up / Down / Tab / Shift+Tab",
                 vec![
-                    (letter('j'), ROSTER, Action::PaletteMove(1)),
-                    (letter('k'), ROSTER, Action::PaletteMove(-1)),
-                    (plain(KeyCode::Up), ROSTER, Action::PaletteMove(-1)),
-                    (plain(KeyCode::Down), ROSTER, Action::PaletteMove(1)),
-                    (plain(KeyCode::Tab), ROSTER, Action::PaletteMove(1)),
-                    (plain(KeyCode::BackTab), ROSTER, Action::PaletteMove(-1)),
+                    (letter('j'), ROSTER, Action::RosterMove(1)),
+                    (letter('k'), ROSTER, Action::RosterMove(-1)),
+                    (plain(KeyCode::Up), ROSTER, Action::RosterMove(-1)),
+                    (plain(KeyCode::Down), ROSTER, Action::RosterMove(1)),
+                    (plain(KeyCode::Tab), ROSTER, Action::RosterMove(1)),
+                    (plain(KeyCode::BackTab), ROSTER, Action::RosterMove(-1)),
                 ],
             ),
             (
@@ -2808,20 +2853,21 @@ mod tests {
             (
                 H::Roster,
                 "Enter",
-                vec![(plain(KeyCode::Enter), RUNNING_ROSTER, Action::PaletteAccept)],
+                vec![(plain(KeyCode::Enter), RUNNING_ROSTER, Action::RosterAnswer)],
             ),
             (
                 H::Roster,
                 "Ctrl+T",
                 vec![(ctrl('t'), ROSTER, Action::OpenPager)],
             ),
+            (H::Roster, "Mouse wheel", vec![]),
             (
                 H::Roster,
                 "Esc / Ctrl+C / Ctrl+D / Alt+T",
                 vec![
-                    (plain(KeyCode::Esc), ROSTER, Action::ClosePopup),
-                    (ctrl('c'), RUNNING_ROSTER, Action::ClosePopup),
-                    (ctrl('d'), ROSTER, Action::ClosePopup),
+                    (plain(KeyCode::Esc), ROSTER, Action::ToggleRoster),
+                    (ctrl('c'), RUNNING_ROSTER, Action::ToggleRoster),
+                    (ctrl('d'), ROSTER, Action::ToggleRoster),
                     (
                         press(KeyCode::Char('t'), KeyModifiers::ALT),
                         ROSTER,
@@ -3622,11 +3668,11 @@ mod tests {
         }
         let alt_c = press(KeyCode::Char('c'), KeyModifiers::ALT);
         for ctx in [
-            IDLE, TYPING, FOCUSED, RUNNING, VI_NORMAL, CONFIRM, INPUT, SELECT, SEARCH, ROSTER,
+            IDLE, TYPING, FOCUSED, RUNNING, VI_NORMAL, CONFIRM, INPUT, SELECT, SEARCH,
         ] {
             assert_eq!(map_key(alt_c, &ctx), Action::CopyToolOutput, "{ctx:?}");
         }
-        for ctx in [BROWSE, PICKER, HELP] {
+        for ctx in [BROWSE, PICKER, HELP, ROSTER] {
             assert_eq!(map_key(alt_c, &ctx), Action::Nothing, "{ctx:?}");
         }
         assert_eq!(map_key(alt_c, &FIND), Action::PagerFindChar('c'));

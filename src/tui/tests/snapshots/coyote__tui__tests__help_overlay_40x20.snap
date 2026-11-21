@@ -3,7 +3,7 @@ source: src/tui/tests/mod.rs
 expression: frame
 ---
 "│ model: openai:test-model             │"
-"│┌Keys─────────────────────────1-7/226┐│"
+"│┌Keys─────────────────────────1-7/228┐│"
 "││                                    ││"
 "││Anywhere                            ││"
 "││  Ctrl+Z                            ││"

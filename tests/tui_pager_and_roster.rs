@@ -2789,6 +2789,44 @@ mod binary_threads {
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
     }
 
+    /// `o` on the kid's row opens its thread over the tasks pop-up, and `q`
+    /// on the thread brings the pop-up back, title and way out in sight.
+    #[test]
+    #[serial]
+    fn closing_the_kids_thread_returns_to_the_tasks_popup() {
+        let scene = scene("thr-return", kid_mark_then_held, "");
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+
+        pty.send(ALT_T).unwrap();
+        let roster =
+            repainted_frame_showing(&mut pty, "Esc = close", "Alt+T did not open the roster");
+        assert!(
+            roster_band(&roster).contains("kid"),
+            "no kid row to open:\n{roster}"
+        );
+        pty.send(b"o").unwrap();
+        let thread =
+            repainted_frame_showing(&mut pty, "Thread: kid", "o did not open the kid's thread");
+        assert!(
+            !thread.contains("Esc = close"),
+            "the tasks pop-up shows over the thread:\n{thread}"
+        );
+        pty.send(b"q").unwrap();
+        let back = repainted_frame_showing(
+            &mut pty,
+            "Esc = close",
+            "closing the thread did not bring the tasks pop-up back",
+        );
+        assert!(
+            back.contains("\u{250c}Tasks") && roster_band(&back).contains("kid"),
+            "the tasks pop-up came back without its title or the kid's row:\n{back}"
+        );
+        pty.send(b"\x1b").unwrap();
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
     // ---------------------------------------------------------------------------
     // The thread picker and a child's transcript.
     // ---------------------------------------------------------------------------

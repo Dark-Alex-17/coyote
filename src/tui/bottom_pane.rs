@@ -1,12 +1,10 @@
 //! What the bottom pane shows besides the composer. The composer is always
 //! there; a view is a band of rows that sits on top of it: the command
-//! palette, the history search, the rewind picker, the task roster. The
-//! prompt modal is not a view: a question outranks all of them and closes
-//! whatever is open.
+//! palette, the history search, the rewind picker. The prompt modal is not
+//! a view: a question outranks all of them and closes whatever is open.
 
 use super::cells::{Cell, RewindBarrier};
 use super::history::ComposerHistory;
-use super::roster::RosterState;
 use super::theme::{DIM, PLAIN_ROWS, RowStyles, Theme};
 use crate::config::{CommandPrefix, RequestContext, StateFlags};
 use crate::repl::{command_candidates, macro_candidates, split_line};
@@ -29,7 +27,6 @@ pub(super) enum View {
     Palette(PaletteState),
     HistorySearch(SearchState),
     Rewind(RewindState),
-    Roster(RosterState),
 }
 
 impl View {
@@ -41,7 +38,6 @@ impl View {
             View::Palette(palette) => palette.band_rows(),
             View::HistorySearch(search) => search.band_rows(),
             View::Rewind(rewind) => rewind.band_rows(),
-            View::Roster(roster) => roster.band_rows(),
         }
     }
 }

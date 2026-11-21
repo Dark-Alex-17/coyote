@@ -8,6 +8,7 @@ use super::bottom_pane::{render_header, render_rows, step_highlight};
 use super::cells::{Cell, short_args, without_think_spans};
 use super::keys::PagerMode;
 use super::render::{self, Renderer};
+use super::roster::RosterState;
 use super::{ChromeKind, DIM, chrome_style};
 use crate::client::{Message, MessageContent, MessageContentPart, MessageRole};
 use crate::config::child_sessions::{ChildMeta, EffectiveStatus};
@@ -330,6 +331,9 @@ pub(super) struct Pager {
     /// generation it was laid out for; reused until either moves.
     laid_out: Option<(u16, u64, Arc<PagerText>)>,
     root_lines: RootLines,
+    /// The tasks pop-up the pager was opened from, which closing the
+    /// pager brings back with its focus where it was.
+    tasks: Option<RosterState>,
     /// Root cells laid out since the pager opened.
     #[cfg(test)]
     cell_layouts: usize,
@@ -354,6 +358,7 @@ impl Pager {
             page: 1,
             laid_out: None,
             root_lines: RootLines::default(),
+            tasks: None,
             #[cfg(test)]
             cell_layouts: 0,
             #[cfg(test)]
@@ -410,6 +415,14 @@ impl Pager {
 
     pub(super) fn shows_root(&self) -> bool {
         matches!(self.thread, Thread::Root)
+    }
+
+    pub(super) fn set_tasks(&mut self, tasks: Option<RosterState>) {
+        self.tasks = tasks;
+    }
+
+    pub(super) fn take_tasks(&mut self) -> Option<RosterState> {
+        self.tasks.take()
     }
 
     fn open_child_view(&mut self, session_id: &str) -> Option<&mut ChildView> {
