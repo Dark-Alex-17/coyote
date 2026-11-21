@@ -1,11 +1,9 @@
-"""Failure locations in a test command's output - the ONE copy of the parser.
+"""Failure locations in a test command's output.
 
-Consumers: sisyphus-next/scripts/gates.py (the carried-failure gate and the
-verdict-line locations) and adversary/scripts/run_checks.py (matching a red
-run against the failures its caller declares carried). A failure is
-identified by the repo paths it resolves to (a directory ends in "/"), so
-both consumers key on the same evidence. Pure regex over the output plus one
-`git ls-files` for the repo index; no LLM.
+A failure is identified by the repo paths it resolves to (a directory ends in
+"/"), so a gate that records failures as carried and the adversary that
+matches a red run against them key on the same evidence. Pure regex over the
+output plus one `git ls-files` for the repo index; no LLM.
 """
 import os
 import re
