@@ -24307,6 +24307,7 @@ mod tests {
                             "ask_owner_route",
                             "ask_review_incomplete",
                             "ask_user",
+                            "base_check",
                             "bookkeeping_judge",
                             "bookkeeping_route",
                             "bookkeeping_scan",
