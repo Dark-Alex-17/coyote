@@ -753,7 +753,7 @@ fn sisyphus_cadence_blocks_render_exclusively_and_share_the_debris_rule() {
 /// The gauntlet hands `build_lock` to the adversary lane through `inputs:`
 /// (the same structured channel as `verification_commands`, and with them
 /// `debris_exclude`, so the adversary's debris lint leaves out what the
-/// gauntlet's own debris lane leaves out), and every
+/// gauntlet's own debris lane leaves out, and `carried_failures`), and every
 /// spawn template that forwards the variable spells it the same way, so an
 /// empty value travels too rather than being dropped by a conditional.
 #[test]
@@ -774,6 +774,11 @@ fn build_lock_forwarding_is_unconditional_in_templates_and_gauntlet_inputs() {
         inputs["debris_exclude"],
         serde_yaml::Value::from("{{debris_exclude}}"),
         "the adversary lane must lint with the same debris_exclude as the gauntlet's debris lane"
+    );
+    assert_eq!(
+        inputs["carried_failures"],
+        serde_yaml::Value::from("{{carried_failures}}"),
+        "the adversary lane must match red runs against the gauntlet's carried_failures"
     );
 
     let forwarded = r#""build_lock": "{{build_lock}}""#;

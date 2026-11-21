@@ -329,6 +329,11 @@ verbatim.
   under that prefix (e.g. `flock -w 240 /path/to/lock`), the same way the coder and
   step-runner gates do, so a parallel batch sharing one target directory
   serialises its verification runs too.
+- The `carried_failures` variable (default `'[]'`, a JSON array of
+  `{"paths", "owner", "evidence"}` items) rides the same passthrough: failures
+  the caller declares expected to stay red in this change and owed elsewhere.
+  The adversary lane reports a red run whose every failure exactly matches a
+  carried item's paths as advisory; a new failure beside them still blocks.
 - Signals failures degrade WIDER: if git can't compute the diff, the surface
   is unknown — the security lane is added (and probe, when a local-run recipe
   exists) on top of caller context + forced lanes, and the report notes it.
