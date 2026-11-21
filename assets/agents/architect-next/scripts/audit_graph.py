@@ -49,7 +49,8 @@ BOUNDED = {
     "review_apply": "review fix rounds<=3 per PR",
     "ask_owner_route": "B21 owner_polls<=2",
     "parse_answer": "B22 reask_rounds<=3",
-    "interpret_route": "one interpretation per reply (reply_interpreted), then parse_answer's B22",
+    "interpret_route": ("one interpretation per reply (reply_interpreted), then parse_answer's B22; judge retry <=1 per question; "
+                        "judge_rulings <= STRIKE_LIMIT per kind:task"),
     "choice_reask": "user-driven: every pass waits on the owner's next reply",
     "choice_park": "DISCUSSION_PARKS_MAX=3 parks per question (choice_parks; a relayed child question keyed by task + question); each park ends the run",
     "route_delegate": "relay: a re-delegation only after the owner answers; the child parks a question at most DISCUSSION_PARKS_MAX times",

@@ -24176,6 +24176,7 @@ mod tests {
                             "gate2_route",
                             "group_closeout",
                             "harvest_report",
+                            "headless_judge",
                             "hygiene_create",
                             "integrate_findings",
                             "integrate_route",

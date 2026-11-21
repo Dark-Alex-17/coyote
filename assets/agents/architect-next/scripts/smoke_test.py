@@ -1000,8 +1000,15 @@ check("gate1_build: the prior verdict keeps its first item", "FIRST-LEAK" in u["
 # ---------------------------------------------------------------- promote (B6) with the stub task store
 u = gates.promote_verify(base_state(promote_retries=0))
 check("promote_verify: no promoted PLAN / no tasks -> one retry (B6 side 1)", u["_next"] == "promote_tasks" and u["promote_retries"] == 1 and ("PLAN" in u["promote_defects"] or "task dirs" in u["promote_defects"]))
-u = gates.promote_verify(base_state(promote_retries=RERUN_ONCE))
-check("promote_verify: B6 exhausted -> escalation promote_failed", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed")
+_store = gates.TASKSTORE
+gates.TASKSTORE = "dirstate"
+try:
+    u = gates.promote_verify(base_state(promote_retries=RERUN_ONCE))
+finally:
+    gates.TASKSTORE = _store
+check("replay 08/1: the promoted PLAN still missing after the retry -> escalation promote_failed, the row count beside it as evidence",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed" and "promoted PLAN not found" in u["escalation"]["evidence"]
+      and "the breakdown table lists 3 tasks but 0 task dirs" in u["escalation"]["evidence"], u.get("escalation"))
 # Simulate promote_tasks: PLAN + three tasks through bin/new-task.
 PROMOTED = FIXTURE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
 ids = []
@@ -1018,6 +1025,39 @@ TASKS = u["tasks"]
 for t in TASKS:
     t["unit"] = "run"
 PS = dict(plan_path=PROMOTED, tasks=TASKS)
+
+# ---------------------------------------------------------------- replay 08/1: a table nested under the task breakdown
+R81 = os.path.join(TMP, "replay-08-1", "plans")
+R81_TASKS = os.path.join(R81, "tasks")
+R81_PLAN = os.path.join(R81, "PLAN-replay.md")
+write(R81_PLAN, "---\ntitle: Replay\nslug: replay\nstatus: in-progress\n---\n\n# Replay\n\n## Task breakdown\n\n"
+      "| Task | Title | Points | Blocked by | Files |\n|---|---|---|---|---|\n"
+      + "".join(f"| {k} | Item {k} | 1 | | README.md |\n" for k in range(1, 11))
+      + "\n### T6 field notes\n\n| Field | Meaning |\n|---|---|\n| a | first |\n| b | second |\n\n## Local-run recipe\n\n`./run-checks`\n")
+
+
+def r81_state(dirs, **over):
+    shutil.rmtree(R81_TASKS, ignore_errors=True)
+    for k in range(1, dirs + 1):
+        write(os.path.join(R81_TASKS, f"TASK-{k:03d}-item-{k}", "index.md"),
+              f"---\ntitle: item {k}\nstatus: pending\nplan: PLAN-replay.md\n---\n\n# item {k}\n")
+    return base_state(plans_root=R81, tasks_root=R81_TASKS, plan_path=R81_PLAN, plan_slug="replay",
+                      run_dir=os.path.join(TMP, "runs-replay", "r81"), **over)
+
+
+u = gates.promote_verify(r81_state(10, promote_retries=0))
+check("replay 08/1: a table inside a ### subsection of the breakdown is not counted (10 rows, 10 dirs) -> branch_setup, no defects",
+      u["_next"] == "branch_setup" and "promote_defects" not in u and len(u["tasks"]) == 10, (u["_next"], u.get("promote_defects")))
+u = gates.promote_verify(r81_state(9, promote_retries=0))
+check("replay 08/1: a real shortfall on the first pass -> one retry whose defect asks to check both counts",
+      u["_next"] == "promote_tasks" and u["promote_retries"] == 1
+      and "the breakdown table lists 10 tasks but 9 task dirs belong to the plan" in u["promote_defects"]
+      and "say in your report why the counts differ" in u["promote_defects"], u.get("promote_defects"))
+u = gates.promote_verify(r81_state(9, promote_retries=RERUN_ONCE))
+R81_LINE = "promote: breakdown lists 10 rows, 9 task dirs after the retry; proceeding (advisory)"
+check("replay 08/1: the shortfall still there after the retry -> ledgered and recorded as an anomaly; the run proceeds, no promote_failed",
+      u["_next"] == "branch_setup" and "escalation" not in u and R81_LINE in u["decisions"]
+      and any(R81_LINE in a for a in u["anomalies_log"]), (u["_next"], u.get("escalation"), u.get("anomalies_log")))
 
 # ---------------------------------------------------------------- branch_setup
 u = gates.branch_setup(base_state(**PS))
@@ -1888,6 +1928,137 @@ E_IR = u["escalation"]
 E_IR_SPENT = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets",
                                                verification_commands='["false"]', task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}},
                                                cap_continues={f"integration_red:{T1}": STRIKE_LIMIT})).get("escalation")
+
+# ---------------------------------------------------------------- replay 08/2: a declared verification command that cannot run as declared
+R82 = os.path.join(TMP, "replay-08-2")
+write(os.path.join(R82, "CONTRIBUTING.md"), "# Contributing\n\nRun every check through the wrapper:\n\n    ./run-checks\n\n"
+                                             "It sets up what the checks need.\n")
+R82_RUN = os.path.join(TMP, "runs-replay", "r82")
+R82_WHY = "CONTRIBUTING.md:5 documents the wrapper, which runs the same checks"
+R82_CTX = dict(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, current_task=T1, run_branch="feat/PLAN-widgets", code_repo_path=R82,
+               run_dir=R82_RUN, verification_commands='["true", "sh check.sh"]')
+R82_PROPOSAL = {"command": "sh check.sh", "replacement": "./run-checks", "reason": R82_WHY, "task": T1}
+
+
+def r82(**over):
+    return base_state(**{**R82_CTX, "task_rounds": {T1: {"merged": True}}, **over})
+
+
+def r82_report(text):
+    write(os.path.join(R82_RUN, "reports", f"{T1}-r1.md"), text)
+
+
+ok_, out_, failed_ = gates._run_verification(base_state(verification_commands='["true", "false", "true"]'), CODE)
+check("replay 08/2: _run_verification names the failing command and its exit",
+      not ok_ and failed_ == {"command": "false", "exit": 1} and "$ false" in out_, (ok_, failed_))
+check("replay 08/2: _run_verification green -> no failed command", gates._run_verification(base_state(), CODE)[::2] == (True, {}))
+u = gates.integration_test(r82())
+fr82 = _lib.as_dict(u.get("fix_request"))
+item82 = " ".join(fr82.get("items", []))
+check("replay 08/2: integration_test RED -> the fix request names the failed command, its exit and asks for a verification-command line",
+      u["_next"] == "fix_round" and fr82.get("failed_command") == "sh check.sh" and "`sh check.sh`" in item82 and " and it exited " in item82
+      and f" in {R82} " in item82 and "`verification-command: <the documented command> -- " in item82, fr82)
+check("replay 08/2: fix_round carries the failed command into state",
+      gates.fix_round(base_state(fix_request=fr82)).get("fix_failed_command") == "sh check.sh")
+FD82 = dict(run_dir=R82_RUN, tasks=TS_W, current_task=T1, fix_source="integration", fix_return_to="integration",
+            fix_origin_return="integration", fix_failed_command="sh check.sh")
+for form in ("verification-command: `./run-checks` -- ", "- verification-command: ./run-checks -- ",
+             "- assess: verification-command: `./run-checks` -- "):
+    r82_report(f"Done.\n\nThe gate command cannot run here.\n{form}{R82_WHY}\n")
+    u = gates.fix_done(base_state(**FD82))
+    check(f"replay 08/2: fix_done(integration) harvests the proposal from {form.split('verification')[0] or 'a bare line'!r}",
+          u["_next"] == "integration_test" and u.get("verification_proposal") == R82_PROPOSAL and u["fix_failed_command"] == ""
+          and any("proposes `./run-checks`" in d for d in u["decisions"]), u.get("verification_proposal"))
+r82_report("Done.\n\nI looked at whether a verification-command: line was needed; it was not.\n")
+check("replay 08/2: a mention in prose is no proposal", "verification_proposal" not in gates.fix_done(base_state(**FD82)))
+u = gates.integration_test(r82(verification_proposal=R82_PROPOSAL))
+E_VC = u.get("escalation") or {}
+check("replay 08/2: RED with a pending proposal for the failed command -> verification_command, no option recommended, output and cited excerpt",
+      u["_next"] == "escalate_gate" and E_VC.get("kind") == "verification_command" and not any(o["recommended"] for o in E_VC["options"])
+      and [o["text"] for o in E_VC["options"]] == [gates.VERIFY_ADOPT, gates.VERIFY_KEEP, "Stop and report"]
+      and "$ sh check.sh" in E_VC["evidence"] and "5:     ./run-checks" in E_VC["evidence"]
+      and "replacement text appears verbatim in the cited file: yes" in E_VC["evidence"] and u["verification_proposal"] == {}
+      and E_VC["data"]["scope"] == "task" and E_VC["data"]["failed_command"] == "sh check.sh", E_VC)
+u = gates.integration_test(r82(verification_proposal={**R82_PROPOSAL, "command": "true"}))
+check("replay 08/2: a proposal for another command than the failed one is ledgered and dropped",
+      u["_next"] == "fix_round" and u["verification_proposal"] == {} and any("dropped" in d for d in u["decisions"]), u["_next"])
+u = gates.integration_test(r82(verification_proposal={**R82_PROPOSAL, "reason": "docs/missing.md:3 says so"}))
+check("replay 08/2: a cited place that does not exist is reported as not found",
+      "cited place not found" in (u.get("escalation") or {}).get("evidence", ""), u.get("escalation"))
+u = gates.apply_answer(r82(escalation=E_VC, last_answer=gates.VERIFY_ADOPT, verification_commands='["true", "sh check.sh", "./run-checks"]'))
+ch82 = _lib.as_list(u.get("verification_changes"))
+check("replay 08/2: adopt -> replaced in place and deduplicated, the change recorded with reason and by, only the verification re-run",
+      u["_next"] == "integration_test" and u["verification_commands"] == '["true", "./run-checks"]' and "fix_request" not in u
+      and len(ch82) == 1 and ch82[0]["from"] == "sh check.sh" and ch82[0]["to"] == "./run-checks" and ch82[0]["reason"] == R82_WHY
+      and ch82[0]["by"] == "owner" and ch82[0]["task"] == T1 and any("already declared" in d for d in u["decisions"]), u)
+u = vg(verification_commands=u["verification_commands"])
+check("replay 08/2: verify_gate after the adoption declares the replacement, not the replaced command",
+      "./run-checks" in json.loads(u["verification_commands_json"]) and "sh check.sh" not in u["verification_commands_json"],
+      u.get("verification_commands_json"))
+u = gates.apply_answer(r82(escalation=E_VC, last_answer=gates.VERIFY_KEEP))
+check("replay 08/2: keep -> the RED's fix round with its output, the pair recorded as kept",
+      u["_next"] == "fix_round" and "$ sh check.sh" in u["fix_request"]["note"] and u["fix_request"]["failed_command"] == "sh check.sh"
+      and _lib.as_list(u.get("verification_changes"))[-1].get("kept") is True, u)
+u = gates.integration_test(r82(verification_proposal=R82_PROPOSAL, verification_changes=u["verification_changes"]))
+check("replay 08/2: a kept pair is not raised again", u["_next"] == "fix_round" and "escalation" not in u, u.get("escalation"))
+E_IR82 = gates.integration_test(r82(task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}},
+                                    cap_continues={f"integration_red:{T1}": STRIKE_LIMIT}))["escalation"]
+r82_report("Done.\n\nREPORT-SUMMARY: the declared command needs the wrapper.\n")
+E_IR82_RPT = gates.integration_test(r82(task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}}))["escalation"]
+check("replay 08/2: integration_red carries the failed command and the latest fix-round report",
+      E_IR82["data"].get("failed_command") == "sh check.sh" and gates.CAP_SPENT_NOTE in E_IR82["question"]
+      and "REPORT-SUMMARY: the declared command needs the wrapper." in E_IR82_RPT["evidence"], E_IR82["data"])
+s = r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE, reply_source="judge", reply_verdict="instruction",
+        reply_instruction="verification_command", reply_value=f"./run-checks -- {R82_WHY}", reply_reason="The project documents the wrapper.")
+s.update(gates.interpret_route(s))
+s.update(gates.apply_answer(s))
+check("replay 08/2: an integration_red verification_command instruction is applied through the one helper and re-runs the verification",
+      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks"]'
+      and s["verification_changes"][-1]["by"] == "headless judge" and s["verification_changes"][-1]["reason"] == R82_WHY, s.get("decisions"))
+CHANGED82 = [{"from": "sh check.sh", "to": "./run-checks", "reason": R82_WHY, "by": "owner", "task": T1, "at": "t"},
+             {"from": "true", "to": "./other", "reason": "r", "by": "headless judge", "task": T1, "at": "t", "kept": True}]
+rep82 = gates.final_report(base_state(plan_path=PROMOTED, tasks=TS_W, run_dir=R82_RUN, verification_changes=CHANGED82))["report"]
+gates.pr_body(base_state(plan_path=PROMOTED, tasks=TS_W, run_dir=R82_RUN, pr_summary_text="Widgets.", body_fix_rounds=RERUN_ONCE,
+                         verification_changes=CHANGED82))
+line82 = f"- `sh check.sh` -> `./run-checks` (owner, {T1}): {R82_WHY}"
+check("replay 08/2: final_report and the PR summary list the verification command changes, a kept proposal marked",
+      "## Verification command changes" in rep82 and line82 in rep82 and "kept, not adopted" in rep82
+      and line82 in read_file(os.path.join(R82_RUN, "pr-summary.md")), rep82[-600:])
+
+# the headless judge: a canned no-human reply to a question that recommends no option
+R82_JUDGE = "The last fix round named the wrapper as the cause, so one more round can land."
+s = r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE, task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT + 1}},
+        cap_continues={f"integration_red:{T1}": STRIKE_LIMIT}, autonomous_digest=[])
+s.update(gates.parse_answer(s))
+first82 = s["_next"]
+s.update({"reply_verdict": "option", "reply_option": gates.INTEGRATION_RED_MORE, "reply_reason": R82_JUDGE})
+s.update(gates.interpret_route(s))
+s.update(gates.apply_answer(s))
+check("replay 08/2: integration_red past the spent cap + headless reply -> the judge's continue dispatches a round carrying its reason",
+      first82 == "headless_judge" and s["_next"] == "fix_round" and any(R82_JUDGE in i for i in s["fix_request"]["items"])
+      and s["cap_continues"][f"integration_red:{T1}"] == STRIKE_LIMIT + 1
+      and any("headless judge" in d and R82_JUDGE in d for d in s["autonomous_digest"])
+      and not any("is unclear -> one clarifying question" in d for d in s["decisions"]), (first82, s["_next"], s.get("decisions")))
+s = r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE)
+s.update(gates.parse_answer(s))
+faults82 = []
+for _ in range(2):
+    s.update({"reply_verdict": "option", "reply_option": "Rewrite the gate", "reply_reason": "it seems best"})
+    s.update(gates.interpret_route(s))
+    faults82.append(s["_next"])
+check("replay 08/2: a judge ruling naming no offered option gets one more ruling, then the run ends blocked with the question",
+      faults82 == ["headless_judge", "end_blocked"] and "headless judge gave no usable ruling twice" in s["failure_reason"]
+      and "still RED after" in s["failure_reason"] and gates.INTEGRATION_RED_MORE in s["failure_reason"], (faults82, s.get("failure_reason")))
+u = gates.parse_answer(r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE, judge_rulings={f"integration_red:{T1}": STRIKE_LIMIT}))
+check("replay 08/2: a question the judge has decided STRIKE_LIMIT times ends blocked without the judge",
+      u["_next"] == "end_blocked" and f"has decided this question {STRIKE_LIMIT} times" in u["failure_reason"], u)
+s = r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE)
+s.update(gates.parse_answer(s))
+s.update({"reply_verdict": "option", "reply_option": "Stop and report", "reply_reason": "Nothing in the evidence says another round can land."})
+s.update(gates.interpret_route(s))
+s.update(gates.apply_answer(s))
+check("replay 08/2: the judge picks Stop -> end_blocked with its reason in failure_reason",
+      s["_next"] == "end_blocked" and "Nothing in the evidence says another round can land." in s["failure_reason"], s.get("failure_reason"))
 ts_cl = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl, T1).update({"status": "complete", "worktree": wt0, "branch": WAVE[0]["branch"]})
 git(CODE, "push", "-q", "origin", WAVE[0]["branch"])
@@ -1991,8 +2162,11 @@ for reply in (HG, f"  {HG}\n"):
           and any(d.startswith("headless: task_failed:") for d in s["decisions"]), s.get("decisions"))
 TF_NONE = gates.task_failed_route(base_state(current_task=T1, oracle_result="Agent node failed: x", task_rounds={}))["escalation"]
 u = gates.parse_answer(base_state(escalation=TF_NONE, last_answer_text=HG))
-check("headless: guidance on a question with no recommended option -> today's path (interpret_reply), no option picked",
-      not any(o["recommended"] for o in TF_NONE["options"]) and u["_next"] == "interpret_reply" and "last_answer" not in u, u)
+check("replay 08/2: guidance on a question with options and none recommended -> headless_judge, never interpret_reply, no option picked",
+      not any(o["recommended"] for o in TF_NONE["options"]) and u["_next"] == "headless_judge" and u["reply_source"] == "judge"
+      and u["reply_accepts"] == gates._accepts_text("task_failed") and "last_answer" not in u, u)
+u = gates.parse_answer(base_state(escalation=escalation("clarify", "Which doc?", []), last_answer_text=HG))
+check("headless: guidance on a question with no options keeps its path, never the judge", u["_next"] != "headless_judge", u)
 u = gates.parse_answer(base_state(escalation=TF, last_answer_text=HG + " Abort."))
 check("headless: a reply that only contains the guidance is not the guidance -> interpret_reply", u["_next"] == "interpret_reply", u)
 u = gates.parse_answer(base_state(escalation=E, last_answer_text=HG))
@@ -2136,7 +2310,8 @@ check("choice_reask: a non-choice escalation is told to pick an option by its nu
 u = _lib.raise_escalation(base_state(reply_interpreted=True), {}, E)
 check("raise_escalation: a new escalation is interpreted afresh", u["reply_interpreted"] is False, u)
 check("interpretation table: every accepted shape has help and an apply path; the branch kind takes base, branch and worktree",
-      all(s_ in gates.INSTRUCTION_HELP and (s_ in gates.INSTRUCTION_ANSWERS or s_ in ("base_branch", "branch_name", "reuse_worktree", "path"))
+      all(s_ in gates.INSTRUCTION_HELP and (s_ in gates.INSTRUCTION_ANSWERS or s_ in ("base_branch", "branch_name", "reuse_worktree", "path",
+                                                                                     "verification_command"))
           for shapes in gates.ACCEPTED_INSTRUCTIONS.values() for s_ in shapes)
       and gates.ACCEPTED_INSTRUCTIONS["git_setup_failed"] == ("base_branch", "branch_name", "reuse_worktree"))
 first, s = interpreted(escalation("approve_breakdown", "Approve?", [option("Approve the breakdown", True),
@@ -2881,7 +3056,9 @@ check("leak_route: the owner's reason for another round reaches amend_plan with 
 def _headless_past_ceiling():
     s = base_state(gate2_result="PLAN_REVIEW: REJECT\n1. x", oracle_rejects=STRIKE_LIMIT, cap_continues={"gate2_stuck": STRIKE_LIMIT})
     s.update(gates.gate2_route(s))
-    nodes = {"interpret_reply": gates.interpret_route, "apply_answer": gates.apply_answer}
+    judge = {"reply_verdict": "option", "reply_option": gates.GATE2_ANOTHER_ROUND, "reply_reason": "the last round named a new cause"}
+    nodes = {"interpret_reply": gates.interpret_route, "headless_judge": lambda st: {**judge, "_next": "interpret_route"},
+             "interpret_route": gates.interpret_route, "apply_answer": gates.apply_answer}
     path = []
     for _ in range(80):
         if s["_next"].startswith("end_"):
@@ -2892,10 +3069,12 @@ def _headless_past_ceiling():
         s.update(u)
         path.append(s["_next"])
     return (s["_next"] == "end_blocked" and s.get("gate2_verdict") != "OKAY" and "gate2_stuck" in s.get("failure_reason", "")
-            and "no reply picked an option" in s.get("failure_reason", "")), (path[-6:], s.get("failure_reason"))
+            and f"the headless judge has decided this question {STRIKE_LIMIT} times" in s.get("failure_reason", "")
+            and path.count("headless_judge") == STRIKE_LIMIT), (path[-6:], s.get("failure_reason"))
 
 
-guarded("parse_answer -> apply_answer: a headless reply past the ceiling that names no option ends blocked, never loops or promotes",
+guarded("parse_answer -> apply_answer: a headless reply past the ceiling goes to the judge at most STRIKE_LIMIT times, then ends blocked, "
+        "never loops or promotes",
         _headless_past_ceiling)
 
 ECHO_ONLY = "Return PLAN_REVIEW: OKAY or REJECT with line-referenced complaints.\n1. line 3 is wrong\n"
