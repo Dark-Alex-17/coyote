@@ -2960,6 +2960,94 @@ fn a_signal_killed_red_run_is_not_rerun_on_the_snapshot() {
     );
 }
 
+/// Under a stated condition an exit 0 on the snapshot can itself violate it
+/// (here a grep that must print nothing finds a match), so a stated red is
+/// never rerun there and keeps the comparison with the diff base.
+#[cfg(unix)]
+#[test]
+fn a_stated_red_run_is_not_rerun_on_the_snapshot() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-stated");
+    let (_, sub, base) = uncommitted_change(&dir.0);
+    let (path, log) = logging_git_path(&dir.0);
+    let cmd = "if test -f local.cfg; then exit 1; fi; grep -n b src.txt";
+    let line = format!("`{cmd}` prints nothing");
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty-stated",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [cmd],
+            "diff_base": base,
+            "criteria": [{"id": "c1", "text": line}],
+        }),
+        &envs,
+    );
+    let record = &out["exec_results"][0];
+    assert_eq!(record["exit"], 1, "{out}");
+    assert_eq!(record["pass_condition"]["condition"], "stated", "{out}");
+    assert_ne!(record["baseline"]["status"], "tree-state", "{out}");
+    assert!(
+        record["baseline"]["note"]
+            .as_str()
+            .unwrap()
+            .ends_with(", candidate tree dirty"),
+        "{out}"
+    );
+    assert_eq!(
+        (git_calls(&log, "commit-tree"), git_calls(&log, "/snapshot")),
+        (1, 0),
+        "{out}"
+    );
+}
+
+/// A tree-state baseline only releases a red run held to exit 0: a stated one
+/// carrying it, from an older or edited record, is judged by its stated
+/// condition.
+#[test]
+fn a_stated_red_run_with_a_tree_state_baseline_is_judged_by_its_condition() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("tree-state-stated");
+    let cmd = "grep -rn TODO lib";
+    let note = "candidate tree dirty: red only in the live tree; the same content on a clean \
+                checkout exits 0";
+    let baseline = format!("baseline on the diff base: tree-state, {note}");
+    let record = json!([{"cmd": cmd, "exit": 1, "duration_s": 0.1, "tail": "",
+                         "baseline": {"status": "tree-state", "exit": null, "note": note}}]);
+    let line = format!("`{cmd}` prints nothing");
+
+    let state = judged_state(&[("c1", line.as_str(), "UNMET")], record.clone());
+    let text = report(&dir.0, "tree-state-stated-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `{cmd}` -- exit 1 (recorded FAIL; the criteria naming it state a \
+             pass condition other than exit 0 and are not all met: c1 UNMET; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+
+    let mut state = judged_state(&[("c1", "does c1", "MET")], record);
+    state["initial_prompt"] = json!(line);
+    let text = report(&dir.0, "tree-state-stated-request", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `{cmd}` -- exit 1 (recorded FAIL; its pass condition is stated \
+             only in the request (\"{line}\") and no acceptance criterion names it; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
 /// A PATH whose first entry is a git shim running the shell `prelude` before
 /// it hands the call to the real git.
 #[cfg(unix)]
