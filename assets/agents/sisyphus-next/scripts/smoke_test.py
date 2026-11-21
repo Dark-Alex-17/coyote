@@ -1776,43 +1776,61 @@ _pd_headless = {}
 for _n, _esc in _pd_open.items():
     _pick = gates.parse_answer(base_state(escalation=_esc, last_answer_text=_lib.HEADLESS_GUIDANCE))
     _pd_headless[_n] = gates.apply_answer(base_state(escalation=_esc, last_answer=_pick["last_answer"], spec_text="AC",
-                                                     plan_defect_continues=_n))
-check("apply_answer: a headless plan_defect continues below the cap with the adversary's finding as the amendment, "
-      "labeled as the default and counted",
-      _pd_headless[0]["_next"] == "build_gauntlet_prompt" and _pd_headless[0].get("plan_defect_continues") == 1
-      and _pd_headless[0]["spec_text"].endswith(
-          "AMENDED by default (no amendment was stated; resolves the adversary's finding): "
-          f"{gates.PLAN_DEFECT_CONTINUE}: criterion 3 is impossible as written")
-      and "AMENDED by the user" not in _pd_headless[0]["spec_text"]
-      and any("plan amendment (default, no amendment stated): " in d for d in _pd_headless[0]["decisions"]), _pd_headless)
+                                                     plan_defect_continues=_n, answer_source=_pick.get("answer_source")))
+check("apply_answer: a headless plan_defect amend pick states no amendment, so the headless judge rules with the fault "
+      "named; nothing is amended or counted",
+      _pd_headless[0]["_next"] == "headless_judge" and "spec_text" not in _pd_headless[0]
+      and "plan_defect_continues" not in _pd_headless[0] and _pd_headless[0]["judge_rulings"]
+      and "no amendment stated" in _pd_headless[0]["escalation"]["data"]["judge_fault"], _pd_headless)
 check("apply_answer: a headless plan_defect at the cap accepts the defect unresolved and proceeds, never end_blocked",
       _pd_headless[STRIKE_LIMIT].get("_next") == "observability_gate"
       and any("criterion 3 is impossible as written" in f for f in _pd_headless[STRIKE_LIMIT].get("follow_ups", []))
       and "plan_defect_continues" not in _pd_headless[STRIKE_LIMIT], _pd_headless[STRIKE_LIMIT])
-_PD_LONG = "x" * 1000 + "the finding's end"
-_pd_long = gates.apply_answer(base_state(escalation=dict(_pd_open[0], evidence=_PD_LONG),
-                                         last_answer=gates.PLAN_DEFECT_CONTINUE, spec_text="AC"))
-check("apply_answer: the default plan_defect amendment embeds only the tail of a long finding",
-      _pd_long["spec_text"].endswith(f"{gates.PLAN_DEFECT_CONTINUE}: {_lib.tail(_PD_LONG, 300)}")
-      and "x" * 400 not in _pd_long["spec_text"], _pd_long["spec_text"])
+_pd_ladder = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer=gates.PLAN_DEFECT_CONTINUE, spec_text="AC",
+                                           answer_source="ladder"))
+check("apply_answer: a ladder plan_defect amend pick with no amendment goes to the headless judge, no amendment written",
+      _pd_ladder["_next"] == "headless_judge" and "spec_text" not in _pd_ladder
+      and _pd_ladder["escalation"]["data"]["judge_fault"] == gates.PLAN_DEFECT_NO_AMENDMENT, _pd_ladder)
+_pd_spent = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer=gates.PLAN_DEFECT_CONTINUE, spec_text="AC",
+                                          answer_source="ladder",
+                                          judge_rulings={gates._decision_key(base_state(), _pd_open[0]): STRIKE_LIMIT}))
+check("apply_answer: a ladder plan_defect amend pick with no amendment once the judge's cap is spent is a fix round, "
+      "never end_blocked",
+      _pd_spent["_next"] == "compose_fix" and _pd_spent["fix_note"] == _pd_open[0]["evidence"]
+      and "spec_text" not in _pd_spent, _pd_spent)
+_pd_judge = {v: gates.interpret_route(base_state(escalation=_pd_open[0], spec_text="AC", reply_source="judge",
+                                                 reply_reason="the ruling", reply_verdict=v,
+                                                 reply_option=gates.PLAN_DEFECT_CONTINUE, reply_instruction="amendment",
+                                                 reply_value="drop AC3"))
+             for v in ("option", "instruction")}
+_pd_judged = {v: gates.apply_answer(base_state(escalation=_pd_open[0], spec_text="AC", plan_defect_continues=0,
+                                               last_answer=r.get("last_answer"), answer_source=r.get("answer_source")))
+              for v, r in _pd_judge.items()}
+check("apply_answer: the judge's amend option pick is a fix round, its why never an amendment; its amendment "
+      "instruction is recorded as the headless judge's",
+      _pd_judge["option"]["last_answer"] == gates.PLAN_DEFECT_CONTINUE
+      and _pd_judged["option"]["_next"] == "compose_fix" and "spec_text" not in _pd_judged["option"]
+      and "the ruling" not in _pd_judged["option"]["fix_note"]
+      and _pd_judged["instruction"]["_next"] == "build_gauntlet_prompt"
+      and _pd_judged["instruction"]["spec_text"].endswith("AMENDED by the headless judge: drop AC3"), _pd_judged)
 _nav_pd, u = chain(base_state(escalation=_pd_open[0], spec_text="AC",
                               consult_result="CONSULT: ANSWER 1 - amendment: vet exit 0 is enough"),
                    "consult_route", "apply_answer")
 check("apply_answer: a plan_defect amendment the navigator stated is labeled the navigator's, never the user's",
       u["_next"] == "build_gauntlet_prompt" and _nav_pd["spec_text"].endswith(
-          f"AMENDED by the navigator: {gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough")
+          "AMENDED by the navigator: amendment: vet exit 0 is enough")
       and any("plan amendment (navigator): " in d for d in _nav_pd["decisions"]), _nav_pd.get("spec_text"))
 _owner_pd, u = chain(base_state(escalation=_pd_open[0], spec_text="AC", answer_source="navigator",
                                 last_answer=f"{gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough"),
                      "ask_dispatch", "apply_answer")
 check("apply_answer: an owner's amendment after the navigator handed the question over is labeled the user's",
-      _owner_pd["spec_text"].endswith(f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough"),
+      _owner_pd["spec_text"].endswith("AMENDED by the user: amendment: vet exit 0 is enough"),
       _owner_pd.get("spec_text"))
 u = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer=f"{gates.PLAN_DEFECT_CONTINUE}: drop AC3",
                                   spec_text="AC", plan_defect_continues=1))
 check("apply_answer: a stated plan_defect amendment is recorded as stated and counted",
       u.get("plan_defect_continues") == 2
-      and u["spec_text"].endswith(f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: drop AC3"), u)
+      and u["spec_text"].endswith("AMENDED by the user: drop AC3"), u)
 # recorded plan_defect cells: the adversary blamed the plan for a red command the plan was not at fault for
 _PD_STOP_TEXT = "Stop; the plan needs amending (report it)"
 _PD_CONT_TEXT = "Continue; treat the criterion as amended (state the amendment)"
@@ -1895,26 +1913,14 @@ _ROUND_SUBS = [{"title": "subtask 1", "outcome": "o",
                 "acceptance_criteria": ["`grep -nE 'float32|float64|math\\.Round' src/coupon.ext` prints nothing"]},
                {"title": "subtask 2", "outcome": "o"}]
 _round_esc = escalation("plan_defect", "q", [option(_PD_CONT_TEXT, True), option(_PD_STOP_TEXT)], evidence=_ROUND_FINDING)
-_round_pick = gates.parse_answer(base_state(escalation=_round_esc, last_answer_text=_lib.HEADLESS_GUIDANCE))
-_d_state, _d = chain(base_state(escalation=_round_esc, last_answer=_round_pick.get("last_answer"), subtasks=_ROUND_SUBS,
-                                subtask_index=1, plan_defect_continues=0), "apply_answer")
-check("apply_answer: a default amendment naming a command the criteria do not is a note, never an amendment; the run "
-      "goes on, counted",
-      _d.get("_next") == "build_gauntlet_prompt" and _d_state.get("plan_defect_continues") == 1
-      and not _d_state["subtasks"][0].get("amendments")
-      and any("src/discount.ext" in f and f.startswith("Plan note (a default amendment, not applied")
-              for f in _d_state.get("follow_ups", []))
-      and "src/discount.ext" not in gates._subtask_spec(_d_state)[0], _d_state["subtasks"][0])
-_known = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `./check-tree --generate` exit 2"),
-                                       last_answer=_PD_CONT_TEXT, subtasks=_DIRTY_SUBS, subtask_index=2))
-_prefix = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `./check-tree --gen` exit 2"),
-                                        last_answer=_PD_CONT_TEXT, subtasks=_DIRTY_SUBS, subtask_index=2))
-check("apply_answer: a default amendment naming only commands the criteria quote whole is still applied; a prefix of "
-      "a quoted command is a different command",
-      _known.get("_next") == "build_gauntlet_prompt" and _known["subtasks"][1].get("amendments")
-      and not _known.get("follow_ups")
-      and not _prefix.get("subtasks") and any("`./check-tree --gen`" in f for f in _prefix.get("follow_ups", [])),
-      (_known.get("subtasks"), _prefix.get("follow_ups")))
+_d_state, _d = chain(base_state(escalation=_round_esc, last_answer=_PD_CONT_TEXT, subtasks=_ROUND_SUBS, subtask_index=1,
+                                plan_defect_continues=0, answer_source=""), "apply_answer")
+check("apply_answer: an owner's amend pick with no amendment is a fix round on the whole finding, counted, never an "
+      "amendment",
+      _d.get("_next") == "compose_fix" and _d_state.get("plan_defect_continues") == 1
+      and _d_state["fix_note"] == _ROUND_FINDING and not _d_state["subtasks"][0].get("amendments")
+      and any("amend picked with no amendment stated -> fix round" in d for d in _d_state["decisions"]),
+      _d_state.get("decisions"))
 _plan_word = [{"finding": "criterion 2 contradicts the plan", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]
 check("triage_route: an escalated finding naming the plan is plan_defect only when the triage model says so",
       gates.triage_route(base_state(triage=_plan_word))["escalation"]["kind"] == "yellow_findings"
@@ -4028,7 +4034,7 @@ upd = gates.apply_answer(am)
 am.update({k: v for k, v in upd.items() if k != "_next"})
 gpa = gates.build_gauntlet_prompt(am)["gauntlet_prompt"]
 check("subtasks: a plan_defect amendment during a subtask reaches that subtask's next gauntlet round, not the parent criteria",
-      upd["_next"] == "build_gauntlet_prompt" and f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: vet warnings" in gpa
+      upd["_next"] == "build_gauntlet_prompt" and "AMENDED by the user: vet warnings" in gpa
       and "spec_text" not in upd and SUBS7[1].get("amendments") is None, gpa)
 
 # batch cadence: the parent runs the panel, so every subtask moves on and the final review is skipped too
@@ -6947,7 +6953,8 @@ with scenario("headless judge: the judge's reason is the pick's stated reason, s
 with scenario("headless judge: its instructions say what a judge_fault in the escalation's data means") as name:
     judge_node = re.search(r"(?ms)^  headless_judge:\n(.*?)(?=^  \w+:\n)",
                            open(os.path.join(HERE, "..", "graph.yaml")).read()).group(1)
-    check(name, "judge_fault, your previous ruling" in " ".join(judge_node.split()), judge_node[:600])
+    check(name, "judge_fault, a previous answer to this question was rejected" in " ".join(judge_node.split()),
+          judge_node[:600])
 with scenario("headless judge: guidance on a draft_confirm with options and none recommended is redraft feedback, "
               "never judged") as name:
     draft = escalation("draft_confirm", "q", [option("Use this draft"), option("Edit the draft")], hard_trigger=False)

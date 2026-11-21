@@ -359,10 +359,13 @@ whole finding, goes to the coder), accept the defect unresolved and proceed (a f
 stop. Amendments and fix rounds share one count; amending is recommended below
 `STRIKE_LIMIT` (3) and accepting from then on, and Stop is never recommended. A navigator's
 Stop pick on a `plan_defect` that carries a note of its own goes to the reply interpreter, which
-reads the note against every option, instead of stopping as picked. A default amendment (a bare or
-headless pick, which states none) takes the adversary's finding; when that finding names a
-backticked command the criteria do not quote whole, it is recorded as a follow-up note
-instead of being applied.
+reads the note against every option, instead of stopping as picked. An amend pick that states
+no amendment never amends: when the ladder, the navigator or the engine's headless answer made
+it, the headless judge rules again (with a `judge_fault` naming the missing amendment, at most
+`STRIKE_LIMIT` times per decision); otherwise it is a fix round on the whole finding. A stated
+amendment is recorded with its author: the user, the navigator, the ladder or the headless
+judge. The judge's own option pick of amend or fix carries no note, since its reason is neither
+an amendment nor a fix.
 
 A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
 attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and

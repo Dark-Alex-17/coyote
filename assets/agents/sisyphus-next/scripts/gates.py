@@ -1356,6 +1356,8 @@ def _scope_guards(state):
 # who wrote a plan amendment: the spec label after "AMENDED by", and the ledger's tag
 AMENDMENT_AUTHORS = {
     "default": ("default (no amendment was stated; resolves the adversary's finding)", "default, no amendment stated"),
+    "judge": ("the headless judge", "headless judge"),
+    "ladder": ("the autonomy ladder", "ladder"),
     "navigator": ("the navigator", "navigator"),
     "user": ("the user", "user"),
 }
@@ -1671,7 +1673,7 @@ def ladder_route(state):
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             digest = list(as_list(state.get("autonomous_digest"))) + [line]
             u.update({"autonomous_digest": digest, "autonomous_decisions": _autonomous_decisions(state, esc),
-                      "last_answer": choice, "last_answer_text": choice})
+                      "last_answer": choice, "last_answer_text": choice, "answer_source": "ladder"})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
             return u
@@ -1847,6 +1849,7 @@ def parse_answer(state):
     if headless := headless_recommended(text, options):
         # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
         choice = headless
+        u["answer_source"] = "headless"
         ledger(state, u, f"headless: {kind}: no human available -> the recommended option: {tail(choice, 200)}")
     elif text == HEADLESS_GUIDANCE and options and kind not in OWN_PROMPT_KINDS:
         # no option is recommended, so a model judge decides; the canned reply is never interpreted or re-asked
@@ -2126,10 +2129,13 @@ def _judge_route(state, u, esc, verdict, shape):
         u["_next"] = "end_blocked"
         return u
     line = f"{kind}: {answer} (basis: headless judge: {reason})"
-    # an option pick carries the reason as its note, so a branch that records the stated reason records the judge's
-    picked = f"{answer}: {reason}" if verdict == "option" else answer
+    # an option pick carries the reason as its note, so a branch that records the stated reason records the judge's;
+    # the why behind a plan_defect amend or fix pick is neither an amendment nor a fix, so that pick stays bare
+    bare = kind == "plan_defect" and answer in (PLAN_DEFECT_CONTINUE, PLAN_DEFECT_FIX)
+    picked = f"{answer}: {reason}" if verdict == "option" and not bare else answer
     u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": picked,
-              "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False})
+              "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False,
+              "answer_source": "judge"})
     ledger(state, u, f"headless judge: {kind}: {how}: {reason}")
     ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
     u["_next"] = "apply_answer"
@@ -2373,22 +2379,8 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
     return u
 
 
-def _plan_criteria(state):
-    """The criteria a plan_defect amendment would change: the current subtask's criteria and amendments in the
-    subtask phase, else spec_text, else (the final review) every subtask's."""
-    if not _subtask_phase(state):
-        return (state.get("spec_text") or "").strip() or "\n".join(
-            str(c) for s in as_list(state.get("subtasks")) for c in as_list(_subtask_at([s], 0).get("acceptance_criteria")))
-    s = _subtask_at(as_list(state.get("subtasks")), max(as_int(state.get("subtask_index")) - 1, 0))
-    return "\n".join([str(c) for c in as_list(s.get("acceptance_criteria"))]
-                     + [t for t, _ in map(_amendment, as_list(s.get("amendments")))])
-
-
-def _unlisted_commands(text, criteria):
-    """The backticked commands in `text` (two words or more, as _declares_gate reads a command) that `criteria` does
-    not quote verbatim as a whole command."""
-    return [c for c in re.findall(r"`([^`\n]+)`", text or "") if len(c.split()) >= 2
-            and not re.search(r"(?<![^\s`])" + re.escape(c.strip()) + r"(?![^\s`])", criteria or "")]
+PLAN_DEFECT_NO_AMENDMENT = ("the amend option was taken with no amendment stated; give the amendment instruction with "
+                            "its text, the fix instruction with its text, or another option")
 
 
 def apply_answer(state):
@@ -2624,6 +2616,8 @@ def apply_answer(state):
         named = _named_option(answer, options)
         used = as_int(state.get("plan_defect_continues"))
         reason = _stated_reason(answer, options)
+        bare_amend = named == PLAN_DEFECT_CONTINUE and reason == NO_STATED_REASON
+        source = state.get("answer_source")
         if stop or named == PLAN_DEFECT_STOP:
             u["failure_reason"] = f"the plan itself is the root cause of a conformance failure; the user chose to stop: {answer}"
             u["_next"] = "end_blocked"
@@ -2634,32 +2628,28 @@ def apply_answer(state):
             ledger(state, u, f"plan defect: accepted unresolved after {used}/{STRIKE_LIMIT} continues: "
                              f"{tail(why, 300)}")
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
-        elif named == PLAN_DEFECT_FIX:
+        elif bare_amend and source in ("ladder", "navigator", "headless") and not esc.get("hard_trigger") \
+                and as_int(as_dict(state.get("judge_rulings")).get(_decision_key(state, esc))) < STRIKE_LIMIT:
+            # an automatic pick states no amendment, so the judge rules again with the amendment text or another option
+            fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": PLAN_DEFECT_NO_AMENDMENT}}
+            u["escalation"] = fixed
+            ledger(state, u, f"plan defect: amend picked by the {source} with no amendment stated -> headless judge")
+            _to_headless_judge(state, u, fixed)
+        elif named == PLAN_DEFECT_FIX or bare_amend:
             # the fix is the stated one, else the adversary's finding whole: a trimmed finding can lose its command
             fix = (esc.get("evidence") or "(no finding recorded)") if reason == NO_STATED_REASON else reason
             u.update({"plan_defect_continues": used + 1, "fix_source": "plan_defect_fix", "fix_note": fix})
-            ledger(state, u, f"plan defect: not a plan defect; fix round ({used + 1}/{STRIKE_LIMIT} continues used"
+            what = "amend picked with no amendment stated -> fix round" if bare_amend else "not a plan defect; fix round"
+            ledger(state, u, f"plan defect: {what} ({used + 1}/{STRIKE_LIMIT} continues used"
                              + (", past the cap at the user's pick" if used + 1 > STRIKE_LIMIT else "")
                              + f"): {tail(fix, 300)}")
             u["_next"] = "compose_fix"
         elif named == PLAN_DEFECT_CONTINUE:
             u["plan_defect_continues"] = used + 1
-            unlisted = []
-            if reason == NO_STATED_REASON:
-                # a bare or headless pick states no amendment, so the run amends the criterion to the adversary's finding
-                author = "default"
-                finding = esc.get("evidence") or ""
-                answer = f"{answer}: {tail(finding, 300) or '(no finding recorded)'}"
-                # a command nobody stated would become a criterion the review runs, so it is only noted
-                unlisted = _unlisted_commands(finding, _plan_criteria(state))
-            else:
-                author = "navigator" if state.get("answer_source") == "navigator" else "user"
+            author = source if source in ("navigator", "judge", "ladder") else "user"
             tag = AMENDMENT_AUTHORS[author][1]
-            if unlisted:
-                note = f"Plan note (a default amendment, not applied: it names a command the criteria do not): {answer}"
-                u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [note]
-                ledger(state, u, note)
-            elif _subtask_phase(state):
+            answer = reason
+            if _subtask_phase(state):
                 # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
                 subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
                 cur = max(as_int(state.get("subtask_index")) - 1, 0)
