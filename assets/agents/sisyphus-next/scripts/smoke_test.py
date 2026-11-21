@@ -6161,7 +6161,9 @@ with scenario("base: a delegated run's unwatched PR with a moved base -> report 
     check(name, u.get("_next") == "base_check" and _v.get("_next") == "final_report" and "escalation" not in _v
           and not _v.get("git_task")
           and "moved 1 commit(s) past this branch (merges cleanly); integration left to the parent orchestrator"
-          in _v.get("gauntlet_attention", ""), (u.get("_next"), _v))
+          in _v.get("gauntlet_attention", "")
+          and any(f.startswith("Base branch main moved 1 commit(s)") and "left to the parent orchestrator" in f
+                  for f in as_list_(_v.get("follow_ups"))), (u.get("_next"), _v))
 with scenario("base: apply_answer base_moved Option 1 -> a base_merge git_task naming the tip SHA, never resolving or "
               "rebasing, to git_ops") as name:
     _tip = "a" * 40
@@ -6348,6 +6350,193 @@ with scenario("base: a tip that is not a local commit, an is-ancestor timeout an
         gates.git = _real_git
     check(name, footgun_statuses == ["unchecked"] * 3 and gates._base_facts(base_run_state(_run))["status"] == "moved",
           footgun_statuses)
+with scenario("base: a re-entry at an unchanged HEAD with a moved base restores the integration count, not the checked "
+              "HEAD, so CI green still routes to base_check") as name:
+    reentry_run, _bare, _push = base_world("reentry")
+    base_push(_push, ("notes.txt", None, "note", "teammate note"))
+    base_seams()
+    first_run = gates.intake({"initial_prompt": "Fix the typo", "project_dir": reentry_run})
+    prior_path = os.path.join(first_run["run_dir"], "state.json")
+    prior = json.load(open(prior_path))
+    prior.update(base_checked_head=scratch_git(reentry_run, "rev-parse", "HEAD"), base_syncs=1, base_integrated=1)
+    open(prior_path, "w").write(json.dumps(prior))
+    resumed = gates.intake({"initial_prompt": f"Fix the follow-ups\nSisyphus run id: {first_run['run_id']}",
+                            "project_dir": reentry_run})
+    restored = {k: v for k, v in resumed.items() if k.startswith("base_") and k not in ("base_sha",)}
+    u = gates._ci_finish_green(base_run_state(reentry_run, **restored), {}, "green")
+    check(name, resumed.get("resume_mode") is True and resumed.get("base_syncs") == 1
+          and resumed.get("base_integrated") == 1 and not resumed.get("base_checked_head")
+          and u.get("_next") == "base_check" and not os.path.exists(_BASE_READY), (restored, u.get("_next")))
+with scenario("base: base_moved answered Option 2 with a reason -> the PR flips, the decision carries the reason and a "
+              "follow-up records it") as name:
+    finish_run, _bare, _push = base_world("finish")
+    base_seams()
+    u = gates.apply_answer(base_run_state(finish_run, escalation=base_question("a" * 40),
+                                          last_answer="Option 2, because the base only touched the docs"))
+    check(name, u.get("_next") == "final_report" and u.get("flip_ready") is True and os.path.exists(_BASE_READY)
+          and "because the base only touched the docs" in (u.get("base_facts") or {}).get("decision", "")
+          and any("finished without integrating (reason: because the base only touched the docs)" in f
+                  for f in as_list_(u.get("follow_ups"))), u)
+with scenario("base: base_moved answered leave, or a bare stop -> final_report, no flip, an attention line") as name:
+    leave_run, _bare, _push = base_world("leave")
+    left = []
+    for reply in ("Option 3", "stop"):
+        base_seams()
+        u = gates.apply_answer(base_run_state(leave_run, escalation=base_question("a" * 40), last_answer=reply))
+        left.append((u.get("_next"), u.get("flip_ready"), os.path.exists(_BASE_READY),
+                     "not integrated" in u.get("gauntlet_attention", "")))
+    check(name, left == [("final_report", None, False, True)] * 2, left)
+_merge_failed = escalation("base_merge_failed", "q", [option(gates.BASE_MERGE_RETRY, True),
+                                                      option("Leave the PR in draft and report")],
+                           evidence="MERGE_HEAD absent", data={"task": base_task("e" * 40)})
+with scenario("base: base_merge_failed answered retry -> the same base_merge task to git_ops with the retries "
+              "reset") as name:
+    u = gates.apply_answer(base_state(escalation=_merge_failed, last_answer="Option 1", base_merge_retries=1))
+    check(name, u.get("_next") == "git_ops" and u.get("base_merge_retries") == 0
+          and (u.get("git_task") or {}).get("kind") == "base_merge", u)
+with scenario("base: base_merge_failed answered leave -> final_report with a follow-up about a possible partial "
+              "merge") as name:
+    u = gates.apply_answer(base_state(escalation=_merge_failed, last_answer="Option 2"))
+    check(name, u.get("_next") == "final_report" and not u.get("git_task")
+          and any("partial merge" in f for f in as_list_(u.get("follow_ups"))), u)
+with scenario("base: base_markers answered resolve -> compose_fix with the marker lines, marker retries plus one") as name:
+    _markers_esc = escalation("base_markers", "q", [option(gates.BASE_RESOLVE, True),
+                                                    option("Leave the PR in draft and report")],
+                              data={"markers": "app.txt:3: leftover conflict marker"})
+    u = gates.apply_answer(base_state(escalation=_markers_esc, last_answer="Option 1", base_marker_retries=1))
+    check(name, u.get("_next") == "compose_fix" and u.get("base_marker_retries") == 2
+          and u.get("fix_source") == "base_sync" and "leftover conflict marker" in u.get("fix_note", ""), u)
+with scenario("base: an owner run whose PR is not found -> report mode, the follow-up names the moved base and leaves "
+              "the integration to the owner") as name:
+    owner_run, _bare, _push = base_world("owner-unwatched")
+    base_push(_push, ("notes.txt", None, "note", "teammate note"))
+    base_seams()
+    unwatched = base_run_state(owner_run, delegated=False, ci_owner=False, publish_retries=1, pr_ref="",
+                               git_report="pushed the branch",
+                               git_task={"kind": "publish", "return_to": "ci_gate", "commit": True, "push": True,
+                                         "open_pr": True, "text": "publish"})
+    u = gates.ci_gate(unwatched)
+    checked = gates.GATES["base_check"]({**unwatched, **u}) if u.get("_next") == "base_check" else {}
+    check(name, u.get("_next") == "base_check" and checked.get("_next") == "final_report"
+          and "escalation" not in checked
+          and any(f.startswith("Base branch main moved 1 commit(s)") and f.endswith("integration left to the owner")
+                  for f in as_list_(checked.get("follow_ups"))), (u.get("_next"), checked))
+with scenario("base: a passing push check after a base sync -> ci_poll with the watch reset and the integration "
+              "counted; the next CI green at the new HEAD goes to base_check, not the flip") as name:
+    sync_run, _bare, _push = base_world("sync-pushed")
+    pre_sync_head = scratch_git(sync_run, "rev-parse", "HEAD")
+    sync_tip = base_push(_push, ("notes.txt", None, "note", "teammate note"))
+    scratch_git(sync_run, "fetch", "-q", "origin", "main")
+    base_merge(sync_run, sync_tip)
+    scratch_git(sync_run, "push", "-q", "origin", "feat/guard")
+    base_seams()
+    synced = base_run_state(sync_run, base_sync_active=True, base_tip=sync_tip, base_syncs=1, ci_polls=5,
+                            base_checked_head=pre_sync_head, push_fix_retries=0,
+                            base_facts={"remote": "origin", "base": "main", "tip": sync_tip, "count": 1,
+                                        "decision": gates.BASE_NOT_CONCLUDED},
+                            git_task={"kind": "push_fix", "return_to": "ci_gate", "text": "push"})
+    u = gates.ci_gate(synced)
+    green = gates.ci_route({**synced, **u, "ci_status": "green"})
+    check(name, u.get("_next") == "ci_poll" and u.get("base_sync_active") is False and u.get("ci_polls") == 0
+          and u.get("base_integrated") == 1 and (u.get("base_facts") or {}).get("decision") == "integrated"
+          and green.get("_next") == "base_check" and not os.path.exists(_BASE_READY), (u, green.get("_next")))
+check("base: review_gate never takes the trivial skip during a base sync",
+      gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False,
+                                   base_sync_active=True))["_next"] == "build_gauntlet_prompt")
+with scenario("base: a PR head that lacks the base tip reads moved even when local HEAD has merged it; without a PR "
+              "head the same tree reads fresh") as name:
+    stale_run, _bare, _push = base_world("stale-pr-head")
+    pushed_head = scratch_git(stale_run, "rev-parse", "HEAD")
+    stale_tip = base_push(_push, ("notes.txt", None, "note", "teammate note"))
+    scratch_git(stale_run, "fetch", "-q", "origin", "main")
+    base_merge(stale_run, stale_tip)
+    base_seams(f", \"headRefOid\": \"{pushed_head}\"")
+    pr_head_facts = gates._base_facts(base_run_state(stale_run))
+    base_seams()
+    local_facts = gates._base_facts(base_run_state(stale_run))
+    check(name, pr_head_facts["status"] == "moved" and pr_head_facts.get("pr_head") == pushed_head
+          and pr_head_facts.get("count") == 1 and local_facts["status"] == "fresh", (pr_head_facts, local_facts))
+with scenario("base: a PR that reports CONFLICTING never reads fresh, even when HEAD contains the fetched tip") as name:
+    conflicting_run, _bare, _push = base_world("conflicting-fresh")
+    base_seams(", \"mergeable\": \"CONFLICTING\"")
+    conflicting_facts = gates._base_facts(base_run_state(conflicting_run))
+    check(name, conflicting_facts["status"] == "moved" and conflicting_facts.get("conflict_state") == "conflicts",
+          conflicting_facts)
+with scenario("base: a base_merge whose pre-merge HEAD left the history (a rebase) reads as a failed merge; the same "
+              "tree without the recorded HEAD reads clean") as name:
+    rebased_run, _bare, _push = base_world("rebased")
+    pre_rebase = scratch_git(rebased_run, "rev-parse", "HEAD")
+    rebased_tip = base_push(_push, ("notes.txt", None, "note", "teammate note"))
+    scratch_git(rebased_run, "fetch", "-q", "origin", "main")
+    scratch_git(rebased_run, "rebase", "-q", rebased_tip)
+    base_seams()
+    rebased = gates.ci_gate(base_run_state(rebased_run, git_task=dict(base_task(rebased_tip), pre_head=pre_rebase)))
+    unrecorded = gates.ci_gate(base_run_state(rebased_run, git_task=base_task(rebased_tip)))
+    check(name, rebased.get("_next") == "git_ops" and rebased.get("base_merge_retries") == 1
+          and "no longer in HEAD's history" in (rebased.get("git_task") or {}).get("text", "")
+          and unrecorded.get("_next") == "compose_fix", (rebased, unrecorded.get("_next")))
+with scenario("base: a negated or several-option free-text reply to base_moved is asked again; an exact option still "
+              "integrates") as name:
+    replies = {r: gates.apply_answer(base_state(escalation=base_question("a" * 40), last_answer=r))
+               for r in ("do not integrate, leave it", "integrate or finish, whichever", "Option 1")}
+    check(name, [replies[r].get("_next") for r in replies] == ["ask_dispatch", "ask_dispatch", "git_ops"]
+          and not replies["do not integrate, leave it"].get("git_task"),
+          {r: u.get("_next") for r, u in replies.items()})
+with scenario("base: conflicts git_ops already staged are still guarded: the staged path joins base_conflicted and "
+              "pr_gate sends the markers back to compose_fix") as name:
+    staged_run, staged_tip, staged_state = base_markers_world("pre-staged")
+    staged_state = dict(staged_state, base_sync_active=False, base_conflicted=[],
+                        base_facts={"remote": "origin", "base": "main", "tip": staged_tip})
+    u = gates.ci_gate(dict(staged_state, git_task=base_task(staged_tip)))
+    guarded = gates.pr_gate({**staged_state, **u})
+    check(name, "app.txt" in as_list_(u.get("base_conflicted")) and guarded.get("_next") == "compose_fix"
+          and not guarded.get("git_task") and "leftover conflict marker" in guarded.get("fix_note", ""),
+          (u.get("base_conflicted"), guarded.get("_next")))
+with scenario("base: the report after an integration that was answered but never concluded says not integrated") as name:
+    pending_facts = {"remote": "origin", "base": "main", "tip": "f" * 40, "count": 1}
+    u = gates.apply_answer(base_state(escalation=base_question("f" * 40), last_answer="Option 1",
+                                      base_status="moved", base_facts=pending_facts))
+    pending_report = gates.final_report(base_state(base_status="moved", **{k: v for k, v in u.items()
+                                                                           if k.startswith("base_")}))["report"]
+    check(name, "- Base: origin/main @ ffffffff: moved 1 commit(s), not integrated (integration not concluded)\n"
+          in pending_report and "integrated 1 time" not in pending_report, pending_report[-600:])
+with scenario("base: the leave answers of base_moved, base_merge_failed and base_markers set pr_review_status once the "
+              "review watch has started") as name:
+    watching = {"pr_tracking": "review", "flip_ready": True, "ci_owner": True, "pr_ref": "9"}
+    stop_watch = "Stop watching and report"
+    statuses = [
+        gates.apply_answer(base_state(escalation=base_question("a" * 40, leave=stop_watch), last_answer="Option 3",
+                                      **watching)).get("pr_review_status"),
+        gates.apply_answer(base_state(escalation=dict(_merge_failed, options=[option(gates.BASE_MERGE_RETRY),
+                                                                              option(stop_watch, True)]),
+                                      last_answer="Option 2", **watching)).get("pr_review_status"),
+        gates.apply_answer(base_state(escalation=escalation("base_markers", "q", [option(gates.BASE_RESOLVE),
+                                                                                  option(stop_watch, True)]),
+                                      last_answer="Option 2", **watching)).get("pr_review_status")]
+    check(name, statuses == ["base_moved", "base_merge_failed", "base_markers"], statuses)
+with scenario("base: at the budget base_markers and base_merge_failed keep resolve and retry recommended while another "
+              "round fits under the engine cap, and recommend leave once it does not") as name:
+    full_polls = _lib.ENGINE_VISIT_CAP - _lib.CI_MAX_ROUNDS
+    markers_fit = gates._base_markers_left(base_state(base_marker_retries=1), {}, "m")["escalation"]
+    markers_full = gates._base_markers_left(base_state(base_marker_retries=1, ci_polls_run=full_polls), {}, "m")
+    budget_run, _bare, _push = base_world("merge-budget")
+    budget_tip = base_push(_push, ("notes.txt", None, "note", "teammate note"))
+    base_seams()
+    failed_fit = gates._base_merge_read(base_run_state(budget_run, base_merge_retries=1), {}, base_task(budget_tip))
+    failed_full = gates._base_merge_read(base_run_state(budget_run, base_merge_retries=1, ci_polls_run=full_polls), {},
+                                         base_task(budget_tip))
+    recs = [base_rec(markers_fit), base_rec(markers_full["escalation"]), base_rec(failed_fit["escalation"]),
+            base_rec(failed_full["escalation"])]
+    check(name, recs == [gates.BASE_RESOLVE, "Leave the PR in draft and report", gates.BASE_MERGE_RETRY,
+                         "Leave the PR in draft and report"], recs)
+with scenario("base: a baseRefOid that is not a commit id is never used as a git argument; the base reads "
+              "unchecked") as name:
+    bad_oid_run, bad_oid_remote, _push = base_world("bad-oid")
+    shutil.rmtree(bad_oid_remote)
+    base_seams(", \"mergeable\": \"CONFLICTING\", \"baseRefOid\": \"--upload-pack=touch\"")
+    bad_oid_facts = gates._base_facts(base_run_state(bad_oid_run))
+    check(name, bad_oid_facts["status"] == "unchecked" and "not a commit id" in bad_oid_facts.get("reason", ""),
+          bad_oid_facts)
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
 os.environ["SISYPHUS_GH_PR_READY_CMD"] = _PR_READY_DEFAULT
 
