@@ -374,7 +374,8 @@ impl PropagationNodeTable {
             },
         );
         // A pinned node is never the one evicted, so the table can run past its cap by
-        // the pinned nodes alone.
+        // the pinned nodes alone: only when the owner lists more than the cap, and then
+        // by no more than the list.
         while nodes.len() > PROPAGATION_NODE_TABLE_MAX_ENTRIES {
             let Some(oldest) = nodes
                 .iter()
@@ -1312,6 +1313,20 @@ mod tests {
 
     /// A pinned node that takes no posts leaves nothing to post to while it is the only
     /// pinned node filed: a stranger's node is not used in its place.
+    /// Nodes are pinned but none of them is filed, or the one filed aged out: strangers'
+    /// nodes are posted to and fetched from.
+    #[test]
+    fn with_no_pinned_node_filed_a_strangers_node_is_used() {
+        let table = PropagationNodeTable::new();
+        let (pinned, aged, stranger) = (node(true), node(true), node(true));
+        table.pin(&[hex(&pinned), hex(&aged)]);
+        table.observe(stranger.clone(), 3, t(1));
+        table.observe(aged, 1, SystemTime::now() - PROPAGATION_NODE_TTL * 2);
+        assert_eq!(hex(&table.select().unwrap()), hex(&stranger));
+        assert_eq!(hex(&table.select_for_posting().unwrap()), hex(&stranger));
+        assert_eq!(table.fetch_rotation(), 1);
+    }
+
     #[test]
     fn a_filed_pinned_node_that_takes_no_posts_leaves_no_stranger_to_post_to() {
         let table = PropagationNodeTable::new();

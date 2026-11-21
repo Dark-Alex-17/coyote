@@ -3856,6 +3856,7 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
         ));
     }
     result_follows();
+    let mut failed = 0;
     for _ in 0..rounds {
         let outcome = tokio::select! {
             outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
@@ -3864,14 +3865,27 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
                 return Ok(());
             }
         };
-        if rounds == 1 {
-            out_text(&sync_outcome_text(outcome)?);
-        } else {
-            match sync_outcome_text(outcome) {
-                Ok(text) => out_text(&text),
-                Err(err) => out_text(&err.to_string()),
+        // Another fetch holds the mailbox: every later round would say so again.
+        let held = matches!(
+            outcome,
+            Err(FetchError::AlreadyRunning | FetchError::HeldByOtherProcess { .. })
+        );
+        match sync_outcome_text(outcome) {
+            Ok(text) => out_text(&text),
+            Err(err) if rounds == 1 => return Err(err),
+            Err(err) => {
+                out_text(&err.to_string());
+                failed += 1;
             }
         }
+        if held {
+            break;
+        }
+    }
+    if rounds > 1 && failed == rounds {
+        bail!(
+            "None of your {rounds} configured propagation nodes could be synced from; each one's reason is above."
+        );
     }
     Ok(())
 }
@@ -8510,6 +8524,11 @@ fn resolve_known(
     also_known: impl FnOnce() -> Vec<String>,
 ) -> Result<String> {
     resolve_known_names(ctx, token, kind, also_known).map_err(|err| {
+        // Two or more known candidates make the refusal an ambiguity, not a name that
+        // resolves to nobody.
+        if known_hashes(ctx, kind).into_iter().nth(1).is_some() {
+            return err;
+        }
         let note = ctx
             .app
             .mesh
@@ -24204,7 +24223,74 @@ mod tests {
                 use super::*;
 
                 /// A node that heard nobody, holds no peer on disk and sits on no relay
-                /// (its one relay went away) answers an empty `.mesh people list` with
+                /// Two configured propagation nodes are filed beside a nearer stranger's and
+                /// none of them answers: a typed sync asks each configured node once, prints
+                /// one line per node, never asks the stranger, and fails once both failed.
+                #[test]
+                #[serial]
+                fn a_typed_sync_asks_each_configured_node_once_and_fails_when_all_fail() {
+                    use crate::mesh::test_support::{PropagationNode, started_runtime_with};
+                    use rns_transport::destination::{DestinationName, SingleOutputDestination};
+                    use rns_transport::identity::PrivateIdentity;
+                    use rns_transport::rand_core::OsRng;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-sync-pinned");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let node = || PropagationNode {
+                            destination: SingleOutputDestination::new(
+                                *PrivateIdentity::new_from_rand(OsRng).as_identity(),
+                                DestinationName::new("lxmf", "propagation"),
+                            )
+                            .desc,
+                            stamp_cost: 0,
+                            per_transfer_limit_kb: 256,
+                            propagation_enabled: true,
+                        };
+                        let (first, second, stranger) = (node(), node(), node());
+                        let hex =
+                            |node: &PropagationNode| node.destination.address_hash.to_hex_string();
+                        let pinned = vec![hex(&first), hex(&second)];
+                        let started = started_runtime_with("repl-mesh-sync-pinned", |config| {
+                            config.propagation_nodes = pinned.clone();
+                        })
+                        .await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let table = started.runtime.propagation_nodes();
+                        for (node, hops) in [(&first, 4), (&second, 5), (&stranger, 1)] {
+                            table.observe(node.clone(), hops, SystemTime::now());
+                        }
+
+                        let before = stdout_lines().len();
+                        let err = run(&mut ctx, ".mesh messaging sync").await.unwrap_err();
+                        let out = stdout_lines()[before..].join("\n");
+                        assert!(
+                            out.contains("Asking each of your 2 configured propagation nodes"),
+                            "{out}"
+                        );
+                        for (asked, node) in [(true, &first), (true, &second), (false, &stranger)] {
+                            let short8 = &hex(node)[..8];
+                            assert_eq!(
+                                out.matches(short8).count(),
+                                usize::from(asked),
+                                "{short8}: {out}"
+                            );
+                        }
+                        assert!(
+                            err.to_string()
+                                .contains("None of your 2 configured propagation nodes"),
+                            "{err}"
+                        );
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// A node that heard nobody, holds no peer on disk and sits on no relay
+                /// (its one relay went away), with a LAN interface, answers an empty
+                /// `.mesh people list` with
                 /// the silent-LAN note in place of the empty-list line, and ends a name
                 /// that resolves to nobody with it on its own line. A peer row takes it
                 /// away from both.
@@ -24224,6 +24310,7 @@ mod tests {
                         ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         let runtime = started.runtime.clone();
                         leave_relay(relay, &runtime).await;
+                        runtime.add_lan_row();
 
                         let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         assert_eq!(out.trim(), LAN_SILENT_NOTE, "{out}");

@@ -430,6 +430,12 @@ impl RnsdLanReader {
         self.last.lock().relay_online
     }
 
+    /// Whether the latest read that reached rnsd found an AutoInterface, with no call;
+    /// `false` before any read reached it.
+    pub(crate) fn lan_seen(&self) -> bool {
+        self.last.lock().lan.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) async fn unavailable(&self) -> bool {
         matches!(*self.target.lock().await, RpcTarget::Unavailable)
@@ -658,12 +664,16 @@ mod tests {
         let dir = keyed_dir("lan-count-rnsd-verdict");
         let source = Scripted::new([Ok(vec![auto(0)]), Ok(vec![auto(1), tcp_client(true)])]);
         let reader = reader_at(&dir.path, source);
-        assert!(!reader.relay_online_seen(), "nothing read yet");
+        assert!(
+            !reader.relay_online_seen() && !reader.lan_seen(),
+            "nothing read yet"
+        );
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
         assert!(!readings.relay_online);
         assert_eq!(readings.readings, [LanReading::Count(0)]);
         assert!(!reader.relay_online_seen());
+        assert!(reader.lan_seen(), "an AutoInterface was read");
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
         assert_eq!(readings.readings, [LanReading::Count(1)]);

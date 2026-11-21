@@ -1764,6 +1764,18 @@ impl MeshRuntime {
         }
     }
 
+    /// Adds a connected `lan` row, for a test of a node that has a LAN interface without
+    /// opening one on the test host's network.
+    #[cfg(all(test, unix))]
+    pub(crate) fn add_lan_row(&self) {
+        self.interface_states.write().push(InterfaceStatus {
+            label: "lan".to_string(),
+            kind: "lan",
+            endpoint: None,
+            state: InterfaceState::Connected,
+        });
+    }
+
     /// Every interface the interface watcher follows: each TCP client with its status
     /// handle, each `local` rnsd with its endpoint.
     pub(crate) fn watched_interfaces(&self) -> &[WatchedInterface] {
@@ -1803,15 +1815,20 @@ impl MeshRuntime {
     /// no row within `PEER_TTL` at `now`, the ones loaded from disk included, and the node
     /// is known to sit on no relay, neither a connected `private` or `public` interface
     /// nor a TCP client the local rnsd's latest reading had online (no call is made; a
-    /// read at join and every later one keep that reading). `None` otherwise.
+    /// read at join and every later one keep that reading). The node must also have a LAN
+    /// to be silent: a `lan` interface, or a local rnsd whose latest reading had an
+    /// AutoInterface; a node on relays alone never gets the multicast advice. `None`
+    /// otherwise.
     pub(crate) fn silent_lan_note(&self, now: SystemTime) -> Option<&'static str> {
-        let rnsd_relay = self
-            .rnsd_lan
-            .as_ref()
-            .is_some_and(|reader| reader.relay_online_seen());
+        let interfaces = self.interface_states();
+        let (rnsd_relay, rnsd_lan) = self.rnsd_lan.as_ref().map_or((false, false), |reader| {
+            (reader.relay_online_seen(), reader.lan_seen())
+        });
+        let has_lan = rnsd_lan || interfaces.iter().any(|status| status.kind == "lan");
         lan_silent_note(
             knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now),
-            on_relay(&self.interface_states(), rnsd_relay),
+            on_relay(&interfaces, rnsd_relay),
+            has_lan,
         )
     }
 
@@ -4309,9 +4326,9 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
 }
 
 /// `LAN_SILENT_NOTE`, for an empty result the user asked for, when the node knows no peer
-/// and sits on no relay.
-fn lan_silent_note(knows_peers: bool, on_relay: bool) -> Option<&'static str> {
-    (!knows_peers && !on_relay).then_some(LAN_SILENT_NOTE)
+/// and sits on no relay, and has a LAN interface that could have found one.
+fn lan_silent_note(knows_peers: bool, on_relay: bool, has_lan: bool) -> Option<&'static str> {
+    (!knows_peers && !on_relay && has_lan).then_some(LAN_SILENT_NOTE)
 }
 
 /// Whether the peer table holds a row heard within `PEER_TTL` of `now`, from `last_seen`
@@ -19424,14 +19441,16 @@ mod tests {
         use super::*;
         use crate::mesh::lan_count::LanReading::{Count, Unknown};
 
-        /// The note goes under an empty result only on a node that knows no peer and
-        /// sits on no relay; either one already reaches the mesh, so it says nothing then.
+        /// The note goes under an empty result only on a node that knows no peer, sits
+        /// on no relay and has a LAN: a peer or a relay already reaches the mesh, and a
+        /// node on relays alone has no multicast for a router to block.
         #[test]
-        fn the_note_needs_no_known_peer_and_no_relay() {
-            assert_eq!(lan_silent_note(false, false), Some(LAN_SILENT_NOTE));
+        fn the_note_needs_no_known_peer_no_relay_and_a_lan() {
+            assert_eq!(lan_silent_note(false, false, true), Some(LAN_SILENT_NOTE));
+            assert_eq!(lan_silent_note(false, false, false), None, "no LAN");
             for (knows_peers, on_relay) in [(false, true), (true, false), (true, true)] {
                 assert_eq!(
-                    lan_silent_note(knows_peers, on_relay),
+                    lan_silent_note(knows_peers, on_relay, true),
                     None,
                     "peers {knows_peers}, relay {on_relay}"
                 );
@@ -19563,9 +19582,10 @@ mod tests {
             ));
         }
 
-        /// A node whose one relay went away knows no peer and sits on no relay, so it
-        /// has the note; a peer row within `PEER_TTL`, one loaded from disk as much
-        /// as one heard, takes it away, and so does a relay that is connected.
+        /// A node whose one relay went away knows no peer and sits on no relay. With
+        /// relays alone it has no LAN to be silent and gets no note; with a `lan` row it
+        /// does. A peer row within `PEER_TTL`, one loaded from disk as much as one heard,
+        /// takes the note away, and so does a relay that is connected.
         #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_node_with_no_peer_and_no_relay_has_the_note_and_a_peer_or_a_relay_takes_it() {
@@ -19578,6 +19598,9 @@ mod tests {
             slot.install(alone.runtime.clone()).unwrap();
             leave_relay(relay, &alone.runtime).await;
             let now = SystemTime::now();
+            assert_eq!(alone.runtime.silent_lan_note(now), None, "relays alone");
+            assert_eq!(alone.runtime.silent_lan_note_now(now).await, None);
+            alone.runtime.add_lan_row();
             assert_eq!(alone.runtime.silent_lan_note(now), Some(LAN_SILENT_NOTE));
             assert_eq!(
                 alone.runtime.silent_lan_note_now(now).await,
@@ -19592,6 +19615,7 @@ mod tests {
             let relayed = started_runtime("lan-note-relayed").await;
             let slot = Arc::new(MeshSlot::default());
             slot.install(relayed.runtime.clone()).unwrap();
+            relayed.runtime.add_lan_row();
             assert_eq!(
                 relayed.runtime.silent_lan_note(SystemTime::now()),
                 None,
@@ -20939,7 +20963,7 @@ mod tests {
                 );
                 assert_eq!(peers_known, known, "a row {age:?} old");
                 assert_eq!(
-                    lan_silent_note(peers_known, false),
+                    lan_silent_note(peers_known, false, true),
                     (!known).then_some(LAN_SILENT_NOTE),
                     "a row {age:?} old"
                 );

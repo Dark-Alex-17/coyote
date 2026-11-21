@@ -11131,6 +11131,7 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         "the rows kept from an earlier run included",
         "a `private` or `public` interface of its own is connected, or the local rnsd reports a `TCPClientInterface` online",
         "A relay that is configured but not connected does not count.",
+        "with neither a `lan` interface nor a `local` rnsd running an AutoInterface, on relays alone",
         "A session with an empty peer table on a LAN-only rnsd, with no relay up, still gets the sentence when it asks.",
         "files the node from a path request at join, instead of waiting up to an hour for the node's next hourly announce",
     ] {
@@ -11147,6 +11148,7 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         "[mesh:relay] No other Coyote host found",
         "Two minutes after joining",
         "keep the line away",
+        "stays at `No users or sessions heard yet.`",
     ] {
         assert!(
             !silent.contains(stale),

@@ -377,6 +377,16 @@ impl CardCadence {
         self.state.lock().last_asked.remove(destination);
     }
 
+    /// `unasked` for a fetch that found no path or route; one prompted by a first hearing
+    /// also forgets the hearing, so the session's next announce asks again instead of
+    /// counting as a second hearing that asks nothing.
+    pub(crate) fn sent_nothing(&self, destination: &str, trigger: CardTrigger) {
+        self.unasked(destination);
+        if matches!(trigger, CardTrigger::Heard | CardTrigger::Answered) {
+            self.forget_heard(destination);
+        }
+    }
+
     /// Whether the background fetch of `destination` is stopped.
     pub(crate) fn is_refused(&self, destination: &str) -> bool {
         self.state.lock().refused.contains(destination)
@@ -414,8 +424,9 @@ impl CardCadence {
         due
     }
 
-    /// Forgets that `destination` was heard, as a new run starts out.
-    #[cfg(all(test, unix))]
+    /// Forgets that `destination` was heard, as a new run starts out, so its next
+    /// announce counts as a first hearing again: for a first hearing whose fetch sent
+    /// nothing.
     pub(crate) fn forget_heard(&self, destination: &str) {
         self.state.lock().heard.remove(destination);
     }
@@ -609,11 +620,13 @@ impl MeshRuntime {
         let cadence = self.card_cadence();
         let served = self.peers().served_recently(destination);
         // A session of this node's own user is named from the session registry, not a
-        // card, so being heard asks it only when it served this node, as before.
+        // card, so being heard asks it only when it served this node; an unserved
+        // hearing is still noted, so it counts once per run as any other.
         if trigger == CardTrigger::Heard
             && !served
             && peer.identity_hash.eq_ignore_ascii_case(self.fingerprint())
         {
+            self.card_cadence().note_heard(destination);
             return None;
         }
         if !cadence.admit(destination, trigger, served) {
@@ -645,12 +658,12 @@ impl MeshRuntime {
         let dest8 = short(destination);
         if !self.path_known(destination).await {
             debug!("Mesh background status card for {dest8} ({trigger:?}) skipped: no path");
-            self.card_cadence().unasked(destination);
+            self.card_cadence().sent_nothing(destination, trigger);
             return;
         }
         let Some(desc) = self.resolve_destination_cached(destination).await else {
             debug!("Mesh background status card for {dest8} ({trigger:?}) skipped: no route");
-            self.card_cadence().unasked(destination);
+            self.card_cadence().sent_nothing(destination, trigger);
             return;
         };
         let route = Route::unasked(desc);
@@ -748,6 +761,34 @@ mod tests {
         assert!(
             cadence.admit(&other, CardTrigger::OwnerGranted, false),
             "a fetch that sent nothing gives its interval back"
+        );
+    }
+
+    /// A first path response counts as the hearing but keeps the served gate; a served
+    /// session is asked on it.
+    #[test]
+    fn a_first_path_response_asks_only_a_session_that_served_this_node() {
+        let cadence = CardCadence::default();
+        assert!(!cadence.admit(D, CardTrigger::Answered, false));
+        assert!(
+            !cadence.admit(D, CardTrigger::Heard, false),
+            "the path response was the hearing"
+        );
+        let served = "e".repeat(32);
+        assert!(cadence.admit(&served, CardTrigger::Answered, true));
+    }
+
+    /// A first hearing whose fetch found no path gives the hearing back, so the next
+    /// announce asks; one that went out does not.
+    #[test]
+    fn a_first_hearing_that_sent_nothing_asks_again_on_the_next_announce() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::Heard, false));
+        cadence.sent_nothing(D, CardTrigger::Heard);
+        assert!(cadence.admit(D, CardTrigger::Heard, false));
+        assert!(
+            !cadence.admit(D, CardTrigger::Heard, false),
+            "it went out this time"
         );
     }
 
@@ -1386,6 +1427,7 @@ mod network {
                 user,
                 "one user"
             );
+            assert!(!a_rt.peers().served_recently(dest), "never served A");
         }
         a_rt.trust()
             .trust_identity(
@@ -1414,13 +1456,20 @@ mod network {
         }
         assert_eq!(status_requests(a_rt), before + 3, "one card request each");
         assert!(
+            !a_rt.card_cadence().heard_in_run(&stranger_dest),
+            "the trust gate turned the stranger's announce away before the cadence"
+        );
+        a_rt.peers().mark_served(&stranger_dest);
+        assert!(
             a_rt.consider_card_fetch(&stranger_dest, CardTrigger::Heard)
                 .is_none()
                 && a_rt
                     .consider_card_fetch(&stranger_dest, CardTrigger::Reheard)
                     .is_none(),
-            "a session of a user A does not trust is not asked, heard or heard again"
+            "a session of a user A does not trust is not asked, heard or heard again, even \
+             one that served A"
         );
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(status_requests(a_rt), before + 3);
 
         for slot in slots.iter().chain([&slot_a]) {

@@ -392,6 +392,7 @@ pub(crate) mod test_support {
     use super::hex_lower;
     #[cfg(unix)]
     use super::message::{PeerBody, from_request_body, is_farewell, received_reply};
+    #[cfg(unix)]
     pub(crate) use super::node::LAN_SILENT_NOTE;
     use super::node::MeshPaths;
     #[cfg(all(test, unix))]
