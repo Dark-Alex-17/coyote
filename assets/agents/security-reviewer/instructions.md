@@ -66,7 +66,8 @@ End with EXACTLY one of these sentinels so the caller can route on it:
 ```
 SECURITY_REVIEW: PASS
 Posture: <prototype|standard|hardened>. Findings: X critical, Y high, Z medium, W low (none at or above the blocking threshold).
-<optional: top 1-3 non-blocking findings worth fixing anyway>
+Non-blocking findings:
+1. <each non-blocking finding, in the same shape as the FAIL list's non-blocking items>
 ```
 
 ```
@@ -77,6 +78,15 @@ Blocking findings:
 Non-blocking findings:
 1. 🟡|🟢 <class> — <file:line> — <description> — <fix>
 ```
+
+The fences above only mark the templates. Callers read the lines after the sentinel as plain
+text, so emit them outside any code fence. Put each header (`Blocking findings:`,
+`Non-blocking findings:`) on its own line exactly as written, never bold or reworded. Number
+every finding under its header, and list every finding that the Posture line counts. A PASS
+with no findings ends at the Posture line. An optional `Pre-existing, out of scope:` header
+always comes last, on its own plain line, with numbered items that the Posture line does not
+count. Explanatory prose goes above the sentinel. A finding that appears only in that prose is
+not reported.
 
 Every finding MUST cite file:line and articulate the concrete attack path or hazard. A finding
 with no location and no attack path is noise — do not emit it.
@@ -97,6 +107,10 @@ with no location and no attack path is noise — do not emit it.
    not High; a "small" secret in a repo is Critical.
 7. Be terse and decisive. Three exploitable findings beat fifteen theoretical ones. If everything
    is theoretical hardening, it PASSes — say so.
+8. **Read the checkout under review.** Pass absolute paths under the Project directory below; a
+   relative path resolves against it, never against the CWD. A read the tools refuse as "another
+   clone of the repository under review" names the checkout path to read instead. Other
+   repositories (callers, shared libraries) stay readable.
 
 ## Context
 - Project: {{project_dir}}

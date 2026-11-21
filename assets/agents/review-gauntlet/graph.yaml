@@ -45,7 +45,7 @@ variables:
     description: Command prefix for every declared verification command, e.g. `flock -w 240 /path/to/lock`; empty runs them bare.
     default: ''
   - name: debris_exclude
-    description: Repo-relative directories the debris lint leaves out of its diff, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none.
+    description: Repo-relative directories holding the run's own planning files, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none. The debris lint leaves them out of its diff, and every review lane is told they are bookkeeping, not scope drift.
     default: ''
 
 settings:
@@ -84,6 +84,10 @@ initial_state:
   file_count: 0
   signals_summary: ''
   signals_error: ''
+  bookkeeping_note: ''
+  # the worktree tree before the lanes, from signals.py; verdict_gate.py diffs it to name the files the probe lane wrote
+  review_tree_before: ''
+  review_tree_error: ''
   touches_auth: false
   touches_deps: false
   touches_exec: false
@@ -211,9 +215,9 @@ nodes:
   signals:
     id: signals
     type: script
-    description: Deterministic diff signals — file list, attack-surface and consumer-surface indicators. Pure git; no LLM judgment.
+    description: Deterministic diff signals -- file list, attack-surface and consumer-surface indicators, plus the worktree tree before the lanes run. Pure git; no LLM judgment. The diff signals keep their 120s envelope (90s per git call) and the before-tree shares one 40s deadline across its git calls, so the node timeout is 160s.
     script: scripts/signals.py
-    timeout: 120
+    timeout: 160
     next: debris_lint
 
   debris_lint:
@@ -401,6 +405,8 @@ nodes:
 
       {{extra_context}}
 
+      {{bookkeeping_note}}
+
       Close your report with your Review Verdict line.
     max_attempts: 2
     state_updates:
@@ -412,15 +418,16 @@ nodes:
     type: agent
     description: Plan-conformance review lane.
     agent: adversary
-    # Exceeds the adversary graph's own settings.timeout (9000) by 600 so the
+    # Exceeds the adversary graph's own settings.timeout (10000) by 600 so the
     # child's graph timeout, not this lane timeout, is the binding bound.
     # NOTE: the child's own internal retry envelope (its nodes' max_attempts ×
     # timeouts) is not derived here — deliberately out of scope for this
     # change; tracked as a follow-up.
-    timeout: 9600
+    timeout: 10600
     inputs:
       verification_commands: '{{verification_commands}}'
       build_lock: '{{build_lock}}'
+      debris_exclude: '{{debris_exclude}}'
     prompt: |
       Adversarial plan-conformance review in {{project_dir}}.
 
@@ -432,6 +439,8 @@ nodes:
       Verification commands arrive as a structured input (the verification_commands variable), not in this prompt.
 
       {{extra_context}}
+
+      {{bookkeeping_note}}
 
       Return your ADVERSARIAL_REVIEW verdict.
     max_attempts: 2
@@ -451,6 +460,8 @@ nodes:
       Security posture: {{security_posture}}.
 
       {{extra_context}}
+
+      {{bookkeeping_note}}
 
       Return your SECURITY_REVIEW verdict.
     max_attempts: 2
@@ -473,6 +484,8 @@ nodes:
 
       Plan / acceptance-criteria context:
       {{plan_context}}
+
+      {{bookkeeping_note}}
 
       The workspace may contain test files from an aborted earlier attempt of
       this lane; reconcile rather than duplicate.
@@ -508,9 +521,9 @@ nodes:
   verdict_gate:
     id: verdict_gate
     type: script
-    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane. Lanes retry_gate gave up on, and any pipeline-level fault, are named on a GAUNTLET_REVIEW_INCOMPLETE machine line so a caller can tell an incomplete review from a failed one.
+    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane. Lanes retry_gate gave up on, and any pipeline-level fault, are named on a GAUNTLET_REVIEW_INCOMPLETE machine line so a caller can tell an incomplete review from a failed one. When the probe lane ran, the after-tree and its diff against the before-tree each share one 40s deadline across their git calls; with the 60s parse envelope the node timeout is 140s.
     script: scripts/verdict_gate.py
-    timeout: 60
+    timeout: 140
     next: done
 
   done:

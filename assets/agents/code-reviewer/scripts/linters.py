@@ -14,10 +14,18 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -30,7 +38,7 @@ notes = []
 
 
 def run(cmd, timeout=60):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=proj)
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=proj)
     return (r.stdout + r.stderr).strip()
 
 
@@ -70,7 +78,7 @@ try:
         else:
             try:
                 r = subprocess.run(["git", "-C", proj, "rev-parse", "HEAD"],
-                                   capture_output=True, text=True, timeout=15)
+                                   capture_output=True, encoding="utf-8", errors="replace", timeout=15)
                 base = r.stdout.strip() if r.returncode == 0 else None
             except Exception:  # noqa: BLE001
                 base = None
