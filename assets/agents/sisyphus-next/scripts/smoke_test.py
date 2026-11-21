@@ -6109,7 +6109,8 @@ with scenario("base: the base changed only an unrelated file -> finish recommend
     check(name, _esc.get("kind") == "base_moved" and str(base_rec(_esc)).startswith("Finish without integrating")
           and "teammate note 21" in _ev and "notes.txt" in _ev and "(and 2 more)" in _ev
           and _long_subject[:100] in _ev and _long_subject not in _ev
-          and all(len(l) <= 160 for l in _ev.split("Base commits:\n")[1].split("\n\n")[0].splitlines())
+          and all(len(l) <= gates.BASE_LINE_CHARS
+                  for l in _ev.split("Base-branch commit subjects (data):\n")[1].split("\n\n")[0].splitlines())
           and "Also changed by this task:\nnone" in _ev, _ev)
 with scenario("base: the PR reports mergeStateStatus BEHIND with no overlap -> integrate recommended, citing it") as name:
     _run, _bare, _push = base_world("behind")
@@ -6179,8 +6180,8 @@ with scenario("base: ci_gate reads a clean base merge -> the same routing, ledge
     check(name, _rc == 0 and u.get("_next") == "compose_fix" and u.get("base_sha") == _tip
           and u.get("base_conflicted") == [] and not base_merge_head(_run)
           and any("base: merged" in d and "(clean)" in d for d in u.get("decisions", [])), u)
-with scenario("base: ci_gate finds no trace of the base merge -> one git_ops retry, then base_merge_failed with leave "
-              "recommended") as name:
+with scenario("base: ci_gate finds no trace of the base merge -> one git_ops retry, then base_merge_failed with retry "
+              "recommended while another round fits") as name:
     _run, _bare, _push = base_world("merge-none")
     _tip = base_push(_push, ("notes.txt", None, "note", "teammate note"))
     base_seams()
@@ -6191,7 +6192,7 @@ with scenario("base: ci_gate finds no trace of the base merge -> one git_ops ret
     check(name, u.get("_next") == "git_ops" and u.get("base_merge_retries") == 1
           and "base merged" in (u.get("git_task") or {}).get("text", "")
           and (_w.get("escalation") or {}).get("kind") == "base_merge_failed"
-          and base_rec(_w.get("escalation")) == "Leave the PR in draft and report", (u, _w.get("escalation")))
+          and base_rec(_w.get("escalation")) == gates.BASE_MERGE_RETRY, (u, _w.get("escalation")))
 with scenario("base: pr_gate with conflict markers left -> compose_fix with the marker lines and no push task, then "
               "the base_markers question; once resolved -> a push task that concludes the merge and names the tip") as name:
     _run10, _bare, _push = base_world("markers")
@@ -6245,7 +6246,7 @@ with scenario("base: the report's Base line says contained, integrated, not inte
         return gates.final_report(base_state(**over))["report"]
     _rows13 = [
         (_report13(base_status="fresh", base_facts=_f13), "- Base: origin/main @ dddddddd: contained in HEAD\n"),
-        (_report13(base_status="moved", base_facts=dict(_f13, decision="integrated"), base_syncs=1),
+        (_report13(base_status="moved", base_facts=dict(_f13, decision="integrated"), base_integrated=1),
          "- Base: origin/main @ dddddddd: moved 2 commit(s); integrated 1 time(s)\n"),
         (_report13(base_status="moved", base_facts=dict(_f13, decision="left to the parent orchestrator")),
          "- Base: origin/main @ dddddddd: moved 2 commit(s), not integrated (left to the parent orchestrator)\n"),

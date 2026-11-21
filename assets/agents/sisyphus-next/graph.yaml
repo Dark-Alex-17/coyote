@@ -399,6 +399,7 @@ initial_state:
   base_tip: ''
   base_facts: {}
   base_syncs: 0
+  base_integrated: 0
   base_sync_active: false
   base_merge_retries: 0
   base_marker_retries: 0
@@ -2253,7 +2254,8 @@ nodes:
       tip. Fresh or unchecked -> the flip (owner) or the report; moved -> the base_moved question (owner) or an
       attention line (report). Never merges.
     script: scripts/base_check.py
-    # BASE_FETCH_SECS (60) + 3 x GH_CALL_SECS (90: the PR read, then the flip and its re-read) + 30 margin
+    # BASE_FETCH_SECS (60) + 3 x GH_CALL_SECS (90: the PR read, then the flip and its re-read) + 30 margin for the
+    # read-only git calls, BASE_GIT_SECS (2) each
     timeout: 360
     fallback: final_report
 
