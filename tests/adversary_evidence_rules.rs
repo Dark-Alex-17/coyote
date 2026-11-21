@@ -1,12 +1,13 @@
 //! Evidence and default rules of the adversary graph's deterministic scripts:
 //! criteria met by inspection, red verification runs compared with a
-//! baseline run on the diff base, the run_checks deadline starting after the
-//! review-stack lock, holistic complaint severity plus the criterion
-//! format-failure fallback, the diff base and repository facts diff_facts.py
-//! records, execution criteria no recorded run covers, and replays of two
-//! recorded reviews' deterministic evidence. Each test spawns the real script
-//! with a JSON state file and skips when python3 (or bash and git, where
-//! needed) is missing.
+//! baseline run on the diff base or rerun on a snapshot of a dirty tree, red
+//! runs judged by the pass condition their criterion states, the run_checks
+//! deadline starting after the review-stack lock, holistic complaint severity
+//! plus the criterion format-failure fallback, the diff base and repository
+//! facts diff_facts.py records, execution criteria no recorded run covers,
+//! and replays of two recorded reviews' deterministic evidence. Each test
+//! spawns the real script with a JSON state file and skips when python3 (or
+//! bash and git, where needed) is missing.
 
 use serde_json::{Value, json};
 use std::env;
@@ -517,7 +518,9 @@ fn a_base_run_that_times_out_is_never_saved() {
         return;
     }
     let dir = fixture_dir("saved-base-timeout");
-    let (repo, base) = repo_with_base_script(&dir.0, "exec sleep 30\n");
+    let (repo, base) = repo_with_base_script(&dir.0, "exec sleep 120\n");
+    // The base run must start before the deadline ends it, after the git
+    // calls that set up its worktree, which a loaded host can slow to seconds.
     let out = script(
         &dir.0,
         "run_checks.py",
@@ -527,7 +530,7 @@ fn a_base_run_that_times_out_is_never_saved() {
             "verification_commands": ["sh check.sh"],
             "diff_base": base,
         }),
-        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "3")],
+        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "30")],
     );
     assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
     assert_eq!(
@@ -563,26 +566,19 @@ fn a_base_run_whose_output_shows_a_signal_kill_is_never_saved() {
     assert!(saved_base_runs(&repo).is_empty(), "{out}");
 }
 
-/// A git shim first on PATH logs every git call: the first run misses the
-/// saved base runs and adds the diff-base worktree, the second hits for
-/// every command and adds none.
+/// A PATH whose first entry is a git shim logging every call's arguments to
+/// the returned file before running the real git.
 #[cfg(unix)]
-#[test]
-fn an_all_hit_run_adds_no_diff_base_worktree() {
+fn logging_git_path(dir: &Path) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    if missing(&["python3", "bash", "git"]) {
-        return;
-    }
-    let dir = fixture_dir("saved-base-shim");
-    let (repo, base) = repo_with_base_script(&dir.0, "echo 'FAILED tests/t.py::other'\nexit 1\n");
     let real_git = Command::new("sh")
         .args(["-c", "command -v git"])
         .output()
         .unwrap();
     let real_git = String::from_utf8(real_git.stdout).unwrap();
-    let bin = dir.0.join("bin");
+    let bin = dir.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let log = dir.0.join("git-calls.txt");
+    let log = dir.join("git-calls.txt");
     fs::write(
         bin.join("git"),
         format!(
@@ -598,18 +594,37 @@ fn an_all_hit_run_adds_no_diff_base_worktree() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    (path, log)
+}
+
+/// The logged git calls whose arguments contain `needle`.
+#[cfg(unix)]
+fn git_calls(log: &Path, needle: &str) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(needle))
+        .count()
+}
+
+/// A git shim first on PATH logs every git call: the first run misses the
+/// saved base runs and adds the diff-base worktree, the second hits for
+/// every command and adds none.
+#[cfg(unix)]
+#[test]
+fn an_all_hit_run_adds_no_diff_base_worktree() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("saved-base-shim");
+    let (repo, base) = repo_with_base_script(&dir.0, "echo 'FAILED tests/t.py::other'\nexit 1\n");
+    let (path, log) = logging_git_path(&dir.0);
     let state = json!({
         "project_dir": repo.to_string_lossy(),
         "verification_commands": ["sh check.sh"],
         "diff_base": base,
     });
-    let worktree_adds = || {
-        fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.contains("worktree add"))
-            .count()
-    };
+    let worktree_adds = || git_calls(&log, "worktree add");
     let miss = script(
         &dir.0,
         "run_checks.py",
@@ -933,6 +948,45 @@ fn a_timed_out_run_skips_the_baseline_and_later_commands_get_no_budget() {
         results[1].get("exit").is_none() && results[1].get("baseline").is_none(),
         "{out}"
     );
+}
+
+/// A git shim that takes 3 s over `git status` makes the pre-run tree
+/// capture outlast the 2 s deadline, which must not skip the first command.
+#[cfg(unix)]
+#[test]
+fn the_pre_run_tree_capture_does_not_spend_the_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("capture-deadline");
+    let (repo, _) = repo_with_base_script(&dir.0, "exit 0\n");
+    let real_git = which::which("git").unwrap();
+    let bin = dir.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *status*) sleep 3 ;; esac\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "capture-deadline",
+        &json!({"project_dir": repo.to_string_lossy(), "verification_commands": ["echo ran"]}),
+        &[
+            ("PATH", path.as_str()),
+            ("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "2"),
+        ],
+    );
+    let record = &out["exec_results"][0];
+    assert!(record.get("skipped").is_none(), "{out}");
+    assert_eq!(record["exit"], 0, "{out}");
 }
 
 #[test]
@@ -1918,5 +1972,1203 @@ fn a_full_target_criterion_covered_by_a_partial_run_conforms_only_with_that_gree
         text.lines()
             .any(|l| l.contains("nothing was executed") && l.contains("declare check-all")),
         "{text}"
+    );
+}
+
+/// A criterion verdict with `status`, carrying evidence when met or
+/// inspected and a complaint otherwise.
+fn judged(id: &str, text: &str, status: &str) -> Value {
+    let met = matches!(status, "MET" | "INSPECTED");
+    json!({"id": id, "text": text, "status": status,
+           "evidence": if met { format!("{id} holds: lib/report.src:3") } else { String::new() },
+           "complaint": if met { String::new() } else { format!("{id} fails at lib/report.src:3") },
+           "no_test_reason": if status == "INSPECTED" { "no test observes the source text" } else { "" }})
+}
+
+/// A verdict state over parsed `criteria` (id, text, final status) and the
+/// recorded `exec_results`.
+fn judged_state(criteria: &[(&str, &str, &str)], exec_results: Value) -> Value {
+    let verdicts: Vec<Value> = criteria
+        .iter()
+        .map(|(id, text, status)| judged(id, text, status))
+        .collect();
+    let parsed: Vec<Value> = criteria
+        .iter()
+        .map(|(id, text, _)| json!({"id": id, "text": text}))
+        .collect();
+    let mut state = verdict_state(json!(verdicts));
+    state["criteria"] = json!(parsed);
+    state["exec_results"] = exec_results;
+    state
+}
+
+fn green(cmd: &str) -> Value {
+    json!({"cmd": cmd, "exit": 0, "duration_s": 1.0, "tail": "ok"})
+}
+
+fn red(cmd: &str, exit: i64, tail: &str, base_exit: i64, note: &str) -> Value {
+    json!({"cmd": cmd, "exit": exit, "duration_s": 0.1, "tail": tail,
+           "baseline": {"status": "regression", "exit": base_exit, "note": note}})
+}
+
+const TYPE_GREP: &str = "grep -Eiw 'REAL|FLOAT|DOUBLE|NUMERIC' schema/0003_items.sql";
+const FLOAT_GREP: &str = "grep -nE 'float32|float64' lib/a.src lib/b.src";
+
+/// An absence grep exits 1 when its criterion holds and 2 on a base where the
+/// file does not exist yet: the red run follows its criterion's verdict, and
+/// so does a command whose criterion states exit 1.
+#[test]
+fn a_red_run_whose_criterion_states_no_output_blocks_only_when_that_criterion_is_unmet() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-no-output");
+    let stated = [
+        (
+            TYPE_GREP.to_string(),
+            format!("`{TYPE_GREP}` prints nothing"),
+        ),
+        (
+            "test -e build/tmp".to_string(),
+            "`test -e build/tmp` exits 1 (the file is absent)".to_string(),
+        ),
+        (
+            "sh probe.sh".to_string(),
+            "`sh probe.sh` exits 1".to_string(),
+        ),
+    ];
+    for (cmd, c6) in &stated {
+        let exec = json!([
+            green("sh test.sh"),
+            red(cmd, 1, "", 2, "exit 1 here but 2 on the diff base"),
+        ]);
+        for status in ["MET", "INSPECTED"] {
+            let state = judged_state(
+                &[("c1", "`sh test.sh` passes", "MET"), ("c6", c6, status)],
+                exec.clone(),
+            );
+            let text = report(&dir.0, "stated-met", &state);
+            assert!(
+                text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+                "{cmd} {status}: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Advisory red runs (not blocking):\n- `{cmd}` -- exit 1 -- c6 {status}: c6 \
+                     holds: lib/report.src:3 -- baseline on the diff base: regression, base exit 2"
+                )),
+                "{cmd} {status}: {text}"
+            );
+        }
+        for status in ["PARTIAL", "UNMET", "no verdict"] {
+            let mut state = judged_state(
+                &[("c1", "`sh test.sh` passes", "MET"), ("c6", c6, status)],
+                exec.clone(),
+            );
+            if status == "no verdict" {
+                state["crit_verdicts"] = json!([state["crit_verdicts"][0].clone()]);
+            }
+            let text = report(&dir.0, "stated-unmet", &state);
+            assert!(
+                text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+                "{cmd} {status}: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Verification run `{cmd}` -- exit 1 (recorded FAIL; the criteria naming it \
+                     state a pass condition other than exit 0 and are not all met: c6 {status};"
+                )),
+                "{cmd} {status}: {text}"
+            );
+            assert!(
+                !text.contains("Advisory red runs"),
+                "{cmd} {status}: {text}"
+            );
+        }
+    }
+}
+
+/// Exiting 0 proves nothing about a stated condition: the run is gated by the
+/// criteria naming it, and it is not the green run an ENVIRONMENT inspection
+/// needs to count as met.
+#[test]
+fn an_exit_0_run_whose_criterion_states_another_condition_is_not_green() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-exit-0");
+    let cmd = "test -e build/tmp";
+    let c6 = "`test -e build/tmp` exits 1 (the file is absent)";
+    let state = judged_state(
+        &[("c1", "does c1", "MET"), ("c6", c6, "UNMET")],
+        json!([green(cmd)]),
+    );
+    let text = report(&dir.0, "stated-exit-0-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `{cmd}` -- exit 0 (not green; the criteria naming it state a pass \
+             condition other than exit 0 and are not all met: c6 UNMET; baseline on the diff \
+             base: none recorded)"
+        )),
+        "{text}"
+    );
+
+    let mut state = judged_state(
+        &[("c1", "does c1", "INSPECTED"), ("c6", c6, "MET")],
+        json!([green(cmd)]),
+    );
+    state["crit_verdicts"][0]["no_test_reason"] =
+        json!("ENVIRONMENT: declare sh test.sh via the verification_commands variable");
+    let text = report(&dir.0, "stated-exit-0-floor", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains("Criteria: 1/2 met") && text.contains("nothing was executed"),
+        "{text}"
+    );
+}
+
+/// A timeout or a signal exit says nothing about the stated condition, so it
+/// blocks even when the criterion naming the command is met.
+#[test]
+fn a_timed_out_or_signal_killed_red_run_blocks_whatever_its_stated_condition() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-timeout");
+    let mut timed_out = red(TYPE_GREP, -1, "TIMEOUT: no exit within 900s", 2, "");
+    timed_out["baseline"] = json!({"status": "not-run", "exit": null,
+        "note": "the command timed out here, so no comparison applies"});
+    let killed = red(
+        TYPE_GREP,
+        137,
+        "Killed",
+        2,
+        "exit 137 here but 2 on the diff base",
+    );
+    for (label, record, outcome, baseline) in [
+        (
+            "timeout",
+            timed_out,
+            "TIMEOUT (exit -1)",
+            "not-run, the command timed out here, so no comparison applies",
+        ),
+        (
+            "signal",
+            killed,
+            "exit 137",
+            "regression, base exit 2, exit 137 here but 2 on the diff base",
+        ),
+    ] {
+        let state = judged_state(
+            &[
+                ("c1", "`sh test.sh` passes", "MET"),
+                ("c6", &format!("`{TYPE_GREP}` prints nothing"), "MET"),
+            ],
+            json!([green("sh test.sh"), record]),
+        );
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "1. Verification run `{TYPE_GREP}` \u{2014} {outcome} (recorded FAIL; a red \
+                 declared command that did not already fail on the diff base blocks CONFORMS; \
+                 baseline on the diff base: {baseline})"
+            )),
+            "{label}: {text}"
+        );
+        assert!(!text.contains("Advisory red runs"), "{label}: {text}");
+    }
+}
+
+#[test]
+fn two_absence_greps_on_one_file_whose_criteria_are_met_conform() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-two-greps");
+    let casts = "grep -n 'unchecked_cast' lib/report.src";
+    let markers = "grep -n 'TODO' lib/report.src";
+    let note = "exit 1 here but 2 on the diff base";
+    let state = judged_state(
+        &[
+            ("c1", "`sh test.sh` passes", "MET"),
+            ("c2", &format!("`{casts}` prints nothing"), "MET"),
+            ("c3", &format!("`{markers}` prints nothing"), "MET"),
+        ],
+        json!([
+            green("sh test.sh"),
+            red(casts, 1, "", 2, note),
+            red(markers, 1, "", 2, note)
+        ]),
+    );
+    let text = report(&dir.0, "two-greps", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    for (cmd, id) in [(casts, "c2"), (markers, "c3")] {
+        assert!(
+            text.contains(&format!("- `{cmd}` -- exit 1 -- {id} MET: ")),
+            "{text}"
+        );
+    }
+}
+
+/// The parse narrowed the plan's absence criterion to one file, so only the
+/// request names the recorded grep: no criterion verdict covers its red run.
+#[test]
+fn a_red_run_whose_condition_only_the_request_states_blocks() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-request-only");
+    let mut state = judged_state(
+        &[
+            ("c1", "`sh test.sh` passes", "MET"),
+            ("c2", "No floating point types in `lib/a.src`", "MET"),
+        ],
+        json!([
+            green("sh test.sh"),
+            red(
+                FLOAT_GREP,
+                2,
+                "grep: lib/b.src: No such file or directory",
+                2,
+                "the failure output differs from the diff base's"
+            ),
+        ]),
+    );
+    state["initial_prompt"] = json!(format!(
+        "## Plan\n- [ ] No floating point: `{FLOAT_GREP}` prints nothing.\n"
+    ));
+    let text = report(&dir.0, "request-only", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "1. Verification run `{FLOAT_GREP}` -- exit 2 (recorded FAIL; its pass condition is \
+             stated only in the request (\"- [ ] No floating point: `{FLOAT_GREP}` prints \
+             nothing.\") and no acceptance criterion names it; baseline on the diff base: \
+             regression, base exit 2, the failure output differs from the diff base's)"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
+/// A wrapper that exits 0 when the grep finds nothing is held to exit 0 by
+/// its criterion.
+#[test]
+fn a_red_wrapper_whose_criterion_says_it_exits_0_blocks() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("wrapped-exit-0");
+    let wrapped = format!(r#"sh -c "{FLOAT_GREP}; test $? -eq 1""#);
+    let state = judged_state(
+        &[
+            ("c1", "`sh test.sh` passes", "MET"),
+            ("c3", &format!("`{wrapped}` exits 0"), "MET"),
+        ],
+        json!([
+            green("sh test.sh"),
+            red(
+                &wrapped,
+                1,
+                "lib/a.src:4: float64",
+                2,
+                "exit 1 here but 2 on the diff base"
+            ),
+        ]),
+    );
+    let text = report(&dir.0, "wrapped-exit-0", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "1. Verification run `{wrapped}` \u{2014} exit 1 (recorded FAIL; a red declared \
+             command that did not already fail on the diff base blocks CONFORMS;"
+        )),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_red_run_held_to_exit_0_or_named_nowhere_still_blocks() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("exit-0-guard");
+    for (label, cmd, exec) in [
+        (
+            "named",
+            "sh test.sh",
+            json!([red(
+                "sh test.sh",
+                1,
+                "1 failed",
+                0,
+                "the command passed on the diff base"
+            )]),
+        ),
+        (
+            "unnamed",
+            "sh build.sh",
+            json!([
+                green("sh test.sh"),
+                red(
+                    "sh build.sh",
+                    1,
+                    "error",
+                    0,
+                    "the command passed on the diff base"
+                ),
+            ]),
+        ),
+    ] {
+        let state = judged_state(&[("c1", "`sh test.sh` passes", "MET")], exec);
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "1. Verification run `{cmd}` \u{2014} exit 1 (recorded FAIL; a red declared \
+                 command that did not already fail on the diff base blocks CONFORMS; baseline on \
+                 the diff base: regression, base exit 0, the command passed on the diff base)"
+            )),
+            "{label}: {text}"
+        );
+        assert!(!text.contains("Advisory red runs"), "{label}: {text}");
+    }
+}
+
+/// Naming a command without stating a condition other than exit 0 holds it
+/// to exit 0, so request prose that merely lists it cannot make it advisory.
+/// Only a backticked span equal to the command names it, only that span's
+/// own clause states its condition, and only with the command as the subject:
+/// a clause saying what the command checks states nothing. A naming line that
+/// says it passes wins over one that states another condition.
+#[test]
+fn a_red_run_named_without_a_stated_condition_is_held_to_exit_0() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("named-in-passing");
+    let note = "the command passed on the diff base";
+    for (label, cmd, c2, request) in [
+        (
+            "listed",
+            "sh test.sh",
+            "The report is sorted",
+            "Verification commands: `sh test.sh`\n",
+        ),
+        (
+            "reviewed",
+            "sh lint.sh",
+            "`sh lint.sh` output is reviewed",
+            "",
+        ),
+        (
+            "if-it-fails",
+            "sh test.sh",
+            "The report is sorted",
+            "Run `sh test.sh`; if it fails, fix the missing case\n",
+        ),
+        (
+            "passes-wins",
+            "grep X f",
+            "`grep X f` prints nothing",
+            "`grep X f` passes\n",
+        ),
+        (
+            "longer-span",
+            "sh test.sh",
+            "`sh test.sh --all | grep X` prints nothing",
+            "",
+        ),
+        (
+            "other-span-clause",
+            "sh a.sh",
+            "`sh a.sh` rebuilds the index, then `sh b.sh` prints nothing",
+            "",
+        ),
+        (
+            "no-warnings",
+            "sh lint.sh",
+            "`sh lint.sh` reports no warnings",
+            "",
+        ),
+        (
+            "checks-exit-1",
+            "pytest tests/test_cli.py",
+            "`pytest tests/test_cli.py` checks the CLI exits 1 on bad input",
+            "",
+        ),
+        (
+            "covers-absent",
+            "cargo test x",
+            "`cargo test x` covers the absent-file case",
+            "",
+        ),
+        (
+            "when-empty",
+            "sh list.sh",
+            "`sh list.sh` prints the header when the list is empty",
+            "",
+        ),
+    ] {
+        let mut state = judged_state(
+            &[
+                ("c1", "The report lists every item", "MET"),
+                ("c2", c2, "MET"),
+            ],
+            json!([red(cmd, 1, "1 failed", 0, note)]),
+        );
+        state["initial_prompt"] = json!(request);
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "1. Verification run `{cmd}` \u{2014} exit 1 (recorded FAIL; a red declared \
+                 command that did not already fail on the diff base blocks CONFORMS;"
+            )),
+            "{label}: {text}"
+        );
+        assert!(!text.contains("Advisory red runs"), "{label}: {text}");
+    }
+}
+
+/// Hosts may have no git identity or a signing default; the snapshot commit
+/// must not depend on either.
+#[cfg(unix)]
+const NO_GIT_CONFIG: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
+/// A repository whose whole change is uncommitted, so HEAD is the diff base.
+/// In `sub`: gen.sh now also reads a new untracked part.txt and the generated
+/// gen.txt matches its sources, fail.sh turned red, check.sh needs the ignored
+/// local.cfg that only the live tree has. Returns the repo, `sub` and the
+/// diff base.
+#[cfg(unix)]
+fn uncommitted_change(dir: &Path) -> (PathBuf, PathBuf, String) {
+    let repo = dir.join("repo");
+    let sub = repo.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join(".gitignore"), "local.cfg\n").unwrap();
+    fs::write(sub.join("src.txt"), "a\n").unwrap();
+    fs::write(sub.join("gen.sh"), "cat src.txt > gen.txt\n").unwrap();
+    fs::write(sub.join("gen.txt"), "a\n").unwrap();
+    fs::write(sub.join("fail.sh"), "exit 0\n").unwrap();
+    fs::write(
+        sub.join("check.sh"),
+        "test -f local.cfg || exit 3\ngit diff --exit-code\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(sub.join("src.txt"), "b\n").unwrap();
+    fs::write(sub.join("part.txt"), "c\n").unwrap();
+    fs::write(sub.join("gen.sh"), "cat src.txt part.txt > gen.txt\n").unwrap();
+    fs::write(sub.join("gen.txt"), "b\nc\n").unwrap();
+    fs::write(
+        sub.join("fail.sh"),
+        "echo 'broken: lib/report.src'\nexit 1\n",
+    )
+    .unwrap();
+    fs::write(sub.join("local.cfg"), "present\n").unwrap();
+    (repo, sub, base)
+}
+
+/// Regenerate-then-diff and bare diff checks are red only because the change
+/// is uncommitted; a genuine failure, and one whose snapshot rerun fails for
+/// want of an ignored file, keep the live-vs-base classification.
+#[cfg(unix)]
+#[test]
+fn red_runs_on_a_dirty_tree_are_rerun_on_a_snapshot_of_it() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-tree");
+    let (repo, sub, base) = uncommitted_change(&dir.0);
+    let regenerate = "sh gen.sh && git diff --exit-code";
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [regenerate, "git diff --exit-code", "sh fail.sh", "sh check.sh"],
+            "diff_base": base,
+        }),
+        &NO_GIT_CONFIG,
+    );
+    let results = out["exec_results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("exec_results must be a record list: {out}"));
+    for record in &results[..2] {
+        assert_eq!(record["exit"], 1, "{out}");
+        assert_eq!(
+            record["baseline"],
+            json!({"status": "tree-state", "exit": null,
+                   "note": "candidate tree dirty: red only in the live tree; the same content \
+                            on a clean checkout exits 0"}),
+            "{out}"
+        );
+    }
+    assert_eq!(
+        results[2]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, candidate tree dirty"}),
+        "{out}"
+    );
+    assert_eq!(
+        results[3]["baseline"],
+        json!({"status": "regression", "exit": 3,
+               "note": "exit 1 here but 3 on the diff base, candidate tree dirty"}),
+        "{out}"
+    );
+    assert_eq!(results[0]["pass_condition"]["condition"], "exit 0", "{out}");
+    assert_eq!(git(&repo, &["worktree", "list"]).lines().count(), 1);
+
+    let saved: Vec<Value> = saved_base_runs(&repo)
+        .iter()
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    let mut saved_cmds: Vec<&str> = saved.iter().map(|s| s["cmd"].as_str().unwrap()).collect();
+    saved_cmds.sort();
+    assert_eq!(
+        saved_cmds,
+        ["sh check.sh", "sh fail.sh"],
+        "only base runs are saved"
+    );
+    let fail_run = saved.iter().find(|s| s["cmd"] == "sh fail.sh").unwrap();
+    assert_eq!(
+        (&fail_run["exit"], &fail_run["output"]),
+        (&json!(0), &json!("")),
+        "the saved run is the base's, not the snapshot's: {fail_run}"
+    );
+
+    let mut state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        json!(results[..2]),
+    );
+    let text = report(&dir.0, "tree-state", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Advisory red runs (not blocking):\n- `{regenerate}` -- exit 1 -- baseline on the \
+             diff base: tree-state, candidate tree dirty: red only in the live tree"
+        )),
+        "{text}"
+    );
+
+    state["crit_verdicts"] = json!([{"id": "c1", "text": "lint is clean", "status": "INSPECTED",
+        "evidence": "lib/report.src:3", "complaint": "",
+        "no_test_reason": "ENVIRONMENT: declare sh lint.sh via the verification_commands variable"}]);
+    let text = report(&dir.0, "tree-state-not-green", &state);
+    assert!(
+        text.starts_with("ADVERSARIAL_REVIEW: DIVERGES") && text.contains("nothing was executed"),
+        "a tree-state run is not a green run: {text}"
+    );
+
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        json!(results),
+    );
+    let text = report(&dir.0, "dirty-regressions", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    for cmd in ["sh fail.sh", "sh check.sh"] {
+        assert!(
+            text.lines()
+                .any(|l| l.contains(&format!("Verification run `{cmd}`"))
+                    && l.ends_with(", candidate tree dirty)")),
+            "{cmd}: {text}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_snapshot_rerun_leaves_the_index_and_refs_alone() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-tree-index");
+    let (repo, sub, base) = uncommitted_change(&dir.0);
+    let observe = || {
+        (
+            git(&repo, &["rev-parse", "HEAD"]),
+            git(&repo, &["status", "--porcelain"]),
+            git(&repo, &["for-each-ref"]),
+        )
+    };
+    let before = observe();
+    let index = fs::read(repo.join(".git/index")).unwrap();
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty-index",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": ["sh fail.sh"],
+            "diff_base": base,
+        }),
+        &NO_GIT_CONFIG,
+    );
+    assert!(
+        out["exec_results"][0]["baseline"]["note"]
+            .as_str()
+            .unwrap()
+            .ends_with(", candidate tree dirty"),
+        "{out}"
+    );
+    assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index, "{out}");
+    assert_eq!(observe(), before, "{out}");
+    assert_eq!(git(&repo, &["worktree", "list"]).lines().count(), 1);
+}
+
+/// A clean tree takes no snapshot: one worktree for the base and no
+/// snapshot commit. Dirtying it adds the snapshot worktree, and the saved
+/// base run means no base worktree.
+#[cfg(unix)]
+#[test]
+fn only_a_dirty_tree_gets_a_snapshot_worktree() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("clean-tree");
+    let (repo, base) = repo_with_base_script(&dir.0, "exit 0\n");
+    let (path, log) = logging_git_path(&dir.0);
+    let state = json!({
+        "project_dir": repo.to_string_lossy(),
+        "verification_commands": ["sh check.sh"],
+        "diff_base": base,
+    });
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let clean = script(&dir.0, "run_checks.py", "clean", &state, &envs);
+    assert_eq!(
+        clean["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0, "note": "the command passed on the diff base"}),
+        "{clean}"
+    );
+    assert_eq!(
+        (
+            git_calls(&log, "worktree add"),
+            git_calls(&log, "commit-tree")
+        ),
+        (1, 0),
+        "{clean}"
+    );
+
+    fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
+    let dirty = script(&dir.0, "run_checks.py", "dirtied", &state, &envs);
+    assert_eq!(
+        (
+            git_calls(&log, "worktree add"),
+            git_calls(&log, "commit-tree")
+        ),
+        (2, 1),
+        "{dirty}"
+    );
+    assert_eq!(
+        dirty["exec_results"][0]["baseline"]["note"],
+        "the command passed on the diff base, candidate tree dirty",
+        "{dirty}"
+    );
+    assert_eq!(git(&repo, &["worktree", "list"]).lines().count(), 1);
+}
+
+/// A regenerate-then-diff command that rewrites a stale generated file
+/// changes the tree it ran in, so its red is the change's own, on a dirty
+/// tree and on a committed one alike.
+#[cfg(unix)]
+#[test]
+fn a_command_that_modifies_the_tree_gets_no_tree_state_baseline() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let regenerate = "sh gen.sh && git diff --exit-code";
+    let dirty_dir = fixture_dir("stale-dirty");
+    let (_, sub, base) = uncommitted_change(&dirty_dir.0);
+    fs::write(sub.join("gen.txt"), "b\n").unwrap();
+    let dirty = script(
+        &dirty_dir.0,
+        "run_checks.py",
+        "stale-dirty",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [regenerate],
+            "diff_base": base,
+        }),
+        &NO_GIT_CONFIG,
+    );
+    assert_eq!(dirty["exec_results"][0]["exit"], 1, "{dirty}");
+    assert_eq!(
+        dirty["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, the declared commands modified \
+                        the tree, candidate tree dirty"}),
+        "{dirty}"
+    );
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        dirty["exec_results"].clone(),
+    );
+    let text = report(&dirty_dir.0, "stale-dirty", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "1. Verification run `{regenerate}` \u{2014} exit 1 (recorded FAIL; a red declared \
+             command that did not already fail on the diff base blocks CONFORMS; baseline on the \
+             diff base: regression, base exit 0, the command passed on the diff base, the \
+             declared commands modified the tree, candidate tree dirty)"
+        )),
+        "{text}"
+    );
+
+    let clean_dir = fixture_dir("stale-clean");
+    let (repo, sub, base) = uncommitted_change(&clean_dir.0);
+    fs::write(sub.join("gen.txt"), "b\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "stale"]);
+    let (path, log) = logging_git_path(&clean_dir.0);
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let clean = script(
+        &clean_dir.0,
+        "run_checks.py",
+        "stale-clean",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [regenerate],
+            "diff_base": base,
+        }),
+        &envs,
+    );
+    assert_eq!(
+        clean["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, the declared commands modified \
+                        the tree"}),
+        "{clean}"
+    );
+    assert_eq!(
+        (
+            git_calls(&log, "worktree add"),
+            git_calls(&log, "commit-tree")
+        ),
+        (1, 0),
+        "{clean}"
+    );
+}
+
+/// On a clean committed tree a command that rewrites a tracked file and exits
+/// 1 gets no tree-state baseline. The tree's `git status` is read again after
+/// the run; the tree is never written into a temporary index.
+#[cfg(unix)]
+#[test]
+fn a_command_that_dirties_a_clean_tree_is_seen_in_its_status() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("clean-dirtied");
+    let (repo, base) = repo_with_base_script(&dir.0, "exit 0\n");
+    let (path, log) = logging_git_path(&dir.0);
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "clean-dirtied",
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": ["sh check.sh; s=$?; echo '# rewritten' >> check.sh; exit $s"],
+            "diff_base": base,
+        }),
+        &envs,
+    );
+    assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
+    assert_eq!(
+        out["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, the declared commands modified the tree"}),
+        "{out}"
+    );
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "M check.sh");
+    assert_eq!(
+        (
+            git_calls(&log, "write-tree"),
+            git_calls(&log, "commit-tree")
+        ),
+        (0, 0),
+        "{out}"
+    );
+}
+
+/// A tree-state red blocks while a criterion naming the command is not met,
+/// since that criterion may be about the uncommitted tree itself. With every
+/// naming criterion met, their evidence is the advisory reason; a run no
+/// criterion names stays advisory.
+#[test]
+fn a_tree_state_red_blocks_unless_the_criteria_naming_it_are_met() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("tree-state-criteria");
+    let cmd = "git diff --exit-code";
+    let note = "candidate tree dirty: red only in the live tree; the same content on a clean \
+                checkout exits 0";
+    let baseline = format!("baseline on the diff base: tree-state, {note}");
+    let record = json!([{"cmd": cmd, "exit": 1, "duration_s": 0.1,
+                         "tail": "diff --git a/gen.txt b/gen.txt",
+                         "baseline": {"status": "tree-state", "exit": null, "note": note}}]);
+    let names = format!("the change leaves `{cmd}` clean");
+    let shows = format!("`{cmd}` shows no diff");
+
+    let state = judged_state(
+        &[("c1", names.as_str(), "UNMET"), ("c2", "does c2", "MET")],
+        record.clone(),
+    );
+    let text = report(&dir.0, "tree-state-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "2. Verification run `{cmd}` -- exit 1 (recorded FAIL; red only in the uncommitted \
+             live tree, and the criteria naming it are not all met: c1 UNMET; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+
+    let state = judged_state(
+        &[
+            ("c1", names.as_str(), "MET"),
+            ("c2", shows.as_str(), "INSPECTED"),
+        ],
+        record.clone(),
+    );
+    let text = report(&dir.0, "tree-state-met", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Advisory red runs (not blocking):\n- `{cmd}` -- exit 1 -- c1 MET: c1 holds: \
+             lib/report.src:3; c2 INSPECTED: c2 holds: lib/report.src:3 -- {baseline}\n"
+        )),
+        "{text}"
+    );
+
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        record,
+    );
+    let text = report(&dir.0, "tree-state-unnamed", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Advisory red runs (not blocking):\n- `{cmd}` -- exit 1 -- {baseline}\n"
+        )),
+        "{text}"
+    );
+}
+
+/// A signal exit says nothing about the tree state either, so it blocks even
+/// with a tree-state baseline.
+#[test]
+fn a_signal_killed_red_run_blocks_despite_a_tree_state_baseline() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("tree-state-killed");
+    let cmd = "sh gen.sh && git diff --exit-code";
+    let note = "candidate tree dirty: red only in the live tree; the same content on a clean \
+                checkout exits 0";
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        json!([{"cmd": cmd, "exit": 137, "duration_s": 0.1, "tail": "Killed",
+                "baseline": {"status": "tree-state", "exit": null, "note": note}}]),
+    );
+    let text = report(&dir.0, "tree-state-killed", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "1. Verification run `{cmd}` \u{2014} exit 137 (recorded FAIL; a red declared command \
+             that did not already fail on the diff base blocks CONFORMS; baseline on the diff \
+             base: tree-state, {note})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
+/// A command killed by a signal in the live tree is not rerun on the pre-run
+/// snapshot, so exiting 0 there cannot give it a tree-state baseline.
+#[cfg(unix)]
+#[test]
+fn a_signal_killed_red_run_is_not_rerun_on_the_snapshot() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-killed");
+    let (_, sub, base) = uncommitted_change(&dir.0);
+    let cmd = "if test -f local.cfg; then sh -c 'kill -KILL $$'; exit $?; fi";
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty-killed",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [cmd],
+            "diff_base": base,
+        }),
+        &NO_GIT_CONFIG,
+    );
+    let record = &out["exec_results"][0];
+    assert_eq!(record["exit"], 137, "{out}");
+    assert_eq!(record["baseline"]["status"], "regression", "{out}");
+    assert!(
+        record["baseline"]["note"]
+            .as_str()
+            .unwrap()
+            .ends_with(", candidate tree dirty"),
+        "{out}"
+    );
+}
+
+/// Under a stated condition an exit 0 on the snapshot can itself violate it
+/// (here a grep that must print nothing finds a match), so a stated red is
+/// never rerun there and keeps the comparison with the diff base.
+#[cfg(unix)]
+#[test]
+fn a_stated_red_run_is_not_rerun_on_the_snapshot() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-stated");
+    let (_, sub, base) = uncommitted_change(&dir.0);
+    let (path, log) = logging_git_path(&dir.0);
+    let cmd = "if test -f local.cfg; then exit 1; fi; grep -n b src.txt";
+    let line = format!("`{cmd}` prints nothing");
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty-stated",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [cmd],
+            "diff_base": base,
+            "criteria": [{"id": "c1", "text": line}],
+        }),
+        &envs,
+    );
+    let record = &out["exec_results"][0];
+    assert_eq!(record["exit"], 1, "{out}");
+    assert_eq!(record["pass_condition"]["condition"], "stated", "{out}");
+    assert_ne!(record["baseline"]["status"], "tree-state", "{out}");
+    assert!(
+        record["baseline"]["note"]
+            .as_str()
+            .unwrap()
+            .ends_with(", candidate tree dirty"),
+        "{out}"
+    );
+    assert_eq!(
+        (git_calls(&log, "commit-tree"), git_calls(&log, "/snapshot")),
+        (1, 0),
+        "{out}"
+    );
+}
+
+/// A tree-state baseline only releases a red run held to exit 0: a stated one
+/// carrying it, from an older or edited record, is judged by its stated
+/// condition.
+#[test]
+fn a_stated_red_run_with_a_tree_state_baseline_is_judged_by_its_condition() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("tree-state-stated");
+    let cmd = "grep -rn TODO lib";
+    let note = "candidate tree dirty: red only in the live tree; the same content on a clean \
+                checkout exits 0";
+    let baseline = format!("baseline on the diff base: tree-state, {note}");
+    let record = json!([{"cmd": cmd, "exit": 1, "duration_s": 0.1, "tail": "",
+                         "baseline": {"status": "tree-state", "exit": null, "note": note}}]);
+    let line = format!("`{cmd}` prints nothing");
+
+    let state = judged_state(&[("c1", line.as_str(), "UNMET")], record.clone());
+    let text = report(&dir.0, "tree-state-stated-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `{cmd}` -- exit 1 (recorded FAIL; the criteria naming it state a \
+             pass condition other than exit 0 and are not all met: c1 UNMET; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+
+    let mut state = judged_state(&[("c1", "does c1", "MET")], record);
+    state["initial_prompt"] = json!(line);
+    let text = report(&dir.0, "tree-state-stated-request", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `{cmd}` -- exit 1 (recorded FAIL; its pass condition is stated \
+             only in the request (\"{line}\") and no acceptance criterion names it; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
+/// A PATH whose first entry is a git shim running the shell `prelude` before
+/// it hands the call to the real git.
+#[cfg(unix)]
+fn git_shim_path(dir: &Path, prelude: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let real_git = which::which("git").unwrap();
+    let bin = dir.join("shim-bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\n{prelude}\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default())
+}
+
+/// A sparse checkout takes no snapshot, yet a dirty one is still reported
+/// dirty; a `git status` that fails leaves the tree state unknown.
+#[cfg(unix)]
+#[test]
+fn a_dirty_sparse_checkout_is_noted_dirty_and_a_failed_status_unknown() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("sparse-dirty");
+    let (repo, _) = repo_with_base_script(&dir.0, "exit 0\n");
+    git(&repo, &["config", "core.sparseCheckout", "true"]);
+    fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
+    let state = json!({
+        "project_dir": repo.to_string_lossy(),
+        "verification_commands": ["sh check.sh"],
+    });
+    let (path, log) = logging_git_path(&dir.0);
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let out = script(&dir.0, "run_checks.py", "sparse-dirty", &state, &envs);
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"],
+        "no diff base was resolved, so nothing to compare against, candidate tree dirty",
+        "{out}"
+    );
+    assert_eq!(git_calls(&log, "commit-tree"), 0, "{out}");
+
+    git(&repo, &["config", "--unset", "core.sparseCheckout"]);
+    let failing = git_shim_path(&dir.0, "case \"$*\" in *status*) exit 1 ;; esac");
+    let envs = [
+        ("PATH", failing.as_str()),
+        NO_GIT_CONFIG[0],
+        NO_GIT_CONFIG[1],
+    ];
+    let out = script(&dir.0, "run_checks.py", "status-fails", &state, &envs);
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"],
+        "no diff base was resolved, so nothing to compare against, candidate tree state unknown",
+        "{out}"
+    );
+}
+
+/// When the dirty tree cannot be written again after the run, whether the
+/// declared commands modified it is unknown and nothing is rerun.
+#[cfg(unix)]
+#[test]
+fn a_failed_post_run_snapshot_leaves_the_dirty_tree_change_unknown() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("post-run-snapshot-fails");
+    let (repo, _) = repo_with_base_script(&dir.0, "exit 0\n");
+    fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
+    let marker = dir.0.join("ran");
+    let path = git_shim_path(
+        &dir.0,
+        &format!(
+            "case \"$*\" in *write-tree*) test -e '{}' && exit 1 ;; esac",
+            marker.display()
+        ),
+    );
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "post-run-snapshot-fails",
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": [format!("touch '{}'; sh check.sh", marker.display())],
+        }),
+        &[("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]],
+    );
+    assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"],
+        "no diff base was resolved, so nothing to compare against, candidate tree dirty, \
+         whether the declared commands modified it is unknown",
+        "{out}"
+    );
+}
+
+#[test]
+fn each_run_record_carries_the_pass_condition_its_criteria_state() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("pass-condition-record");
+    let cmd = "grep -n TODO notes.txt";
+    let line = format!("`{cmd}` prints nothing");
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "pass-condition",
+        &json!({
+            "project_dir": dir.0.to_string_lossy(),
+            "verification_commands": [cmd],
+            "criteria": [{"id": "c1", "text": line}],
+        }),
+        &[],
+    );
+    assert_eq!(
+        out["exec_results"][0]["pass_condition"],
+        json!({"condition": "stated", "criteria": ["c1"], "line": line}),
+        "{out}"
     );
 }
