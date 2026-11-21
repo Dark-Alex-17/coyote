@@ -518,7 +518,7 @@ fn a_base_run_that_times_out_is_never_saved() {
         return;
     }
     let dir = fixture_dir("saved-base-timeout");
-    let (repo, base) = repo_with_base_script(&dir.0, "exec sleep 30\n");
+    let (repo, base) = repo_with_base_script(&dir.0, "exec sleep 120\n");
     // The base run must start before the deadline ends it, after the git
     // calls that set up its worktree, which a loaded host can slow to seconds.
     let out = script(
@@ -530,7 +530,7 @@ fn a_base_run_that_times_out_is_never_saved() {
             "verification_commands": ["sh check.sh"],
             "diff_base": base,
         }),
-        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "10")],
+        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "30")],
     );
     assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
     assert_eq!(
