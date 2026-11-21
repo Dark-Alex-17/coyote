@@ -3877,7 +3877,7 @@ fn initial_state_seeds_the_base_check_keys_with_their_types() {
 #[test]
 fn shipped_candidate_is_ascii_apart_from_the_severity_markers() {
     let markers = ['\u{1f534}', '\u{1f7e1}'];
-    let expected = [("scripts/gates.py", 1), ("scripts/smoke_test.py", 3)];
+    let expected: [(&str, usize); 2] = [("scripts/gates.py", 1), ("scripts/smoke_test.py", 3)];
     let mut offenders = Vec::new();
     let mut counted = Vec::new();
     let mut seen = 0;
