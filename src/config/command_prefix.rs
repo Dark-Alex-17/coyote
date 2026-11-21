@@ -1,13 +1,16 @@
 use crate::repl::builtin_command_names;
 
 use anyhow::bail;
+use arc_swap::ArcSwap;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 static BUILTIN_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(builtin_command_names);
+
+static LIVE_PREFIX: OnceLock<LivePrefix> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -91,7 +94,93 @@ fn is_hint_name(rest: &str) -> bool {
     let len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .unwrap_or(rest.len());
-    len > 0 && BUILTIN_NAMES.contains(&&rest[..len])
+    len > 0 && BUILTIN_NAMES.contains(&&rest[..len]) && !continues_as_path(&rest[len..])
+}
+
+/// A builtin name followed by a path separator, a glob star, or `.` and more name
+/// characters is a dotfile path such as `.vault/key`, `.vault\key`, `.vault*` or
+/// `.mcp.json`, not a command hint.
+fn continues_as_path(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    match chars.next() {
+        Some('/' | '\\' | '*') => true,
+        Some('.') => chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '*' | '_' | '-')),
+        _ => false,
+    }
+}
+
+/// The prefix a running session renders hints in. Clones share one value, so a store
+/// through any of them is what the next load through every other sees.
+#[derive(Clone, Default)]
+pub struct LivePrefix(Arc<ArcSwap<CommandPrefix>>);
+
+impl LivePrefix {
+    pub fn load(&self) -> CommandPrefix {
+        **self.0.load()
+    }
+
+    pub fn store(&self, prefix: CommandPrefix) {
+        self.0.store(Arc::new(prefix));
+    }
+}
+
+/// Makes `live` the prefix `live_prefix` reads. The first install wins: one REPL owns
+/// the terminal for the life of the process.
+pub fn install_live_prefix(live: &LivePrefix) {
+    LIVE_PREFIX.get_or_init(|| live.clone());
+}
+
+/// The prefix of the session that owns the terminal, for output sinks that are handed
+/// no context; dot until one is installed.
+pub fn live_prefix() -> CommandPrefix {
+    #[cfg(test)]
+    if let Some(prefix) = live_prefix_override::current() {
+        return prefix;
+    }
+    LIVE_PREFIX
+        .get()
+        .map_or_else(CommandPrefix::default, LivePrefix::load)
+}
+
+#[cfg(test)]
+pub(crate) mod live_prefix_override {
+    //! Stands in for the installed prefix while a guard is held, so a test can drive the
+    //! context-free sinks without a REPL. Process-global: tests using it must be
+    //! `#[serial]`.
+
+    use super::{CommandPrefix, LivePrefix};
+    use std::sync::Mutex;
+
+    static OVERRIDE: Mutex<Option<LivePrefix>> = Mutex::new(None);
+
+    #[must_use]
+    pub fn install(live: LivePrefix) -> OverrideGuard {
+        *OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(live);
+        OverrideGuard
+    }
+
+    pub struct OverrideGuard;
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+    }
+
+    pub(super) fn current() -> Option<CommandPrefix> {
+        OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(LivePrefix::load)
+    }
 }
 
 impl FromStr for CommandPrefix {
@@ -123,6 +212,39 @@ impl fmt::Display for CommandPrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod live {
+        use super::*;
+        use serial_test::serial;
+
+        #[test]
+        fn a_store_through_one_clone_is_what_every_clone_loads() {
+            let live = LivePrefix::default();
+            let held = live.clone();
+            assert_eq!(held.load(), CommandPrefix::Dot);
+            live.store(CommandPrefix::Slash);
+            assert_eq!(held.load(), CommandPrefix::Slash);
+            held.store(CommandPrefix::Both);
+            assert_eq!(live.load(), CommandPrefix::Both);
+        }
+
+        #[test]
+        #[serial]
+        fn live_prefix_follows_the_override_while_it_is_held() {
+            let live = LivePrefix::default();
+            {
+                let _guard = live_prefix_override::install(live.clone());
+                assert_eq!(live_prefix(), CommandPrefix::Dot);
+                live.store(CommandPrefix::Slash);
+                assert_eq!(live_prefix(), CommandPrefix::Slash);
+            }
+            assert_eq!(
+                live_prefix(),
+                CommandPrefix::Dot,
+                "nothing is installed in tests"
+            );
+        }
+    }
 
     #[derive(Deserialize, Debug)]
     struct Holder {
@@ -257,6 +379,59 @@ mod tests {
             "a .yaml file",
         ] {
             assert_eq!(slash.render_hints(text), text, "{text}");
+        }
+    }
+
+    mod path_shaped_tails {
+        use super::*;
+
+        const PATHS: [&str; 9] = [
+            "allow `.vault/key`",
+            "deny .vault/** for everyone",
+            "wrote .session/notes.md",
+            "read .info.md and .rag_v2",
+            "under (.agent/tools)",
+            "\".file.tar-gz\"",
+            "share .vault\\key on Windows",
+            "deny .vault* to peers",
+            "edit .mcp.json",
+        ];
+
+        #[test]
+        fn dotfile_paths_named_like_builtins_survive_every_prefix() {
+            for prefix in [
+                CommandPrefix::Dot,
+                CommandPrefix::Slash,
+                CommandPrefix::Both,
+            ] {
+                for text in PATHS {
+                    assert_eq!(prefix.render_hints(text), text, "{prefix}: {text}");
+                }
+            }
+        }
+
+        #[test]
+        fn hints_at_sentence_end_and_before_punctuation_still_render() {
+            let cases = [
+                ("run .help.", "run /help."),
+                ("run .help, then .info.", "run /help, then /info."),
+                ("try `.vault`.", "try `/vault`."),
+                ("(.session)", "(/session)"),
+                ("use .rag; then .exit rag", "use /rag; then /exit rag"),
+            ];
+            for (text, slashed) in cases {
+                assert_eq!(CommandPrefix::Slash.render_hints(text), slashed, "{text}");
+                assert_eq!(CommandPrefix::Dot.render_hints(text), text, "{text}");
+                assert_eq!(CommandPrefix::Both.render_hints(text), text, "{text}");
+            }
+        }
+
+        #[test]
+        fn a_hint_and_a_path_on_one_line_render_only_the_hint() {
+            assert_eq!(
+                CommandPrefix::Slash.render_hints("`.vault/key` is denied; run `.vault list`"),
+                "`.vault/key` is denied; run `/vault list`"
+            );
         }
     }
 }

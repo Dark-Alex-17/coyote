@@ -1,7 +1,8 @@
 use super::types::{METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
 use crate::client::call_chat_completions_streaming;
-use crate::config::{Input, RenderMode, RequestContext};
+use crate::config::{Input, RenderMode, RequestContext, publish_mesh_snapshot};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::mesh::snapshot::TurnState;
 use crate::utils;
 use crate::utils::AbortSignal;
 use anyhow::Result;
@@ -16,6 +17,7 @@ pub(crate) struct AcpServerState {
 }
 
 pub async fn run_acp_server(ctx: RequestContext, abort: AbortSignal) -> Result<()> {
+    publish_mesh_snapshot(&ctx, TurnState::idle_now());
     let state = AcpServerState {
         ctx: Some(ctx),
         abort,
@@ -184,7 +186,10 @@ async fn handle_session_prompt(req: Request, state: &mut AcpServerState) -> Resp
     };
 
     let abort = state.abort.clone();
-    match run_prompt_turn(ctx, &text, abort).await {
+    publish_mesh_snapshot(ctx, TurnState::working_now());
+    let outcome = run_prompt_turn(ctx, &text, abort).await;
+    publish_mesh_snapshot(ctx, TurnState::idle_now());
+    match outcome {
         Ok(output) => Response::ok(
             req.id,
             json!({ "output": output, "stopReason": "end_turn" }),

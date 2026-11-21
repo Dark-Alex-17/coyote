@@ -248,13 +248,13 @@ pub async fn gemini_chat_completions_streaming(
                         )?;
                     }
                 }
-            } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
-                .as_str()
-                .or_else(|| data["candidates"][0]["finishReason"].as_str())
-            {
-                bail!("Blocked due to safety")
             }
-
+            if let Some(category) = gemini_refusal_category(&data) {
+                if !handler.has_received_visible_output() {
+                    return Err(gemini_refusal(category).into());
+                }
+                debug!("stream ended with a provider refusal after partial output");
+            }
             Ok(())
         };
         json_stream(res.bytes_stream(), handle).await?;
@@ -319,22 +319,38 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     }
 
     let text = text_parts.join("\n\n");
+    let refusal = gemini_refusal_category(data).map(gemini_refusal);
     if text.is_empty() && tool_calls.is_empty() {
-        if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
-            .as_str()
-            .or_else(|| data["candidates"][0]["finishReason"].as_str())
-        {
-            bail!("Blocked due to safety")
-        } else {
-            bail!("Invalid response data: {data}");
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
         }
+        bail!("Invalid response data: {data}");
     }
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        refusal,
         ..Default::default()
     };
     Ok(output)
+}
+
+/// Gemini blocks a prompt with `promptFeedback.blockReason`, whatever the reason, and
+/// stops a reply on its safety filters with `finishReason: SAFETY`. Either is a
+/// refusal, and the reason names its category.
+fn gemini_refusal_category(data: &Value) -> Option<&str> {
+    data["promptFeedback"]["blockReason"].as_str().or_else(|| {
+        data["candidates"][0]["finishReason"]
+            .as_str()
+            .filter(|reason| *reason == "SAFETY")
+    })
+}
+
+fn gemini_refusal(category: &str) -> ProviderRefusal {
+    ProviderRefusal {
+        category: Some(category.to_string()),
+        explanation: None,
+    }
 }
 
 pub fn gemini_build_chat_completions_body(
@@ -644,6 +660,152 @@ mod tests {
         let contents = body["contents"].as_array().unwrap();
 
         assert_eq!(contents.len(), 1, "body: {body}");
+    }
+
+    mod safety_refusal_tests {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Serves one canned JSON response to the first request, then closes.
+        async fn serve(status: &'static str, body: Value) -> RequestBuilder {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = body.to_string();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(response.as_bytes()).await.unwrap();
+            });
+            ReqwestClient::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(format!("http://{addr}/"))
+        }
+
+        async fn stream(body: Value) -> (Result<()>, SseHandler) {
+            let builder = serve("200 OK", body).await;
+            let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+            handler.set_silent(true);
+            let res = gemini_chat_completions_streaming(
+                builder,
+                &mut handler,
+                &Model::new("vertexai", "gemini-test"),
+            )
+            .await;
+            (res, handler)
+        }
+
+        fn refusal_category(err: &anyhow::Error) -> Option<&str> {
+            err.downcast_ref::<ProviderRefusal>()
+                .unwrap_or_else(|| panic!("not a provider refusal: {err:#}"))
+                .category
+                .as_deref()
+        }
+
+        #[test]
+        fn a_blocked_prompt_is_a_refusal_named_by_its_block_reason() {
+            let data = json!({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}});
+
+            let err = gemini_extract_chat_completions_text(&data).unwrap_err();
+
+            assert_eq!(refusal_category(&err), Some("PROHIBITED_CONTENT"));
+        }
+
+        #[test]
+        fn a_safety_finish_with_no_content_is_a_refusal() {
+            let data = json!({"candidates": [{"finishReason": "SAFETY"}]});
+
+            let err = gemini_extract_chat_completions_text(&data).unwrap_err();
+
+            assert_eq!(refusal_category(&err), Some("SAFETY"));
+            assert_eq!(
+                format!("{err:#}"),
+                "the model declined to answer (provider refusal: SAFETY)"
+            );
+        }
+
+        #[test]
+        fn an_empty_reply_with_another_finish_reason_is_not_a_refusal() {
+            let data = json!({"candidates": [{"finishReason": "RECITATION"}]});
+
+            let err = gemini_extract_chat_completions_text(&data).unwrap_err();
+
+            assert!(err.downcast_ref::<ProviderRefusal>().is_none(), "{err:#}");
+        }
+
+        #[tokio::test]
+        async fn an_api_error_saying_blocked_due_to_safety_is_not_a_refusal() {
+            let builder = serve(
+                "400 Bad Request",
+                json!({"error": {"code": 400, "message": "Blocked due to safety", "status": "INVALID_ARGUMENT"}}),
+            )
+            .await;
+
+            let err = gemini_chat_completions(builder, &Model::new("vertexai", "gemini-test"))
+                .await
+                .unwrap_err();
+
+            assert!(err.downcast_ref::<ProviderRefusal>().is_none(), "{err:#}");
+            assert!(err.downcast_ref::<ApiStatusError>().is_some(), "{err:#}");
+        }
+
+        #[tokio::test]
+        async fn a_streamed_block_before_any_text_is_a_refusal() {
+            let (res, _) = stream(json!([{"promptFeedback": {"blockReason": "SAFETY"}}])).await;
+
+            let err = res.unwrap_err();
+            assert_eq!(refusal_category(&err), Some("SAFETY"));
+        }
+
+        #[tokio::test]
+        async fn a_streamed_safety_stop_after_text_keeps_the_text() {
+            let (res, handler) = stream(json!([
+                {"candidates": [{"content": {"parts": [{"text": "partial"}]}}]},
+                {"candidates": [{"finishReason": "SAFETY"}]}
+            ]))
+            .await;
+
+            res.unwrap();
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "partial");
+        }
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        #[test]
+        fn a_safety_stop_after_text_keeps_the_text_and_carries_the_refusal() {
+            let data = json!({"candidates": [{
+                "content": {"parts": [{"text": "partial"}]},
+                "finishReason": "SAFETY"
+            }]});
+
+            let output = gemini_extract_chat_completions_text(&data).unwrap();
+
+            assert_eq!(output.text, "partial");
+            let refusal = output.refusal.expect("the refusal rides with the text");
+            assert_eq!(refusal.category.as_deref(), Some("SAFETY"));
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let data = json!({"candidates": [{
+                "content": {"parts": [{"text": "done"}]},
+                "finishReason": "STOP"
+            }]});
+
+            let output = gemini_extract_chat_completions_text(&data).unwrap();
+
+            assert!(output.refusal.is_none());
+        }
     }
 
     #[test]

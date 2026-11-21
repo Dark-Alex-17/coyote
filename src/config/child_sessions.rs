@@ -3598,8 +3598,7 @@ updated_at: 2026-01-02T03:04:05Z
     #[test]
     #[serial]
     fn sweep_looks_the_process_table_up_once_for_every_candidate() {
-        use crate::utils::process::ALIVE_SET_CALLS;
-        use std::sync::atomic::Ordering;
+        use crate::utils::process::alive_set_calls;
 
         let _guard = TestConfigDirGuard::new("child-sessions-sweep-one-lookup");
         let current = ProcessStamp::current();
@@ -3608,9 +3607,9 @@ updated_at: 2026-01-02T03:04:05Z
         let proc_dir = ChildSessionRoot::from_stamp(current).dir();
         fs::create_dir_all(&proc_dir).unwrap();
 
-        let before = ALIVE_SET_CALLS.load(Ordering::SeqCst);
+        let before = alive_set_calls();
         sweep_orphans();
-        let during = ALIVE_SET_CALLS.load(Ordering::SeqCst) - before;
+        let during = alive_set_calls() - before;
 
         assert_eq!(during, 1);
         assert!(first.is_dir());
@@ -3620,13 +3619,9 @@ updated_at: 2026-01-02T03:04:05Z
         fs::remove_dir_all(&first).unwrap();
         fs::remove_dir_all(&second).unwrap();
         fs::remove_dir_all(&proc_dir).unwrap();
-        let before = ALIVE_SET_CALLS.load(Ordering::SeqCst);
+        let before = alive_set_calls();
         sweep_orphans();
-        assert_eq!(
-            ALIVE_SET_CALLS.load(Ordering::SeqCst) - before,
-            0,
-            "no candidate, no lookup"
-        );
+        assert_eq!(alive_set_calls() - before, 0, "no candidate, no lookup");
     }
 
     /// A `root.yaml` holding bytes that are not UTF-8 is no identity anyone
