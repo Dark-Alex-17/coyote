@@ -317,7 +317,8 @@ def intake(state):
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
-                  "probe_adoption", "base_syncs", "base_integrated"):
+                  "probe_adoption", "base_syncs", "base_integrated", "attention_notes", "autonomous_decisions",
+                  "judge_rulings"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -2116,7 +2117,9 @@ def _judge_route(state, u, esc, verdict, shape):
         u["_next"] = "end_blocked"
         return u
     line = f"{kind}: {answer} (basis: headless judge: {reason})"
-    u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": answer,
+    # an option pick carries the reason as its note, so a branch that records the stated reason records the judge's
+    picked = f"{answer}: {reason}" if verdict == "option" else answer
+    u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": picked,
               "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False})
     ledger(state, u, f"headless judge: {kind}: {how}: {reason}")
     ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
@@ -4788,10 +4791,11 @@ def _start_probe_adoption(state, u):
     the ones it did not review starts.
 
     A test still in the worktree and unchanged since that round's tree was reviewed by it, so it is adopted with no
-    extra round, and so is one that round's own probe lane wrote and that is unchanged since the round ended: the
-    lane ran it green in a passing round. Any other test that differs needs a review round over the tree that holds
-    it, at most ADOPTION_ROUNDS_MAX a run. Past that limit, and for a test that is gone or a tree that cannot be
-    compared, it is recorded as not adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not completed.
+    extra round, and so is one that round's own probe lane created (absent from the round's reviewed tree), reported
+    GREEN, and left unchanged since the round ended. Any other test that differs needs a review round over the tree
+    that holds it, at most ADOPTION_ROUNDS_MAX a run. Past that limit, and for a test that is gone or a tree that
+    cannot be compared, it is recorded as not adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not
+    completed.
     Either way it is settled and never asked about again."""
     adoption = as_dict(state.get("probe_adoption"))
     settled = {str(p) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") == "probe"
@@ -4814,7 +4818,11 @@ def _start_probe_adoption(state, u):
     ended = last.get("tree_after") or ""
     since_code, since_out, _ = (git(root, "diff-tree", "-r", "-z", "--name-only", ended, tree) if ended and tree
                                 else (1, "", ""))
-    ran_green = set() if since_code else set(as_list(last.get("probe_written"))) - set(_nul_names(since_out))
+    ran_green = set()
+    if not since_code and reviewed and str(as_dict(last.get("lanes")).get("probe", "")).startswith("GREEN"):
+        # only a file the round's probe lane created: an edit to a file already in the reviewed tree needs review
+        ran_green = {p for p in set(as_list(last.get("probe_written"))) - set(_nul_names(since_out))
+                     if git(root, "cat-file", "-e", f"{reviewed}:{p}")[0] != 0}
     basis = f"written and run green by the probe lane in passing round {last.get('round')}"
     adopted = {str(as_dict(a).get("path")): as_dict(a) for a in as_list(adoption.get("adopted"))}
     newly, green, pending, gone, unknown = [], [], [], [], []

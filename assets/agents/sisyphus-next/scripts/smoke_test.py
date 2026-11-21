@@ -6603,6 +6603,16 @@ with scenario("failed-once: a resumed state's kind-only autonomous_kinds list is
     design = escalation("design_choice", "pick", [option("A", True, "e"), option("B")])
     u = gates.escalate_gate(base_state(escalation=design, escalation_policy="autonomous", autonomous_kinds=["design_choice"]))
     check(name, u["_next"] == "ladder_judge", u.get("_next"))
+with scenario("re-entry: a resumed run keeps its failed-once decisions, its judge rulings and its attention "
+              "notes") as name:
+    resumed_id = "20990101T000000-cafef0aa"
+    kept = {"autonomous_decisions": ["approach|s1|sub"], "judge_rulings": {"review_incomplete|s1|sub": 2},
+            "attention_notes": ["scope: 6 expected files, not asked under the autonomous policy"]}
+    _lib.snapshot({"run_id": resumed_id, "run_dir": _lib.ensure_run_dir(resumed_id), "base_sha": BASE, **kept}, {},
+                  "subtask 1")
+    resumed = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {resumed_id}", "project_dir": REPO})
+    check(name, resumed.get("resume_mode") is True and {k: resumed.get(k) for k in kept} == kept,
+          {k: resumed.get(k) for k in kept})
 
 # ---------------------------------------------------------------- the expected-file count question
 SIX_FILES = [f"src/f{i}.py" for i in range(6)]
@@ -6632,15 +6642,22 @@ with scenario("scope_size: Narrow, or a Proceed with a note, recomposes the brie
 GREEN_BASIS = "written and run green by the probe lane in passing round 2"
 
 
-def probe_pass_round(name, path):
-    """A scratch repo whose second gauntlet round passes after its probe lane wrote `path`; (state after
-    route_gauntlet, route_gauntlet's update)."""
+def probe_pass_round(name, path, probe_lane="GREEN", existed=False):
+    """A scratch repo whose second gauntlet round passes after its probe lane wrote `path` (into a file already in the
+    reviewed tree when `existed`); (state after route_gauntlet, route_gauntlet's update)."""
     root = adopt_repo(name)
+    if existed:
+        put(root, path)
     round2 = {"round": 2, "head": "h", "code_tree": gates._worktree_tree(root)}
-    put(root, path)
+    if existed:
+        with open(os.path.join(root, path), "a") as f:
+            f.write("edited by the probe lane\n")
+    else:
+        put(root, path)
+    result = passed.replace("| probe | SKIPPED | not selected |", f"| probe | {probe_lane} | probe detail |")
     state = base_state(git_root=root, project_dir=root, base_sha=scratch_git(root, "rev-parse", "HEAD"),
                        round_heads=[{"round": 1, "head": "h", "verdict": "BLOCKED"}, round2],
-                       gauntlet_result=passed + f"\n## Probe-written tests\n- {path}\n")
+                       gauntlet_result=result + f"\n## Probe-written tests\n- {path}\n")
     return chain(state, "route_gauntlet")
 
 
@@ -6666,6 +6683,20 @@ with scenario("probe adoption: a test edited after its passing round still gets 
     u = gates.pr_gate({**st, "git_actions": {"commit": True}})
     check(name, u.get("_next") == "build_gauntlet_prompt"
           and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/edited.test.ts", "round": 2}],
+          (u.get("_next"), u.get("probe_adoption")))
+with scenario("probe adoption: a test from a passing round whose probe lane is not GREEN gets the adoption "
+              "round") as name:
+    st, _ = probe_pass_round("not-green-a", "tests/attn.test.ts", probe_lane="SKIPPED")
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/attn.test.ts", "round": 2}],
+          (u.get("_next"), u.get("probe_adoption")))
+with scenario("probe adoption: a probe-listed file that was already in the round's reviewed tree gets the adoption "
+              "round") as name:
+    st, _ = probe_pass_round("existed-a", "tests/old.test.ts", existed=True)
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/old.test.ts", "round": 2}],
           (u.get("_next"), u.get("probe_adoption")))
 with scenario("probe adoption: the adoption round's ledger line says what its prompt omits, not that the probe "
               "cannot run") as name:
@@ -6782,7 +6813,7 @@ with scenario("headless judge: review_incomplete, which recommends no option, re
 with scenario("headless judge: a ruling to retry goes through apply_answer, its reason in the autonomous digest") as name:
     judged = judge_rules(st, "option", "Retry the review again", JUDGE_WHY)
     applied = gates.apply_answer(judged)
-    check(name, judged["_next"] == "apply_answer" and judged["last_answer"] == "Retry the review again"
+    check(name, judged["_next"] == "apply_answer" and judged["last_answer"] == f"Retry the review again: {JUDGE_WHY}"
           and applied["_next"] == "build_gauntlet_prompt"
           and f"review_incomplete: Retry the review again (basis: headless judge: {JUDGE_WHY})" in judged["autonomous_digest"]
           and not any("clarifying question" in d for d in judged["decisions"]), (judged.get("_next"), applied.get("_next")))
@@ -6803,6 +6834,28 @@ with scenario("headless judge: the judge can pick the option that stops the run"
     judged = judge_rules(st, "option", "Abort this task", "Every retry faulted the same way; another cannot complete.")
     applied = gates.apply_answer(judged)
     check(name, judged["_next"] == "apply_answer" and applied["_next"] == "end_aborted", applied)
+with scenario("headless judge: the judge's reason is the pick's stated reason, so the follow-up records it") as name:
+    why = "The criterion names a file the plan later removed; the change meets the rest."
+    defect = escalation("plan_defect", "q", [option(gates.PLAN_DEFECT_CONTINUE), option(gates.PLAN_DEFECT_ACCEPT),
+                                             option("Stop; the plan needs amending (report it)")])
+    judged = judge_rules(base_state(escalation=defect, reply_source="judge", last_answer_text=HG, autonomous_digest=[]),
+                         "option", gates.PLAN_DEFECT_ACCEPT, why)
+    applied = gates.apply_answer(judged)
+    check(name, any(f.endswith(f"say-so: {why}") for f in applied.get("follow_ups", [])),
+          (judged.get("last_answer"), applied.get("follow_ups")))
+with scenario("headless judge: its instructions say what a judge_fault in the escalation's data means") as name:
+    judge_node = re.search(r"(?ms)^  headless_judge:\n(.*?)(?=^  \w+:\n)",
+                           open(os.path.join(HERE, "..", "graph.yaml")).read()).group(1)
+    check(name, "judge_fault, your previous ruling" in " ".join(judge_node.split()), judge_node[:600])
+with scenario("headless judge: guidance on a draft_confirm with options and none recommended is redraft feedback, "
+              "never judged") as name:
+    draft = escalation("draft_confirm", "q", [option("Use this draft"), option("Edit the draft")], hard_trigger=False)
+    u = gates.parse_answer(base_state(escalation=draft, last_answer_text=HG))
+    check(name, u["_next"] != "headless_judge" and u["_next"] == "apply_answer" and "judge_rulings" not in u, u)
+with scenario("headless judge: guidance on a question with no options stands as its free-text answer, never "
+              "judged") as name:
+    u = gates.parse_answer(base_state(escalation=escalation("clarify", "Which module?", []), last_answer_text=HG))
+    check(name, u["_next"] == "apply_answer" and u["last_answer"] == HG and "judge_rulings" not in u, u)
 with scenario("headless judge: a hard trigger with no recommended option is never judged; the run ends blocked with "
               "the question") as name:
     hard = escalation("design_ask", "Restructure the storage module outside the task?", [option("Yes"), option("No")],

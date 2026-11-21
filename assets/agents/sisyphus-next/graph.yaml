@@ -1518,6 +1518,8 @@ nodes:
       succeed; stopping is right when it does not. If the question accepts an
       instruction and none of the options fits, give that instruction. State
       your reason in one or two sentences, grounded in the evidence.
+      When the escalation's data carries judge_fault, your previous ruling on
+      this question was rejected for the reason it states.
       Output reply_verdict, reply_option (the option's exact text) or
       reply_instruction and reply_value, reply_reason, and anomalies (anything
       outside this step's job someone should know; empty is the normal case).
