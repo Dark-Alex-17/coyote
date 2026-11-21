@@ -758,6 +758,13 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
         |identity| grants_all(&trust, identity),
     ));
     let prefix = live_prefix();
+    if rows.is_empty()
+        && let Some(note) = runtime.silent_lan_note_now(now).await
+    {
+        // Nobody heard, no peer on disk and no relay: the empty list says why it may be.
+        out_text(note);
+        return Ok(());
+    }
     out_path_text(&render_peers(&rows, &namer, now, prefix).render(prefix));
     Ok(())
 }
@@ -3834,20 +3841,38 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 /// The automatic sync runs on the idle-time driver's interval; this runs one now. A
 /// fetch already running, here or in another process of this identity, is reported and
-/// left to finish rather than treated as a failure.
+/// left to finish rather than treated as a failure. With several configured propagation
+/// nodes on file it asks each of them in turn, one line each, and a node that fails does
+/// not keep the next from being asked.
 async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     parse_args(rest, &[], "messaging", "sync")?;
     let runtime = live(ctx)?;
-    out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
+    let rounds = runtime.propagation_nodes().fetch_rotation();
+    if rounds == 1 {
+        out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
+    } else {
+        out_text(&format!(
+            "Asking each of your {rounds} configured propagation nodes for held messages; Ctrl-C cancels..."
+        ));
+    }
     result_follows();
-    let outcome = tokio::select! {
-        outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
-        _ = wait_user_interrupt(Some(abort_signal)) => {
-            out_text("Sync interrupted.");
-            return Ok(());
+    for _ in 0..rounds {
+        let outcome = tokio::select! {
+            outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
+            _ = wait_user_interrupt(Some(abort_signal)) => {
+                out_text("Sync interrupted.");
+                return Ok(());
+            }
+        };
+        if rounds == 1 {
+            out_text(&sync_outcome_text(outcome)?);
+        } else {
+            match sync_outcome_text(outcome) {
+                Ok(text) => out_text(&text),
+                Err(err) => out_text(&err.to_string()),
+            }
         }
-    };
-    out_text(&sync_outcome_text(outcome)?);
+    }
     Ok(())
 }
 
@@ -8479,6 +8504,26 @@ fn known_hashes(ctx: &RequestContext, kind: HashKind) -> Vec<String> {
 /// ruled out, and the prefix candidates only once no name matched. Only a hash comes
 /// out, so a name never reaches the wire.
 fn resolve_known(
+    ctx: &RequestContext,
+    token: &str,
+    kind: HashKind,
+    also_known: impl FnOnce() -> Vec<String>,
+) -> Result<String> {
+    resolve_known_names(ctx, token, kind, also_known).map_err(|err| {
+        let note = ctx
+            .app
+            .mesh
+            .get()
+            .and_then(|runtime| runtime.silent_lan_note(SystemTime::now()));
+        match note {
+            Some(note) => QuotingError::trailed_by(err, NoticeText::from(note)),
+            None => err,
+        }
+    })
+}
+
+/// `resolve_known` without the silent-LAN note a refusal on a node that heard nobody gets.
+fn resolve_known_names(
     ctx: &RequestContext,
     token: &str,
     kind: HashKind,
@@ -24158,6 +24203,51 @@ mod tests {
             mod peers_listing_tests {
                 use super::*;
 
+                /// A node that heard nobody, holds no peer on disk and sits on no relay
+                /// (its one relay went away) answers an empty `.mesh people list` with
+                /// the silent-LAN note in place of the empty-list line, and ends a name
+                /// that resolves to nobody with it on its own line. A peer row takes it
+                /// away from both.
+                #[test]
+                #[serial]
+                fn an_empty_answer_on_a_node_alone_carries_the_silent_lan_note() {
+                    use crate::mesh::test_support::{
+                        LAN_SILENT_NOTE, leave_relay, started_runtime_on_doomed_relay,
+                    };
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-peers-alone");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (started, relay) =
+                            started_runtime_on_doomed_relay("repl-mesh-peers-alone").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let runtime = started.runtime.clone();
+                        leave_relay(relay, &runtime).await;
+
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
+                        assert_eq!(out.trim(), LAN_SILENT_NOTE, "{out}");
+                        let err = out_of(&mut ctx, ".mesh people status kim")
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert!(err.contains("'kim' is not a session hash"), "{err}");
+                        assert!(err.ends_with(&format!("\n{LAN_SILENT_NOTE}")), "{err}");
+
+                        heard_peer(&runtime, "Tia", SystemTime::now());
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
+                        assert!(!out.contains(LAN_SILENT_NOTE), "{out}");
+                        let err = out_of(&mut ctx, ".mesh people status kim")
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert!(!err.contains(LAN_SILENT_NOTE), "{err}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
                 /// A row filed in the peer table that the transport holds no path to reads
                 /// `no route`, from the cached path table alone, and a row announcing this
                 /// node's own identity is named `(you)`.
@@ -38925,6 +39015,9 @@ mod tests {
                 let ctx = ctx_with(MeshConfig::default(), true);
                 ctx.app.mesh.install(runtime.clone()).unwrap();
                 stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+                // Heard already in this run, so a later announce of the stub asks for no
+                // card over a link these tests then mark gone.
+                runtime.card_cadence().note_heard(&stub.destination_hex());
                 stub.announce(Some("Tia")).await;
                 runtime
                     .trust()

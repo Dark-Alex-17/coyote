@@ -36,9 +36,7 @@ use crate::mesh::knock::{
     drain_knocks, knock_message,
 };
 use crate::mesh::knocks::KnockCache;
-use crate::mesh::lan_count::{
-    LanReading, LanReadings, ReadEffort, RnsdLanReader, RnsdLocator, lan_readings,
-};
+use crate::mesh::lan_count::{LanReadings, ReadEffort, RnsdLanReader, RnsdLocator, lan_readings};
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
@@ -120,7 +118,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, interval_at, sleep, timeout, timeout_at};
+use tokio::time::{interval, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 /// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
@@ -153,13 +151,10 @@ const LOCAL_EVENT_CAPACITY: usize = 64;
 /// How long the shared-instance client waits before redialing rnsd after a drop; the row
 /// reads `lost, retrying` until a redial lands.
 const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
-/// How long a node on `lan` or `local` waits before it suggests a TCP relay for a LAN
-/// that reaches no other host, and how often it reads the LAN counts again until it
-/// has settled.
-const LAN_SILENT_GRACE_SECS: u64 = 120;
-/// The idle line for a LAN that stayed silent through `LAN_SILENT_GRACE_SECS`: its
-/// count read zero or could not be read, on a node that knows no peer and sits on no relay.
-const LAN_SILENT_HINT: &str = "No other Coyote host found on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
+/// The note under an empty result the user asked for, `.mesh people list` with nobody in
+/// it or a name that resolves to nobody, on a node that knows no peer and sits on no
+/// relay (`MeshRuntime::silent_lan_note`). It is never printed unasked.
+pub(crate) const LAN_SILENT_NOTE: &str = "No one heard yet. If another host on your network should be here, many Wi-Fi routers block the multicast Coyote uses to find them; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -887,9 +882,10 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         peers.claim_served(&instance_id);
-        let propagation_nodes = Arc::new(PropagationNodeTable::load(
+        let propagation_nodes = Arc::new(PropagationNodeTable::load_pinned(
             mesh_cache_dir(&paths.cache_dir).join(PROPAGATION_NODE_TABLE_FILE),
             SystemTime::now(),
+            &config.propagation_node_hashes(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
         let sent_threads = SentThreads::open(&paths.cache_dir, &instance_id)?;
@@ -1756,6 +1752,18 @@ impl MeshRuntime {
         self.interface_states.read().clone()
     }
 
+    /// Marks every interface row unreachable and retrying, as the watcher does once a
+    /// relay's redials keep failing, for a test that needs a node on no relay now.
+    #[cfg(all(test, unix))]
+    pub(crate) fn mark_interfaces_unreachable(&self) {
+        for status in self.interface_states.write().iter_mut() {
+            status.state = InterfaceState::Unreachable {
+                reason: "the test stopped the relay".to_string(),
+                retrying: true,
+            };
+        }
+    }
+
     /// Every interface the interface watcher follows: each TCP client with its status
     /// handle, each `local` rnsd with its endpoint.
     pub(crate) fn watched_interfaces(&self) -> &[WatchedInterface] {
@@ -1789,6 +1797,42 @@ impl MeshRuntime {
             effort,
         )
         .await
+    }
+
+    /// `LAN_SILENT_NOTE` for an empty result the user asked for: when the peer table holds
+    /// no row within `PEER_TTL` at `now`, the ones loaded from disk included, and the node
+    /// is known to sit on no relay, neither a connected `private` or `public` interface
+    /// nor a TCP client the local rnsd's latest reading had online (no call is made; a
+    /// read at join and every later one keep that reading). `None` otherwise.
+    pub(crate) fn silent_lan_note(&self, now: SystemTime) -> Option<&'static str> {
+        let rnsd_relay = self
+            .rnsd_lan
+            .as_ref()
+            .is_some_and(|reader| reader.relay_online_seen());
+        lan_silent_note(
+            knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now),
+            on_relay(&self.interface_states(), rnsd_relay),
+        )
+    }
+
+    /// `silent_lan_note` after a quick read of the local rnsd, for `.mesh people list`:
+    /// one call on the short budget, none when the peer table already rules the note out.
+    pub(crate) async fn silent_lan_note_now(&self, now: SystemTime) -> Option<&'static str> {
+        if knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now) {
+            return None;
+        }
+        if self.rnsd_lan.is_some() {
+            let _ = self.lan_readings(ReadEffort::Quick).await;
+        }
+        self.silent_lan_note(now)
+    }
+
+    /// One patient read of the local rnsd, so its relay state is known before anyone asks;
+    /// started once the node has joined. Nothing is told.
+    async fn read_rnsd_once(&self) {
+        if self.rnsd_lan.is_some() {
+            let _ = self.lan_readings(ReadEffort::Patient).await;
+        }
     }
 
     /// When this node last sent an announce of any kind; `None` until it has sent one.
@@ -2247,13 +2291,15 @@ impl MeshRuntime {
         })
     }
 
-    /// Fetches the messages the nearest announced propagation node holds for this node,
+    /// Fetches the messages the propagation node `PropagationNodeTable::select` picks holds
+    /// for this node (the pinned node whose turn it is, else the nearest filed one),
     /// handing the ones that pass every check to `sink`; knocks, access requests and peer
     /// messages go to the knock gate and the access and peer surfaces instead. The dedup
     /// store is read from disk for each fetch and written back before the node is told to
     /// delete anything, so a message survives a restart between the two as a remembered id
     /// rather than a second delivery. One fetch runs at a time across every Coyote process
-    /// of this identity; stopping the node cancels it.
+    /// of this identity; stopping the node cancels it. Each fetch that picked a node moves
+    /// the pinned rotation on, so the next asks the next pinned node.
     pub(crate) async fn fetch_propagated(
         &self,
         sink: &dyn InboundSink,
@@ -2275,6 +2321,7 @@ impl MeshRuntime {
                 .await;
         }
         let node = selected?;
+        self.propagation_nodes.advance_fetch_turn();
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
         let cancel = self.cancellation_token();
         let asked = request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
@@ -3743,6 +3790,8 @@ async fn receive_announces(
             }) && (unrouted || !runtime.card_cadence().heard_in_run(&destination));
             let trigger = if reheard {
                 CardTrigger::Reheard
+            } else if event.is_path_response {
+                CardTrigger::Answered
             } else {
                 CardTrigger::Heard
             };
@@ -4118,9 +4167,7 @@ fn reconcile_tcp_after_lag(
 /// told once, and its redials are not told at all. The watcher holds
 /// no peer-controlled state: a fixed list from the node's own config, two flags, a
 /// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
-/// when the node or its slot is gone. Every `LAN_SILENT_GRACE_SECS` until its
-/// `LanSilentHint` settles, the watcher also reads the LAN counts and asks it whether to
-/// print `LAN_SILENT_HINT`.
+/// when the node or its slot is gone.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -4139,36 +4186,10 @@ async fn watch_interfaces(
     let Some(mut events) = events else {
         return;
     };
-    let grace = Duration::from_secs(LAN_SILENT_GRACE_SECS);
-    let mut lan_silent_ticks = interval_at(tokio::time::Instant::now() + grace, grace);
-    // A host waking from sleep reads the LAN once, not once per tick it slept through.
-    lan_silent_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut lan_silent = LanSilentHint::default();
     loop {
         let mut transitions = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = lan_silent_ticks.tick(), if !lan_silent.settled() => {
-                let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
-                    return;
-                };
-                let hint = tokio::select! {
-                    () = cancel.cancelled() => return,
-                    hint = lan_silent.read_and_tick(
-                        || runtime.lan_readings(ReadEffort::Patient),
-                        || lan_silent_inputs(&runtime, SystemTime::now()),
-                    ) => hint,
-                };
-                if let Some(hint) = hint {
-                    info!("Mesh found no other host on the LAN within {LAN_SILENT_GRACE_SECS}s; suggested a TCP relay");
-                    slot.push_idle(IdleNotify {
-                        source: Source::Relay,
-                        text: hint.into(),
-                        origin: Origin::Local,
-                        model_note: None,
-                    });
-                }
-            }
             received = next_interface_event(&mut events) => match received {
                 Ok(event) => {
                     transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
@@ -4287,52 +4308,10 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
     }
 }
 
-/// What one look at the LAN decides about `LAN_SILENT_HINT`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LanVerdict {
-    /// Look again at the next tick.
-    Wait,
-    /// Never tell it in this run.
-    Settle,
-    /// Tell it now, the one time in this run.
-    Tell,
-}
-
-/// Whether `LAN_SILENT_HINT` is due, from one reading per LAN interface. A count above
-/// zero anywhere settles it, and so does a node that knows a peer (`knows_peers`) or
-/// sits on a relay (`on_relay`), since it already reaches the mesh, and a node with no
-/// LAN interface at all. Otherwise, once `LAN_SILENT_GRACE_SECS` are up, it is told
-/// when every LAN interface counts zero or reads `Unknown`.
-pub(super) fn lan_silent_verdict(
-    elapsed: Duration,
-    readings: &[LanReading],
-    knows_peers: bool,
-    on_relay: bool,
-) -> LanVerdict {
-    let counted_a_host = readings
-        .iter()
-        .any(|reading| matches!(reading, LanReading::Count(hosts) if *hosts > 0));
-    if counted_a_host || readings.is_empty() || knows_peers || on_relay {
-        return LanVerdict::Settle;
-    }
-    if elapsed < Duration::from_secs(LAN_SILENT_GRACE_SECS) {
-        return LanVerdict::Wait;
-    }
-    LanVerdict::Tell
-}
-
-/// What the silent-LAN check reads from `runtime` at `now` besides the LAN counts: the
-/// time since join, whether its peer table, rows loaded from disk included, knows a
-/// peer, and its interfaces' states.
-fn lan_silent_inputs(runtime: &MeshRuntime, now: SystemTime) -> LanSilentInputs {
-    LanSilentInputs {
-        elapsed: now.duration_since(runtime.joined_at()).unwrap_or_default(),
-        knows_peers: knows_peers(
-            runtime.peers().snapshot().iter().map(|peer| peer.last_seen),
-            now,
-        ),
-        interfaces: runtime.interface_states(),
-    }
+/// `LAN_SILENT_NOTE`, for an empty result the user asked for, when the node knows no peer
+/// and sits on no relay.
+fn lan_silent_note(knows_peers: bool, on_relay: bool) -> Option<&'static str> {
+    (!knows_peers && !on_relay).then_some(LAN_SILENT_NOTE)
 }
 
 /// Whether the peer table holds a row heard within `PEER_TTL` of `now`, from `last_seen`
@@ -4351,77 +4330,6 @@ fn on_relay(interfaces: &[InterfaceStatus], rnsd_relay_online: bool) -> bool {
         || interfaces.iter().any(|status| {
             matches!(status.kind, "private" | "public") && status.state == InterfaceState::Connected
         })
-}
-
-/// Whether `LAN_SILENT_HINT` is still to be told. It settles for good once it is told or
-/// once `lan_silent_verdict` settles it, so a host row swept hours later does not make
-/// the LAN silent.
-#[derive(Default)]
-pub(super) struct LanSilentHint {
-    settled: bool,
-}
-
-/// What one tick of the silent-LAN check reads besides the LAN counts.
-pub(super) struct LanSilentInputs {
-    /// Time since the node joined.
-    pub elapsed: Duration,
-    /// Whether the peer table holds a row within `PEER_TTL`, as `knows_peers` reads it.
-    pub knows_peers: bool,
-    /// Every configured interface with its state, for `on_relay`.
-    pub interfaces: Vec<InterfaceStatus>,
-}
-
-impl LanSilentHint {
-    pub(super) fn settled(&self) -> bool {
-        self.settled
-    }
-
-    /// One tick of the watcher: one read of the LAN counts by `read`, then the verdict on
-    /// them with `inputs`, taken once the counts are in. A settled hint reads nothing.
-    pub(super) async fn read_and_tick<F>(
-        &mut self,
-        read: impl FnOnce() -> F,
-        inputs: impl FnOnce() -> LanSilentInputs,
-    ) -> Option<&'static str>
-    where
-        F: Future<Output = LanReadings>,
-    {
-        if self.settled {
-            return None;
-        }
-        let lan = read().await;
-        let inputs = inputs();
-        self.tick(
-            inputs.elapsed,
-            &lan.readings,
-            inputs.knows_peers,
-            on_relay(&inputs.interfaces, lan.relay_online),
-        )
-    }
-
-    /// The hint, the one time it is due.
-    fn tick(
-        &mut self,
-        elapsed: Duration,
-        readings: &[LanReading],
-        knows_peers: bool,
-        on_relay: bool,
-    ) -> Option<&'static str> {
-        if self.settled {
-            return None;
-        }
-        match lan_silent_verdict(elapsed, readings, knows_peers, on_relay) {
-            LanVerdict::Wait => None,
-            LanVerdict::Settle => {
-                self.settled = true;
-                None
-            }
-            LanVerdict::Tell => {
-                self.settled = true;
-                Some(LAN_SILENT_HINT)
-            }
-        }
-    }
 }
 
 /// Folds one state event of the attached `local` rnsd's client into its row. `Connected`
@@ -5301,6 +5209,18 @@ impl MeshSlot {
                 Arc::downgrade(&runtime),
                 runtime.cancellation_token(),
             )));
+        }
+        {
+            let (joined, cancel) = (Arc::downgrade(&runtime), runtime.cancellation_token());
+            runtime.register_task(tokio::spawn(async move {
+                let Some(runtime) = joined.upgrade() else {
+                    return;
+                };
+                tokio::select! {
+                    () = cancel.cancelled() => {}
+                    () = runtime.read_rnsd_once() => {}
+                }
+            }));
         }
         runtime.register_task(tokio::spawn(sweep_pending(
             Arc::downgrade(self),
@@ -19500,144 +19420,47 @@ mod tests {
         }
     }
 
-    mod lan_silent_hint_tests {
+    mod lan_silent_note_tests {
         use super::*;
-        use LanReading::{Count, Unknown};
+        use crate::mesh::lan_count::LanReading::{Count, Unknown};
 
-        const GRACE: Duration = Duration::from_secs(LAN_SILENT_GRACE_SECS);
-
-        /// Every LAN interface counting no host or reading `Unknown`, on a node that
-        /// knows no peer and sits on no relay, tells the hint at the grace and later.
+        /// The note goes under an empty result only on a node that knows no peer and
+        /// sits on no relay; either one already reaches the mesh, so it says nothing then.
         #[test]
-        fn the_hint_is_due_at_the_grace_when_every_lan_interface_is_silent() {
-            assert_eq!(LAN_SILENT_GRACE_SECS, 120);
-            for readings in [
-                &[Count(0)][..],
-                &[Unknown],
-                &[Count(0), Count(0)],
-                &[Count(0), Unknown],
-            ] {
-                for elapsed in [GRACE, GRACE * 3] {
-                    assert_eq!(
-                        lan_silent_verdict(elapsed, readings, false, false),
-                        LanVerdict::Tell,
-                        "{readings:?}"
-                    );
-                }
-            }
-        }
-
-        #[test]
-        fn the_hint_is_not_due_before_the_grace() {
-            assert_eq!(
-                lan_silent_verdict(GRACE - Duration::from_millis(1), &[Count(0)], false, false),
-                LanVerdict::Wait
-            );
-            assert_eq!(
-                lan_silent_verdict(Duration::ZERO, &[Unknown], false, false),
-                LanVerdict::Wait
-            );
-            let mut hint = LanSilentHint::default();
-            assert_eq!(hint.tick(GRACE / 2, &[Count(0)], false, false), None);
-            assert!(!hint.settled());
-        }
-
-        /// A count of zero is not told on a node that knows a peer or sits on a relay:
-        /// either one already reaches the mesh, so the LAN being silent is no news.
-        #[test]
-        fn a_zero_count_is_kept_quiet_by_a_known_peer_or_a_relay() {
+        fn the_note_needs_no_known_peer_and_no_relay() {
+            assert_eq!(lan_silent_note(false, false), Some(LAN_SILENT_NOTE));
             for (knows_peers, on_relay) in [(false, true), (true, false), (true, true)] {
-                let mut hint = LanSilentHint::default();
                 assert_eq!(
-                    hint.tick(GRACE, &[Count(0)], knows_peers, on_relay),
+                    lan_silent_note(knows_peers, on_relay),
                     None,
                     "peers {knows_peers}, relay {on_relay}"
                 );
-                assert!(hint.settled(), "peers {knows_peers}, relay {on_relay}");
             }
         }
 
-        /// A relay settles the hint whatever the LAN interfaces read: unknown, unknown
-        /// beside zero, or zero.
+        /// No interval or idle line prints it: the interface watcher and the idle driver
+        /// never name it, only the empty results the user asked for do.
         #[test]
-        fn a_relay_keeps_the_hint_away_from_an_unknown_or_a_zero_count() {
-            for (elapsed, readings) in [
-                (GRACE, &[Unknown][..]),
-                (GRACE * 2, &[Count(0), Unknown]),
-                (GRACE * 3, &[Count(0)]),
-            ] {
-                let mut hint = LanSilentHint::default();
-                assert_eq!(hint.tick(elapsed, readings, false, true), None);
-                assert!(hint.settled(), "{readings:?}");
-            }
-        }
-
-        #[test]
-        fn no_lan_interface_keeps_the_hint_away() {
-            for any_heard in [false, true] {
-                assert_eq!(
-                    lan_silent_verdict(GRACE, &[], any_heard, false),
-                    LanVerdict::Settle
-                );
-                assert_eq!(
-                    LanSilentHint::default().tick(GRACE, &[], any_heard, true),
-                    None
-                );
-            }
-        }
-
-        /// A host on any LAN interface settles it at once, before the grace and with no
-        /// host heard, beside an interface counting zero or reading `Unknown`.
-        #[test]
-        fn a_counted_host_keeps_the_hint_away_even_when_nothing_was_heard() {
-            for readings in [&[Count(1)][..], &[Count(0), Count(3)], &[Unknown, Count(2)]] {
-                for elapsed in [Duration::ZERO, GRACE] {
-                    let mut hint = LanSilentHint::default();
-                    assert_eq!(hint.tick(elapsed, readings, false, false), None);
-                    assert!(hint.settled(), "{readings:?}");
-                }
-            }
-        }
-
-        /// A known peer settles it where a count cannot be read too.
-        #[test]
-        fn a_heard_peer_keeps_the_hint_away_from_an_unknown_count() {
-            for readings in [&[Unknown][..], &[Unknown, Unknown], &[Count(0), Unknown]] {
-                let mut hint = LanSilentHint::default();
-                assert_eq!(hint.tick(GRACE, readings, true, false), None);
-                assert!(hint.settled(), "{readings:?}");
-            }
-        }
-
-        #[test]
-        fn the_hint_is_printed_once() {
-            let mut hint = LanSilentHint::default();
-            assert_eq!(
-                hint.tick(GRACE, &[Count(0)], false, false),
-                Some(LAN_SILENT_HINT)
+        fn the_note_is_never_printed_unasked() {
+            use crate::mesh::test_support::read_source;
+            let node = read_source(Path::new("src/mesh/node.rs"));
+            let watcher = node
+                .split_once("async fn watch_interfaces(")
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .expect("node.rs defines watch_interfaces")
+                .0;
+            assert!(
+                !watcher.contains("LAN_SILENT"),
+                "the watcher prints no LAN note"
             );
-            assert!(hint.settled());
-            assert_eq!(hint.tick(GRACE * 10, &[Count(0)], false, false), None);
-            assert_eq!(hint.tick(GRACE * 11, &[Unknown], false, false), None);
-        }
-
-        /// The ticks before the grace leave it open; a peer heard once settles it, so
-        /// that peer's row swept from the table later does not bring the hint back.
-        #[test]
-        fn a_peer_heard_once_keeps_the_hint_away_after_its_row_is_swept() {
-            let mut hint = LanSilentHint::default();
-            assert_eq!(hint.tick(GRACE / 2, &[Unknown], false, false), None);
-            assert!(!hint.settled());
-            assert_eq!(hint.tick(GRACE, &[Unknown], true, false), None);
-            assert!(hint.settled());
-            assert_eq!(hint.tick(GRACE * 90, &[Count(0)], false, false), None);
+            assert!(!read_source(Path::new("src/repl/idle.rs")).contains("LAN_SILENT"));
         }
 
         /// The counts come off the transport's own peer counter on the `lan` host
         /// channel, as the discovery runtime installs it: none installed reads
-        /// `Unknown`, zero tells the hint and a host settles it.
+        /// `Unknown`, then the count, for the `.mesh status` LAN row.
         #[tokio::test]
-        async fn the_in_process_lan_count_drives_the_hint() {
+        async fn the_in_process_lan_count_is_read_off_the_transport() {
             let transport = Transport::new(TransportConfig::new(
                 SCOPE_APP_NAME,
                 &TransportIdentity::new_from_rand(OsRng),
@@ -19673,23 +19496,12 @@ mod tests {
                 .await
                 .readings;
             assert_eq!(readings, [Count(0)]);
-            assert_eq!(
-                LanSilentHint::default().tick(GRACE, &readings, false, false),
-                Some(LAN_SILENT_HINT)
-            );
-            assert_eq!(
-                LanSilentHint::default().tick(GRACE, &readings, true, true),
-                None
-            );
 
             counter.store(2, Ordering::Release);
             let readings = lan_readings(Some(&transport), &[host], None, ReadEffort::Quick)
                 .await
                 .readings;
             assert_eq!(readings, [Count(2)]);
-            let mut hint = LanSilentHint::default();
-            assert_eq!(hint.tick(GRACE, &readings, false, false), None);
-            assert!(hint.settled());
 
             assert!(
                 lan_readings(None, &[host], None, ReadEffort::Patient)
@@ -19751,34 +19563,48 @@ mod tests {
             ));
         }
 
-        /// The inputs as the watcher reads them on a LAN-only rnsd: an empty peer table,
-        /// no relay connected and no TCP client online leave the zero count told once at
-        /// the grace.
-        #[test]
-        fn a_node_with_no_peer_and_no_relay_on_a_silent_lan_is_told_once() {
+        /// A node whose one relay went away knows no peer and sits on no relay, so it
+        /// has the note; a peer row within `PEER_TTL`, one loaded from disk as much
+        /// as one heard, takes it away, and so does a relay that is connected.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_with_no_peer_and_no_relay_has_the_note_and_a_peer_or_a_relay_takes_it() {
+            use crate::mesh::test_support::{
+                leave_relay, started_runtime, started_runtime_on_doomed_relay,
+            };
+
+            let (alone, relay) = started_runtime_on_doomed_relay("lan-note-alone").await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(alone.runtime.clone()).unwrap();
+            leave_relay(relay, &alone.runtime).await;
             let now = SystemTime::now();
-            let rnsd = LanReadings {
-                readings: vec![Count(0)],
-                relay_online: false,
-            };
-            let mut hint = LanSilentHint::default();
-            let tick = |hint: &mut LanSilentHint, elapsed| {
-                hint.tick(
-                    elapsed,
-                    &rnsd.readings,
-                    knows_peers([], now),
-                    on_relay(&[], rnsd.relay_online),
-                )
-            };
-            assert_eq!(tick(&mut hint, GRACE), Some(LAN_SILENT_HINT));
-            assert_eq!(tick(&mut hint, GRACE * 2), None);
+            assert_eq!(alone.runtime.silent_lan_note(now), Some(LAN_SILENT_NOTE));
+            assert_eq!(
+                alone.runtime.silent_lan_note_now(now).await,
+                Some(LAN_SILENT_NOTE)
+            );
+            let sighting = alone.runtime.own_session_sighting("lan-note-peer", "peer");
+            alone.runtime.peers().observe(sighting, now - PEER_TTL / 2);
+            assert_eq!(alone.runtime.silent_lan_note(now), None, "a peer on disk");
+            assert_eq!(alone.runtime.silent_lan_note_now(now).await, None);
+            assert!(slot.stop().await.unwrap());
+
+            let relayed = started_runtime("lan-note-relayed").await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(relayed.runtime.clone()).unwrap();
+            assert_eq!(
+                relayed.runtime.silent_lan_note(SystemTime::now()),
+                None,
+                "a connected relay"
+            );
+            assert!(slot.stop().await.unwrap());
         }
 
         #[test]
-        fn the_hint_points_at_the_deployment_page_section() {
+        fn the_note_points_at_the_deployment_page_section() {
             assert_eq!(
-                LAN_SILENT_HINT,
-                "No other Coyote host found on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
+                LAN_SILENT_NOTE,
+                "No one heard yet. If another host on your network should be here, many Wi-Fi routers block the multicast Coyote uses to find them; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
             );
         }
     }
@@ -20948,6 +20774,53 @@ mod tests {
             node.stop().await;
         }
 
+        /// Two configured nodes are filed beside a nearer stranger: each fetch asks the
+        /// configured node whose turn it is and moves the turn on, so two fetches ask both
+        /// and the stranger is never asked.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn fetches_rotate_over_both_configured_nodes_and_never_ask_a_stranger() {
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let pn = |hops: u8| {
+                let destination = crate::mesh::propagation::propagation_node_destination(
+                    *TransportIdentity::new_from_rand(OsRng).as_identity(),
+                );
+                (
+                    PropagationNode {
+                        destination,
+                        stamp_cost: 0,
+                        per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                        propagation_enabled: true,
+                    },
+                    hops,
+                )
+            };
+            let (first, second, stranger) = (pn(4), pn(5), pn(1));
+            let hex_of = |node: &PropagationNode| node.destination.address_hash.to_hex_string();
+            let tmp = TempDir::new("node-pinned-rotation");
+            let runtime =
+                start_with_configured(&tmp, relay.port, &[hex_of(&first.0), hex_of(&second.0)])
+                    .await;
+            for (node, hops) in [&first, &second, &stranger] {
+                runtime
+                    .propagation_nodes()
+                    .observe(node.clone(), *hops, SystemTime::now());
+            }
+            let sink = Arc::new(CountingSink::default());
+            let mut asked = Vec::new();
+            for _ in 0..3 {
+                asked.push(hex_of(&runtime.propagation_nodes().select().unwrap()));
+                let _ = runtime.fetch_propagated(&*sink).await;
+            }
+            assert_eq!(
+                asked,
+                [hex_of(&first.0), hex_of(&second.0), hex_of(&first.0)]
+            );
+            assert_eq!(runtime.propagation_nodes().fetch_rotation(), 2);
+
+            stop(&runtime).await;
+            relay.stop().await;
+        }
+
         /// A sync that finds no node filed asks the mesh for the configured one in the
         /// background: that sync still reports no node, and the node is filed after it.
         /// The node was never installed in a slot, so no round ran at join.
@@ -21027,10 +20900,10 @@ mod tests {
         }
 
         /// A row kept in `peers.json` from an earlier run, heard within `PEER_TTL`, is a
-        /// known peer to the silent-LAN check of the node that loads it; one older than
-        /// that is not.
+        /// known peer to the silent-LAN note of the node that loads it, which then has no
+        /// note; one older than that is not.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_peer_row_loaded_from_disk_within_the_ttl_keeps_the_silent_lan_line_quiet() {
+        async fn a_peer_row_loaded_from_disk_within_the_ttl_keeps_the_silent_lan_note_away() {
             let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
             for (age, known) in [
                 (PEER_TTL / 2, true),
@@ -21059,20 +20932,15 @@ mod tests {
                 earlier.persist_if_dirty().unwrap();
 
                 let runtime = start_on(&tmp, relay.port).await;
-                let inputs = lan_silent_inputs(&runtime, SystemTime::now());
-                assert_eq!(inputs.knows_peers, known, "a row {age:?} old");
+                let now = SystemTime::now();
+                let peers_known = knows_peers(
+                    runtime.peers().snapshot().iter().map(|peer| peer.last_seen),
+                    now,
+                );
+                assert_eq!(peers_known, known, "a row {age:?} old");
                 assert_eq!(
-                    lan_silent_verdict(
-                        Duration::from_secs(LAN_SILENT_GRACE_SECS),
-                        &[LanReading::Count(0)],
-                        inputs.knows_peers,
-                        false,
-                    ),
-                    if known {
-                        LanVerdict::Settle
-                    } else {
-                        LanVerdict::Tell
-                    },
+                    lan_silent_note(peers_known, false),
+                    (!known).then_some(LAN_SILENT_NOTE),
                     "a row {age:?} old"
                 );
                 stop(&runtime).await;

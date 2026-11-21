@@ -85,7 +85,7 @@ fn quoted_text<'a>(link: &'a (dyn std::error::Error + 'static)) -> Option<&'a No
         return Some(closed.notice());
     }
     link.downcast_ref::<QuotingError>()
-        .map(|quoting| &quoting.0)
+        .map(|quoting| &quoting.full)
 }
 
 /// Marks an error the `.mesh` verb raised. Display and source pass straight through, so
@@ -114,29 +114,56 @@ impl std::error::Error for MeshVerbError {
 /// A `.mesh` error that quotes text this node did not write: a path a peer named, a
 /// share rule's pattern, or a share file's own words. Only its frame runs are spelled
 /// in the prefix, so a quoted `.vault` keeps its dot while the hints beside it follow
-/// the prefix.
+/// the prefix. A trailer, when there is one, stays the last line whatever is added
+/// after the message later.
 #[derive(Debug)]
-pub(crate) struct QuotingError(NoticeText);
+pub(crate) struct QuotingError {
+    head: NoticeText,
+    trailer: Option<NoticeText>,
+    full: NoticeText,
+}
 
 impl QuotingError {
     pub(crate) fn wrap(text: NoticeText) -> anyhow::Error {
-        anyhow::Error::new(Self(text))
+        Self::with_trailer(text, None)
+    }
+
+    /// `err` with `trailer` on a line of its own after it, kept last when a caller adds
+    /// to the message with `followed_by`.
+    pub(crate) fn trailed_by(err: anyhow::Error, trailer: NoticeText) -> anyhow::Error {
+        let head = match err.downcast::<Self>() {
+            Ok(Self { head, .. }) => head,
+            Err(err) => NoticeText::from(err.to_string()),
+        };
+        Self::with_trailer(head, Some(trailer))
+    }
+
+    fn with_trailer(head: NoticeText, trailer: Option<NoticeText>) -> anyhow::Error {
+        let full = match &trailer {
+            Some(trailer) => head.clone().frame("\n").then(trailer.clone()),
+            None => head.clone(),
+        };
+        anyhow::Error::new(Self {
+            head,
+            trailer,
+            full,
+        })
     }
 
     /// `err` with `tail` after its message, quoting as `err` did. Only the top message of
     /// an error that quotes nothing is kept, all of it this node's own text.
     pub(crate) fn followed_by(err: anyhow::Error, tail: NoticeText) -> anyhow::Error {
-        let head = match err.downcast::<Self>() {
-            Ok(Self(text)) => text,
-            Err(err) => NoticeText::from(err.to_string()),
+        let (head, trailer) = match err.downcast::<Self>() {
+            Ok(Self { head, trailer, .. }) => (head, trailer),
+            Err(err) => (NoticeText::from(err.to_string()), None),
         };
-        Self::wrap(head.then(tail))
+        Self::with_trailer(head.then(tail), trailer)
     }
 }
 
 impl fmt::Display for QuotingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        fmt::Display::fmt(&self.full, f)
     }
 }
 

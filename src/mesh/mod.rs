@@ -392,6 +392,7 @@ pub(crate) mod test_support {
     use super::hex_lower;
     #[cfg(unix)]
     use super::message::{PeerBody, from_request_body, is_farewell, received_reply};
+    pub(crate) use super::node::LAN_SILENT_NOTE;
     use super::node::MeshPaths;
     #[cfg(all(test, unix))]
     pub(crate) use super::node::RecordingEnvoy;
@@ -1832,6 +1833,25 @@ pub(crate) mod test_support {
         started_runtime_at(tag, config, options, relay_handle).await
     }
 
+    /// A runtime joined over a loopback relay it is about to lose: install it in a slot
+    /// (which runs its interface watcher), then hand the relay to `leave_relay`.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_on_doomed_relay(
+        tag: &str,
+    ) -> (StartedRuntime, TransportRelay) {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let started = started_runtime_on(tag, relay.port).await;
+        (started, relay)
+    }
+
+    /// Stops `relay` and marks `runtime`'s interface rows unreachable, so it sits on no
+    /// relay; a drop alone leaves a TCP row connected until its redials fail.
+    #[cfg(unix)]
+    pub(crate) async fn leave_relay(relay: TransportRelay, runtime: &MeshRuntime) {
+        relay.stop().await;
+        runtime.mark_interfaces_unreachable();
+    }
+
     /// A runtime joined to whatever listens on `port`, such as a `PeerStub`. There is no
     /// relay task, so `relay_handle` is a task already finished and aborting it does
     /// nothing.
@@ -1865,7 +1885,47 @@ pub(crate) mod test_support {
         options: NodeOptions,
         relay_handle: JoinHandle<()>,
     ) -> StartedRuntime {
+        started_runtime_as(tag, config, options, relay_handle, None).await
+    }
+
+    /// `started_runtime_on` for another session of `sibling`'s user: the node starts on
+    /// a copy of `sibling`'s identity key, so it announces a destination of its own under
+    /// the same identity.
+    #[cfg(unix)]
+    pub(crate) async fn started_session_of(
+        tag: &str,
+        port: u16,
+        sibling: &StartedRuntime,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
+        let key = mesh_paths(&sibling.tmp).identity_path;
+        let mut config = private_config(port);
+        adjust(&mut config);
+        let relay_handle = tokio::spawn(std::future::ready(()));
+        started_runtime_as(
+            tag,
+            config,
+            NodeOptions::default(),
+            relay_handle,
+            Some(&key),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn started_runtime_as(
+        tag: &str,
+        config: MeshConfig,
+        options: NodeOptions,
+        relay_handle: JoinHandle<()>,
+        identity_from: Option<&std::path::Path>,
+    ) -> StartedRuntime {
         let tmp = TempDir::new(tag);
+        if let Some(key) = identity_from {
+            let to = mesh_paths(&tmp).identity_path;
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(key, &to).unwrap();
+        }
         let mut session = Session::default();
         let runtime = MeshRuntime::start(&config, true, &mut session, mesh_paths(&tmp), options)
             .await

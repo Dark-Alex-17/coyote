@@ -36,9 +36,17 @@ pub(crate) enum CardTrigger {
     /// is what names it. It comes alongside the store's `Granted`; the interval keeps the
     /// two to one fetch.
     OwnerGranted,
-    /// The session announced or answered a path request; only the first time a session
-    /// is heard in a run counts, and a card or message it served counts as heard.
+    /// The session announced; only the first time a session is heard in a run counts,
+    /// and a card or message it served counts as heard. Asked
+    /// whether or not it served this node: a background fetch only ever asks a session
+    /// the trust list covers, so a new session of a user trusted as a whole is named
+    /// from its card without waiting for it to make contact.
     Heard,
+    /// The session answered a path request for the first time in a run, counted as a
+    /// hearing as `Heard` is. Asked only when it served this node: the path was asked for
+    /// because this node is about to reach it, and a card fetch beside that request would
+    /// share its link, so a send on its way waits on the fetch's link instead of its own.
+    Answered,
     /// The session was heard again, by an announce or a path response, after this node
     /// had it as left or with no route, or for the first time in this run while the peer
     /// table held it from before: asked whether or not it served this node, since it may
@@ -164,8 +172,10 @@ impl CardCadence {
     /// Whether a background fetch of `destination`, prompted by `trigger`, may go out
     /// now, and if so notes it as asked. `served` is whether the session served this
     /// node a card or a message in this run or the previous one; a session that did not
-    /// is asked only after the owner granted it trust or after it contacted this node,
-    /// and one that refused since the trust last changed is never asked. A grant is a
+    /// is asked only when it is heard, after the owner granted it trust or after it
+    /// contacted this node, and one that refused since the trust last changed is never
+    /// asked. Only a session the trust list covers reaches this (`consider_card_fetch`
+    /// asks the trust store first), so being heard asks unserved too. A grant is a
     /// trust change on this side and a contact one on the other side, so both lift a
     /// refusal first. Only the first time a session is heard in a run counts, and no
     /// destination is asked twice within `CARD_FETCH_MIN_INTERVAL`, but for a contact
@@ -173,11 +183,14 @@ impl CardCadence {
     /// deferred until the interval lapses, replacing any fetch deferred before it.
     pub(crate) fn admit(&self, destination: &str, trigger: CardTrigger, served: bool) -> bool {
         let now = self.now();
-        let order = (!matches!(trigger, CardTrigger::Heard | CardTrigger::Reheard))
-            .then(|| self.write_lock.lock());
+        let order = (!matches!(
+            trigger,
+            CardTrigger::Heard | CardTrigger::Answered | CardTrigger::Reheard
+        ))
+        .then(|| self.write_lock.lock());
         let mut state = self.state.lock();
         let lifted = match trigger {
-            CardTrigger::Heard => {
+            CardTrigger::Heard | CardTrigger::Answered => {
                 if !state.heard.insert(destination.to_string()) {
                     return false;
                 }
@@ -220,7 +233,10 @@ impl CardCadence {
     ) -> bool {
         let asks_unserved = matches!(
             trigger,
-            CardTrigger::OwnerGranted | CardTrigger::Contacted | CardTrigger::Reheard
+            CardTrigger::OwnerGranted
+                | CardTrigger::Contacted
+                | CardTrigger::Heard
+                | CardTrigger::Reheard
         );
         if (!served && !asks_unserved) || state.refused.contains(destination) {
             return false;
@@ -592,6 +608,14 @@ impl MeshRuntime {
         }
         let cadence = self.card_cadence();
         let served = self.peers().served_recently(destination);
+        // A session of this node's own user is named from the session registry, not a
+        // card, so being heard asks it only when it served this node, as before.
+        if trigger == CardTrigger::Heard
+            && !served
+            && peer.identity_hash.eq_ignore_ascii_case(self.fingerprint())
+        {
+            return None;
+        }
         if !cadence.admit(destination, trigger, served) {
             return None;
         }
@@ -678,8 +702,11 @@ mod tests {
 
     const D: &str = "dddddddddddddddddddddddddddddddd";
 
+    /// A store grant asks only a session that served this node; being heard, as the
+    /// owner's own grant, asks one that never did, since only a session the trust list
+    /// covers is ever considered.
     #[test]
-    fn only_a_session_that_served_this_node_is_asked_unless_the_owner_granted_it_trust() {
+    fn a_grant_asks_only_a_served_session_and_being_heard_or_the_owners_grant_asks_any() {
         let cadence = CardCadence::default();
         assert_eq!(
             cadence.permits.available_permits(),
@@ -687,7 +714,15 @@ mod tests {
             "background fetches share the status concurrency cap"
         );
         assert!(!cadence.admit(D, CardTrigger::Granted, false));
-        assert!(!cadence.admit(D, CardTrigger::Heard, false));
+        assert!(
+            cadence.admit(D, CardTrigger::Heard, false),
+            "a covered session heard for the first time is asked though it never served"
+        );
+        assert!(
+            !cadence.admit(D, CardTrigger::Granted, true),
+            "within the interval of that ask"
+        );
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
         assert!(cadence.admit(D, CardTrigger::Granted, true));
         let other = "e".repeat(32);
         assert!(
@@ -1286,6 +1321,111 @@ mod network {
 
         assert!(slot_a.stop().await.unwrap());
         assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// Three sessions of one user announce while A trusts nobody, which asks nothing and
+    /// counts as no hearing. A then trusts the user as a whole, and the next announce of
+    /// each session is the first hearing that counts; none of them ever served A, and A
+    /// types nothing. Each is asked for its card once and A names it from the card within
+    /// 30 s. A session of a user A does not trust is heard too, and is never asked, heard
+    /// or heard again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_sessions_of_a_trusted_user_are_named_unasked_and_an_untrusted_one_is_not_asked() {
+        use crate::mesh::test_support::started_session_of;
+
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("cadence-trusted-user-a", relay.port).await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let a_rt = &a.runtime;
+        let a_dest = a_rt.current_destination_hash();
+        let named = |config: &mut crate::config::MeshConfig| {
+            config.person_name = Some("Maki".into());
+        };
+        let first = started_runtime_on_with("cadence-trusted-user-m1", relay.port, named).await;
+        let mut sessions = vec![first];
+        for tag in ["cadence-trusted-user-m2", "cadence-trusted-user-m3"] {
+            let next = started_session_of(tag, relay.port, &sessions[0], named).await;
+            sessions.push(next);
+        }
+        let stranger = started_runtime_on("cadence-untrusted-user-x", relay.port).await;
+        let user = sessions[0].runtime.fingerprint().to_string();
+        let mut slots = Vec::new();
+        for (index, node) in sessions.iter().chain([&stranger]).enumerate() {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(node.runtime.clone()).unwrap();
+            slot.rename_session(&format!("s{index}"));
+            wait_for_peer(&node.runtime, &a_dest).await;
+            node.runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &a_dest,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            slots.push(slot);
+        }
+        let dests: Vec<String> = sessions
+            .iter()
+            .map(|node| node.runtime.current_destination_hash())
+            .collect();
+        let stranger_dest = stranger.runtime.current_destination_hash();
+        for dest in dests.iter().chain([&stranger_dest]) {
+            wait_for_peer(a_rt, dest).await;
+            assert!(
+                !a_rt.card_cadence().heard_in_run(dest),
+                "no hearing counted yet"
+            );
+        }
+        for dest in &dests {
+            assert_eq!(
+                a_rt.peers().get(dest).unwrap().identity_hash,
+                user,
+                "one user"
+            );
+        }
+        a_rt.trust()
+            .trust_identity(
+                slot_a.as_ref(),
+                &user,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let before = status_requests(a_rt);
+
+        for node in sessions.iter().chain([&stranger]) {
+            node.runtime.announce_on_connect().await.unwrap();
+        }
+        let started = Instant::now();
+        for (index, dest) in dests.iter().enumerate() {
+            let want = format!("Maki / s{index}");
+            while a_rt.who_at(dest).to_string() != want {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "A never named {want}: {}",
+                    a_rt.who_at(dest),
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        assert_eq!(status_requests(a_rt), before + 3, "one card request each");
+        assert!(
+            a_rt.consider_card_fetch(&stranger_dest, CardTrigger::Heard)
+                .is_none()
+                && a_rt
+                    .consider_card_fetch(&stranger_dest, CardTrigger::Reheard)
+                    .is_none(),
+            "a session of a user A does not trust is not asked, heard or heard again"
+        );
+        assert_eq!(status_requests(a_rt), before + 3);
+
+        for slot in slots.iter().chain([&slot_a]) {
+            assert!(slot.stop().await.unwrap());
+        }
         relay.stop().await;
     }
 

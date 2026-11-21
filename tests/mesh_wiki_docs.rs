@@ -5301,7 +5301,10 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     let deployment = read(wiki.join("Mesh-Deployment.md"));
     let nodes = section("Mesh-Deployment.md", &deployment, "## Propagation nodes");
     assert!(
-        flat(&nodes).contains("nearest by hops (an operator-pinned node is not supported yet)"),
+        flat(&nodes).contains("nearest by hops (an operator-pinned node goes first, see below)")
+            && flat(&nodes).contains(
+                "while any of them is filed Coyote posts to and fetches from pinned nodes only, asking each of them once per sync interval; other filed nodes are used only when no pinned node is filed"
+            ),
         "Mesh-Deployment.md's Propagation nodes section does not state the selection rule"
     );
     let mesh = read(wiki.join("Mesh.md"));
@@ -10844,6 +10847,21 @@ fn the_configured_propagation_nodes_key_is_described_on_the_deployment_and_confi
             "Mesh-Configuration.md lacks {needle:?}"
         );
     }
+    let pinned = flat(&section(
+        "Mesh-Configuration.md",
+        &configuration,
+        "## `propagation_nodes`",
+    ));
+    for needle in [
+        "A listed node is also pinned: it is never evicted from the table of 32 nodes",
+        "while any listed node is filed the node posts to and fetches from listed nodes only",
+        "Nodes heard but not listed are used only when no listed node is filed",
+    ] {
+        assert!(
+            pinned.contains(needle),
+            "Mesh-Configuration.md's propagation_nodes section lacks {needle:?}"
+        );
+    }
 }
 
 /// The line a silent peer leaves opens `no answer from "<user> / <session>" (<dest8>)`,
@@ -11053,9 +11071,10 @@ fn folded_section(page: &str, heading: &str) -> String {
 }
 
 /// The silent-LAN section says how the LAN host count is read, in the order and with the
-/// keys the code uses, and when the line comes or stays quiet: a known peer or a relay
-/// keeps it away. It quotes the line's first sentence as `LAN_SILENT_HINT` words it. The
-/// `.mesh status` page quotes the LAN line in the words `.mesh status` prints.
+/// keys the code uses, that the sentence is never raised unasked, only under an empty
+/// result the user asked for, and that a known peer or a relay keeps it away. It quotes
+/// the sentence as `LAN_SILENT_NOTE` words it, up to its link. The `.mesh status` page
+/// quotes the LAN line in the words `.mesh status` prints.
 #[test]
 fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
     let repl = read(repo_root().join("src/repl/mesh.rs"));
@@ -11082,37 +11101,37 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         );
     }
     let node = read(repo_root().join("src/mesh/node.rs"));
-    let hint = node
-        .split_once("const LAN_SILENT_HINT: &str = \"")
+    let note = node
+        .split_once("const LAN_SILENT_NOTE: &str = \"")
         .and_then(|(_, rest)| rest.split_once("\";"))
-        .map(|(hint, _)| hint)
-        .expect("src/mesh/node.rs defines LAN_SILENT_HINT");
-    let first_sentence = hint
-        .split_once(". ")
-        .map(|(sentence, _)| format!("{sentence}."))
-        .expect("LAN_SILENT_HINT has more than one sentence");
+        .map(|(note, _)| note)
+        .expect("src/mesh/node.rs defines LAN_SILENT_NOTE");
+    let words = note
+        .split_once(" - see ")
+        .map(|(words, _)| words)
+        .expect("LAN_SILENT_NOTE ends with a link");
 
     let Some(wiki) = wiki_dir() else { return };
     let silent = folded_section(
         &read(wiki.join("Mesh-Deployment.md")),
         "## When the LAN is silent",
     );
-    let quoted = format!("`[mesh:relay] {first_sentence}`");
+    let quoted = format!("`{words}`");
     assert!(
         silent.contains(&quoted),
-        "Mesh-Deployment.md's silent-LAN section does not quote the line as the code prints it: {quoted}"
+        "Mesh-Deployment.md's silent-LAN section does not quote the sentence as the code prints it: {quoted}"
     );
     for needle in [
         "`/etc/reticulum`, then `~/.config/reticulum`, then `~/.reticulum`",
         "its `rpc_key` or the key rnsd derives from its transport identity",
         "`.mesh status` shows it as `LAN: N hosts reachable`",
-        "whose every LAN interface reaches 0 hosts, or reads no count at all",
-        "One LAN host is enough to keep the line away",
+        "Coyote never raises this on its own: a session doing its own work alone sees nothing.",
+        "`.mesh people list` with nobody in it or a name that resolves to nobody",
         "when it knows peers, that is any row in its peer table heard within the last three hourly announces",
         "the rows kept from an earlier run included",
         "a `private` or `public` interface of its own is connected, or the local rnsd reports a `TCPClientInterface` online",
         "A relay that is configured but not connected does not count.",
-        "A session with an empty peer table on a LAN-only rnsd, with no relay up, still gets the line.",
+        "A session with an empty peer table on a LAN-only rnsd, with no relay up, still gets the sentence when it asks.",
         "files the node from a path request at join, instead of waiting up to an hour for the node's next hourly announce",
     ] {
         assert!(
@@ -11125,6 +11144,9 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         "does not make the LAN reach anyone",
         "no `private` relay is configured",
         "No other host has been heard on your LAN",
+        "[mesh:relay] No other Coyote host found",
+        "Two minutes after joining",
+        "keep the line away",
     ] {
         assert!(
             !silent.contains(stale),

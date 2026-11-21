@@ -14,8 +14,8 @@ use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::lan_count::{LanReading, ReadEffort, RnsdLanReader, RnsdLocator};
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
 use crate::mesh::node::{
-    FullEnvoy, InterfaceState, LanVerdict, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy,
-    lan_silent_verdict, session_destination_name,
+    FullEnvoy, InterfaceState, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy,
+    session_destination_name,
 };
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::propagation_nodes::PROPAGATION_NODE_TABLE_FILE;
@@ -2670,11 +2670,7 @@ async fn a_node_reads_the_lan_host_count_of_its_rnsd() {
     let reading = reader.read().await.lan;
     assert_eq!(reading, Some(LanReading::Unknown));
     assert!(reader.unavailable().await);
-    let readings: Vec<LanReading> = reading.into_iter().collect();
-    assert_eq!(
-        lan_silent_verdict(Duration::from_secs(600), &readings, true, false),
-        LanVerdict::Settle
-    );
+    assert!(!reader.relay_online_seen(), "a refused key reads no relay");
     let wrong_key_path = wrong_key_dir.path.display().to_string();
     let told = |lines: Vec<String>| {
         lines

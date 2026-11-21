@@ -279,6 +279,9 @@ impl Coalescer {
 /// node at the short cadence.
 pub(crate) struct SyncSchedule {
     interval: Option<Duration>,
+    /// How many nodes one interval's fetches rotate over: the interval is split between
+    /// them, so each is asked once per interval (`rotate_over`).
+    rotation: u32,
     due_at: Option<Instant>,
     in_flight: Option<String>,
     pending: bool,
@@ -298,6 +301,7 @@ impl SyncSchedule {
     pub(crate) fn new(interval_secs: u64, announce: bool) -> Self {
         Self {
             interval: propagation_sync_every(interval_secs, announce),
+            rotation: 1,
             due_at: None,
             in_flight: None,
             pending: false,
@@ -310,6 +314,12 @@ impl SyncSchedule {
 
     pub(crate) fn due_at(&self) -> Option<Instant> {
         self.due_at
+    }
+
+    /// The fetches rotate over `nodes` propagation nodes, the pinned ones on file; at
+    /// least one.
+    pub(crate) fn rotate_over(&mut self, nodes: usize) {
+        self.rotation = u32::try_from(nodes.max(1)).unwrap_or(u32::MAX);
     }
 
     /// Whether a request, from the node joining or from the timer, may start a fetch now.
@@ -495,9 +505,10 @@ impl SyncSchedule {
         if self.stopped {
             return;
         }
+        let rotation = self.rotation;
         self.due_at = self
             .interval
-            .and_then(|interval| now.checked_add(interval.min(wait)));
+            .and_then(|interval| now.checked_add((interval / rotation).min(wait)));
     }
 }
 
@@ -939,6 +950,23 @@ mod tests {
 
     fn link_failure(text: &str) -> Result<FetchReport, FetchError> {
         Err(FetchError::Link(RequestError::LinkFailed(text.to_string())))
+    }
+
+    #[test]
+    fn with_two_pinned_nodes_the_interval_is_split_so_each_is_asked_once_per_interval() {
+        let mut schedule = SyncSchedule::new(300, true);
+        let now = Instant::now();
+        assert!(schedule.accepts_request());
+        schedule.rotate_over(2);
+        schedule.started(NODE.to_string());
+        assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), now), None);
+        assert_eq!(schedule.due_at(), Some(now + Duration::from_secs(150)));
+
+        assert!(schedule.accepts_request());
+        schedule.rotate_over(1);
+        schedule.started(NODE.to_string());
+        assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), now), None);
+        assert_eq!(schedule.due_at(), Some(now + Duration::from_secs(300)));
     }
 
     #[test]

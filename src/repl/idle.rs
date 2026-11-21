@@ -452,6 +452,8 @@ impl DriverLoop {
             return;
         };
         let node = node.destination.address_hash.to_hex_string();
+        self.sync
+            .rotate_over(runtime.propagation_nodes().fetch_rotation());
         debug!("Propagation sync from {} starting", short(&node));
         self.no_node_logged = false;
         self.sync.started(node);

@@ -295,7 +295,7 @@ mesh:
     #   instance: default        # The rnsd instance whose abstract socket @rns/<instance> is dialed on Linux and Android; ignored elsewhere
     # - type: lan                # lan = link-local only (Reticulum AutoInterface), the no-daemon fallback. Does not cross sbx, WireGuard, Tailscale or
                                  # OpenVPN; only one process per host can bind it
-                                 # On local or lan, Coyote reads the LAN host count (`.mesh status`, the silent-LAN hint) from the lan interface or from
+                                 # On local or lan, Coyote reads the LAN host count (the `.mesh status` LAN row) from the lan interface or from
                                  # the local rnsd's interface stats (its config dir found as rnsd finds it), and falls back to hosts heard when it cannot
     # - type: private            # private = TCP client to a relay your team runs; requires host + port
     #   host: relay.example.com
@@ -349,7 +349,9 @@ mesh:
                                       # while `announce` is false
   propagation_nodes: []          # Destination hashes (32 hex characters each) of propagation nodes to ask the mesh for by path request at join, and again
                                  # whenever none is filed at a post or a sync, rather than waiting up to an hour for the node's next announce: a team relay
-                                 # that is also a propagation node, or a first run before the node's hourly announce (default: [] = none)
+                                 # that is also a propagation node, or a first run before the node's hourly announce; listed nodes are never evicted, and
+                                 # while one is filed held mail is posted to and fetched from listed nodes only, each synced once per interval (default:
+                                 # [] = none)
   fetch:                         # File sharing between trusted peers; see the mesh.fetch keys below
     inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to
                                  # 98304, the per-message total)

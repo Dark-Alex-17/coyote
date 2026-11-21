@@ -23,7 +23,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Upper bound on remembered propagation nodes; the least recently heard is evicted first.
@@ -148,6 +148,10 @@ pub(crate) struct PropagationNodeTable {
     inner: Mutex<BTreeMap<String, PropagationNodeRecord>>,
     /// Set by every change since the last write, so a burst of announces costs one write.
     dirty: AtomicBool,
+    /// The owner's configured nodes, lower case, in config order (`pin`).
+    pinned: Mutex<Vec<String>>,
+    /// Which pinned node the next fetch asks, modulo how many are filed.
+    fetch_turn: AtomicUsize,
 }
 
 impl PropagationNodeTable {
@@ -162,17 +166,27 @@ impl PropagationNodeTable {
             path,
             inner: Mutex::new(BTreeMap::new()),
             dirty: AtomicBool::new(false),
+            pinned: Mutex::new(Vec::new()),
+            fetch_turn: AtomicUsize::new(0),
         }
     }
 
+    /// `load_pinned` with nothing pinned.
+    #[cfg(test)]
+    pub(crate) fn load(path: PathBuf, now: SystemTime) -> Result<Self> {
+        Self::load_pinned(path, now, &[])
+    }
+
     /// Loads the table at `path`, dropping nodes not heard for `PROPAGATION_NODE_TTL` at
-    /// `now` and keeping the `PROPAGATION_NODE_TABLE_MAX_ENTRIES` most recently heard of
-    /// the rest. A missing file is an empty table. A file whose version is readable
-    /// but not `PROPAGATION_NODE_TABLE_VERSION` is refused and left in place, since the
+    /// `now` and keeping, of the rest, every node in `pinned` (lower case) and the most
+    /// recently heard others up to `PROPAGATION_NODE_TABLE_MAX_ENTRIES` in all; the table
+    /// is marked with `pinned` as `pin` does. A missing file is an empty table. A file
+    /// whose version is readable but not `PROPAGATION_NODE_TABLE_VERSION` is refused and
+    /// left in place, since the
     /// remedy depends on which Coyote wrote it; one that cannot be read or parsed is moved
     /// aside to `<path>.corrupt` with a warning and the table starts empty, since nodes
     /// announce again and must never keep the mesh from starting.
-    pub(crate) fn load(path: PathBuf, now: SystemTime) -> Result<Self> {
+    pub(crate) fn load_pinned(path: PathBuf, now: SystemTime, pinned: &[String]) -> Result<Self> {
         let stored = match fs::read(&path) {
             Ok(bytes) => match parse_node_file(&bytes) {
                 Ok(stored) => stored,
@@ -205,12 +219,17 @@ impl PropagationNodeTable {
             })
             .collect();
         records.sort_by_key(|record| Reverse(record.last_seen));
-        records.truncate(PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        let is_pinned = |record: &PropagationNodeRecord| {
+            pinned.contains(&record.node.destination.address_hash.to_hex_string())
+        };
+        let (kept, rest): (Vec<_>, Vec<_>) =
+            records.into_iter().partition(|record| is_pinned(record));
+        let room = PROPAGATION_NODE_TABLE_MAX_ENTRIES.saturating_sub(kept.len());
+        let records = kept.into_iter().chain(rest.into_iter().take(room));
         let table = Self::empty(path);
+        table.pin(pinned);
         table.inner.lock().extend(
-            records
-                .into_iter()
-                .map(|record| (record.node.destination.address_hash.to_hex_string(), record)),
+            records.map(|record| (record.node.destination.address_hash.to_hex_string(), record)),
         );
         Ok(table)
     }
@@ -339,6 +358,7 @@ impl PropagationNodeTable {
 
     pub(crate) fn observe(&self, node: PropagationNode, hops: u8, now: SystemTime) -> PeerChange {
         let key = node.destination.address_hash.to_hex_string();
+        let pinned = self.pinned.lock().clone();
         let mut nodes = self.inner.lock();
         let change = if nodes.contains_key(&key) {
             PeerChange::Refreshed
@@ -353,12 +373,17 @@ impl PropagationNodeTable {
                 last_seen: now,
             },
         );
+        // A pinned node is never the one evicted, so the table can run past its cap by
+        // the pinned nodes alone.
         while nodes.len() > PROPAGATION_NODE_TABLE_MAX_ENTRIES {
-            let oldest = nodes
+            let Some(oldest) = nodes
                 .iter()
+                .filter(|(key, _)| !pinned.contains(*key))
                 .min_by_key(|(_, record)| record.last_seen)
                 .map(|(key, _)| key.clone())
-                .expect("a table over its cap is not empty");
+            else {
+                break;
+            };
             nodes.remove(&oldest);
             debug!("Evicted propagation node {}", short(&oldest));
         }
@@ -366,14 +391,51 @@ impl PropagationNodeTable {
         change
     }
 
-    /// The node a fetch should ask: the nearest by hops, the most recently heard breaking a
-    /// tie, among nodes heard within `PROPAGATION_NODE_TTL`. Neither the enabled flag nor
-    /// the announced cost is consulted: slot `[2]` is
-    /// `propagation_node and not from_static_only` (`LXMRouter.py:309`), which gates posting
-    /// only, since `message_get_request` never reads it (`LXMRouter.py:1427-1429`), and a
-    /// fetch mines no stamp. Both stay on the record for the posting picker.
+    /// Marks `hashes` (lower case) as the owner's pinned nodes: never evicted, and while
+    /// one is filed the only nodes posted to and fetched from.
+    pub(crate) fn pin(&self, hashes: &[String]) {
+        *self.pinned.lock() = hashes.to_vec();
+    }
+
+    /// The pinned nodes on file and not aged out at `now`, in the order the owner lists
+    /// them.
+    fn filed_pinned(&self, now: SystemTime) -> Vec<PropagationNodeRecord> {
+        let pinned = self.pinned.lock().clone();
+        let nodes = self.inner.lock();
+        pinned
+            .iter()
+            .filter_map(|hash| nodes.get(hash))
+            .filter(|record| !record.is_expired(now))
+            .cloned()
+            .collect()
+    }
+
+    /// How many nodes a full round of fetches asks: every pinned node on file, else one.
+    pub(crate) fn fetch_rotation(&self) -> usize {
+        self.filed_pinned(SystemTime::now()).len().max(1)
+    }
+
+    /// Moves the fetch rotation on to the next pinned node.
+    pub(crate) fn advance_fetch_turn(&self) {
+        self.fetch_turn.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The node a fetch should ask. While any pinned node is filed, the pinned node whose
+    /// turn it is, so fetches rotate over every one of them (`advance_fetch_turn` moves the
+    /// turn on); another filed node is never asked then. Otherwise the nearest by hops,
+    /// the most recently heard breaking a tie, among nodes heard within
+    /// `PROPAGATION_NODE_TTL`. Neither the enabled flag nor the announced cost is
+    /// consulted: slot `[2]` is `propagation_node and not from_static_only`
+    /// (`LXMRouter.py:309`), which gates posting only, since `message_get_request` never
+    /// reads it (`LXMRouter.py:1427-1429`), and a fetch mines no stamp. Both stay on the
+    /// record for the posting picker.
     pub(crate) fn select(&self) -> Result<PropagationNode, FetchError> {
         let now = SystemTime::now();
+        let pinned = self.filed_pinned(now);
+        if !pinned.is_empty() {
+            let turn = self.fetch_turn.load(Ordering::Acquire) % pinned.len();
+            return Ok(pinned[turn].node.clone());
+        }
         self.inner
             .lock()
             .values()
@@ -386,12 +448,19 @@ impl PropagationNodeTable {
     /// The node a post should go to: nearest by hops and most recently heard, as `select`,
     /// but only among nodes that take posted messages at a cost this node will mine.
     /// `propagate` refuses a node over the ceiling anyway; choosing around it means a
-    /// dear node nearby does not hide an affordable one further off.
+    /// dear node nearby does not hide an affordable one further off. While any pinned
+    /// node is filed only pinned nodes are considered, so held mail never goes to a
+    /// stranger's node that the owner's other machines do not fetch from.
     pub(crate) fn select_for_posting(&self) -> Result<PropagationNode, FetchError> {
         let now = SystemTime::now();
-        self.inner
-            .lock()
-            .values()
+        let pinned = self.filed_pinned(now);
+        let candidates = if pinned.is_empty() {
+            self.inner.lock().values().cloned().collect()
+        } else {
+            pinned
+        };
+        candidates
+            .iter()
             .filter(|record| {
                 !record.is_expired(now)
                     && record.node.propagation_enabled
@@ -1199,6 +1268,97 @@ mod tests {
                 .any(|line| line.starts_with(&ignored)),
             "no debug line starting {ignored:?}"
         );
+    }
+
+    /// The owner's node is heard first, then 33 strangers' nodes, nearer by hops: the
+    /// table evicts strangers only, so the pinned node stays, and while it is filed it is
+    /// the only node posted to and fetched from. With it gone, strangers' nodes are used.
+    #[test]
+    fn a_pinned_node_outlives_33_strangers_and_is_the_only_post_and_fetch_target() {
+        let table = PropagationNodeTable::new();
+        let pinned = node(true);
+        table.pin(&[hex(&pinned)]);
+        table.observe(pinned.clone(), 9, t(1));
+        let strangers: Vec<PropagationNode> = (0..33).map(|_| node(true)).collect();
+        for (index, stranger) in strangers.iter().enumerate() {
+            table.observe(stranger.clone(), 1, t(2 + index as u64));
+        }
+
+        let held: Vec<String> = table
+            .snapshot()
+            .iter()
+            .map(|record| hex(&record.node))
+            .collect();
+        assert_eq!(held.len(), PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        assert!(
+            held.contains(&hex(&pinned)),
+            "the pinned node is never evicted"
+        );
+        assert!(
+            !held.contains(&hex(&strangers[0])) && !held.contains(&hex(&strangers[1])),
+            "the two oldest strangers made room"
+        );
+        assert_eq!(hex(&table.select_for_posting().unwrap()), hex(&pinned));
+        assert_eq!(hex(&table.select().unwrap()), hex(&pinned));
+        assert_eq!(table.fetch_rotation(), 1);
+
+        table.pin(&[]);
+        assert_ne!(
+            hex(&table.select_for_posting().unwrap()),
+            hex(&pinned),
+            "with no pinned node filed the nearest stranger is used"
+        );
+    }
+
+    /// A pinned node that takes no posts leaves nothing to post to while it is the only
+    /// pinned node filed: a stranger's node is not used in its place.
+    #[test]
+    fn a_filed_pinned_node_that_takes_no_posts_leaves_no_stranger_to_post_to() {
+        let table = PropagationNodeTable::new();
+        let pinned = node(false);
+        table.pin(&[hex(&pinned)]);
+        table.observe(pinned.clone(), 3, t(1));
+        table.observe(node(true), 1, t(2));
+        assert!(table.select_for_posting().is_err());
+        assert_eq!(hex(&table.select().unwrap()), hex(&pinned));
+    }
+
+    /// With two pinned nodes filed, the fetches rotate over both, a stranger's node never
+    /// among them, and a table loaded with them pinned keeps them over the cap.
+    #[test]
+    fn fetches_rotate_over_every_pinned_node_and_a_load_keeps_them() {
+        let tmp = crate::mesh::test_support::TempDir::new("pn-table-pinned-rotation");
+        let path = tmp.path.join(PROPAGATION_NODE_TABLE_FILE);
+        let table = PropagationNodeTable::load(path.clone(), SystemTime::now()).unwrap();
+        let (first, second) = (node(true), node(true));
+        let pinned = [hex(&first), hex(&second)];
+        table.pin(&pinned);
+        table.observe(first.clone(), 4, t(1));
+        table.observe(second.clone(), 5, t(2));
+        for index in 0..40 {
+            table.observe(node(true), 1, t(3 + index));
+        }
+        assert_eq!(table.fetch_rotation(), 2);
+        let mut asked = Vec::new();
+        for _ in 0..4 {
+            asked.push(hex(&table.select().unwrap()));
+            table.advance_fetch_turn();
+        }
+        assert_eq!(
+            asked,
+            [hex(&first), hex(&second), hex(&first), hex(&second)]
+        );
+        table.persist_if_dirty().unwrap();
+
+        let reloaded = PropagationNodeTable::load_pinned(path, SystemTime::now(), &pinned).unwrap();
+        let held: Vec<String> = reloaded
+            .snapshot()
+            .iter()
+            .map(|record| hex(&record.node))
+            .collect();
+        assert_eq!(held.len(), PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        assert!(held.contains(&hex(&first)) && held.contains(&hex(&second)));
+        assert_eq!(reloaded.fetch_rotation(), 2);
     }
 
     /// The configured hashes the table does not hold are the ones asked for; one round

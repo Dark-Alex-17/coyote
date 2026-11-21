@@ -136,7 +136,9 @@ pub struct MeshConfig {
     /// Destination hashes of propagation nodes this node asks the mesh for by path request
     /// at join, and whenever its table holds none at a post or a sync, so it need not wait
     /// for their next announce: a team relay that is also a propagation node, or a first
-    /// run before the node's hourly announce. Read in lower case.
+    /// run before the node's hourly announce. These are pinned: never evicted from the
+    /// node table, and while one is filed the only nodes posted to and fetched from.
+    /// Read in lower case.
     pub propagation_nodes: Vec<String>,
     pub fetch: MeshFetch,
     pub envoy_memory: EnvoyMemoryConfig,

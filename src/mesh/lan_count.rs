@@ -1,5 +1,6 @@
-//! How many other hosts the node's LAN interfaces reach, for the silent-LAN line and
-//! `.mesh status`. The in-process `lan` interface reads its discovery table through the
+//! How many other hosts the node's LAN interfaces reach, for `.mesh status`, and whether
+//! the local rnsd sits on a TCP relay, for the silent-LAN note under an empty result.
+//! The in-process `lan` interface reads its discovery table through the
 //! transport; a `local` rnsd is asked over the RPC listener its shared instance opens,
 //! as rnstatus asks it, and its AutoInterfaces are summed. The same rnsd answer says
 //! whether rnsd sits on a TCP relay.
@@ -423,6 +424,12 @@ impl RnsdLanReader {
         RnsdReading::UNKNOWN
     }
 
+    /// Whether the latest read that reached rnsd had a TCP client online, with no call;
+    /// `false` before any read reached it.
+    pub(crate) fn relay_online_seen(&self) -> bool {
+        self.last.lock().relay_online
+    }
+
     #[cfg(test)]
     pub(crate) async fn unavailable(&self) -> bool {
         matches!(*self.target.lock().await, RpcTarget::Unavailable)
@@ -431,7 +438,7 @@ impl RnsdLanReader {
 
 fn tell_unavailable(reason: &str) {
     debug!(
-        "Mesh could not read the local rnsd's interface stats: {}; the silent-LAN check reads no count there and stays quiet only for a known peer or a relay",
+        "Mesh could not read the local rnsd's interface stats: {}; the LAN row reads no count there and a TCP client of that rnsd is not counted as a relay",
         redact_hashes(reason)
     );
 }
@@ -644,70 +651,36 @@ mod tests {
         );
     }
 
-    /// The rnsd's zero count reaches the silent-LAN check through the same readings the
-    /// watcher takes: it tells the line to a node that knows no peer and sits on no
-    /// relay, and not to one that does.
+    /// The rnsd's counts reach the `.mesh status` LAN row through `lan_readings`, and the
+    /// relay flag each read saw is kept for the silent-LAN note, read with no call.
     #[tokio::test]
-    async fn the_rnsd_zero_count_tells_the_silent_lan_line() {
-        use crate::mesh::node::{LanVerdict, lan_silent_verdict};
+    async fn the_rnsd_counts_are_read_and_the_relay_flag_is_kept() {
         let dir = keyed_dir("lan-count-rnsd-verdict");
-        let source = Scripted::new([Ok(vec![auto(0)]), Ok(vec![auto(1)])]);
+        let source = Scripted::new([Ok(vec![auto(0)]), Ok(vec![auto(1), tcp_client(true)])]);
         let reader = reader_at(&dir.path, source);
-        let grace = Duration::from_secs(120);
+        assert!(!reader.relay_online_seen(), "nothing read yet");
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
         assert!(!readings.relay_online);
-        let readings = readings.readings;
-        assert_eq!(readings, [LanReading::Count(0)]);
-        assert_eq!(
-            lan_silent_verdict(grace, &readings, false, false),
-            LanVerdict::Tell
-        );
-        assert_eq!(
-            lan_silent_verdict(grace, &readings, true, true),
-            LanVerdict::Settle
-        );
+        assert_eq!(readings.readings, [LanReading::Count(0)]);
+        assert!(!reader.relay_online_seen());
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
-        let readings = readings.readings;
-        assert_eq!(readings, [LanReading::Count(1)]);
-        assert_eq!(
-            lan_silent_verdict(grace, &readings, false, false),
-            LanVerdict::Settle
-        );
+        assert_eq!(readings.readings, [LanReading::Count(1)]);
+        assert!(readings.relay_online);
+        assert!(reader.relay_online_seen());
     }
 
-    /// The watcher's tick keeps the line quiet over a zero count when the rnsd reports a
-    /// TCP client online, or when a peer is known, and tells it when neither holds.
+    /// The quick read a `.mesh people list` takes keeps the relay flag the note reads:
+    /// a TCP client online reads as a relay, one offline does not.
     #[tokio::test]
-    async fn a_tick_over_a_zero_count_stays_quiet_on_a_relay_or_with_a_known_peer() {
-        use crate::mesh::node::{LanSilentHint, LanSilentInputs};
-        let grace = Duration::from_secs(120);
-        for (relay_online, knows_peers, told) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-        ] {
+    async fn a_quick_read_keeps_the_relay_flag_the_note_reads() {
+        for relay_online in [true, false] {
             let dir = keyed_dir("lan-count-tick-quiet");
             let source = Scripted::new([Ok(vec![auto(0), tcp_client(relay_online)])]);
             let reader = reader_at(&dir.path, source);
-            let mut hint = LanSilentHint::default();
-            let line = hint
-                .read_and_tick(
-                    || lan_readings(None, &[], Some(&reader), ReadEffort::Patient),
-                    || LanSilentInputs {
-                        elapsed: grace,
-                        knows_peers,
-                        interfaces: Vec::new(),
-                    },
-                )
-                .await;
-            assert_eq!(
-                line.is_some(),
-                told,
-                "relay {relay_online}, peers {knows_peers}"
-            );
-            assert!(hint.settled());
+            lan_readings(None, &[], Some(&reader), ReadEffort::Quick).await;
+            assert_eq!(reader.relay_online_seen(), relay_online);
         }
     }
 
@@ -723,91 +696,64 @@ mod tests {
         )
     }
 
-    /// The silent-LAN watcher's tick on a paused clock, counting rnsd calls. A tick makes
-    /// at most `RPC_ATTEMPTS` calls, `RPC_RETRY_WAIT` apart, and stops at the first answer.
-    /// Once the line is told or settled, no tick calls again. A key rnsd refuses ends the
-    /// calls for the run. The quick read `.mesh status` takes makes one call on
-    /// `QUICK_RPC_BUDGET`, or none while a tick's read is under way.
+    /// The reads the silent-LAN note rests on, on a paused clock, counting rnsd calls:
+    /// the one patient read at join makes at most `RPC_ATTEMPTS` calls, `RPC_RETRY_WAIT`
+    /// apart, and stops at the first answer; nothing reads rnsd again until the user asks.
+    /// Each `.mesh people list` (or `.mesh status`) makes one call on `QUICK_RPC_BUDGET`,
+    /// or none while another read is under way, answering with the last reading then. A
+    /// key rnsd refuses ends the calls for the run.
     #[tokio::test(start_paused = true)]
-    async fn each_silent_lan_tick_bounds_its_rnsd_calls_and_none_follow_once_it_settles() {
-        use crate::mesh::node::{LanSilentHint, LanSilentInputs};
-        let grace = Duration::from_secs(120);
-        let at = |elapsed: Duration| {
-            move || LanSilentInputs {
-                elapsed,
-                knows_peers: false,
-                interfaces: Vec::new(),
-            }
-        };
-
+    async fn the_reads_behind_the_silent_lan_note_bound_their_rnsd_calls() {
         let dir = keyed_dir("lan-count-tick-told");
         let source = Scripted::new([
             Err(refused()),
             Err(RpcError::Timeout),
             Err(refused()),
-            Err(refused()),
-            Ok(vec![auto(0)]),
+            Ok(vec![auto(0), tcp_client(true)]),
+            Ok(vec![auto(0), tcp_client(false)]),
         ]);
         let reader = paced_reader_at(&dir.path, source.clone());
-        let read = || lan_readings(None, &[], Some(&reader), ReadEffort::Patient);
-        let mut hint = LanSilentHint::default();
         assert_eq!(
-            hint.read_and_tick(read, at(grace / 2)).await,
-            None,
-            "an unknown count before the grace waits"
+            reader.read().await,
+            RnsdReading::UNKNOWN,
+            "the read at join gave up after its attempts"
         );
-        assert!(!hint.settled());
         assert_eq!(source.calls(), RPC_ATTEMPTS as usize);
         assert_eq!(source.gaps(), [RPC_RETRY_WAIT; 2]);
         assert_eq!(*source.budgets.lock(), [RPC_BUDGET; 3]);
+        assert!(!reader.relay_online_seen());
 
-        tokio::time::advance(grace).await;
-        assert!(
-            hint.read_and_tick(read, at(grace)).await.is_some(),
-            "a zero count at the grace tells the line"
+        let idle = Duration::from_secs(3600);
+        tokio::time::advance(idle).await;
+        assert_eq!(source.calls(), 3, "nothing reads rnsd while nobody asks");
+        assert!(reader.read_quick().await.relay_online, "the first ask");
+        assert!(reader.relay_online_seen());
+        assert_eq!(source.calls(), 4, "one call per ask");
+        assert_eq!(source.gaps()[2], idle);
+        assert!(!reader.read_quick().await.relay_online, "the second ask");
+        assert!(!reader.relay_online_seen());
+        assert_eq!(source.calls(), 5);
+        assert_eq!(
+            *source.budgets.lock(),
+            [
+                RPC_BUDGET,
+                RPC_BUDGET,
+                RPC_BUDGET,
+                QUICK_RPC_BUDGET,
+                QUICK_RPC_BUDGET
+            ]
         );
-        assert_eq!(source.calls(), 5, "the tick stopped at the answer");
-        assert_eq!(source.gaps()[2..], [grace, RPC_RETRY_WAIT]);
-        for tick in 2..5 {
-            tokio::time::advance(grace).await;
-            assert_eq!(hint.read_and_tick(read, at(grace * tick)).await, None);
-        }
-        assert_eq!(source.calls(), 5, "no call once the line was told");
-
-        let dir = keyed_dir("lan-count-tick-settled");
-        let source = Scripted::new([Ok(vec![auto(2)])]);
-        let reader = paced_reader_at(&dir.path, source.clone());
-        let read = || lan_readings(None, &[], Some(&reader), ReadEffort::Patient);
-        let mut hint = LanSilentHint::default();
-        assert_eq!(hint.read_and_tick(read, at(grace)).await, None);
-        assert!(hint.settled(), "a counted host settles it");
-        for tick in 2..5 {
-            tokio::time::advance(grace).await;
-            assert_eq!(hint.read_and_tick(read, at(grace * tick)).await, None);
-        }
-        assert_eq!(source.calls(), 1, "no call once it settled");
 
         let dir = keyed_dir("lan-count-tick-refused");
         let source = Scripted::new([Err(RpcError::Authentication)]);
         let reader = paced_reader_at(&dir.path, source.clone());
-        let read = || lan_readings(None, &[], Some(&reader), ReadEffort::Patient);
-        let mut hint = LanSilentHint::default();
-        assert_eq!(hint.read_and_tick(read, at(grace / 4)).await, None);
-        tokio::time::advance(grace).await;
-        assert_eq!(hint.read_and_tick(read, at(grace / 2)).await, None);
-        assert!(!hint.settled());
-        tokio::time::advance(grace).await;
-        assert!(
-            hint.read_and_tick(read, at(grace)).await.is_some(),
-            "an unknown count at the grace, with no peer and no relay, tells the line"
-        );
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
+        for _ in 0..3 {
+            tokio::time::advance(idle).await;
+            assert_eq!(reader.read_quick().await, RnsdReading::UNKNOWN);
+        }
         assert_eq!(source.calls(), 1, "no call after the key was refused");
-        assert_eq!(
-            reader.read_quick().await,
-            RnsdReading::UNKNOWN,
-            "nor from .mesh status"
-        );
-        assert_eq!(source.calls(), 1);
+        assert!(!reader.relay_online_seen());
 
         let dir = keyed_dir("lan-count-tick-status");
         let source = Scripted::new([Err(refused()), Ok(vec![auto(3)]), Ok(vec![auto(1)])]);

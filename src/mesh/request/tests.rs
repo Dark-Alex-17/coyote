@@ -1525,6 +1525,8 @@ pub(crate) mod network {
         }
 
         /// Announces node B so node A has a path to it, waiting until A files B as a peer.
+        /// B counts as heard in A's run already, so the announce starts no background
+        /// card fetch that would take one of B's scripted replies.
         pub(crate) async fn introduce_b_to_a(&self) {
             let b_app_data = AnnounceAppData {
                 version: 1,
@@ -1532,9 +1534,10 @@ pub(crate) mod network {
             }
             .encode()
             .unwrap();
+            let b_hash = self.responder.desc.address_hash.to_hex_string();
+            self.node_a.card_cadence().note_heard(&b_hash);
             self.responder.announce(Some(&b_app_data)).await;
             let peers = self.node_a.peers();
-            let b_hash = self.responder.desc.address_hash.to_hex_string();
             wait_until("node A to file node B as a peer", || {
                 peers
                     .snapshot()
@@ -12209,6 +12212,9 @@ pub(crate) mod network {
         }
         .encode()
         .unwrap();
+        // Heard already in A's run, as `introduce_b_to_a` has B, so its announce starts no
+        // background card fetch.
+        pair.node_a.card_cadence().note_heard(&c_instance);
         responder_c.announce(Some(&c_app_data)).await;
         let peers = pair.node_a.peers();
         wait_until("node A to file node C as a peer", || {
