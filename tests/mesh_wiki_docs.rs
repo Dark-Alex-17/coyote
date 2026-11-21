@@ -4793,6 +4793,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
             "Setting up rnsd",
             "When the LAN is silent",
             "Two laptops on one network",
+            "Moving between networks",
             "Joining with some interfaces down",
             "Running without rnsd",
             "Two sessions on one host",
@@ -11161,4 +11162,59 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         status.contains(needle),
         "Mesh-Commands.md's `.mesh status` section does not say {needle:?}"
     );
+}
+
+/// The "Moving between networks" section and the commands page quote the two greeting
+/// lines as `upstream_line` words them, and the section gives the poll interval
+/// `UPSTREAM_POLL` sets and the hourly limit the greetings share.
+#[test]
+fn the_pages_quote_the_upstream_and_network_change_lines() {
+    let body = fn_body("src/mesh/node.rs", "upstream_line");
+    let literals = string_literals(&body);
+    for piece in [
+        "{} reconnected upstream",
+        "This host's network changed",
+        "{subject}; announced so other sessions can find this one again",
+    ] {
+        assert!(
+            literals.iter().any(|literal| literal == piece),
+            "fn upstream_line no longer words {piece:?}: {literals:?}"
+        );
+    }
+    let upstream = read(repo_root().join("src/mesh/upstream.rs"));
+    assert!(
+        upstream.contains("const UPSTREAM_POLL: Duration = Duration::from_secs(30);"),
+        "src/mesh/upstream.rs no longer polls every 30 s"
+    );
+    let announced = "announced so other sessions can find this one again";
+    let lines = [
+        format!("`[mesh:relay] This host's network changed; {announced}`"),
+        format!("`[mesh:relay] <interface> reconnected upstream; {announced}`"),
+    ];
+
+    let Some(wiki) = wiki_dir() else { return };
+    let moving = folded_section(
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## Moving between networks",
+    );
+    for needle in lines.iter().map(String::as_str).chain([
+        "every 30 seconds it reads the host's interface addresses (loopback and link-local left out)",
+        "share the limit of four an hour that a relay reconnect has, and do not move the heartbeat",
+    ]) {
+        assert!(
+            moving.contains(needle),
+            "Mesh-Deployment.md's Moving between networks section does not say {needle:?}"
+        );
+    }
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for needle in lines
+        .iter()
+        .map(String::as_str)
+        .chain(["(Mesh-Deployment#moving-between-networks)"])
+    {
+        assert!(
+            commands.contains(needle),
+            "Mesh-Commands.md does not quote {needle:?}"
+        );
+    }
 }
