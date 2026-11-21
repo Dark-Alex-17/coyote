@@ -23,6 +23,7 @@ use crate::tui::events::SystemClock;
 use crate::tui::queued::{carry_over, reconcile_queue, take_user_messages};
 use crate::tui::run_now::CommandOutput;
 use crate::tui::sink::{TuiPrompter, TuiSink};
+use crate::utils::SPINNER_FRAMES;
 use crate::utils::create_abort_signal;
 use bottom_pane::RewindState;
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
@@ -636,10 +637,16 @@ async fn the_composer_stays_responsive_while_a_tool_sleeps() {
     let rendered = terminal.backend().to_string();
     assert_eq!(app.composer_text(), "hello");
     // The app runs on the real clock here, so the elapsed seconds in
-    // the status row depend on the host's speed.
-    // Width-preserving: the clock's digit becomes `N`, so the row keeps
-    // its length and the snapshot its columns.
-    insta::with_settings!({ filters => vec![(r"Working \. \d+s", "Working . Ns")] }, {
+    // the status row and the throbber's frame depend on the host's speed.
+    // Width-preserving: the clock's digit becomes `N` and the frame the
+    // first one, so the row keeps its length and the snapshot its columns.
+    let any_frame = format!("[{}] Working", SPINNER_FRAMES.concat());
+    let first_frame = format!("{} Working", SPINNER_FRAMES[0]);
+    let filters = vec![
+        (r"Working \. \d+s", "Working . Ns"),
+        (any_frame.as_str(), first_frame.as_str()),
+    ];
+    insta::with_settings!({ filters => filters }, {
         insta::assert_snapshot!("sleeping_tool_composer_responsive_60x20", rendered);
     });
 
@@ -1469,25 +1476,78 @@ fn a_pending_prefill_lands_in_the_composer_on_idle_return() {
     assert_eq!(harness.app.composer_text(), "");
 }
 
-/// The elapsed-time row keeps ticking: the tick is asked for after the
-/// scheduler forgets the frame just drawn, so it is not wiped with it.
+/// The status row animates while a turn runs: the throbber's next frame
+/// is asked for after the scheduler forgets the frame just drawn, so it
+/// is not wiped with it, and each interval turns the glyph. Idle, no
+/// frame is asked for.
 #[test]
-fn the_status_row_ticks_once_a_second_while_a_turn_runs() {
+fn the_status_row_animates_while_a_turn_runs() {
     let mut harness = Harness::standalone(80, 24);
     harness.app.begin_turn("work", false);
-    harness.render();
+    let first = harness.draw();
+    assert!(
+        first.contains(&format!("{} Working . 0s", SPINNER_FRAMES[0])),
+        "{first}"
+    );
     harness.app.frame_drawn();
     let due = harness.app.frames.due_at().expect("a tick is pending");
-    harness.clock.advance(STATUS_TICK);
-    assert!(due <= harness.clock.now());
+    assert_eq!(due, harness.clock.now() + THROBBER_INTERVAL);
+    harness.clock.advance(THROBBER_INTERVAL);
+    let next = harness.draw();
+    assert!(
+        next.contains(&format!("{} Working . 0s", SPINNER_FRAMES[1])),
+        "{next}"
+    );
+    harness.clock.advance(STATUS_TICK - THROBBER_INTERVAL);
     let rendered = harness.draw();
     assert!(
-        rendered.contains("Working . 1s  Esc to interrupt"),
+        rendered.contains(&format!(
+            "{} Working . 1s  Esc to interrupt",
+            SPINNER_FRAMES[0]
+        )),
         "{rendered}"
     );
 
     harness.app.end_turn(false, &TurnOutcome::default());
     harness.render();
+    harness.app.frame_drawn();
+    assert_eq!(harness.app.frames.due_at(), None);
+}
+
+/// A job row still running with no turn keeps its throbber turning and
+/// is drawn anew each frame; once the job ends, idle asks for nothing.
+#[test]
+fn a_running_job_row_animates_while_idle() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.handle_msg(UiMsg::JobStarted {
+        job_id: "job_1a2b3c4d".to_string(),
+        tool: "execute_command".to_string(),
+    });
+    harness.clock.advance(Duration::from_secs(12));
+    let frame = harness.draw();
+    assert!(
+        frame.contains(&format!("job_1a2b3c4d  {} running 12s", SPINNER_FRAMES[0])),
+        "{frame}"
+    );
+    harness.app.frame_drawn();
+    assert_eq!(
+        harness.app.frames.due_at(),
+        Some(harness.clock.now() + THROBBER_INTERVAL)
+    );
+    harness.clock.advance(THROBBER_INTERVAL);
+    let frame = harness.draw();
+    assert!(
+        frame.contains(&format!("job_1a2b3c4d  {} running 12s", SPINNER_FRAMES[1])),
+        "{frame}"
+    );
+
+    harness.app.handle_msg(UiMsg::JobFinished {
+        job_id: "job_1a2b3c4d".to_string(),
+        ok: true,
+        error: None,
+    });
+    let frame = harness.draw();
+    assert!(frame.contains("job_1a2b3c4d  done"), "{frame}");
     harness.app.frame_drawn();
     assert_eq!(harness.app.frames.due_at(), None);
 }
@@ -1530,13 +1590,21 @@ fn the_status_row_names_thinking_and_the_running_tool() {
 
     harness
         .app
-        .handle_msg(UiMsg::ToolRunning(Some("fs_write".to_string())));
+        .handle_msg(UiMsg::ToolRunning(Some("execute_command".to_string())));
+    harness.clock.advance(Duration::from_secs(9));
     let rendered = harness.draw();
-    assert!(rendered.contains("Running fs_write"), "{rendered}");
+    assert!(
+        rendered.contains(&format!(
+            "{} Working . 12s . execute_command  Esc to interrupt",
+            SPINNER_FRAMES[0]
+        )),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Running"), "{rendered}");
     harness.app.handle_msg(UiMsg::ToolRunning(None));
     harness.app.handle_msg(UiMsg::ThinkingStopped);
     let rendered = harness.draw();
-    assert!(rendered.contains("Working . 3s"), "{rendered}");
+    assert!(rendered.contains("Working . 12s  Esc"), "{rendered}");
 }
 
 /// Once the teardown task owns the context the keys that would start
@@ -1879,7 +1947,8 @@ fn chrome_styles(no_color: bool) -> Vec<(&'static str, (Color, Modifier))> {
     });
     harness.draw();
     styles.extend([
-        ("runtime", style_at(&harness, "Running fs_read")),
+        ("throbber", style_at(&harness, SPINNER_FRAMES[0])),
+        ("runtime", style_at(&harness, "Working . 0s . fs_read")),
         ("interrupt key", style_at(&harness, "Esc to interrupt")),
         ("queued header", style_at(&harness, "pending: 1")),
         ("queued text", style_at(&harness, "later q2w")),
@@ -1923,6 +1992,9 @@ fn the_chrome_parts_are_told_apart_by_colour() {
         ("queued header", "footer field"),
         ("queued text", "footer separator"),
         ("queued header", "runtime"),
+        ("throbber", "interrupt key"),
+        ("throbber", "hint key"),
+        ("throbber", "hint label"),
     ] {
         assert_ne!(fg(a), fg(b), "{a} and {b} share a colour: {styles:?}");
     }
@@ -2092,7 +2164,10 @@ fn a_running_tool_row_starts_collapsed_behind_its_arrow() {
     let frame = harness.draw();
     insta::assert_snapshot!("tool_running_80x24", &frame);
     assert!(
-        frame.contains("\u{25B8} fs_read({\"path\":\"src/main.rs\"})  running"),
+        frame.contains(&format!(
+            "\u{25B8} fs_read({{\"path\":\"src/main.rs\"}})  {} running 0s",
+            SPINNER_FRAMES[0]
+        )),
         "{frame}"
     );
     assert!(!frame.contains("Call fs_read"), "{frame}");
@@ -2225,7 +2300,10 @@ fn the_hooks_arguments_render_the_same_header_as_the_narration() {
         frame.lines().nth(usize::from(row)).unwrap().to_string()
     };
     let expected = header(&mut from_narration);
-    assert!(expected.contains("fs_read({\"path\":\"src/main.rs\"})  running"));
+    assert!(expected.contains(&format!(
+        "fs_read({{\"path\":\"src/main.rs\"}})  {} running 0s",
+        SPINNER_FRAMES[0]
+    )));
     assert_eq!(header(&mut from_hook), expected);
 }
 
@@ -2237,7 +2315,7 @@ fn a_finished_tool_row_collapses_and_opens_from_the_keyboard() {
     harness.app.end_turn(false, &TurnOutcome::default());
     let frame = harness.draw();
     insta::assert_snapshot!("tool_collapsed_ok_80x24", &frame);
-    assert!(frame.contains("1.2s  ok"), "{frame}");
+    assert!(frame.contains(")  1s  ok"), "{frame}");
     assert!(!frame.contains("fn main()"), "{frame}");
     assert!(!frame.contains("Call fs_read"), "{frame}");
 
@@ -2270,7 +2348,7 @@ fn a_failed_tool_row_shows_the_first_error_line_until_opened() {
     harness.app.end_turn(false, &TurnOutcome::default());
     let frame = harness.draw();
     insta::assert_snapshot!("tool_failed_80x24", &frame);
-    assert!(frame.contains("1.2s  failed: exit 2"), "{frame}");
+    assert!(frame.contains(")  1s  failed: exit 2"), "{frame}");
     assert!(!frame.contains("no such file"), "{frame}");
 
     harness.app.handle_key(ctrl(KeyCode::Up));
@@ -2301,9 +2379,9 @@ fn a_narrow_folded_header_keeps_its_state_and_cuts_the_arguments() {
     harness.app.end_turn(false, &TurnOutcome::default());
     let frame = harness.draw();
     insta::assert_snapshot!("tool_failed_40x20", &frame);
-    assert!(frame.contains("1.2s  failed: exit 2"), "{frame}");
+    assert!(frame.contains(")  1s  failed: exit 2"), "{frame}");
     assert!(
-        frame.contains("fs_read({\"pa...)  1.2s  failed: exit 2"),
+        frame.contains("fs_read({\"path...)  1s  failed: exit 2"),
         "{frame}"
     );
 }
@@ -2490,7 +2568,7 @@ fn a_bookkeeping_call_is_one_dim_line_that_never_takes_the_focus() {
     let frame = harness.draw();
     insta::assert_snapshot!("bookkeeping_line_80x24", &frame);
     assert!(
-        frame.contains("memory__search({\"query\":\"tui\"})  1.2s  ok"),
+        frame.contains("memory__search({\"query\":\"tui\"})  1s  ok"),
         "{frame}"
     );
     assert!(!frame.contains("3 hits"), "{frame}");
@@ -2727,7 +2805,7 @@ fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
         &cells[1],
         Cell::Job {
             row: TaskRow {
-                status: JobStatus::Running,
+                status: JobStatus::Running { .. },
                 ..
             },
             ..
@@ -2737,7 +2815,7 @@ fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
         &cells[2],
         Cell::Agent {
             row: TaskRow {
-                status: AgentStatus::Running,
+                status: AgentStatus::Running { .. },
                 ..
             },
             ..
@@ -3928,7 +4006,49 @@ fn the_welcome_block_greets_an_empty_transcript_until_the_first_turn() {
     );
 
     let mut narrow = Harness::standalone(40, 20);
-    assert_welcome_snapshot("welcome_40x20", &narrow.draw());
+    let frame = narrow.draw();
+    assert_welcome_snapshot("welcome_40x20", &frame);
+    assert!(frame.contains(concat!("coyote ", env!("CARGO_PKG_VERSION"))));
+}
+
+/// The logo stands beside the box where both fit and is dropped, never
+/// stacked, where the frame is too narrow or too short.
+#[test]
+fn the_welcome_logo_shows_only_where_it_fits() {
+    let ears = r"/\   /\";
+    for (name, width, height, logo) in [
+        ("welcome_120x40", 120, 40, true),
+        ("welcome_60x24", 60, 24, false),
+        ("welcome_80x12", 80, 12, false),
+    ] {
+        let frame = Harness::standalone(width, height).draw();
+        assert_welcome_snapshot(name, &frame);
+        assert_eq!(frame.contains(ears), logo, "{frame}");
+        assert!(frame.contains(concat!("coyote ", env!("CARGO_PKG_VERSION"))));
+    }
+}
+
+/// The logo takes the theme's colour, and `NO_COLOR` takes it away.
+#[test]
+fn the_welcome_logo_loses_its_colour_under_no_color() {
+    for no_color in [false, true] {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(no_color);
+        let frame = harness.draw();
+        let buffer = harness.terminal.backend().buffer();
+        let row = (0..buffer.area.height)
+            .find(|&y| buffer[(0, y)].symbol() == "<")
+            .unwrap_or_else(|| panic!("no logo snout in\n{frame}"));
+        let art: Vec<Color> = (0..20)
+            .map(|x| &buffer[(x, row)])
+            .filter(|cell| cell.symbol() != " ")
+            .map(|cell| cell.fg)
+            .collect();
+        assert!(!art.is_empty(), "{frame}");
+        for fg in art {
+            assert_eq!(fg == Color::Reset, no_color, "{fg:?}\n{frame}");
+        }
+    }
 }
 
 #[test]
@@ -4936,8 +5056,10 @@ fn the_idle_status_drops_the_help_key_where_it_types() {
 /// A turn's first frame rewrites every cell of the working text over
 /// either idle hint, with and without colour, so the output stream
 /// carries the words whole rather than only the letters that differ.
+/// The throbber in front is neither dim nor italic; the words are dim.
 #[test]
 fn the_first_working_frame_rewrites_the_idle_hint_whole() {
+    let text = format!("{} Working . 0s  Esc to interrupt", SPINNER_FRAMES[0]);
     for no_color in [false, true] {
         for draft in ["", "draft"] {
             let mut harness = Harness::standalone(80, 24);
@@ -4959,7 +5081,7 @@ fn the_first_working_frame_rewrites_the_idle_hint_whole() {
                     (0..after.area.width)
                         .map(|x| after[(x, y)].symbol())
                         .collect::<String>()
-                        .starts_with("Working . 0s  Esc to interrupt")
+                        .starts_with(&text)
                 })
                 .unwrap_or_else(|| panic!("no working row: {working}"));
             let updated: Vec<u16> = before
@@ -4968,7 +5090,6 @@ fn the_first_working_frame_rewrites_the_idle_hint_whole() {
                 .filter(|&(_, y, _)| y == row)
                 .map(|(x, _, _)| x)
                 .collect();
-            let text = "Working . 0s  Esc to interrupt";
             for (x, c) in (0u16..).zip(text.chars()) {
                 assert!(
                     updated.contains(&x),
@@ -4976,7 +5097,8 @@ fn the_first_working_frame_rewrites_the_idle_hint_whole() {
                 );
                 let modifier = after[(x, row)].modifier;
                 assert!(
-                    modifier.contains(Modifier::DIM) && !modifier.contains(Modifier::ITALIC),
+                    (x == 0 || modifier.contains(Modifier::DIM))
+                        && !modifier.contains(Modifier::ITALIC),
                     "no_color {no_color}, draft {draft:?}: column {x} ({c}) is {modifier:?}"
                 );
             }

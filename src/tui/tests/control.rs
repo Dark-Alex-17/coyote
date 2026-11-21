@@ -234,14 +234,14 @@ fn a_turn_ending_fails_its_unreported_tool_rows_and_spares_jobs() {
         &cells[2],
         Cell::Job {
             row: TaskRow {
-                status: JobStatus::Running,
+                status: JobStatus::Running { .. },
                 ..
             },
             ..
         }
     ));
     let frame = harness.draw();
-    assert!(frame.contains("3.0s  failed: interrupted"), "{frame}");
+    assert!(frame.contains("3s  failed: interrupted"), "{frame}");
 }
 
 /// The loop drains the channel before `end_turn`, the way the Work arm

@@ -144,6 +144,19 @@ impl Transcript {
         }
     }
 
+    /// Counts every running row as changed, so the next frame draws its
+    /// throbber and elapsed time anew; whether there was one.
+    pub(super) fn touch_running(&mut self) -> bool {
+        let mut any = false;
+        for index in 0..self.cells.len() {
+            if self.cells[index].running() {
+                self.touch(index);
+                any = true;
+            }
+        }
+        any
+    }
+
     /// The cells for laying out, with the revision of each: what they
     /// show is left as it is and only the line caches inside them fill,
     /// so nothing counts as changed.
@@ -460,12 +473,13 @@ impl Transcript {
         let mut cell_lines = Vec::with_capacity(self.cells.len());
         let mut headers: Vec<usize> = Vec::with_capacity(self.cells.len());
         let mut total = 0;
+        let room = centre.then_some(area.height);
         for cell in &mut self.cells {
             if !headers.is_empty() {
                 total += 1;
             }
             headers.push(total);
-            let lines = cell.cached_lines(area.width, renderer);
+            let lines = cell.cached_lines(area.width, room, renderer);
             total += lines.len();
             cell_lines.push(lines);
         }
@@ -497,7 +511,13 @@ impl Transcript {
             self.unseen = 0;
         }
         let end = total - self.offset_from_bottom;
-        let start = end.saturating_sub(height);
+        // A greeting taller than the area keeps its top, where the
+        // wordmark is; the render clips its bottom.
+        let start = if centre {
+            0
+        } else {
+            end.saturating_sub(height)
+        };
         self.last_offset = self.offset_from_bottom;
         self.anchor = headers
             .partition_point(|header| *header <= start)
@@ -849,11 +869,11 @@ impl Transcript {
                     call_id, status, ..
                 } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
                 Cell::Job { row, .. } => {
-                    matches!(row.status, JobStatus::Running)
+                    matches!(row.status, JobStatus::Running { .. })
                         && row.calls.iter().any(|call| call.call_id.is_empty())
                 }
                 Cell::Agent { row, .. } => {
-                    matches!(row.status, AgentStatus::Running)
+                    matches!(row.status, AgentStatus::Running { .. })
                         && row.calls.iter().any(|call| call.call_id.is_empty())
                 }
                 _ => false,
@@ -903,7 +923,8 @@ impl Anchor {
 
 /// The rows of the transcript the view shows, with the follow chip while
 /// the view is scrolled away from the bottom. The greeting alone sits in
-/// the middle of the area rather than at its bottom.
+/// the middle of the area rather than at its bottom, and loses its bottom
+/// rows rather than its top when it is taller.
 pub(super) struct TranscriptView {
     lines: Vec<Line<'static>>,
     centre: bool,
@@ -923,7 +944,11 @@ impl Widget for TranscriptView {
             content.y += top;
             content.height -= top;
         }
-        let skip = self.lines.len().saturating_sub(usize::from(content.height));
+        let skip = if self.centre {
+            0
+        } else {
+            self.lines.len().saturating_sub(usize::from(content.height))
+        };
         let visible: Vec<Line<'static>> = self.lines.into_iter().skip(skip).collect();
         Paragraph::new(visible).render(content, buf);
         if let Some(chip) = self.chip {

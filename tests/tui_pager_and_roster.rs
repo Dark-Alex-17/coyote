@@ -950,19 +950,21 @@ mod transcript {
     }
 
     /// Checks a folded tool header squeezed to `name(args)<elapsed><status>`:
-    /// the piece after the closing paren must be a duration (`0.4s`, `12s`,
-    /// `350ms`) and nothing else, which is also what keeps an error message
-    /// out of the header.
+    /// the piece after the closing paren must be a duration (`0s`, `12s`,
+    /// `1m3s` once squeezed) and nothing else, which is also what keeps an
+    /// error message out of the header.
     fn assert_header_is_name_args_elapsed(header: &str, name: &str) {
         let args_end = header
             .rfind(')')
             .unwrap_or_else(|| panic!("no closing paren in the {name} header {header:?}"));
         let elapsed = &header[args_end + 1..];
-        let digits = elapsed.trim_end_matches("ms").trim_end_matches('s');
+        let digits = elapsed.trim_end_matches('s');
         assert!(
-            !digits.is_empty()
-                && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
-                && (elapsed.ends_with('s')),
+            digits.starts_with(|c: char| c.is_ascii_digit())
+                && digits
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == 'h' || c == 'm')
+                && elapsed.ends_with('s'),
             "the {name} header should read name(args) elapsed status, got {header:?} \
          (after the args: {elapsed:?})"
         );

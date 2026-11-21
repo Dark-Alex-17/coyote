@@ -1104,8 +1104,17 @@ fn tui_page_quotes_the_code() {
     let queued = src(&["tui", "queued.rs"]);
     let pending = literal_with(production(&queued), "pending: ").replace("{}", "<n>");
     let dropped = literal_with(tui, "queued line(s)").replace("{dropped}", "<n>");
-    let running = literal_with(tui, "Running {tool}").replace("{tool}", "<tool>");
-    let thinking = literal_with(tui, "Thinking for ").replace("{}", "<n>");
+    let running = literal_with(tui, " . {tool}")
+        .trim_start()
+        .replace("{}", "<time>")
+        .replace("{tool}", "<tool>");
+    let thinking = literal_with(tui, "Thinking for ")
+        .trim_start()
+        .replace("{}", "<time>");
+    assert_eq!(
+        const_expr(&src(&["tui", "throbber.rs"]), "THROBBER_INTERVAL"),
+        "Duration::from_millis(100)"
+    );
     let interrupt = literal_with(tui, "Esc to interrupt")
         .trim_start()
         .to_string();
@@ -1183,6 +1192,7 @@ fn tui_page_quotes_the_code() {
         format!("`.{keys_command}`"),
         format!("`{}`", normal.trim()),
         "1 second".to_string(),
+        "100 ms".to_string(),
         "within a second".to_string(),
         "4 MiB".to_string(),
         "32 MiB".to_string(),

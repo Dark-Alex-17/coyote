@@ -9,6 +9,7 @@ use super::bottom_pane::{first_line, step_highlight};
 use super::cells::elapsed_text;
 use super::help::MARGIN;
 use super::theme::Theme;
+use super::throbber::Tick;
 use super::{ChromeKind, DIM, chrome_style};
 use crate::events::NoticeKind;
 use crate::supervisor::escalation::{EscalationQueue, PendingEscalation};
@@ -20,7 +21,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use std::sync::Arc;
-use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = "Tasks";
@@ -124,10 +124,17 @@ impl RosterRow {
     }
 
     /// The row's text after its label: a task's id, padded to `id_width`
-    /// columns so the states line up, its state and, while it runs, how
-    /// long it has run by `now`; a question's first line, without the
-    /// `[kind] ` that names its modal, and how many follow.
-    fn detail(&self, id_width: usize, now: Instant) -> String {
+    /// columns so the states line up, and its state, which while it runs
+    /// is the throbber's frame in `throbber`, `running` and how long it
+    /// has run by `tick`; a question's first line, without the `[kind] `
+    /// that names its modal, and how many follow. The rest is in `style`.
+    fn detail(
+        &self,
+        id_width: usize,
+        tick: Tick,
+        style: Style,
+        throbber: Style,
+    ) -> Vec<Span<'static>> {
         match self {
             RosterRow::Task(task) => {
                 let status = match task.status {
@@ -138,23 +145,30 @@ impl RosterRow {
                 };
                 let id = super::render::plain_text(&task.id);
                 let pad = id_width.saturating_sub(id.width());
-                let mut detail = format!("{id}{:pad$}  {status}", "");
-                if task.status == TaskRowStatus::Running
-                    && let Some(started) = task.started_at
-                {
-                    detail.push_str("  ");
-                    detail.push_str(&elapsed_text(now.saturating_duration_since(started)));
+                let head = format!("{id}{:pad$}  ", "");
+                if task.status != TaskRowStatus::Running {
+                    return vec![Span::styled(format!("{head}{status}"), style)];
                 }
-                detail
+                let mut state = format!(" {status}");
+                if let Some(started) = task.started_at {
+                    state.push_str("  ");
+                    state.push_str(&elapsed_text(tick.elapsed(started)));
+                }
+                vec![
+                    Span::styled(head, style),
+                    Span::styled(tick.frame(), throbber),
+                    Span::styled(state, style),
+                ]
             }
             RosterRow::Escalation(ask) => {
                 let (_, question) = super::escalation_kind(&ask.question);
                 let (first, tail) = first_line(question);
-                if tail.is_empty() {
+                let text = if tail.is_empty() {
                     first
                 } else {
                     format!("{first}  {tail}")
-                }
+                };
+                vec![Span::styled(text, style)]
             }
         }
     }
@@ -242,8 +256,8 @@ pub(super) struct RosterPopup<'a> {
     pub(super) state: &'a RosterState,
     pub(super) theme: &'a Theme,
     pub(super) no_color: bool,
-    /// What a job's running time is counted to.
-    pub(super) now: Instant,
+    /// What a task's running time is counted to and its throbber read at.
+    pub(super) tick: Tick,
 }
 
 impl Widget for RosterPopup<'_> {
@@ -274,7 +288,8 @@ impl Widget for RosterPopup<'_> {
         RosterView {
             state: self.state,
             no_color: self.no_color,
-            now: self.now,
+            tick: self.tick,
+            throbber: self.theme.throbber,
         }
         .render(inner, buf);
     }
@@ -285,8 +300,9 @@ impl Widget for RosterPopup<'_> {
 struct RosterView<'a> {
     state: &'a RosterState,
     no_color: bool,
-    /// What a job's running time is counted to.
-    now: Instant,
+    /// What a task's running time is counted to and its throbber read at.
+    tick: Tick,
+    throbber: Style,
 }
 
 impl Widget for RosterView<'_> {
@@ -324,12 +340,12 @@ impl Widget for RosterView<'_> {
             let style = row.style(self.no_color);
             let label = row.label();
             let pad = label_width.saturating_sub(label.width());
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{label}{:pad$}", ""), style),
                 Span::raw("  "),
-                Span::styled(row.detail(id_width, self.now), DIM.patch(style)),
-            ]);
-            Paragraph::new(line).render(line_area, buf);
+            ];
+            spans.extend(row.detail(id_width, self.tick, DIM.patch(style), self.throbber));
+            Paragraph::new(Line::from(spans)).render(line_area, buf);
             if highlight == Some(start + offset) {
                 buf.set_style(line_area, Style::new().add_modifier(Modifier::REVERSED));
             }
@@ -340,11 +356,12 @@ impl Widget for RosterView<'_> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::utils::SPINNER_FRAMES;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use std::sync::OnceLock;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// When every test job started; frames count its running time from it.
     fn started() -> Instant {
@@ -354,6 +371,17 @@ pub(super) mod tests {
 
     fn frame_time() -> Instant {
         started() + Duration::from_secs(75)
+    }
+
+    fn tick_at(now: Instant) -> Tick {
+        Tick {
+            origin: started(),
+            now,
+        }
+    }
+
+    fn detail_text(row: &RosterRow, id_width: usize, now: Instant) -> String {
+        Line::from(row.detail(id_width, tick_at(now), Style::new(), Style::new())).to_string()
     }
 
     pub(in crate::tui) fn task(
@@ -414,7 +442,8 @@ pub(super) mod tests {
                     RosterView {
                         state,
                         no_color,
-                        now: frame_time(),
+                        tick: tick_at(frame_time()),
+                        throbber: Theme::fallback(no_color).throbber,
                     },
                     frame.area(),
                 );
@@ -552,13 +581,15 @@ pub(super) mod tests {
         RosterView {
             state: &state,
             no_color: false,
-            now: frame_time(),
+            tick: tick_at(frame_time()),
+            throbber: Style::new(),
         }
         .render(Rect::new(0, 0, 80, 24), &mut buf);
         RosterView {
             state: &state,
             no_color: false,
-            now: frame_time(),
+            tick: tick_at(frame_time()),
+            throbber: Style::new(),
         }
         .render(Rect::new(0, 0, 0, 0), &mut buf);
         let empty = RosterState::default();
@@ -577,8 +608,11 @@ pub(super) mod tests {
             TaskRowStatus::Failed,
         );
         let later = frame_time() + Duration::from_secs(60);
-        assert_eq!(failed.detail(12, frame_time()), failed.detail(12, later));
-        assert_eq!(failed.detail(12, later), "job_5e6f7a8b  failed");
+        assert_eq!(
+            detail_text(&failed, 12, frame_time()),
+            detail_text(&failed, 12, later)
+        );
+        assert_eq!(detail_text(&failed, 12, later), "job_5e6f7a8b  failed");
         let running = task(
             "job_5e6f7a8b",
             TaskKind::Job,
@@ -586,10 +620,17 @@ pub(super) mod tests {
             TaskRowStatus::Running,
         );
         assert_eq!(
-            running.detail(12, frame_time()),
-            "job_5e6f7a8b  running  75.0s"
+            detail_text(&running, 12, frame_time()),
+            format!("job_5e6f7a8b  {} running  1m 15s", SPINNER_FRAMES[0])
         );
-        assert_ne!(running.detail(12, frame_time()), running.detail(12, later));
+        assert_ne!(
+            detail_text(&running, 12, frame_time()),
+            detail_text(&running, 12, later)
+        );
+        assert_eq!(
+            detail_text(&running, 12, frame_time() + Duration::from_millis(100)),
+            format!("job_5e6f7a8b  {} running  1m 15s", SPINNER_FRAMES[1])
+        );
     }
 
     #[test]
@@ -619,7 +660,7 @@ pub(super) mod tests {
                 options: vec!["main".to_string(), "dev".to_string()],
             })]
         );
-        assert_eq!(rows[0].detail(0, frame_time()), "Which branch?");
+        assert_eq!(detail_text(&rows[0], 0, frame_time()), "Which branch?");
     }
 
     #[test]

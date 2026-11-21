@@ -43,7 +43,7 @@ pub(super) fn transcript_text(cells: &[Cell], config: &AppConfig) -> String {
                 }
             }
             Cell::Tool { .. } | Cell::Job { .. } | Cell::Agent { .. } | Cell::Node { .. } => {
-                cell.summary_line().unwrap_or_default()
+                cell.summary_line(None).unwrap_or_default()
             }
             Cell::Text { .. } | Cell::Welcome { .. } => continue,
         };
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(
             render::plain_text(&text),
             "> read a.txt\n\
-             fs_read({\"path\":\"a.txt\"})  0.2s  ok\n\
+             fs_read({\"path\":\"a.txt\"})  0s  ok\n\
              The file says hello.\n\
              Cancelled job job-1\n\
              \n\

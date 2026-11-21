@@ -17,6 +17,9 @@ use tokio::sync::{
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_ACK_DEADLINE: Duration = Duration::from_millis(250);
+/// The braille frames the spinner turns through; the TUI's throbber
+/// draws the same ones.
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Default)]
 pub struct SpinnerInner {
@@ -27,8 +30,6 @@ pub struct SpinnerInner {
 }
 
 impl SpinnerInner {
-    const DATA: [&'static str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
     #[cfg(test)]
     fn observed(cleared: Arc<AtomicUsize>) -> Self {
         Self {
@@ -43,7 +44,7 @@ impl SpinnerInner {
             return Ok(());
         }
         let mut writer = stdout();
-        let frame = Self::DATA[self.index % Self::DATA.len()];
+        let frame = SPINNER_FRAMES[self.index % SPINNER_FRAMES.len()];
         let dots = ".".repeat((self.index / 5) % 4);
         let line = format!("{frame}{}{:<3}", self.message, dots);
         queue!(writer, cursor::MoveToColumn(0), style::Print(line),)?;

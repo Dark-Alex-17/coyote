@@ -86,11 +86,13 @@ pub(super) fn chrome_style(kind: ChromeKind, no_color: bool) -> Style {
 
 /// A tool row's header in the colours of the REPL's `Call <tool>` line:
 /// the name as the REPL paints it, the arrow, arguments and state in its
-/// muted colour, a failure in the error colour.
+/// muted colour, a failure in the error colour, a running row's throbber
+/// in the status row's.
 pub(super) struct ToolHeaderStyles {
     pub(super) muted: Style,
     pub(super) name: Style,
     pub(super) failed: Style,
+    pub(super) throbber: Style,
 }
 
 impl ToolHeaderStyles {
@@ -98,10 +100,12 @@ impl ToolHeaderStyles {
         let paint = |style: Style, colour: Color| {
             if no_color { style } else { style.fg(colour) }
         };
+        let tool_fn = from_repl(tool_fn_color(), markdown);
         Self {
             muted: paint(DIM, from_repl(tool_dim_color(), markdown)),
-            name: paint(BOLD, from_repl(tool_fn_color(), markdown)),
+            name: paint(BOLD, tool_fn),
             failed: chrome_style(ChromeKind::Error, no_color),
+            throbber: paint(Style::new(), tool_fn),
         }
     }
 }
@@ -129,6 +133,15 @@ pub(super) fn field_background(config: &AppConfig, options: &RenderOptions) -> C
         }
     };
     Color::Rgb(nudge(base.r), nudge(base.g), nudge(base.b))
+}
+
+/// The greeting's logo: the heading colour, without the heading's bold.
+pub(super) fn logo_style(markdown: &MarkdownRender, no_color: bool) -> Style {
+    if no_color {
+        Style::new()
+    } else {
+        Style::new().fg(from_markdown(markdown.heading_color(), HEADING_FALLBACK))
+    }
 }
 
 /// A REPL colour; RGB goes through `markdown` so a terminal without
@@ -177,6 +190,8 @@ pub(super) struct Theme {
     pub(super) hint_label: Style,
     /// What a turn is doing, on the status row.
     pub(super) status_runtime: Style,
+    /// The frame that turns in front of it while it runs.
+    pub(super) throbber: Style,
     /// The key that interrupts it, beside it.
     pub(super) status_key: Style,
     pub(super) footer_field: Style,
@@ -213,6 +228,7 @@ impl Theme {
             hint_key: paint(ITALIC.add_modifier(Modifier::BOLD), HIGHLIGHT),
             hint_label: paint(ITALIC, tool_dim),
             status_runtime: paint(DIM, tool_fn),
+            throbber: paint(Style::new(), tool_fn),
             status_key: paint(DIM, HIGHLIGHT),
             footer_field: paint(DIM, tool_key),
             footer_separator: paint(DIM, FOOTER_SEPARATOR),
@@ -325,6 +341,7 @@ mod tests {
             (coloured.hint_key, plain.hint_key),
             (coloured.hint_label, plain.hint_label),
             (coloured.status_runtime, plain.status_runtime),
+            (coloured.throbber, plain.throbber),
             (coloured.status_key, plain.status_key),
             (coloured.footer_field, plain.footer_field),
             (coloured.footer_separator, plain.footer_separator),
@@ -344,5 +361,12 @@ mod tests {
         }
         assert_eq!(plain.surface(DARK_FALLBACK), Style::new());
         assert_eq!(coloured.surface(DARK_FALLBACK).bg, Some(DARK_FALLBACK));
+        let renderer = super::super::Renderer::new(RenderOptions::default()).unwrap();
+        let markdown = renderer.markdown_render();
+        assert_eq!(
+            logo_style(markdown, false),
+            Style::new().fg(HEADING_FALLBACK)
+        );
+        assert_eq!(logo_style(markdown, true), Style::new());
     }
 }

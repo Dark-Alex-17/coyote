@@ -127,7 +127,16 @@ fn interleaved_node_calls_fold_under_their_own_node() {
             route: Some("merge".to_string()),
         }
     ));
-    assert!(matches!(&rows[1], Cell::Node { row, .. } if row.status == NodeStatus::Running));
+    assert!(matches!(
+        &rows[1],
+        Cell::Node {
+            row: TaskRow {
+                status: NodeStatus::Running { .. },
+                ..
+            },
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -231,7 +240,7 @@ fn open_thread(harness: &mut Harness) {
 
 /// A call the child starts while its thread is open shows in the next
 /// frame, with no flush of its session, and its finish turns it ok.
-/// The frame keeps ticking while the call runs, and stops after.
+/// The throbber turns while the call runs, and the frames stop after.
 #[test]
 fn an_open_thread_shows_a_childs_call_at_once_and_its_finish() {
     let mut harness = Harness::standalone(80, 24);
@@ -245,20 +254,28 @@ fn an_open_thread_shows_a_childs_call_at_once_and_its_finish() {
     assert!(harness.app.frames.due_at().is_some());
     let frame = harness.draw();
     assert!(
-        frame.contains("\u{25B8} fs_read({\"path\":\"src/lib.rs\"})  running"),
+        frame.contains(&format!(
+            "\u{25B8} fs_read({{\"path\":\"src/lib.rs\"}})  {} running 0s",
+            SPINNER_FRAMES[0]
+        )),
         "{frame}"
     );
     assert!(harness.app.take_control_requests().is_empty());
     harness.app.frame_drawn();
     assert_eq!(
         harness.app.frames.due_at(),
-        Some(harness.clock.now() + STATUS_TICK)
+        Some(harness.clock.now() + THROBBER_INTERVAL)
+    );
+    harness.clock.advance(THROBBER_INTERVAL);
+    let frame = harness.draw();
+    assert!(
+        frame.contains(&format!("  {} running 0s", SPINNER_FRAMES[1])),
+        "{frame}"
     );
 
     child_tool_done(&mut harness, None, "call-v1", true);
     let frame = harness.draw();
-    assert!(frame.contains("})  0."), "{frame}");
-    assert!(frame.contains("s  ok"), "{frame}");
+    assert!(frame.contains("})  0s  ok"), "{frame}");
     harness.app.frame_drawn();
     assert_eq!(harness.app.frames.due_at(), None);
 }

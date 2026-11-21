@@ -1659,7 +1659,7 @@ mod tests {
         };
         assert!(row("fs_grep(").contains("pattern"), "{frame}");
         assert!(row("fs_grep(").contains("})  ok "), "{frame}");
-        assert!(row("fs_read(").contains("1.2s  ok"), "{frame}");
+        assert!(row("fs_read(").contains("1s  ok"), "{frame}");
         assert!(row("execute_command(").contains("running"), "{frame}");
         assert_eq!(frame.matches("fs_read(").count(), 1, "{frame}");
         assert!(
@@ -1747,6 +1747,7 @@ mod tests {
             "plan".to_string(),
             "llm".to_string(),
             ChildNodeState::Started,
+            now,
         );
         for (call_id, name, said) in [
             ("call-p1", "fs_read", "read Cargo.toml"),
@@ -1771,12 +1772,14 @@ mod tests {
                 duration_ms: Some(2000),
                 route: Some("build".to_string()),
             },
+            now,
         );
         live.node(
             PLANNER,
             "build".to_string(),
             "tool".to_string(),
             ChildNodeState::Started,
+            now,
         );
         live.node(
             PLANNER,
@@ -1785,6 +1788,7 @@ mod tests {
             ChildNodeState::Failed {
                 error: "exit 3".to_string(),
             },
+            now,
         );
         let mut pager = Pager::child(
             "planner-b2".to_string(),

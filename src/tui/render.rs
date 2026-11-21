@@ -5,12 +5,14 @@
 //! streaming reply is split into a stable part, rendered once per width,
 //! and a live tail.
 
+use super::throbber::Tick;
 use crate::config::is_format_char;
 use crate::render::{MarkdownRender, RenderOptions};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
 const ESC: char = '\x1b';
@@ -268,6 +270,9 @@ pub(crate) struct Renderer {
     /// `NO_COLOR` at start: the UI's own colours are dropped while the
     /// attributes stay. Tests flip it through `App::set_no_color`.
     pub(super) no_color: bool,
+    /// The instant the frame being laid out is drawn for: what a running
+    /// row's throbber and elapsed time read. The App sets it each frame.
+    pub(super) tick: Tick,
 }
 
 impl Renderer {
@@ -277,6 +282,7 @@ impl Renderer {
             .wrap
             .as_deref()
             .and_then(|value| value.parse::<u16>().ok());
+        let now = Instant::now();
         let markdown = MarkdownRender::init(RenderOptions {
             wrap: None,
             ..options
@@ -285,6 +291,7 @@ impl Renderer {
             markdown,
             wrap_cap,
             no_color: *crate::utils::NO_COLOR,
+            tick: Tick { origin: now, now },
         })
     }
 

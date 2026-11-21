@@ -2,7 +2,8 @@
 //! and the rules for how a tool, job or agent row collapses to one line.
 
 use super::render::{self, RenderCache, Renderer};
-use super::theme::ToolHeaderStyles;
+use super::theme::{ToolHeaderStyles, logo_style};
+use super::throbber::{self, Tick};
 use super::{
     ChromeKind, DIM, FULL_OUTPUT_LIMIT, LATE_OUTPUT_LIMIT, TOOL_OUTPUT_TAIL, chrome_style,
 };
@@ -16,19 +17,20 @@ use std::fmt;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Plain lines cached per width; the two most recently used widths are kept.
+/// Plain lines cached per width, or per whatever else `K` names that the
+/// lines depend on; the two most recently used keys are kept.
 #[derive(Default)]
-pub(super) struct LineCache {
-    entries: Vec<(u16, Vec<Line<'static>>)>,
+pub(super) struct LineCache<K = u16> {
+    entries: Vec<(K, Vec<Line<'static>>)>,
 }
 
-impl LineCache {
+impl<K: Copy + PartialEq> LineCache<K> {
     pub(super) fn get(
         &mut self,
-        width: u16,
+        key: K,
         render: impl FnOnce() -> Vec<Line<'static>>,
     ) -> &[Line<'static>] {
-        match self.entries.iter().position(|(w, _)| *w == width) {
+        match self.entries.iter().position(|(k, _)| *k == key) {
             Some(index) => {
                 let entry = self.entries.remove(index);
                 self.entries.push(entry);
@@ -37,7 +39,7 @@ impl LineCache {
                 if self.entries.len() >= 2 {
                     self.entries.remove(0);
                 }
-                self.entries.push((width, render()));
+                self.entries.push((key, render()));
             }
         }
         self.entries
@@ -45,11 +47,11 @@ impl LineCache {
             .map_or(&[], |(_, lines)| lines.as_slice())
     }
 
-    /// The lines laid out at `width`, if they have been.
-    pub(super) fn peek(&self, width: u16) -> Option<&[Line<'static>]> {
+    /// The lines laid out for `key`, if they have been.
+    pub(super) fn peek(&self, key: K) -> Option<&[Line<'static>]> {
         self.entries
             .iter()
-            .find(|(w, _)| *w == width)
+            .find(|(k, _)| *k == key)
             .map(|(_, lines)| lines.as_slice())
     }
 }
@@ -354,7 +356,7 @@ impl ToolStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum JobStatus {
-    Running,
+    Running { since: Instant },
     Done,
     Failed(String),
     Cancelled,
@@ -362,7 +364,7 @@ pub(super) enum JobStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AgentStatus {
-    Running,
+    Running { since: Instant },
     Completed,
     Failed(String),
     Interrupted,
@@ -370,7 +372,9 @@ pub(super) enum AgentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum NodeStatus {
-    Running,
+    Running {
+        since: Instant,
+    },
     Completed {
         elapsed: Option<Duration>,
         route: Option<String>,
@@ -554,11 +558,11 @@ pub(super) enum Cell {
         cache: LineCache,
     },
     /// The boxed greeting an empty transcript shows until a line is
-    /// submitted.
+    /// submitted, laid out per width and the height it has to fit.
     Welcome {
         model: String,
         prefix: CommandPrefix,
-        cache: LineCache,
+        cache: LineCache<(u16, Option<u16>)>,
     },
 }
 
@@ -723,12 +727,23 @@ impl Cell {
         }
     }
 
-    pub(super) fn node(node_id: String, node_type: String) -> Self {
+    pub(super) fn node(node_id: String, node_type: String, since: Instant) -> Self {
         Self::Node {
             node_id,
             node_type,
-            row: TaskRow::new(NodeStatus::Running),
+            row: TaskRow::new(NodeStatus::Running { since }),
             cache: LineCache::default(),
+        }
+    }
+
+    /// Whether the row's work has yet to end, so its throbber turns.
+    pub(super) fn running(&self) -> bool {
+        match self {
+            Cell::Tool { status, .. } => matches!(status, ToolStatus::Running { .. }),
+            Cell::Job { row, .. } => matches!(row.status, JobStatus::Running { .. }),
+            Cell::Agent { row, .. } => matches!(row.status, AgentStatus::Running { .. }),
+            Cell::Node { row, .. } => matches!(row.status, NodeStatus::Running { .. }),
+            _ => false,
         }
     }
 
@@ -940,7 +955,6 @@ impl Cell {
         | Cell::Notice { cache, .. }
         | Cell::Error { cache, .. }
         | Cell::Command { cache, .. }
-        | Cell::Welcome { cache, .. }
         | Cell::Text { cache, .. }
         | Cell::Tool { cache, .. }
         | Cell::Job { cache, .. }
@@ -949,20 +963,27 @@ impl Cell {
         {
             *cache = LineCache::default();
         }
+        if let Cell::Welcome { cache, .. } = self {
+            *cache = LineCache::default();
+        }
     }
 
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
-        self.cached_lines(width, renderer).into_owned()
+        self.cached_lines(width, None, renderer).into_owned()
     }
 
     /// The cell's lines at `width`, borrowed from its cache; only a reply
     /// still streaming comes back owned, as its tail is rendered anew.
+    /// `height` is the room the cell is shown in, when it is the only one;
+    /// only the greeting fits itself to it.
     pub(super) fn cached_lines(
         &mut self,
         width: u16,
+        height: Option<u16>,
         renderer: &mut Renderer,
     ) -> Cow<'_, [Line<'static>]> {
         let no_color = renderer.no_color;
+        let tick = Some(renderer.tick);
         Cow::Borrowed(match self {
             Cell::User {
                 text,
@@ -1040,7 +1061,7 @@ impl Cell {
                     (false, true) => EXPANDED_ARROW,
                     (false, false) => COLLAPSED_ARROW,
                 };
-                let state = tool_state(status);
+                let state = tool_state(status, tick);
                 // The header is one row; the view clips what does not
                 // fit, so the arguments give way to the state. The
                 // narration below it is what the user approves, so that
@@ -1053,12 +1074,13 @@ impl Cell {
                 } else {
                     styles.muted
                 };
-                let mut lines = vec![Line::from(vec![
+                let mut header = vec![
                     Span::styled(arrow, styles.muted),
                     Span::styled(render::plain_text(name), styles.name),
                     Span::styled(render::plain_text(&format!("({args})  ")), styles.muted),
-                    Span::styled(render::plain_text(&state), state_style),
-                ])];
+                ];
+                header.extend(state_spans(&state, state_style, styles.throbber));
+                let mut lines = vec![Line::from(header)];
                 if open {
                     let body_width = width.saturating_sub(BODY_INDENT.len() as u16).max(1);
                     let mut body =
@@ -1087,7 +1109,7 @@ impl Cell {
                     kind: "job",
                     name: tool,
                     id: job_id,
-                    state: job_state(&row.status),
+                    state: job_state(&row.status, tick),
                 };
                 row_lines(header, row, width, &styles)
             }),
@@ -1102,7 +1124,7 @@ impl Cell {
                     kind: "agent",
                     name,
                     id: agent_id,
-                    state: agent_state(&row.status),
+                    state: agent_state(&row.status, tick),
                 };
                 row_lines(header, row, width, &styles)
             }),
@@ -1117,7 +1139,7 @@ impl Cell {
                     kind: "node",
                     name: node_id,
                     id: node_type,
-                    state: node_state(&row.status),
+                    state: node_state(&row.status, tick),
                 };
                 row_lines(header, row, width, &styles)
             }),
@@ -1125,7 +1147,10 @@ impl Cell {
                 model,
                 prefix,
                 cache,
-            } => cache.get(width, || welcome_lines(model, *prefix, width)),
+            } => cache.get((width, height), || {
+                let logo = logo_style(renderer.markdown_render(), no_color);
+                welcome_lines(model, *prefix, width, height, logo)
+            }),
         })
     }
 
@@ -1137,7 +1162,8 @@ impl Cell {
         if let Cell::Text { tail, .. } = self {
             return tail.full.lines(width).to_vec();
         }
-        let Some(header) = self.summary_line() else {
+        let tick = Some(renderer.tick);
+        let Some(header) = self.summary_line(tick) else {
             return self.lines(width, renderer);
         };
         match self {
@@ -1156,30 +1182,40 @@ impl Cell {
                 lines.extend_from_slice(tail.full.lines(width));
                 lines
             }
-            Cell::Job { row, .. } => {
-                full_row_lines(&header, job_state(&row.status).1, &mut row.calls, width)
-            }
-            Cell::Agent { row, .. } => {
-                full_row_lines(&header, agent_state(&row.status).1, &mut row.calls, width)
-            }
-            Cell::Node { row, .. } => {
-                full_row_lines(&header, node_state(&row.status).1, &mut row.calls, width)
-            }
+            Cell::Job { row, .. } => full_row_lines(
+                &header,
+                job_state(&row.status, tick).1,
+                &mut row.calls,
+                width,
+            ),
+            Cell::Agent { row, .. } => full_row_lines(
+                &header,
+                agent_state(&row.status, tick).1,
+                &mut row.calls,
+                width,
+            ),
+            Cell::Node { row, .. } => full_row_lines(
+                &header,
+                node_state(&row.status, tick).1,
+                &mut row.calls,
+                width,
+            ),
             _ => render::plain_lines(&header, width, DIM),
         }
     }
 
     /// The one-line, unclipped header of a tool, job or agent row, with
-    /// no escape left in it; None for every other cell.
-    pub(super) fn summary_line(&self) -> Option<String> {
+    /// no escape left in it, a running row's throbber and elapsed time
+    /// read at `tick`; None for every other cell.
+    pub(super) fn summary_line(&self, tick: Option<Tick>) -> Option<String> {
         let line = match self {
             Cell::Tool {
                 name, args, status, ..
-            } => format!("{name}({args})  {}", tool_state(status)),
+            } => format!("{name}({args})  {}", tool_state(status, tick)),
             Cell::Job {
                 job_id, tool, row, ..
             } => with_folded(
-                format!("job {tool} {job_id}  {}", job_state(&row.status).0),
+                format!("job {tool} {job_id}  {}", job_state(&row.status, tick).0),
                 &row.calls,
             ),
             Cell::Agent {
@@ -1188,7 +1224,10 @@ impl Cell {
                 row,
                 ..
             } => with_folded(
-                format!("agent {name} {agent_id}  {}", agent_state(&row.status).0),
+                format!(
+                    "agent {name} {agent_id}  {}",
+                    agent_state(&row.status, tick).0
+                ),
                 &row.calls,
             ),
             Cell::Node {
@@ -1197,7 +1236,10 @@ impl Cell {
                 row,
                 ..
             } => with_folded(
-                format!("node {node_id} {node_type}  {}", node_state(&row.status).0),
+                format!(
+                    "node {node_id} {node_type}  {}",
+                    node_state(&row.status, tick).0
+                ),
                 &row.calls,
             ),
             _ => return None,
@@ -1206,9 +1248,36 @@ impl Cell {
     }
 }
 
-fn tool_state(status: &ToolStatus) -> String {
+/// A running row's state: the throbber's frame, `running` and how long
+/// the row has run by `tick`; the word alone without a tick, as in the
+/// transcript printed on exit.
+fn running_state(since: Instant, tick: Option<Tick>) -> String {
+    match tick {
+        Some(tick) => format!(
+            "{} running {}",
+            tick.frame(),
+            elapsed_text(tick.elapsed(since))
+        ),
+        None => "running".to_string(),
+    }
+}
+
+/// A row's state, scrubbed, with a leading throbber frame in a style of
+/// its own.
+fn state_spans(state: &str, style: Style, throbber_style: Style) -> Vec<Span<'static>> {
+    let state = render::plain_text(state);
+    match throbber::split_frame(&state) {
+        Some((frame, rest)) => vec![
+            Span::styled(frame, throbber_style),
+            Span::styled(rest.to_string(), style),
+        ],
+        None => vec![Span::styled(state, style)],
+    }
+}
+
+fn tool_state(status: &ToolStatus, tick: Option<Tick>) -> String {
     match status {
-        ToolStatus::Running { .. } => "running".to_string(),
+        ToolStatus::Running { since } => running_state(*since, tick),
         ToolStatus::Ok { elapsed } => format!("{}  ok", elapsed_text(*elapsed)),
         ToolStatus::Failed { elapsed, error } => {
             format!("{}  failed: {}", elapsed_text(*elapsed), first_line(error))
@@ -1218,9 +1287,9 @@ fn tool_state(status: &ToolStatus) -> String {
 }
 
 /// The state word of a job row and the whole error of a failed one.
-fn job_state(status: &JobStatus) -> (String, Option<&str>) {
+fn job_state(status: &JobStatus, tick: Option<Tick>) -> (String, Option<&str>) {
     match status {
-        JobStatus::Running => ("running".to_string(), None),
+        JobStatus::Running { since } => (running_state(*since, tick), None),
         JobStatus::Done => ("done".to_string(), None),
         JobStatus::Failed(error) => (format!("failed: {}", first_line(error)), Some(error)),
         JobStatus::Cancelled => ("cancelled".to_string(), None),
@@ -1228,9 +1297,9 @@ fn job_state(status: &JobStatus) -> (String, Option<&str>) {
 }
 
 /// The state word of an agent row and the whole error of a failed one.
-fn agent_state(status: &AgentStatus) -> (String, Option<&str>) {
+fn agent_state(status: &AgentStatus, tick: Option<Tick>) -> (String, Option<&str>) {
     match status {
-        AgentStatus::Running => ("running".to_string(), None),
+        AgentStatus::Running { since } => (running_state(*since, tick), None),
         AgentStatus::Completed => ("completed".to_string(), None),
         AgentStatus::Failed(error) => (format!("failed: {}", first_line(error)), Some(error)),
         AgentStatus::Interrupted => ("interrupted".to_string(), None),
@@ -1238,9 +1307,9 @@ fn agent_state(status: &AgentStatus) -> (String, Option<&str>) {
 }
 
 /// The state word of a node row and the whole error of a failed one.
-fn node_state(status: &NodeStatus) -> (String, Option<&str>) {
+fn node_state(status: &NodeStatus, tick: Option<Tick>) -> (String, Option<&str>) {
     match status {
-        NodeStatus::Running => ("running".to_string(), None),
+        NodeStatus::Running { since } => (running_state(*since, tick), None),
         NodeStatus::Completed { elapsed, route } => {
             let mut state = "completed".to_string();
             if let Some(elapsed) = elapsed {
@@ -1293,8 +1362,18 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default()
 }
 
+/// An elapsed time in whole seconds: `42s`, `1m 3s`, `2h 36m 5s`. Hours
+/// are the largest unit, and every smaller unit shows once a larger does.
 pub(super) fn elapsed_text(elapsed: Duration) -> String {
-    format!("{:.1}s", elapsed.as_secs_f64())
+    let total = elapsed.as_secs();
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn output_lines(lines: &[String]) -> Vec<Line<'static>> {
@@ -1400,8 +1479,8 @@ fn row_lines<S>(
         Span::styled(format!("{kind} "), styles.muted),
         Span::styled(name.to_string(), styles.name),
         Span::styled(format!("{rest}  "), styles.muted),
-        Span::styled(render::plain_text(&state), state_style),
     ];
+    spans.extend(state_spans(&state, state_style, styles.throbber));
     let summary = folded_summary(&row.calls);
     if !summary.is_empty() {
         spans.push(Span::styled(
@@ -1463,27 +1542,62 @@ fn folded_verb(name: &str) -> &str {
     }
 }
 
+/// The greeting's logo, a coyote's head. Plain ASCII, so any terminal
+/// and any font draws it the same.
+const LOGO: [&str; 9] = [
+    r"            /\   /\",
+    r"           /  \_/  \",
+    r"          /         \",
+    r"    _____/   o       |",
+    r" __/                 |",
+    r"<____                /",
+    r"     `---.___       /",
+    r"             \      |",
+    r"              |     |",
+];
+
+/// Columns between the logo and the box.
+const LOGO_GAP: usize = 2;
+
+/// Two border columns and one space of padding on each side.
+const WELCOME_FRAME: usize = 4;
+
+/// The widest the box's text runs before it wraps, which leaves room for
+/// the logo beside the box on an 80-column terminal.
+const WELCOME_TEXT_WIDTH: usize = 52;
+
 /// The greeting, boxed and centred in `width`: the wordmark, the model,
 /// the interrupt hint, and the help and key help hints spelled with the
-/// active command prefix. Only BOLD and DIM mark it up, so it reads the
-/// same under `NO_COLOR`.
-pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> Vec<Line<'static>> {
+/// active command prefix. Within `height` the hints give way, the
+/// interrupt tip first, so the borders, the wordmark and the model show. The
+/// logo sits left of the box where both fit side by side and the box is
+/// at least as tall as the logo; otherwise the box is alone. Only BOLD
+/// and DIM mark the box up, so it reads the same under `NO_COLOR`.
+pub(super) fn welcome_lines(
+    model: &str,
+    prefix: CommandPrefix,
+    width: u16,
+    height: Option<u16>,
+    logo: Style,
+) -> Vec<Line<'static>> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let plain = Style::new();
     let help = prefix.render_hints(crate::repl::WELCOME_HELP_HINT);
-    let mut text = vec![
+    let head = [
         (format!("coyote {}", env!("CARGO_PKG_VERSION")), bold),
         (format!("model: {model}"), plain),
-        (String::new(), plain),
     ];
-    text.extend(
-        crate::repl::WELCOME_INTERRUPT_HINT
-            .lines()
-            .map(|line| (line.to_string(), DIM)),
-    );
-    text.push((String::new(), plain));
-    text.push((help.into_owned(), plain));
-    text.push((
+    // In the order they give way, each with the paragraph it sits in. The
+    // interrupt hint goes as a whole: its second line reads on from the
+    // tip.
+    let mut hints: Vec<(usize, String, Style)> = crate::repl::WELCOME_INTERRUPT_HINT
+        .lines()
+        .map(|line| (0, line.to_string(), DIM))
+        .collect();
+    let interrupt = hints.len();
+    hints.push((1, help.into_owned(), plain));
+    hints.push((
+        1,
         format!(
             "Empty prompt: \"?\" or \"{}{}\" = keys",
             prefix.display(),
@@ -1491,33 +1605,83 @@ pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> V
         ),
         plain,
     ));
+    let text_without = |dropped: usize| {
+        let mut text = head.to_vec();
+        let mut paragraph = None;
+        for (index, line, style) in &hints[dropped..] {
+            if paragraph != Some(*index) {
+                text.push((String::new(), plain));
+                paragraph = Some(*index);
+            }
+            text.push((line.clone(), *style));
+        }
+        text
+    };
 
-    // Two border columns and one space of padding on each side.
-    const FRAME: usize = 4;
-    let longest = text.iter().map(|(line, _)| line.width()).max().unwrap_or(0);
     let columns = usize::from(width);
-    if columns <= FRAME {
-        return text
+    if columns <= WELCOME_FRAME {
+        return text_without(0)
             .into_iter()
             .flat_map(|(line, style)| render::plain_lines(&line, width, style))
             .collect();
     }
-    let box_width = columns.min(longest + FRAME);
-    let inner = box_width - FRAME;
+    let longest = text_without(0)
+        .iter()
+        .map(|(line, _)| line.width())
+        .max()
+        .unwrap_or(0);
+    let natural = longest.min(WELCOME_TEXT_WIDTH) + WELCOME_FRAME;
+    let box_width = columns.min(natural);
+    let fits = |rows: usize| height.is_none_or(|height| rows <= usize::from(height));
+    let rows = [0, interrupt, interrupt + 1]
+        .into_iter()
+        .map(|dropped| boxed(text_without(dropped), box_width))
+        .find(|rows| fits(rows.len()))
+        .unwrap_or_else(|| boxed(text_without(hints.len()), box_width));
+
+    let logo_width = LOGO.iter().map(|row| row.len()).max().unwrap_or(0);
+    let with_logo =
+        columns >= logo_width + LOGO_GAP + natural && rows.len() >= LOGO.len() && fits(rows.len());
+    let used = if with_logo {
+        logo_width + LOGO_GAP + box_width
+    } else {
+        box_width
+    };
+    let margin = " ".repeat((columns - used) / 2);
+    let logo_top = rows.len().saturating_sub(LOGO.len()) / 2;
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut spans = vec![Span::raw(margin.clone())];
+            if with_logo {
+                let art = index
+                    .checked_sub(logo_top)
+                    .and_then(|row| LOGO.get(row))
+                    .copied()
+                    .unwrap_or_default();
+                spans.push(Span::styled(art, logo));
+                spans.push(Span::raw(" ".repeat(logo_width - art.len() + LOGO_GAP)));
+            }
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// `text` wrapped inside a box `box_width` columns wide, border included;
+/// `box_width` is more than `WELCOME_FRAME`.
+fn boxed(text: Vec<(String, Style)>, box_width: usize) -> Vec<Line<'static>> {
+    let inner = box_width - WELCOME_FRAME;
     let inner_width = u16::try_from(inner).unwrap_or(u16::MAX);
-    let margin = Span::raw(" ".repeat((columns - box_width) / 2));
     let edge = |left: &str, fill: &str, right: &str| {
-        Line::from(vec![
-            margin.clone(),
-            Span::raw(format!("{left}{}{right}", fill.repeat(box_width - 2))),
-        ])
+        Line::from(format!("{left}{}{right}", fill.repeat(box_width - 2)))
     };
     let set = border::PLAIN;
     let mut lines = vec![edge(set.top_left, set.horizontal_top, set.top_right)];
     for (line, style) in text {
         for wrapped in render::plain_lines(&line, inner_width, style) {
             let pad = inner.saturating_sub(wrapped.width()) + 1;
-            let mut spans = vec![margin.clone(), Span::raw(format!("{} ", set.vertical_left))];
+            let mut spans = vec![Span::raw(format!("{} ", set.vertical_left))];
             spans.extend(wrapped.spans);
             spans.push(Span::raw(format!(
                 "{}{}",
@@ -1720,7 +1884,9 @@ mod tests {
             tool: "execute_command".to_string(),
             row: TaskRow {
                 calls,
-                ..TaskRow::new(JobStatus::Running)
+                ..TaskRow::new(JobStatus::Running {
+                    since: Instant::now(),
+                })
             },
             cache: LineCache::default(),
         };
@@ -1873,7 +2039,7 @@ mod tests {
     #[test]
     fn welcome_lines_use_only_bold_and_dim() {
         for width in [80, 40, 20, 3] {
-            let lines = welcome_lines("openai:test-model", CommandPrefix::Dot, width);
+            let lines = welcome_lines("openai:test-model", CommandPrefix::Dot, width, None, DIM);
             for line in &lines {
                 assert!(
                     line.width() <= usize::from(width),
@@ -1906,7 +2072,7 @@ mod tests {
 
     #[test]
     fn welcome_lines_spell_the_help_hint_with_the_active_prefix() {
-        let lines = welcome_lines("m", CommandPrefix::Slash, 80);
+        let lines = welcome_lines("m", CommandPrefix::Slash, 80, None, DIM);
         let text: Vec<String> = lines.iter().map(Line::to_string).collect();
         assert!(
             text.iter().any(|line| line.contains("\"/help\"")),
@@ -1916,6 +2082,69 @@ mod tests {
             text.iter().any(|line| line.contains("\"/keys\"")),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn welcome_lines_give_up_the_hints_before_the_wordmark() {
+        let text = |height: u16| -> Vec<String> {
+            welcome_lines("m", CommandPrefix::Dot, 40, Some(height), DIM)
+                .iter()
+                .map(Line::to_string)
+                .collect()
+        };
+        let full = text(u16::MAX);
+        assert!(full.iter().any(|line| line.contains("Tip:")), "{full:?}");
+        for height in [12, 8, 5, 4] {
+            let lines = text(height);
+            assert!(lines.len() <= usize::from(height), "{height}: {lines:?}");
+            assert!(
+                lines[0].contains(border::PLAIN.top_left),
+                "{height}: {lines:?}"
+            );
+            assert!(lines[1].contains("coyote "), "{height}: {lines:?}");
+            assert!(lines[2].contains("model: m"), "{height}: {lines:?}");
+            let bottom = lines.last().unwrap();
+            assert!(bottom.contains(border::PLAIN.bottom_left), "{lines:?}");
+            assert!(!lines.iter().any(|line| line.contains("Tip:")), "{lines:?}");
+        }
+        assert!(text(12).iter().any(|line| line.contains("Empty prompt")));
+    }
+
+    #[test]
+    fn the_logo_sits_beside_the_box_only_where_both_fit() {
+        let has_logo = |width: u16, height: Option<u16>| {
+            welcome_lines("m", CommandPrefix::Dot, width, height, DIM)
+                .iter()
+                .any(|line| line.to_string().contains(LOGO[0].trim()))
+        };
+        assert!(has_logo(80, None));
+        assert!(has_logo(80, Some(16)));
+        assert!(!has_logo(60, None));
+        assert!(!has_logo(80, Some(4)));
+        assert!(LOGO.iter().all(|row| row.is_ascii() && row.len() <= 24));
+        let lines = welcome_lines("m", CommandPrefix::Dot, 80, None, DIM);
+        assert!(LOGO.len() <= lines.len(), "{lines:?}");
+        assert!(lines.iter().all(|line| line.width() <= 80), "{lines:?}");
+    }
+
+    #[test]
+    fn elapsed_text_counts_whole_seconds_up_to_hours() {
+        let cases = [
+            (Duration::ZERO, "0s"),
+            (Duration::from_millis(999), "0s"),
+            (Duration::from_secs(42), "42s"),
+            (Duration::from_millis(59_900), "59s"),
+            (Duration::from_secs(60), "1m 0s"),
+            (Duration::from_secs(63), "1m 3s"),
+            (Duration::from_secs(3599), "59m 59s"),
+            (Duration::from_secs(3600), "1h 0m 0s"),
+            (Duration::from_secs(3607), "1h 0m 7s"),
+            (Duration::from_secs(9365), "2h 36m 5s"),
+            (Duration::from_secs(26 * 3600), "26h 0m 0s"),
+        ];
+        for (elapsed, text) in cases {
+            assert_eq!(elapsed_text(elapsed), text, "{elapsed:?}");
+        }
     }
 
     #[test]
@@ -1983,6 +2212,7 @@ mod tests {
         let narration =
             format!("Call fs_write {{\"path\":\"src/x.rs\",\"content\":\"{content}\"}}");
         let mut cell = Cell::tool("c1".to_string(), narration.clone(), Instant::now());
+        let running = format!("{} running 0s", crate::utils::SPINNER_FRAMES[0]);
         let header = "fs_write({\"path\":\"src/x.rs\",\"content\":\"xxxxxxxxxxxxxxx...)";
         let body = |lines: &[Line<'_>]| -> String {
             lines[1..]
@@ -2000,14 +2230,14 @@ mod tests {
         assert_eq!(lines.len(), 1, "a running row did not start collapsed");
         assert_eq!(
             lines[0].to_string(),
-            format!("{COLLAPSED_ARROW}{header}  running")
+            format!("{COLLAPSED_ARROW}{header}  {running}")
         );
 
         cell.toggle();
         let lines = cell.lines(80, &mut renderer);
         assert_eq!(
             lines[0].to_string(),
-            format!("{EXPANDED_ARROW}{header}  running")
+            format!("{EXPANDED_ARROW}{header}  {running}")
         );
         assert_eq!(body(&lines), narration, "the narration is not whole");
 
@@ -2021,7 +2251,7 @@ mod tests {
         let lines = cell.lines(80, &mut renderer);
         assert_eq!(
             lines[0].to_string(),
-            format!("{EXPANDED_ARROW}{header}  1.2s  ok")
+            format!("{EXPANDED_ARROW}{header}  1s  ok")
         );
         assert_eq!(body(&lines), narration, "the narration is not whole");
 
@@ -2030,7 +2260,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "a collapsed row took more than one line");
         assert_eq!(
             lines[0].to_string(),
-            format!("{COLLAPSED_ARROW}{header}  1.2s  ok")
+            format!("{COLLAPSED_ARROW}{header}  1s  ok")
         );
     }
 
@@ -2055,7 +2285,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0].to_string(),
-            "\u{25B8} fs_read({\"path\":\"x\"})  0.1s  failed: no such elif red"
+            "\u{25B8} fs_read({\"path\":\"x\"})  0s  failed: no such elif red"
         );
         cell.toggle();
         let text: Vec<String> = cell
@@ -2156,7 +2386,9 @@ mod tests {
             Cell::Job {
                 job_id: "job-1".to_string(),
                 tool: "execute_command".to_string(),
-                row: TaskRow::new(JobStatus::Running),
+                row: TaskRow::new(JobStatus::Running {
+                    since: Instant::now(),
+                }),
                 cache: LineCache::default(),
             },
             Cell::Agent {
@@ -2180,6 +2412,64 @@ mod tests {
             };
             assert!(has(Modifier::BOLD), "{header:?}");
             assert!(has(Modifier::DIM), "{header:?}");
+        }
+    }
+
+    /// A running tool, job or agent row shows the throbber's frame at the
+    /// renderer's tick, coloured unless `NO_COLOR`, and how long the row
+    /// has run; the exit dump's header, with no tick, says `running`.
+    #[test]
+    fn running_rows_show_the_throbber_and_how_long_they_have_run() {
+        let mut renderer = renderer();
+        let since = Instant::now();
+        renderer.tick = Tick {
+            origin: since,
+            now: since + Duration::from_millis(12_300),
+        };
+        let frame = throbber::frame_at(since, renderer.tick.now);
+        assert_eq!(frame, crate::utils::SPINNER_FRAMES[3]);
+        let mut cells = [
+            Cell::tool(
+                "c1".to_string(),
+                "Call fs_read {\"path\":\"x\"}".to_string(),
+                since,
+            ),
+            Cell::Job {
+                job_id: "job-1".to_string(),
+                tool: "execute_command".to_string(),
+                row: TaskRow::new(JobStatus::Running { since }),
+                cache: LineCache::default(),
+            },
+            Cell::Agent {
+                agent_id: "agent-1".to_string(),
+                name: "reviewer".to_string(),
+                row: TaskRow::new(AgentStatus::Running { since }),
+                cache: LineCache::default(),
+            },
+        ];
+        for no_color in [false, true] {
+            renderer.no_color = no_color;
+            let colour = ToolHeaderStyles::new(renderer.markdown_render(), no_color)
+                .throbber
+                .fg;
+            assert_eq!(colour.is_none(), no_color);
+            for cell in &mut cells {
+                cell.forget_wrapped_lines();
+                let lines = cell.lines(80, &mut renderer);
+                let header = lines[0].to_string();
+                assert!(
+                    header.ends_with(&format!("  {frame} running 12s")),
+                    "{header}"
+                );
+                let glyph = lines[0]
+                    .spans
+                    .iter()
+                    .find(|span| span.content == frame)
+                    .expect("the frame is a span of its own");
+                assert_eq!(glyph.style.fg, colour, "{header}");
+                let dumped = cell.summary_line(None).unwrap();
+                assert!(dumped.ends_with("  running"), "{dumped}");
+            }
         }
     }
 

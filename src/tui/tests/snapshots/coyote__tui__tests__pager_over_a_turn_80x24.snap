@@ -1,11 +1,11 @@
 ---
-source: src/tui/mod.rs
+source: src/tui/tests/mod.rs
 expression: "&frame"
 ---
 "Thread: root thread                                                      1-22/34"
 "> count                                                                         "
 "                                                                                "
-"execute_command({"command":"seq 30"})  1.2s  ok                                 "
+"execute_command({"command":"seq 30"})  1s  ok                                   "
 "Call execute_command {"command":"seq 30"}                                       "
 "count 01                                                                        "
 "count 02                                                                        "

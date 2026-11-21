@@ -36,6 +36,7 @@ mod run_now;
 mod sink;
 mod terminal;
 mod theme;
+mod throbber;
 mod todo;
 mod transcript;
 
@@ -51,7 +52,7 @@ use bottom_pane::{
     PaletteSnapshot, PaletteState, PaletteView, RewindTarget, RewindView, SearchState, SearchView,
     View,
 };
-use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow};
+use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow, elapsed_text};
 use child_live::{ChildLive, ChildThread, ToolEnd};
 use command_timing::Timing;
 use composer::Composer;
@@ -87,6 +88,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use theme::{ChromeKind, DIM, Theme, chrome_style, field_background};
+use throbber::{THROBBER_INTERVAL, Tick};
 use todo::TodoPanel;
 use tokio::task::JoinSet;
 use transcript::{Transcript, WHEEL_LINES};
@@ -387,6 +389,9 @@ pub(crate) struct App {
     /// None until it has been drawn.
     origin_area: Option<Rect>,
     clock: Arc<dyn Clock>,
+    /// What the throbber counts its frames from, fixed at start so the
+    /// frame a given instant shows depends on the clock alone.
+    throbber_origin: Instant,
     frames: FrameScheduler,
     renderer: Renderer,
     theme: Theme,
@@ -493,6 +498,7 @@ impl App {
             frame_area: None,
             question_area: None,
             origin_area: None,
+            throbber_origin: clock.now(),
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
@@ -522,6 +528,13 @@ impl App {
 
     pub(crate) fn schedule_frame(&mut self) {
         self.frames.schedule_frame();
+    }
+
+    fn tick(&self) -> Tick {
+        Tick {
+            origin: self.throbber_origin,
+            now: self.clock.now(),
+        }
     }
 
     #[cfg(test)]
@@ -1458,12 +1471,20 @@ impl App {
         }
     }
 
-    /// Whether the pager shows a child with a call or node still running.
-    fn open_child_runs(&self) -> bool {
-        self.pager()
-            .and_then(Pager::child_session)
-            .and_then(|session_id| self.child_live.by_session(session_id))
-            .is_some_and(ChildThread::running)
+    /// Readies the running rows of the child thread on show, if any, for
+    /// the throbber's next frame; whether it has one.
+    fn touch_open_child_running(&mut self) -> bool {
+        let Some(Overlay::Pager(pager)) = self.overlay.as_mut() else {
+            return false;
+        };
+        let running = pager
+            .child_session()
+            .and_then(|session_id| self.child_live.by_session_mut(session_id))
+            .is_some_and(ChildThread::forget_running_lines);
+        if running {
+            pager.child_rows_changed();
+        }
+        running
     }
 
     /// Closes the pager and frees the lines it laid out; a pager opened
@@ -1605,7 +1626,9 @@ impl App {
                 node_type,
                 state,
             } => {
-                self.child_live.node(&agent_id, node_id, node_type, state);
+                let now = self.clock.now();
+                self.child_live
+                    .node(&agent_id, node_id, node_type, state, now);
                 self.child_rows_changed(&agent_id);
             }
             UiMsg::JobStarted { job_id, tool } => self.transcript.start_row(
@@ -1613,7 +1636,9 @@ impl App {
                 Cell::Job {
                     job_id,
                     tool,
-                    row: TaskRow::new(JobStatus::Running),
+                    row: TaskRow::new(JobStatus::Running {
+                        since: self.clock.now(),
+                    }),
                     cache: LineCache::default(),
                 },
                 "job__start",
@@ -1648,7 +1673,9 @@ impl App {
                     Cell::Agent {
                         agent_id,
                         name,
-                        row: TaskRow::new(AgentStatus::Running),
+                        row: TaskRow::new(AgentStatus::Running {
+                            since: self.clock.now(),
+                        }),
                         cache: LineCache::default(),
                     },
                     "agent__spawn",
@@ -1769,11 +1796,13 @@ impl App {
         &cells[..end.min(cells.len())]
     }
 
-    /// Every turn state is dim and the idle hint is italic instead. The
-    /// terminal backend only rewrites cells whose symbol or style changed,
-    /// so a shared style would let a turn's first frame skip the letters
-    /// it has in common with the hint and leave a torn word in the output
-    /// stream. Modifiers survive `NO_COLOR`, so this holds there too.
+    /// Every turn state is dim and the idle hint is italic instead; the
+    /// throbber in front of a turn state is neither, and no hint has its
+    /// glyphs. The terminal backend only rewrites cells whose symbol or
+    /// style changed, so a shared style would let a turn's first frame
+    /// skip the letters it has in common with the hint and leave a torn
+    /// word in the output stream. Modifiers survive `NO_COLOR`, so this
+    /// holds there too.
     fn status_text(&self) -> Option<Line<'static>> {
         if self.exiting {
             return Some(Line::from(Span::styled(
@@ -1794,20 +1823,23 @@ impl App {
             };
             return Some(Line::from(hint_spans(status, &self.theme)));
         };
-        let now = self.clock.now();
-        let secs = |since: Instant| now.duration_since(since).as_secs();
+        let tick = self.tick();
+        let elapsed = |since: Instant| elapsed_text(tick.elapsed(since));
         let state = if let Some(tool) = &turn.tool {
-            format!("Running {tool}")
+            format!(" Working . {} . {tool}", elapsed(turn.started))
         } else if let Some(since) = turn.thinking_since {
-            format!("Thinking for {}s", secs(since))
+            format!(" Thinking for {}", elapsed(since))
         } else {
             format!(
-                "{} . {}s",
+                " {} . {}",
                 turn.busy.as_deref().unwrap_or("Working"),
-                secs(turn.started)
+                elapsed(turn.started)
             )
         };
-        let mut spans = vec![Span::styled(state, self.theme.status_runtime)];
+        let mut spans = vec![
+            Span::styled(tick.frame(), self.theme.throbber),
+            Span::styled(state, self.theme.status_runtime),
+        ];
         if self.prompts.is_empty() && !self.covers_transcript() {
             spans.push(Span::styled("  Esc to interrupt", self.theme.status_key));
         }
@@ -1846,6 +1878,7 @@ impl App {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.frame_area = Some(area);
+        self.renderer.tick = self.tick();
         // Matched on the field, not through `layer`, so the pager can be
         // borrowed beside the transcript and the renderer.
         if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
@@ -1905,7 +1938,7 @@ impl App {
                     state: roster,
                     theme: &self.theme,
                     no_color: self.renderer.no_color,
-                    now: self.clock.now(),
+                    tick: self.renderer.tick,
                 },
                 upper,
             ),
@@ -1988,21 +2021,27 @@ impl App {
         );
     }
 
-    /// Records the draw; while a turn runs the elapsed-time row asks for
-    /// its next tick here, after the scheduler has forgotten the frame
-    /// that was just drawn, and so does an open tasks pop-up for its next
-    /// read, and a child's thread on show while a row of it runs. The
-    /// footer counts tick too while any task runs, unless the pager
+    /// Records the draw and asks for the next tick here, after the
+    /// scheduler has forgotten the frame that was just drawn. While
+    /// anything animates (a turn, a running row of the transcript while
+    /// no child's thread covers it or of the child's thread on show, a
+    /// running task in the tasks pop-up) the throbber's next frame is
+    /// due; the running rows are counted as changed so that frame draws
+    /// them anew. Otherwise an open tasks pop-up asks for its next read,
+    /// and the footer counts tick while any task runs, unless the pager
     /// covers them: an agent reports finished before its join handle
     /// does, and nested spawns send no message. Nothing can spawn while
     /// the counts are zero and no turn runs, so idle stops there.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
-        if self.turn.is_some()
-            || matches!(self.overlay, Some(Overlay::Tasks(_)))
-            || (self.pager().is_none() && self.roster_sources.running_counts() != (0, 0))
-            || self.open_child_runs()
-        {
+        let transcript_shown = self.pager().is_none_or(Pager::shows_root);
+        let rows_run = transcript_shown && self.transcript.touch_running();
+        let child_runs = self.touch_open_child_running();
+        let tasks_run = self.roster_sources.running_counts() != (0, 0);
+        let roster = matches!(self.overlay, Some(Overlay::Tasks(_)));
+        if self.turn.is_some() || rows_run || child_runs || (roster && tasks_run) {
+            self.frames.schedule_frame_in(THROBBER_INTERVAL);
+        } else if roster || (self.pager().is_none() && tasks_run) {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }

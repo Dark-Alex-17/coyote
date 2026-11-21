@@ -4,7 +4,7 @@
 //! file has its messages; only this store has its calls as they happen.
 
 use super::FULL_OUTPUT_BUDGET;
-use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow, ToolStatus};
+use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow};
 use super::sink::ChildNodeState;
 use indexmap::IndexMap;
 use serde_json::Value;
@@ -40,13 +40,16 @@ impl ChildThread {
         &mut self.rows
     }
 
-    /// Whether a call or a node of the child has yet to end.
-    pub(super) fn running(&self) -> bool {
-        self.rows.iter().any(|cell| match cell {
-            Cell::Tool { status, .. } => matches!(status, ToolStatus::Running { .. }),
-            Cell::Node { row, .. } => row.status == NodeStatus::Running,
-            _ => false,
-        })
+    /// Drops the cached lines of every call or node of the child yet to
+    /// end, so the next frame draws its throbber and elapsed time anew;
+    /// whether there was one.
+    pub(super) fn forget_running_lines(&mut self) -> bool {
+        let mut any = false;
+        for cell in self.rows.iter_mut().filter(|cell| cell.running()) {
+            cell.forget_wrapped_lines();
+            any = true;
+        }
+        any
     }
 
     /// The newest row of node `node_id`; a node a graph loops back to has
@@ -176,7 +179,9 @@ impl ChildLive {
         match node {
             Some(node_id) => {
                 if thread.node_row(&node_id).is_none() {
-                    thread.rows.push(Cell::node(node_id.clone(), String::new()));
+                    thread
+                        .rows
+                        .push(Cell::node(node_id.clone(), String::new(), now));
                 }
                 if let Some(row) = thread.node_row(&node_id) {
                     row.calls.push(FoldedCall::running(call_id, name, now));
@@ -272,13 +277,14 @@ impl ChildLive {
         node_id: String,
         node_type: String,
         state: ChildNodeState,
+        now: Instant,
     ) {
         let Some(thread) = self.threads.get_mut(agent_id) else {
             return;
         };
         let status = match state {
             ChildNodeState::Started => {
-                thread.rows.push(Cell::node(node_id, node_type));
+                thread.rows.push(Cell::node(node_id, node_type, now));
                 self.cap_rows(agent_id);
                 return;
             }
