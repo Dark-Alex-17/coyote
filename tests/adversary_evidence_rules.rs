@@ -2644,8 +2644,9 @@ fn the_snapshot_rerun_leaves_the_index_and_refs_alone() {
 }
 
 /// A clean tree takes no snapshot: one worktree for the base and no
-/// snapshot commit. Dirtying it adds the snapshot worktree, and the saved
-/// base run means no base worktree.
+/// snapshot commit. Dirtying it, with the change moved out of the commit so
+/// HEAD is the diff base, adds the snapshot worktree, and the saved base run
+/// means no base worktree.
 #[cfg(unix)]
 #[test]
 fn only_a_dirty_tree_gets_a_snapshot_worktree() {
@@ -2677,6 +2678,7 @@ fn only_a_dirty_tree_gets_a_snapshot_worktree() {
     );
 
     fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
+    git(&repo, &["reset", "-q", &base]);
     let dirty = script(&dir.0, "run_checks.py", "dirtied", &state, &envs);
     assert_eq!(
         (
@@ -3046,6 +3048,130 @@ fn a_stated_red_run_with_a_tree_state_baseline_is_judged_by_its_condition() {
         "{text}"
     );
     assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
+/// The uncommitted change of `uncommitted_change` beside a committed one, so
+/// HEAD is no longer the diff base. Returns `sub` and the diff base.
+#[cfg(unix)]
+fn committed_and_uncommitted_change(dir: &Path) -> (PathBuf, String) {
+    let (repo, sub, base) = uncommitted_change(dir);
+    fs::write(repo.join("feature.txt"), "committed\n").unwrap();
+    git(&repo, &["add", "feature.txt"]);
+    git(&repo, &["commit", "-q", "-m", "feature"]);
+    (sub, base)
+}
+
+/// With commits since the diff base the uncommitted tree is not the whole
+/// change, so no red is rerun on the snapshot: a stray edit to a file that
+/// must stay identical, and a regenerate-then-diff check that a clean
+/// checkout of the live tree would pass, are both compared with the base and
+/// block whether or not a criterion naming them is met.
+#[cfg(unix)]
+#[test]
+fn reds_beside_commits_since_the_diff_base_are_not_rerun_on_the_snapshot() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-beside-commits");
+    let (sub, base) = committed_and_uncommitted_change(&dir.0);
+    let (path, log) = logging_git_path(&dir.0);
+    let protected = "git diff --exit-code -- src.txt";
+    let regenerate = "sh gen.sh && git diff --exit-code";
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty-beside-commits",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [protected, regenerate],
+            "diff_base": base,
+        }),
+        &[("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]],
+    );
+    let results = out["exec_results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("exec_results must be a record list: {out}"));
+    for record in results {
+        assert_eq!(record["exit"], 1, "{out}");
+        assert_eq!(
+            record["baseline"],
+            json!({"status": "regression", "exit": 0,
+                   "note": "the command passed on the diff base, candidate tree dirty beside \
+                            commits since the diff base"}),
+            "{out}"
+        );
+    }
+    assert_eq!(git_calls(&log, "/snapshot"), 0, "{out}");
+
+    let met = judged_state(
+        &[(
+            "c1",
+            "src.txt stays identical: `git diff --exit-code -- src.txt` exits 0",
+            "MET",
+        )],
+        json!([results[0]]),
+    );
+    let unnamed = judged_state(&[("c1", "does c1", "MET")], json!([results[0]]));
+    for (label, state) in [
+        ("beside-commits-met", met),
+        ("beside-commits-unnamed", unnamed),
+    ] {
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.contains(&format!("Verification run `{protected}`"))
+                    && l.ends_with(", candidate tree dirty beside commits since the diff base)")),
+            "{label}: {text}"
+        );
+    }
+}
+
+/// A diff base given as a branch name still lets a dirty tree whose HEAD is
+/// that branch's commit rerun its reds on the snapshot; a diff base that does
+/// not resolve offers no snapshot rerun.
+#[cfg(unix)]
+#[test]
+fn the_snapshot_rerun_resolves_the_diff_base_and_fails_closed() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-symbolic-base");
+    let (repo, sub, _) = uncommitted_change(&dir.0);
+    let branch = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let protected = "git diff --exit-code -- src.txt";
+    let run = |label: &str, diff_base: &str| {
+        script(
+            &dir.0,
+            "run_checks.py",
+            label,
+            &json!({
+                "project_dir": sub.to_string_lossy(),
+                "verification_commands": [protected],
+                "diff_base": diff_base,
+            }),
+            &NO_GIT_CONFIG,
+        )
+    };
+    let out = run("symbolic-base", &branch);
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["status"], "tree-state",
+        "{out}"
+    );
+
+    let out = run("unresolvable-base", "no-such-ref");
+    let baseline = &out["exec_results"][0]["baseline"];
+    assert_eq!(baseline["status"], "not-run", "{out}");
+    assert!(
+        baseline["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("the diff-base worktree could not be created"),
+        "{out}"
+    );
 }
 
 /// A PATH whose first entry is a git shim running the shell `prelude` before
