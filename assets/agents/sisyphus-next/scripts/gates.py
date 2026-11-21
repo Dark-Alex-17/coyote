@@ -4098,8 +4098,8 @@ def build_gauntlet_prompt(state):
                 lines += [f"Settled lanes: {', '.join(green)}"]
     recipe = (state.get("local_run_recipe") or "").strip()
     if adopting:
-        ledger(state, u, f"gauntlet: round {n} reviews the adopted probe-written tests: no probe context, so the round "
-                         "cannot write tests again")
+        ledger(state, u, f"gauntlet: round {n} reviews the adopted probe-written tests: the prompt carries no local-run "
+                         "recipe or usage suites")
     elif state.get("pipeline_size") == "small":
         ledger(state, u, "gauntlet: proportionate review (pipeline small): no probe context")
     elif recipe or truthy(state.get("consumer_surface")):
@@ -4242,6 +4242,7 @@ def _note_probe_written(state, u, n, written, other, deleted, unavailable, unsaf
         known = as_list(state.get("probe_tests"))
         u["probe_tests"] = known + [{"path": p, "round": n} for p in written if {"path": p, "round": n} not in known]
         ledger(state, u, f"probe tests: the probe lane wrote {len(written)} file(s) in round {n}: {', '.join(written)}")
+        _intend_to_add(state, u, written)
     notes = []
     entries = []
     if other:
@@ -4269,6 +4270,19 @@ def _note_probe_written(state, u, n, written, other, deleted, unavailable, unsaf
         u["gauntlet_attention"] = "\n".join(x for x in [u.get("gauntlet_attention", ""), *notes] if x)
 
 
+def _intend_to_add(state, u, paths):
+    """Mark probe-written files intent-to-add, as debt_scan does after a coder round: no coder runs after the last
+    review round, and an untracked file is missing from the `git diff <base>` the reviewers and the declared
+    verification commands read."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    present = [p for p in paths if os.path.isfile(os.path.join(root, p))]
+    if not present:
+        return
+    code, _, err = git(root, "add", "-N", "--", *_literal(present))
+    if code:
+        ledger(state, u, f"probe tests: git add -N failed for {', '.join(present)}: {tail(err.strip(), 200)}")
+
+
 def route_gauntlet(state):
     u = {}
     note_script_error(state, u, "run_gauntlet")
@@ -4294,6 +4308,7 @@ def route_gauntlet(state):
                            "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
         if written:
             rounds[-1]["probe_written"] = written
+        rounds[-1]["tree_after"] = _worktree_tree(state.get("git_root") or state.get("project_dir") or ".")
     merged_lanes = dict(as_dict(state.get("gauntlet_lanes")))
     merged_lanes.update(lanes)
     u.update({"gauntlet_verdict": verdict, "gauntlet_incomplete": incomplete, "gauntlet_lanes": merged_lanes,
@@ -4665,10 +4680,11 @@ def _start_probe_adoption(state, u):
     the ones it did not review starts.
 
     A test still in the worktree and unchanged since that round's tree was reviewed by it, so it is adopted with no
-    extra round. One that differs needs a review round over the tree that holds it, at most ADOPTION_ROUNDS_MAX a
-    run. Past that limit, and for a test that is gone or a tree that cannot be compared, it is recorded as not
-    adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not completed. Either way it is settled and
-    never asked about again."""
+    extra round, and so is one that round's own probe lane wrote and that is unchanged since the round ended: the
+    lane ran it green in a passing round. Any other test that differs needs a review round over the tree that holds
+    it, at most ADOPTION_ROUNDS_MAX a run. Past that limit, and for a test that is gone or a tree that cannot be
+    compared, it is recorded as not adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not completed.
+    Either way it is settled and never asked about again."""
     adoption = as_dict(state.get("probe_adoption"))
     settled = {str(p) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") == "probe"
                for p in as_list(as_dict(s).get("paths"))}
@@ -4687,14 +4703,23 @@ def _start_probe_adoption(state, u):
     reviewed, tree = last.get("code_tree") or "", _worktree_tree(root)
     code, out, _ = git(root, "diff-tree", "-r", "-z", "--name-only", reviewed, tree) if reviewed and tree else (1, "", "")
     changed = set(_nul_names(out))
+    ended = last.get("tree_after") or ""
+    since_code, since_out, _ = (git(root, "diff-tree", "-r", "-z", "--name-only", ended, tree) if ended and tree
+                                else (1, "", ""))
+    ran_green = set() if since_code else set(as_list(last.get("probe_written"))) - set(_nul_names(since_out))
+    basis = f"written and run green by the probe lane in passing round {last.get('round')}"
     adopted = {str(as_dict(a).get("path")): as_dict(a) for a in as_list(adoption.get("adopted"))}
-    newly, pending, gone, unknown = [], [], [], []
+    newly, green, pending, gone, unknown = [], [], [], [], []
     for path, written in latest.items():
         entry = {"path": path, "round": written}
         if not os.path.isfile(os.path.join(root, path)):
             gone.append(entry)
         elif code:
             unknown.append(entry)
+        elif path in changed and path in ran_green:
+            if as_dict(adopted.get(path)).get("round") != written:
+                adopted[path] = {**entry, "reviewed_in": last.get("round"), "basis": basis}
+                green.append(adopted[path])
         elif path in changed:
             pending.append(entry)
         elif as_dict(adopted.get(path)).get("round") != written:
@@ -4707,12 +4732,15 @@ def _start_probe_adoption(state, u):
                (capped, f"the run's limit of {ADOPTION_ROUNDS_MAX} adoption rounds was reached")]
     skipped = [(entries, why) for entries, why in skipped if entries]
     start = bool(pending) and not capped
-    if not (newly or skipped or start):
+    if not (newly or green or skipped or start):
         return False
     update = {**adoption, "adopted": list(adopted.values())}
     if newly:
         ledger(state, u, f"probe tests: adopted {_paths_of(newly)}, unchanged since review round {last.get('round')} "
                          "reviewed them")
+    if green:
+        _intend_to_add(state, u, [a["path"] for a in green])
+        ledger(state, u, f"probe tests: adopted {_paths_of(green)}, {basis} and unchanged since")
     attention = [u.get("gauntlet_attention", state.get("gauntlet_attention")) or ""]
     for entries, why in skipped:
         update["not_adopted"] = list(as_list(update.get("not_adopted"))) + [
@@ -4731,12 +4759,13 @@ def _start_probe_adoption(state, u):
 
 
 def _adopted_groups(adoption):
-    """The adopted tests as (written round, reviewed round, paths), in adoption order."""
+    """The adopted tests as (how each group was reviewed, paths), in adoption order."""
     groups = {}
     for a in as_list(adoption.get("adopted")):
         a = as_dict(a)
-        groups.setdefault((a.get("round"), a.get("reviewed_in")), []).append(str(a.get("path")))
-    return [(r, rv, ", ".join(paths)) for (r, rv), paths in groups.items()]
+        how = a.get("basis") or f"written in round {a.get('round')}, reviewed in round {a.get('reviewed_in')}"
+        groups.setdefault(how, []).append(str(a.get("path")))
+    return [(how, ", ".join(paths)) for how, paths in groups.items()]
 
 
 def _adoption_publish_text(state, u):
@@ -4753,8 +4782,8 @@ def _adoption_publish_text(state, u):
                                    if code or str(as_dict(a).get("path")) in dirty]}
         groups = _adopted_groups(unpublished)
         if groups:
-            text += "\n\n" + " ".join(f"Probe-written tests adopted into the reviewed change (written in round {r}, "
-                                      f"reviewed in round {rv}): {p}." for r, rv, p in groups)
+            text += "\n\n" + " ".join(f"Probe-written tests adopted into the reviewed change ({how}): {p}."
+                                      for how, p in groups)
             text += " Commit them with the task's work."
     other = [as_dict(s) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") in ("other", "deleted")]
     if other:
@@ -6575,8 +6604,7 @@ def _assemble_report(state, u, pre_publish=False):
     lines += [f"- escalated to standard: {as_dict(e).get('why')} ({as_dict(e).get('at')})"
               for e in as_list(g("size_escalations", []))]
     adoption = as_dict(g("probe_adoption", {}))
-    lines += [f"Probe-written tests adopted: {p} (written in round {r}, reviewed in round {rv})"
-              for r, rv, p in _adopted_groups(adoption)]
+    lines += [f"Probe-written tests adopted: {p} ({how})" for how, p in _adopted_groups(adoption)]
     lines += [f"Probe-written tests adoption NOT completed: {_paths_of(as_list(s.get('paths')))} (adoption round "
               f"{s.get('round')} accepted NEEDS-HUMAN; no review round over them passed)"
               for s in map(as_dict, as_list(adoption.get("not_completed")))]

@@ -6610,6 +6610,52 @@ with scenario("scope_size: Narrow, or a Proceed with a note, recomposes the brie
              for a in ("Narrow the scope first (say how): only the api files", "Proceed: but skip the docs")]
     check(name, nexts == ["compose_brief", "compose_brief"], nexts)
 
+# ---------------------------------------------------------------- a passing round's own probe tests
+GREEN_BASIS = "written and run green by the probe lane in passing round 2"
+
+
+def probe_pass_round(name, path):
+    """A scratch repo whose review round 2 passes after its probe lane wrote `path`; (state after route_gauntlet,
+    route_gauntlet's update)."""
+    root = adopt_repo(name)
+    round2 = {"round": 2, "head": "h", "code_tree": gates._worktree_tree(root)}
+    put(root, path)
+    state = base_state(git_root=root, project_dir=root, base_sha=scratch_git(root, "rev-parse", "HEAD"),
+                       round_heads=[{"round": 1, "head": "h", "verdict": "BLOCKED"}, round2],
+                       gauntlet_result=passed + f"\n## Probe-written tests\n- {path}\n")
+    return chain(state, "route_gauntlet")
+
+
+with scenario("probe adoption: a test the passing round's own probe lane wrote, unchanged since, is adopted with no "
+              "adoption round; the publish text and the report say how") as name:
+    st, routed = probe_pass_round("green-a", "tests/green.test.ts")
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, routed["_next"] == "observability_gate" and u.get("_next") == "git_ops"
+          and (u.get("probe_adoption") or {}).get("adopted") == [
+              {"path": "tests/green.test.ts", "round": 2, "reviewed_in": 2, "basis": GREEN_BASIS}]
+          and f"Probe-written tests adopted into the reviewed change ({GREEN_BASIS}): tests/green.test.ts. Commit "
+              "them with the task's work." in u["git_task"]["text"]
+          and f"Probe-written tests adopted: tests/green.test.ts ({GREEN_BASIS})" in u["report"],
+          (u.get("_next"), u.get("probe_adoption"), u.get("decisions")))
+with scenario("probe adoption: a probe-written file is in git diff <base> once route_gauntlet has run") as name:
+    st, _ = probe_pass_round("intent-a", "tests/seen.test.ts")
+    diffed = scratch_git(st["git_root"], "diff", "--name-only", st["base_sha"]).splitlines()
+    check(name, "tests/seen.test.ts" in diffed, diffed)
+with scenario("probe adoption: a test edited after its passing round still gets the adoption round") as name:
+    st, _ = probe_pass_round("edited-a", "tests/edited.test.ts")
+    with open(os.path.join(st["git_root"], "tests/edited.test.ts"), "a") as f:
+        f.write("edited after the round\n")
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/edited.test.ts", "round": 2}],
+          (u.get("_next"), u.get("probe_adoption")))
+with scenario("probe adoption: the adoption round's ledger line says what its prompt omits, not that the probe "
+              "cannot run") as name:
+    u = gates.build_gauntlet_prompt(base_state(probe_adoption={"due": [{"path": "tests/x.test.ts", "round": 2}]},
+                                               round_heads=[{"round": 2, "head": "h", "verdict": "PASS"}]))
+    check(name, any("the prompt carries no local-run recipe or usage suites" in d for d in u["decisions"])
+          and not any("cannot write tests" in d for d in u["decisions"]), u["decisions"])
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
