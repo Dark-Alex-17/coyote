@@ -4510,9 +4510,6 @@ def _repeat_block(state, root, lane, fixes):
     if len(rounds) < 2:
         return "unknown"
     prev, cur = rounds[-2], rounds[-1]
-    if prev.get("review_key") and prev.get("review_key") == cur.get("review_key"):
-        # the same tree, prompt and verification commands: reworded findings are not a new class
-        return "unchanged"
     before = as_list(as_dict(prev.get("lane_blockers")).get(lane))
     after = as_list(as_dict(cur.get("lane_blockers")).get(lane)) or fixes
     if before and _findings_changed(before, after):
