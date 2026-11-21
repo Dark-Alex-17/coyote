@@ -3982,6 +3982,13 @@ def _carried_section(carried, n):
     return "\n".join([CARRIED_HEADER] + [f"- {_carried_line(f, n)}" for f in carried]) if carried else ""
 
 
+def _carried_review_section(carried):
+    """The carried failures worded for the reviewers, so no line tells them they own a failure."""
+    return "\n".join(["Carried-forward test failures (known red tests, each owned by the subtask named on its line; "
+                      "one a later subtask owns is expected to stay red in this review and is not a regression of "
+                      "this change):"] + [f"- {_carried_line(f)}" for f in carried])
+
+
 def _posture(state):
     posture = (state.get("security_posture") or "standard").strip().lower()
     rigor = (state.get("quality_rigor") or "production").strip().lower()
@@ -4089,6 +4096,9 @@ def build_gauntlet_prompt(state):
             over = f" ({capped} more dropped by the cap)" if capped else ""
             ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
     u["review_verification_commands"] = cmds
+    carried = _carried(state) if _subtask_phase(state) else []
+    if carried:
+        lines.append(_carried_review_section(carried))
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if dropped or as_list(state.get("publish_criteria")) or _publish_asks(state)["commit"]:

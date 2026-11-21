@@ -6682,6 +6682,22 @@ with scenario("lane_stuck: the same review_key with reworded findings is unchang
     check(name, gates._repeat_block(base_state(round_heads=heads), SNAP_REPO, "adversary", [A6_OTHER]) == "unchanged"
           and u.get("escalation", {}).get("kind") == "lane_stuck", (u.get("_next"), u.get("lane_block_streak")))
 
+# ---------------------------------------------------------------- carried failures in the subtask review
+LATER_RED = [{"paths": ["tests/later_test.ext"], "owner": 2, "since": 1, "evidence": "expected 3, got 2"}]
+with scenario("build_gauntlet: a subtask review names the carried failures above the plan block, owned by the later "
+              "subtask and not a regression") as name:
+    gp = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=0, subtask_changed_files=["f"],
+                                                carried_failures=LATER_RED))["gauntlet_prompt"].splitlines()
+    at = [i for i, l in enumerate(gp) if l.startswith("Carried-forward test failures")]
+    plan_at = next((i for i, l in enumerate(gp) if l.startswith("Plan / acceptance criteria:")), len(gp))
+    check(name, len(at) == 1 and at[0] < plan_at and "not a regression of this change" in gp[at[0]]
+          and gp[at[0] + 1] == "- tests/later_test.ext (owned by subtask 2, since subtask 1): expected 3, got 2"
+          and "you own this" not in "\n".join(gp), gp)
+with scenario("build_gauntlet: the final whole-task review names no carried failures") as name:
+    gp = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, final_review=True,
+                                                spec_text="AC1", carried_failures=LATER_RED))["gauntlet_prompt"]
+    check(name, "Carried-forward test failures" not in gp and "tests/later_test.ext" not in gp, gp)
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
