@@ -80,6 +80,7 @@ use crate::mesh::trust::{
     Decision, InstancePresence, KeyChangeOutcome, Tier, TrustStore, decode_name_hash, parse_hash,
     row_derives,
 };
+use crate::mesh::upstream::{InterfaceTransitions, UpstreamChange, UpstreamPoll, host_addresses};
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
     mesh_cache_dir, parse_rfc3339,
@@ -789,6 +790,9 @@ pub(crate) struct MeshRuntime {
     interfaces: Mutex<Vec<JoinedInterface>>,
     /// The local rnsd's LAN host count; `None` without an attached `local` entry.
     rnsd_lan: Option<RnsdLanReader>,
+    /// The rnsd TCP interfaces that went offline or came back and the host interfaces
+    /// whose addresses changed, with when, as the interface watcher saw them.
+    interface_transitions: InterfaceTransitions,
     destination: Mutex<DestinationState>,
     /// Held shared for the node's lifetime so no process rotates the key it announces
     /// under; `None` once `shutdown` has released it. Outside `DestinationState` because a
@@ -1096,6 +1100,7 @@ impl MeshRuntime {
             transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
             rnsd_lan,
+            interface_transitions: InterfaceTransitions::default(),
             destination: Mutex::new(DestinationState {
                 dest,
                 hash,
@@ -1750,6 +1755,16 @@ impl MeshRuntime {
     /// Every configured interface with its current state, in config order.
     pub(crate) fn interface_states(&self) -> Vec<InterfaceStatus> {
         self.interface_states.read().clone()
+    }
+
+    /// The interface transitions the watcher recorded this run, newest last.
+    pub(crate) fn interface_transitions(&self) -> &InterfaceTransitions {
+        &self.interface_transitions
+    }
+
+    /// The reader of the attached `local` rnsd's interface stats, when there is one.
+    pub(crate) fn rnsd_reader(&self) -> Option<&RnsdLanReader> {
+        self.rnsd_lan.as_ref()
     }
 
     /// Marks every interface row unreachable and retrying, as the watcher does once a
@@ -4185,6 +4200,13 @@ fn reconcile_tcp_after_lag(
 /// no peer-controlled state: a fixed list from the node's own config, two flags, a
 /// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
 /// when the node or its slot is gone.
+///
+/// Every `UPSTREAM_POLL` the watcher also reads the local rnsd's TCP interfaces and this
+/// host's addresses (`UpstreamPoll`): an rnsd upstream that came back online, or a change
+/// of the host's addresses, leaves everyone who knew this session unable to reach it, so
+/// either is greeted once through `greet`, all of them sharing one budget of
+/// `RECONNECT_GREETINGS_PER_HOUR`, and a poll that finds both greets once. Each
+/// transition is recorded on the node (`interface_transitions`).
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -4203,10 +4225,53 @@ async fn watch_interfaces(
     let Some(mut events) = events else {
         return;
     };
+    let mut upstream = UpstreamPoll::new(host_addresses());
+    let mut upstream_greetings = GreetingBudget::default();
     loop {
         let mut transitions = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
+            () = upstream.tick() => {
+                let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
+                    return;
+                };
+                let change = tokio::select! {
+                    () = cancel.cancelled() => return,
+                    change = upstream.read(
+                        runtime.rnsd_reader(),
+                        host_addresses,
+                        runtime.interface_transitions(),
+                    ) => change,
+                };
+                if change.is_empty() {
+                    continue;
+                }
+                let greeting = tokio::select! {
+                    () = cancel.cancelled() => return,
+                    greeting = greet(&runtime, &mut upstream_greetings, Instant::now()) => greeting,
+                };
+                match upstream_line(&change, &greeting) {
+                    Some(line) => {
+                        match &greeting {
+                            ReconnectGreeting::Failed(err) => warn!(
+                                "Mesh {line} Cause: {}",
+                                redact_hashes(&format!("{err:#}"))
+                            ),
+                            _ => info!("Mesh {line}"),
+                        }
+                        slot.push_idle(IdleNotify {
+                            source: Source::Relay,
+                            text: line.into(),
+                            origin: Origin::Local,
+                            model_note: None,
+                        });
+                    }
+                    None => debug!(
+                        "Mesh saw {change:?}; this session does not announce, so nothing was sent"
+                    ),
+                }
+                continue;
+            }
             received = next_interface_event(&mut events) => match received {
                 Ok(event) => {
                     transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
@@ -4275,18 +4340,9 @@ async fn watch_interfaces(
                     }
                 }
                 Transition::Reconnect => {
-                    let greeting = if !runtime.announce {
-                        ReconnectGreeting::NodeDoesNotAnnounce
-                    } else if greetings.take(Instant::now()) {
-                        tokio::select! {
-                            () = cancel.cancelled() => return,
-                            outcome = runtime.announce_on_connect() => match outcome {
-                                Ok(()) => ReconnectGreeting::Announced,
-                                Err(err) => ReconnectGreeting::Failed(err),
-                            },
-                        }
-                    } else {
-                        ReconnectGreeting::PastCap
+                    let greeting = tokio::select! {
+                        () = cancel.cancelled() => return,
+                        greeting = greet(&runtime, greetings, Instant::now()) => greeting,
                     };
                     let line = reconnect_line(label, &greeting);
                     match &greeting {
@@ -4306,6 +4362,50 @@ async fn watch_interfaces(
             }
         }
     }
+}
+
+/// Greets after a transition that leaves this session unreachable until it announces:
+/// one announce through `announce_on_connect`, skipping the floor and leaving its
+/// reference and the heartbeat clock alone, while `budget` has a greeting left this hour.
+/// A node that does not announce sends nothing and takes nothing from the budget.
+async fn greet(
+    runtime: &MeshRuntime,
+    budget: &mut GreetingBudget,
+    now: Instant,
+) -> ReconnectGreeting {
+    if !runtime.announce {
+        return ReconnectGreeting::NodeDoesNotAnnounce;
+    }
+    if !budget.take(now) {
+        return ReconnectGreeting::PastCap;
+    }
+    match runtime.announce_on_connect().await {
+        Ok(()) => ReconnectGreeting::Announced,
+        Err(err) => ReconnectGreeting::Failed(err),
+    }
+}
+
+/// The idle line for an upstream reconnect of the local rnsd or a change of this host's
+/// network, worded as `reconnect_line` is; a network change names itself when both came
+/// in one poll. `None` for a node that does not announce: nothing changed for its user.
+fn upstream_line(change: &UpstreamChange, greeting: &ReconnectGreeting) -> Option<String> {
+    let subject = if change.network_changed.is_empty() {
+        format!("{} reconnected upstream", change.reconnected.join(" and "))
+    } else {
+        "This host's network changed".to_string()
+    };
+    Some(match greeting {
+        ReconnectGreeting::Announced => {
+            format!("{subject}; announced so other sessions can find this one again")
+        }
+        ReconnectGreeting::PastCap => format!(
+            "{subject} again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+        ),
+        ReconnectGreeting::Failed(_) => format!(
+            "{subject}, but announcing failed; the next heartbeat will announce this session (details in the log)."
+        ),
+        ReconnectGreeting::NodeDoesNotAnnounce => return None,
+    })
 }
 
 /// The idle line for a relay that reconnected, by what became of the announce over it.
@@ -19280,6 +19380,135 @@ mod tests {
             metrics.num_alive_tasks() == 0
         })
         .await;
+    }
+
+    /// The greeting for an upstream reconnect of the local rnsd or a change of this host's
+    /// network: once per transition, under the hourly cap, never moving the floor.
+    mod upstream_greeting_tests {
+        use super::*;
+
+        const RELAY: &str = "TCPInterface[Team Relay/192.168.0.84:4244]";
+
+        fn reconnected() -> UpstreamChange {
+            UpstreamChange {
+                reconnected: vec![RELAY.to_string()],
+                network_changed: Vec::new(),
+            }
+        }
+
+        fn moved() -> UpstreamChange {
+            UpstreamChange {
+                reconnected: vec![RELAY.to_string()],
+                network_changed: vec!["en0".to_string()],
+            }
+        }
+
+        /// The lines read as the reconnect lines do, with a network change naming itself
+        /// when it came with an upstream reconnect, in the user's words only; a node that
+        /// does not announce gets none.
+        #[test]
+        fn the_upstream_and_network_lines_read_in_full() {
+            assert_eq!(
+                upstream_line(&reconnected(), &ReconnectGreeting::Announced).unwrap(),
+                "TCPInterface[Team Relay/192.168.0.84:4244] reconnected upstream; announced so other sessions can find this one again"
+            );
+            assert_eq!(
+                upstream_line(&moved(), &ReconnectGreeting::Announced).unwrap(),
+                "This host's network changed; announced so other sessions can find this one again"
+            );
+            assert_eq!(
+                upstream_line(&moved(), &ReconnectGreeting::PastCap).unwrap(),
+                "This host's network changed again (more than 4 times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+            );
+            let failed = upstream_line(
+                &reconnected(),
+                &ReconnectGreeting::Failed(anyhow!("the transport said no")),
+            )
+            .unwrap();
+            assert_eq!(
+                failed,
+                "TCPInterface[Team Relay/192.168.0.84:4244] reconnected upstream, but announcing failed; the next heartbeat will announce this session (details in the log)."
+            );
+            assert!(upstream_line(&moved(), &ReconnectGreeting::NodeDoesNotAnnounce).is_none());
+            for change in [reconnected(), moved()] {
+                for greeting in [
+                    ReconnectGreeting::Announced,
+                    ReconnectGreeting::PastCap,
+                    ReconnectGreeting::Failed(anyhow!("x")),
+                ] {
+                    let line = upstream_line(&change, &greeting).unwrap();
+                    assert!(line.is_ascii(), "{line}");
+                    for word in ["peer", "node", "owner", "person"] {
+                        assert!(!line.to_lowercase().contains(word), "{word} in {line}");
+                    }
+                }
+            }
+        }
+
+        /// Five transitions in an hour: the first four are greeted with an announce each
+        /// and the fifth is past the cap; none moves the floor's reference, which the
+        /// heartbeat honours too, so its clock is untouched.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn five_transitions_an_hour_greet_four_times_and_leave_the_floor_alone() {
+            install_log_collector();
+            let started = started_runtime("node-upstream-greet").await;
+            let runtime = &started.runtime;
+            let floor = runtime.destination.lock().await.last_announce;
+            assert!(floor.is_some(), "the start announce sets the floor");
+            let hash8 = short(&runtime.current_destination_hash()).to_string();
+            let before = debug_snapshot().len();
+            let mut budget = GreetingBudget::default();
+            let now = Instant::now();
+            let mut greetings = Vec::new();
+            for minute in 0..5 {
+                let greeting =
+                    greet(runtime, &mut budget, now + Duration::from_secs(60 * minute)).await;
+                greetings.push(matches!(greeting, ReconnectGreeting::Announced));
+                if minute == 4 {
+                    assert!(
+                        matches!(greeting, ReconnectGreeting::PastCap),
+                        "{greeting:?}"
+                    );
+                }
+            }
+            assert_eq!(greetings, [true, true, true, true, false]);
+            assert_eq!(
+                announces_since(before, &hash8),
+                RECONNECT_GREETINGS_PER_HOUR
+            );
+            assert_eq!(
+                runtime.destination.lock().await.last_announce,
+                floor,
+                "the floor"
+            );
+            runtime.shutdown().await.unwrap();
+        }
+
+        /// A node that does not announce sends nothing and keeps its budget whole.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_that_does_not_announce_is_not_greeted() {
+            install_log_collector();
+            let started =
+                started_runtime_with("node-upstream-silent", |config| config.announce = false)
+                    .await;
+            let runtime = &started.runtime;
+            let hash8 = short(&runtime.current_destination_hash()).to_string();
+            let before = debug_snapshot().len();
+            let mut budget = GreetingBudget::default();
+            for _ in 0..5 {
+                assert!(matches!(
+                    greet(runtime, &mut budget, Instant::now()).await,
+                    ReconnectGreeting::NodeDoesNotAnnounce
+                ));
+            }
+            assert_eq!(announces_since(before, &hash8), 0);
+            for _ in 0..RECONNECT_GREETINGS_PER_HOUR {
+                assert!(budget.take(Instant::now()), "nothing was taken");
+            }
+            runtime.shutdown().await.unwrap();
+        }
     }
 
     /// Every reconnect of a TCP relay is told, whatever became of the announce over it.

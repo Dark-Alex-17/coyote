@@ -130,6 +130,10 @@ self_update = { version = "0.44", default-features = false, features = [
 qrcode = "0.14"
 tokio-util = "0.7"
 arc-swap = "1.9.2"
+# The host's interface addresses, polled so a move between networks is greeted with an
+# announce. Already in the graph through `coyote-rns-transport`, whose AutoInterface
+# enumerates the same interfaces; the version moves with the transport's.
+if-addrs = "0.15"
 
 # Reticulum transport and LXMF wire format.
 #

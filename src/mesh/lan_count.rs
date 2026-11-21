@@ -245,11 +245,21 @@ fn resolve_target(
     Ok((rpc_endpoint(abstract_sockets, &settings, instance), key))
 }
 
-/// The interface kind, host count and whether it is up, of one entry of rnsd's stats.
+/// The interface name (`Type[name]`), kind, host count and whether it is up, of one entry
+/// of rnsd's stats.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfaceHosts {
+    pub name: String,
     pub kind: String,
     pub hosts: Option<u64>,
+    pub online: bool,
+}
+
+/// One of the local rnsd's TCP client interfaces, its upstream connections, by its
+/// `Type[name]` and whether it was online at the read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RnsdTcpInterface {
+    pub name: String,
     pub online: bool,
 }
 
@@ -279,6 +289,7 @@ impl LanStatsSource for SharedInstanceRpc {
             .interfaces
             .into_iter()
             .map(|stat| InterfaceHosts {
+                name: stat.name,
                 kind: stat.kind,
                 hosts: stat.peers,
                 online: stat.online,
@@ -310,6 +321,11 @@ pub(crate) struct RnsdLanReader {
     /// What the latest read that reached rnsd returned, for a quick read that finds
     /// another read under way.
     last: parking_lot::Mutex<RnsdReading>,
+    /// The TCP client interfaces the latest read that reached rnsd listed, from the same
+    /// answer as `last`; `None` before any read reached rnsd.
+    last_tcp: parking_lot::Mutex<Option<Vec<RnsdTcpInterface>>>,
+    /// How many reads have reached rnsd, so a caller can tell its own read did.
+    answered: std::sync::atomic::AtomicU64,
 }
 
 impl RnsdLanReader {
@@ -337,6 +353,8 @@ impl RnsdLanReader {
             retry_wait,
             target: Mutex::new(RpcTarget::Unresolved),
             last: parking_lot::Mutex::new(RnsdReading::default()),
+            last_tcp: parking_lot::Mutex::new(None),
+            answered: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -400,6 +418,18 @@ impl RnsdLanReader {
                             .any(|entry| entry.kind == TCP_CLIENT_INTERFACE_KIND && entry.online),
                     };
                     *self.last.lock() = reading;
+                    *self.last_tcp.lock() = Some(
+                        entries
+                            .into_iter()
+                            .filter(|entry| entry.kind == TCP_CLIENT_INTERFACE_KIND)
+                            .map(|entry| RnsdTcpInterface {
+                                name: entry.name,
+                                online: entry.online,
+                            })
+                            .collect(),
+                    );
+                    self.answered
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     return reading;
                 }
                 Err(err) if attempt < attempts && (retryable(&err) || not_listening_yet(&err)) => {
@@ -429,6 +459,21 @@ impl RnsdLanReader {
     /// `false` before any read reached it.
     pub(crate) fn relay_online_seen(&self) -> bool {
         self.last.lock().relay_online
+    }
+
+    /// One patient read for the upstream watch: rnsd's TCP client interfaces and whether
+    /// each is online, from the same `interface_stats` answer the count comes from, so
+    /// the LAN row and the relay flag are kept up to date by it too. `None` when the read
+    /// did not reach rnsd (it failed, or rnsd refused the key for the run, in which case
+    /// no call is made).
+    pub(crate) async fn read_tcp_interfaces(&self) -> Option<Vec<RnsdTcpInterface>> {
+        use std::sync::atomic::Ordering;
+        let before = self.answered.load(Ordering::Acquire);
+        self.read().await;
+        if self.answered.load(Ordering::Acquire) == before {
+            return None;
+        }
+        self.last_tcp.lock().clone()
     }
 
     /// Whether the latest read that reached rnsd found an AutoInterface, with no call;
@@ -554,6 +599,7 @@ mod tests {
 
     fn entry(kind: &str, hosts: Option<u64>) -> InterfaceHosts {
         InterfaceHosts {
+            name: format!("{kind}[test]"),
             kind: kind.to_string(),
             hosts,
             online: true,
@@ -702,6 +748,60 @@ mod tests {
             lan_readings(None, &[], Some(&reader), ReadEffort::Quick).await;
             assert_eq!(reader.relay_online_seen(), relay_online);
         }
+    }
+
+    /// The upstream watch's poll on a paused clock, counting rnsd calls: one call per
+    /// `UPSTREAM_POLL` and no sooner, the first one interval after start, each one the
+    /// same `interface_stats` answer that also keeps the LAN row; the offline-to-online
+    /// edge of rnsd's TCP interface between two of them is the reconnect. Once rnsd
+    /// refuses the key, no poll calls again.
+    #[tokio::test(start_paused = true)]
+    async fn the_upstream_poll_reads_rnsd_once_per_interval_and_never_after_a_refused_key() {
+        use crate::mesh::upstream::{InterfaceTransitions, UPSTREAM_POLL, UpstreamPoll};
+        let relay = |online| InterfaceHosts {
+            name: "TCPInterface[Team Relay]".to_string(),
+            ..tcp_client(online)
+        };
+        let dir = keyed_dir("lan-count-upstream-poll");
+        let source = Scripted::new([
+            Ok(vec![auto(0), relay(false)]),
+            Ok(vec![auto(0), relay(true)]),
+            Ok(vec![auto(1), relay(true)]),
+            Ok(vec![auto(1), relay(true)]),
+        ]);
+        let reader = paced_reader_at(&dir.path, source.clone());
+        let transitions = InterfaceTransitions::default();
+        let started = tokio::time::Instant::now();
+        let mut poll = UpstreamPoll::new(None);
+        let mut reconnects = Vec::new();
+        for _ in 0..4 {
+            poll.tick().await;
+            let change = poll.read(Some(&reader), || None, &transitions).await;
+            reconnects.push(change.reconnected.len());
+        }
+        assert_eq!(source.calls(), 4, "one call a poll");
+        assert_eq!(source.asked_at.lock()[0] - started, UPSTREAM_POLL);
+        assert_eq!(source.gaps(), [UPSTREAM_POLL; 3]);
+        assert_eq!(*source.budgets.lock(), [RPC_BUDGET; 4]);
+        assert_eq!(reconnects, [0, 1, 0, 0], "the one offline-to-online edge");
+        assert!(
+            reader.relay_online_seen() && reader.lan_seen(),
+            "the LAN row follows"
+        );
+
+        let dir = keyed_dir("lan-count-upstream-refused");
+        let source = Scripted::new([Err(RpcError::Authentication)]);
+        let reader = paced_reader_at(&dir.path, source.clone());
+        let mut poll = UpstreamPoll::new(None);
+        for _ in 0..5 {
+            poll.tick().await;
+            assert!(
+                poll.read(Some(&reader), || None, &transitions)
+                    .await
+                    .is_empty()
+            );
+        }
+        assert_eq!(source.calls(), 1, "no call after the key was refused");
     }
 
     /// A reader on the real retry wait, at `dir`.

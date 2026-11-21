@@ -1786,6 +1786,7 @@ dependencies = [
  "hnsw_rs",
  "html_to_markdown",
  "http 1.5.0",
+ "if-addrs",
  "image",
  "indexmap 2.14.2",
  "indoc",
