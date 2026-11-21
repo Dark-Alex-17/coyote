@@ -7080,6 +7080,28 @@ with scenario("repeat decisions: review_exhausted answered with the engine's rec
           and st["escalation"]["kind"] == "review_exhausted" and second_prompt == "ask_user"
           and judged["_next"] == "headless_judge", (first_prompt, applied, second_prompt, judged))
 
+# ---------------------------------------------------------------- failure locations from the shared module
+with scenario("failure locations: the gates parse them through the shared module") as name:
+    _locator = gates._failure_locations()
+    _located = gates._verdict_locations(base_state(project_dir=CARRY, git_root=CARRY),
+                                        ["New failures: beta/beta_check.src"])
+    check(name, _locator is not None and os.path.realpath(_locator.__file__)
+          == os.path.realpath(os.path.join(gates.SHARED_DIR, "failure_locations.py"))
+          and [f["paths"] for f in _located] == [["beta/beta_check.src"]], (_locator, _located))
+with scenario("failure locations: with the shared parser unavailable the red test gate blocks unclassified and no "
+              "verdict line locates a path") as name:
+    _real_locator = gates._failure_locations
+    gates._failure_locations = lambda: None
+    try:
+        _cu = sub_step(carry_start(), "route_coder_result")
+        _located = gates._verdict_locations(base_state(project_dir=CARRY, git_root=CARRY),
+                                            ["New failures: beta/beta_check.src"])
+    finally:
+        gates._failure_locations = _real_locator
+    check(name, _cu["_next"] == "compose_fix" and not _cu.get("carried_failures") and _located == []
+          and "unclassified: failure locator unavailable" in _cu.get("last_coder_error", ""),
+          (_cu.get("_next"), _cu.get("last_coder_error"), _located))
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
