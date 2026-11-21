@@ -6440,9 +6440,8 @@ with scenario("base: a passing push check after a base sync -> ci_poll with the 
     check(name, u.get("_next") == "ci_poll" and u.get("base_sync_active") is False and u.get("ci_polls") == 0
           and u.get("base_integrated") == 1 and (u.get("base_facts") or {}).get("decision") == "integrated"
           and green.get("_next") == "base_check" and not os.path.exists(_BASE_READY), (u, green.get("_next")))
-check("base: review_gate never takes the trivial skip during a base sync",
-      gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False,
-                                   base_sync_active=True))["_next"] == "build_gauntlet_prompt")
+_sync_review = gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False, base_sync_active=True))
+check("base: review_gate never takes the trivial skip during a base sync", _sync_review["_next"] == "build_gauntlet_prompt")
 with scenario("base: a PR head that lacks the base tip reads moved even when local HEAD has merged it; without a PR "
               "head the same tree reads fresh") as name:
     stale_run, _bare, _push = base_world("stale-pr-head")

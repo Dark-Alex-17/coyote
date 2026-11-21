@@ -3475,6 +3475,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// the `ci_poll` visit bounds that sit under the engine's per-node cap.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("BASE_FETCH_SECS", "60"),
+    ("BASE_GIT_SECS", "10"),
     ("BASE_SYNC_MAX", "2"),
     ("CHOICE_OPTIONS_MAX", "4"),
     ("CHOICE_OPTIONS_MIN", "2"),
