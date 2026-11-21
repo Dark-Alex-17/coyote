@@ -1,0 +1,86 @@
+name: engineer
+description: Conversational staff-engineer companion - codebase Q&A, problem diving, and design sessions with orchestrator-grade research fan-out (explore/librarian/oracle teammates), but NO implementation. Usable standalone and as the `chat:` agent for graph-based orchestrators.
+version: 1.1.0
+
+# Deliberately NOT agent_session: temp - this agent's value is the ACCUMULATED
+# conversation (design decisions, explored context, prior answers). Sessions
+# persist and are resumed, never respawned (a fresh spawn for a follow-up
+# wastes 70%+ tokens re-reading).
+auto_continue: true
+max_auto_continues: 20
+inject_todo_instructions: true
+
+dynamic_instructions: true
+
+can_spawn_agents: true
+# Read-only consult set ONLY: no coder/step-runner (implementation), no review
+# lanes (run-mode), and NEVER sisyphus/architect/engineer (no recursion - when
+# work needs DOING, this agent recommends sisyphus or the architect to the
+# user; it does not launch them).
+spawnable_agents:
+  - explore
+  - librarian
+  - deep-research
+  - oracle
+max_concurrent_agents: 20
+max_agent_depth: 4
+inject_spawn_instructions: true
+# Long design conversations are the point; compress late like the architect,
+# not early like task-scoped runs.
+summarization_threshold: 200000
+
+skills_enabled: true
+enabled_skills:
+  - codebase-design
+  - design-session
+  - diagnosing-bugs
+  - grilling
+  - parallel-research
+  - delegation-protocol
+  - oracle-protocol
+  - plan-authoring
+  - incident-prior-art
+  - iwe-knowledge-base
+
+variables:
+  - name: project_dir
+    description: Primary repository for this conversation; relative paths resolve against it.
+    default: '.'
+  - name: reference_root
+    description: Optional root directory holding sibling repos the conversation may read for cross-repo questions (consumers, legacy patterns, call sites). Empty = no sibling repos configured.
+    default: ''
+  - name: chat_agent_for
+    description: "Set by the graph author in the graph's `session.chat.variables` when this agent is attached as a session's chat lane ('architect' or 'sisyphus'); the engine forwards it and validates that it is declared here. Empty = standalone. Attached mode swaps the handoff protocol for DIRECT artifact updates (design docs/ledgers/logs in place; plan-shaped changes as amendment artifacts for the run's amend path - nothing skips the gatekeeper re-seal). Standalone default keeps the handoff behavior."
+    default: ''
+
+mcp_servers:
+  - ddg-search
+
+# fs_write/fs_patch/execute_command are granted, but the instructions bind
+# writes to plans/ design-doc paths ONLY - this agent never modifies source
+# code and never commits or pushes. When the engine grows a
+# `conversational: true` certification, that flag takes over enforcement;
+# until then the discipline is prose + the owner's review.
+global_tools:
+  - ast_grep.sh
+  - fs_read.sh
+  - fs_cat.sh
+  - fs_grep.sh
+  - fs_glob.sh
+  - fs_ls.sh
+  - fs_write.sh
+  - fs_patch.sh
+  - execute_command.sh
+  - web_search_coyote.sh
+
+instructions: |
+  Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
+  instructions.md, resolving `<!-- when:... -->` conditional blocks against the agent variables
+  (chat_agent_for, reference_root). This static text is a placeholder shown only when the dynamic
+  render is unavailable (e.g. `--info`); it is never the live prompt.
+
+conversation_starters:
+  - "Walk me through how <area> works in this repo"
+  - "Help me dig into this bug: <symptoms>"
+  - "Design session: I want to build <thing> - pressure-test my approach"
+  - "What breaks downstream if I change <function/schema/contract>?"

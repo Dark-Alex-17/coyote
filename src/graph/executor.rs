@@ -2116,6 +2116,10 @@ nodes:
             "fix_loop_gate.sh",
             &shipped_script("assets/agents/coder/scripts/fix_loop_gate.sh"),
         );
+        ws.write_script(
+            "gate_lib.sh",
+            &shipped_script("assets/agents/coder/scripts/gate_lib.sh"),
+        );
 
         let yaml = r#"
 name: t
@@ -2404,6 +2408,93 @@ nodes:
             "an ASK-free trail renders the empty disclosure: {result}"
         );
         assert!(!result.contains("null"), "never the literal word: {result}");
+    }
+
+    /// The SHIPPED coder graph's planning fault, end to end: when
+    /// `analyze_request` dies, its shipped fallback target hands an empty
+    /// plan naming the fault to the approval gate instead of ending the run
+    /// as CODER_FAILED. The kept nodes come from assets/agents/coder/graph.yaml
+    /// itself, so reverting the fallback edge there fails this test.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_shipped_coder_analyze_request_fault_continues_to_the_approval_gate() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let _autoapprove = crate::testing::EnvVarGuard::unset("CODER_AUTOAPPROVE");
+        let mut graph: serde_yaml::Value =
+            serde_yaml::from_str(&shipped_script("assets/agents/coder/graph.yaml")).unwrap();
+        let shipped_nodes = graph["nodes"].as_mapping().unwrap().clone();
+
+        let mut analyze = shipped_nodes["analyze_request"].clone();
+        let analyze_map = analyze.as_mapping_mut().unwrap();
+        analyze_map.insert("prompt".into(), "{{nope}}".into());
+        analyze_map.remove("tools");
+        let fallback = analyze["fallback"].as_str().unwrap().to_string();
+
+        let mut nodes = serde_yaml::Mapping::new();
+        nodes.insert("analyze_request".into(), analyze);
+        nodes.insert(
+            fallback.as_str().into(),
+            shipped_nodes[fallback.as_str()].clone(),
+        );
+        nodes.insert("end_failure".into(), shipped_nodes["end_failure"].clone());
+        for name in ["gate_approval", "baseline_tests", "route_complexity"] {
+            let output = format!(
+                "{} {{{{plan_summary}}}} | {{{{risks}}}} | {{{{complexity_score}}}}",
+                name.to_uppercase()
+            );
+            let mut end = serde_yaml::Mapping::new();
+            end.insert("type".into(), "end".into());
+            end.insert("output".into(), output.into());
+            nodes.insert(name.into(), end.into());
+        }
+        graph["nodes"] = nodes.into();
+        graph["start"] = "analyze_request".into();
+        graph["initial_state"]["initial_prompt"] =
+            "Make a retried refund idempotent on its reason key in the Python ledger".into();
+
+        let ws = TestWorkspace::new();
+        // A fallback straight to an end node has no script; the run then has
+        // to fail the gate assertion below rather than panic during setup.
+        if let Some(script) = graph["nodes"][fallback.as_str()]["script"].as_str() {
+            if let Some(parent) = std::path::Path::new(script).parent() {
+                fs::create_dir_all(ws.dir.join(parent)).unwrap();
+            }
+            ws.write_script(
+                script,
+                &shipped_script(&format!("assets/agents/coder/{script}")),
+            );
+        }
+
+        let graph: Graph = serde_yaml::from_value(graph).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let rest = result.strip_prefix("GATE_APPROVAL ").unwrap_or_else(|| {
+            panic!("a dead analyze_request must reach the approval gate: {result}")
+        });
+        let parts: Vec<&str> = rest.split(" | ").collect();
+        assert_eq!(parts.len(), 3, "{result}");
+        let (plan_summary, risks, complexity) = (parts[0], parts[1], parts[2]);
+        assert!(
+            plan_summary.contains("Planning ended without a plan"),
+            "{result}"
+        );
+        assert!(
+            plan_summary.contains("LLM node failed"),
+            "the plan quotes the engine's error: {result}"
+        );
+        assert_eq!(complexity.trim(), "7", "{result}");
+        assert!(
+            risks.contains("analyze_request ended without concluding: LLM node failed"),
+            "the risks name the fault: {result}"
+        );
     }
 
     /// Two branches running in the same super-step each carry their own

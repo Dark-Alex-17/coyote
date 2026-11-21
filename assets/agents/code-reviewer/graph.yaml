@@ -30,6 +30,9 @@ variables:
   - name: project_dir
     description: Project directory containing the changes to review
     default: '.'
+  - name: review_grounding
+    description: "'1' grounds the fs read tools in the review checkout: relative paths resolve against project_dir, and a read inside another clone of the same origin repository is refused with the checkout path. Reads in other repositories are unaffected. '0' turns it off."
+    default: '1'
   - name: rigor
     description: Quality bar rigor (poc|prototype|production); empty = resolve from plan frontmatter or default to production
     default: ''
@@ -67,6 +70,8 @@ initial_state:
   bar_provenance: detected-default
   resolved_diff_spec: ''
   changed_files: []
+  generated_files: []
+  generated_notes: []
   file_count: 0
   facts_note: ''
   conventions: ''
@@ -87,6 +92,9 @@ initial_state:
   walkthrough: ''
   changes_rows: []
   findings: []
+  unanchored: []
+  anchor_checked: false
+  anchor_error: ''
   cross_file: ''
   operational_history: ''
   org_context_section: ''
@@ -97,6 +105,7 @@ initial_state:
   final_report: ''
   gate_feedback: ''
   gate_attempts: 0
+  gate_prior_report: ''
   parse_failure: ''
   refine_failure: ''
   aux_failure: ''
@@ -296,6 +305,8 @@ nodes:
       Linter output (extract the lines for your files):
       {{linter_notes}}
       {{extra_context}}
+
+      {{gate_prior_report}}
     max_attempts: 2
     state_updates:
       domain_report: '{{output}}'
@@ -343,7 +354,9 @@ nodes:
       lessons tied to these paths, with dates and links — especially any GUARD present
       in the past that this diff deletes or weakens." Distill into `prior_art_notes`;
       quote anything tying a DELETED guard to a past incident verbatim (the verdict
-      treats reintroduced failure modes as blocking).
+      treats reintroduced failure modes as blocking). Label the notes as context: an
+      incident is a requirement only when the diff deletes or weakens the guard it
+      names, never because the incident exists.
 
       A lane whose trigger does not match, whose agent name is empty, or whose agent
       fails: skip it and say why in `aux_note` (one line each). Never invent lane
@@ -415,17 +428,31 @@ nodes:
         - a diff that contradicts a recorded org decision (org_context_notes) → a
           🔴 CRITICAL finding quoting the decision;
         - a downstream consumer hit on a changed/removed contract element
-          (downstream_notes) → a 🔴 CRITICAL finding naming the consuming repo + file:line;
+          (downstream_notes) -> a 🔴 CRITICAL finding ANCHORED AT THE CHANGED LINE IN THIS
+          DIFF (`file` = the changed file, `lines` = the changed contract element), naming
+          the consuming repo + file:line as evidence in the description;
         - repo-level linter residue that maps to no single file → a finding under the
           owning surface (severity per the linter's own level; buf breaking = 🔴).
+      - **Anchor every finding you can in the diff.** `file` is a changed file of this
+        diff, relative to the checkout, and `lines` is a range inside or next to a changed
+        hunk, copied from the domain report. Never invent or widen a line range. A finding
+        about code outside the diff (a caller or consumer the change breaks, missing code,
+        an unchanged twin) is legitimate: keep it, citing the location it is about. A
+        script notes each finding that does not anchor for the verifier and lists it under
+        "Not anchored in the diff"; it never drops one. Generated files are not reviewed.
+      - **Prior-art and incident notes are context, not requirements.** An incident, alert
+        or prior-PR note from the operational-history lane never becomes a "guard that must
+        remain intact", a finding or an attention flag on its own; it does only when the
+        diff itself deletes or weakens that guard (cite the diff line) or the intent/plan
+        names it. An incident id that appears nowhere in the diff is context only.
       - **Every finding needs**: id (f1, f2, …), severity (icon + word verbatim, e.g.
         "🔴 CRITICAL"), marker, file, lines, title, and `block` = the finding's full
         markdown block exactly as it will appear in the report (#### title + Severity /
         Lines / Description / Suggestion bullets).
       - **attention_flags** (ADDITIVE-ONLY human-attention triggers; scripts add the
         deterministic ones — migrations, auth — separately): money movement or
-        billing-amount computation changes; secrets/cryptography/key handling; a deleted
-        guard the operational-history lane tied to a past incident; a reintroduced
+        billing-amount computation changes; secrets/cryptography/key handling; a guard
+        the diff deletes that the operational-history lane tied to a past incident; a reintroduced
         incident failure mode; a contradicted recorded decision. One short line each.
       - **The placement question**: when the diff adds tolerance for a state its own
         comments/errors call impossible ("should never happen", "defensive"), name the
@@ -510,6 +537,14 @@ nodes:
     state_updates:
       synth_failure: '{{output}}'
     fallback: verdict
+    next: anchor_gate
+
+  anchor_gate:
+    id: anchor_gate
+    type: script
+    description: Advisory anchor check before verification and reporting. A finding is anchored when its file is a reviewed changed file of the diff and one of its cited ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines of deleted lines by their old-side numbers. Every other finding is kept whole, carries the reason as an anchor note for the verifier, and is listed under "Not anchored in the diff"; no finding is dropped or lowered here. A crash keeps the findings and records anchor_error, which verdict.py reports as a pipeline fault.
+    script: scripts/anchor_gate.py
+    timeout: 120
     next: verify
 
   verify:

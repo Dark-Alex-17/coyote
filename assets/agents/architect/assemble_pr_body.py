@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Assemble the single-PR body from the plan, the tasks tree, and a summary file.
+
+Grep-complete where the ground truth is on disk; verbatim where it is judgment:
+
+  summary          --summary-file, pasted verbatim (the Problem/Approach prose)
+  Quality bar      plan frontmatter `rigor:`; the line is emitted only below `production`
+  task checklist   every task dir under --tasks-dir whose index.md belongs to the plan
+                   (`plan:` matches the plan's basename with a trailing `.md` stripped on
+                   both sides, so `PLAN-x` and `PLAN-x.md` name the same plan while a
+                   dotted slug keeps its dots, when the field exists; `status: complete`
+                   when that field exists; only the ids named by `--tasks` when that is
+                   given - a PR group's members), title from frontmatter, commit SHAs
+                   from the log.md `completed` entry
+  Review decisions `rejected-finding:` ledger lines, one entry per tag occurrence
+  Hygiene pass     --hygiene-file verbatim, else `HYGIENE:` ledger lines, else "clean"
+  Design decisions `design-decision` ledger lines
+  Follow-ups       `Follow-ups:` ledger lines as checkboxes (only with --followups)
+
+Ledger lines in log.md are prose, often several tags on one line: an entry runs from its
+tag to the next entry-opening tag on the line, or the end of the line, so an entry can
+carry a trailing clause; markers that qualify an entry (`(deferred by quality bar)`,
+`debris-exempt`, `debt-assigned`) stay in its text. A tag line also owns the block under
+it: each bullet under it is one more entry, an indented non-bullet line continues the
+bullet above it, and the block ends at a blank line, the next `## ` heading, a column-0
+line that is not a bullet (a wrapped prose paragraph), or the next entry-opening line.
+That is how a bare `Follow-ups:` line with its bullets below is read. The body is a draft
+the caller reviews before `gh pr create`, never posted blind. Anything that cannot be
+derived is reported as a NOTE and left visible in the body (never silently omitted) so a
+hand fix is a local edit, not a rewrite.
+"""
+import argparse
+import os
+import re
+import sys
+
+import plan_tasks
+from plan_tasks import frontmatter, plan_identity, read
+
+# A bare token needs a hex letter, so dates and counts never read as SHAs; an
+# all-digit token counts only where the log marks it as a commit.
+SHA_RE = re.compile(
+    r"(?:(?<=@ )|(?<=(?i:commit) ))[0-9]{7,40}\b"
+    r"|(?<=`)[0-9]{7,40}(?=`)"
+    r"|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"
+)
+HEX_WORDS = {"deadbeef", "cafebabe"}
+# Tags that open an entry; an entry stops at the next of these on its line or below it.
+ENTRY_TAGS = ("rejected-finding:", "design-decision", "Follow-ups:", "HYGIENE:")
+BULLET_RE = re.compile(r"^\s*[-*]\s+")
+
+
+def note(msg):
+    print(f"assemble_pr_body: NOTE {msg}", file=sys.stderr)
+
+
+def find_tasks(tasks_dir, plan_id, only=None):
+    """[(task_id, title, dir)] for the plan's complete tasks, in task order (number, then
+    suffix). With `only` (a set of task ids) the checklist keeps those ids alone and any
+    listed id that is missing or not complete is a NOTE."""
+    rows, missing = plan_tasks.walk_tasks(tasks_dir, plan_id, only)
+    found, skipped = [], []
+    for task_id, fm, root in rows:
+        base = plan_tasks.label(root)
+        if fm is None:
+            note(plan_tasks.unreadable_note(base))
+            continue
+        absent = plan_tasks.absent_fields(fm)
+        if absent:
+            note(plan_tasks.fieldless_note(base, absent))
+        if not plan_tasks.is_complete(fm):
+            skipped.append(f"{base} (status: {fm.get('status', '')})")
+            continue
+        title = fm.get("title", "")
+        if not title:
+            m = re.search(r"^#\s+(.+?)\s*$", read(os.path.join(root, "index.md")), re.M)
+            title = m.group(1) if m else "(untitled - index.md has no title)"
+            note(f"{base}: no `title:` frontmatter; used {'the H1' if m else 'a placeholder'}")
+        found.append((task_id, title, root))
+    if skipped:
+        note("excluded from the checklist (not `status: complete`): " + ", ".join(skipped))
+    if missing:
+        note(plan_tasks.missing_note(missing))
+    return found
+
+
+def completed_shas(log_text):
+    """Hex SHAs from the `completed` entry: the `## ... completed` section when the log
+    uses H2 entries, else lines that open with `completed`."""
+    sections, cur, in_completed = [], [], False
+    for line in log_text.splitlines():
+        if line.startswith("## "):
+            if in_completed:
+                sections.append("\n".join(cur))
+            in_completed = "completed" in line.lower()
+            cur = []
+        elif in_completed:
+            cur.append(line)
+    if in_completed:
+        sections.append("\n".join(cur))
+    if not sections:
+        sections = [l for l in log_text.splitlines() if l.lower().startswith("completed")]
+    seen, out = set(), []
+    for s in sections:
+        for sha in SHA_RE.findall(s):
+            if sha in HEX_WORDS or sha in seen:
+                continue
+            seen.add(sha)
+            out.append(sha)
+    return out
+
+
+def is_bullet(line):
+    return BULLET_RE.match(line) is not None
+
+
+def ends_block(line):
+    if not line.strip() or line.startswith("## "):
+        return True
+    if not is_bullet(line) and not line[0].isspace():
+        return True
+    head = BULLET_RE.sub("", line).lstrip()
+    return any(head.startswith(t) for t in ENTRY_TAGS)
+
+
+def ledger_entries(tasks, tag):
+    """[(task_id, text)] - one entry per tag occurrence across the tasks' log.md files,
+    plus one per bullet of the block under a tag line; an indented non-bullet line is
+    a wrapped continuation of the entry above it."""
+    others = [t for t in ENTRY_TAGS if t != tag]
+    entries = []
+    for task_id, _title, root in tasks:
+        path = os.path.join(root, "log.md")
+        if not os.path.isfile(path):
+            continue
+        lines = read(path).splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if tag not in line:
+                continue
+            found = []
+            for part in line.split(tag)[1:]:
+                cuts = [part.find(o) for o in others if part.find(o) >= 0]
+                if cuts:
+                    part = part[: min(cuts)]
+                text = re.sub(r"^[\s:\u2014\u2013-]+", "", part).strip()
+                if text:
+                    found.append(text)
+            while i < len(lines) and not ends_block(lines[i]):
+                if is_bullet(lines[i]):
+                    text = BULLET_RE.sub("", lines[i]).strip()
+                    if text:
+                        found.append(text)
+                elif found:
+                    found[-1] = f"{found[-1]} {lines[i].strip()}"
+                else:
+                    found.append(lines[i].strip())
+                i += 1
+            if not found:
+                note(f"{task_id}: {tag} tag with nothing under it")
+            entries.extend((task_id, text) for text in found)
+    return entries
+
+
+def bullets(entries, box=""):
+    return "\n".join(f"- {box}({t}) {text}" for t, text in entries)
+
+
+def main():
+    # The body is UTF-8 with LF line ends whatever the host locale (ledger lines
+    # carry the severity glyphs verbatim and tools.sh hands the text on as-is),
+    # and an unencodable glyph is escaped rather than a traceback.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", newline="\n")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--plan", required=True, help="PLAN-<slug>.md (rigor from frontmatter; its name, `.md` stripped, filters tasks)")
+    ap.add_argument("--tasks-dir", required=True, help="tree searched recursively for TASK-NNN-*/index.md")
+    ap.add_argument("--tasks", help="comma-separated task ids (TASK-a,TASK-b); keeps only those in the checklist and ledger rollups - a PR group's members")
+    ap.add_argument("--summary-file", required=True, help="file holding the Problem/Approach summary, pasted verbatim")
+    ap.add_argument("--hygiene-file", help="file holding the kept HYGIENE items, pasted verbatim (else derived from `HYGIENE:` ledger lines)")
+    ap.add_argument("--quality-note", default="", help="text appended to the Quality bar line (e.g. deferred-hardening task ids)")
+    ap.add_argument("--followups", action="store_true", help="append a `## Follow-up / manual actions` section from `Follow-ups:` ledger lines")
+    ap.add_argument("--out", help="also write the body to this file")
+    args = ap.parse_args()
+    only = plan_tasks.task_filter(ap, args.tasks)
+
+    for p in (args.plan, args.summary_file) + ((args.hygiene_file,) if args.hygiene_file else ()):
+        if not os.path.isfile(p):
+            sys.exit(f"assemble_pr_body: file not found: {p}")
+    if not os.path.isdir(args.tasks_dir):
+        sys.exit(f"assemble_pr_body: tasks dir not found: {args.tasks_dir}")
+
+    plan_base = os.path.basename(args.plan)
+    plan_fm = frontmatter(read(args.plan))
+    tasks = find_tasks(args.tasks_dir, plan_identity(args.plan), only)
+    if not tasks:
+        note(f"no tasks under {args.tasks_dir} belong to {plan_base} - checklist left empty")
+
+    out = [read(args.summary_file).strip(), ""]
+
+    rigor = plan_fm.get("rigor", "")
+    if not rigor:
+        note("plan frontmatter has no `rigor:`; Quality bar line omitted - add it by hand if rigor is below production")
+    elif rigor != "production":
+        line = f"**Quality bar:** {rigor}"
+        if args.quality_note:
+            line += f" - {args.quality_note}"
+        out += [line, ""]
+
+    out.append("## Tasks")
+    for task_id, title, root in tasks:
+        log_path = os.path.join(root, "log.md")
+        shas = completed_shas(read(log_path)) if os.path.isfile(log_path) else []
+        if not shas:
+            note(f"{task_id}: no commit SHAs in the log.md `completed` entry")
+            sha_text = "commit SHAs: none recorded in log.md"
+        else:
+            sha_text = ", ".join(f"`{s}`" for s in shas)
+        out.append(f"- [x] {task_id} - {title} ({sha_text})")
+    out.append("")
+
+    rejected = ledger_entries(tasks, "rejected-finding:")
+    if rejected:
+        out += ["## Review decisions", bullets(rejected), ""]
+
+    out.append("## Hygiene pass")
+    if args.hygiene_file:
+        out.append(read(args.hygiene_file).strip())
+    else:
+        hyg = ledger_entries(tasks, "HYGIENE:")
+        out.append(bullets(hyg) if hyg else "clean")
+    out.append("")
+
+    design = ledger_entries(tasks, "design-decision")
+    if design:
+        out += ["## Design decisions", bullets(design), ""]
+
+    if args.followups:
+        fu = ledger_entries(tasks, "Follow-ups:")
+        out += ["## Follow-up / manual actions", bullets(fu, box="[ ] ") if fu else "None.", ""]
+
+    body = "\n".join(out).rstrip() + "\n"
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
+    sys.stdout.write(body)
+
+
+if __name__ == "__main__":
+    main()

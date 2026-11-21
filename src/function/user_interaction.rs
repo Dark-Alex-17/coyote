@@ -471,6 +471,27 @@ mod tests {
     }
 
     #[test]
+    fn headless_guidance_matches_the_next_agents_python_copies() {
+        let line = format!("\nHEADLESS_GUIDANCE = \"{HEADLESS_GUIDANCE}\"\n");
+        for (agent, lib) in [
+            (
+                "architect-next",
+                include_str!("../../assets/agents/architect-next/scripts/_lib.py"),
+            ),
+            (
+                "sisyphus-next",
+                include_str!("../../assets/agents/sisyphus-next/scripts/_lib.py"),
+            ),
+        ] {
+            assert_eq!(
+                lib.matches(&line).count(),
+                1,
+                "{agent}/scripts/_lib.py must define HEADLESS_GUIDANCE as the engine's text"
+            );
+        }
+    }
+
+    #[test]
     fn headless_default_line_for_prose_tools_has_no_node_and_null_answer() {
         assert_eq!(
             headless_default_line(None, "user__select", None),

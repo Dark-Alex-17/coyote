@@ -50,9 +50,12 @@ flowchart TD
     verify_build -->|"fail"| fix_loop_gate
     verify_build -. "script crashed" .-> fix_loop_gate
     verify_tests{"verify_tests<br/>script"}
-    verify_tests -->|"pass"| edge_case_sweep
+    verify_tests -->|"pass"| debt_scan
     verify_tests -->|"fail"| fix_loop_gate
     verify_tests -. "script crashed" .-> fix_loop_gate
+    debt_scan{"debt_scan<br/>script"}
+    debt_scan --> edge_case_sweep
+    debt_scan -. "script crashed" .-> edge_case_sweep
     fix_loop_gate{"fix_loop_gate<br/>script"}
     fix_loop_gate -->|"budget left"| implement
     fix_loop_gate -->|"budget spent"| end_failure
@@ -75,6 +78,7 @@ flowchart TD
     check_handoff{"check_handoff<br/>script"}
     check_handoff -->|"schema valid"| gate_user_review
     check_handoff -->|"one retry"| write_handoff
+    check_handoff -->|"failed twice"| end_failure
     gate_user_review{{"gate_user_review<br/>approval"}}
     gate_user_review -->|"approve"| end_success
     gate_user_review -->|"revise"| get_revision
@@ -102,17 +106,33 @@ End nodes emit sentinel outcomes for the caller:
   exhausted, a verification gate crashed twice (rendered as `Verification
   gate error:`), the handoff failed validation twice, or an orient/handoff
   LLM fault was recorded (rendered as `Pipeline fault:` in the output), or a
-  routing gate (`route_staleness`/`route_sweep`/`route_review`) crashed
-  (rendered as `Last script error:`).
+  script node whose fallback is `end_failure` crashed: a routing gate
+  (`route_staleness`/`route_sweep`/`route_review`), `resolve_step`,
+  `route_coder_result`, `fix_loop_gate`, `check_handoff` or `note_llm_fault`
+  (rendered as `Last script error:`). That section shows the most recent
+  script crash of the run, so a `debt_scan` crash earlier in the run can
+  still appear there when the step later fails for another reason.
 
-The edge-case sweep also derives the step's debt list mechanically rather
-than trusting the coder's summary: after `git ls-files --others
---exclude-standard -z | xargs -0 -r git add -N --` (so every file the coder
-created counts, listed or not, while `.gitignore` keeps build artefacts out)
-it greps the step diff's added lines for `#[allow(`, `#![allow(`, `#[expect(`,
-`#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` and `#[ignore` (a
-`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped), plus any
-env-gated or opt-in test. A marker
+The step's debt list is derived mechanically rather than trusted from the
+coder's summary: a deterministic `debt_scan` script node (a thin shim over
+the shared `agents/.shared/debt_scan.py`, the same scanner Sisyphus's
+`debt_scan` tool runs) intent-to-adds the coder's untracked files (so every
+file the coder created counts, listed or not, while `.gitignore` keeps build
+artefacts out), diffs against the step base with `--no-color --no-ext-diff`,
+and reports one `<file>:<line> -- <added line>` per `#[allow(`, `#![allow(`,
+`#[expect(`, `#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` or
+`#[ignore` on an ADDED line, with real positions already resolved (a
+`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped). The scan
+fails open: on any error the sweep sees a `DEBT_SCAN_FAILED` report quoting
+the manual pipeline to run by hand, and a crash of the shim itself falls
+forward on the node's `fallback:` edge to that same sweep: on the FIRST pass
+with the initial-state `DEBT_SCAN_FAILED` default still in `debt_hits`, and
+on a later pass (the review loop re-enters `implement`, so the scan re-runs)
+with the previous pass's report still there plus the engine's
+`last_script_error` rendered as the prompt's `## Debt scan status` line,
+which tells the sweep to treat that report as `DEBT_SCAN_FAILED`. Either
+way the step never fails after build and tests went green. The edge-case
+sweep adds any env-gated or opt-in test the coder introduced. A marker
 with no same-line comment naming its owning task is a finding; since the
 sweep has no edge back to the coder, it lists each one under
 `Debt left behind:` in the handoff's Notes for next step and in the
@@ -140,7 +160,9 @@ Node crashes degrade the run visibly instead of masquerading as success:
 - `route_staleness`, `route_sweep` and `route_review` crashes end as
   `STEP_FAILED` with the engine's error under `Last script error:`. A routing
   gate that died has decided nothing, so the run does not proceed as if it
-  had chosen the optimistic branch.
+  had chosen the optimistic branch. `resolve_step`, `route_coder_result`,
+  `fix_loop_gate`, `check_handoff` and `note_llm_fault` crashes end the same
+  way.
 - `orient` and `write_handoff` faults route through `note_llm_fault`, which
   distills the engine's failure text into a `fault_note` rendered in the
   `STEP_FAILED` output — never an empty shell.
@@ -186,8 +208,7 @@ does not propagate to the spawned coder.
   parallel agents sharing one target directory serialise their gate runs
   (the spawned coder's own gates inherit the prefix: parent agent variables
   are cloned into the child; its ad-hoc cargo calls are not covered). The
-  whole gate
-  command runs under the prefix as one unit. Waiting on the lock counts
+  whole gate command runs under the prefix as one unit. Waiting on the lock counts
   toward the gate node's timeout (300 s format/lint, 600 s build, 1200 s
   tests), so prefer `flock -w <secs>` or raise those timeouts when runs are
   long. A gate killed by its timeout while still waiting leaves the lock
