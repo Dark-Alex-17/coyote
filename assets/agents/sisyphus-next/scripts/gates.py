@@ -1924,6 +1924,15 @@ PLAN_DEFECT_STOP = "Stop; the plan needs amending (report it)"
 SCOPE_PROCEED = "Proceed"
 SCOPE_NARROW = "Narrow the scope first (say how)"
 
+PROBE_SUPPLY = "Supply it and re-run the probe (say what to provide)"
+PROBE_SURFACE = "Surface the gap and proceed"
+SCOPE_SERIALIZE = "Serialize: finish in-scope work only; the breaching edit waits for the owner"
+SCOPE_REDECLARE = "Proceed: scope re-declared to include these files"
+YELLOW_FIX = "Fix it"
+YELLOW_ACCEPT = "Accept it (recorded)"
+DESIGN_ADOPT = "Adopt the pattern (one more coder round introduces it)"
+DESIGN_KEEP = "Keep the code as shipped (answer recorded, no change)"
+
 # The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
 ACCEPTED_INSTRUCTIONS = {
     "clarify": ("answer",),
@@ -1952,12 +1961,12 @@ INSTRUCTION_HELP = {
     "scope": "narrow the change before it is implemented, as described; value: how to narrow it",
     "here": "do the work in this run anyway; value: the reason",
 }
-# How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
-# the owner's own words verbatim.
+# How an applied text instruction reads as an answer, with the owner's own words verbatim. A shape that stands for an
+# option names that option with the words as its note, since apply_answer reads a reply only by the option it names.
 INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}",
-                       "amendment": "Continue; treat the criterion as amended: {}", "fix": PLAN_DEFECT_FIX + ": {}",
-                       "recipe": "Supply it: {}",
-                       "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}",
+                       "amendment": PLAN_DEFECT_CONTINUE + ": {}", "fix": PLAN_DEFECT_FIX + ": {}",
+                       "recipe": PROBE_SUPPLY + ": {}",
+                       "rescope": SCOPE_REDECLARE + ": {}", "narrow": SIZING_NARROW_PREFIX + "{}",
                        "here": SIZING_HERE_REASON + ": {}", "scope": SCOPE_NARROW + ": {}"}
 FREE_FORM_SHAPES = ("answer", "design", "amendment", "fix", "recipe", "rescope", "narrow", "here", "scope")
 
@@ -2232,20 +2241,36 @@ def choice_reask(state):
     return u
 
 
-def _answered(state, choices, default=None):
-    """The key whose words the answer starts with, else the first key whose words it contains, else default.
+def _answered(state, choices):
+    """The key whose words the named option's text starts with, else the first key whose words it contains; None for
+    an answer that names no option (its number, its exact text, or "<option>: <note>").
 
-    An answer naming an option is read by that option's text alone, so a note after it cannot outvote the pick."""
+    Only the option's text is read, so neither free text nor a note after the pick is matched on its words."""
     ans = (state.get("last_answer") or "").strip()
     named = _named_option(ans, as_dict(state.get("escalation")).get("options") or [])
-    said = (named or ans).lower()
-    for key, words in choices.items():
-        if any(said.startswith(w) for w in words):
-            return key
-    for key, words in choices.items():
-        if any(w in said for w in words):
-            return key
-    return default
+    if not named:
+        return None
+    low = named.lower()
+    return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
+            or next((k for k, words in choices.items() if any(w in low for w in words)), None))
+
+
+def _unmatched(state, u, esc, answer, exhausted=None):
+    """An answer that names no option goes to interpret_reply once per question, then is asked again.
+
+    The one-shot flag lives in the escalation's own data, since parse_answer resets reply_interpreted before
+    apply_answer runs."""
+    data = as_dict(esc.get("data"))
+    if truthy(data.get("reply_read")):
+        _reask_unmatched(state, u, esc, answer, exhausted=exhausted)
+        return
+    kind = esc.get("kind", "")
+    author = "navigator" if state.get("answer_source") == "navigator" else "owner"
+    u.update({"escalation": {**esc, "data": {**data, "reply_read": True}}, "last_answer_text": answer,
+              "reply_accepts": _accepts_text(kind), "reply_author": author, "reply_interpreted": False,
+              "reply_source": "navigator" if author == "navigator" else ""})
+    ledger(state, u, f"apply_answer: {kind}: {tail(answer, 200)!r} names no option -> interpret")
+    u["_next"] = "interpret_reply"
 
 
 STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and report", "stop and report")
@@ -2348,10 +2373,6 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
     return u
 
 
-_CONTINUE_WORD_RE = re.compile(r"\b(?:continue|treat|amendment|amended|proceed|advance)\b")
-_STOP_WORD_RE = re.compile(r"\b(?:stop|abort|halt|discontinue)")
-
-
 def _plan_criteria(state):
     """The criteria a plan_defect amendment would change: the current subtask's criteria and amendments in the
     subtask phase, else spec_text, else (the final review) every subtask's."""
@@ -2368,15 +2389,6 @@ def _unlisted_commands(text, criteria):
     not quote verbatim as a whole command."""
     return [c for c in re.findall(r"`([^`\n]+)`", text or "") if len(c.split()) >= 2
             and not re.search(r"(?<![^\s`])" + re.escape(c.strip()) + r"(?![^\s`])", criteria or "")]
-
-
-def _says_continue(said):
-    """The first continue word decides: it continues unless a negation precedes it in its clause."""
-    for clause in re.split(r"[.;,:!?()\n\u2014\u2013]|\s-\s", said.replace("\u2019", "'")):
-        m = _CONTINUE_WORD_RE.search(clause)
-        if m:
-            return not _NOT_RE.search(clause[:m.start()])
-    return False
 
 
 def apply_answer(state):
@@ -2537,7 +2549,7 @@ def apply_answer(state):
     elif kind == "oracle_fault":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "proceed": ["proceed"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "retry":
             u["oracle_retries"] = as_int(state.get("oracle_retries")) + 1
             u["_next"] = "consult_oracle"
@@ -2582,7 +2594,8 @@ def apply_answer(state):
         ledger(state, u, f"design-decision: {q} -> {answer}")
         data = as_dict(esc.get("data"))
         adopted = list(as_list(data.get("adopted")))
-        if _answered(state, {"adopt": ["adopt", "yes", "introduce"]}, None) == "adopt":
+        # the question accepts the owner's own words as its answer, so anything but the Adopt option is recorded only
+        if _named_option(answer, options) == DESIGN_ADOPT:
             adopted.append(f"{q} -> {answer}")
         remaining = [a for a in as_list(data.get("remaining")) if isinstance(a, str) and a.strip()]
         if remaining:
@@ -2597,8 +2610,10 @@ def apply_answer(state):
             u["design_asks"] = []
             u["_next"] = "review_gate"
     elif kind == "yellow_findings":
-        a = _answered(state, {"fix": ["fix"], "accept": ["accept"]}, "fix")
-        if a == "fix":
+        a = _answered(state, {"fix": ["fix"], "accept": ["accept"]})
+        if a is None:
+            _unmatched(state, u, esc, answer)
+        elif a == "fix":
             u["fix_source"] = "review"
             u["_next"] = "compose_fix"
         else:
@@ -2606,15 +2621,13 @@ def apply_answer(state):
                 f"Accepted without fix at the user's say-so: {tail(esc.get('evidence', ''), 300)}"]
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "plan_defect":
-        # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a reply that is or leads
-        # with a stop stops; a reply negating its continue ("do not proceed") stops; one naming no side is asked again
         named = _named_option(answer, options)
-        said = (named or answer).strip().lower()
-        leads_stop = stop or said.startswith(("stop", "abort"))
-        a = "continue" if _says_continue(said) and not leads_stop else "stop"
         used = as_int(state.get("plan_defect_continues"))
         reason = _stated_reason(answer, options)
-        if named == PLAN_DEFECT_ACCEPT:
+        if stop or named == PLAN_DEFECT_STOP:
+            u["failure_reason"] = f"the plan itself is the root cause of a conformance failure; the user chose to stop: {answer}"
+            u["_next"] = "end_blocked"
+        elif named == PLAN_DEFECT_ACCEPT:
             why = (esc.get("evidence") or "(no finding recorded)") if reason == NO_STATED_REASON else reason
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Plan defect accepted unresolved at the user's say-so: {why}"]
@@ -2629,9 +2642,7 @@ def apply_answer(state):
                              + (", past the cap at the user's pick" if used + 1 > STRIKE_LIMIT else "")
                              + f"): {tail(fix, 300)}")
             u["_next"] = "compose_fix"
-        elif not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
-            _reask_unmatched(state, u, esc, answer, "says neither stop nor continue")
-        elif a == "continue":
+        elif named == PLAN_DEFECT_CONTINUE:
             u["plan_defect_continues"] = used + 1
             unlisted = []
             if reason == NO_STATED_REASON:
@@ -2662,13 +2673,15 @@ def apply_answer(state):
                 ledger(state, u, f"plan amendment ({tag}): {answer}")
             u["_next"] = "build_gauntlet_prompt"
         else:
-            u["failure_reason"] = f"the plan itself is the root cause of a conformance failure; the user chose to stop: {answer}"
-            u["_next"] = "end_blocked"
+            _unmatched(state, u, esc, answer)
     elif kind == "probe_gap":
-        a = _answered(state, {"supply": ["supply", "provide"], "surface": ["surface", "proceed"]}, "surface")
-        if a == "supply":
+        a = _answered(state, {"supply": ["supply", "provide"], "surface": ["surface", "proceed"]})
+        if a is None:
+            _unmatched(state, u, esc, answer)
+        elif a == "supply":
+            reason = _stated_reason(answer, options)
             u["fix_source"] = "probe_gap"
-            u["fix_note"] = answer
+            u["fix_note"] = answer if reason == NO_STATED_REASON else reason
             u["_next"] = "compose_fix"
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
@@ -2678,7 +2691,7 @@ def apply_answer(state):
     elif kind == "review_incomplete":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "accept": ["accept"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "retry":
             u["_next"] = "build_gauntlet_prompt"
         elif a == "accept":
@@ -2702,8 +2715,9 @@ def apply_answer(state):
                                                    "proceed": ["proceed without"]})
         # a strikeout's way on is proceeding without its change, the others' is accepting the findings
         onward = "proceed" if kind == "strikeout" else "accept"
-        if a is None or (a in ("accept", "proceed") and a != onward) \
-                or (a == "proceed" and not _strikeout_can_proceed(state)):
+        if a is None:
+            _unmatched(state, u, esc, answer)
+        elif (a in ("accept", "proceed") and a != onward) or (a == "proceed" and not _strikeout_can_proceed(state)):
             _reask_unmatched(state, u, esc, answer)
         elif a == "round":
             rounds = as_int(state.get("strikeout_rounds")) + 1
@@ -2729,8 +2743,10 @@ def apply_answer(state):
             u["_next"] = "end_aborted"
     elif kind == "scope_breach":
         a = "abort" if stop else _answered(state, {"proceed": ["proceed", "re-scope", "rescope"],
-                                                   "serialize": ["serialize", "in-scope"]}, "serialize")
-        if a == "abort":
+                                                   "serialize": ["serialize", "in-scope"]})
+        if a is None:
+            _unmatched(state, u, esc, answer)
+        elif a == "abort":
             u["failure_reason"] = "aborted: scope breach could not be resolved"
             u["_next"] = "end_aborted"
         else:
@@ -2740,7 +2756,9 @@ def apply_answer(state):
                 extra.append(f"Do NOT edit files outside this task's declared scope ({state.get('scope_breach', '')}); "
                              "report the remaining edit as a follow-up for the parent to serialize.")
             else:
-                extra.append(f"Scope re-declared by the parent to include: {answer}")
+                reason = _stated_reason(answer, options)
+                scope = state.get("scope_breach", "") if reason == NO_STATED_REASON else reason
+                extra.append(f"Scope re-declared by the parent to include: {scope}")
             brief["must_not_do_extra"] = extra
             u["coder_brief"] = brief
             u["scope_breach"] = ""
@@ -2749,7 +2767,7 @@ def apply_answer(state):
         a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"], "fix": ["resume", "coder", "fix"],
                               "leave": ["leave", "draft", "report", "stop"]})
         if a is None and not stop:
-            _reask_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "rerun" and not stop:
             _reset_ci_watch(u)
             u["_next"] = "ci_poll"
@@ -2774,7 +2792,7 @@ def apply_answer(state):
                               "green": ["treat as green", "finish without ci"],
                               "leave": ["leave", "draft", "report", "stop"]})
         if a is None and not stop:
-            _reask_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "rerun" and not stop:
             root = state.get("git_root") or state.get("project_dir") or "."
             done = [str(r) for r in as_list(state.get("ci_rerun_ids"))]
@@ -2822,30 +2840,32 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR left in draft with CI {status}: {non_pass}"]
             u["_next"] = "final_report"
     elif kind == "ci_poll_cap":
-        a = "stop" if stop else _answered(state, {"keep": ["keep waiting"], "stop": ["leave", "stop", "report"]}, "stop")
+        a = "stop" if stop else _answered(state, {"keep": ["keep waiting"], "stop": ["leave", "stop", "report"]})
         budget = _ci_poll_budget(state)
-        if a == "keep" and _ci_watch_fits(state):
+        if _watch_started(state):
+            stopped = f"Review watch stopped: the run's CI polls reached the {_ci_poll_limit_name(state)} ({budget})"
+        else:
+            stopped = f"CI watch stopped: the run's CI polls reached the run-wide budget ({budget}); the PR stays in draft"
+        report = {"follow_ups": list(as_list(state.get("follow_ups"))) + [stopped], "_next": "final_report"}
+        if a is None:
+            _unmatched(state, u, esc, answer, exhausted=report)
+        elif a == "keep" and _ci_watch_fits(state):
             _reset_ci_watch(u)
             u["ci_poll_budget"] = as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS
             ledger(state, u, f"ci: one more watch inside the engine cap (run-wide budget now {u['ci_poll_budget']} polls)")
             u["_next"] = "ci_poll"
         else:
-            if _watch_started(state):
-                stopped = f"Review watch stopped: the run's CI polls reached the {_ci_poll_limit_name(state)} ({budget})"
-            else:
-                stopped = f"CI watch stopped: the run's CI polls reached the run-wide budget ({budget}); the PR stays in draft"
-            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
-            u["_next"] = "final_report"
+            u.update(report)
     elif kind == "base_moved":
         data = as_dict(esc.get("data"))
         facts = as_dict(state.get("base_facts"))
         tip = str(data.get("tip") or "")
         moved = (f"Base {data.get('base')} moved {_commits_text(data.get('count'))} past the PR "
                  f"({_conflict_summary(data)})")
-        a = _base_answer(state, {"integrate": ["integrate"], "finish": ["finish"],
-                                 "leave": ["leave", "draft", "report", "stop"]})
+        a = _answered(state, {"integrate": ["integrate"], "finish": ["finish"],
+                              "leave": ["leave", "draft", "report", "stop"]})
         if a is None and not stop:
-            _base_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "integrate" and not stop:
             root = state.get("git_root") or state.get("project_dir") or "."
             u["git_task"] = {"kind": "base_merge", "return_to": "ci_gate", "tip": tip, "remote": data.get("remote"),
@@ -2881,9 +2901,9 @@ def apply_answer(state):
             u["_next"] = "final_report"
     elif kind == "base_merge_failed":
         task = as_dict(as_dict(esc.get("data")).get("task"))
-        a = "leave" if stop else _base_answer(state, {"retry": ["retry"], "leave": ["leave", "draft", "report", "stop"]})
+        a = "leave" if stop else _answered(state, {"retry": ["retry"], "leave": ["leave", "draft", "report", "stop"]})
         if a is None:
-            _base_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "retry":
             u["git_task"] = task
             u["base_merge_retries"] = 0
@@ -2896,10 +2916,10 @@ def apply_answer(state):
             u["base_facts"] = {**as_dict(state.get("base_facts")), "decision": "integration failed"}
             u["_next"] = "final_report"
     elif kind == "base_markers":
-        a = "leave" if stop else _base_answer(state, {"resolve": ["resolve"],
-                                                      "leave": ["leave", "draft", "report", "stop"]})
+        a = "leave" if stop else _answered(state, {"resolve": ["resolve"],
+                                                   "leave": ["leave", "draft", "report", "stop"]})
         if a is None:
-            _base_unmatched(state, u, esc, answer)
+            _unmatched(state, u, esc, answer)
         elif a == "resolve":
             u.update(base_marker_retries=as_int(state.get("base_marker_retries")) + 1, fix_source="base_sync",
                      fix_note=str(as_dict(esc.get("data")).get("markers") or ""))
@@ -2915,7 +2935,7 @@ def apply_answer(state):
     elif kind == "pr_review_push_unconfirmed":
         a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+            _unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
         elif a == "retry":
             u["_next"] = "pr_review_resolve"
         else:
@@ -2926,7 +2946,7 @@ def apply_answer(state):
     elif kind == "pr_review_closed":
         a = "stop" if stop else _answered(state, {"keep": ["keep"], "stop": ["stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+            _unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
         elif a == "keep":
             u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
             u["_next"] = "pr_review_poll"
@@ -2937,7 +2957,7 @@ def apply_answer(state):
     elif kind == "pr_review_exhausted":
         a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+            _unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
         elif a == "retry":
             u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
             u["_next"] = "pr_review_poll"
@@ -2961,7 +2981,7 @@ def apply_answer(state):
         untrusted = [i for i in as_list(as_dict(esc.get("data")).get("untrusted")) if isinstance(i, dict)]
         a = "stop" if stop else _answered(state, {"skip": ["skip"], "stop": ["stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+            _unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
         elif a == "skip":
             ledger(state, u, f"review-watch: {_pr_label(state)} {len(untrusted)} untrusted item(s) skipped")
             u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
@@ -2988,7 +3008,7 @@ def apply_answer(state):
         skipped = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
                     "reason": "skipped at the owner's say-so"} for j in judged]
         if a is None:
-            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+            _unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
         elif a == "fix":
             asked = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
                       "text": j.get("body") or j.get("question") or ""} for j in judged]
@@ -3037,9 +3057,9 @@ def scope_check(state):
                     "scope_breach",
                     f"Scope breach: correct implementation needs files outside this task's declared scope: {breach}. "
                     "Nothing was edited. How should the parent resolve it?",
-                    [option("Serialize: finish in-scope work only; the breaching edit waits for the owner", recommended=True,
+                    [option(SCOPE_SERIALIZE, recommended=True,
                             evidence="the batch was declared file-disjoint"),
-                     option("Proceed: scope re-declared to include these files"),
+                     option(SCOPE_REDECLARE),
                      option("Abort this task")],
                     hard_trigger=True)
                 u["escalation"] = normalize_choices(state, u, esc) or esc
@@ -3673,8 +3693,7 @@ def _design_ask(asks, adopted=()):
     """The design question for the first of `asks`; the ones after it and the adopting answers so far ride in its
     data, so each ask is asked in turn and one coder round adopts every pattern chosen."""
     return escalation("design_ask", f"Design question: {asks[0]}",
-                      [option("Adopt the pattern (one more coder round introduces it)"),
-                       option("Keep the code as shipped (answer recorded, no change)")],
+                      [option(DESIGN_ADOPT), option(DESIGN_KEEP)],
                       hard_trigger=True, tier3_ok=False, data={"remaining": list(asks[1:]), "adopted": list(adopted)})
 
 
@@ -4647,8 +4666,8 @@ def triage_route(state):
         if kind == "probe_gap":
             esc = escalation("probe_gap", "The usage probe is INCONCLUSIVE: the environment, not the code, blocks it. "
                                           "Supply the missing recipe/fixture/mock and re-run, or surface the gap?",
-                             [option("Supply it and re-run the probe (say what to provide)"),
-                              option("Surface the gap and proceed", recommended=True,
+                             [option(PROBE_SUPPLY),
+                              option(PROBE_SURFACE, recommended=True,
                                      evidence="a consumer-facing change that cannot be exercised locally is itself a finding")],
                              evidence=str(e.get("finding", "")))
         elif kind == "plan_defect":
@@ -4671,7 +4690,7 @@ def triage_route(state):
                              evidence=str(e.get("finding", "")))
         else:
             esc = escalation("yellow_findings", "A review warning at production rigor: fix it, or accept it as scoped-out?",
-                             [option("Fix it", recommended=True), option("Accept it (recorded)")],
+                             [option(YELLOW_FIX, recommended=True), option(YELLOW_ACCEPT)],
                              evidence="\n".join(str(x.get("finding", "")) for x in escalations)[:2500])
         return raise_escalation(state, u, esc)
     ledger(state, u, "review: every blocker rejected with citation or deferred by the quality bar; proceeding")
@@ -5639,34 +5658,6 @@ def _ci_leave_option(state):
 def _base_round_fits(state):
     """Whether one more base round, with the CI watch after its push, fits under the engine cap."""
     return as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS < ENGINE_VISIT_CAP
-
-
-def _base_answer(state, choices):
-    """The key a reply to a base question picks through the option it names (its number, its exact text, or
-    "<option>: <note>"), else None; free text is never scanned for keys."""
-    ans = (state.get("last_answer") or "").strip()
-    named = _named_option(ans, as_dict(state.get("escalation")).get("options") or [])
-    if not named:
-        return None
-    low = named.lower()
-    return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
-            or next((k for k, words in choices.items() if any(w in low for w in words)), None))
-
-
-def _base_unmatched(state, u, esc, answer):
-    """A reply to a base question that names no option is read by the reply interpreter once per question, then
-    asked again. The flag lives in the escalation, since parse_answer resets reply_interpreted before apply_answer."""
-    data = as_dict(esc.get("data"))
-    if truthy(data.get("base_interpreted")):
-        _reask_unmatched(state, u, esc, answer)
-        return
-    kind = esc.get("kind", "")
-    author = "navigator" if state.get("answer_source") == "navigator" else "owner"
-    u.update({"escalation": {**esc, "data": {**data, "base_interpreted": True}}, "last_answer_text": answer,
-              "reply_accepts": _accepts_text(kind), "reply_author": author, "reply_interpreted": False,
-              "reply_source": "navigator" if author == "navigator" else ""})
-    ledger(state, u, f"apply_answer: {kind}: {tail(answer, 200)!r} names no option -> interpret")
-    u["_next"] = "interpret_reply"
 
 
 def _base_left(state, u, status):

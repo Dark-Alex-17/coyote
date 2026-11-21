@@ -410,8 +410,49 @@ u = gates.parse_answer(base_state(escalation=escalation("clarify", "q", []), las
 check("parse_answer: no options -> free text", u["last_answer"] == "the auth module")
 
 # ---------------------------------------------------------------- apply_answer continuations
+# the options each kind is raised with, so a row's answer is read the way a live one is: by the option it names; the
+# CI kinds carry both leave texts, of which a live question offers the one that fits the watch
+REVIEW_OPTIONS = ["One more fix round anyway", "Accept the findings unresolved and proceed", "Abort and report"]
+CI_LEAVES = ["Stop watching and report", "Leave the PR in draft and report"]
+DESIGN_ADOPT = "Adopt the pattern (one more coder round introduces it)"
+DESIGN_KEEP = "Keep the code as shipped (answer recorded, no change)"
+YELLOW_ACCEPT = "Accept it (recorded)"
+PROBE_SUPPLY = "Supply it and re-run the probe (say what to provide)"
+PROBE_SURFACE = "Surface the gap and proceed"
+SCOPE_SERIALIZE = "Serialize: finish in-scope work only; the breaching edit waits for the owner"
+SCOPE_REDECLARE = "Proceed: scope re-declared to include these files"
+KIND_OPTIONS = {
+    "oracle_fault": ["Retry the consult", "Proceed without the oracle (the context pack alone directs the coder)",
+                     "Abort this task"],
+    "engine_fault": ["Retry the coder round", "Abort this task"],
+    "design_ask": [DESIGN_ADOPT, DESIGN_KEEP],
+    "yellow_findings": ["Fix it", YELLOW_ACCEPT],
+    "plan_defect": [gates.PLAN_DEFECT_CONTINUE, gates.PLAN_DEFECT_FIX, gates.PLAN_DEFECT_ACCEPT, gates.PLAN_DEFECT_STOP],
+    "probe_gap": [PROBE_SUPPLY, PROBE_SURFACE],
+    "review_incomplete": ["Retry the review again", "Accept NEEDS-HUMAN: proceed without the incomplete review "
+                          "(recorded in the report / PR body)", "Abort this task"],
+    "strikeout": ["Apply the oracle's direction in ONE more coder round", gates.STRIKEOUT_PROCEED, "Abort and report"],
+    "lane_stuck": REVIEW_OPTIONS,
+    "review_exhausted": REVIEW_OPTIONS,
+    "scope_breach": [SCOPE_SERIALIZE, SCOPE_REDECLARE, "Abort this task"],
+    "ci_unsure": ["Re-run the failing checks once", "Resume with a coder fix round"] + CI_LEAVES,
+    "ci_exhausted": [gates.CI_KEEP_WAITING, "Re-run the failing checks once", "Resume with a coder fix round"] + CI_LEAVES,
+    "ci_infra": [gates.CI_KEEP_WAITING] + CI_LEAVES,
+    "ci_inconclusive": [gates.CI_RERUN_CANCELLED, gates.CI_TREAT_GREEN] + CI_LEAVES,
+    "ci_no_checks": [gates.CI_NO_CI, gates.CI_KEEP_WAITING] + CI_LEAVES,
+    "ci_poll_cap": [gates.CI_CAP_KEEP_WAITING] + CI_LEAVES,
+    "pr_review_push_unconfirmed": ["Retry the push check", "Stop watching and report"],
+    "pr_review_closed": ["Stop watching and report", "Keep watching (the PR was reopened)"],
+    "pr_review_exhausted": ["Stop watching and report", "Retry the review watch"],
+}
+
+
+def kind_esc(kind, **over):
+    return escalation(kind, "q", [option(t) for t in KIND_OPTIONS.get(kind, [])], **over)
+
+
 def aa(kind, answer, **over):
-    return gates.apply_answer(base_state(escalation=escalation(kind, "q", []), last_answer=answer, **over))
+    return gates.apply_answer(base_state(escalation=kind_esc(kind), last_answer=answer, **over))
 
 check("apply: clarify -> assess with Q/A", aa("clarify", "auth")["_next"] == "assess")
 check("apply: design_choice -> compose_brief", aa("design_choice", "A")["_next"] == "compose_brief")
@@ -421,27 +462,27 @@ check("apply: oracle_fault explicit retry past the bound -> consult again (honou
 check("apply: oracle_fault abort -> end_aborted", aa("oracle_fault", "Abort this task")["_next"] == "end_aborted")
 check("apply: coder_rejected -> compose_fix", aa("coder_rejected", "use cookies")["_next"] == "compose_fix")
 check("apply: engine_fault retry -> compose_fix", aa("engine_fault", "Retry the coder round")["_next"] == "compose_fix")
-u = aa("design_ask", "Adopt the pattern", design_ask_rounds=0)
+u = aa("design_ask", DESIGN_ADOPT, design_ask_rounds=0)
 check("apply: design_ask adopt -> one coder round + design-decision ledgered", u["_next"] == "compose_fix" and u["design_ask_rounds"] == 1 and u["design_decisions"])
-check("apply: design_ask adopt B9 exhausted -> review_gate", aa("design_ask", "Adopt the pattern", design_ask_rounds=RERUN_ONCE)["_next"] == "review_gate")
-check("apply: design_ask keep -> review_gate", aa("design_ask", "Keep the code as shipped")["_next"] == "review_gate")
+check("apply: design_ask adopt B9 exhausted -> review_gate", aa("design_ask", DESIGN_ADOPT, design_ask_rounds=RERUN_ONCE)["_next"] == "review_gate")
+check("apply: design_ask keep -> review_gate", aa("design_ask", DESIGN_KEEP)["_next"] == "review_gate")
 check("apply: yellow fix -> compose_fix", aa("yellow_findings", "Fix it")["_next"] == "compose_fix")
-check("apply: yellow accept -> observability + follow-up", aa("yellow_findings", "Accept it")["_next"] == "observability_gate")
-check("apply: plan_defect stop -> end_blocked", aa("plan_defect", "Stop; the plan needs amending")["_next"] == "end_blocked")
-u = aa("plan_defect", "Continue; treat the criterion as amended: X", spec_text="old")
+check("apply: yellow accept -> observability + follow-up", aa("yellow_findings", YELLOW_ACCEPT)["_next"] == "observability_gate")
+check("apply: plan_defect stop -> end_blocked", aa("plan_defect", gates.PLAN_DEFECT_STOP)["_next"] == "end_blocked")
+u = aa("plan_defect", f"{gates.PLAN_DEFECT_CONTINUE}: X", spec_text="old")
 check("apply: plan_defect continue -> amended spec + re-review", u["_next"] == "build_gauntlet_prompt" and "AMENDED" in u["spec_text"])
-check("apply: probe_gap supply -> compose_fix", aa("probe_gap", "Supply it and re-run")["_next"] == "compose_fix")
-check("apply: probe_gap surface -> observability + follow-up", aa("probe_gap", "Surface the gap and proceed")["follow_ups"])
+check("apply: probe_gap supply -> compose_fix", aa("probe_gap", PROBE_SUPPLY)["_next"] == "compose_fix")
+check("apply: probe_gap surface -> observability + follow-up", aa("probe_gap", PROBE_SURFACE)["follow_ups"])
 check("apply: review_incomplete retry -> fresh gauntlet", aa("review_incomplete", "Retry the review again")["_next"] == "build_gauntlet_prompt")
-u = aa("review_incomplete", "Accept NEEDS-HUMAN: proceed without the incomplete review", gauntlet_incomplete=["probe"], round_heads=[{}])
+u = aa("review_incomplete", KIND_OPTIONS["review_incomplete"][1], gauntlet_incomplete=["probe"], round_heads=[{}])
 check("apply: review_incomplete accept -> skipped review recorded", u["_next"] == "observability_gate" and "probe" in u["skipped_reviews"][0])
 check("apply: review_incomplete abort -> end_aborted", aa("review_incomplete", "Abort this task")["_next"] == "end_aborted")
 u = aa("strikeout", "Apply the oracle's direction in ONE more coder round", strikeout_rounds=0)
 check("apply: strikeout one round -> compose_fix with strikes reset (B6)", u["_next"] == "compose_fix" and u["fix_strikes"] == 0 and u["strikeout_rounds"] == 1)
 check("apply: strikeout explicit round past RERUN_ONCE -> compose_fix (honoured)",
-      aa("strikeout", "Apply the oracle's direction", strikeout_rounds=RERUN_ONCE)["_next"] == "compose_fix")
-check("apply: lane_stuck accept -> proceed with follow-up", aa("lane_stuck", "Accept the findings unresolved")["_next"] == "observability_gate")
-u = aa("scope_breach", "Serialize: finish in-scope work only", coder_brief={"task": "t"}, scope_breach="src/x")
+      aa("strikeout", "1", strikeout_rounds=RERUN_ONCE)["_next"] == "compose_fix")
+check("apply: lane_stuck accept -> proceed with follow-up", aa("lane_stuck", "Accept the findings unresolved and proceed")["_next"] == "observability_gate")
+u = aa("scope_breach", SCOPE_SERIALIZE, coder_brief={"task": "t"}, scope_breach="src/x")
 check("apply: scope_breach serialize -> render with constraint", u["_next"] == "render_coder_prompt" and any("Do NOT edit" in l for l in u["coder_brief"]["must_not_do_extra"]))
 check("apply: scope_breach abort", aa("scope_breach", "Abort this task")["_next"] == "end_aborted")
 check("apply: ci_unsure leave -> final_report + follow-up", aa("ci_unsure", "Leave the PR in draft and report")["_next"] == "final_report")
@@ -662,19 +703,21 @@ check("answers: a ladder ruling naming an option number keeps its amendment",
       u["_next"] == "apply_answer" and u["last_answer"] == f"{PD_CONT}: drop the vet criterion")
 check("answers: plan_defect stop option, its number and a bare stop -> end_blocked",
       all(gates.apply_answer(base_state(escalation=pd, last_answer=a))["_next"] == "end_blocked"
-          for a in ("Stop; the plan needs amending (report it)", "1", "stop")))
+          for a in ("Stop; the plan needs amending (report it)", "1", "stop", "1 - stop, don't proceed")))
 check("answers: plan_defect raw numbered reply with an em-dash amendment continues",
-      aa("plan_defect", "2 \u2014 amendment: vet exit 0 is enough", spec_text="AC")["_next"] == "build_gauntlet_prompt"
+      aa("plan_defect", "1 \u2014 amendment: vet exit 0 is enough", spec_text="AC")["_next"] == "build_gauntlet_prompt"
       and gates.apply_answer(base_state(escalation=pd, last_answer="2 \u2014 amendment: x", spec_text="AC"))["_next"]
       == "build_gauntlet_prompt")
 check("answers: a typed numbered pick with free text is interpreted, never truncated to the option",
       all(gates.parse_answer(base_state(escalation=e, last_answer_text=t))["_next"] == "interpret_reply"
           for e in (pd, {**pd, "data": {"multiple_choice": True}}) for t in ("2 - only for the read path", "Option 2: reads only")))
-check("answers: plan_defect replies that negate their continue word stop, with or without the options",
-      all(gates.apply_answer(base_state(escalation=e, last_answer=a, spec_text="AC"))["_next"] == "end_blocked"
-          for e in (pd, escalation("plan_defect", "q", []))
-          for a in ("Do not continue, the plan is wrong", "don't proceed", "no, discontinue",
-                    "Stop - do not continue", "1 - stop, don't proceed", "stop; the amendment is wrong")))
+_pd_free = {a: gates.apply_answer(base_state(escalation=pd, last_answer=a, spec_text="AC"))
+            for a in ("Do not continue, the plan is wrong", "don't proceed", "do not proceed", "no, discontinue",
+                      "Stop - do not continue", "stop; the amendment is wrong", "stop retrying on 5xx, then continue")}
+check("answers: plan_defect replies that name no option go to interpret_reply whatever their words, nothing acted on",
+      all(u["_next"] == "interpret_reply" and u["escalation"]["data"]["reply_read"] is True and "spec_text" not in u
+          and "failure_reason" not in u and "plan_defect_continues" not in u for u in _pd_free.values()),
+      {a: u.get("_next") for a, u in _pd_free.items()})
 check("answers: the navigator's numbered amendment still continues once continue words are read at word boundaries",
       aa("plan_defect", f"{PD_CONT}: {PD_REPLY[4:]}", spec_text="AC")["_next"] == "build_gauntlet_prompt")
 # one tolerant picker: wrapped numbers, the rendered label echoed back, and two option numbers that never resolve
@@ -806,7 +849,9 @@ for _wrap in ("**2** \u2014 ", "(2) \u2014 ", "Option 2: "):
     check(f"answers: the seed plan_defect amendment led by {_wrap.strip()!r} continues with the amendment",
           u["_next"] == "build_gauntlet_prompt" and s2["last_answer"].startswith(PD_CONT)
           and PD_REPLY[4:] in s2["subtasks"][0]["amendments"][0]["text"], u.get("_next"))
-# an answer apply_answer cannot act on is asked again; at the cap only a recommended option that keeps going is taken
+# an answer apply_answer cannot act on, once the interpreter has read it, is asked again; at the cap only a recommended
+# option that keeps going is taken
+READ = {"reply_read": True}
 SO3 = [option("Abort and report", True), option("One more fix round anyway"), option("Accept the findings unresolved and proceed")]
 _UNMATCHED = [("strikeout", so_nav), ("lane_stuck", SO3), ("review_exhausted", SO3), ("oracle_fault", of_nav),
               ("plan_defect", pd["options"]),
@@ -817,12 +862,12 @@ _UNMATCHED = [("strikeout", so_nav), ("lane_stuck", SO3), ("review_exhausted", S
               ("pr_review_closed", [option("Stop watching and report", True), option("Keep watching (the PR was reopened)")]),
               ("pr_review_exhausted", [option("Stop watching and report", True), option("Retry the review watch")]),
               ("pr_review_push_unconfirmed", [option("Retry the push check"), option("Stop watching and report", True)])]
-_first = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", o), last_answer="hmm, not sure", ask_question="Q?",
-                                           strikeout_rounds=0, oracle_retries=0)) for k, o in _UNMATCHED}
-check("answers: an unmatched reply to an abort- or stop-defaulting question is asked again, never acted on",
+_first = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", o, data=READ), last_answer="hmm, not sure",
+                                           ask_question="Q?", strikeout_rounds=0, oracle_retries=0)) for k, o in _UNMATCHED}
+check("answers: an unmatched reply to an abort- or stop-defaulting question, once read, is asked again, never acted on",
       all(u["_next"] == "ask_dispatch" and u["apply_reasks"] == 1 and "hmm, not sure" in u["ask_question"]
           for u in _first.values()), {k: u.get("_next") for k, u in _first.items()})
-_cap = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", o), last_answer="hmm, not sure",
+_cap = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", o, data=READ), last_answer="hmm, not sure",
                                          apply_reasks=gates.APPLY_REASK_MAX, strikeout_rounds=0, oracle_retries=0))
         for k, o in _UNMATCHED}
 check("answers: at the re-ask cap a non-stop recommendation is taken, otherwise the run never aborts on a guess",
@@ -836,7 +881,7 @@ _real_apply = gates.apply_answer
 # the spent re-ask budget falls back to the recommendation through apply_answer; the stub makes that branch abort
 gates.apply_answer = lambda s: {"_next": "end_aborted"}
 try:
-    _spent = _real_apply(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
+    _spent = _real_apply(base_state(escalation=escalation("strikeout", "q", so_nav, data=READ), last_answer="hmm, not sure",
                                     apply_reasks=gates.APPLY_REASK_MAX))
 finally:
     gates.apply_answer = _real_apply
@@ -849,7 +894,8 @@ check("answers: a navigator note naming another option number anywhere goes to t
 check("answers: an echoed option text, in either rendered shape, is a clean pick even when the text holds a number",
       _lib.split_option_reply("Option 1: Use 2 caches", [option("Use 2 caches"), option("Use one")]) == ("Use 2 caches", "")
       and _lib.split_option_reply("1) Proceed with the plan (recommended)", ROUTE3) == ("Proceed with the plan", ""))
-_re = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm", ask_question="Q?"))
+_re = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav, data=READ), last_answer="hmm",
+                                    ask_question="Q?"))
 check("answers: the re-ask note goes into the escalation question so a remote owner sees it, once",
       "Could not act on the reply 'hmm'" in _re["escalation"]["question"]
       and gates.apply_answer(base_state(escalation=_re["escalation"], last_answer="huh"))["escalation"]["question"]
@@ -859,7 +905,7 @@ _ea = gates.parse_answer(base_state(escalation={**escalation("lane_stuck", "q", 
                                     last_answer_text="", reask_rounds=REASK_MAX))
 check("answers: an empty reply after the re-asks never takes a recommended option that aborts",
       _ea["last_answer"] == "" and gates.apply_answer({**base_state(escalation=escalation("lane_stuck", "q", SO3)),
-                                                      **_ea})["_next"] == "ask_dispatch")
+                                                      **_ea})["_next"] == "interpret_reply")
 for kind, opts, pick in (
         ("engine_fault", [option("Retry the coder round", True), option("Abort this task")], "2 - abort, retrying won't help"),
         ("strikeout", [option("Abort and report (code left in a working state)", True), option("One more fix round anyway"),
@@ -899,14 +945,14 @@ s2, u = chain(base_state(escalation=pd, last_answer_text="hmm", reply_verdict=""
 check("interpret_route: an interpreter fault -> parse_answer's re-ask, the fault ledgered; the run never sticks",
       u["_next"] == "parse_answer" and any("interpreter fault" in d for d in s2["decisions"])
       and chain(s2, "parse_answer")[1]["_next"] == "ask_user")
-sb = escalation("scope_breach", "breach", [option("Serialize: finish in-scope work only", True), option("Proceed: scope re-declared"), option("Abort this task")])
+sb = kind_esc("scope_breach")
 s2, u = chain(base_state(escalation=sb, coder_brief={}, last_answer_text="re-scope to add src/x.rs; never abort the batch",
                          reply_verdict="instruction", reply_instruction="rescope", reply_value="src/x.rs"), "interpret_route", "apply_answer")
 check("apply_answer: a rescope that mentions abort proceeds with the owner's words, never an abort",
       u["_next"] == "render_coder_prompt" and any("never abort the batch" in x for x in s2["coder_brief"]["must_not_do_extra"]))
 check("apply_answer: stop/abort read from the whole reply or an exact option only",
-      aa("review_incomplete", "retry, do not abort")["_next"] == "build_gauntlet_prompt"
-      and aa("oracle_fault", "proceed; abort only if it breaks")["_next"] == "design_gate"
+      aa("review_incomplete", "Retry the review again: do not abort")["_next"] == "build_gauntlet_prompt"
+      and aa("oracle_fault", "2: abort only if it breaks")["_next"] == "design_gate"
       and aa("engine_fault", "abort")["_next"] == "end_aborted" and aa("clarify", "Abort")["_next"] == "end_aborted")
 cq = escalation("clarify", "Which cache?", [option("Stop using the in-memory cache", True), option("Keep the cache")],
                 data={"stop_options": []})
@@ -922,11 +968,69 @@ so = [option("Abort and report", True), option("One more fix round anyway"), opt
 check("apply_answer: strikeout / lane_stuck replies that mention abort are no abort; the whole reply or the option is",
       all(gates.apply_answer(base_state(escalation=escalation(k, "q", so), last_answer=t, strikeout_rounds=0,
                                         review_rounds=0))["_next"] == "compose_fix"
-          for k in ("strikeout", "lane_stuck") for t in ("one more round, not abort", "not abort, one more round"))
+          for k in ("strikeout", "lane_stuck") for t in ("2: not abort", "One more fix round anyway: not abort"))
       and gates.apply_answer(base_state(escalation=escalation("lane_stuck", "q", so), last_answer="Abort and report"))["_next"] == "end_aborted"
-      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever"))["_next"] == "ask_dispatch"
-      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever",
+      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="abort"))["_next"] == "end_aborted"
+      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="not abort, one more round"))["_next"] == "interpret_reply"
+      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so, data=READ), last_answer="whatever"))["_next"] == "ask_dispatch"
+      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so, data=READ), last_answer="whatever",
                                         apply_reasks=gates.APPLY_REASK_MAX))["_next"] == "end_blocked")
+# answers are read by the option they name; the words of free text never pick one
+KEYWORD_REPLIES = [("oracle_fault", "retry later"), ("yellow_findings", "fix it later"), ("probe_gap", "surface it"),
+                   ("review_incomplete", "retry later"), ("strikeout", "one more round"), ("lane_stuck", "accept it"),
+                   ("review_exhausted", "one more round"), ("scope_breach", "proceed"), ("plan_defect", "proceed"),
+                   ("ci_unsure", "keep waiting a bit"), ("ci_inconclusive", "keep waiting a bit"),
+                   ("ci_poll_cap", "keep waiting a bit"), ("pr_review_push_unconfirmed", "retry later"),
+                   ("pr_review_closed", "keep watching"), ("pr_review_exhausted", "retry later")]
+UNMATCHED_KEYS = {"parked", "escalation", "last_answer_text", "reply_accepts", "reply_author", "reply_interpreted",
+                  "reply_source", "decisions", "_next"}
+_kw_first = {k: gates.apply_answer(base_state(escalation=kind_esc(k), last_answer=t, coder_brief={}, scope_breach="src/x",
+                                              spec_text="AC")) for k, t in KEYWORD_REPLIES}
+check("answers: keyword-bearing free text on every option-read kind -> interpret_reply once, reply_read set, nothing acted on",
+      all(u["_next"] == "interpret_reply" and u["escalation"]["data"].get("reply_read") is True
+          and u["last_answer_text"] == t and set(u) <= UNMATCHED_KEYS
+          for (k, t), u in zip(KEYWORD_REPLIES, _kw_first.values())),
+      {k: (u.get("_next"), sorted(set(u) - UNMATCHED_KEYS)) for k, u in _kw_first.items()})
+_kw_again = {k: gates.apply_answer(base_state(escalation=_kw_first[k].get("escalation", kind_esc(k)), last_answer=t,
+                                              ask_question="Q?", coder_brief={}, spec_text="AC")) for k, t in KEYWORD_REPLIES}
+check("answers: the same free text once the interpreter has read it -> asked again, never acted on",
+      all(u["_next"] == "ask_dispatch" and u["apply_reasks"] == 1 for u in _kw_again.values()),
+      {k: u.get("_next") for k, u in _kw_again.items()})
+_named = [("probe_gap", f"{PROBE_SUPPLY}: a fixture at tests/f.json", "compose_fix"),
+          ("probe_gap", PROBE_SURFACE, "observability_gate"),
+          ("scope_breach", f"{SCOPE_REDECLARE}: src/x.rs", "render_coder_prompt"),
+          ("scope_breach", "1", "render_coder_prompt"),
+          ("yellow_findings", f"{YELLOW_ACCEPT}: low risk", "observability_gate"),
+          ("oracle_fault", "Retry the consult: once more", "consult_oracle"),
+          ("ci_poll_cap", gates.CI_CAP_KEEP_WAITING, "ci_poll"),
+          ("ci_poll_cap", "Leave the PR in draft and report", "final_report")]
+_named_u = [gates.apply_answer(base_state(escalation=kind_esc(k), last_answer=t, coder_brief={}, scope_breach="src/x",
+                                          oracle_retries=0, ci_polls_run=0)) for k, t, _ in _named]
+check("answers: an exact option, its number, or '<option>: <note>' picks that option's branch, the note as its reason",
+      [u["_next"] for u in _named_u] == [w for _, _, w in _named]
+      and _named_u[0]["fix_note"] == "a fixture at tests/f.json"
+      and _named_u[2]["coder_brief"]["must_not_do_extra"] == ["Scope re-declared by the parent to include: src/x.rs"],
+      [u.get("_next") for u in _named_u])
+# kinds whose apply_answer branch dispatches on the named option, with the option each accepted instruction stands for
+INSTRUCTION_OPTIONS = {("plan_defect", "amendment"): gates.PLAN_DEFECT_CONTINUE, ("plan_defect", "fix"): gates.PLAN_DEFECT_FIX,
+                       ("probe_gap", "recipe"): PROBE_SUPPLY, ("scope_breach", "rescope"): SCOPE_REDECLARE,
+                       ("sizing_cap", "here"): gates.SIZING_HERE_REASON, ("scope_size", "scope"): gates.SCOPE_NARROW}
+_inst_opts = {**KIND_OPTIONS, "sizing_cap": [gates.SIZING_HERE_REASON, gates.SIZING_ARCHITECT, gates.SIZING_STOP],
+              "scope_size": [gates.SCOPE_PROCEED, gates.SCOPE_NARROW]}
+# design_ask takes the owner's own words as its answer, so its instruction stands for no option
+_by_option = [(k, s) for k, shapes in gates.ACCEPTED_INSTRUCTIONS.items() for s in shapes
+              if k in _inst_opts and k != "design_ask"]
+_inst_named = {(k, s): gates._named_option(gates._apply_instruction(base_state(), s, "drop AC3", "drop AC3"),
+                                           [option(t) for t in _inst_opts[k]]) for k, s in _by_option}
+check("answers: every accepted instruction on an option-read kind applies as a pick of the option it stands for",
+      sorted(_by_option) == sorted(INSTRUCTION_OPTIONS)
+      and all(_inst_named[p] == INSTRUCTION_OPTIONS[p] for p in INSTRUCTION_OPTIONS), _inst_named)
+_da_free = aa("design_ask", "yes", design_ask_rounds=0)
+_da_adopt = aa("design_ask", f"{DESIGN_ADOPT}: behind a flag", design_ask_rounds=0)
+check("answers: design_ask adopts only on its Adopt option; a free 'yes' is recorded, never adopted nor interpreted",
+      _da_free["_next"] == "review_gate" and _da_free["design_decisions"] == ["q -> yes"]
+      and _da_adopt["_next"] == "compose_fix" and "behind a flag" in _da_adopt["fix_note"],
+      (_da_free.get("_next"), _da_adopt.get("_next")))
 
 # ---------------------------------------------------------------- multiple-choice prompts
 mc_opts = [option("Proceed without the oracle"), option("Retry the consult", True, "one retry is in bounds"),
@@ -1209,8 +1313,11 @@ oj = escalation("pr_review_owner_judgment", "q", [option("Fix them as the review
                 data={"judgment": [{"id": "c1", "kind": "comment", "url": "u", "body": "b", "question": "q"}], "noaction": []})
 u = gates.apply_answer(base_state(escalation=oj, last_answer="please address these, don't stop", pr_review_queue=[]))
 u2 = gates.apply_answer(base_state(escalation=oj, last_answer="Stop watching and report", pr_review_queue=[]))
-check("apply_answer: pr_review_owner_judgment 'please address these, don't stop' is a fix round, never a stop",
-      u["_next"] == "compose_fix" and u2["_next"] == "final_report")
+u3 = gates.apply_answer(base_state(escalation=oj, last_answer="Fix them as the reviewer asks: don't stop", pr_review_queue=[]))
+u4 = gates.apply_answer(base_state(escalation=oj, last_answer="stop", pr_review_queue=[]))
+check("apply_answer: pr_review_owner_judgment 'please address these, don't stop' is interpreted, never a stop",
+      u["_next"] == "interpret_reply" and u2["_next"] == "final_report" and u3["_next"] == "compose_fix"
+      and u4["_next"] == "final_report")
 
 # ---------------------------------------------------------------- discussion park and continue: re-entry
 pst = base_state(run_id="20261101T000000-aaaaaaaa", run_dir=_lib.ensure_run_dir("20261101T000000-aaaaaaaa"),
@@ -1701,11 +1808,11 @@ _owner_pd, u = chain(base_state(escalation=_pd_open[0], spec_text="AC", answer_s
 check("apply_answer: an owner's amendment after the navigator handed the question over is labeled the user's",
       _owner_pd["spec_text"].endswith(f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough"),
       _owner_pd.get("spec_text"))
-u = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer="Continue; treat the criterion as amended: drop AC3",
+u = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer=f"{gates.PLAN_DEFECT_CONTINUE}: drop AC3",
                                   spec_text="AC", plan_defect_continues=1))
 check("apply_answer: a stated plan_defect amendment is recorded as stated and counted",
       u.get("plan_defect_continues") == 2
-      and u["spec_text"].endswith("AMENDED by the user: Continue; treat the criterion as amended: drop AC3"), u)
+      and u["spec_text"].endswith(f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: drop AC3"), u)
 # recorded plan_defect cells: the adversary blamed the plan for a red command the plan was not at fault for
 _PD_STOP_TEXT = "Stop; the plan needs amending (report it)"
 _PD_CONT_TEXT = "Continue; treat the criterion as amended (state the amendment)"
@@ -2140,7 +2247,7 @@ check("ci_route: after keep waiting at ci_poll_cap, a cancelled run already re-r
 check("ci_poll: after a keep-waiting answer the next poll reads CI",
       gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_t_ci, ci_polls_run=_lib.POLL_VISIT_BUDGET,
                                ci_poll_budget=_lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS)).get("ci_status") == "green")
-u = gates.apply_answer(base_state(escalation=_esc_full, last_answer=gates.CI_CAP_KEEP_WAITING,
+u = gates.apply_answer(base_state(escalation=_esc, last_answer=gates.CI_CAP_KEEP_WAITING,
                                   ci_polls_run=_lib.ENGINE_VISIT_CAP - _lib.CI_MAX_ROUNDS))
 check("apply: ci_poll_cap keep waiting with no watch left under the engine cap -> final_report",
       u.get("_next") == "final_report" and "ci_poll_budget" not in u)
@@ -2381,7 +2488,7 @@ for _src in ("review", "strikeout", "coder_failed"):
                          pr_review_pending=_round["pr_review_pending"]))
     check(f"pr_tracking review: pr_gate after a review round with fix_source {_src} still sends the review_update task",
           u["_next"] == "git_ops" and u["git_task"]["kind"] == "review_update")
-u = gates.apply_answer(rs(escalation=escalation("review_exhausted", "q", []), last_answer="Accept the findings unresolved and proceed",
+u = gates.apply_answer(rs(escalation=kind_esc("review_exhausted"), last_answer="Accept the findings unresolved and proceed",
                           fix_source="review", pr_review_pending=_round["pr_review_pending"]))
 check("pr_tracking review: review_exhausted accept in a review round -> observability_gate with pending intact",
       u["_next"] == "observability_gate" and "pr_review_pending" not in u
@@ -2511,7 +2618,7 @@ for _st in ("timeout", "poll_error"):
 u = gates.ci_route(base_state(ci_status="timeout"))
 check("pr_tracking ci: ci_route timeout keeps the draft text",
       u["escalation"]["question"] == "CI watch ended without a verdict (timeout). Keep waiting, or leave the PR in draft and report?")
-u = gates.apply_answer(rs(escalation=escalation("ci_exhausted", "q", []), last_answer="Stop watching and report",
+u = gates.apply_answer(rs(escalation=kind_esc("ci_exhausted"), last_answer="Stop watching and report",
                           ci_status="timeout", ci_diagnosis="runner gone"))
 check("pr_tracking review: apply_answer ci leave with the watch started -> review-aware follow-up",
       u["_next"] == "final_report" and u["follow_ups"] == ["Review watch stopped with CI timeout on the ready PR: runner gone"])
@@ -2570,7 +2677,7 @@ check("pr_tracking review: ci_apply unsure after the flip sets pr_review_status 
 u = gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=0, pr_review_status="pending"))
 check("pr_tracking review: a CI fix round after the flip leaves pr_review_status unchanged",
       u["_next"] == "compose_fix" and "pr_review_status" not in u)
-u = gates.apply_answer(rs(escalation=escalation("ci_poll_cap", "q", []), last_answer="Stop watching and report"))
+u = gates.apply_answer(rs(escalation=kind_esc("ci_poll_cap"), last_answer="Stop watching and report"))
 check("pr_tracking review: apply_answer ci_poll_cap after the flip -> final_report with the ceiling follow-up",
       u["_next"] == "final_report"
       and u["follow_ups"] == [f"Review watch stopped: the run's CI polls reached the review-mode ceiling ({_ceil})"])
@@ -2883,9 +2990,10 @@ check("pr_tracking review: apply_answer untrusted stop -> final_report naming th
       _a["_next"] == "final_report" and "https://github.com/o/r/pull/7#c7" in _a["follow_ups"][0] and "r7" in _a["follow_ups"][0]
       and _SECRET not in json.dumps(_a))
 _fix = untrusted_answer("Fix them as the reviewer asks")
-_fix_cap = untrusted_answer("Fix them as the reviewer asks", apply_reasks=gates.APPLY_REASK_MAX)
-check("pr_tracking review: apply_answer untrusted offers no fix path: asked again, then the report, no round started",
-      _fix["_next"] == "ask_dispatch" and _fix_cap["_next"] == "final_report"
+_fix_cap = untrusted_answer("Fix them as the reviewer asks", apply_reasks=gates.APPLY_REASK_MAX,
+                            escalation={**_untrusted_esc, "data": {**_untrusted_esc["data"], **READ}})
+check("pr_tracking review: apply_answer untrusted offers no fix path: interpreted, then the report, no round started",
+      _fix["_next"] == "interpret_reply" and _fix_cap["_next"] == "final_report"
       and not any(k in x for x in (_fix, _fix_cap) for k in ("fix_source", "pr_review_queue", "pr_review_addressed"))
       and any("stayed unanswered" in f for f in _fix_cap["follow_ups"]))
 
@@ -3511,10 +3619,10 @@ check("subtasks: the final review never takes the read-only skip (the same clean
       gates.review_gate(dict(ro, final_review=True))["_next"] == "build_gauntlet_prompt" and gates.review_gate(ro)["_next"] == "next_subtask")
 check("subtasks: a trivial multi-subtask run never skips its final whole-task review",
       gates.review_gate(dict(ro, final_review=True, intent="trivial", changed_files=["a"]))["_next"] == "build_gauntlet_prompt")
-for kind, ans in (("yellow_findings", "Accept it (recorded)"), ("review_incomplete", "Accept NEEDS-HUMAN"),
+for kind, ans in (("yellow_findings", "Accept it (recorded)"), ("review_incomplete", KIND_OPTIONS["review_incomplete"][1]),
                   ("lane_stuck", "Accept the findings unresolved and proceed"), ("probe_gap", "Surface the gap and proceed")):
-    mid = gates.apply_answer(base_state(escalation=escalation(kind, "q", []), last_answer=ans, subtasks=SUBS7, subtask_index=2))
-    end = gates.apply_answer(base_state(escalation=escalation(kind, "q", []), last_answer=ans, subtasks=SUBS7, subtask_index=5,
+    mid = gates.apply_answer(base_state(escalation=kind_esc(kind), last_answer=ans, subtasks=SUBS7, subtask_index=2))
+    end = gates.apply_answer(base_state(escalation=kind_esc(kind), last_answer=ans, subtasks=SUBS7, subtask_index=5,
                                         final_review=True))
     check(f"subtasks: {kind} accepted mid-run -> the next subtask; at the final review -> observability",
           mid["_next"] == "next_subtask" and end["_next"] == "observability_gate", (mid.get("_next"), end.get("_next")))
@@ -3915,12 +4023,12 @@ check("subtasks: a re-entry from a snapshot-written state.json keeps task_number
 am = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, subtasks=SUBS7, subtask_index=2, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={},
                 escalation=escalation("plan_defect", "q", [option("Stop; the plan needs amending (report it)", True),
                                                           option("Continue; treat the criterion as amended (state the amendment)")]),
-                last_answer="Continue; treat the criterion as amended: vet warnings about shadowing are accepted")
+                last_answer=f"{gates.PLAN_DEFECT_CONTINUE}: vet warnings about shadowing are accepted")
 upd = gates.apply_answer(am)
 am.update({k: v for k, v in upd.items() if k != "_next"})
 gpa = gates.build_gauntlet_prompt(am)["gauntlet_prompt"]
 check("subtasks: a plan_defect amendment during a subtask reaches that subtask's next gauntlet round, not the parent criteria",
-      upd["_next"] == "build_gauntlet_prompt" and "AMENDED by the user: Continue; treat the criterion as amended: vet warnings" in gpa
+      upd["_next"] == "build_gauntlet_prompt" and f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: vet warnings" in gpa
       and "spec_text" not in upd and SUBS7[1].get("amendments") is None, gpa)
 
 # batch cadence: the parent runs the panel, so every subtask moves on and the final review is skipped too
@@ -5004,7 +5112,7 @@ check("initial_state: every state key the gates write and read back is seeded (v
 check("caps: the final whole-task review resets oracle_retries",
       gates._start_final_review(base_state(subtasks=subs, oracle_retries=RERUN_ONCE), {}, len(subs))
       .get("oracle_retries") == 0)
-_ra, u = chain(base_state(escalation=escalation("lane_stuck", "q", SO3), last_answer="hmm", reask_rounds=REASK_MAX - 1),
+_ra, u = chain(base_state(escalation=escalation("lane_stuck", "q", SO3, data=READ), last_answer="hmm", reask_rounds=REASK_MAX - 1),
                "apply_answer")
 _rb, u2 = chain({**_ra, "last_answer_text": "still hmm", "reply_interpreted": True}, "parse_answer")
 _rc, u3 = chain({**_rb, "last_answer_text": "hmm again"}, "parse_answer")
@@ -5454,7 +5562,9 @@ u = gates.ci_apply(_cs)
 check("ci fix flag: a real CI verdict starts a CI fix and marks it active",
       u.get("_next") == "compose_fix" and u.get("ci_fix_active") is True, u)
 _cs.update(u)
-u = gates.apply_answer(base_state(escalation={"kind": "ci_exhausted"}, last_answer="Resume with one more coder fix round"))
+u = gates.apply_answer(base_state(escalation=escalation("ci_exhausted", "q", [option("Resume with one more coder fix round"),
+                                                                             option("Stop watching and report")]),
+                                  last_answer="Resume with one more coder fix round"))
 check("ci fix flag: the owner's fix answer on a CI escalation marks the CI fix active",
       u.get("_next") == "compose_fix" and u.get("ci_fix_active") is True, u)
 u = gates.pr_gate(base_state(**{**_cs, "fix_source": "review"}))
@@ -5824,7 +5934,7 @@ with scenario("apply: NEEDS-HUMAN accepted on an adoption round -> adoption NOT 
               "rounds normal") as name:
     _nh = {**fresh(_a1), "gauntlet_incomplete": ["security"]}
     _nh["round_heads"][-1].update(verdict="BLOCKED", incomplete=["security"])
-    u = aa("review_incomplete", "Accept NEEDS-HUMAN: proceed without the incomplete review", **_nh)
+    u = aa("review_incomplete", KIND_OPTIONS["review_incomplete"][1], **_nh)
     _nh["probe_adoption"] = u.get("probe_adoption")
     _pg = gates.pr_gate(base_state(**fresh(_nh)))
     _bg = gates.build_gauntlet_prompt(base_state(**fresh(_nh)))
@@ -6767,7 +6877,7 @@ with scenario("base: free text to base_merge_failed and base_markers goes to the
                                             reply_interpreted=False))
               for f in firsts if f.get("escalation")]
     check(name, [f.get("_next") for f in firsts] == ["interpret_reply"] * 2
-          and all(f["escalation"]["data"].get("base_interpreted") is True and f.get("reply_author") == "owner"
+          and all(f["escalation"]["data"].get("reply_read") is True and f.get("reply_author") == "owner"
                   and f.get("reply_accepts") == gates._accepts_text(f["escalation"]["kind"])
                   and not f.get("git_task") and not f.get("follow_ups") for f in firsts)
           and [a.get("_next") for a in agains] == ["ask_dispatch"] * 2,

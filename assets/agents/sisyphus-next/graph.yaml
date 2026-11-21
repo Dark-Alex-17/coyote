@@ -1599,7 +1599,7 @@ nodes:
   apply_answer:
     id: apply_answer
     type: script
-    description: The continuation switch on the escalation kind (design doc 2.3).
+    description: 'The continuation switch on the escalation kind. An answer counts only by the option it names (its number, its exact text, or "<option>: <note>"); free text is never matched on its words and goes to interpret_reply once, then is asked again.'
     script: scripts/apply_answer.py
     # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each, or flips the PR with two
     timeout: 300

@@ -1815,8 +1815,8 @@ fn run_smoke_sabotages(python: &Path, sabotages: &[(&str, &str, &str, &str)]) {
 /// `continue:` with a colon carries an answer, one park is resumed once, and
 /// the live variables survive a resume; then the fix-round guards: a clarify
 /// option that starts with "Stop" is an answer, the park cap is per question,
-/// the strikeout and owner-judgment replies stop only on the whole reply, and
-/// only a `vehicle: sisyphus` handoff is consumed.
+/// the strikeout and owner-judgment replies stop only on the whole reply or
+/// the stop option, and only a `vehicle: sisyphus` handoff is consumed.
 #[test]
 #[ignore = "twenty-one smoke battery runs take about four minutes; run with -- --ignored"]
 fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
@@ -1967,8 +1967,8 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
                  \"address\"], \"stop\": [\"stop\"]})",
                 "a = _answered(state, {\"stop\": [\"stop\"], \"skip\": [\"skip\"], \"fix\": [\"fix\", \
                  \"address\"]})",
-                "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is a fix \
-                 round, never a stop",
+                "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is \
+                 interpreted, never a stop",
             ),
             (
                 "consume-vehicle",
