@@ -1,4 +1,5 @@
 mod child_live;
+mod command_timing;
 mod control;
 mod lend;
 mod modal;
@@ -20,6 +21,7 @@ use crate::tui::control::{
 };
 use crate::tui::events::SystemClock;
 use crate::tui::queued::{carry_over, reconcile_queue, take_user_messages};
+use crate::tui::run_now::CommandOutput;
 use crate::tui::sink::{TuiPrompter, TuiSink};
 use crate::utils::create_abort_signal;
 use bottom_pane::RewindState;
@@ -663,7 +665,8 @@ fn a_paste_with_carriage_returns_lands_line_by_line() {
 
 /// A prompt entered during a turn is held and handed to the loop,
 /// whose step puts it on the turn's queue and announces it; a command
-/// is only held. Alt+Up takes the newest back, newest first.
+/// that has to wait for the turn is only held. Alt+Up takes the newest
+/// back, newest first.
 #[test]
 #[serial]
 fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
@@ -696,7 +699,7 @@ fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
             if text == "hello q9d-q"
     ));
 
-    harness.type_text(".info");
+    harness.type_text(".agent coder");
     assert_eq!(harness.press(KeyCode::Enter), None);
     assert_eq!(
         harness.app.queued,
@@ -706,7 +709,7 @@ fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
                 command: false
             },
             QueuedLine {
-                text: ".info".to_string(),
+                text: ".agent coder".to_string(),
                 command: true
             },
         ]
@@ -717,8 +720,9 @@ fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
 
     let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
     assert_eq!(harness.app.handle_key(alt_up), None);
-    assert_eq!(harness.app.composer_text(), ".info");
-    // The second Alt+Up finds `.info` as the draft and holds it again.
+    assert_eq!(harness.app.composer_text(), ".agent coder");
+    // The second Alt+Up finds `.agent coder` as the draft and holds it
+    // again.
     assert_eq!(
         harness.app.handle_key(alt_up),
         Some(Command::Unqueue {
@@ -730,11 +734,132 @@ fn lines_entered_during_a_turn_are_queued_and_prompts_reach_the_model() {
     assert_eq!(
         harness.app.queued,
         vec![QueuedLine {
-            text: ".info".to_string(),
+            text: ".agent coder".to_string(),
             command: true
         }]
     );
     assert!(harness.draw().contains("pending: 1"));
+}
+
+/// A command that only reads does not wait for the turn: it goes to
+/// the loop to run at once, leaves nothing pending, and lands in the
+/// history like a sent line.
+#[test]
+fn reading_commands_entered_during_a_turn_run_now() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    for line in [".info", ".help"] {
+        harness.type_text(line);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::RunNow(line.to_string()))
+        );
+        assert_eq!(harness.app.composer_text(), "");
+        assert_eq!(harness.app.history.prev(""), Some(line));
+        harness.app.history.reset();
+    }
+    assert!(harness.app.queued.is_empty());
+    assert!(!harness.draw().contains("pending:"));
+}
+
+/// A command that switches what the turn runs on still waits for it.
+#[test]
+fn an_agent_switch_entered_during_a_turn_still_waits() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    harness.type_text(".agent x");
+    assert_eq!(harness.press(KeyCode::Enter), None);
+    assert_eq!(
+        harness.app.queued,
+        vec![QueuedLine {
+            text: ".agent x".to_string(),
+            command: true
+        }]
+    );
+    assert!(harness.draw().contains("pending: 1"));
+}
+
+/// What a command run beside the turn printed comes back as the same
+/// command cell an idle run leaves; a failure adds the error cell after
+/// it, as an idle run does.
+#[test]
+fn a_command_run_beside_the_turn_adds_its_command_cell() {
+    let mut harness = Harness::standalone(100, 30);
+    harness.app.begin_turn("explain", false);
+    let output = "model                         openai:test-model\n".to_string();
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".info".to_string(),
+        result: Ok(CommandOutput::Text(output.clone())),
+    });
+    let Some(Cell::Command {
+        name,
+        output: shown,
+        opened,
+        rewind_barrier,
+        ..
+    }) = harness.app.transcript.cells().last()
+    else {
+        panic!("no Command cell for the command");
+    };
+    assert_eq!(name, ".info");
+    assert_eq!(shown, &output);
+    assert!(!opened);
+    assert_eq!(*rewind_barrier, None);
+    assert!(harness.draw().contains("openai:test-model"));
+
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".info bogus".to_string(),
+        result: Err("Unknown command".to_string()),
+    });
+    let cells = harness.app.transcript.cells();
+    assert!(matches!(
+        &cells[cells.len() - 2],
+        Cell::Command { name, output, .. } if name == ".info bogus" && output.is_empty()
+    ));
+    assert!(matches!(
+        cells.last(),
+        Some(Cell::Error { text, .. }) if text == "Unknown command"
+    ));
+}
+
+/// A setting typed during a turn goes to the loop like a reading
+/// command, leaving nothing pending; once checked it says when it takes
+/// effect, and a bad one gets the error an idle `.set` would.
+#[test]
+fn a_setting_entered_during_a_turn_applies_from_the_next_turn() {
+    let mut harness = Harness::standalone(100, 30);
+    harness.app.begin_turn("explain", false);
+    for line in [".set temperature 0.5", ".reasoning high"] {
+        harness.type_text(line);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::RunNow(line.to_string()))
+        );
+    }
+    assert!(harness.app.queued.is_empty());
+    assert!(!harness.draw().contains("pending:"));
+
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".set temperature 0.5".to_string(),
+        result: Ok(CommandOutput::Deferred),
+    });
+    assert!(matches!(
+        harness.app.transcript.cells().last(),
+        Some(Cell::Command { name, output, .. })
+            if name == ".set temperature 0.5"
+                && output == ".set temperature 0.5 applies from the next turn\n"
+    ));
+    assert!(harness.draw().contains("applies from the next turn"));
+
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".set bogus 1".to_string(),
+        result: Err("Unknown key 'bogus'".to_string()),
+    });
+    assert!(matches!(
+        harness.app.transcript.cells().last(),
+        Some(Cell::Error { text, .. }) if text == "Unknown key 'bogus'"
+    ));
+    assert!(harness.app.queued.is_empty());
 }
 
 /// Alt+Up over a draft trades places with it: the held line comes
@@ -905,7 +1030,7 @@ fn an_interrupt_drops_the_queued_lines_with_a_notice() {
     harness.app.begin_turn("explain", false);
     harness.type_text("later");
     harness.press(KeyCode::Enter);
-    harness.type_text(".info");
+    harness.type_text(".agent");
     assert!(palette(&harness).is_some());
     assert_eq!(harness.press(KeyCode::Enter), None);
     assert_eq!(harness.app.queued.len(), 2);
@@ -3143,7 +3268,7 @@ fn enter_with_no_highlight_submits_the_line() {
 fn enter_with_the_palette_open_and_no_highlight_queues_the_command_mid_turn() {
     let mut harness = Harness::standalone(80, 24);
     harness.app.begin_turn("explain", false);
-    harness.type_text(".info");
+    harness.type_text(".agent");
     assert_eq!(
         palette(&harness).map(|palette| palette.highlight),
         Some(None)
@@ -3152,10 +3277,30 @@ fn enter_with_the_palette_open_and_no_highlight_queues_the_command_mid_turn() {
     assert_eq!(
         harness.app.queued,
         vec![QueuedLine {
-            text: ".info".to_string(),
+            text: ".agent".to_string(),
             command: true
         }]
     );
+    assert!(palette(&harness).is_none());
+    assert!(harness.app.composer.is_empty());
+}
+
+/// A command that only reads goes to the loop to run beside the turn,
+/// from the palette as from the bare composer.
+#[test]
+fn enter_with_the_palette_open_runs_a_reading_command_mid_turn() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    harness.type_text(".info");
+    assert_eq!(
+        palette(&harness).map(|palette| palette.highlight),
+        Some(None)
+    );
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::RunNow(".info".to_string()))
+    );
+    assert!(harness.app.queued.is_empty());
     assert!(palette(&harness).is_none());
     assert!(harness.app.composer.is_empty());
 }

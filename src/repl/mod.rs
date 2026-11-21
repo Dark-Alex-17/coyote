@@ -867,49 +867,10 @@ async fn dispatch_repl_line(
             ".help" => {
                 dump_repl_help(ctx.command_prefix());
             }
-            ".info" => match args {
-                Some("role") => {
-                    let info = ctx.role_info()?;
-                    print!("{info}");
-                }
-                Some("session") => {
-                    let app = Arc::clone(&ctx.app.config);
-                    let info = ctx.session_info(app.as_ref())?;
-                    print!("{info}");
-                }
-                Some("rag") => {
-                    let info = ctx.rag_info()?;
-                    print!("{info}");
-                }
-                Some("agent") => {
-                    let info = ctx.agent_info()?;
-                    print!("{info}");
-                }
-                Some("tools") => {
-                    let info = ctx.tools_info()?;
-                    print!("{info}");
-                }
-                Some("todo") => {
-                    let info = ctx.todo_info()?;
-                    print!("{info}");
-                }
-                Some(arg) if arg.starts_with("mcp-server") => {
-                    let mut parts = arg.splitn(2, char::is_whitespace);
-                    parts.next();
-                    let name = parts.next().map(str::trim).unwrap_or("");
-                    if name.is_empty() {
-                        bail!("{}", ctx.render_hints("Usage: .info mcp-server <server>"));
-                    }
-                    let info = ctx.mcp_server_info(name).await?;
-                    print!("{info}");
-                }
-                Some(_) => unknown_command(ctx)?,
-                None => {
-                    let app = Arc::clone(&ctx.app.config);
-                    let output = ctx.sysinfo(app.as_ref())?;
-                    print!("{output}");
-                }
-            },
+            ".info" => {
+                let info = info_output(ctx, args).await?;
+                print!("{info}");
+            }
             ".model" => match args {
                 Some(name) => {
                     let app = Arc::clone(&ctx.app.config);
@@ -1140,7 +1101,7 @@ async fn dispatch_repl_line(
                                     # (Use `.edit skill <name>` to edit an existing skill without the create-if-missing behavior.)"#
                         )
                     ),
-                    "loaded" => ctx.list_loaded_skills(),
+                    "loaded" => print!("{}", ctx.loaded_skills_listing()),
                     "load" => {
                         if rest.is_empty() {
                             println!("{}", ctx.render_hints("Usage: .skill load <name>"));
@@ -1157,7 +1118,7 @@ async fn dispatch_repl_line(
                     }
                     name => {
                         let app = Arc::clone(&ctx.app.config);
-                        ctx.upsert_skill(app.as_ref(), name)?;
+                        print!("{}", ctx.upsert_skill(app.as_ref(), name)?);
                     }
                 }
             }
@@ -1339,7 +1300,7 @@ async fn dispatch_repl_line(
                 }
                 match args {
                     Some("config") => {
-                        ctx.edit_config()?;
+                        print!("{}", ctx.edit_config()?);
                     }
                     Some("role") => {
                         let app = Arc::clone(&ctx.app.config);
@@ -1354,26 +1315,13 @@ async fn dispatch_repl_line(
                     }
                     Some("agent-config") => {
                         let app = Arc::clone(&ctx.app.config);
-                        ctx.edit_agent_config(app.as_ref())?;
+                        print!("{}", ctx.edit_agent_config(app.as_ref())?);
                     }
                     Some("mcp-config") => {
-                        ctx.edit_mcp_config()?;
+                        print!("{}", ctx.edit_mcp_config()?);
                     }
                     Some(s) if s == "skill" || s.starts_with("skill ") => {
-                        let name = s.strip_prefix("skill").unwrap_or("").trim();
-                        if name.is_empty() {
-                            println!("{}", ctx.render_hints("Usage: .edit skill <name>"));
-                        } else if let Err(e) = paths::validate_skill_name(name) {
-                            bail!(e);
-                        } else if !paths::has_skill(name) {
-                            bail!(
-                                "Skill '{name}' is not installed (expected at {})",
-                                paths::skill_file(name).display()
-                            );
-                        } else {
-                            let app = Arc::clone(&ctx.app.config);
-                            ctx.upsert_skill(app.as_ref(), name)?;
-                        }
+                        print!("{}", edit_skill_output(ctx, s)?);
                     }
                     _ => {
                         println!(
@@ -1638,22 +1586,10 @@ async fn dispatch_repl_line(
                     )
                 }
             },
-            ".list" => match args.map(str::trim) {
-                Some("prompts") => {
-                    ctx.list_mcp_prompts().await?;
-                }
-                Some(args) => {
-                    ctx.list_assets(args)?;
-                }
-                _ => {
-                    println!(
-                        "{}",
-                        ctx.render_hints(
-                            "Usage: .list <roles|sessions|agents|rags|macros|skills|prompts|tools|mcp-servers|bundles>"
-                        )
-                    )
-                }
-            },
+            ".list" => {
+                let listing = list_output(ctx, args).await?;
+                print!("{listing}");
+            }
             ".copy" => {
                 let output = ctx
                     .last_message
@@ -2038,11 +1974,70 @@ pub(crate) fn latch_prompt_interrupt(
     had_active_tasks
 }
 
-fn unknown_command(ctx: &RequestContext) -> Result<()> {
+pub(crate) fn unknown_command(ctx: &RequestContext) -> Result<()> {
     bail!(
         "{}",
         ctx.render_hints(r#"Unknown command. Type ".help" for additional help."#)
     );
+}
+
+/// What `.info [args]` prints.
+pub(crate) async fn info_output(ctx: &RequestContext, args: Option<&str>) -> Result<String> {
+    match args {
+        Some("role") => ctx.role_info(),
+        Some("session") => ctx.session_info(&ctx.app.config),
+        Some("rag") => ctx.rag_info(),
+        Some("agent") => ctx.agent_info(),
+        Some("tools") => ctx.tools_info(),
+        Some("todo") => ctx.todo_info(),
+        Some(arg) if arg.starts_with("mcp-server") => {
+            let mut parts = arg.splitn(2, char::is_whitespace);
+            parts.next();
+            let name = parts.next().map(str::trim).unwrap_or("");
+            if name.is_empty() {
+                bail!("{}", ctx.render_hints("Usage: .info mcp-server <server>"));
+            }
+            ctx.mcp_server_info(name).await
+        }
+        Some(_) => unknown_command(ctx).map(|()| String::new()),
+        None => ctx.sysinfo(&ctx.app.config),
+    }
+}
+
+/// What `.list [kind]` prints.
+pub(crate) async fn list_output(ctx: &RequestContext, args: Option<&str>) -> Result<String> {
+    match args.map(str::trim) {
+        Some("prompts") => Ok(ctx.mcp_prompts_listing().await),
+        Some(kind) => ctx.assets_listing(kind),
+        None => Ok(format!(
+            "{}\n",
+            ctx.render_hints(
+                "Usage: .list <roles|sessions|agents|rags|macros|skills|prompts|tools|mcp-servers|bundles>"
+            )
+        )),
+    }
+}
+
+/// What `.edit skill [name]` prints, `args` starting at `skill`. Unlike
+/// `.skill <name>` it never creates the skill.
+pub(crate) fn edit_skill_output(ctx: &RequestContext, args: &str) -> Result<String> {
+    let name = args.strip_prefix("skill").unwrap_or("").trim();
+    if name.is_empty() {
+        return Ok(format!(
+            "{}\n",
+            ctx.render_hints("Usage: .edit skill <name>")
+        ));
+    }
+    if let Err(e) = paths::validate_skill_name(name) {
+        bail!(e);
+    }
+    if !paths::has_skill(name) {
+        bail!(
+            "Skill '{name}' is not installed (expected at {})",
+            paths::skill_file(name).display()
+        );
+    }
+    ctx.upsert_skill(&ctx.app.config, name)
 }
 
 #[derive(Debug, PartialEq)]
@@ -2203,11 +2198,16 @@ pub fn builtin_command_names() -> Vec<&'static str> {
     names
 }
 
+#[cfg(test)]
+pub(crate) fn repl_command_names() -> impl Iterator<Item = &'static str> {
+    REPL_COMMANDS.iter().map(ReplCommand::name)
+}
+
 fn dump_repl_help(prefix: CommandPrefix) {
     println!("{}", repl_help_text(prefix));
 }
 
-fn repl_help_text(prefix: CommandPrefix) -> String {
+pub(crate) fn repl_help_text(prefix: CommandPrefix) -> String {
     let head = REPL_COMMANDS
         .iter()
         .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
@@ -2230,7 +2230,10 @@ Press Ctrl+C while the model is working to interrupt the turn; in a session, pre
     prefix.render_hints(&text).into_owned()
 }
 
-fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Option<&str>)> {
+pub(crate) fn parse_command(
+    line: &str,
+    prefix: CommandPrefix,
+) -> Option<(Cow<'_, str>, Option<&str>)> {
     match COMMAND_RE.captures(line) {
         Ok(Some(captures)) => {
             let cmd = prefix.normalize(captures.get(1)?.as_str())?;

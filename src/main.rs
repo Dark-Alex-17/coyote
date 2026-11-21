@@ -498,7 +498,7 @@ async fn run(
         paths::validate_skill_name(name)?;
         if !paths::has_skill(name) {
             let app = Arc::clone(&ctx.app.config);
-            ctx.upsert_skill(app.as_ref(), name)?;
+            print!("{}", ctx.upsert_skill(app.as_ref(), name)?);
             return Ok(());
         }
     } else if skills.len() > 1 {

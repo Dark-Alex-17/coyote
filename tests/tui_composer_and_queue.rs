@@ -219,6 +219,120 @@ mod queue_vi_and_headless {
         quit_and_check(&mut pty);
     }
 
+    /// A reading command typed while the model streams runs at once: its
+    /// output lands while the turn is still held, and it never joins the
+    /// queue.
+    #[test]
+    #[serial]
+    fn a_dot_info_typed_mid_stream_runs_at_once() {
+        let dir = fresh_config_dir("info-mid-stream");
+        let _guard = TempDirGuard(dir.clone());
+        let release = dir.join("release");
+        let fake = FakeLlm::start(vec![
+            Reply::Streamed(vec![
+                Chunk::Text("part one ni4 ".to_string()),
+                Chunk::WaitFor(release.clone()),
+                Chunk::Text("reply one ni4".to_string()),
+            ]),
+            Reply::Text("reply two ni4".to_string()),
+        ]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        let turn_at = pty.raw().len();
+        pty.send(b"first prompt ni4\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "part one ni4", turn_at, "the held stream");
+        pty.read_for(Duration::from_millis(300));
+
+        let info_at = pty.raw().len();
+        pty.send(b".info\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "log_path", info_at, "the output of `.info`");
+        let frame = repainted_frame_after_resize(&mut pty, 40, 101);
+        assert!(
+            frame.contains("Esc to interrupt"),
+            "the turn was no longer running when `.info` showed:\n{frame}"
+        );
+        let shown = since(&pty, info_at);
+        assert!(
+            !shown.contains("pending:"),
+            "`.info` was queued behind the turn:\n{shown}"
+        );
+
+        // The held reply grows above the command's cell, out of view, so
+        // the turn's end shows as the next prompt's reply.
+        fs::write(&release, b"").unwrap();
+        let next_at = pty.raw().len();
+        pty.send(b"second prompt ni4\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "reply two ni4",
+            next_at,
+            "the reply after the held turn",
+        );
+        pty.read_for(Duration::from_millis(500));
+        assert_eq!(fake.served(), 2);
+        quit_and_check(&mut pty);
+    }
+
+    /// A setting typed while the model streams is checked at once and
+    /// confirmed for the next turn, without joining the queue; once the
+    /// turn ends the session has it.
+    #[test]
+    #[serial]
+    fn a_dot_set_typed_mid_stream_applies_from_the_next_turn() {
+        let dir = fresh_config_dir("set-mid-stream");
+        let _guard = TempDirGuard(dir.clone());
+        let release = dir.join("release");
+        let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+            Chunk::Text("part one ns5 ".to_string()),
+            Chunk::WaitFor(release.clone()),
+            Chunk::Text("reply one ns5".to_string()),
+        ])]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        let turn_at = pty.raw().len();
+        pty.send(b"first prompt ns5\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "part one ns5", turn_at, "the held stream");
+        pty.read_for(Duration::from_millis(300));
+
+        let set_at = pty.raw().len();
+        pty.send(b".set temperature 0.5\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "applies from the next turn",
+            set_at,
+            "the confirmation of `.set`",
+        );
+        let shown = since(&pty, set_at);
+        assert!(
+            !shown.contains("pending:"),
+            "`.set` was queued behind the turn:\n{shown}"
+        );
+
+        fs::write(&release, b"").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "reply one ns5",
+            set_at,
+            "the end of the held reply",
+        );
+        pty.read_for(Duration::from_millis(500));
+
+        let info_at = pty.raw().len();
+        pty.send(b".info\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "log_path", info_at, "the idle `.info`");
+        // Tall enough for the head of the output, where the setting is.
+        let info = repainted_frame_after_resize(&mut pty, 90, 101);
+        assert!(
+            squeezed(&info).contains("temperature0.5"),
+            "the setting typed during the turn did not reach the session:\n{info}"
+        );
+        quit_and_check(&mut pty);
+    }
+
     // ---------------------------------------------------------------------
     // A headless macro run cannot save a role by answering itself.
     // ---------------------------------------------------------------------

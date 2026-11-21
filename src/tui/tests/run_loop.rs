@@ -1,10 +1,11 @@
 use super::*;
 use crate::tui::run_loop::{
-    DumpRoute, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished, dump_route, flush_typeahead,
-    join_unattended, purge_turn_queue, quit_abort,
+    DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished, dump_route,
+    flush_typeahead, join_unattended, purge_turn_queue, quit_abort,
 };
 #[cfg(unix)]
 use crate::tui::run_loop::{Termination, edit_in_editor};
+use crate::tui::run_now::{CommandOutput, replay_deferred};
 
 /// The loop's half of the drop: the user's lines come off the queue
 /// the running turn reads, a task's notification stays for the exit
@@ -288,4 +289,120 @@ fn renew_stream_drops_the_old_stream_before_opening_the_new_one() {
         dropped < opened,
         "the new event stream was opened while the old one still held stdin"
     );
+}
+
+fn command_result(msg: UiMsg) -> (String, Result<CommandOutput, String>) {
+    let UiMsg::CommandRan { line, result } = msg else {
+        panic!("not a command result");
+    };
+    (line, result)
+}
+
+/// Commands typed during a turn run one at a time on the fork taken as
+/// the turn started, each handing it back for the next; a turn that
+/// ended meanwhile keeps it, and what is left waits for an idle turn.
+#[test]
+#[serial]
+fn commands_beside_a_turn_share_its_snapshot_one_at_a_time() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-run-now-snapshot");
+        let ctx = chat_ctx();
+        let sysinfo = ctx.sysinfo(&ctx.app.config).unwrap();
+        let mut immediate = ImmediateCommands::default();
+        immediate.turn_started(&ctx);
+        immediate.push(".info".to_string());
+        immediate.push(".info bogus".to_string());
+        immediate.start_next();
+        assert!(immediate.is_running());
+        assert_eq!(immediate.take_idle_line(), None);
+        // The second line waits while the first has the snapshot out.
+        immediate.start_next();
+        let ran = immediate.join().await;
+        let (line, result) = command_result(immediate.finish(ran, true));
+        assert_eq!(line, ".info");
+        assert_eq!(result, Ok(CommandOutput::Text(sysinfo)));
+        assert!(!immediate.is_running());
+
+        immediate.start_next();
+        assert!(immediate.is_running(), "the snapshot did not come back");
+        let ran = immediate.join().await;
+        let (line, result) = command_result(immediate.finish(ran, true));
+        assert_eq!(line, ".info bogus");
+        let err = result.unwrap_err();
+        assert!(err.contains("Unknown command"), "{err}");
+
+        immediate.push(".help".to_string());
+        immediate.start_next();
+        immediate.turn_ended();
+        let ran = immediate.join().await;
+        let (line, result) = command_result(immediate.finish(ran, false));
+        assert_eq!(line, ".help");
+        assert!(result.is_ok());
+        immediate.push(".info".to_string());
+        immediate.start_next();
+        assert!(
+            !immediate.is_running(),
+            "a finished turn's snapshot was reused"
+        );
+        assert_eq!(immediate.take_idle_line().as_deref(), Some(".info"));
+    });
+}
+
+/// A setting typed during a turn is checked on the snapshot and kept for
+/// the turn's end only when it held; replayed on the context the turn
+/// hands back, it is there before anything else runs on that context.
+#[test]
+#[serial]
+fn a_setting_beside_a_turn_reaches_the_returned_context() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-run-now-deferred");
+        let ctx = chat_ctx();
+        let mut immediate = ImmediateCommands::default();
+        immediate.turn_started(&ctx);
+        immediate.push(".set bogus 1".to_string());
+        immediate.push(".set temperature 0.5".to_string());
+        immediate.start_next();
+        let ran = immediate.join().await;
+        let (_, result) = command_result(immediate.finish(ran, true));
+        assert!(result.is_err());
+        assert!(immediate.take_deferred().is_empty());
+
+        immediate.start_next();
+        let ran = immediate.join().await;
+        let (line, result) = command_result(immediate.finish(ran, true));
+        assert_eq!(line, ".set temperature 0.5");
+        assert_eq!(result, Ok(CommandOutput::Deferred));
+        immediate.turn_ended();
+
+        let mut returned = ctx;
+        assert_eq!(returned.app.config.temperature, None);
+        let lines = immediate.take_deferred();
+        assert_eq!(lines, [".set temperature 0.5"]);
+        assert!(replay_deferred(&mut returned, lines).await.is_empty());
+        assert_eq!(returned.app.config.temperature, Some(0.5));
+        assert!(immediate.take_deferred().is_empty());
+    });
+}
+
+/// The settings reach the returned context before the next held line
+/// starts its turn on it, and not when the session is ending.
+#[test]
+fn a_finished_turn_applies_settings_before_the_next_held_line() {
+    let body = fn_body(
+        include_str!("../run_loop.rs"),
+        "async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext)",
+    );
+    let ended = body.find("Done::Turn(joined) =>").unwrap();
+    let arm = &body[ended..];
+    let applied = arm
+        .find("apply_deferred(app, &mut immediate, &mut returned)")
+        .unwrap();
+    let next = arm.find("start_turn(").unwrap();
+    assert!(applied < next, "the next held line started first");
+    assert!(
+        arm[..applied].contains("if !quit_requested {"),
+        "settings were applied to a session that is ending"
+    );
+    let quit = body.find("Some(Command::Quit) =>").unwrap();
+    assert!(body[quit..].contains("immediate.clear();"));
 }

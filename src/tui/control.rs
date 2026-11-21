@@ -3,6 +3,7 @@ use super::pager::{Pager, ThreadRow};
 use super::redirect::FdRedirect;
 use super::rewind::{is_undo, rewind_barrier, undo_opener};
 use super::roster::{RosterRow, RosterSources};
+use super::run_now::{CommandOutput, run_now};
 use super::sink::UiMsg;
 use super::{App, CONTROL_TASK_WAIT, Overlay, TurnStatus, cells, pager, render};
 use crate::config::RequestContext;
@@ -112,6 +113,23 @@ pub(crate) fn spawn_turn(
             },
         };
         (ctx, outcome)
+    })
+}
+
+/// Runs a command beside the turn on the snapshot the turn started with,
+/// under the same runtime rule as [`spawn_turn`]. Off the loop thread for
+/// another reason too: `.edit` borrows the terminal, and a lend asked for
+/// on the loop thread would wait on itself. The snapshot comes back with
+/// what the command left to show or the error it failed with.
+pub(super) fn spawn_run_now(
+    mut snapshot: RequestContext,
+    line: String,
+) -> JoinHandle<(RequestContext, Result<CommandOutput, String>)> {
+    spawn_work(async move {
+        let result = run_now(&mut snapshot, &line)
+            .await
+            .map_err(|err| crate::utils::pretty_error(&err));
+        (snapshot, result)
     })
 }
 
@@ -409,6 +427,37 @@ impl App {
             });
         }
         self.schedule_frame();
+    }
+
+    /// Shows a command that ran beside the turn the way `end_turn` shows
+    /// the same command run as a turn of its own; a setting says when it
+    /// takes effect.
+    pub(crate) fn push_command_result(
+        &mut self,
+        line: &str,
+        result: Result<CommandOutput, String>,
+    ) {
+        let mut cell = Cell::command(line);
+        let error = match result {
+            Ok(output) => {
+                let text = match output {
+                    CommandOutput::Text(text) => text,
+                    CommandOutput::Deferred => format!("{line} applies from the next turn\n"),
+                };
+                if let Cell::Command { output, .. } = &mut cell {
+                    *output = text;
+                }
+                None
+            }
+            Err(error) => Some(error),
+        };
+        self.transcript.push(cell);
+        if let Some(error) = error {
+            self.transcript.push(Cell::Error {
+                text: render::plain_text(&error),
+                cache: LineCache::default(),
+            });
+        }
     }
 
     pub(crate) fn begin_exit(&mut self) {

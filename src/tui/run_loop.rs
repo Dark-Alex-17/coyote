@@ -1,8 +1,9 @@
-use super::control::{TurnOutcome, spawn_control_request, spawn_exit, spawn_turn};
+use super::control::{TurnOutcome, spawn_control_request, spawn_exit, spawn_run_now, spawn_turn};
 use super::events::SystemClock;
 use super::lend::{OwnerGuard, TtyHandles, remember_tty};
 use super::queued::{carry_over, reconcile_queue, take_user_messages};
 use super::rewind::apply_rewind;
+use super::run_now::{CommandOutput, replay_deferred};
 use super::sink::{LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use super::terminal::Screen;
 use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, redirect, render};
@@ -14,6 +15,7 @@ use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, bail};
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
+use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,10 +80,116 @@ async fn join(task: &mut Option<Task>) -> Done {
     }
 }
 
-/// Sends `line` off with the context as a turn.
+/// The snapshot back from a command, with what it left to show or its error.
+type CommandRun = (RequestContext, Result<CommandOutput, String>);
+type RanCommand = Result<CommandRun, tokio::task::JoinError>;
+
+/// The commands typed during a turn that run beside it rather than
+/// after it: one at a time, in the order typed, each on a fork of the
+/// context taken as the turn started.
+#[derive(Default)]
+pub(super) struct ImmediateCommands {
+    /// The fork, while its turn runs and no command has it out.
+    snapshot: Option<RequestContext>,
+    running: Option<(String, JoinHandle<CommandRun>)>,
+    waiting: VecDeque<String>,
+    /// Settings the snapshot took, in the order typed, for the live
+    /// context to take when the turn ends.
+    deferred: Vec<String>,
+}
+
+impl ImmediateCommands {
+    pub(super) fn turn_started(&mut self, ctx: &RequestContext) {
+        self.snapshot = Some(ctx.fork_for_branch());
+    }
+
+    pub(super) fn turn_ended(&mut self) {
+        self.snapshot = None;
+    }
+
+    pub(super) fn push(&mut self, line: String) {
+        self.waiting.push_back(line);
+    }
+
+    /// Forgets the lines still to run and the settings still to apply,
+    /// for a session that is ending.
+    pub(super) fn clear(&mut self) {
+        self.waiting.clear();
+        self.deferred.clear();
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    pub(super) fn take_deferred(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.deferred)
+    }
+
+    /// Sends the oldest waiting line off with the snapshot, when nothing
+    /// else has it out.
+    pub(super) fn start_next(&mut self) {
+        if self.running.is_some() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.take() else {
+            return;
+        };
+        match self.waiting.pop_front() {
+            Some(line) => self.running = Some((line.clone(), spawn_run_now(snapshot, line))),
+            None => self.snapshot = Some(snapshot),
+        }
+    }
+
+    /// The oldest waiting line, once nothing runs: with no turn left to
+    /// run beside, it runs as a turn like any idle line.
+    pub(super) fn take_idle_line(&mut self) -> Option<String> {
+        if self.running.is_some() {
+            return None;
+        }
+        self.waiting.pop_front()
+    }
+
+    pub(super) async fn join(&mut self) -> RanCommand {
+        let (_, handle) = self
+            .running
+            .as_mut()
+            .expect("polled only while a command runs");
+        handle.await
+    }
+
+    /// The message the finished command's cell comes from. The snapshot
+    /// goes back only while the turn it was taken for still runs: a turn
+    /// that ended took its snapshot with it, and the next one brought its
+    /// own. A setting the snapshot took is kept for the live context
+    /// either way.
+    pub(super) fn finish(&mut self, joined: RanCommand, turn_running: bool) -> UiMsg {
+        let (line, _) = self
+            .running
+            .take()
+            .expect("finish follows a command's join");
+        let result = match joined {
+            Ok((snapshot, result)) => {
+                if turn_running && self.snapshot.is_none() {
+                    self.snapshot = Some(snapshot);
+                }
+                result
+            }
+            Err(err) => Err(format!("The command did not finish: {err}")),
+        };
+        if result == Ok(CommandOutput::Deferred) {
+            self.deferred.push(line.clone());
+        }
+        UiMsg::CommandRan { line, result }
+    }
+}
+
+/// Sends `line` off with the context as a turn, keeping a fork of the
+/// context for the commands that run beside it.
 fn start_turn(
     app: &mut App,
     ctx: RequestContext,
+    immediate: &mut ImmediateCommands,
     abort: &AbortSignal,
     tx: &UnboundedSender<UiMsg>,
     line: String,
@@ -89,12 +197,41 @@ fn start_turn(
     abort.reset();
     let command = is_command(&line, ctx.app.config.command_prefix);
     app.begin_turn(&line, command);
+    immediate.turn_started(&ctx);
     let queue = Arc::clone(&ctx.notification_queue);
     Task::Turn {
         handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
         command,
         queue,
     }
+}
+
+/// Hands the live context the settings the snapshot took during the
+/// turn, then refreshes what the screen shows of them. Runs on an
+/// interrupted turn too: the settings are the user's, not the turn's.
+async fn apply_deferred(
+    app: &mut App,
+    immediate: &mut ImmediateCommands,
+    ctx: &mut RequestContext,
+) {
+    let lines = immediate.take_deferred();
+    if lines.is_empty() {
+        return;
+    }
+    for (line, err) in replay_deferred(ctx, lines).await {
+        let text = format!(
+            "{} did not apply: {}",
+            line.trim(),
+            crate::utils::pretty_error(&err)
+        );
+        app.transcript.push_notice(
+            app.notice_merge_from(),
+            NoticeKind::ToolWarning,
+            render::plain_text(&text),
+        );
+    }
+    app.sync_from_ctx(ctx);
+    app.refresh_palette(Some(ctx));
 }
 
 #[cfg(unix)]
@@ -159,6 +296,9 @@ enum Step {
     Frame,
     /// Boxed: the context rides back inside the join result.
     Work(Box<Done>),
+    /// A command that ran beside the turn finished; boxed for the same
+    /// reason.
+    Ran(Box<RanCommand>),
     Signal,
 }
 
@@ -651,6 +791,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     } = shell;
     let mut ctx = Some(ctx);
     let mut task: Option<Task> = None;
+    let mut immediate = ImmediateCommands::default();
     let mut quit_requested = false;
     let mut frame_failing = false;
     loop {
@@ -659,6 +800,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             msg = rx.recv() => Step::Msg(msg),
             _ = app.frames.next_frame() => Step::Frame,
             done = join(&mut task), if task.is_some() => Step::Work(Box::new(done)),
+            ran = immediate.join(), if immediate.is_running() => Step::Ran(Box::new(ran)),
             _ = termination.recv() => Step::Signal,
         };
         match step {
@@ -705,7 +847,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 match command {
                     Some(Command::Submit(line)) => {
                         if let Some(ctx) = ctx.take() {
-                            task = Some(start_turn(app, ctx, abort, tx, line));
+                            task = Some(start_turn(app, ctx, &mut immediate, abort, tx, line));
                         } else {
                             // Submit is not mapped while a task holds the
                             // context; should that ever change, the draft
@@ -719,6 +861,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             queued::queue_user_message(queue, &text);
                         }
                     }
+                    Some(Command::RunNow(line)) => immediate.push(line),
                     Some(Command::Unqueue { held, draft }) => {
                         if let Some(Task::Turn { queue, .. }) = &task {
                             if let Some(text) = held
@@ -740,6 +883,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     }
                     Some(Command::Quit) => {
                         quit_requested = true;
+                        immediate.clear();
                         quit_abort(abort, task.is_some());
                         purge_turn_queue(&task);
                     }
@@ -823,6 +967,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             }
             Step::Msg(Some(msg)) => app.handle_msg(msg),
             Step::Msg(None) => {}
+            Step::Ran(ran) => {
+                let turn_running = matches!(task, Some(Task::Turn { .. }));
+                app.handle_msg(immediate.finish(*ran, turn_running));
+            }
             Step::Frame => {
                 // One line per streak of failed frames, not one per frame:
                 // a terminal that is gone would otherwise fill the log.
@@ -844,6 +992,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     };
                     match joined {
                         Ok((mut returned, outcome)) => {
+                            immediate.turn_ended();
                             // The select is unbiased: a tool's last report
                             // may still sit in the channel next to the join
                             // that won, and the end-of-turn sweep would
@@ -856,6 +1005,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             app.refresh_palette(Some(&returned));
                             if outcome.exit {
                                 quit_requested = true;
+                            }
+                            if !quit_requested {
+                                apply_deferred(app, &mut immediate, &mut returned).await;
                             }
                             reconcile_queue(&mut app.queued, &take_user_messages(&queue));
                             // An `.exit` that ran from the queue ends the
@@ -873,7 +1025,14 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                                 // left the finished turn's behind.
                                 let next = app.queued.remove(0);
                                 carry_over(&returned.notification_queue, &app.queued);
-                                task = Some(start_turn(app, returned, abort, tx, next.text));
+                                task = Some(start_turn(
+                                    app,
+                                    returned,
+                                    &mut immediate,
+                                    abort,
+                                    tx,
+                                    next.text,
+                                ));
                             }
                         }
                         Err(err) => {
@@ -920,6 +1079,22 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     &mut app.control_tasks,
                 );
             }
+        }
+        immediate.start_next();
+        // A setting whose check outlived its turn finds the context idle.
+        if task.is_none()
+            && !quit_requested
+            && let Some(idle) = ctx.as_mut()
+        {
+            apply_deferred(app, &mut immediate, idle).await;
+        }
+        if task.is_none()
+            && !quit_requested
+            && ctx.is_some()
+            && let Some(line) = immediate.take_idle_line()
+            && let Some(idle) = ctx.take()
+        {
+            task = Some(start_turn(app, idle, &mut immediate, abort, tx, line));
         }
         if quit_requested
             && task.is_none()

@@ -354,22 +354,21 @@ fn ensure_reasoning_effort_supported(agent: &Agent) -> Result<()> {
     Ok(())
 }
 
-fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
+fn asset_names_listing(kind: &str, names: &[String]) -> String {
     if names.is_empty() {
-        println!("No {kind} found.");
-        return Ok(());
+        return format!("No {kind} found.\n");
     }
 
     let mut header: Vec<char> = kind.chars().collect();
     header[0] = header[0].to_ascii_uppercase();
     let header: String = header.into_iter().collect();
 
-    println!("{header}:");
+    let mut out = format!("{header}:\n");
     for name in names {
-        println!("  • {name}");
+        out.push_str(&format!("  • {name}\n"));
     }
 
-    Ok(())
+    out
 }
 
 pub(crate) fn asset_table(header: &[&str]) -> Table {
@@ -4194,29 +4193,29 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn edit_config(&self) -> Result<()> {
+    /// Opens the config in the editor; returns the reminder to show after.
+    pub fn edit_config(&self) -> Result<String> {
         let config_path = paths::config_file();
         let editor = self.app.config.editor()?;
         edit_file(&editor, &config_path)?;
-        println!(
-            "NOTE: Remember to restart {} if there are changes made to '{}'",
+        Ok(format!(
+            "NOTE: Remember to restart {} if there are changes made to '{}'\n",
             env!("CARGO_CRATE_NAME"),
             config_path.display(),
-        );
-        Ok(())
+        ))
     }
 
-    pub fn edit_mcp_config(&self) -> Result<()> {
+    /// Opens the MCP config in the editor; returns the reminder to show
+    /// after.
+    pub fn edit_mcp_config(&self) -> Result<String> {
         let mcp_path = paths::mcp_config_file();
         let editor = self.app.config.editor()?;
         edit_file(&editor, &mcp_path)?;
-        println!(
-            "NOTE: Remember to restart {} for changes to '{}' to take effect",
+        Ok(format!(
+            "NOTE: Remember to restart {} for changes to '{}' to take effect\n",
             env!("CARGO_CRATE_NAME"),
             mcp_path.display(),
-        );
-
-        Ok(())
+        ))
     }
 
     pub fn new_role(&self, app: &AppConfig, name: &str) -> Result<()> {
@@ -4313,7 +4312,9 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn edit_agent_config(&self, app: &AppConfig) -> Result<()> {
+    /// Opens the agent's config in the editor, writing a stub first when
+    /// it has none; returns the reminder to show after.
+    pub fn edit_agent_config(&self, app: &AppConfig) -> Result<String> {
         let agent_name = match &self.agent {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
@@ -4338,12 +4339,10 @@ impl RequestContext {
 
         let editor = app.editor()?;
         edit_file(&editor, &target_path)?;
-        println!(
-            "NOTE: Remember to reload the agent if there are changes made to '{}'",
+        Ok(format!(
+            "NOTE: Remember to reload the agent if there are changes made to '{}'\n",
             target_path.display()
-        );
-
-        Ok(())
+        ))
     }
 
     pub fn new_macro(&self, app: &AppConfig, name: &str) -> Result<()> {
@@ -4503,14 +4502,14 @@ impl RequestContext {
             .collect()
     }
 
-    pub fn list_assets(&self, kind: &str) -> Result<()> {
+    /// What `.list <kind>` prints.
+    pub fn assets_listing(&self, kind: &str) -> Result<String> {
         match kind {
-            "roles" => print_asset_names("roles", &paths::list_roles(true)),
+            "roles" => Ok(asset_names_listing("roles", &paths::list_roles(true))),
             "sessions" => {
                 let rows = self.session_list_rows();
                 if rows.is_empty() {
-                    println!("No sessions found.");
-                    return Ok(());
+                    return Ok("No sessions found.\n".to_string());
                 }
 
                 let mut table = asset_table(&["name", "scope", "state"]);
@@ -4520,16 +4519,13 @@ impl RequestContext {
                     table.add_row(vec![name.as_str(), &scope, state]);
                 }
 
-                println!("Sessions:");
-                println!("{table}");
-                Ok(())
+                Ok(format!("Sessions:\n{table}\n"))
             }
-            "rags" => print_asset_names("RAGs", &paths::list_rags()),
+            "rags" => Ok(asset_names_listing("RAGs", &paths::list_rags())),
             "macros" => {
                 let policy = self.macro_policy();
                 if policy.macros.is_empty() {
-                    println!("No macros found.");
-                    return Ok(());
+                    return Ok("No macros found.\n".to_string());
                 }
 
                 let mut table =
@@ -4553,15 +4549,12 @@ impl RequestContext {
                     ]);
                 }
 
-                println!("Macros:");
-                println!("{table}");
-                Ok(())
+                Ok(format!("Macros:\n{table}\n"))
             }
             "agents" => {
                 let entries = list_agents_with_descriptions();
                 if entries.is_empty() {
-                    println!("No agents found.");
-                    return Ok(());
+                    return Ok("No agents found.\n".to_string());
                 }
 
                 let mut table = asset_table(&["name", "description"]);
@@ -4569,9 +4562,7 @@ impl RequestContext {
                     table.add_row(vec![name, description]);
                 }
 
-                println!("Agents:");
-                println!("{table}");
-                Ok(())
+                Ok(format!("Agents:\n{table}\n"))
             }
             "skills" => {
                 let policy = SkillPolicy::effective(
@@ -4612,8 +4603,7 @@ impl RequestContext {
                 }
 
                 if entries.is_empty() {
-                    println!("No skills found.");
-                    return Ok(());
+                    return Ok("No skills found.\n".to_string());
                 }
 
                 let mut table = asset_table(&["loaded", "name", "description"]);
@@ -4626,9 +4616,7 @@ impl RequestContext {
                     table.add_row(vec![marker, name, description]);
                 }
 
-                println!("Skills:");
-                println!("{table}");
-                Ok(())
+                Ok(format!("Skills:\n{table}\n"))
             }
             "tools" => {
                 let mut names = self.concrete_tool_names();
@@ -4660,29 +4648,24 @@ impl RequestContext {
                 };
 
                 if names.is_empty() {
-                    println!("No tools found.");
-                    return Ok(());
+                    return Ok("No tools found.\n".to_string());
                 }
 
-                println!("Tools:");
+                let mut out = String::from("Tools:\n");
                 for name in &names {
                     let marker = if active.contains(name.as_str()) {
                         "✓".green().bold().to_string()
                     } else {
                         "✗".red().bold().to_string()
                     };
-                    println!("  {marker} {name}");
+                    out.push_str(&format!("  {marker} {name}\n"));
                 }
-                Ok(())
+                Ok(out)
             }
-            "mcp-servers" => {
-                match self.mcp_servers_listing() {
-                    Some(listing) => print!("{listing}"),
-                    None => println!("No MCP servers found."),
-                }
-                Ok(())
-            }
-            "bundles" => bundles::list_installed_bundles(),
+            "mcp-servers" => Ok(self
+                .mcp_servers_listing()
+                .unwrap_or_else(|| "No MCP servers found.\n".to_string())),
+            "bundles" => bundles::installed_bundles_listing(),
             _ => bail!(
                 "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, prompts, tools, mcp-servers, bundles"
             ),
@@ -6128,11 +6111,11 @@ impl RequestContext {
             .prompt_completion(&enabled_ids, args)
     }
 
-    pub async fn list_mcp_prompts(&self) -> Result<()> {
+    /// What `.list prompts` prints.
+    pub async fn mcp_prompts_listing(&self) -> String {
         let items = self.tool_scope.mcp_runtime.prompt_catalog().await;
         if items.is_empty() {
-            println!("No prompts found.");
-            return Ok(());
+            return "No prompts found.\n".to_string();
         }
 
         let mut table = asset_table(&["server", "name", "description", "args"]);
@@ -6140,9 +6123,7 @@ impl RequestContext {
             table.add_row(row.to_vec());
         }
 
-        println!("Prompts:");
-        println!("{table}");
-        Ok(())
+        format!("Prompts:\n{table}\n")
     }
 
     async fn rebuild_tool_scope(
@@ -7093,7 +7074,9 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
+    /// Opens the skill in the editor, scaffolding it first when missing;
+    /// returns the confirmation to show after.
+    pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<String> {
         paths::validate_skill_name(name)?;
         crate::tui::ensure_terminal_lendable()?;
         let path = paths::skill_file(name);
@@ -7105,12 +7088,8 @@ impl RequestContext {
         }
         let editor = app.editor()?;
         edit_file(&editor, &path)?;
-        if is_new {
-            println!("✓ Created skill at '{}'.", path.display());
-        } else {
-            println!("✓ Saved skill at '{}'.", path.display());
-        }
-        Ok(())
+        let verb = if is_new { "Created" } else { "Saved" };
+        Ok(format!("✓ {verb} skill at '{}'.\n", path.display()))
     }
 
     pub async fn load_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
@@ -7181,17 +7160,18 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn list_loaded_skills(&self) {
+    /// What `.skill loaded` prints.
+    pub fn loaded_skills_listing(&self) -> String {
         let names = self.skill_registry.loaded_names();
 
         if names.is_empty() {
-            println!("No skills loaded.");
-        } else {
-            println!("Loaded skills:");
-            for name in names {
-                println!("  • {name}");
-            }
+            return "No skills loaded.\n".to_string();
         }
+        let mut out = String::from("Loaded skills:\n");
+        for name in names {
+            out.push_str(&format!("  • {name}\n"));
+        }
+        out
     }
 
     pub async fn apply_prelude(

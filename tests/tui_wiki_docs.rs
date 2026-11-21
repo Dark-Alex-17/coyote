@@ -1222,6 +1222,65 @@ fn tui_page_quotes_the_code() {
     }
 }
 
+/// Every entry of the TUI's command timing table as the page's table shows
+/// it: the command, its class and, for a queued one, the reason.
+fn command_timings() -> Vec<(String, String, String)> {
+    let source = src(&["tui", "command_timing.rs"]);
+    let start = source
+        .find("pub(super) const COMMAND_TIMINGS")
+        .expect("the source declares COMMAND_TIMINGS");
+    let table = &source[start..];
+    let table = flat(&table[..table.find("\n];").expect("the table ends with `];`")])
+        .replace("( \"", "(\"");
+    table
+        .split("(\".")
+        .skip(1)
+        .map(|entry| {
+            let (name, rest) = entry.split_once('"').expect("a command name ends");
+            let timing = rest.trim_start_matches(", ");
+            let (class, reason) = if timing.starts_with("Timing::Now)") {
+                ("At once", String::new())
+            } else if timing.starts_with("Timing::Deferred)") {
+                ("Next turn", String::new())
+            } else if timing.starts_with("Timing::Queue(") {
+                ("Queued", string_literals(timing).remove(0))
+            } else {
+                let constant = &timing[..timing.find(')').expect("an entry ends")];
+                (
+                    "Queued",
+                    string_literals(&const_expr(&source, constant)).remove(0),
+                )
+            };
+            (format!(".{name}"), class.to_string(), reason)
+        })
+        .collect()
+}
+
+/// The page's table of what a command typed during a turn does is the
+/// timing table, row for row, so a command added, moved or reworded in
+/// the code fails here until the page follows.
+#[test]
+fn tui_page_lists_every_command_timing() {
+    let timings = command_timings();
+    assert!(timings.len() > 60, "the table scraper read {timings:?}");
+    let control = src(&["tui", "control.rs"]);
+    let applies = literal_with(production(&control), "applies from the next turn")
+        .replace("{line}", "<line>");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let queued = section(PAGE, &read(wiki.join(PAGE)), "## Queued input");
+    let needle = format!("`{}`", applies.trim_end());
+    assert!(flat(&queued).contains(&needle), "{PAGE} says {needle}");
+    let rows: Vec<(String, String, String)> = table_rows(&queued)
+        .into_iter()
+        .map(|row| {
+            let [name, class, reason] = <[String; 3]>::try_from(row).expect("three cells a row");
+            (name.trim_matches('`').to_string(), class, reason)
+        })
+        .collect();
+    assert_eq!(rows, timings);
+}
+
 /// What the page says about how the UI is drawn holds for the code that
 /// draws it: each pair is a fact in the source and the words the page
 /// uses for it, so changing one without the other fails here. The page

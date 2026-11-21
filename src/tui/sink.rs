@@ -3,6 +3,7 @@
 //! UI loop's inbox. A question for the human goes the same way and blocks
 //! the asking thread on a std channel until the modal answers.
 
+use super::run_now::CommandOutput;
 use crate::client::SseEvent;
 use crate::config::AppConfig;
 use crate::config::child_sessions::ChildSessionRoot;
@@ -139,6 +140,12 @@ pub(crate) enum UiMsg {
     TaskCancelled {
         id: String,
         result: Result<Value, String>,
+    },
+    /// What a command run during a turn on the turn's starting context
+    /// left to show, or the error it failed with.
+    CommandRan {
+        line: String,
+        result: Result<CommandOutput, String>,
     },
 }
 

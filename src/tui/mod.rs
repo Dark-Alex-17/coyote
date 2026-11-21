@@ -15,6 +15,7 @@
 mod bottom_pane;
 mod cells;
 mod child_live;
+mod command_timing;
 mod composer;
 mod control;
 mod dump;
@@ -31,6 +32,7 @@ mod render;
 mod rewind;
 mod roster;
 mod run_loop;
+mod run_now;
 mod sink;
 mod terminal;
 mod theme;
@@ -51,6 +53,7 @@ use bottom_pane::{
 };
 use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow};
 use child_live::{ChildLive, ChildThread, ToolEnd};
+use command_timing::Timing;
 use composer::Composer;
 use control::{ControlRequest, cancel_report, is_plain_session_id};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
@@ -280,6 +283,10 @@ pub(crate) enum Command {
     /// A prompt typed during a turn; the loop offers it to the running
     /// turn's model.
     Queue(String),
+    /// A command typed during a turn that runs at once on the context
+    /// the turn started with, without waiting for the turn. A setting
+    /// among them reaches the live context when the turn ends.
+    RunNow(String),
     /// A held line taken back into the composer: the loop withdraws the
     /// prompt from the running turn and offers the draft it displaced,
     /// each `None` when it was a command the turn never saw.
@@ -813,6 +820,18 @@ impl App {
     fn queue_composer(&mut self) -> Option<Command> {
         if self.exiting {
             return None;
+        }
+        if self.take_keys_command() {
+            return None;
+        }
+        // `.keys` gets this far only when a macro of that name shadows
+        // it, and the macro waits like any other.
+        let now = matches!(
+            command_timing::lookup(&self.composer_text(), self.config.command_prefix),
+            Some((name, Timing::Now | Timing::Deferred)) if name.strip_prefix('.') != Some(KEYS_COMMAND)
+        );
+        if now {
+            return self.take_composer_line().map(Command::RunNow);
         }
         self.hold_composer_line().map(Command::Queue)
     }
@@ -1727,6 +1746,7 @@ impl App {
                 self.transcript
                     .push_notice(self.notice_merge_from(), kind, text);
             }
+            UiMsg::CommandRan { line, result } => self.push_command_result(&line, result),
         }
         self.schedule_frame();
     }

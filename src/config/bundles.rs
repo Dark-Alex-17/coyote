@@ -656,14 +656,19 @@ pub(crate) fn installed_bundle_names() -> Vec<String> {
 }
 
 pub fn list_installed_bundles() -> Result<()> {
+    print!("{}", installed_bundles_listing()?);
+    Ok(())
+}
+
+pub fn installed_bundles_listing() -> Result<String> {
     let store = BundleStore::load()?;
     let rows = bundle_list_rows(&store, &paths::config_dir());
     if rows.is_empty() {
-        println!(
+        return Ok(
             "No bundles installed. Install one with `coyote --install <git-url|owner/repo>` \
-             or, from the REPL, `.install <git-url|owner/repo>` (see `.install --help`)."
+             or, from the REPL, `.install <git-url|owner/repo>` (see `.install --help`).\n"
+                .to_string(),
         );
-        return Ok(());
     }
 
     let mut table = request_context::asset_table(&[
@@ -687,9 +692,7 @@ pub fn list_installed_bundles() -> Result<()> {
         ]);
     }
 
-    println!("Bundles:");
-    println!("{table}");
-    Ok(())
+    Ok(format!("Bundles:\n{table}\n"))
 }
 
 fn sanitize_name_segment(segment: &str) -> String {

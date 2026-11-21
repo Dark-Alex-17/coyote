@@ -3747,13 +3747,17 @@ mod binary {
         pty.send(b"\x1b").unwrap();
         // A command typed right after the interrupt runs as its own turn; had
         // the stream still been running it would queue behind the fake's
-        // eight-second hold.
+        // eight-second hold. `.clear images` is one that waits for a running
+        // turn, where `.info` would run beside it.
         pty.read_for(Duration::from_millis(500));
         let info_at = pty.raw().len();
-        pty.send(b".info\r").unwrap();
-        let transcript = pty
-            .wait_for_after("log_path", info_at, PTY_DEADLINE)
-            .expect("keys were not handled after the interrupt");
+        pty.send(b".clear images\r").unwrap();
+        let transcript = wait_for_squeezed_after(
+            &mut pty,
+            "No pending images.",
+            info_at,
+            "keys were not handled after the interrupt",
+        );
         assert!(
             pressed.elapsed() < Duration::from_secs(6),
             "the command ran only after the fake gave up holding the stream, not on Esc"
@@ -4245,11 +4249,16 @@ mod binary {
             "Ctrl+C during a running turn quit the UI instead of interrupting the turn:\n{since}"
         );
 
+        // `.clear images` waits for a running turn, so its output shows the
+        // interrupt ended the turn.
         let info_at = pty.raw().len();
-        pty.send(b".info\r").unwrap();
-        let transcript = pty
-            .wait_for_after("log_path", info_at, PTY_DEADLINE)
-            .expect("keys were not handled after the Ctrl+C interrupt");
+        pty.send(b".clear images\r").unwrap();
+        let transcript = wait_for_squeezed_after(
+            &mut pty,
+            "No pending images.",
+            info_at,
+            "keys were not handled after the Ctrl+C interrupt",
+        );
         assert!(
             pressed.elapsed() < Duration::from_secs(6),
             "the command ran only after the fake gave up holding the stream, not on Ctrl+C"
