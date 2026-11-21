@@ -5171,7 +5171,8 @@ def _pr_view(state, ref=""):
                                env={**os.environ, "SISYPHUS_PR_REF": ref})
         else:
             p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json",
-                                "number,url,isDraft,headRefName,body,baseRefName,baseRefOid,mergeable,mergeStateStatus"],
+                                "number,url,isDraft,headRefName,headRefOid,body,baseRefName,baseRefOid,mergeable,"
+                                "mergeStateStatus"],
                                cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
         doc = json.loads(p.stdout) if p.returncode == 0 else None
         return doc if isinstance(doc, dict) else None
