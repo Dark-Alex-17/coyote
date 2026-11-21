@@ -3891,7 +3891,7 @@ fn shipped_candidate_is_ascii_apart_from_the_severity_markers() {
             offenders.push(format!("{rel}: not UTF-8"));
             continue;
         };
-        let mut kept = 0;
+        let mut kept = 0usize;
         for (line_no, line) in text.lines().enumerate() {
             for c in line.chars().filter(|c| !c.is_ascii()) {
                 if markers.contains(&c) {
