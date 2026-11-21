@@ -3798,6 +3798,72 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
     }
 }
 
+/// `base_check` fetches the base branch once and then makes up to three gh
+/// calls (the PR read, the flip and its re-read). A crash must still reach
+/// the report, so the shim declares `fallback: final_report`.
+#[test]
+fn base_check_is_a_script_node_whose_timeout_covers_the_fetch_and_three_gh_calls() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let fetch = lib_constant(&lib, "BASE_FETCH_SECS");
+    let gh_call = lib_constant(&lib, "GH_CALL_SECS");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &shipped["nodes"]["base_check"];
+    assert_eq!(node["type"].as_str(), Some("script"), "base_check type");
+    let script = node["script"].as_str().expect("base_check names a script");
+    assert!(
+        script.ends_with("scripts/base_check.py"),
+        "base_check runs {script}"
+    );
+    assert!(
+        candidate_dir().join("scripts/base_check.py").is_file(),
+        "the base_check shim is missing"
+    );
+    assert_eq!(
+        node["fallback"].as_str(),
+        Some("final_report"),
+        "base_check has no fallback to final_report: a shim crash would end the run without a report"
+    );
+    let limit = node["timeout"]
+        .as_i64()
+        .expect("base_check has an integer timeout");
+    assert!(
+        limit >= fetch + 3 * gh_call,
+        "base_check timeout {limit} is below BASE_FETCH_SECS {fetch} + 3 * GH_CALL_SECS {gh_call}"
+    );
+}
+
+/// The base-freshness state starts empty, with the types the gates read.
+#[test]
+fn initial_state_seeds_the_base_check_keys_with_their_types() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let init = &shipped["initial_state"];
+    for key in [
+        "base_then",
+        "base_mode",
+        "base_status",
+        "base_checked_head",
+        "base_tip",
+    ] {
+        assert_eq!(init[key].as_str(), Some(""), "initial_state.{key}");
+    }
+    for key in ["base_syncs", "base_merge_retries"] {
+        assert_eq!(init[key].as_i64(), Some(0), "initial_state.{key}");
+    }
+    assert_eq!(
+        init["base_sync_active"].as_bool(),
+        Some(false),
+        "initial_state.base_sync_active"
+    );
+    assert!(
+        init["base_conflicted"]
+            .as_sequence()
+            .is_some_and(|s| s.is_empty()),
+        "initial_state.base_conflicted is not an empty list"
+    );
+}
+
 /// Each `subprocess.run(...)` call in `source` as its 1-based line number and
 /// the call text up to the matching close paren. Parens inside string
 /// literals and comments do not count.
