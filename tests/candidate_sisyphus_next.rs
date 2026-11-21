@@ -3356,6 +3356,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ask_owner_poll", "timeout", 0),
     ("assess", "max_iterations", 20),
     ("assess", "timeout", 900),
+    ("base_check", "timeout", 360),
     ("bookkeeping_judge", "timeout", 300),
     ("bookkeeping_scan", "timeout", 60),
     ("build_gauntlet_prompt", "timeout", 60),
@@ -3424,6 +3425,9 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 /// round counters among them are what the `_lib.py` bounds are checked on.
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "apply_reasks",
+    "base_marker_retries",
+    "base_merge_retries",
+    "base_syncs",
     "ci_fix_strikes",
     "ci_poll_budget",
     "ci_poll_fails",
@@ -3469,6 +3473,8 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// window an empty check list must persist before it reads `no_checks`, and
 /// the `ci_poll` visit bounds that sit under the engine's per-node cap.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
+    ("BASE_FETCH_SECS", "60"),
+    ("BASE_SYNC_MAX", "2"),
     ("CHOICE_OPTIONS_MAX", "4"),
     ("CHOICE_OPTIONS_MIN", "2"),
     ("CI_FLAKE_RERUNS", "2"),
