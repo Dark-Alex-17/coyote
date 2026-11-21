@@ -7045,12 +7045,25 @@ with scenario("repeat decisions: apply_answer records a decision it acted on, ne
     again = gates.apply_answer(base_state(escalation=dict(REPEAT_ESC, data={"reply_read": True}), last_answer="maybe later"))
     check(name, acted.get("answered_decisions") == [REPEAT_KEY]
           and unread["_next"] == "interpret_reply" and "answered_decisions" not in unread
-          and again["_next"] != "apply_answer" and "answered_decisions" not in again, (acted, unread, again))
+          and again["_next"] == "ask_dispatch" and "answered_decisions" not in again, (acted, unread, again))
 with scenario("repeat decisions: an autonomous run asks the owner for a decision it already answered, even one the "
               "ladder never saw") as name:
     u = gates.escalate_gate(base_state(escalation=REPEAT_ESC, escalation_policy="autonomous",
                                        answered_decisions=[REPEAT_KEY]))
     check(name, u["_next"] == "ask_dispatch", u)
+with scenario("repeat decisions: plan_defect, yellow_findings and probe_gap raised again in the same subtask with new "
+              "findings are the same decision, and the no-human reply goes to the headless judge") as name:
+    seen = {}
+    for kind in ("plan_defect", "yellow_findings", "probe_gap"):
+        texts = KIND_OPTIONS[kind]
+        opts = [option(texts[0], True)] + [option(t) for t in texts[1:]]
+        first = escalation(kind, "first finding?", opts, evidence="finding one")
+        later = escalation(kind, "a different finding?", opts, evidence="finding two")
+        st = base_state(subtask_index=2)
+        key = gates._decision_key(st, first)
+        u = gates.parse_answer(dict(st, escalation=later, last_answer_text=HG, answered_decisions=[key]))
+        seen[kind] = (key == gates._decision_key(st, later), u["_next"], u.get("judge_rulings", {}).get(key))
+    check(name, all(v == (True, "headless_judge", 1) for v in seen.values()), seen)
 with scenario("repeat decisions: review_exhausted answered with the engine's recommended pick and raised again "
               "reaches the headless judge") as name:
     st, u = chain(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}], review_rounds=STRIKE_LIMIT),
