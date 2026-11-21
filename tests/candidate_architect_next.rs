@@ -3239,70 +3239,108 @@ fn conformance_nodes_forward_debris_exclude_to_every_reviewer() {
     );
 }
 
-/// The README's `build_lock` row names five agent nodes, the agent each runs,
-/// and that each of those agents declares `build_lock` itself. A CLI root's
-/// agent variables do not reach agent-node children, so each of the five
-/// passes `build_lock` through `inputs:`, and the two `sisyphus-next`
-/// delegates pass `escalation_policy` the same way.
+/// The candidate's agent nodes whose child agent declares `variable`, from the
+/// child's own `graph.yaml` or `config.yaml`.
+fn agent_nodes_whose_child_declares(variable: &str) -> BTreeSet<String> {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let mut found = BTreeSet::new();
+    for (name, node) in doc["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("agent") {
+            continue;
+        }
+        let root = agents_dir().join(node["agent"].as_str().unwrap());
+        let file = ["graph.yaml", "config.yaml"]
+            .iter()
+            .map(|f| root.join(f))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("{} ships no graph.yaml or config.yaml", root.display()));
+        if names_of(&variable_list(&file)).contains(&variable) {
+            found.insert(name.as_str().unwrap().to_string());
+        }
+    }
+    found
+}
+
+/// A CLI root's agent variables do not reach agent-node children, so every
+/// agent node whose child declares `build_lock` passes it through `inputs:`
+/// and no other node does. The README's `build_lock` row names those five
+/// nodes and the agent each runs.
 #[test]
-fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
+fn readme_build_lock_row_names_the_five_children_and_their_inputs() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let nodes = &doc["nodes"];
+    let declaring = agent_nodes_whose_child_declares("build_lock");
+    for (name, node) in nodes.as_mapping().unwrap() {
+        let name = name.as_str().unwrap();
+        if declaring.contains(name) {
+            assert_eq!(
+                node["inputs"]["build_lock"].as_str(),
+                Some("{{build_lock}}"),
+                "{name} runs a child that declares build_lock, so it must pass it through inputs: {node:?}"
+            );
+        } else {
+            assert!(
+                node["inputs"]["build_lock"].is_null(),
+                "{name} runs no child that declares build_lock, yet passes it: {node:?}"
+            );
+        }
+    }
     let readme = readme();
     let row = readme
         .lines()
         .find(|l| l.starts_with("| `build_lock` variable |"))
         .expect("the README lost its build_lock row");
-    for (node, agent) in [
+    let named = [
         ("delegate", "sisyphus-next"),
         ("wave_delegate", "sisyphus-next"),
         ("run_gauntlet", "review-gauntlet"),
         ("wave_gauntlet", "review-gauntlet"),
         ("run_adversary", "adversary"),
-    ] {
+    ];
+    assert_eq!(
+        declaring,
+        named.iter().map(|(n, _)| n.to_string()).collect(),
+        "the nodes whose child declares build_lock changed; update the README build_lock row"
+    );
+    for (node, agent) in named {
         assert!(
             row.contains(&format!("`{node}`")) && row.contains(&format!("`{agent}`")),
             "the README build_lock row no longer names {node} running {agent}"
-        );
-        assert_eq!(
-            nodes[node]["type"].as_str(),
-            Some("agent"),
-            "README names {node} as an agent node"
         );
         assert_eq!(
             nodes[node]["agent"].as_str(),
             Some(agent),
             "README says {node} runs {agent}"
         );
-        assert_eq!(
-            nodes[node]["inputs"]["build_lock"].as_str(),
-            Some("{{build_lock}}"),
-            "README says {node} passes build_lock through inputs: {:?}",
-            nodes[node]
-        );
-        if agent == "sisyphus-next" {
-            assert_eq!(
-                nodes[node]["inputs"]["escalation_policy"].as_str(),
-                Some("{{escalation_policy}}"),
-                "{node} must pass escalation_policy through inputs: {:?}",
-                nodes[node]
-            );
-        }
     }
     assert!(
         row.contains("each pass `build_lock: '{{build_lock}}'` through `inputs:`"),
         "the README build_lock row no longer says the five nodes pass it through inputs: {row}"
     );
-    for (agent, file) in [
-        ("sisyphus-next", "graph.yaml"),
-        ("review-gauntlet", "graph.yaml"),
-        ("adversary", "graph.yaml"),
-    ] {
-        let vars = variable_list(&agents_dir().join(agent).join(file));
+}
+
+/// Every agent node whose child declares `escalation_policy` passes the
+/// architect's own through `inputs:`, so an autonomous architect delegates to
+/// an autonomous child.
+#[test]
+fn delegates_pass_escalation_policy_through_inputs() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let declaring = agent_nodes_whose_child_declares("escalation_policy");
+    for node in ["delegate", "wave_delegate"] {
         assert!(
-            names_of(&vars).contains(&"build_lock"),
-            "README says {agent} declares build_lock itself"
+            declaring.contains(node),
+            "{node} no longer runs a child that declares escalation_policy: {declaring:?}"
+        );
+    }
+    for node in &declaring {
+        assert_eq!(
+            doc["nodes"][node.as_str()]["inputs"]["escalation_policy"].as_str(),
+            Some("{{escalation_policy}}"),
+            "{node} must pass escalation_policy through inputs: {:?}",
+            doc["nodes"][node.as_str()]
         );
     }
 }
@@ -5079,34 +5117,28 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
 }
 
 /// A CLI root's agent variables do not reach agent-node children, so the
-/// five nodes whose agents declare `build_lock` thread it through `inputs:`
-/// and no other node does; apart from those inputs, the variable declaration
-/// is the one line of `graph.yaml` that names it.
+/// nodes whose agents declare `build_lock` thread it through `inputs:` and no
+/// other node does; apart from those inputs, the variable declaration is the
+/// one line of `graph.yaml` that names it.
 #[test]
 fn only_the_build_lock_children_thread_it_through_inputs() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
-    let threading: BTreeSet<&str> = doc["nodes"]
+    let threading: BTreeSet<String> = doc["nodes"]
         .as_mapping()
         .unwrap()
         .iter()
         .filter(|(_, node)| !node["inputs"]["build_lock"].is_null())
-        .map(|(id, _)| id.as_str().unwrap())
+        .map(|(id, _)| id.as_str().unwrap().to_string())
         .collect();
+    let declaring = agent_nodes_whose_child_declares("build_lock");
     assert_eq!(
-        threading,
-        BTreeSet::from([
-            "delegate",
-            "run_adversary",
-            "run_gauntlet",
-            "wave_delegate",
-            "wave_gauntlet",
-        ]),
+        threading, declaring,
         "the nodes that thread build_lock through inputs"
     );
     let mentions: Vec<&str> = text.lines().filter(|l| l.contains("build_lock")).collect();
     let mut expected = vec!["  - name: build_lock"];
-    expected.extend(["      build_lock: '{{build_lock}}'"; 5]);
+    expected.extend(vec!["      build_lock: '{{build_lock}}'"; declaring.len()]);
     assert_eq!(mentions, expected, "graph.yaml");
 }
 
@@ -6050,8 +6082,20 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         "the graph agent librarian and the config agents",
         "pass those three through `inputs:`",
         "no `mode-degraded:` ledger line is written",
+        "do not reach its agent-node children",
+        "escalation_policy: '{{escalation_policy}}'",
+        "reads `$LLM_AGENT_VAR_AUTO_CONFIRM` from the child agent's environment",
     ] {
         assert!(row.contains(clause), "the E9 row lost {clause:?}: {row}");
+    }
+    for stale in [
+        "copies the parent's agent variables",
+        "by the same inheritance",
+    ] {
+        assert!(
+            !row.contains(stale),
+            "the E9 row claims engine inheritance again with {stale:?}: {row}"
+        );
     }
     for agent in expected {
         assert!(row.contains(agent), "{agent} missing from: {row}");

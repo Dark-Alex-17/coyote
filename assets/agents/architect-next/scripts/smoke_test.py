@@ -3711,12 +3711,18 @@ check("graph: delegate and wave_delegate hand the architect's escalation_policy 
 lock_in = {n: render_inputs(n, {**base_state(build_lock=LOCK), "wtask": WAVE[0]}).get("build_lock") for n in ("run_gauntlet", "wave_gauntlet", "run_adversary")}
 check("graph: run_gauntlet, wave_gauntlet and run_adversary hand the architect's build_lock to their child", all(v == LOCK for v in lock_in.values()), lock_in)
 # The child's own escalate_gate over the delegate inputs: the battery drops LLM_AGENT_VAR_*, so only an input can carry the policy.
-for policy, sn_next in (("autonomous", "ladder_judge"), ("interactive", "ask_dispatch")):
-    p, sn_gate = sisyphus_next_call("escalate_gate", {**render_inputs("delegate", {**base_state(escalation_policy=policy), **U_SEQ}),
-                                                      "escalation": SN_ESC, "run_dir": os.path.join(TMP, "sn-runs", f"esc-{policy}"), "decisions": []})
-    check(f"graph: under escalation_policy={policy} a delegated sisyphus-next routes a plan_defect with one recommended option "
-          f"from escalate_gate to {sn_next}",
-          sn_gate.get("_next") == sn_next, f"rc={p.returncode} {p.stderr[-300:]} {sn_gate}")
+SN_ESC_HARD = {**SN_ESC, "hard_trigger": True}
+for node in ("delegate", "wave_delegate"):
+    for policy, esc, sn_next in (("autonomous", SN_ESC, "ladder_judge"), ("interactive", SN_ESC, "ask_dispatch"),
+                                 ("autonomous", SN_ESC_HARD, "ask_dispatch")):
+        arch = ({**base_state(escalation_policy=policy, build_lock=LOCK), **U_SEQ} if node == "delegate"
+                else {"wtask": WAVE[0], "escalation_policy": policy, "build_lock": LOCK})
+        label = "hard-trigger" if esc.get("hard_trigger") else "plain"
+        p, sn_gate = sisyphus_next_call("escalate_gate", {**render_inputs(node, arch), "escalation": esc, "decisions": [],
+                                                          "run_dir": os.path.join(TMP, "sn-runs", f"esc-{node}-{policy}-{label}")})
+        check(f"graph: under escalation_policy={policy} a {node} sisyphus-next routes a {label} plan_defect with one recommended option "
+              f"from escalate_gate to {sn_next}",
+              sn_gate.get("_next") == sn_next, f"rc={p.returncode} {p.stderr[-300:]} {sn_gate}")
 SN_GRAPH, sn_graph_error = read_graph(os.path.join(SN_SCRIPTS, "..", "graph.yaml"))
 SN_NODES = (SN_GRAPH or {}).get("nodes") or {}
 wave_in = render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]})
