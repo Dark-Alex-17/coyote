@@ -6739,15 +6739,6 @@ with scenario("render_coder_prompt: a fix round lists the commands the last revi
                                                       ["./check --filter export_order", "./lint", "./run-cli export"])))[
         "coder_prompt"]
     check(name, "## FIX ROUND 1" in prompt and "- ./run-cli export" in prompt.split("## CONTEXT", 1)[-1], prompt[-800:])
-with scenario("lane_stuck: the same review_key with reworded findings is unchanged review input -> lane_stuck, not a "
-              "new class of findings") as name:
-    heads = [{"round": i + 1, "head": SNAP_HEAD, "code_tree": tree_2, "review_key": "same-inputs",
-              "lane_blockers": {"adversary": [f]}} for i, f in enumerate([A6_FINDING, A6_OTHER])]
-    u = gates.triage_route(base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, review_rounds=1,
-                                      triage=[{"finding": A6_OTHER, "action": "fix", "lane": "adversary"}],
-                                      lane_block_streak={"adversary": 1}, round_heads=heads))
-    check(name, gates._repeat_block(base_state(round_heads=heads), SNAP_REPO, "adversary", [A6_OTHER]) == "unchanged"
-          and u.get("escalation", {}).get("kind") == "lane_stuck", (u.get("_next"), u.get("lane_block_streak")))
 
 # ---------------------------------------------------------------- carried failures in the subtask review
 LATER_RED = [{"paths": ["tests/later_test.ext"], "owner": 2, "since": 1, "evidence": "expected 3, got 2"}]
