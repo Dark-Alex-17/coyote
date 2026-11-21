@@ -1890,10 +1890,14 @@ PLAN_DEFECT_FIX = "Not a plan defect: fix round (state the fix)"
 PLAN_DEFECT_ACCEPT = "Accept the plan defect unresolved and proceed (state the reason)"
 PLAN_DEFECT_STOP = "Stop; the plan needs amending (report it)"
 
+SCOPE_PROCEED = "Proceed"
+SCOPE_NARROW = "Narrow the scope first (say how)"
+
 # The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
 ACCEPTED_INSTRUCTIONS = {
     "clarify": ("answer",),
     "design_choice": ("design",),
+    "scope_size": ("scope",),
     "design_ask": ("answer",),
     "plan_defect": ("amendment", "fix"),
     "probe_gap": ("recipe",),
@@ -1914,6 +1918,7 @@ INSTRUCTION_HELP = {
     "rescope": "proceed with the task's scope re-declared as described; value: the new scope",
     "path": "use the handoff file at a path; value: the path",
     "narrow": "do a narrower part of the work in this run, sized again first; value: the narrower scope",
+    "scope": "narrow the change before it is implemented, as described; value: how to narrow it",
     "here": "do the work in this run anyway; value: the reason",
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
@@ -1922,8 +1927,8 @@ INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}"
                        "amendment": "Continue; treat the criterion as amended: {}", "fix": PLAN_DEFECT_FIX + ": {}",
                        "recipe": "Supply it: {}",
                        "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}",
-                       "here": SIZING_HERE_REASON + ": {}"}
-FREE_FORM_SHAPES = ("answer", "design", "amendment", "fix", "recipe", "rescope", "narrow", "here")
+                       "here": SIZING_HERE_REASON + ": {}", "scope": SCOPE_NARROW + ": {}"}
+FREE_FORM_SHAPES = ("answer", "design", "amendment", "fix", "recipe", "rescope", "narrow", "here", "scope")
 
 
 def _accepts_text(kind):
@@ -2445,6 +2450,9 @@ def apply_answer(state):
                 "_next": "end_redirect"})
     elif kind == "design_choice":
         u["_next"] = "compose_brief"
+    elif kind == "scope_size":
+        # a bare Proceed keeps the brief as composed; any other answer is read by compose_brief from the decisions
+        u["_next"] = "render_coder_prompt" if _exact_option(answer, options) == SCOPE_PROCEED else "compose_brief"
     elif kind == "oracle_fault":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "proceed": ["proceed"]})
         if a is None:
@@ -2961,11 +2969,18 @@ def scope_check(state):
             ledger(state, u, "scope check: no declared own scope in the roster; breach check skipped")
     elif not truthy(state.get("delegated")) and len(expected) >= 5 and not truthy(state.get("scope_confirmed")):
         u["scope_confirmed"] = True
+        if str(var(state, "escalation_policy", "interactive")).strip().lower() == "autonomous":
+            more = f" and {len(expected) - 20} more" if len(expected) > 20 else ""
+            line = f"proceeded on {len(expected)} expected files: {', '.join(expected[:20])}{more}"
+            u["attention_notes"] = list(as_list(state.get("attention_notes"))) + [line]
+            ledger(state, u, f"scope check: autonomous policy, not asked; {line}")
+            u["_next"] = "render_coder_prompt"
+            return u
         return raise_escalation(state, u, escalation(
-            "design_choice",
+            "scope_size",
             f"This change is expected to touch {len(expected)} files. Proceed?",
-            [option("Proceed", recommended=True, evidence="the context pack grounds the approach"),
-             option("Narrow the scope first (say how)")],
+            [option(SCOPE_PROCEED, recommended=True, evidence="the context pack grounds the approach"),
+             option(SCOPE_NARROW)],
             evidence="\n".join(expected[:20])))
     u["_next"] = "render_coder_prompt"
     return u
@@ -6631,8 +6646,9 @@ def _assemble_report(state, u, pre_publish=False):
     skipped = as_list(g("skipped_reviews", []))
     if skipped:
         lines += ["## Skipped reviews (NEEDS-HUMAN)"] + [f"- {s}" for s in skipped] + [""]
-    if g("gauntlet_attention"):
-        lines += ["## Human attention required", g("gauntlet_attention"), ""]
+    notes = [f"- {n}" for n in as_list(g("attention_notes", []))]
+    if notes or g("gauntlet_attention"):
+        lines += ["## Human attention required"] + notes + [x for x in [g("gauntlet_attention")] if x] + [""]
     rej = as_list(g("rejected_findings", []))
     if rej:
         lines += ["## Review decisions"] + [f"- {r}" for r in rej] + [""]

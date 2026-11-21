@@ -6586,6 +6586,30 @@ with scenario("failed-once: a resumed state's kind-only autonomous_kinds list is
     u = gates.escalate_gate(base_state(escalation=design, escalation_policy="autonomous", autonomous_kinds=["design_choice"]))
     check(name, u["_next"] == "ladder_judge", u.get("_next"))
 
+# ---------------------------------------------------------------- the expected-file count question
+SIX_FILES = [f"src/f{i}.py" for i in range(6)]
+with scenario("scope_size: under the autonomous policy 5+ expected files are not asked; the ledger and the report's "
+              "attention section name them, and no autonomous decision is recorded") as name:
+    st, u = chain(base_state(escalation_policy="autonomous", expected_files=SIX_FILES), "scope_check")
+    report = gates._assemble_report(st, {})
+    line = "proceeded on 6 expected files: " + ", ".join(SIX_FILES)
+    attention = report.split("## Human attention required", 1)[-1]
+    check(name, u["_next"] == "render_coder_prompt" and not u.get("escalation") and line in st.get("attention_notes", [])
+          and any(line in d for d in u["decisions"]) and f"- {line}" in attention
+          and not st.get("autonomous_digest") and not st.get("autonomous_decisions"), (u, report[-600:]))
+with scenario("scope_size: interactive, 5+ expected files raise the scope_size question once") as name:
+    u = gates.scope_check(base_state(expected_files=SIX_FILES))
+    check(name, u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "scope_size" and u["scope_confirmed"],
+          u.get("escalation"))
+with scenario("scope_size: Proceed goes on to the coder prompt without composing the brief again") as name:
+    st, u = chain(base_state(expected_files=SIX_FILES), "scope_check")
+    u = gates.apply_answer({**st, "last_answer": "Proceed"})
+    check(name, u["_next"] == "render_coder_prompt", u.get("_next"))
+with scenario("scope_size: Narrow, or a Proceed with a note, recomposes the brief, which reads the answer") as name:
+    nexts = [gates.apply_answer({**st, "last_answer": a})["_next"]
+             for a in ("Narrow the scope first (say how): only the api files", "Proceed: but skip the docs")]
+    check(name, nexts == ["compose_brief", "compose_brief"], nexts)
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
