@@ -48,6 +48,9 @@ CI_PENDING = ("pending", "queued", "in_progress", "expected", "waiting", "reques
 CI_CANCELLED = ("cancel", "cancelled")
 CI_QUIET = ("skipping", "skipped", "neutral")
 GH_CALL_SECS = 90         # one gh subprocess call; node timeouts budget their sleep plus this per call
+BASE_FETCH_SECS = 60      # the one fetch of the PR's base branch before the run reports success
+BASE_GIT_SECS = 10        # each read-only local git call of the base check; the node budget allows 15 of them
+BASE_SYNC_MAX = 2         # base integrations per run the base_moved question recommends before it asks for a reason
 CI_LOG_RUNS_MAX = 3       # distinct CI runs whose failed log one ci_route visit fetches, sized with its node timeout
 REVIEW_POLL_SLEEP = 600   # review comments arrive on a human timescale, so the watch reads every ten minutes
 REVIEW_MAX_POLLS = 80     # per run; stays below ENGINE_VISIT_CAP, which caps visits per node
@@ -273,6 +276,7 @@ STATE_KEYS = (
     "decisions", "follow_ups", "parked", "escalation", "coder_result", "git_report",
     "ci_status", "ci_rerun_ids", "anomalies_log",
     "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests", "probe_adoption",
+    "base_syncs", "base_integrated", "base_checked_head",
 )
 
 
@@ -643,10 +647,11 @@ def set_frontmatter(path, pairs):
 
 
 # ---------------------------------------------------------------- git
-def git(cwd, *args, timeout=60):
+def git(cwd, *args, timeout=60, env=None):
     try:
         p = subprocess.run(
-            ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout
+            ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, **env} if env else None,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, "", str(e)

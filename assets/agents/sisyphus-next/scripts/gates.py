@@ -22,6 +22,7 @@ import unicodedata
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
+    BASE_FETCH_SECS, BASE_GIT_SECS, BASE_SYNC_MAX,
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
     CI_PASS, CI_PENDING, CI_POLL_BACKOFF, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
@@ -315,7 +316,7 @@ def intake(state):
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
-                  "probe_adoption"):
+                  "probe_adoption", "base_syncs", "base_integrated"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -2723,6 +2724,82 @@ def apply_answer(state):
                 stopped = f"CI watch stopped: the run's CI polls reached the run-wide budget ({budget}); the PR stays in draft"
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
             u["_next"] = "final_report"
+    elif kind == "base_moved":
+        data = as_dict(esc.get("data"))
+        facts = as_dict(state.get("base_facts"))
+        tip = str(data.get("tip") or "")
+        moved = (f"Base {data.get('base')} moved {_commits_text(data.get('count'))} past the PR "
+                 f"({_conflict_summary(data)})")
+        a = _base_answer(state, {"integrate": ["integrate"], "finish": ["finish"],
+                                 "leave": ["leave", "draft", "report", "stop"]})
+        if a is None and not stop:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "integrate" and not stop:
+            root = state.get("git_root") or state.get("project_dir") or "."
+            u["git_task"] = {"kind": "base_merge", "return_to": "ci_gate", "tip": tip, "remote": data.get("remote"),
+                             "base": data.get("base"), "pre_head": git_out(root, "rev-parse", "HEAD", default=""),
+                             "commit": False, "push": False, "open_pr": False,
+                             "text": f"Fetch `{data.get('remote')} {data.get('base')}` and merge commit `{tip}` into "
+                                     f"the CURRENT branch (`git merge --no-ff --no-edit {tip}`). If it conflicts, do "
+                                     "not resolve and do not abort: leave the merge in progress and report the "
+                                     "conflicted paths. Never rebase, never force-push, never push."}
+            u["base_merge_retries"] = 0
+            u["base_facts"] = {**facts, "decision": BASE_NOT_CONCLUDED}
+            ledger(state, u, f"base: integrating {tip[:8]} at the user's say-so")
+            u["_next"] = "git_ops"
+        elif a == "finish" and not stop:
+            reason = _stated_reason(answer, options)
+            root = state.get("git_root") or state.get("project_dir") or "."
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"{moved}; finished without integrating (reason: {reason})"]
+            if data.get("conflict_state") == "conflicts":
+                attention = state.get("gauntlet_attention") or ""
+                u["gauntlet_attention"] = "\n".join(x for x in [attention, f"- {moved}; not integrated"] if x)
+            u["base_checked_head"] = git_out(root, "rev-parse", "HEAD", default="")
+            u["base_facts"] = {**facts, "decision": f"finished without integrating: {reason}"}
+            ledger(state, u, f"base: finished without integrating {tip[:8]} at the user's say-so ({reason})")
+            _ci_finish_green({**state, **u}, u, state.get("base_then") or "green")
+        else:
+            left = "the review watch stopped" if _watch_started(state) else "PR left in draft"
+            _base_left(state, u, "base_moved")
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"{moved}; {left}, not integrated"]
+            attention = state.get("gauntlet_attention") or ""
+            u["gauntlet_attention"] = "\n".join(x for x in [attention, f"- {moved}; {left}, not integrated"] if x)
+            u["base_facts"] = {**facts, "decision": left}
+            u["_next"] = "final_report"
+    elif kind == "base_merge_failed":
+        task = as_dict(as_dict(esc.get("data")).get("task"))
+        a = "leave" if stop else _base_answer(state, {"retry": ["retry"], "leave": ["leave", "draft", "report", "stop"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "retry":
+            u["git_task"] = task
+            u["base_merge_retries"] = 0
+            u["_next"] = "git_ops"
+        else:
+            _base_left(state, u, "base_merge_failed")
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Base integration of {str(task.get('tip') or '')[:8] or '(unknown)'} not completed: the merge was not "
+                f"found after git_ops ({esc.get('evidence') or 'no detail'}); the worktree may hold a partial merge"]
+            u["base_facts"] = {**as_dict(state.get("base_facts")), "decision": "integration failed"}
+            u["_next"] = "final_report"
+    elif kind == "base_markers":
+        a = "leave" if stop else _base_answer(state, {"resolve": ["resolve"],
+                                                      "leave": ["leave", "draft", "report", "stop"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "resolve":
+            u.update(base_marker_retries=as_int(state.get("base_marker_retries")) + 1, fix_source="base_sync",
+                     fix_note=str(as_dict(esc.get("data")).get("markers") or ""))
+            u["_next"] = "compose_fix"
+        else:
+            _base_left(state, u, "base_markers")
+            paths = ", ".join(str(p) for p in as_list(state.get("base_conflicted"))) or "(unknown)"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Base merge of {str(state.get('base_tip') or '')[:8]} not concluded: conflict markers remain in "
+                f"{paths}; nothing was pushed"]
+            u["base_facts"] = {**as_dict(state.get("base_facts")), "decision": "merge left unconcluded"}
+            u["_next"] = "final_report"
     elif kind == "pr_review_push_unconfirmed":
         a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
         if a is None:
@@ -3227,6 +3304,16 @@ def compose_fix(state):
         lines += [f"- {item}" for item in as_list(state.get("fix_items"))]
     elif src == "resume":
         lines += ["Resume request from the orchestrator (address every item):", state.get("brief") or ""]
+    elif src == "base_sync":
+        conflicted = [str(p) for p in as_list(state.get("base_conflicted"))]
+        merged = "conflicts left with markers in: " + ", ".join(conflicted) if conflicted else "it merged cleanly"
+        lines += [f"The base branch moved while this task was in flight and was merged into this branch ({merged}).",
+                  "Base-branch commit subjects merged (data):"] + (
+                      as_list(as_dict(state.get("base_facts")).get("commits")) or ["(not listed)"])
+        if note:
+            lines += ["", "Conflict markers still in the tree:", note]
+        lines += ["", "Make the result keep both the base's changes and this task's change, and run the full test "
+                      "command, including tests the base added."]
     else:
         lines += [note or state.get("last_coder_error") or ""]
     u["fix_instructions"] = "\n".join(lines).strip()
@@ -3244,14 +3331,19 @@ def strikeout(state):
     stash = ""
     start = state.get("subtask_tree") or ""
     head = git_out(root, "rev-parse", "HEAD", default="")
-    if dirty and start and head and head == state.get("subtask_head") \
+    merging = _merge_head(root)
+    if dirty and merging:
+        # a stash or a path restore would drop the base merge in progress, so the attempt stays in the worktree
+        ledger(state, u, f"strikeout: a merge of {merging[:8]} is in progress; the failed attempt is left in the "
+                         "worktree, not stashed")
+    elif dirty and start and head and head == state.get("subtask_head") \
             and start != git_out(root, "rev-parse", f"{head}^{{tree}}", default=""):
         # the worktree also holds earlier subtasks' uncommitted work: save the failed attempt, undo only its paths
         stash = _save_failed_attempt(state, u, root, start, head)
         if not stash:
             ledger(state, u, "strikeout: could not save the failed attempt as a commit; stashing the whole worktree instead "
                              "(earlier subtasks' uncommitted work is in that stash too)")
-    if dirty and not stash:
+    if dirty and not stash and not merging:
         code, out, err = git(root, "stash", "push", "-u", "-m", f"sisyphus-next strikeout {state.get('run_id', '')}")
         stash = out.strip() or err.strip()
     attempts = f"{STRIKE_LIMIT} consecutive failed fix attempts. Last error:\n{state.get('last_coder_error') or ''}"
@@ -3259,7 +3351,8 @@ def strikeout(state):
         attempts = "Research was skipped for this subtask (pipeline small).\n" + attempts
     u["diagnosis"] = ((state.get("diagnosis") or "") + "\n\n" + attempts).strip()
     ledger(state, u, f"strikeout: stopped after {STRIKE_LIMIT} strikes; "
-                     + (f"broken attempt stashed ({stash[:80]})" if stash else "worktree was clean"))
+                     + (f"broken attempt stashed ({stash[:80]})" if stash
+                        else "broken attempt left in the worktree" if dirty else "worktree was clean"))
     u["strikeout_stash"] = stash
     snapshot(state, u, "strikeout")
     return u
@@ -3458,7 +3551,7 @@ def review_gate(state):
                                     "the parent orchestrator runs the full panel over the batch")
         u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
     elif (state.get("intent") == "trivial" and len(as_list(state.get("changed_files"))) <= 1 and not truthy(state.get("has_spec"))
-          and not truthy(state.get("final_review"))):
+          and not truthy(state.get("final_review")) and not truthy(state.get("base_sync_active"))):
         u["review_skipped_note"] = "review skipped: trivial single-file change with no spec (coder self_review is sufficient)"
         u["_next"] = "next_subtask" if _subtask_phase(state) else "whetstone_gate"
     elif _subtask_phase(state) and not _cache_files(u, changed := _subtask_changes(state)):
@@ -3956,7 +4049,8 @@ def build_gauntlet_prompt(state):
         last = rounds[-1] if isinstance(rounds[-1], dict) else {}
         dirty = tree_dirty
         if full:
-            ledger(state, u, f"gauntlet: round {n} runs the full gauntlet after the pipeline escalation: no re-review "
+            why = "the base integration" if truthy(state.get("base_sync_active")) else "the pipeline escalation"
+            ledger(state, u, f"gauntlet: round {n} runs the full gauntlet after {why}: no re-review "
                              "delta or settled lanes")
         elif last.get("head") and last["head"] != head and not dirty:
             lines += [f"Re-review delta: {last['head']}..HEAD"]
@@ -4679,6 +4773,16 @@ def pr_gate(state):
                          "text": _review_update_text(state, pending) + _adoption_publish_text(state, u)}
         u["_next"] = "git_ops"
         return u
+    if _base_sync_push(state):
+        markers = _leftover_markers(state)
+        if markers:
+            return _base_markers_left(state, u, markers)
+        u["git_task"] = {"kind": "push_fix", "return_to": "ci_gate", "commit": True, "push": True,
+                         "open_pr": False, "draft": False, "flip_ready": False,
+                         "text": _base_sync_push_text(state) + _adoption_publish_text(state, u)}
+        u["push_fix_retries"] = 0
+        u["_next"] = "git_ops"
+        return u
     if (_review_mode(state) and truthy(state.get("ci_owner")) and truthy(state.get("flip_ready"))) or _ci_fix_push(state):
         u["git_task"] = {"kind": "push_fix", "return_to": "ci_gate", "commit": True, "push": True,
                          "open_pr": False, "draft": False, "flip_ready": False,
@@ -4728,19 +4832,74 @@ def _ci_fix_push(state):
             and bool(str(state.get("pr_ref") or "").strip()))
 
 
-def _push_fix_text(state):
+def _unposted_rounds_text(state):
     rounds = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict)]
     unposted = rounds[as_int(state.get("review_rounds_posted")):]
+    if not unposted:
+        return ""
+    return (" Post one '## Review round N @ <full head SHA>' comment for each review round the PR does not carry "
+            "yet: " + ", ".join(f"round {r.get('round')} @ {r.get('head') or '(unknown head)'}" for r in unposted) + ".")
+
+
+def _push_fix_text(state):
     checks = _ci_failing_checks(state)
     text = (f"Commit the CI fix and push the CURRENT branch (the PR head of {_pr_label(state)}). "
             "Do NOT open a PR and do NOT change draft state. Leave the PR description alone.")
-    if unposted:
-        text += (" Post one '## Review round N @ <full head SHA>' comment for each review round the PR does not carry "
-                 "yet: " + ", ".join(f"round {r.get('round')} @ {r.get('head') or '(unknown head)'}" for r in unposted)
-                 + ".")
+    text += _unposted_rounds_text(state)
     text += (" Then post ONE '## Update @ <full head SHA>' comment naming the CI failure this push fixes: "
              + (", ".join(checks) if checks else "the failing CI checks") + ".")
     return text
+
+
+def _base_sync_push(state):
+    """A base integration on the PR this run watches: it goes out as a plain push to that PR's head, even when the
+    publish checks failed, so git_ops is never asked to open a second PR."""
+    return truthy(state.get("base_sync_active")) and truthy(state.get("ci_owner")) and bool(_pr_ref(state))
+
+
+def _base_sync_push_text(state):
+    facts = as_dict(state.get("base_facts"))
+    text = ("Conclude the merge in progress, if any, with `git commit --no-edit`, commit any remaining change, and push "
+            f"the CURRENT branch (the PR head of {_pr_label(state)}). Do not open a PR, do not change draft state, leave "
+            "the description alone.")
+    text += _unposted_rounds_text(state)
+    text += (" Then post ONE '## Update @ <full head SHA>' comment naming the integrated base commit "
+             f"{state.get('base_tip') or '(unknown)'} of `{facts.get('remote') or 'the remote'}/"
+             f"{facts.get('base') or 'base'}`.")
+    return text
+
+
+def _merge_head(root):
+    return git_out(root, "rev-parse", "-q", "--verify", "MERGE_HEAD", default="")
+
+
+def _leftover_markers(state):
+    """The `git diff --check` lines naming conflict markers still in the paths the base merge conflicted on."""
+    paths = [str(p) for p in as_list(state.get("base_conflicted")) if str(p).strip()]
+    tip = str(state.get("base_tip") or "")
+    if not paths or not tip:
+        return ""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    _, out, _ = git(root, "diff", "--check", tip, "--", *_literal(paths))
+    return "\n".join(l for l in out.splitlines() if "leftover conflict marker" in l)
+
+
+def _base_markers_left(state, u, markers):
+    tries = as_int(state.get("base_marker_retries"))
+    if tries < RERUN_ONCE:
+        u.update(base_marker_retries=tries + 1, fix_source="base_sync", fix_note=markers)
+        ledger(state, u, "publish: conflict markers left after the base merge -> one more coder round, nothing pushed")
+        u["_next"] = "compose_fix"
+        return u
+    again = _base_round_fits(state)
+    return raise_escalation(state, u, escalation(
+        "base_markers", "Conflict markers from the base merge are still in the tree after the coder rounds, so "
+                        "nothing was pushed. How to proceed?",
+        [option(BASE_RESOLVE, recommended=again, evidence=f"{tries} coder round(s) on the markers so far"),
+         option(_ci_leave_option(state), recommended=not again,
+                evidence="the merge stays unconcluded and unpushed" + (
+                    "" if again else "; another round and its CI watch do not fit under the engine cap"))],
+        evidence=tail(markers, 2000), hard_trigger=_watch_started(state), data={"markers": markers}))
 
 
 def _retry_text(what, failed, guard):
@@ -4800,11 +4959,17 @@ def ci_gate(state):
         else:
             ledger(state, u, f"push_fix: every check passed ({', '.join(n for n, _, _ in rows)})")
             u["review_rounds_posted"] = len([r for r in as_list(state.get("round_heads")) if isinstance(r, dict)])
+            if truthy(state.get("base_sync_active")):
+                u["base_integrated"] = as_int(state.get("base_integrated")) + 1
+                u["base_facts"] = {**as_dict(state.get("base_facts")), "decision": "integrated"}
         u["ci_fix_active"] = False
+        u["base_sync_active"] = False
         _reset_ci_watch(u)
         u["ci_rerun_ids"] = []
         u["_next"] = "ci_poll"
         return u
+    if task.get("kind") == "base_merge":
+        return _base_merge_read(state, u, task)
     if ret == "run_coder":
         u["git_task"] = {}
         u["_next"] = "run_coder"
@@ -4859,7 +5024,64 @@ def ci_gate(state):
         ledger(state, u, f"ci: {note}" + ("; left in draft" if task.get("open_pr") and not owns else ""))
         if _review_mode(state) and truthy(state.get("delegated")) and task.get("open_pr"):
             ledger(state, u, "review-watch: not started: PR lifecycle owned by the parent orchestrator")
-        u["_next"] = "final_report"
+        if _publish_asks(state)["push"]:
+            u.update(base_mode="report", base_then="")
+            u["_next"] = "base_check"
+        else:
+            u["_next"] = "final_report"
+    return u
+
+
+def _base_merge_read(state, u, task):
+    """Read what a base_merge task left: the tip merged, or a merge stopped with MERGE_HEAD at the tip. Either way
+    the run base moves to the tip and the change goes back through a coder round and a full review."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    tip = str(task.get("tip") or "")
+    pre = str(task.get("pre_head") or "")
+    merging = _merge_head(root)
+    # history rewritten under the merge (a rebase, a reset) reads as no merge at all
+    kept = not pre or git(root, "merge-base", "--is-ancestor", pre, "HEAD")[0] == 0
+    clean = kept and bool(tip) and not merging and git(root, "merge-base", "--is-ancestor", tip, "HEAD")[0] == 0
+    pending = kept and bool(tip) and merging == tip
+    if not clean and not pending:
+        tries = as_int(state.get("base_merge_retries"))
+        detail = (f"MERGE_HEAD {merging[:8] if merging else 'absent'} and the base commit {tip[:8] or '(none)'} is not "
+                  "contained in HEAD") if kept else f"the HEAD before the merge {pre[:8]} is no longer in HEAD's history"
+        if tries < RERUN_ONCE:
+            u["base_merge_retries"] = tries + 1
+            u["git_task"] = {**task, "text": _retry_text("merge", [("base merged", False, detail)],
+                                                         "merge only that commit; never rebase, never force-push, "
+                                                         "never push")}
+            ledger(state, u, f"base: merge of {tip[:8]} not found ({detail}) -> one more git_ops round")
+            u["_next"] = "git_ops"
+            return u
+        ledger(state, u, f"base: merge of {tip[:8]} still not found after {tries} retry ({detail})")
+        return raise_escalation(state, u, escalation(
+            "base_merge_failed", f"The base commit {tip[:8] or '(unknown)'} could not be merged into this branch "
+                                 f"after {tries + 1} git_ops round(s). How to proceed?",
+            [option(BASE_MERGE_RETRY, recommended=_base_round_fits(state)),
+             option(_ci_leave_option(state), recommended=not _base_round_fits(state),
+                    evidence=_one_line(state.get("git_report"), 600))],
+            evidence=detail, hard_trigger=_watch_started(state), data={"task": task}))
+    staged = []
+    if pending:
+        unmerged = git_out(root, "diff", "--name-only", "--diff-filter=U").splitlines()
+        unmerged = [p for p in unmerged if p.strip()]
+        # staged with their markers so no unmerged entry blocks the coder; MERGE_HEAD stays, so the push concludes
+        # the merge as a merge commit
+        if unmerged and git(root, "add", "--", *_literal(unmerged))[0] != 0:
+            ledger(state, u, f"base: could not stage the conflicted paths {', '.join(unmerged)}")
+        # a git_ops that already staged its conflicts leaves no unmerged entry, so every staged path is guarded
+        staged = unmerged + git_out(root, "diff", "--cached", "--name-only").splitlines()
+    predicted = [str(p) for p in as_list(as_dict(state.get("base_facts")).get("conflicted"))]
+    conflicted = list(dict.fromkeys(p for p in staged + predicted if p.strip()))
+    n = as_int(state.get("base_syncs")) + 1
+    u.update(base_sha=tip, debt_base=tip, run_base_sha=tip, base_tip=tip, full_gauntlet_due=True, base_sync_active=True,
+             base_syncs=n, base_conflicted=conflicted, base_merge_retries=0, base_marker_retries=0,
+             fix_source="base_sync", git_task={})
+    how = "clean" if clean else f"conflicts in {', '.join(conflicted)}" if conflicted else "merged, not yet committed"
+    ledger(state, u, f"base: merged {tip[:8]} into the branch ({how}); run base moves to {tip[:8]}; full re-review due")
+    u["_next"] = "compose_fix"
     return u
 
 
@@ -4925,9 +5147,17 @@ def _push_fix_checks(state):
     branch = git_out(root, "branch", "--show-current", default="")
     pr = _pr_view(state, str(state.get("pr_ref") or "").strip())
     head = None if pr is None else pr.get("headRefName")
-    return [_clean_worktree_row(state, root), _pushed_row(root),
+    rows = [_clean_worktree_row(state, root), _pushed_row(root),
             ("PR head", bool(branch) and head == branch,
              "the PR could not be read" if pr is None else f"PR head {head!r}, current branch {branch or '(detached HEAD)'!r}")]
+    if truthy(state.get("base_sync_active")):
+        tip = str(state.get("base_tip") or "")
+        merging = _merge_head(root)
+        contained = bool(tip) and git(root, "merge-base", "--is-ancestor", tip, "HEAD")[0] == 0
+        rows.append(("merge concluded", not merging and contained,
+                     f"MERGE_HEAD {merging[:8] if merging else 'absent'}, base commit {tip[:8] or '(none)'} "
+                     + ("contained in HEAD" if contained else "not contained in HEAD")))
+    return rows
 
 
 def _pr_view(state, ref=""):
@@ -4940,7 +5170,9 @@ def _pr_view(state, ref=""):
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
                                env={**os.environ, "SISYPHUS_PR_REF": ref})
         else:
-            p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json", "number,url,isDraft,headRefName,body"],
+            p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json",
+                                "number,url,isDraft,headRefName,headRefOid,body,baseRefName,baseRefOid,mergeable,"
+                                "mergeStateStatus"],
                                cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
         doc = json.loads(p.stdout) if p.returncode == 0 else None
         return doc if isinstance(doc, dict) else None
@@ -5187,6 +5419,16 @@ CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
 CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
 CI_NO_CI = "Finish without CI (no checks configured; recorded)"
 CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
+BASE_INTEGRATE = "Integrate the base and re-verify (merge it, resolve, full test command, re-review, push, re-watch CI)"
+BASE_INTEGRATE_AGAIN = "Integrate once more (state why the base should settle now)"
+BASE_FINISH = "Finish without integrating (state why the base change does not affect this work)"
+BASE_MERGE_RETRY = "Retry the integration"
+BASE_RESOLVE = "Resolve the conflict markers once more"
+BASE_COMMITS_SHOWN = 20
+BASE_FILES_SHOWN = 30
+BASE_LINE_CHARS = 160
+BASE_NOT_CONCLUDED = "integration not concluded"
+SHA_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
 def _reset_ci_watch(u):
@@ -5214,7 +5456,47 @@ def _ci_leave_option(state):
     return "Stop watching and report" if _watch_started(state) else "Leave the PR in draft and report"
 
 
+def _base_round_fits(state):
+    """Whether one more base round, with the CI watch after its push, fits under the engine cap."""
+    return as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS < ENGINE_VISIT_CAP
+
+
+def _base_answer(state, choices):
+    """The key a reply to a base question picks: the option it names exactly first, else the one key its free text
+    names. Free text naming several keys, or one after a negation ("do not integrate"), picks none."""
+    ans = (state.get("last_answer") or "").strip()
+    named = _named_option(ans, as_dict(state.get("escalation")).get("options") or [])
+    if named:
+        low = named.lower()
+        return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
+                or next((k for k, words in choices.items() if any(w in low for w in words)), None))
+    said = ans.lower()
+    hits, negated = set(), False
+    for key, words in choices.items():
+        for w in words:
+            for m in re.finditer(re.escape(w), said):
+                if re.search(r"\b(?:not|never|no|don't|dont|without)\W+(?:\w+\W+)?$", said[:m.start()]):
+                    negated = True
+                else:
+                    hits.add(key)
+    return next(iter(hits)) if len(hits) == 1 and not negated else None
+
+
+def _base_left(state, u, status):
+    if _watch_started(state):
+        u["pr_review_status"] = status
+        ledger(state, u, f"review-watch: {_pr_label(state)} stop: {status}")
+
+
 def _ci_finish_green(state, u, note):
+    if truthy(state.get("ci_owner")) and _publish_asks(state)["push"]:
+        root = state.get("git_root") or state.get("project_dir") or "."
+        if git_out(root, "rev-parse", "HEAD", default="") != str(state.get("base_checked_head") or ""):
+            # before the flip, so a PR that conflicts with its base is never marked ready
+            u.update(base_then=note, base_mode="owner")
+            ledger(state, u, f"ci: {note} -> base check")
+            u["_next"] = "base_check"
+            return u
     if _review_mode(state) and truthy(state.get("flip_ready")):
         ledger(state, u, f"ci: {note} -> back to the review watch")
         return _start_review_watch(state, u)
@@ -5223,6 +5505,229 @@ def _ci_finish_green(state, u, note):
     _confirm_pr_ready(state, u)
     if _review_mode(state) and truthy(state.get("ci_owner")):
         return _start_review_watch(state, u)
+    u["_next"] = "final_report"
+    return u
+
+
+def _clip(line):
+    line = str(line)
+    return line if len(line) <= BASE_LINE_CHARS else line[:BASE_LINE_CHARS - 3] + "..."
+
+
+def _commits_text(n):
+    return f"{n} commit(s)" if as_int(n, -1) >= 0 else "an unknown number of commits"
+
+
+def _base_remote(root):
+    """The upstream remote of the current branch, else origin, else the first remote, else ""."""
+    remotes = _base_git_out(root, "remote").split()
+    branch = _base_git_out(root, "branch", "--show-current")
+    upstream = _base_git_out(root, "for-each-ref", "--format=%(upstream:remotename)", f"refs/heads/{branch}") if branch else ""
+    if upstream in remotes:
+        return upstream
+    return "origin" if "origin" in remotes else (remotes[0] if remotes else "")
+
+
+def _base_git(root, *args):
+    return git(root, *args, timeout=BASE_GIT_SECS)
+
+
+def _base_git_out(root, *args):
+    code, out, _ = _base_git(root, *args)
+    return out.strip() if code == 0 else ""
+
+
+def _is_commit(root, ref):
+    return bool(ref) and _base_git(root, "cat-file", "-e", f"{ref}^{{commit}}")[0] == 0
+
+
+def _base_facts(state):
+    """The PR's base branch next to HEAD, read from local git first and gh second.
+
+    The head compared is the PR's head when gh reports one other than local HEAD, so a push that did not land cannot
+    read fresh. status is no_remote, unchecked (with a reason), fresh, or moved (with the commits, the files, the
+    overlap with this branch's own files and the conflict state). Nothing here merges, and an unchecked base never
+    stops the run."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    remote = _base_remote(root)
+    if not remote:
+        return {"status": "no_remote", "reason": "no remote configured"}
+    pr = _pr_view(state, _pr_ref(state)) or {}
+    base = str(pr.get("baseRefName") or as_dict(state.get("git_actions")).get("base") or "").strip()
+    if not base:
+        prefix = f"refs/remotes/{remote}/"
+        sym = _base_git_out(root, "symbolic-ref", f"{prefix}HEAD")
+        base = sym[len(prefix):] if sym.startswith(prefix) else ""
+    facts = {"remote": remote, "base": base, "mergeable": str(pr.get("mergeable") or ""),
+             "merge_state": str(pr.get("mergeStateStatus") or "")}
+    if not base:
+        return {**facts, "status": "unchecked", "reason": f"base branch unknown (no PR base, no brief base, no {remote}/HEAD)"}
+    gh_conflicts = facts["mergeable"] == "CONFLICTING"
+    pr_tip = str(pr.get("baseRefOid") or "")
+    code, _, err = git(root, "fetch", "--no-tags", remote, f"refs/heads/{base}", timeout=BASE_FETCH_SECS,
+                       env={"GIT_TERMINAL_PROMPT": "0"})
+    fetched = code == 0
+    if fetched:
+        tip = _base_git_out(root, "rev-parse", "FETCH_HEAD")
+    elif gh_conflicts and SHA_RE.fullmatch(pr_tip):
+        tip = pr_tip
+    else:
+        reason = f"git fetch {remote} {base} failed: {_one_line(err, 300) or f'exit {code}'}"
+        if gh_conflicts and pr_tip:
+            reason += f"; the PR's baseRefOid {_one_line(pr_tip, 80)!r} is not a commit id"
+        return {**facts, "status": "unchecked", "reason": reason}
+    facts["tip"] = tip
+    head = "HEAD"
+    pr_head = str(pr.get("headRefOid") or "").strip()
+    if pr_head and pr_head != _base_git_out(root, "rev-parse", "HEAD"):
+        if not SHA_RE.fullmatch(pr_head) or not _is_commit(root, pr_head):
+            return {**facts, "status": "unchecked",
+                    "reason": f"the PR head {_one_line(pr_head, 80)} is not local HEAD and not a local commit"}
+        head = facts["pr_head"] = pr_head
+    known = _is_commit(root, tip)
+    if fetched:
+        if not known:
+            return {**facts, "status": "unchecked", "reason": f"base tip {tip[:8] or '(none)'} is not a local commit"}
+        rc, _, err = _base_git(root, "merge-base", "--is-ancestor", tip, head)
+        if rc == 0 and not gh_conflicts:
+            return {**facts, "status": "fresh"}
+        # rc 1 is "not an ancestor", but _lib.git also returns 1 on a timeout or OSError; those carry an error text
+        if rc not in (0, 1) or (rc == 1 and err.strip()):
+            return {**facts, "status": "unchecked",
+                    "reason": f"merge-base --is-ancestor exit {rc}: {_one_line(err, 300) or '(no error text)'}"}
+    facts.update(status="moved", count=-1, merge_base="", commits=[], base_files=[], overlap=[], conflicted=[],
+                 conflict_state="conflicts" if gh_conflicts else "unknown",
+                 behind_required=facts["merge_state"] == "BEHIND")
+    if not known:
+        return facts
+    count = as_int(_base_git_out(root, "rev-list", "--count", f"{head}..{tip}"), -1)
+    mb = _base_git_out(root, "merge-base", head, tip)
+    commits = [_clip(l) for l in _base_git_out(root, "log", "--format=%h %s", "-n", str(BASE_COMMITS_SHOWN),
+                                               f"{head}..{tip}").splitlines() if l.strip()]
+    if count > len(commits):
+        commits.append(f"(and {count - len(commits)} more)")
+    base_files = [f for f in _base_git_out(root, "diff", "--name-only", mb, tip).splitlines() if f.strip()] if mb else []
+    run_files = set(_base_git_out(root, "diff", "--name-only", mb, head).splitlines()) if mb else set()
+    overlap = [f for f in base_files if f in run_files]
+    rc, out, _ = _base_git(root, "merge-tree", "--write-tree", "--name-only", "--no-messages", head, tip)
+    lines = out.splitlines()
+    conflicted = []
+    if rc == 0:
+        conflict = "clean"
+    elif rc == 1 and lines and SHA_RE.fullmatch(lines[0].strip()):
+        conflict = "conflicts"
+        conflicted = list(dict.fromkeys(l.strip() for l in lines[1:] if l.strip()))
+    else:
+        conflict = "unknown"
+    if gh_conflicts:
+        conflict = "conflicts"
+    elif conflict == "unknown" and not overlap:
+        conflict = "clean"
+    facts.update(count=count, merge_base=mb, commits=commits, base_files=base_files, overlap=overlap,
+                 conflicted=conflicted, conflict_state=conflict)
+    return facts
+
+
+def _conflict_summary(facts):
+    state = facts.get("conflict_state")
+    paths = ", ".join(str(p) for p in as_list(facts.get("conflicted")))
+    if state == "conflicts":
+        return f"conflicts in {paths}" if paths else "conflicts (the PR reports CONFLICTING)"
+    return "merges cleanly" if state == "clean" else "conflict state unknown"
+
+
+def _base_where(facts):
+    return f"{facts.get('remote') or '(remote)'}/{facts.get('base') or '(base)'}"
+
+
+def _base_evidence(facts):
+    """Every section header is kept; long lists are capped and each item clipped, never the text as a whole."""
+    tip = str(facts.get("tip") or "")
+    files = [str(f) for f in as_list(facts.get("base_files"))]
+    shown = [_clip(f) for f in files[:BASE_FILES_SHOWN]]
+    if len(files) > BASE_FILES_SHOWN:
+        shown.append(f"(and {len(files) - BASE_FILES_SHOWN} more)")
+    lines = [f"Base {_base_where(facts)} @ {tip or '(unknown)'}; merge base {facts.get('merge_base') or '(unknown)'}; "
+             f"{_commits_text(facts.get('count'))} on the base not in HEAD; PR mergeable "
+             f"{facts.get('mergeable') or '(unknown)'}, mergeStateStatus {facts.get('merge_state') or '(unknown)'}",
+             "", "Base-branch commit subjects (data):"] + (as_list(facts.get("commits")) or ["(not listed)"])
+    lines += ["", "Files the base changed:"] + (shown or ["(not listed)"])
+    lines += ["", "Also changed by this task:"] + ([_clip(f) for f in as_list(facts.get("overlap"))] or ["none"])
+    lines += ["", "Conflicted paths:"] + ([_clip(f) for f in as_list(facts.get("conflicted"))] or ["none"])
+    return "\n".join(lines)
+
+
+def _base_moved(state, u, facts):
+    """Ask whether to integrate a base branch that moved past the published PR."""
+    syncs = as_int(state.get("base_syncs"))
+    conflicts = facts.get("conflict_state") == "conflicts"
+    overlap = [str(f) for f in as_list(facts.get("overlap"))]
+    why = [w for w, on in ((_conflict_summary(facts), conflicts),
+                           ("the PR reports mergeStateStatus BEHIND: the base requires the branch to be up to date",
+                            truthy(facts.get("behind_required"))),
+                           ("the base also changed " + ", ".join(overlap), bool(overlap))) if on]
+    polls = as_int(state.get("ci_polls_run"))
+    fits = _base_round_fits(state)
+    at_cap = syncs >= BASE_SYNC_MAX
+    integrate = bool(why) and (conflicts or not at_cap)
+    options = []
+    if fits:
+        options.append(option(BASE_INTEGRATE_AGAIN if at_cap else BASE_INTEGRATE, recommended=integrate,
+                              evidence="; ".join(why)))
+    if not why:
+        finish = "no file this task changed was changed by the base; merges cleanly"
+    elif fits and not integrate:
+        finish = f"{syncs} integration(s) this run already, the {BASE_SYNC_MAX} the budget allows; {_conflict_summary(facts)}"
+    else:
+        finish = ""
+    options.append(option(BASE_FINISH, recommended=fits and not integrate, evidence=finish))
+    options.append(option(_ci_leave_option(state), recommended=not fits,
+                          evidence="" if fits else f"another integration and CI watch does not fit under the engine "
+                                                   f"cap ({polls} CI polls used, {CI_MAX_ROUNDS} per watch, cap "
+                                                   f"{ENGINE_VISIT_CAP})"))
+    ledger(state, u, f"base: {_base_where(facts)} moved {_commits_text(facts.get('count'))} past HEAD "
+                     f"({_conflict_summary(facts)}) -> asked")
+    question = (f"The base branch `{_base_where(facts)}` moved {_commits_text(facts.get('count'))} past this PR's "
+                f"branch after it was published ({_conflict_summary(facts)}); the CI result predates the move. "
+                "How to proceed?")
+    data = {k: facts.get(k) for k in ("remote", "base", "tip", "merge_base", "conflict_state", "conflicted", "overlap",
+                                      "behind_required", "count")}
+    return raise_escalation(state, u, escalation("base_moved", question, options, evidence=_base_evidence(facts),
+                                                 hard_trigger=_watch_started(state), data=data))
+
+
+def base_check(state):
+    u = {}
+    note_script_error(state, u, "base_check")
+    root = state.get("git_root") or state.get("project_dir") or "."
+    owner = state.get("base_mode") == "owner"
+    head = git_out(root, "rev-parse", "HEAD", default="")
+    facts = _base_facts(state)
+    status = facts["status"]
+    u.update(base_facts=facts, base_status=status, base_tip=str(facts.get("tip") or ""))
+    if status in ("no_remote", "unchecked"):
+        ledger(state, u, f"base: freshness not checked ({facts['reason']})")
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"base freshness not checked: {facts['reason']}"]
+    elif status == "fresh":
+        ledger(state, u, f"base: {_base_where(facts)} @ {facts['tip'][:8]} contained in HEAD")
+    elif owner:
+        return _base_moved(state, u, facts)
+    else:
+        who = "the parent orchestrator" if truthy(state.get("delegated")) else "the owner"
+        line = (f"base branch {facts.get('base')} moved {_commits_text(facts.get('count'))} past this branch "
+                f"({_conflict_summary(facts)}"
+                + (f"; base also changed: {', '.join(as_list(facts.get('overlap')))}" if facts.get("overlap") else "")
+                + f"); integration left to {who}")
+        ledger(state, u, f"base: {line}")
+        attention = state.get("gauntlet_attention") or ""
+        u["gauntlet_attention"] = "\n".join(x for x in [attention, f"- {line}"] if x)
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [line[:1].upper() + line[1:]]
+        u["base_facts"] = {**facts, "decision": f"left to {who}"}
+        u["_next"] = "final_report"
+        return u
+    u["base_checked_head"] = head
+    if owner:
+        return _ci_finish_green({**state, **u}, u, state.get("base_then") or "green")
     u["_next"] = "final_report"
     return u
 
@@ -6084,6 +6589,8 @@ def _assemble_report(state, u, pre_publish=False):
         lines.append("- CI: not yet watched (set after publishing)")
     else:
         lines.append(f"- CI: {g('ci_watch_note') or 'not watched: no publish step ran'}")
+    if not pre_publish and (base := _base_report_line(state, g)):
+        lines.append(base)
     for c in as_list(g("publish_checks", [])):
         if isinstance(c, dict):
             lines.append(f"- publish check {c.get('check')}: {'ok' if c.get('ok') else 'FAILED'} ({c.get('detail')})")
@@ -6138,6 +6645,26 @@ def _assemble_report(state, u, pre_publish=False):
     return "\n".join(lines)
 
 
+def _base_report_line(state, g):
+    facts = as_dict(g("base_facts", {}))
+    status = g("base_status")
+    syncs = as_int(g("base_integrated", 0))
+    where = f"{_base_where(facts)} @ {str(facts.get('tip') or '')[:8] or '(unknown)'}"
+    if status == "fresh":
+        return f"- Base: {where}: contained in HEAD" + (f"; integrated {syncs} time(s)" if syncs else "")
+    if status == "moved":
+        moved = f"- Base: {where}: moved {_commits_text(facts.get('count'))}"
+        if facts.get("decision") == "integrated":
+            return f"{moved}; integrated {syncs} time(s)"
+        return (f"{moved}, not integrated ({facts.get('decision') or 'no decision recorded'})"
+                + (f"; integrated {syncs} time(s) earlier" if syncs else ""))
+    if status in ("no_remote", "unchecked"):
+        return f"- Base: not checked ({facts.get('reason') or status})"
+    if _publish_asks(state)["push"] and g("git_report"):
+        return "- Base: not checked (the base check did not run)"
+    return ""
+
+
 def final_report(state):
     u = {}
     harvest_anomalies(state, u, "final")
@@ -6180,7 +6707,7 @@ GATES = {
     "build_gauntlet_prompt": build_gauntlet_prompt, "route_gauntlet": route_gauntlet,
     "triage_route": triage_route, "observability_gate": observability_gate,
     "observability_route": observability_route, "whetstone_gate": whetstone_gate, "pr_gate": pr_gate,
-    "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply,
+    "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply, "base_check": base_check,
     "pr_review_poll": pr_review_poll, "pr_review_route": pr_review_route, "pr_review_apply": pr_review_apply,
     "pr_review_resolve": pr_review_resolve, "pr_review_reply": pr_review_reply,
     "final_report": final_report,

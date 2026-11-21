@@ -3356,6 +3356,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ask_owner_poll", "timeout", 0),
     ("assess", "max_iterations", 20),
     ("assess", "timeout", 900),
+    ("base_check", "timeout", 480),
     ("bookkeeping_judge", "timeout", 300),
     ("bookkeeping_scan", "timeout", 60),
     ("build_gauntlet_prompt", "timeout", 60),
@@ -3424,6 +3425,10 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 /// round counters among them are what the `_lib.py` bounds are checked on.
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "apply_reasks",
+    "base_integrated",
+    "base_marker_retries",
+    "base_merge_retries",
+    "base_syncs",
     "ci_fix_strikes",
     "ci_poll_budget",
     "ci_poll_fails",
@@ -3469,6 +3474,9 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// window an empty check list must persist before it reads `no_checks`, and
 /// the `ci_poll` visit bounds that sit under the engine's per-node cap.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
+    ("BASE_FETCH_SECS", "60"),
+    ("BASE_GIT_SECS", "10"),
+    ("BASE_SYNC_MAX", "2"),
     ("CHOICE_OPTIONS_MAX", "4"),
     ("CHOICE_OPTIONS_MIN", "2"),
     ("CI_FLAKE_RERUNS", "2"),
@@ -3790,6 +3798,122 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
             "{node} timeout {limit} does not exceed CI_LOG_RUNS_MAX {runs} * GH_CALL_SECS {gh_call}"
         );
     }
+}
+
+/// `base_check` fetches the base branch once and then makes up to three gh
+/// calls (the PR read, the flip and its re-read). A crash must still reach
+/// the report, so the shim declares `fallback: final_report`.
+#[test]
+fn base_check_is_a_script_node_whose_timeout_covers_the_fetch_and_three_gh_calls() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let fetch = lib_constant(&lib, "BASE_FETCH_SECS");
+    let gh_call = lib_constant(&lib, "GH_CALL_SECS");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &shipped["nodes"]["base_check"];
+    assert_eq!(node["type"].as_str(), Some("script"), "base_check type");
+    let script = node["script"].as_str().expect("base_check names a script");
+    assert!(
+        script.ends_with("scripts/base_check.py"),
+        "base_check runs {script}"
+    );
+    assert!(
+        candidate_dir().join("scripts/base_check.py").is_file(),
+        "the base_check shim is missing"
+    );
+    assert_eq!(
+        node["fallback"].as_str(),
+        Some("final_report"),
+        "base_check has no fallback to final_report: a shim crash would end the run without a report"
+    );
+    let limit = node["timeout"]
+        .as_i64()
+        .expect("base_check has an integer timeout");
+    assert!(
+        limit >= fetch + 3 * gh_call,
+        "base_check timeout {limit} is below BASE_FETCH_SECS {fetch} + 3 * GH_CALL_SECS {gh_call}"
+    );
+}
+
+/// The base-freshness state starts empty, with the types the gates read.
+#[test]
+fn initial_state_seeds_the_base_check_keys_with_their_types() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let init = &shipped["initial_state"];
+    for key in [
+        "base_then",
+        "base_mode",
+        "base_status",
+        "base_checked_head",
+        "base_tip",
+    ] {
+        assert_eq!(init[key].as_str(), Some(""), "initial_state.{key}");
+    }
+    for key in ["base_syncs", "base_integrated", "base_merge_retries"] {
+        assert_eq!(init[key].as_i64(), Some(0), "initial_state.{key}");
+    }
+    assert!(
+        init["base_facts"]
+            .as_mapping()
+            .is_some_and(|m| m.is_empty()),
+        "initial_state.base_facts is not an empty mapping"
+    );
+    assert_eq!(
+        init["base_sync_active"].as_bool(),
+        Some(false),
+        "initial_state.base_sync_active"
+    );
+    assert!(
+        init["base_conflicted"]
+            .as_sequence()
+            .is_some_and(|s| s.is_empty()),
+        "initial_state.base_conflicted is not an empty list"
+    );
+}
+
+/// Every shipped file is ASCII on disk, apart from the two review severity
+/// markers the gauntlet output carries, which the gates parse and the smoke
+/// battery feeds; their count per file is pinned.
+#[test]
+fn shipped_candidate_is_ascii_apart_from_the_severity_markers() {
+    let markers = ['\u{1f534}', '\u{1f7e1}'];
+    let expected: [(&str, usize); 2] = [("scripts/gates.py", 1), ("scripts/smoke_test.py", 3)];
+    let mut offenders = Vec::new();
+    let mut counted = Vec::new();
+    let mut seen = 0;
+    for rel in files_under(&candidate_dir()) {
+        if rel.contains("__pycache__") {
+            continue;
+        }
+        seen += 1;
+        let bytes = fs::read(candidate_dir().join(&rel)).unwrap();
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            offenders.push(format!("{rel}: not UTF-8"));
+            continue;
+        };
+        let mut kept = 0usize;
+        for (line_no, line) in text.lines().enumerate() {
+            for c in line.chars().filter(|c| !c.is_ascii()) {
+                if markers.contains(&c) {
+                    kept += 1;
+                } else {
+                    offenders.push(format!("{rel}:{}: U+{:04X}", line_no + 1, c as u32));
+                }
+            }
+        }
+        if kept > 0 {
+            counted.push((rel, kept));
+        }
+    }
+    assert!(seen > 40, "the ASCII sweep saw only {seen} files");
+    assert!(
+        offenders.is_empty(),
+        "non-ASCII bytes in shipped files:\n{}",
+        offenders.join("\n")
+    );
+    let counted: Vec<(&str, usize)> = counted.iter().map(|(r, n)| (r.as_str(), *n)).collect();
+    assert_eq!(counted, expected, "severity markers per shipped file");
 }
 
 /// Each `subprocess.run(...)` call in `source` as its 1-based line number and

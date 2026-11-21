@@ -50,8 +50,10 @@ BOUNDED = {
     "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
     "ci_poll": "B15 elapsed-time limit + CI_MAX_ROUNDS per watch + poll fails<=3; POLL_VISIT_BUDGET per run in every mode",
     "ci_gate": "publish_retries<=RERUN_ONCE git_ops re-runs after a failed publish check / push_fix_retries<=RERUN_ONCE "
-               "after a failed CI fix push check",
+               "after a failed CI fix push check / base_merge_retries<=RERUN_ONCE after a base merge git_ops left no "
+               "trace, then the base_merge_failed escalation",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
+    "base_check": "once per HEAD (base_checked_head): the flip it hands on to finds HEAD already checked",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",
     "pr_review_route": "B16 REVIEW_MAX_ROUNDS fix rounds + REVIEW_CI_POLL_BUDGET",
     "merge_oracle": "oracle_retries: one retry per subtask recommended (via apply_answer), then proceeding without "
