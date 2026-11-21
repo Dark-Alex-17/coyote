@@ -199,7 +199,10 @@ arc-swap = "1.9.2"
 # record of the emission times and blobs each session heard, since the path table's
 # newest blob does not say which of them this session already heard. The RPC client's
 # handshake brings `md-5` and `sha3` (with `keccak`) into the lock, for the HMAC digests
-# Python's `multiprocessing.connection` offers.
+# Python's `multiprocessing.connection` offers. The 0.18.4 release adds `RpcError::Io` (an
+# io failure after the dial succeeded; `Protocol` now means only wrong bytes) and
+# `RpcError::io_kind()` (the `std::io::ErrorKind` of an `Io` or `Connect` failure), which
+# the stats read retries on instead of matching error text.
 #
 # The fork re-exports `rand_core` and `rmpv`, so Coyote names the RNG its constructors
 # take as `rns_transport::rand_core::OsRng` and needs no `rand_core` entry of its own.
@@ -221,7 +224,7 @@ arc-swap = "1.9.2"
 # re-exports surface this crate does not use, and it covers only the `rns-*` crates and
 # not `lxmf-wire`, so it cannot replace both entries anyway. Depending on the two
 # directly keeps one mechanism instead of two.
-coyote-rns-transport = "0.18.3"
+coyote-rns-transport = "0.18.4"
 lxmf-wire = "0.14.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the

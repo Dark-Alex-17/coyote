@@ -341,8 +341,9 @@ impl RnsdLanReader {
     }
 
     /// The summed count of rnsd's AutoInterfaces, `None` when rnsd runs none, so it has
-    /// no LAN to count, and whether a TCP client interface is online. A connect, a
-    /// timeout or a dropped connection is tried again `RPC_ATTEMPTS` times in all before
+    /// no LAN to count, and whether a TCP client interface is online. A dial rnsd refuses
+    /// because its listener is not bound yet, a timeout or a dropped connection is tried
+    /// again `RPC_ATTEMPTS` times in all before
     /// this read is `Unknown` with no relay online; a key rnsd refuses, or a config that
     /// names none, makes every read of the run read so without a call, and is told once
     /// at debug.
@@ -401,7 +402,7 @@ impl RnsdLanReader {
                     *self.last.lock() = reading;
                     return reading;
                 }
-                Err(err) if attempt < attempts && retryable(&err) => {
+                Err(err) if attempt < attempts && (retryable(&err) || not_listening_yet(&err)) => {
                     attempt += 1;
                     sleep(self.retry_wait).await;
                 }
@@ -449,13 +450,22 @@ fn tell_unavailable(reason: &str) {
     );
 }
 
-/// What goes away by itself: rnsd not listening yet, slow, or dropping the connection.
+/// What goes away by itself: rnsd slow past the budget, or a transient drop on either
+/// side of the dial, read off the typed io kind of an `Io` or `Connect` failure.
 fn retryable(err: &RpcError) -> bool {
-    match err {
-        RpcError::Connect(_) | RpcError::Timeout => true,
-        RpcError::Protocol(message) => message.to_ascii_lowercase().contains("reset"),
-        _ => false,
-    }
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    matches!(err, RpcError::Timeout)
+        || matches!(
+            err.io_kind(),
+            Some(ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof)
+        )
+}
+
+/// rnsd is up but its RPC listener is not bound yet: it binds a few seconds after the
+/// shared instance starts, so a refused dial is polled for again.
+fn not_listening_yet(err: &RpcError) -> bool {
+    matches!(err, RpcError::Connect(_))
+        && err.io_kind() == Some(std::io::ErrorKind::ConnectionRefused)
 }
 
 /// What every later call would fail with too: the key, or the digest rnsd asks for.
@@ -879,8 +889,12 @@ mod tests {
         let dir = keyed_dir("lan-count-three-failures");
         let source = Scripted::new([
             Err(RpcError::Timeout),
-            Err(RpcError::Protocol("Connection RESET by peer".into())),
-            Err(refused()),
+            Err(RpcError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            Err(RpcError::Connect(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
             Ok(vec![auto(0)]),
         ]);
         let reader = reader_at(&dir.path, source.clone());
@@ -891,11 +905,46 @@ mod tests {
         assert_eq!(source.calls(), 4);
     }
 
+    /// A drop on either side of the dial is retried, read off the typed io kind: a reset,
+    /// an abort, a broken pipe or a reply cut short, as `Io` after the dial or `Connect`
+    /// during it (macOS resets an overflowed dial before `connect()` returns). A refused
+    /// dial is not one of them: rnsd's listener is not bound yet, which the read polls
+    /// for on its own. Text in a `Protocol` error says nothing about the connection.
+    #[test]
+    fn a_drop_is_retryable_by_its_io_kind_and_a_refused_dial_is_the_not_listening_poll() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(retryable(&RpcError::Io(Error::from(kind))), "Io({kind:?})");
+            assert!(
+                retryable(&RpcError::Connect(Error::from(kind))),
+                "Connect({kind:?})"
+            );
+        }
+        assert!(retryable(&RpcError::Timeout));
+        assert!(!retryable(&refused()), "a refused dial is not a drop");
+        assert!(not_listening_yet(&refused()));
+        assert!(!not_listening_yet(&RpcError::Io(Error::from(
+            ErrorKind::ConnectionRefused
+        ))));
+        assert!(!retryable(&RpcError::Protocol("connection reset".into())));
+        assert!(!retryable(&RpcError::Io(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+        assert!(!retryable(&RpcError::Connect(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+    }
+
     #[tokio::test]
     async fn a_failure_that_is_not_a_drop_is_not_retried_but_asked_again_next_read() {
         let dir = keyed_dir("lan-count-no-retry");
         let source = Scripted::new([
-            Err(RpcError::Protocol("frame too long".into())),
+            Err(RpcError::Protocol("connection reset".into())),
             Err(RpcError::Decode("not a map".into())),
             Ok(vec![auto(1)]),
         ]);
