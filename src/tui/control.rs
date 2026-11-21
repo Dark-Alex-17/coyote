@@ -578,11 +578,9 @@ impl App {
 
     pub(super) fn open_thread_picker(&mut self) {
         let mut rows = vec![ThreadRow::root()];
-        let none_yet = || Some("No child sessions yet".to_string());
         let note = match self.child_root.as_deref() {
-            None => none_yet(),
+            None => None,
             Some(root) => match root.list_children() {
-                Ok(children) if children.is_empty() => none_yet(),
                 Ok(children) => {
                     let running: Vec<ProcessStamp> = children
                         .iter()
@@ -604,6 +602,20 @@ impl App {
                 }
             },
         };
+        // A child the root does not list yet is still known from its start.
+        // With no root there is no file to open it from, so it is left out.
+        if self.child_root.is_some() {
+            let listed = rows.len();
+            for (session_id, agent, finished) in self.child_live.sessions() {
+                if !rows[..listed]
+                    .iter()
+                    .any(|row| row.session_id.as_deref() == Some(session_id))
+                {
+                    rows.push(ThreadRow::live(session_id, agent, finished));
+                }
+            }
+        }
+        let note = note.or_else(|| (rows.len() == 1).then(|| "No child sessions yet".to_string()));
         if let Some(pager) = self.pager_mut() {
             pager.open_picker(rows, note);
         }

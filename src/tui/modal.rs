@@ -600,6 +600,7 @@ impl App {
             // The queue does not say how deep the asking agent is; a
             // direct child is the fallback.
             depth: 1,
+            node: None,
         };
         let mut req = PromptRequest::new(action, question.to_string(), origin);
         req.options = ask.options;

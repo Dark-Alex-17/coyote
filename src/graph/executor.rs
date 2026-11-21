@@ -270,17 +270,10 @@ impl GraphExecutor {
                     .clone();
                 logger.node_start(&node, in_super_step);
                 let node_hooks = NodeHookEmitter::resolve(ctx, node_id, node_type_label(&node));
-                hooks::fire(
-                    HookEvent::GraphNodeStarted,
-                    ctx,
-                    &[
-                        ("COYOTE_NODE_ID", node_id.clone()),
-                        ("COYOTE_NODE_TYPE", node_hooks.node_type.to_string()),
-                    ],
-                    None,
-                );
+                node_hooks.started();
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
+                branch_ctx.graph_node = Some(node_id.clone());
                 let ui = Arc::clone(&branch_ctx.ui);
                 let mut peer_id: Option<String> = None;
                 if let Some(assignment) = peer_assignments.remove(node_id) {
@@ -605,17 +598,20 @@ fn provision_frontier_peers(
 }
 
 struct NodeHookEmitter {
+    started: Vec<ResolvedHook>,
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_name: Option<String>,
     node_id: String,
     node_type: &'static str,
+    origin: Origin,
 }
 
 impl NodeHookEmitter {
     fn resolve(ctx: &RequestContext, node_id: &str, node_type: &'static str) -> Self {
         Self {
+            started: ctx.resolved_hooks(HookEvent::GraphNodeStarted),
             completed: ctx.resolved_hooks(HookEvent::GraphNodeCompleted),
             failed: ctx.resolved_hooks(HookEvent::GraphNodeFailed),
             session_name: ctx
@@ -625,15 +621,24 @@ impl NodeHookEmitter {
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
             node_id: node_id.to_string(),
             node_type,
+            origin: Origin {
+                node: Some(node_id.to_string()),
+                ..Origin::from(ctx)
+            },
         }
     }
 
-    fn extras(&self, elapsed: Duration) -> Vec<(&'static str, String)> {
+    fn identity_extras(&self) -> Vec<(&'static str, String)> {
         vec![
             ("COYOTE_NODE_ID", self.node_id.clone()),
             ("COYOTE_NODE_TYPE", self.node_type.to_string()),
-            ("COYOTE_NODE_DURATION_MS", elapsed.as_millis().to_string()),
         ]
+    }
+
+    fn extras(&self, elapsed: Duration) -> Vec<(&'static str, String)> {
+        let mut extras = self.identity_extras();
+        extras.push(("COYOTE_NODE_DURATION_MS", elapsed.as_millis().to_string()));
+        extras
     }
 
     fn dispatch(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
@@ -642,8 +647,16 @@ impl NodeHookEmitter {
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
-        hooks::publish_hook_event(event, &base_envs, extras, None, Origin::detached());
+        hooks::publish_hook_event(event, &base_envs, extras, None, self.origin.clone());
         hooks::fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
+    }
+
+    fn started(&self) {
+        self.dispatch(
+            HookEvent::GraphNodeStarted,
+            &self.started,
+            &self.identity_extras(),
+        );
     }
 
     fn completed(&self, elapsed: Duration, route: Option<&str>) {
@@ -2696,7 +2709,9 @@ nodes:
     #[test]
     #[serial]
     fn completed_publishes_bus_twin_without_resolved_hooks() {
-        let ctx = ctx_with_global_hooks(Default::default());
+        let mut ctx = ctx_with_global_hooks(Default::default());
+        ctx.self_agent_id = Some("graph-agent-x7x".to_string());
+        ctx.current_depth = 1;
         let node_id = "node-bus-probe-x7x";
         let _sink = hooks::test_sink::install();
         let bus = crate::events::RecordingSink::install();
@@ -2716,7 +2731,14 @@ nodes:
             panic!("expected Event::Hook, got {:?}", published[0]);
         };
         assert_eq!(*event, HookEvent::GraphNodeCompleted);
-        assert_eq!(*origin, Origin::detached());
+        assert_eq!(
+            *origin,
+            Origin {
+                agent_id: Some("graph-agent-x7x".to_string()),
+                depth: 1,
+                node: Some(node_id.to_string()),
+            }
+        );
         assert_eq!(*payload, None);
         assert!(envs.contains(&("COYOTE_NODE_TYPE".to_string(), "llm".to_string())));
         assert!(envs.contains(&("COYOTE_NODE_ROUTE".to_string(), "next".to_string())));
@@ -2727,6 +2749,131 @@ nodes:
             }),
             "no hook is resolved, so nothing may reach test_sink"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn failed_publishes_with_the_graph_agents_origin() {
+        let mut ctx = ctx_with_global_hooks(Default::default());
+        ctx.self_agent_id = Some("graph-agent-f3f".to_string());
+        ctx.current_depth = 2;
+        let node_id = "node-failed-probe-f3f";
+        let bus = crate::events::RecordingSink::install();
+
+        NodeHookEmitter::resolve(&ctx, node_id, "script").failed(Duration::from_millis(7), "boom");
+
+        let published = bus.drain_hooks_with_env("COYOTE_NODE_ID", node_id);
+        let [
+            crate::events::Event::Hook {
+                event,
+                envs,
+                origin,
+                ..
+            },
+        ] = published.as_slice()
+        else {
+            panic!("expected one Event::Hook, got {published:?}");
+        };
+        assert_eq!(*event, HookEvent::GraphNodeFailed);
+        assert!(envs.contains(&("COYOTE_NODE_ERROR".to_string(), "boom".to_string())));
+        assert_eq!(
+            *origin,
+            Origin {
+                agent_id: Some("graph-agent-f3f".to_string()),
+                depth: 2,
+                node: Some(node_id.to_string()),
+            }
+        );
+    }
+
+    /// Two nodes of one super-step share the graph agent's id; every
+    /// hook fired inside a node, and the node's own start, names that
+    /// node. The agent nodes name an agent that does not exist, so each
+    /// fires `agent.failed` from inside its node and falls back.
+    #[tokio::test]
+    #[serial]
+    async fn hooks_inside_super_step_nodes_name_their_node() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+        let yaml = r#"
+name: super_step_origin_test
+settings:
+  validate_before_run: false
+start: dispatcher
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {}
+    next: [left_o9n, right_o9n]
+  left_o9n:
+    type: agent
+    agent: missing-agent-o9n
+    prompt: "go"
+    fallback: done
+    next: done
+  right_o9n:
+    type: agent
+    agent: missing-agent-o9n
+    prompt: "go"
+    fallback: done
+    next: done
+  done:
+    type: end
+    output: "ok"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        ctx.self_agent_id = Some("graph-agent-o9n".to_string());
+        ctx.current_depth = 1;
+        let bus = crate::events::RecordingSink::install();
+        GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let origin = |node: &str| Origin {
+            agent_id: Some("graph-agent-o9n".to_string()),
+            depth: 1,
+            node: Some(node.to_string()),
+        };
+        let events = bus.drain();
+        let hooks_of = |wanted: HookEvent| -> Vec<(String, Origin)> {
+            let mut found: Vec<(String, Origin)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::events::Event::Hook {
+                        event,
+                        envs,
+                        origin,
+                        ..
+                    } if *event == wanted
+                        && origin.agent_id.as_deref() == Some("graph-agent-o9n") =>
+                    {
+                        let node_env = envs
+                            .iter()
+                            .find(|(key, _)| key == "COYOTE_NODE_ID" || key == "COYOTE_AGENT_ID")
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or_default();
+                        Some((node_env, origin.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            found.retain(|(id, _)| id.ends_with("_o9n"));
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            found
+        };
+        let expected = vec![
+            ("left_o9n".to_string(), origin("left_o9n")),
+            ("right_o9n".to_string(), origin("right_o9n")),
+        ];
+        assert_eq!(hooks_of(HookEvent::GraphNodeStarted), expected);
+        assert_eq!(hooks_of(HookEvent::AgentFailed), expected);
     }
 
     /// Declared variables are seeded into state at run start, so the agent

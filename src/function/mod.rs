@@ -1923,11 +1923,13 @@ impl ToolCall {
                 envs,
                 agent_name,
                 ctx.app.config.tool_timeout,
-                ToolIo::new(Arc::clone(&ctx.ui), self.id.clone(), current_depth).with_prompter(
-                    Arc::clone(&ctx.prompter),
-                    Arc::clone(&ctx.prompt_memory),
-                    Origin::from(&*ctx),
-                ),
+                ToolIo::new(Arc::clone(&ctx.ui), self.id.clone(), current_depth)
+                    .with_origin(Origin::from(&*ctx))
+                    .with_prompter(
+                        Arc::clone(&ctx.prompter),
+                        Arc::clone(&ctx.prompt_memory),
+                        Origin::from(&*ctx),
+                    ),
                 ctx.session_abort.clone(),
             )
             .await
@@ -2658,6 +2660,7 @@ pub(crate) struct ToolIo {
     ui: Arc<dyn UiSink>,
     call_id: Option<String>,
     depth: usize,
+    origin: Origin,
     prompter: Option<prompt_channel::ToolPrompter>,
 }
 
@@ -2667,8 +2670,15 @@ impl ToolIo {
             ui,
             call_id,
             depth,
+            origin: Origin::detached(),
             prompter: None,
         }
+    }
+
+    /// Names the agent and graph node the tool runs for on its output chunks.
+    pub(crate) fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Lets the tool ask the human; without it no reply channel is offered.
@@ -2996,6 +3006,7 @@ pub fn run_llm_function(
                 call_id: stdout_io.call_id.clone().unwrap_or_default(),
                 stream: OutputStream::Stdout,
                 bytes: chunk.to_vec(),
+                origin: stdout_io.origin.clone(),
             });
             stdout_io.ui.tool_output(
                 stdout_io.call_id.as_deref(),
@@ -3059,6 +3070,7 @@ pub fn run_llm_function(
                 call_id: stderr_io.call_id.clone().unwrap_or_default(),
                 stream: OutputStream::Stderr,
                 bytes: chunk.to_vec(),
+                origin: stderr_io.origin.clone(),
             });
             stderr_io.ui.tool_output(
                 stderr_io.call_id.as_deref(),
@@ -5805,6 +5817,7 @@ mod tests {
                 call_id,
                 stream,
                 bytes,
+                ..
             } = event
                 && call_id == "call-chunk-x7x"
             {

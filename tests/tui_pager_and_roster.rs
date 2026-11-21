@@ -2904,6 +2904,63 @@ mod binary_threads {
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
     }
 
+    /// The kid's thread, opened while the kid sits in its gated tool and
+    /// before it saved that round, shows the call as a running tool row
+    /// named after the tool; opening the gate turns the row ok with no
+    /// key pressed.
+    #[test]
+    #[serial]
+    fn the_kids_thread_shows_its_running_tool_row_live_and_then_ok() {
+        let scene = scene("thr-live-row", kid_in_a_blocking_tool, "");
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+        wait_for_file(
+            &mut pty,
+            &scene.dir.join("kid.gated"),
+            "the kid's gate tool",
+        );
+
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"\t").unwrap();
+        let picker = repainted_frame_showing(
+            &mut pty,
+            "Threads  Enter = open  Esc = back",
+            "Tab did not open the picker",
+        );
+        assert!(
+            row_after(thread_picker_band(&picker), "kid").is_some(),
+            "the picker does not list the kid:\n{picker}"
+        );
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\r").unwrap();
+        let (running, thread) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+            row_after(frame, "kid_gate(").is_some_and(|row| row.contains("running"))
+        });
+        assert!(
+            running,
+            "the kid's thread does not show its gated call running:\n{thread}\nlog: {}",
+            scene.log.display()
+        );
+
+        fs::write(&scene.kid_gate, "").unwrap();
+        let (finished, after) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+            row_after(frame, "kid_gate(").is_some_and(|row| row.contains(" ok"))
+        });
+        assert!(
+            finished,
+            "the kid's gated call did not turn ok in its open thread:\n{after}"
+        );
+        pty.send(b"q").unwrap();
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
     /// The boss's first turn: spawn the kid, then text answers to the
     /// turn-end reminders until the turn ends with the UI idle again.
     fn first_turn_spawning(prompt: &str) -> Vec<Reply> {

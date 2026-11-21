@@ -617,6 +617,10 @@ pub struct RequestContext {
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
+    /// Id of the graph node this context runs inside. Set on a node's branch
+    /// context so the events it publishes name the node; a spawned child
+    /// starts without one.
+    pub graph_node: Option<String>,
     pub inbox: Option<Arc<Inbox>>,
     pub parent_inbox: Option<Arc<Inbox>>,
     /// Directory of concurrent teammates for `teammates: true` graph fan-outs.
@@ -714,6 +718,7 @@ impl RequestContext {
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
+            graph_node: None,
             inbox: None,
             parent_inbox: None,
             peer_registry: None,
@@ -808,6 +813,7 @@ impl RequestContext {
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
+            graph_node: None,
             inbox: None,
             parent_inbox: None,
             peer_registry: None,
@@ -935,6 +941,7 @@ impl RequestContext {
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
+            graph_node: self.graph_node.clone(),
             inbox: self.inbox.clone(),
             parent_inbox: self.parent_inbox.clone(),
             peer_registry: None,
@@ -1010,6 +1017,7 @@ impl RequestContext {
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
+            graph_node: None,
             inbox: Some(inbox),
             parent_inbox: parent.inbox.clone(),
             peer_registry: None,
@@ -13036,6 +13044,25 @@ mod tests {
             "agent_test_1".to_string(),
         );
         assert_eq!(child.last_graph_branch, None);
+    }
+
+    /// A branch runs inside the same graph node as its parent; a spawned
+    /// child runs its own thread, so its events name no node of ours.
+    #[test]
+    fn graph_node_is_copied_by_fork_for_branch_and_reset_for_a_child() {
+        let mut ctx = create_test_ctx();
+        ctx.graph_node = Some("plan".to_string());
+
+        assert_eq!(ctx.fork_for_branch().graph_node.as_deref(), Some("plan"));
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert_eq!(child.graph_node, None);
     }
 
     #[test]

@@ -2448,6 +2448,7 @@ mod tests {
                 Origin {
                     agent_id: Some("parity-child".to_string()),
                     depth: 2,
+                    node: None,
                 },
                 "{event:?}"
             );

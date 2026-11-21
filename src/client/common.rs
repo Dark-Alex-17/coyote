@@ -2285,6 +2285,7 @@ mod tests {
         let origin = Origin {
             agent_id: Some(agent_id.to_string()),
             depth: 0,
+            node: None,
         };
         vec![
             Event::ThinkingStarted {

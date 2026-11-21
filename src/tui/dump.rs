@@ -42,7 +42,7 @@ pub(super) fn transcript_text(cells: &[Cell], config: &AppConfig) -> String {
                     format!("{header}\n{output}")
                 }
             }
-            Cell::Tool { .. } | Cell::Job { .. } | Cell::Agent { .. } => {
+            Cell::Tool { .. } | Cell::Job { .. } | Cell::Agent { .. } | Cell::Node { .. } => {
                 cell.summary_line().unwrap_or_default()
             }
             Cell::Text { .. } | Cell::Welcome { .. } => continue,

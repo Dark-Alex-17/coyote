@@ -1602,6 +1602,7 @@ fn a_long_answer_never_cuts_the_question_it_answers() {
         origin: Origin {
             agent_id: Some("agent-q5f".to_string()),
             depth: 1,
+            node: None,
         },
         ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
     };
@@ -1635,6 +1636,7 @@ fn long_options_never_cut_the_question_they_answer() {
         origin: Origin {
             agent_id: Some("agent-o7c".to_string()),
             depth: 1,
+            node: None,
         },
         ..PromptRequest::new(PromptAction::Select, question, Origin::detached())
     };
@@ -1661,6 +1663,7 @@ fn only_a_question_without_a_tool_is_rendered_as_markdown() {
     let agent = Origin {
         agent_id: Some("agent-m3d".to_string()),
         depth: 1,
+        node: None,
     };
     for origin in [Origin::detached(), agent] {
         let mut harness = Harness::standalone(80, 24);

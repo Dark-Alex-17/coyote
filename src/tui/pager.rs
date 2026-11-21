@@ -1,11 +1,13 @@
 //! The pager: Ctrl+T's full-screen read of one thread. The root thread is
 //! the transcript with every tool, job and agent row open on everything
-//! its calls printed; a child agent's thread is its saved session, shown
-//! read-only and read again each time the child writes it. A find field
-//! and a thread picker sit on top of the text.
+//! its calls printed; a child agent's thread is its saved session, read
+//! again each time the child writes it, merged with the tool and node
+//! rows the child's hooks report as they happen, shown read-only. A find
+//! field and a thread picker sit on top of the text.
 
 use super::bottom_pane::{render_header, render_rows, step_highlight};
-use super::cells::{Cell, short_args, without_think_spans};
+use super::cells::{Cell, without_think_spans};
+use super::child_live::{ChildLive, ChildThread};
 use super::keys::PagerMode;
 use super::render::{self, Renderer};
 use super::roster::RosterState;
@@ -15,7 +17,7 @@ use crate::config::child_sessions::{ChildMeta, EffectiveStatus};
 use crate::config::{RequestContext, Session};
 use anyhow::{Context, Result, bail};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
@@ -34,7 +36,7 @@ const PICKER_HINT: &str = "j/k move  Enter open  Esc back";
 const NARROW: u16 = 70;
 const PICKER_HEADER: &str = "Threads  Enter = open  Esc = back";
 const CHECKPOINT_NOTE: &str =
-    "Read-only. Rounds inside a tool loop show up at the child's next checkpoint.";
+    "Read-only. Tool calls show live; replies show up at the child's next checkpoint.";
 const ROOT_THREAD: &str = "root thread";
 const COMPRESSED_DIVIDER: &str = "(earlier rounds, compressed)";
 /// The largest child session file the pager reads; a bigger one is
@@ -51,7 +53,10 @@ pub(crate) enum ChildEntry {
     Compressed,
     User(String),
     Assistant(String),
+    /// A call and what it returned. `call_id` is empty for a result the
+    /// session keeps without its call.
     Tool {
+        call_id: String,
         name: String,
         args: String,
         output: String,
@@ -74,6 +79,7 @@ fn entries(messages: &[Message]) -> Vec<ChildEntry> {
                         entries.push(ChildEntry::Assistant(text.to_string()));
                     }
                     entries.push(ChildEntry::Tool {
+                        call_id: result.call.id.clone().unwrap_or_default(),
                         name: result.call.name.clone(),
                         args: result.call.arguments.to_string(),
                         output: match &result.output {
@@ -100,6 +106,7 @@ fn entries(messages: &[Message]) -> Vec<ChildEntry> {
             MessageRole::User => entries.push(ChildEntry::User(text)),
             MessageRole::Assistant => entries.push(ChildEntry::Assistant(text)),
             MessageRole::Tool => entries.push(ChildEntry::Tool {
+                call_id: String::new(),
                 name: "tool".to_string(),
                 args: String::new(),
                 output: text,
@@ -130,22 +137,81 @@ pub(super) fn load_child(file: &Path, ctx: &RequestContext) -> Result<Vec<ChildE
     Ok(shown)
 }
 
+/// The lines of a text entry. A tool call is drawn from its row instead,
+/// so it has none here.
 fn entry_lines(entry: &ChildEntry, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
     match entry {
         ChildEntry::Compressed => render::plain_lines(COMPRESSED_DIVIDER, width, DIM),
         ChildEntry::User(text) => render::plain_lines(&format!("> {text}"), width, BOLD),
         ChildEntry::Assistant(text) => renderer.markdown(without_think_spans(text, true), width),
-        ChildEntry::Tool { name, args, output } => {
-            let mut lines =
-                render::plain_lines(&format!("{name}({})", short_args(args)), width, DIM);
-            lines.extend(
-                render::hard_wrap(render::preformatted_lines(output), width)
-                    .into_iter()
-                    .map(|line| line.patch_style(DIM)),
-            );
-            lines
+        ChildEntry::Tool { .. } => Vec::new(),
+    }
+}
+
+/// A saved call as a finished tool row of the main view's, for a call
+/// no live row reports; None for a text entry.
+fn recorded_row(entry: &ChildEntry) -> Option<Cell> {
+    let ChildEntry::Tool {
+        call_id,
+        name,
+        args,
+        output,
+    } = entry
+    else {
+        return None;
+    };
+    Some(Cell::recorded_tool(
+        call_id.clone(),
+        format!("{name} {args}"),
+        output,
+    ))
+}
+
+/// Where a row of a child's thread is drawn from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildRow {
+    /// Entry `n` of the saved session; a call there is its recorded row.
+    Disk(usize),
+    /// Row `n` of the child's live thread.
+    Live(usize),
+}
+
+/// The rows of a child's thread: the saved session in order, each call
+/// in it drawn as its live row when it has one and left out when a node
+/// row holds it, then every live row the session does not name yet.
+fn merged_rows(entries: &[ChildEntry], live: &[Cell]) -> Vec<ChildRow> {
+    let live_tools: HashMap<&str, usize> = live
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cell)| match cell {
+            Cell::Tool { call_id, .. } if !call_id.is_empty() => Some((call_id.as_str(), index)),
+            _ => None,
+        })
+        .collect();
+    let in_node = |call_id: &str| {
+        live.iter()
+            .any(|cell| matches!(cell, Cell::Node { .. }) && cell.takes_output_of(call_id))
+    };
+    let mut shown = vec![false; live.len()];
+    let mut rows = Vec::with_capacity(entries.len() + live.len());
+    for (index, entry) in entries.iter().enumerate() {
+        match entry {
+            ChildEntry::Tool { call_id, .. } if !call_id.is_empty() => {
+                match live_tools.get(call_id.as_str()) {
+                    Some(&at) if !shown[at] => {
+                        shown[at] = true;
+                        rows.push(ChildRow::Live(at));
+                    }
+                    Some(_) => {}
+                    None if in_node(call_id) => {}
+                    None => rows.push(ChildRow::Disk(index)),
+                }
+            }
+            _ => rows.push(ChildRow::Disk(index)),
         }
     }
+    rows.extend((0..live.len()).filter(|at| !shown[*at]).map(ChildRow::Live));
+    rows
 }
 
 fn status_word(status: EffectiveStatus) -> &'static str {
@@ -180,6 +246,16 @@ impl ThreadRow {
             session_id: Some(meta.session_id.clone()),
             agent: meta.agent.clone(),
             status: status_word(status).to_string(),
+        }
+    }
+
+    /// A child the UI saw start, which the child-session root does not
+    /// list (yet).
+    pub(super) fn live(session_id: &str, agent: &str, finished: bool) -> Self {
+        Self {
+            session_id: Some(session_id.to_string()),
+            agent: agent.to_string(),
+            status: if finished { "finished" } else { "running" }.to_string(),
         }
     }
 
@@ -220,10 +296,18 @@ pub(super) struct ChildView {
     /// None until the first read comes back. A failed read keeps what the
     /// last good one gave and says why next to it.
     entries: Option<Vec<ChildEntry>>,
+    /// The recorded row of each saved call, by entry; None for a text
+    /// entry. A re-read keeps the row of an unchanged entry, folded or
+    /// open as it was.
+    recorded: Vec<Option<Cell>>,
     error: Option<String>,
-    /// Each entry's lines by position. A re-read of a growing thread
-    /// lays out only the entries that are new or changed.
-    layouts: Vec<EntryLayout>,
+    /// Each text entry's lines by position. A re-read of a growing
+    /// thread lays out only the entries that are new or changed.
+    layouts: Vec<Option<EntryLayout>>,
+    /// The rows as last laid out, which a click is matched against.
+    rows: Vec<ChildRow>,
+    /// The foldable row Ctrl+Up and Ctrl+Down last moved to.
+    focus: Option<ChildRow>,
     /// The read under way, by generation. At most one runs at a time.
     loading: Option<u64>,
     /// The child wrote its file again while a read was under way: one
@@ -231,9 +315,48 @@ pub(super) struct ChildView {
     stale: bool,
 }
 
+impl ChildView {
+    fn cell<'a>(&'a self, row: ChildRow, live: &'a [Cell]) -> Option<&'a Cell> {
+        match row {
+            ChildRow::Disk(index) => self.recorded.get(index)?.as_ref(),
+            ChildRow::Live(index) => live.get(index),
+        }
+    }
+
+    fn cell_mut<'a>(&'a mut self, row: ChildRow, live: &'a mut [Cell]) -> Option<&'a mut Cell> {
+        match row {
+            ChildRow::Disk(index) => self.recorded.get_mut(index)?.as_mut(),
+            ChildRow::Live(index) => live.get_mut(index),
+        }
+    }
+
+    /// Takes a good read, keeping the recorded row of each call that is
+    /// where it was with what it had.
+    fn set_entries(&mut self, entries: Vec<ChildEntry>) {
+        let previous = self.entries.take().unwrap_or_default();
+        let mut kept = std::mem::take(&mut self.recorded);
+        self.recorded = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let unchanged = previous.get(index) == Some(entry);
+                match kept.get_mut(index).and_then(Option::take) {
+                    Some(cell) if unchanged => Some(cell),
+                    _ => recorded_row(entry),
+                }
+            })
+            .collect();
+        self.entries = Some(entries);
+    }
+}
+
+fn live_rows<'a>(live: &'a ChildLive, session_id: &str) -> &'a [Cell] {
+    live.by_session(session_id).map_or(&[], ChildThread::rows)
+}
+
 enum Thread {
     Root,
-    Child(ChildView),
+    Child(Box<ChildView>),
 }
 
 /// Where the view lands at the next frame, once the lines it is made of
@@ -243,11 +366,16 @@ enum Jump {
     Top,
     Bottom,
     Cell(usize),
-    Match { forward: bool },
+    Match {
+        forward: bool,
+    },
+    /// Scroll just far enough to show the first line of row `n`.
+    Reveal(usize),
 }
 
-/// A run of the text: the lines of one root cell (shared with the
-/// layout cache) or the whole of a child's thread, and where it starts.
+/// A run of the text and where it starts: the lines of one root cell
+/// (shared with the layout cache) or of one row of a child's thread, or
+/// the note heading a child's thread.
 struct Piece {
     cell: Option<usize>,
     start: usize,
@@ -294,6 +422,20 @@ impl PagerText {
             .iter()
             .find(|piece| piece.cell == Some(cell))
             .map(|piece| piece.start)
+    }
+
+    /// The cell or row whose lines hold line `index`.
+    fn cell_at(&self, index: usize) -> Option<usize> {
+        let at = self
+            .pieces
+            .partition_point(|piece| piece.start <= index)
+            .checked_sub(1)?;
+        let piece = &self.pieces[at];
+        if index - piece.start < piece.lines.len() {
+            piece.cell
+        } else {
+            None
+        }
     }
 }
 
@@ -378,6 +520,10 @@ impl Pager {
         self.root_lines = RootLines::default();
         if let Thread::Child(view) = &mut self.thread {
             view.layouts.clear();
+            view.recorded
+                .iter_mut()
+                .flatten()
+                .for_each(Cell::forget_layout);
         }
     }
 
@@ -389,16 +535,19 @@ impl Pager {
     /// A child's thread, empty until its first read comes back.
     pub(super) fn child(session_id: String, agent: String, file: PathBuf) -> Self {
         Self::new(
-            Thread::Child(ChildView {
+            Thread::Child(Box::new(ChildView {
                 session_id,
                 agent,
                 file,
                 entries: None,
+                recorded: Vec::new(),
                 error: None,
                 layouts: Vec::new(),
+                rows: Vec::new(),
+                focus: None,
                 loading: None,
                 stale: false,
-            }),
+            })),
             Jump::Bottom,
         )
     }
@@ -415,6 +564,117 @@ impl Pager {
 
     pub(super) fn shows_root(&self) -> bool {
         matches!(self.thread, Thread::Root)
+    }
+
+    /// The session of the child on show.
+    pub(super) fn child_session(&self) -> Option<&str> {
+        match &self.thread {
+            Thread::Root => None,
+            Thread::Child(view) => Some(&view.session_id),
+        }
+    }
+
+    /// The live rows of the child on show changed: its text is laid out
+    /// again at the next frame.
+    pub(super) fn child_rows_changed(&mut self) {
+        if let Thread::Child(_) = self.thread {
+            self.laid_out = None;
+        }
+    }
+
+    /// Moves the focus to the next foldable row of the child on show, or
+    /// the previous one; from no focus, to the first or the last.
+    pub(super) fn step_focus(&mut self, live: &ChildLive, forward: bool) {
+        let Thread::Child(view) = &mut self.thread else {
+            return;
+        };
+        let cells = live_rows(live, &view.session_id);
+        view.rows = merged_rows(view.entries.as_deref().unwrap_or_default(), cells);
+        let foldable: Vec<usize> = (0..view.rows.len())
+            .filter(|&index| {
+                view.cell(view.rows[index], cells)
+                    .is_some_and(Cell::collapsible)
+            })
+            .collect();
+        let at = view
+            .focus
+            .and_then(|focus| view.rows.iter().position(|row| *row == focus));
+        let target = match (at, forward) {
+            (None, true) => foldable.first().copied(),
+            (None, false) => foldable.last().copied(),
+            (Some(at), true) => foldable
+                .iter()
+                .copied()
+                .find(|&index| index > at)
+                .or(Some(at)),
+            (Some(at), false) => foldable
+                .iter()
+                .copied()
+                .rev()
+                .find(|&index| index < at)
+                .or(Some(at)),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        view.focus = Some(view.rows[target]);
+        self.jump = Some(Jump::Reveal(target));
+        self.laid_out = None;
+    }
+
+    /// Opens or closes the focused row of the child on show.
+    pub(super) fn toggle_focused(&mut self, live: &mut ChildLive) {
+        let Thread::Child(view) = &mut self.thread else {
+            return;
+        };
+        let Some(focus) = view.focus else {
+            return;
+        };
+        let cells = live
+            .by_session_mut(&view.session_id)
+            .map_or(&mut [][..], ChildThread::rows_mut);
+        if let Some(cell) = view.cell_mut(focus, cells) {
+            cell.toggle();
+            self.laid_out = None;
+        }
+    }
+
+    /// A left click at `column`, `row` of a pager drawn over `area`: on a
+    /// foldable row of the child on show, focuses it and opens or closes
+    /// it.
+    pub(super) fn click(&mut self, live: &mut ChildLive, column: u16, row: u16, area: Rect) {
+        let body = if area.height >= 3 {
+            Rect::new(area.x, area.y + 1, area.width, area.height - 2)
+        } else {
+            area
+        };
+        if self.picker.is_some() || !body.contains(Position::new(column, row)) {
+            return;
+        }
+        let line = self.top + usize::from(row - body.y);
+        let Some(index) = self
+            .laid_out
+            .as_ref()
+            .and_then(|(_, _, text)| text.cell_at(line))
+        else {
+            return;
+        };
+        let Thread::Child(view) = &mut self.thread else {
+            return;
+        };
+        let Some(&clicked) = view.rows.get(index) else {
+            return;
+        };
+        let cells = live
+            .by_session_mut(&view.session_id)
+            .map_or(&mut [][..], ChildThread::rows_mut);
+        if let Some(cell) = view.cell_mut(clicked, cells)
+            && cell.collapsible()
+        {
+            cell.toggle();
+            view.focus = Some(clicked);
+            self.laid_out = None;
+        }
     }
 
     pub(super) fn set_tasks(&mut self, tasks: Option<RosterState>) {
@@ -469,7 +729,7 @@ impl Pager {
         view.loading = None;
         match result {
             Ok(entries) => {
-                view.entries = Some(entries);
+                view.set_entries(entries);
                 view.error = None;
             }
             Err(error) => view.error = Some(error),
@@ -598,12 +858,14 @@ impl Pager {
     /// The thread laid out at `width`. The root thread is looked at
     /// again only when the transcript's `generation` moved, and then only
     /// the cells whose revision moved are laid out again; a child's
-    /// thread is laid out again when a read of it came back.
+    /// thread is laid out again when a read of it came back, its live
+    /// rows in `live` changed or one of its rows was opened or closed.
     pub(super) fn text(
         &mut self,
         cells: &mut [Cell],
         revisions: &[u64],
         generation: u64,
+        live: &mut ChildLive,
         width: u16,
         renderer: &mut Renderer,
     ) -> Arc<PagerText> {
@@ -617,7 +879,7 @@ impl Pager {
         {
             return Arc::clone(text);
         }
-        let text = Arc::new(self.lay_out(cells, revisions, width, renderer));
+        let text = Arc::new(self.lay_out(cells, revisions, live, width, renderer));
         self.reanchor(&text);
         self.laid_out = Some((width, generation, Arc::clone(&text)));
         text
@@ -642,58 +904,81 @@ impl Pager {
         &mut self,
         cells: &mut [Cell],
         revisions: &[u64],
+        live: &mut ChildLive,
         width: u16,
         renderer: &mut Renderer,
     ) -> PagerText {
         match &mut self.thread {
             Thread::Root => self.lay_out_root(cells, revisions, width, renderer),
             Thread::Child(view) => {
-                let mut lines = Vec::new();
+                let mut head = Vec::new();
                 let no_color = renderer.no_color;
-                lines.extend(render::plain_lines(CHECKPOINT_NOTE, width, DIM));
+                head.extend(render::plain_lines(CHECKPOINT_NOTE, width, DIM));
                 if let Some(error) = &view.error {
-                    lines.extend(render::plain_lines(
+                    head.extend(render::plain_lines(
                         &format!("Cannot read this transcript: {error}"),
                         width,
                         chrome_style(ChromeKind::Error, no_color),
                     ));
                 }
-                let ChildView {
-                    entries, layouts, ..
-                } = view;
-                match entries {
-                    Some(entries) => {
-                        layouts.truncate(entries.len());
-                        for (index, entry) in entries.iter().enumerate() {
-                            let hash = entry_hash(entry);
-                            let fresh = layouts
-                                .get(index)
-                                .is_some_and(|layout| layout.hash == hash && layout.width == width);
-                            if !fresh {
-                                let layout = EntryLayout {
-                                    hash,
-                                    width,
-                                    lines: entry_lines(entry, width, renderer),
-                                };
-                                match layouts.get_mut(index) {
-                                    Some(slot) => *slot = layout,
-                                    None => layouts.push(layout),
-                                }
-                                #[cfg(test)]
-                                {
-                                    self.entry_layouts += 1;
-                                }
-                            }
-                            lines.push(Line::default());
-                            lines.extend_from_slice(&layouts[index].lines);
-                        }
-                    }
-                    None if view.error.is_none() => {
-                        lines.push(Line::from(Span::styled("Loading...", DIM)));
-                    }
-                    None => {}
+                if view.entries.is_none() && view.error.is_none() {
+                    head.push(Line::from(Span::styled("Loading...", DIM)));
                 }
-                PagerText::single(lines)
+                let live = live
+                    .by_session_mut(&view.session_id)
+                    .map_or(&mut [][..], ChildThread::rows_mut);
+                let entries = view.entries.as_deref().unwrap_or_default();
+                view.rows = merged_rows(entries, live);
+                view.layouts.resize_with(entries.len(), || None);
+                let mut total = head.len();
+                let mut pieces = vec![Piece {
+                    cell: None,
+                    start: 0,
+                    lines: head.into(),
+                }];
+                for (index, &row) in view.rows.iter().enumerate() {
+                    let mut lines = match row {
+                        ChildRow::Live(at) => live[at].lines(width, renderer),
+                        ChildRow::Disk(at) => match view.recorded[at].as_mut() {
+                            Some(cell) => cell.lines(width, renderer),
+                            None => {
+                                let entry = &entries[at];
+                                let hash = entry_hash(entry);
+                                let slot = &mut view.layouts[at];
+                                let fresh = slot.as_ref().is_some_and(|layout| {
+                                    layout.hash == hash && layout.width == width
+                                });
+                                if !fresh {
+                                    *slot = Some(EntryLayout {
+                                        hash,
+                                        width,
+                                        lines: entry_lines(entry, width, renderer),
+                                    });
+                                    #[cfg(test)]
+                                    {
+                                        self.entry_layouts += 1;
+                                    }
+                                }
+                                slot.as_ref()
+                                    .map_or_else(Vec::new, |layout| layout.lines.clone())
+                            }
+                        },
+                    };
+                    if view.focus == Some(row)
+                        && let Some(header) = lines.first_mut()
+                    {
+                        *header = header.clone().patch_style(REVERSED);
+                    }
+                    total += 1;
+                    let rows = lines.len();
+                    pieces.push(Piece {
+                        cell: Some(index),
+                        start: total,
+                        lines: lines.into(),
+                    });
+                    total += rows;
+                }
+                PagerText { pieces, total }
             }
         }
     }
@@ -766,6 +1051,16 @@ impl Pager {
             Some(Jump::Cell(cell)) => {
                 self.top = text.cell_start(cell).unwrap_or(last_top);
                 self.follow = false;
+            }
+            Some(Jump::Reveal(cell)) => {
+                if let Some(line) = text.cell_start(cell) {
+                    if line < self.top {
+                        self.top = line;
+                    } else if line >= self.top + self.page {
+                        self.top = line + 1 - self.page;
+                    }
+                }
+                self.follow = self.top >= last_top;
             }
             // A match on the last page is a place the user went to read,
             // not a request to follow new lines past it.
@@ -974,6 +1269,8 @@ mod tests {
     use crate::tui::cells::{
         AgentStatus, FoldedCall, JobStatus, LineCache, TaskRow, ToolStatus, append_output,
     };
+    use crate::tui::child_live::ToolEnd;
+    use crate::tui::sink::ChildNodeState;
     use crate::tui::transcript::Transcript;
     use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
@@ -1031,7 +1328,29 @@ mod tests {
     }
 
     fn draw(pager: &mut Pager, cells: &mut [Cell], width: u16, height: u16) -> String {
-        let mut renderer = renderer();
+        draw_live(pager, cells, &mut ChildLive::default(), width, height)
+    }
+
+    fn draw_live(
+        pager: &mut Pager,
+        cells: &mut [Cell],
+        live: &mut ChildLive,
+        width: u16,
+        height: u16,
+    ) -> String {
+        draw_terminal(pager, cells, live, &mut renderer(), width, height)
+            .backend()
+            .to_string()
+    }
+
+    fn draw_terminal(
+        pager: &mut Pager,
+        cells: &mut [Cell],
+        live: &mut ChildLive,
+        renderer: &mut Renderer,
+        width: u16,
+        height: u16,
+    ) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
@@ -1041,14 +1360,15 @@ mod tests {
                     cells,
                     &revisions,
                     fresh_generation(),
+                    live,
                     area.width,
-                    &mut renderer,
+                    renderer,
                 );
                 pager.settle(&text, Pager::text_rows(area.height));
                 frame.render_widget(PagerView { pager, text: &text }, area);
             })
             .unwrap();
-        terminal.backend().to_string()
+        terminal
     }
 
     #[test]
@@ -1120,7 +1440,14 @@ mod tests {
     fn cells_line(pager: &mut Pager, cells: &mut [Cell], line: usize) -> String {
         let revisions = fresh_revisions(cells);
         pager
-            .text(cells, &revisions, fresh_generation(), 80, &mut renderer())
+            .text(
+                cells,
+                &revisions,
+                fresh_generation(),
+                &mut ChildLive::default(),
+                80,
+                &mut renderer(),
+            )
             .line(line)
             .map(Line::to_string)
             .unwrap_or_default()
@@ -1210,6 +1537,7 @@ mod tests {
             ChildEntry::User("review src/lib.rs".to_string()),
             ChildEntry::Assistant("Reading the file first.".to_string()),
             ChildEntry::Tool {
+                call_id: "call-r1".to_string(),
                 name: "fs_read".to_string(),
                 args: "{\"path\":\"src/lib.rs\"}".to_string(),
                 output: "fn main() {}\n".to_string(),
@@ -1242,8 +1570,280 @@ mod tests {
         pager.set_child_entries(session_id, 1, result);
     }
 
+    const REVIEWER: &str = "agent_reviewer_4e5f";
+    const PLANNER: &str = "agent_planner_7a8b";
+
+    fn ok_end(duration_ms: u64) -> ToolEnd {
+        ToolEnd {
+            ok: true,
+            error: None,
+            duration_ms: Some(duration_ms),
+        }
+    }
+
+    /// The reviewer's live rows: the saved `call-r1` finished, and
+    /// `call-r2`, which its session has yet to save, still running.
+    fn reviewer_live() -> ChildLive {
+        let now = Instant::now();
+        let mut live = ChildLive::default();
+        live.agent_started(
+            REVIEWER.to_string(),
+            "reviewer".to_string(),
+            Some("reviewer-a1".to_string()),
+        );
+        live.tool_started(
+            REVIEWER,
+            None,
+            "call-r1".to_string(),
+            "fs_read".to_string(),
+            Some(serde_json::json!({"path": "src/lib.rs"})),
+            now,
+        );
+        live.tool_output(REVIEWER, "call-r1", b"fn main() {}\n");
+        live.tool_finished(REVIEWER, None, "call-r1", ok_end(1200), now);
+        live.tool_started(
+            REVIEWER,
+            None,
+            "call-r2".to_string(),
+            "execute_command".to_string(),
+            Some(serde_json::json!({"command": "cargo test"})),
+            now,
+        );
+        live.tool_output(REVIEWER, "call-r2", b"running 3 tests\n");
+        live
+    }
+
+    /// The reviewer's saved session: `call-r0` from before the UI
+    /// started, which no live row reports, and `call-r1`.
+    fn reviewer_entries() -> Vec<ChildEntry> {
+        let mut entries = child_entries();
+        entries.insert(
+            2,
+            ChildEntry::Tool {
+                call_id: "call-r0".to_string(),
+                name: "fs_grep".to_string(),
+                args: "{\"pattern\":\"unsafe\"}".to_string(),
+                output: "no matches\n".to_string(),
+            },
+        );
+        entries
+    }
+
+    fn reviewer_pager() -> Pager {
+        let mut pager = Pager::child(
+            "reviewer-a1".to_string(),
+            "reviewer".to_string(),
+            PathBuf::from("/nonexistent/reviewer-a1.yaml"),
+        );
+        deliver(&mut pager, "reviewer-a1", Ok(reviewer_entries()));
+        pager
+    }
+
+    /// A child's thread shows its saved text with each call as a tool
+    /// row of the main view's: a saved call with a live row as that row,
+    /// one without as a recorded row that claims no time, then the calls
+    /// made since the last save. Every row starts folded.
+    #[test]
+    fn a_child_thread_merges_saved_text_with_live_tool_rows() {
+        let mut cells = Vec::new();
+        let mut live = reviewer_live();
+        let mut pager = reviewer_pager();
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        insta::assert_snapshot!("pager_child_live_80x24", &frame);
+        let row = |name: &str| {
+            frame
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no {name} row: {frame}"))
+                .to_string()
+        };
+        assert!(row("fs_grep(").contains("pattern"), "{frame}");
+        assert!(row("fs_grep(").contains("})  ok "), "{frame}");
+        assert!(row("fs_read(").contains("1.2s  ok"), "{frame}");
+        assert!(row("execute_command(").contains("running"), "{frame}");
+        assert_eq!(frame.matches("fs_read(").count(), 1, "{frame}");
+        assert!(
+            !frame.contains("fn main()"),
+            "a folded row shows output: {frame}"
+        );
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 40, 12);
+        insta::assert_snapshot!("pager_child_live_40x12", &frame);
+    }
+
+    /// Ctrl+Up from no focus goes to the last foldable row and Enter
+    /// opens it on its call and output tail; the open state is kept in
+    /// the live row, so it outlasts a new layout.
+    #[test]
+    fn a_focused_child_row_opens_and_stays_open() {
+        let mut cells = Vec::new();
+        let mut live = reviewer_live();
+        let mut pager = reviewer_pager();
+        draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        pager.step_focus(&live, false);
+        pager.toggle_focused(&mut live);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        insta::assert_snapshot!("pager_child_live_expanded_80x24", &frame);
+        assert!(frame.contains("running 3 tests"), "{frame}");
+        assert!(frame.contains("execute_command {\"command\""), "{frame}");
+        pager.child_rows_changed();
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        assert!(frame.contains("running 3 tests"), "{frame}");
+
+        pager.step_focus(&live, false);
+        pager.toggle_focused(&mut live);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        assert!(frame.contains("fn main() {}"), "{frame}");
+        pager.step_focus(&live, false);
+        pager.toggle_focused(&mut live);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        assert!(frame.contains("no matches"), "{frame}");
+        pager.step_focus(&live, false);
+        assert_eq!(pager.mode(), PagerMode::Browse);
+        deliver(&mut pager, "reviewer-a1", Ok(reviewer_entries()));
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        assert!(
+            frame.contains("no matches"),
+            "a re-read folded a recorded row: {frame}"
+        );
+    }
+
+    /// A left click on a row's header opens it; on text it does nothing.
+    #[test]
+    fn a_click_on_a_child_row_opens_it() {
+        let mut cells = Vec::new();
+        let mut live = reviewer_live();
+        let mut pager = reviewer_pager();
+        let area = Rect::new(0, 0, 80, 24);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        let y = |frame: &str, needle: &str| {
+            u16::try_from(
+                frame
+                    .lines()
+                    .position(|line| line.contains(needle))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        pager.click(&mut live, 3, y(&frame, "It looks fine."), area);
+        assert_eq!(draw_live(&mut pager, &mut cells, &mut live, 80, 24), frame);
+        pager.click(&mut live, 3, y(&frame, "execute_command("), area);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        assert!(frame.contains("running 3 tests"), "{frame}");
+    }
+
+    /// A graph child shows a row per node in start order, its calls
+    /// folded under it; a saved call a node holds is not shown again.
+    #[test]
+    fn a_graph_child_shows_a_row_per_node_with_its_calls() {
+        let now = Instant::now();
+        let mut live = ChildLive::default();
+        live.agent_started(
+            PLANNER.to_string(),
+            "planner".to_string(),
+            Some("planner-b2".to_string()),
+        );
+        live.node(
+            PLANNER,
+            "plan".to_string(),
+            "llm".to_string(),
+            ChildNodeState::Started,
+        );
+        for (call_id, name, said) in [
+            ("call-p1", "fs_read", "read Cargo.toml"),
+            ("call-p2", "fs_grep", "3 matches"),
+        ] {
+            live.tool_started(
+                PLANNER,
+                Some("plan".to_string()),
+                call_id.to_string(),
+                name.to_string(),
+                None,
+                now,
+            );
+            live.tool_output(PLANNER, call_id, format!("{said}\n").as_bytes());
+            live.tool_finished(PLANNER, Some("plan"), call_id, ok_end(300), now);
+        }
+        live.node(
+            PLANNER,
+            "plan".to_string(),
+            "llm".to_string(),
+            ChildNodeState::Completed {
+                duration_ms: Some(2000),
+                route: Some("build".to_string()),
+            },
+        );
+        live.node(
+            PLANNER,
+            "build".to_string(),
+            "tool".to_string(),
+            ChildNodeState::Started,
+        );
+        live.node(
+            PLANNER,
+            "build".to_string(),
+            "tool".to_string(),
+            ChildNodeState::Failed {
+                error: "exit 3".to_string(),
+            },
+        );
+        let mut pager = Pager::child(
+            "planner-b2".to_string(),
+            "planner".to_string(),
+            PathBuf::from("/nonexistent/planner-b2.yaml"),
+        );
+        deliver(
+            &mut pager,
+            "planner-b2",
+            Ok(vec![
+                ChildEntry::User("plan the release".to_string()),
+                ChildEntry::Tool {
+                    call_id: "call-p1".to_string(),
+                    name: "fs_read".to_string(),
+                    args: "{}".to_string(),
+                    output: "read Cargo.toml\n".to_string(),
+                },
+            ]),
+        );
+        let mut cells = Vec::new();
+        pager.step_focus(&live, true);
+        pager.toggle_focused(&mut live);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        insta::assert_snapshot!("pager_child_graph_80x24", &frame);
+        let plan = frame.find("node plan").expect("a plan row");
+        let build = frame.find("node build").expect("a build row");
+        assert!(plan < build, "{frame}");
+        assert!(frame.contains("read Cargo.toml"), "{frame}");
+        assert!(frame.contains("3 matches"), "{frame}");
+        assert!(frame.contains("failed: exit 3"), "{frame}");
+        assert!(
+            !frame.contains("fs_read("),
+            "a node's call shows twice: {frame}"
+        );
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 40, 12);
+        insta::assert_snapshot!("pager_child_graph_40x12", &frame);
+    }
+
+    /// Under NO_COLOR a child's tool rows keep their text and lose every
+    /// colour.
+    #[test]
+    fn a_child_thread_under_no_color_has_no_colour() {
+        let mut cells = Vec::new();
+        let mut live = reviewer_live();
+        let mut pager = reviewer_pager();
+        let mut renderer = renderer();
+        renderer.no_color = true;
+        let terminal = draw_terminal(&mut pager, &mut cells, &mut live, &mut renderer, 80, 24);
+        let frame = terminal.backend().to_string();
+        insta::assert_snapshot!("pager_child_live_no_color_80x24", &frame);
+        for cell in terminal.backend().buffer().content() {
+            assert_eq!(cell.fg, ratatui::style::Color::Reset, "{cell:?}");
+            assert_eq!(cell.bg, ratatui::style::Color::Reset, "{cell:?}");
+        }
+    }
+
     /// A re-read of a growing thread lays out the new entry only; a new
-    /// width or a forgotten layout lays out every entry again.
+    /// width or a forgotten layout lays out every entry again. A saved
+    /// call is drawn from its row's own cache, so only text counts.
     #[test]
     fn a_reread_lays_out_only_the_entries_it_added() {
         let mut cells = Vec::new();
@@ -1253,21 +1853,27 @@ mod tests {
             PathBuf::from("/nonexistent/reviewer-a1.yaml"),
         );
         let mut entries = child_entries();
+        let texts = |entries: &[ChildEntry]| {
+            entries
+                .iter()
+                .filter(|entry| recorded_row(entry).is_none())
+                .count()
+        };
         deliver(&mut pager, "reviewer-a1", Ok(entries.clone()));
         draw(&mut pager, &mut cells, 80, 24);
-        assert_eq!(pager.entry_layouts, entries.len());
+        assert_eq!(pager.entry_layouts, texts(&entries));
 
         entries.push(ChildEntry::Assistant("One more round.".to_string()));
         deliver(&mut pager, "reviewer-a1", Ok(entries.clone()));
         let frame = draw(&mut pager, &mut cells, 80, 24);
         assert!(frame.contains("One more round."), "{frame}");
-        assert_eq!(pager.entry_layouts, entries.len());
+        assert_eq!(pager.entry_layouts, texts(&entries));
 
         draw(&mut pager, &mut cells, 60, 24);
-        assert_eq!(pager.entry_layouts, 2 * entries.len());
+        assert_eq!(pager.entry_layouts, 2 * texts(&entries));
         pager.forget_layout();
         draw(&mut pager, &mut cells, 60, 24);
-        assert_eq!(pager.entry_layouts, 3 * entries.len());
+        assert_eq!(pager.entry_layouts, 3 * texts(&entries));
     }
 
     /// The picker opens on the thread on show, and the rounds a child's
@@ -1374,12 +1980,13 @@ mod tests {
         let revisions = vec![1, 2, 3];
         let mut pager = Pager::root();
         let mut renderer = renderer();
-        let first = pager.text(&mut cells, &revisions, 5, 80, &mut renderer);
-        let again = pager.text(&mut cells, &revisions, 5, 80, &mut renderer);
+        let mut live = ChildLive::default();
+        let first = pager.text(&mut cells, &revisions, 5, &mut live, 80, &mut renderer);
+        let again = pager.text(&mut cells, &revisions, 5, &mut live, 80, &mut renderer);
         assert!(Arc::ptr_eq(&first, &again));
-        let changed = pager.text(&mut cells, &revisions, 6, 80, &mut renderer);
+        let changed = pager.text(&mut cells, &revisions, 6, &mut live, 80, &mut renderer);
         assert!(!Arc::ptr_eq(&first, &changed));
-        let narrower = pager.text(&mut cells, &revisions, 6, 40, &mut renderer);
+        let narrower = pager.text(&mut cells, &revisions, 6, &mut live, 40, &mut renderer);
         assert!(!Arc::ptr_eq(&changed, &narrower));
     }
 
@@ -1468,7 +2075,14 @@ mod tests {
         let mut lay_out = |pager: &mut Pager, transcript: &mut Transcript| {
             let generation = transcript.generation();
             let (cells, revisions) = transcript.cells_for_layout();
-            pager.text(cells, revisions, generation, 80, &mut renderer)
+            pager.text(
+                cells,
+                revisions,
+                generation,
+                &mut ChildLive::default(),
+                80,
+                &mut renderer,
+            )
         };
         lay_out(&mut pager, &mut transcript);
         assert_eq!(pager.cell_layouts, 4);
@@ -1629,6 +2243,7 @@ mod tests {
                 &mut cells,
                 &revisions,
                 fresh_generation(),
+                &mut ChildLive::default(),
                 area.width,
                 &mut renderer,
             );
@@ -1674,6 +2289,7 @@ mod tests {
                 ChildEntry::User("hi".to_string()),
                 ChildEntry::Assistant("Looking.".to_string()),
                 ChildEntry::Tool {
+                    call_id: "c1".to_string(),
                     name: "fs_read".to_string(),
                     args: "{\"path\":\"a\"}".to_string(),
                     output: "body".to_string(),
@@ -1699,6 +2315,7 @@ mod tests {
             MessageContent::ToolCalls(calls),
         )];
         let tool = |name: &str| ChildEntry::Tool {
+            call_id: String::new(),
             name: name.to_string(),
             args: "{}".to_string(),
             output: format!("{name} out"),

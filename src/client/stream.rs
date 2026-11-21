@@ -723,6 +723,7 @@ mod tests {
         let origin = Origin {
             agent_id: Some("agent_x".into()),
             depth: 1,
+            node: None,
         };
         handler.set_origin(origin.clone());
         handler.thinking_started();

@@ -7,12 +7,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
-/// Where an event came from: the publishing agent (None for the root) and its
-/// nesting depth below the root.
+/// Where an event came from: the publishing agent (None for the root), its
+/// nesting depth below the root, and the graph node it runs inside, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
     pub agent_id: Option<String>,
     pub depth: usize,
+    pub node: Option<String>,
 }
 
 impl Origin {
@@ -21,6 +22,7 @@ impl Origin {
         Self {
             agent_id: None,
             depth: 0,
+            node: None,
         }
     }
 }
@@ -30,6 +32,7 @@ impl From<&RequestContext> for Origin {
         Self {
             agent_id: ctx.self_agent_id.clone(),
             depth: ctx.current_depth,
+            node: ctx.graph_node.clone(),
         }
     }
 }
@@ -96,6 +99,7 @@ pub enum Event {
         call_id: String,
         stream: OutputStream,
         bytes: Vec<u8>,
+        origin: Origin,
     },
     UsageUpdated {
         right_prompt: String,
@@ -402,22 +406,25 @@ mod tests {
             Origin::detached(),
             Origin {
                 agent_id: None,
-                depth: 0
+                depth: 0,
+                node: None
             }
         );
     }
 
     #[test]
-    fn origin_from_context_copies_agent_id_and_depth() {
+    fn origin_from_context_copies_agent_id_depth_and_node() {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.self_agent_id = Some("child".into());
         ctx.current_depth = 3;
+        ctx.graph_node = Some("plan".into());
 
         assert_eq!(
             Origin::from(&ctx),
             Origin {
                 agent_id: Some("child".to_string()),
-                depth: 3
+                depth: 3,
+                node: Some("plan".to_string())
             }
         );
     }

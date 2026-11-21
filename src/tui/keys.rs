@@ -142,6 +142,9 @@ pub(crate) struct KeyContext {
     /// The pager, the key help or the tasks pop-up; each takes every key
     /// but the terminal's own.
     pub(crate) overlay: Option<OverlayKind>,
+    /// Whether the pager shows a child's thread, whose rows open and
+    /// close as the transcript's do.
+    pub(crate) child_thread: bool,
 }
 
 impl KeyContext {
@@ -270,6 +273,11 @@ pub(crate) enum Action {
     ThreadPickerMove(i32),
     ThreadPickerChoose,
     CloseThreadPicker,
+    /// Move the focus between the foldable rows of a child's thread.
+    PagerFocusPrev,
+    PagerFocusNext,
+    /// Open or close the focused row of a child's thread.
+    PagerToggleFocused,
     /// Move the transcript view by this many lines, down when positive.
     ScrollLines(i32),
     /// Move the transcript view by this many pages, down when positive.
@@ -562,6 +570,16 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(Pager, "/", "Find"),
         row(Pager, "n / N", "Next or previous match"),
         row(Pager, "Tab", "Pick a thread"),
+        row(
+            Pager,
+            "Ctrl+Up / Ctrl+Down",
+            "Move the focus between a child thread's rows",
+        ),
+        row(
+            Pager,
+            "Enter",
+            "Open or close the focused row of a child thread; a click opens or closes any",
+        ),
         row(Pager, "Mouse wheel", "Scroll"),
         row(
             Pager,
@@ -604,7 +622,9 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         _ => {}
     }
     let modal = match ctx.layer() {
-        Layer::Overlay(OverlayKind::Pager(mode)) => return pager_key(key, code, mode),
+        Layer::Overlay(OverlayKind::Pager(mode)) => {
+            return pager_key(key, code, mode, ctx.child_thread);
+        }
         Layer::Overlay(OverlayKind::Help) => return help_key(key, code),
         Layer::Overlay(OverlayKind::Tasks) => return tasks_key(key, code),
         Layer::Modal(modal) => Some(modal),
@@ -838,9 +858,10 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
 }
 
 /// The pager's keys: less's motions over the text, a find field and
-/// the thread picker. `code` is the case-folded key; `G` and `N` are
-/// told from `g` and `n` by the key as typed or by Shift.
-fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode) -> Action {
+/// the thread picker, and over a child's thread the transcript's fold
+/// keys. `code` is the case-folded key; `G` and `N` are told from `g`
+/// and `n` by the key as typed or by Shift.
+fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let upper = key.modifiers.contains(KeyModifiers::SHIFT)
         || matches!(key.code, KeyCode::Char(c) if c.is_ascii_uppercase());
@@ -870,8 +891,11 @@ fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode) -> Action {
         PagerMode::Browse => match code {
             KeyCode::Esc => Action::ClosePager,
             KeyCode::Char('c' | 'd' | 't') if ctrl => Action::ClosePager,
+            KeyCode::Up if ctrl && child_thread => Action::PagerFocusPrev,
+            KeyCode::Down if ctrl && child_thread => Action::PagerFocusNext,
             _ if ctrl => Action::Nothing,
             KeyCode::Char('q') => Action::ClosePager,
+            KeyCode::Enter if child_thread => Action::PagerToggleFocused,
             KeyCode::Down | KeyCode::Char('j') => Action::PagerScroll(1),
             KeyCode::Up | KeyCode::Char('k') => Action::PagerScroll(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => Action::PagerPage(1),
@@ -932,6 +956,7 @@ mod tests {
         popup: None,
         vi: None,
         overlay: None,
+        child_thread: false,
     };
 
     #[test]
@@ -2135,8 +2160,25 @@ mod tests {
             overlay: Some(OverlayKind::Pager(PagerMode::Picker)),
             ..IDLE
         };
+        let child = KeyContext {
+            child_thread: true,
+            ..browse
+        };
+        let child_find = KeyContext {
+            child_thread: true,
+            ..find
+        };
+        let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
         let shift = |c: char| press(KeyCode::Char(c), KeyModifiers::SHIFT);
         let cases = [
+            (control(KeyCode::Up), child, Action::PagerFocusPrev),
+            (control(KeyCode::Down), child, Action::PagerFocusNext),
+            (plain(KeyCode::Enter), child, Action::PagerToggleFocused),
+            (plain(KeyCode::Up), child, Action::PagerScroll(-1)),
+            (control(KeyCode::Up), browse, Action::Nothing),
+            (control(KeyCode::Down), browse, Action::Nothing),
+            (plain(KeyCode::Enter), browse, Action::Nothing),
+            (plain(KeyCode::Enter), child_find, Action::PagerFindSubmit),
             (plain(KeyCode::Char('j')), browse, Action::PagerScroll(1)),
             (plain(KeyCode::Down), browse, Action::PagerScroll(1)),
             (plain(KeyCode::Char('k')), browse, Action::PagerScroll(-1)),
@@ -2310,6 +2352,10 @@ mod tests {
         overlay: Some(OverlayKind::Pager(PagerMode::Browse)),
         ..IDLE
     };
+    const CHILD_BROWSE: KeyContext = KeyContext {
+        child_thread: true,
+        ..BROWSE
+    };
     const FIND: KeyContext = KeyContext {
         overlay: Some(OverlayKind::Pager(PagerMode::Find)),
         ..IDLE
@@ -2366,7 +2412,7 @@ mod tests {
                 &[VI_NORMAL, VI_NORMAL_EMPTY, VI_NORMAL_SCROLLED],
                 [&composer[..], &[H::ViNormal]].concat(),
             ),
-            (&[BROWSE], vec![H::Anywhere, H::Pager]),
+            (&[BROWSE, CHILD_BROWSE], vec![H::Anywhere, H::Pager]),
             (&[FIND], vec![H::Anywhere, H::PagerFind]),
             (&[PICKER], vec![H::Anywhere, H::ThreadPicker]),
         ];
@@ -2986,6 +3032,23 @@ mod tests {
                 H::Pager,
                 "Tab",
                 vec![(plain(KeyCode::Tab), BROWSE, Action::OpenThreadPicker)],
+            ),
+            (
+                H::Pager,
+                "Ctrl+Up / Ctrl+Down",
+                vec![
+                    (control(KeyCode::Up), CHILD_BROWSE, Action::PagerFocusPrev),
+                    (control(KeyCode::Down), CHILD_BROWSE, Action::PagerFocusNext),
+                ],
+            ),
+            (
+                H::Pager,
+                "Enter",
+                vec![(
+                    plain(KeyCode::Enter),
+                    CHILD_BROWSE,
+                    Action::PagerToggleFocused,
+                )],
             ),
             (H::Pager, "Mouse wheel", vec![]),
             (

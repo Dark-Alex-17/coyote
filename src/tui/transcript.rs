@@ -18,7 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 /// Lines one wheel notch moves the view.
@@ -659,20 +659,7 @@ impl Transcript {
             return;
         };
         let grew = tail.full.settle();
-        if let ToolStatus::Running { since } = *status {
-            // The hook's own measurement when it has one; the UI's clock
-            // otherwise, so a failed call still shows how long it took.
-            let elapsed =
-                duration_ms.map_or_else(|| now.duration_since(since), Duration::from_millis);
-            *status = if ok {
-                ToolStatus::Ok { elapsed }
-            } else {
-                ToolStatus::Failed {
-                    elapsed,
-                    error: error.unwrap_or_default(),
-                }
-            };
-        }
+        status.finish(now, ok, error, duration_ms);
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
@@ -717,6 +704,7 @@ impl Transcript {
                         call_id,
                         name,
                         tail,
+                        status: None,
                     });
                     self.account_full_output(
                         isize::try_from(moved).unwrap_or(isize::MAX),

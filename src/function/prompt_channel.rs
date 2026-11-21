@@ -1611,6 +1611,7 @@ mod tests {
                 call_id: id,
                 stream: OutputStream::Stdout,
                 bytes: chunk,
+                ..
             } = event
                 && id == call_id
             {

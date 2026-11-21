@@ -59,6 +59,35 @@ pub(crate) enum UiMsg {
         error: Option<String>,
         duration_ms: Option<u64>,
     },
+    /// A child agent's `tool.started` hook. `node` is the graph node the
+    /// call runs inside, when the child is a graph agent.
+    ChildToolStarted {
+        agent_id: String,
+        node: Option<String>,
+        call_id: String,
+        name: String,
+        args: Option<Value>,
+    },
+    ChildToolFinished {
+        agent_id: String,
+        node: Option<String>,
+        call_id: String,
+        ok: bool,
+        error: Option<String>,
+        duration_ms: Option<u64>,
+    },
+    ChildToolOutput {
+        agent_id: String,
+        call_id: String,
+        chunk: Vec<u8>,
+    },
+    /// A graph node of a child agent started or ended.
+    ChildNode {
+        agent_id: String,
+        node_id: String,
+        node_type: String,
+        state: ChildNodeState,
+    },
     JobStarted {
         job_id: String,
         tool: String,
@@ -74,6 +103,7 @@ pub(crate) enum UiMsg {
     AgentStarted {
         agent_id: String,
         name: String,
+        session_id: Option<String>,
     },
     AgentFinished {
         agent_id: String,
@@ -127,6 +157,18 @@ pub(crate) enum AgentOutcome {
     Completed,
     Failed(String),
     Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChildNodeState {
+    Started,
+    Completed {
+        duration_ms: Option<u64>,
+        route: Option<String>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// The UI's sink: forwards every call to the UI loop's inbox. Also a bus
@@ -247,6 +289,29 @@ fn is_root(origin: &Origin) -> bool {
     origin.agent_id.is_none() && origin.depth == 0
 }
 
+fn tool_duration_ms(envs: &[(String, String)]) -> Option<u64> {
+    hook_env(envs, "COYOTE_TOOL_DURATION_MS").and_then(|ms| ms.parse().ok())
+}
+
+fn tool_args(payload: &Option<String>) -> Option<Value> {
+    payload
+        .as_deref()
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+fn child_node_state(event: HookEvent, envs: &[(String, String)]) -> ChildNodeState {
+    match event {
+        HookEvent::GraphNodeFailed => ChildNodeState::Failed {
+            error: hook_env_or_empty(envs, "COYOTE_NODE_ERROR"),
+        },
+        HookEvent::GraphNodeCompleted => ChildNodeState::Completed {
+            duration_ms: hook_env(envs, "COYOTE_NODE_DURATION_MS").and_then(|ms| ms.parse().ok()),
+            route: hook_env(envs, "COYOTE_NODE_ROUTE"),
+        },
+        _ => ChildNodeState::Started,
+    }
+}
+
 impl EventSink for TuiSink {
     fn on_event(&self, event: &Event) {
         match event {
@@ -269,11 +334,26 @@ impl EventSink for TuiSink {
                 self.send(UiMsg::ToolStarted {
                     call_id: hook_env_or_empty(envs, "COYOTE_TOOL_CALL_ID"),
                     name: hook_env_or_empty(envs, "COYOTE_TOOL_NAME"),
-                    args: payload
-                        .as_deref()
-                        .and_then(|payload| serde_json::from_str(payload).ok()),
+                    args: tool_args(payload),
                 });
             }
+            Event::Hook {
+                event: HookEvent::ToolStarted,
+                envs,
+                payload,
+                origin:
+                    Origin {
+                        agent_id: Some(agent_id),
+                        node,
+                        ..
+                    },
+            } => self.send(UiMsg::ChildToolStarted {
+                agent_id: agent_id.clone(),
+                node: node.clone(),
+                call_id: hook_env_or_empty(envs, "COYOTE_TOOL_CALL_ID"),
+                name: hook_env_or_empty(envs, "COYOTE_TOOL_NAME"),
+                args: tool_args(payload),
+            }),
             Event::Hook {
                 event: event @ (HookEvent::ToolCompleted | HookEvent::ToolFailed),
                 envs,
@@ -285,10 +365,61 @@ impl EventSink for TuiSink {
                     call_id: hook_env_or_empty(envs, "COYOTE_TOOL_CALL_ID"),
                     ok: *event == HookEvent::ToolCompleted,
                     error: hook_env(envs, "COYOTE_TOOL_ERROR"),
-                    duration_ms: hook_env(envs, "COYOTE_TOOL_DURATION_MS")
-                        .and_then(|ms| ms.parse().ok()),
+                    duration_ms: tool_duration_ms(envs),
                 });
             }
+            Event::Hook {
+                event: event @ (HookEvent::ToolCompleted | HookEvent::ToolFailed),
+                envs,
+                origin:
+                    Origin {
+                        agent_id: Some(agent_id),
+                        node,
+                        ..
+                    },
+                ..
+            } => self.send(UiMsg::ChildToolFinished {
+                agent_id: agent_id.clone(),
+                node: node.clone(),
+                call_id: hook_env_or_empty(envs, "COYOTE_TOOL_CALL_ID"),
+                ok: *event == HookEvent::ToolCompleted,
+                error: hook_env(envs, "COYOTE_TOOL_ERROR"),
+                duration_ms: tool_duration_ms(envs),
+            }),
+            // The root's own output reaches the transcript through
+            // `tool_output`; only a child's is taken from the bus.
+            Event::ToolOutputChunk {
+                call_id,
+                bytes,
+                origin:
+                    Origin {
+                        agent_id: Some(agent_id),
+                        ..
+                    },
+                ..
+            } => self.send(UiMsg::ChildToolOutput {
+                agent_id: agent_id.clone(),
+                call_id: call_id.clone(),
+                chunk: bytes.clone(),
+            }),
+            Event::Hook {
+                event:
+                    event @ (HookEvent::GraphNodeStarted
+                    | HookEvent::GraphNodeCompleted
+                    | HookEvent::GraphNodeFailed),
+                envs,
+                origin:
+                    Origin {
+                        agent_id: Some(agent_id),
+                        ..
+                    },
+                ..
+            } => self.send(UiMsg::ChildNode {
+                agent_id: agent_id.clone(),
+                node_id: hook_env_or_empty(envs, "COYOTE_NODE_ID"),
+                node_type: hook_env_or_empty(envs, "COYOTE_NODE_TYPE"),
+                state: child_node_state(*event, envs),
+            }),
             Event::Hook {
                 event: HookEvent::JobStarted,
                 envs,
@@ -322,6 +453,7 @@ impl EventSink for TuiSink {
             } if origin.depth == 1 => self.send(UiMsg::AgentStarted {
                 agent_id: hook_env_or_empty(envs, "COYOTE_AGENT_ID"),
                 name: hook_env_or_empty(envs, "COYOTE_AGENT_NAME"),
+                session_id: hook_env(envs, "COYOTE_AGENT_SESSION_ID"),
             }),
             Event::Hook {
                 event:
@@ -506,16 +638,164 @@ mod tests {
         ));
         assert_eq!(msgs.len(), 4);
 
-        // A child's tool hooks stay off the root transcript.
+        // A child's tool hooks stay off the root transcript and the
+        // status row; they reach the child's own thread instead.
         sink.on_event(&hook(
             HookEvent::ToolStarted,
             &[("COYOTE_TOOL_NAME", "fs_read")],
             Origin {
                 agent_id: Some("agent_1".to_string()),
                 depth: 1,
+                node: None,
             },
         ));
+        let msgs = drain(&mut rx);
+        assert!(
+            matches!(&msgs[..], [UiMsg::ChildToolStarted { .. }]),
+            "{msgs:?}"
+        );
+    }
+
+    fn graph_child(node: Option<&str>) -> Origin {
+        Origin {
+            agent_id: Some("agent_graph_9f8e".to_string()),
+            depth: 1,
+            node: node.map(str::to_string),
+        }
+    }
+
+    /// A child's tool hooks become the child's own start and end, naming
+    /// the agent and the graph node, and never touch the status row.
+    #[test]
+    fn child_tool_hooks_become_child_tool_messages() {
+        let (sink, mut rx) = sink();
+        sink.on_event(&Event::Hook {
+            event: HookEvent::ToolStarted,
+            envs: envs(&[
+                ("COYOTE_TOOL_NAME", "fs_read"),
+                ("COYOTE_TOOL_CALL_ID", "call-c1"),
+            ]),
+            payload: Some(r#"{"path":"a.rs"}"#.to_string()),
+            origin: graph_child(Some("plan")),
+        });
+        sink.on_event(&hook(
+            HookEvent::ToolFailed,
+            &[
+                ("COYOTE_TOOL_CALL_ID", "call-c1"),
+                ("COYOTE_TOOL_ERROR", "missing"),
+                ("COYOTE_TOOL_DURATION_MS", "40"),
+            ],
+            graph_child(Some("plan")),
+        ));
+        sink.on_event(&hook(
+            HookEvent::ToolCompleted,
+            &[("COYOTE_TOOL_CALL_ID", "call-c2")],
+            graph_child(None),
+        ));
+        let msgs = drain(&mut rx);
+        assert!(
+            !msgs.iter().any(|msg| matches!(msg, UiMsg::ToolRunning(_))),
+            "{msgs:?}"
+        );
+        assert!(matches!(
+            &msgs[0],
+            UiMsg::ChildToolStarted { agent_id, node: Some(node), call_id, name, args: Some(args) }
+                if agent_id == "agent_graph_9f8e" && node == "plan" && call_id == "call-c1"
+                    && name == "fs_read" && args["path"] == "a.rs"
+        ));
+        assert!(matches!(
+            &msgs[1],
+            UiMsg::ChildToolFinished {
+                agent_id, node: Some(node), call_id, ok: false, error: Some(error), duration_ms: Some(40)
+            } if agent_id == "agent_graph_9f8e" && node == "plan" && call_id == "call-c1" && error == "missing"
+        ));
+        assert!(matches!(
+            &msgs[2],
+            UiMsg::ChildToolFinished { node: None, call_id, ok: true, error: None, .. }
+                if call_id == "call-c2"
+        ));
+        assert_eq!(msgs.len(), 3);
+    }
+
+    /// A child's graph node hooks carry its state; the root's own graph
+    /// nodes have no child thread to go to.
+    #[test]
+    fn child_node_hooks_become_child_node_messages() {
+        let (sink, mut rx) = sink();
+        sink.on_event(&hook(
+            HookEvent::GraphNodeStarted,
+            &[("COYOTE_NODE_ID", "plan"), ("COYOTE_NODE_TYPE", "llm")],
+            graph_child(Some("plan")),
+        ));
+        sink.on_event(&hook(
+            HookEvent::GraphNodeCompleted,
+            &[
+                ("COYOTE_NODE_ID", "plan"),
+                ("COYOTE_NODE_TYPE", "llm"),
+                ("COYOTE_NODE_DURATION_MS", "1500"),
+                ("COYOTE_NODE_ROUTE", "build"),
+            ],
+            graph_child(Some("plan")),
+        ));
+        sink.on_event(&hook(
+            HookEvent::GraphNodeFailed,
+            &[
+                ("COYOTE_NODE_ID", "build"),
+                ("COYOTE_NODE_TYPE", "script"),
+                ("COYOTE_NODE_ERROR", "exit 3"),
+            ],
+            graph_child(Some("build")),
+        ));
+        sink.on_event(&hook(
+            HookEvent::GraphNodeStarted,
+            &[("COYOTE_NODE_ID", "root-node"), ("COYOTE_NODE_TYPE", "llm")],
+            Origin {
+                node: Some("root-node".to_string()),
+                ..Origin::detached()
+            },
+        ));
+        let msgs = drain(&mut rx);
+        assert!(matches!(
+            &msgs[0],
+            UiMsg::ChildNode { agent_id, node_id, node_type, state: ChildNodeState::Started }
+                if agent_id == "agent_graph_9f8e" && node_id == "plan" && node_type == "llm"
+        ));
+        assert!(matches!(
+            &msgs[1],
+            UiMsg::ChildNode {
+                node_id,
+                state: ChildNodeState::Completed { duration_ms: Some(1500), route: Some(route) },
+                ..
+            } if node_id == "plan" && route == "build"
+        ));
+        assert!(matches!(
+            &msgs[2],
+            UiMsg::ChildNode { node_id, state: ChildNodeState::Failed { error }, .. }
+                if node_id == "build" && error == "exit 3"
+        ));
+        assert_eq!(msgs.len(), 3);
+    }
+
+    /// A child's tool output reaches its thread from the bus; the root's
+    /// arrives through `tool_output` alone, so the bus copy is dropped.
+    #[test]
+    fn only_a_childs_output_chunk_is_forwarded_from_the_bus() {
+        let (sink, mut rx) = sink();
+        let chunk = |origin: Origin| Event::ToolOutputChunk {
+            call_id: "call-o1".to_string(),
+            stream: OutputStream::Stdout,
+            bytes: b"line\n".to_vec(),
+            origin,
+        };
+        sink.on_event(&chunk(Origin::detached()));
         assert!(drain(&mut rx).is_empty());
+        sink.on_event(&chunk(graph_child(Some("plan"))));
+        let msgs = drain(&mut rx);
+        assert!(matches!(
+            &msgs[..],
+            [UiMsg::ChildToolOutput { agent_id, call_id, chunk }]
+                if agent_id == "agent_graph_9f8e" && call_id == "call-o1" && chunk == b"line\n"
+        ));
     }
 
     /// A job starts under the root but ends from its own task with a
@@ -537,6 +817,7 @@ mod tests {
             Origin {
                 agent_id: Some("agent_1".to_string()),
                 depth: 1,
+                node: None,
             },
         ));
         sink.on_event(&hook(
@@ -582,10 +863,12 @@ mod tests {
         let child = |depth: usize| Origin {
             agent_id: Some("agent_coder_1a2b".to_string()),
             depth,
+            node: None,
         };
         let started = &[
             ("COYOTE_AGENT_ID", "agent_coder_1a2b"),
             ("COYOTE_AGENT_NAME", "coder"),
+            ("COYOTE_AGENT_SESSION_ID", "sess_coder_1a2b"),
         ];
         sink.on_event(&hook(HookEvent::AgentStarted, started, child(2)));
         sink.on_event(&hook(HookEvent::AgentStarted, started, Origin::detached()));
@@ -612,7 +895,8 @@ mod tests {
         let msgs = drain(&mut rx);
         assert!(matches!(
             &msgs[0],
-            UiMsg::AgentStarted { agent_id, name } if agent_id == "agent_coder_1a2b" && name == "coder"
+            UiMsg::AgentStarted { agent_id, name, session_id: Some(session_id) }
+                if agent_id == "agent_coder_1a2b" && name == "coder" && session_id == "sess_coder_1a2b"
         ));
         assert!(matches!(
             &msgs[1],

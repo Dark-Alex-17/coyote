@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: planner (ro) planner-b2  1-10/10"
+"Read-only. Tool calls show live; replies"
+"show up at the child's next checkpoint. "
+"                                        "
+"> plan the release                      "
+"                                        "
+"▾ node pla...  completed in 2.0s, route "
+"  read Cargo.toml                       "
+"  3 matches                             "
+"                                        "
+"▸ node build tool  failed: exit 3       "
+"q close  Tab threads  / find  n/N  j/k  "

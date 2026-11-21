@@ -14,6 +14,7 @@
 
 mod bottom_pane;
 mod cells;
+mod child_live;
 mod composer;
 mod control;
 mod dump;
@@ -49,6 +50,7 @@ use bottom_pane::{
     View,
 };
 use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow};
+use child_live::{ChildLive, ChildThread, ToolEnd};
 use composer::Composer;
 use control::{ControlRequest, cancel_report, is_plain_session_id};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
@@ -76,7 +78,7 @@ use rewind::opens_exchange;
 use roster::{RosterPopup, RosterRow, RosterSources, RosterState};
 pub use run_loop::{ensure_tty, run};
 use sink::{AgentOutcome, LendJob, UiMsg};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -409,6 +411,8 @@ pub(crate) struct App {
     /// The generation of the newest child read asked for.
     child_reads: u64,
     roster_sources: RosterSources,
+    /// Each spawned child's tool calls and graph nodes as they happen.
+    child_live: ChildLive,
     /// A fork of the context as it last came back idle, for what the
     /// roster and the pager do while a turn has the context: cancelling
     /// a task, replying to an agent's question and reading a child's
@@ -499,6 +503,7 @@ impl App {
             prompt_memory,
             overlay: None,
             roster_sources: RosterSources::default(),
+            child_live: ChildLive::default(),
             control: None,
             child_root: None,
             control_requests: Vec::new(),
@@ -552,6 +557,7 @@ impl App {
                     self.theme = Theme::new(renderer.markdown_render(), renderer.no_color);
                     self.renderer = renderer;
                     self.transcript.forget_layout();
+                    self.child_live.forget_layout();
                     for prompt in &mut self.prompts {
                         prompt.forget_question_layout();
                     }
@@ -657,6 +663,7 @@ impl App {
             popup: self.popup(),
             vi: self.vi_mode,
             overlay: self.overlay.as_ref().map(Overlay::kind),
+            child_thread: self.pager().is_some_and(|pager| !pager.shows_root()),
         }
     }
 
@@ -1006,6 +1013,15 @@ impl App {
             }
             TermInput::Mouse(mouse) => {
                 match self.layer() {
+                    Layer::Overlay(OverlayKind::Pager(PagerMode::Browse))
+                        if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                    {
+                        if let (Some(Overlay::Pager(pager)), Some(area)) =
+                            (self.overlay.as_mut(), self.frame_area)
+                        {
+                            pager.click(&mut self.child_live, mouse.column, mouse.row, area);
+                        }
+                    }
                     Layer::Overlay(_) => {
                         let delta = match mouse.kind {
                             MouseEventKind::ScrollUp => -WHEEL_LINES,
@@ -1334,6 +1350,24 @@ impl App {
             Action::PagerFindCancel => self.with_pager(Pager::cancel_find),
             Action::ThreadPickerMove(delta) => self.with_pager(|pager| pager.move_picker(delta)),
             Action::CloseThreadPicker => self.with_pager(Pager::close_picker),
+            Action::PagerFocusPrev => {
+                if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
+                    pager.step_focus(&self.child_live, false);
+                }
+                None
+            }
+            Action::PagerFocusNext => {
+                if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
+                    pager.step_focus(&self.child_live, true);
+                }
+                None
+            }
+            Action::PagerToggleFocused => {
+                if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
+                    pager.toggle_focused(&mut self.child_live);
+                }
+                None
+            }
             Action::ScrollLines(delta) => {
                 self.transcript.scroll_lines(delta);
                 None
@@ -1374,6 +1408,43 @@ impl App {
             f(pager);
         }
         None
+    }
+
+    /// Forgets the live thread of every finished child the roster no
+    /// longer lists, so collected children free what they held.
+    fn prune_child_threads(&mut self) {
+        let listed: HashSet<String> = self
+            .roster_sources
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                RosterRow::Task(task) => Some(task.id),
+                RosterRow::Escalation(_) => None,
+            })
+            .collect();
+        self.child_live.retain_listed(|id| listed.contains(id));
+    }
+
+    /// The live rows of child `agent_id` changed: its thread, if on show,
+    /// is laid out again at the next frame.
+    fn child_rows_changed(&mut self, agent_id: &str) {
+        let Some(Overlay::Pager(pager)) = self.overlay.as_mut() else {
+            return;
+        };
+        if pager
+            .child_session()
+            .is_some_and(|session_id| self.child_live.session_is_of(session_id, agent_id))
+        {
+            pager.child_rows_changed();
+        }
+    }
+
+    /// Whether the pager shows a child with a call or node still running.
+    fn open_child_runs(&self) -> bool {
+        self.pager()
+            .and_then(Pager::child_session)
+            .and_then(|session_id| self.child_live.by_session(session_id))
+            .is_some_and(ChildThread::running)
     }
 
     /// Closes the pager and frees the lines it laid out; a pager opened
@@ -1471,6 +1542,53 @@ impl App {
                 );
                 self.dismiss_prompts(|prompt| prompt.asked_by_call(&call_id));
             }
+            UiMsg::ChildToolStarted {
+                agent_id,
+                node,
+                call_id,
+                name,
+                args,
+            } => {
+                let now = self.clock.now();
+                self.child_live
+                    .tool_started(&agent_id, node, call_id, name, args, now);
+                self.child_rows_changed(&agent_id);
+            }
+            UiMsg::ChildToolFinished {
+                agent_id,
+                node,
+                call_id,
+                ok,
+                error,
+                duration_ms,
+            } => {
+                let now = self.clock.now();
+                let end = ToolEnd {
+                    ok,
+                    error,
+                    duration_ms,
+                };
+                self.child_live
+                    .tool_finished(&agent_id, node.as_deref(), &call_id, end, now);
+                self.child_rows_changed(&agent_id);
+            }
+            UiMsg::ChildToolOutput {
+                agent_id,
+                call_id,
+                chunk,
+            } => {
+                self.child_live.tool_output(&agent_id, &call_id, &chunk);
+                self.child_rows_changed(&agent_id);
+            }
+            UiMsg::ChildNode {
+                agent_id,
+                node_id,
+                node_type,
+                state,
+            } => {
+                self.child_live.node(&agent_id, node_id, node_type, state);
+                self.child_rows_changed(&agent_id);
+            }
             UiMsg::JobStarted { job_id, tool } => self.transcript.start_row(
                 self.turn_first_cell(),
                 Cell::Job {
@@ -1497,16 +1615,26 @@ impl App {
                     .set_job_status(&job_id, JobStatus::Cancelled);
                 self.dismiss_prompts(|prompt| prompt.asked_by_job(&job_id));
             }
-            UiMsg::AgentStarted { agent_id, name } => self.transcript.start_row(
-                self.turn_first_cell(),
-                Cell::Agent {
-                    agent_id,
-                    name,
-                    row: TaskRow::new(AgentStatus::Running),
-                    cache: LineCache::default(),
-                },
-                "agent__spawn",
-            ),
+            UiMsg::AgentStarted {
+                agent_id,
+                name,
+                session_id,
+            } => {
+                self.prune_child_threads();
+                self.child_live
+                    .agent_started(agent_id.clone(), name.clone(), session_id);
+                self.child_rows_changed(&agent_id);
+                self.transcript.start_row(
+                    self.turn_first_cell(),
+                    Cell::Agent {
+                        agent_id,
+                        name,
+                        row: TaskRow::new(AgentStatus::Running),
+                        cache: LineCache::default(),
+                    },
+                    "agent__spawn",
+                );
+            }
             UiMsg::AgentFinished { agent_id, outcome } => {
                 let status = match outcome {
                     AgentOutcome::Completed => AgentStatus::Completed,
@@ -1514,6 +1642,11 @@ impl App {
                     AgentOutcome::Interrupted => AgentStatus::Interrupted,
                 };
                 self.transcript.set_agent_status(&agent_id, status);
+                self.child_live.agent_finished(&agent_id);
+                // Before the prune, which may forget the child and the
+                // session that leads to it.
+                self.child_rows_changed(&agent_id);
+                self.prune_child_threads();
                 self.dismiss_prompts(|prompt| prompt.asked_by_agent(&agent_id));
             }
             UiMsg::TodoUpdated(items) => self.todo.set_items(items),
@@ -1698,7 +1831,14 @@ impl App {
         if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
             let generation = self.transcript.generation();
             let (cells, revisions) = self.transcript.cells_for_layout();
-            let text = pager.text(cells, revisions, generation, area.width, &mut self.renderer);
+            let text = pager.text(
+                cells,
+                revisions,
+                generation,
+                &mut self.child_live,
+                area.width,
+                &mut self.renderer,
+            );
             pager.settle(&text, Pager::text_rows(area.height));
             frame.render_widget(PagerView { pager, text: &text }, area);
             return;
@@ -1831,15 +1971,17 @@ impl App {
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
     /// that was just drawn, and so does an open tasks pop-up for its next
-    /// read. The footer counts tick too while any task runs, unless the
-    /// pager covers them: an agent reports finished before its join
-    /// handle does, and nested spawns send no message. Nothing can spawn
-    /// while the counts are zero and no turn runs, so idle stops there.
+    /// read, and a child's thread on show while a row of it runs. The
+    /// footer counts tick too while any task runs, unless the pager
+    /// covers them: an agent reports finished before its join handle
+    /// does, and nested spawns send no message. Nothing can spawn while
+    /// the counts are zero and no turn runs, so idle stops there.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
         if self.turn.is_some()
             || matches!(self.overlay, Some(Overlay::Tasks(_)))
             || (self.pager().is_none() && self.roster_sources.running_counts() != (0, 0))
+            || self.open_child_runs()
         {
             self.frames.schedule_frame_in(STATUS_TICK);
         }

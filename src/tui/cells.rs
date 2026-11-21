@@ -310,9 +310,46 @@ pub(super) fn any_full_output_laid_out(cells: &mut [Cell]) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ToolStatus {
-    Running { since: Instant },
-    Ok { elapsed: Duration },
-    Failed { elapsed: Duration, error: String },
+    Running {
+        since: Instant,
+    },
+    Ok {
+        elapsed: Duration,
+    },
+    Failed {
+        elapsed: Duration,
+        error: String,
+    },
+    /// A call a saved session holds, which says neither how long it took
+    /// nor whether the tool reported a failure.
+    Recorded,
+}
+
+impl ToolStatus {
+    /// Settles a running call as its finish hook reports it; a call
+    /// already settled keeps its state.
+    pub(super) fn finish(
+        &mut self,
+        now: Instant,
+        ok: bool,
+        error: Option<String>,
+        duration_ms: Option<u64>,
+    ) {
+        let ToolStatus::Running { since } = *self else {
+            return;
+        };
+        // The hook's own measurement when it has one; the UI's clock
+        // otherwise, so a failed call still shows how long it took.
+        let elapsed = duration_ms.map_or_else(|| now.duration_since(since), Duration::from_millis);
+        *self = if ok {
+            ToolStatus::Ok { elapsed }
+        } else {
+            ToolStatus::Failed {
+                elapsed,
+                error: error.unwrap_or_default(),
+            }
+        };
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,14 +368,28 @@ pub(super) enum AgentStatus {
     Interrupted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NodeStatus {
+    Running,
+    Completed {
+        elapsed: Option<Duration>,
+        route: Option<String>,
+    },
+    Failed(String),
+}
+
 /// A `job__*` or `agent__*` call folded into the row of the job or agent
 /// it addresses, so checking on a job three times is three words on one
-/// line rather than three cells.
+/// line rather than three cells; or a child's tool call folded into the
+/// row of the graph node it ran inside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FoldedCall {
     pub(super) call_id: String,
     pub(super) name: String,
     pub(super) tail: OutputTail,
+    /// Only a call folded into a node row has one; a job or agent row
+    /// tracks no state per call.
+    pub(super) status: Option<ToolStatus>,
 }
 
 impl FoldedCall {
@@ -347,6 +398,14 @@ impl FoldedCall {
             call_id,
             name,
             tail: OutputTail::default(),
+            status: None,
+        }
+    }
+
+    pub(super) fn running(call_id: String, name: String, since: Instant) -> Self {
+        Self {
+            status: Some(ToolStatus::Running { since }),
+            ..Self::new(call_id, name)
         }
     }
 }
@@ -484,6 +543,14 @@ pub(super) enum Cell {
         agent_id: String,
         name: String,
         row: TaskRow<AgentStatus>,
+        cache: LineCache,
+    },
+    /// A graph node a child agent ran, with the tool calls it made folded
+    /// under it.
+    Node {
+        node_id: String,
+        node_type: String,
+        row: TaskRow<NodeStatus>,
         cache: LineCache,
     },
     /// The boxed greeting an empty transcript shows until a line is
@@ -637,6 +704,17 @@ impl Cell {
         }
     }
 
+    /// A call read back from a saved session: a finished tool row, folded,
+    /// with the tail of what the call returned as its output.
+    pub(super) fn recorded_tool(call_id: String, summary: String, output: &str) -> Self {
+        let mut cell = Self::tool(call_id, summary, Instant::now());
+        if let Cell::Tool { status, tail, .. } = &mut cell {
+            *status = ToolStatus::Recorded;
+            append_output(tail, output.as_bytes());
+        }
+        cell
+    }
+
     pub(super) fn welcome(model: String, prefix: CommandPrefix) -> Self {
         Self::Welcome {
             model,
@@ -645,11 +723,20 @@ impl Cell {
         }
     }
 
+    pub(super) fn node(node_id: String, node_type: String) -> Self {
+        Self::Node {
+            node_id,
+            node_type,
+            row: TaskRow::new(NodeStatus::Running),
+            cache: LineCache::default(),
+        }
+    }
+
     /// Whether the row can be opened and closed, and so take the focus.
     pub(super) fn collapsible(&self) -> bool {
         match self {
             Cell::Tool { bookkeeping, .. } => !bookkeeping,
-            Cell::Job { .. } | Cell::Agent { .. } => true,
+            Cell::Job { .. } | Cell::Agent { .. } | Cell::Node { .. } => true,
             _ => false,
         }
     }
@@ -668,6 +755,11 @@ impl Cell {
                 ..
             }
             | Cell::Agent {
+                row: TaskRow { expanded, .. },
+                cache,
+                ..
+            }
+            | Cell::Node {
                 row: TaskRow { expanded, .. },
                 cache,
                 ..
@@ -696,7 +788,7 @@ impl Cell {
     }
 
     /// Where the output of call `call_id` goes: this tool row's own tail,
-    /// or that of the call folded into this job or agent row.
+    /// or that of the call folded into this job, agent or node row.
     pub(super) fn output_for(&mut self, call_id: &str) -> Option<&mut OutputTail> {
         match self {
             Cell::Tool {
@@ -707,6 +799,10 @@ impl Cell {
                 ..
             }
             | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Node {
                 row: TaskRow { calls, .. },
                 ..
             } => calls
@@ -729,6 +825,10 @@ impl Cell {
             | Cell::Agent {
                 row: TaskRow { calls, .. },
                 ..
+            }
+            | Cell::Node {
+                row: TaskRow { calls, .. },
+                ..
             } => calls.iter().any(|call| call.call_id == call_id),
             _ => false,
         }
@@ -744,13 +844,17 @@ impl Cell {
             | Cell::Agent {
                 row: TaskRow { expanded, .. },
                 ..
+            }
+            | Cell::Node {
+                row: TaskRow { expanded, .. },
+                ..
             } => *expanded,
             _ => false,
         }
     }
 
-    /// The whole output of a tool, job or agent row as Alt+C copies it;
-    /// None for every other cell.
+    /// The whole output of a tool, job, agent or node row as Alt+C copies
+    /// it; None for every other cell.
     pub(super) fn copied_output(&self) -> Option<CopiedOutput> {
         match self {
             Cell::Tool { name, tail, .. } => Some(CopiedOutput {
@@ -760,6 +864,9 @@ impl Cell {
             }),
             Cell::Job { tool, row, .. } => Some(row_output(format!("job {tool}"), &row.calls)),
             Cell::Agent { name, row, .. } => Some(row_output(format!("agent {name}"), &row.calls)),
+            Cell::Node { node_id, row, .. } => {
+                Some(row_output(format!("node {node_id}"), &row.calls))
+            }
             _ => None,
         }
     }
@@ -773,6 +880,10 @@ impl Cell {
                 ..
             }
             | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Node {
                 row: TaskRow { calls, .. },
                 ..
             } => calls.iter_mut().map(|call| &mut call.tail.full).collect(),
@@ -789,6 +900,10 @@ impl Cell {
                 ..
             }
             | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Node {
                 row: TaskRow { calls, .. },
                 ..
             } => calls.iter().map(|call| call.tail.full.text.len()).sum(),
@@ -829,7 +944,8 @@ impl Cell {
         | Cell::Text { cache, .. }
         | Cell::Tool { cache, .. }
         | Cell::Job { cache, .. }
-        | Cell::Agent { cache, .. } = self
+        | Cell::Agent { cache, .. }
+        | Cell::Node { cache, .. } = self
         {
             *cache = LineCache::default();
         }
@@ -990,6 +1106,21 @@ impl Cell {
                 };
                 row_lines(header, row, width, &styles)
             }),
+            Cell::Node {
+                node_id,
+                node_type,
+                row,
+                cache,
+            } => cache.get(width, || {
+                let styles = ToolHeaderStyles::new(renderer.markdown_render(), no_color);
+                let header = RowHeader {
+                    kind: "node",
+                    name: node_id,
+                    id: node_type,
+                    state: node_state(&row.status),
+                };
+                row_lines(header, row, width, &styles)
+            }),
             Cell::Welcome {
                 model,
                 prefix,
@@ -1031,6 +1162,9 @@ impl Cell {
             Cell::Agent { row, .. } => {
                 full_row_lines(&header, agent_state(&row.status).1, &mut row.calls, width)
             }
+            Cell::Node { row, .. } => {
+                full_row_lines(&header, node_state(&row.status).1, &mut row.calls, width)
+            }
             _ => render::plain_lines(&header, width, DIM),
         }
     }
@@ -1057,6 +1191,15 @@ impl Cell {
                 format!("agent {name} {agent_id}  {}", agent_state(&row.status).0),
                 &row.calls,
             ),
+            Cell::Node {
+                node_id,
+                node_type,
+                row,
+                ..
+            } => with_folded(
+                format!("node {node_id} {node_type}  {}", node_state(&row.status).0),
+                &row.calls,
+            ),
             _ => return None,
         };
         Some(render::plain_text(&line))
@@ -1070,6 +1213,7 @@ fn tool_state(status: &ToolStatus) -> String {
         ToolStatus::Failed { elapsed, error } => {
             format!("{}  failed: {}", elapsed_text(*elapsed), first_line(error))
         }
+        ToolStatus::Recorded => "ok".to_string(),
     }
 }
 
@@ -1090,6 +1234,24 @@ fn agent_state(status: &AgentStatus) -> (String, Option<&str>) {
         AgentStatus::Completed => ("completed".to_string(), None),
         AgentStatus::Failed(error) => (format!("failed: {}", first_line(error)), Some(error)),
         AgentStatus::Interrupted => ("interrupted".to_string(), None),
+    }
+}
+
+/// The state word of a node row and the whole error of a failed one.
+fn node_state(status: &NodeStatus) -> (String, Option<&str>) {
+    match status {
+        NodeStatus::Running => ("running".to_string(), None),
+        NodeStatus::Completed { elapsed, route } => {
+            let mut state = "completed".to_string();
+            if let Some(elapsed) = elapsed {
+                state.push_str(&format!(" in {}", elapsed_text(*elapsed)));
+            }
+            if let Some(route) = route {
+                state.push_str(&format!(", route {route}"));
+            }
+            (state, None)
+        }
+        NodeStatus::Failed(error) => (format!("failed: {}", first_line(error)), Some(error)),
     }
 }
 

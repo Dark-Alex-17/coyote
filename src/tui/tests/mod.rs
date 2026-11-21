@@ -1,3 +1,4 @@
+mod child_live;
 mod control;
 mod lend;
 mod modal;
@@ -1454,10 +1455,16 @@ fn only_root_tool_hooks_drive_the_status_row() {
     sink.on_event(&hook(Origin {
         agent_id: Some("agent_1".to_string()),
         depth: 1,
+        node: None,
     }));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(UiMsg::ChildToolStarted { agent_id, .. }) if agent_id == "agent_1"
+    ));
     sink.on_event(&hook(Origin {
         agent_id: None,
         depth: 1,
+        node: None,
     }));
     assert!(rx.try_recv().is_err());
     sink.on_event(&hook(Origin::detached()));
@@ -1512,6 +1519,7 @@ fn a_child_agents_thinking_never_drives_the_status_row() {
     let child = Origin {
         agent_id: Some("agent_c".into()),
         depth: 1,
+        node: None,
     };
     sink.on_event(&Event::ThinkingStarted {
         origin: child.clone(),
@@ -2298,6 +2306,7 @@ fn an_agent_takes_its_spawn_calls_row_and_folds_the_collect_in() {
     harness.app.handle_msg(UiMsg::AgentStarted {
         agent_id: "agent_coder_1a2b3c4d".to_string(),
         name: "coder".to_string(),
+        session_id: None,
     });
     finish_tool(&mut harness, "call-1", true, None);
     narrate(
@@ -2576,6 +2585,7 @@ fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
     harness.app.handle_msg(UiMsg::AgentStarted {
         agent_id: "agent_coder_1a2b3c4d".to_string(),
         name: "coder".to_string(),
+        session_id: None,
     });
     harness.app.handle_msg(UiMsg::JobFinished {
         job_id: "job_other".to_string(),
