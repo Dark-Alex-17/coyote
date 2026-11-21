@@ -1097,7 +1097,7 @@ def _cap_continues(state, cap):
 
 def _continue_recommended(continues):
     """Going on past a cap is the recommended option until it has been taken STRIKE_LIMIT times; after that no option
-    is, so the owner or the reply interpreter weighs the evidence and a run with no owner cannot loop forever."""
+    is, so the owner or the headless judge weighs the evidence and a run with no owner cannot loop forever."""
     return continues < STRIKE_LIMIT
 
 
@@ -1170,7 +1170,9 @@ def promote_verify(state):
             u["plan_path"] = promoted
             tasks = load_tasks({**state, "plan_path": promoted})
     advisory = ""
-    if rows and len(tasks) < len(rows):
+    if not tasks and (rows or text):
+        defects.append(f"promotion left no task dirs for the plan; the breakdown table lists {len(rows)} tasks")
+    elif rows and len(tasks) < len(rows):
         advisory = (f"the breakdown table lists {len(rows)} tasks but {len(tasks)} task dirs belong to the plan; add the missing "
                     "task or say in your report why the counts differ")
     if is_micro(state):
@@ -1185,18 +1187,18 @@ def promote_verify(state):
         if as_int(state.get("promote_retries")) < RERUN_ONCE:
             u["promote_retries"] = as_int(state.get("promote_retries")) + 1
             u["promote_defects"] = "\n".join(f"- {d}" for d in defects + ([f"Check: {advisory}"] if advisory else []))
-            ledger(state, u, f"promote: defects -> one retry: {(defects + [advisory])[:3] if advisory else defects[:3]}")
+            ledger(state, u, f"promote: defects -> one retry: {defects + ([advisory] if advisory else [])}")
             u["_next"] = "promote_tasks"
             return u
-    if advisory:
-        line = f"promote: breakdown lists {len(rows)} rows, {len(tasks)} task dirs after the retry; proceeding (advisory)"
-        ledger(state, u, line)
-        harvest_anomalies({**state, **u, "anomalies": [line]}, u, "promote_verify")
     if defects:
         return raise_escalation(state, u, escalation(
             "promote_failed", "Promotion left mechanical defects after a retry. Abort, or continue with the tasks as they are?",
             [option("Abort the run", recommended=True), option("Continue with the tasks as promoted")],
             evidence="\n".join(defects + ([advisory] if advisory else [])), hard_trigger=True))
+    if advisory:
+        line = f"promote: breakdown lists {len(rows)} rows, {len(tasks)} task dirs after the retry; proceeding (advisory)"
+        ledger(state, u, line)
+        harvest_anomalies({**state, **u, "anomalies": [line]}, u, "promote_verify")
     ok, out = commit_planning(state if "plan_path" not in u else {**state, **u},
                               f"plan({state.get('plan_slug')}): promote intake packet - {len(tasks)} task(s)")
     if not ok:
@@ -2389,19 +2391,30 @@ def fix_done(state):
 VERIFICATION_COMMAND_RE = re.compile(r"(?im)^[^\S\n]*(?:[-*+]\s+)?(?:[\w-]+:\s+)?verification-command:\s*(.+)$")
 
 
+def _parse_verification_line(text):
+    """(command, reason) of `<command> -- <reason>`. A command may carry its own ` -- `, so a leading backticked span
+    is the command; without backticks the reason starts after the last ` -- `."""
+    text = (text or "").strip()
+    m = re.match(r"`([^`]*)`\s*(.*)$", text)
+    if m:
+        rest = m.group(2).strip()
+        return m.group(1).strip(), (rest[2:] if rest.startswith("--") else rest).strip()
+    command, sep, reason = text.rpartition(" -- ")
+    return (command.strip(), reason.strip()) if sep else (text, "")
+
+
 def _harvest_verification_proposal(state, u, tid):
     """Record the round report's last `verification-command:` line as a proposal to run another command in place of
     the verification command that failed."""
-    found = VERIFICATION_COMMAND_RE.findall(_prior_report(state, tid)[0])
+    failed = state.get("fix_failed_command") or ""
+    found = VERIFICATION_COMMAND_RE.findall(_prior_report(state, tid)[0]) if failed else []
     if not found:
         return
-    failed = state.get("fix_failed_command") or ""
-    replacement, _, reason = found[-1].partition(" -- ")
-    replacement, reason = replacement.strip().strip("`").strip(), reason.strip()
+    replacement, reason = _parse_verification_line(found[-1])
     if not replacement or replacement == failed:
         return
     u["verification_proposal"] = {"command": failed, "replacement": replacement, "reason": reason, "task": tid}
-    ledger(state, u, f"verification: {tid}'s fix round proposes `{replacement}` in place of `{failed or '(no failed command)'}`: "
+    ledger(state, u, f"verification: {tid}'s fix round proposes `{replacement}` in place of `{failed}`: "
                      f"{trim_items(reason, 300) or 'no reason given'}")
 
 
@@ -2923,9 +2936,9 @@ def _failed_command_items(failed, code):
     ran = f"exited {failed['exit']}" if failed.get("exit") is not None else "did not run before the verification time limit"
     return [f"The integration gate ran the declared verification command `{cmd}` in {code} and it {ran}; its output is in the note. "
             "If the failure is in the code, fix the code. If the command itself cannot run here as declared and the project "
-            "documents another way to run the same check, change no code for it; instead add one line to your report: "
-            "`verification-command: <the documented command> -- <where the project documents it (path:line) and why it runs "
-            "the same check>`."]
+            "documents another way to run the same check, change no code for it; instead add one line to your report, with "
+            "the command in backticks: verification-command: `<the documented command>` -- <where the project documents it "
+            "(path:line) and why it runs the same check>."]
 
 
 def _integration_red_fix_request(tid, run_branch, note, failed, code):
@@ -3448,13 +3461,14 @@ def parse_answer(state):
 
 def _to_headless_judge(state, u, esc):
     """Send a question with no human and no recommended option to the headless judge, at most STRIKE_LIMIT times per
-    kind and task, so a run whose judge keeps going on cannot loop forever."""
+    question, so a run whose judge keeps going on cannot loop forever."""
     kind = esc.get("kind", "")
-    key = f"{kind}:{as_dict(esc.get('data')).get('task') or ''}"
+    asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
+    key = (f"{kind}:{as_dict(esc.get('data')).get('task') or ''}:"
+           f"{hashlib.sha1(asked.encode('utf-8', 'replace')).hexdigest()[:8]}")
     rulings = dict(as_dict(state.get("judge_rulings")))
     if as_int(rulings.get(key)) >= STRIKE_LIMIT:
         ledger(state, u, f"headless judge: {kind}: already decided {rulings[key]} times -> stop and report")
-        asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
         u["failure_reason"] = (f"stopped: {kind}: the headless judge has decided this question {rulings[key]} times; the question "
                                f"was: {trim_items(asked, 500)}")
         u["_next"] = "end_blocked"
@@ -3478,6 +3492,7 @@ ACCEPTED_INSTRUCTIONS = {
     "mode_invalid": ("mode_values",),
     "delegate_discussion": ("answer",),
     "integration_red": ("verification_command",),
+    "verification_command": ("verification_command",),
 }
 INSTRUCTION_HELP = {
     "base_branch": "cut the run branch from a different base branch; value: that branch name",
@@ -3490,7 +3505,8 @@ INSTRUCTION_HELP = {
     "recipe": "supply the local-run recipe for the probe; value: the recipe",
     "mode_values": "set run mode values; value: key=value pairs",
     "answer": "answer the implementer's question in your own words; value: the answer",
-    "verification_command": "run a different command in place of the failing verification command; value: the command, then ` -- ` and why",
+    "verification_command": ("run a different command in place of the failing verification command; value: the command in "
+                             "backticks, then ` -- ` and why"),
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
 # the owner's own words verbatim; only mode_values takes the interpreter's extracted value.
@@ -3522,9 +3538,9 @@ def _apply_instruction(state, u, esc, shape, value, text):
         return _typed_doc_path(value)
     if shape == "verification_command":
         data = as_dict(esc.get("data"))
-        replacement, _, why = value.partition(" -- ")
+        replacement, why = _parse_verification_line(value)
         return VERIFY_REPLACED_RERUN if _adopt_verification_command(
-            state, u, data.get("failed_command") or "", replacement.strip().strip("`"), why.strip(), _decided_by(state),
+            state, u, data.get("failed_command") or "", replacement, why, _decided_by(state),
             data.get("task") or "") else ""
     if shape in FREE_FORM_SHAPES:
         return INSTRUCTION_ANSWERS[shape].format(text.strip()) if text.strip() else ""
@@ -3627,7 +3643,8 @@ def _judge_route(state, u, esc, verdict, shape):
         faults = as_int(data.get("judge_faults"))
         if faults < RERUN_ONCE:
             ledger(state, u, f"headless judge: {kind}: the ruling {how} -> one more ruling")
-            u.update({"escalation": {**esc, "data": {**data, "judge_faults": faults + 1}}, "reply_source": "judge"})
+            u.update({"escalation": {**esc, "data": {**data, "judge_faults": faults + 1, "judge_fault": f"the ruling {how}"}},
+                      "reply_source": "judge"})
             u["_next"] = "headless_judge"
             return u
         ledger(state, u, f"headless judge: {kind}: the ruling {how} again -> stop and report")
@@ -4420,7 +4437,7 @@ def apply_answer(state):
         ledger(state, u, f"relay: {tid}: the owner answered {tail(answer, 200)!r} -> resuming the implementer's run "
                          f"{data.get('child_run_id')}")
         u["_next"] = "compose_delegation"
-    elif kind == "integration_red" and answer == VERIFY_REPLACED_RERUN:
+    elif kind in ("integration_red", "verification_command") and answer == VERIFY_REPLACED_RERUN:
         _rerun_verification(state, u, as_dict(esc.get("data")))
     elif kind in ("integration_conflict", "integration_red"):
         a = ("abort" if abort else "stop" if stop
@@ -4450,8 +4467,9 @@ def apply_answer(state):
                 ledger(state, u, f"verification: `{failed}` is no longer declared, so `{new}` cannot replace it; the RED stands")
             u["verification_changes"] = list(as_list(state.get("verification_changes"))) + [
                 {"from": failed, "to": new, "reason": data.get("reason") or "", "by": by, "task": data.get("task") or "", "at": now_iso(),
-                 "kept": True}]
-            ledger(state, u, f"verification: `{failed}` kept in place of the proposed `{new}` (by {by})")
+                 "not_applied" if a == "adopt" else "kept": True}]
+            if a == "keep":
+                ledger(state, u, f"verification: `{failed}` kept in place of the proposed `{new}` (by {by})")
             _red_next(state, u, data.get("scope") or "task", data.get("task") or "", data.get("output") or esc.get("evidence", ""),
                       {"command": failed, "exit": data.get("failed_exit")})
         elif a == "stop":
@@ -4826,7 +4844,8 @@ def _skip_empty_group(state, u):
 
 
 def _verification_change_lines(state):
-    return [f"- `{c.get('from')}` -> `{c.get('to')}` ({c.get('by')}, {c.get('task') or 'run'}){' kept, not adopted' if c.get('kept') else ''}: "
+    return [f"- `{c.get('from')}` -> `{c.get('to')}` ({c.get('by')}, {c.get('task') or 'run'})"
+            f"{' kept, not adopted' if c.get('kept') else ' adopt not applied' if c.get('not_applied') else ''}: "
             f"{c.get('reason') or 'no reason given'}" for c in map(as_dict, as_list(state.get("verification_changes")))]
 
 
