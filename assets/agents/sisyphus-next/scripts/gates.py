@@ -806,8 +806,9 @@ def _route_intent(state, u):
         # only the fixed Abort option assess_fault adds is a stop; an assessed option such as "Stop using the
         # in-memory cache" is an answer
         stops = ["Abort"] if truthy(state.get("assess_faulted")) else []
-        return raise_escalation(state, u, escalation("clarify", q.get("question", ""), opts,
-                                                     data={"stop_options": stops}))
+        asked = q.get("question", "")
+        return raise_escalation(state, u, escalation("clarify", asked, opts, data={
+            "stop_options": stops, "decision": _hashed_decision("clarify", asked)}))
 
     if intent in ("exploration", "design_question"):
         u["_next"] = "research_answer"
@@ -1515,13 +1516,15 @@ def design_gate(state):
         q = state["register_question"].strip()
         u["register_question"] = ""
         return raise_escalation(state, u, escalation("design_choice", q, [], evidence="codebase register: "
-                                                     + str(state.get("codebase_register") or "")))
+                                                     + str(state.get("codebase_register") or ""),
+                                                     data={"decision": _hashed_decision("register", q)}))
     opts = [o for o in as_list(state.get("design_options")) if isinstance(o, dict) and o.get("text")]
     if opts:
         u["design_options"] = []
         return raise_escalation(state, u, escalation(
             "design_choice", "Which design approach should the implementation follow?",
-            [option(o["text"], o.get("recommended", False), o.get("evidence", "")) for o in opts]))
+            [option(o["text"], o.get("recommended", False), o.get("evidence", "")) for o in opts],
+            data={"decision": "approach"}))
     proposal = (state.get("architecture_proposal") or "").strip()
     if proposal and not truthy(state.get("proposal_confirmed")):
         u["proposal_confirmed"] = True
@@ -1529,9 +1532,23 @@ def design_gate(state):
             "design_choice", "Adopt the architecture-reviewer's refined proposal as the implementation plan?",
             [option("Adopt the proposal", recommended=True, evidence="refined into an implementation-ready interface"),
              option("Skip it; implement the request as stated")],
-            evidence=tail(proposal, 1500)))
+            evidence=tail(proposal, 1500), data={"decision": "proposal"}))
     u["_next"] = "compose_brief"
     return u
+
+
+def _hashed_decision(prefix, question):
+    return f"{prefix}:{hashlib.sha1(str(question).encode('utf-8', 'replace')).hexdigest()[:8]}"
+
+
+def _decision_key(state, esc):
+    """The decision an escalation asks about, in the subtask or final review that raised it.
+
+    A kind that carries several unrelated decisions names the one it asks in data.decision; any other kind is one
+    decision per subtask, whatever its question text says."""
+    decision = as_dict(esc.get("data")).get("decision") or esc.get("kind", "unknown")
+    review = "final" if truthy(state.get("final_review")) else "sub"
+    return f"{decision}|s{as_int(state.get('subtask_index'))}|{review}"
 
 
 # ====================================================================== 2.3
@@ -1609,7 +1626,8 @@ def escalate_gate(state):
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
-    failed_once = kind in as_list(state.get("autonomous_kinds"))
+    key = _decision_key(state, esc)
+    failed_once = key in as_list(state.get("autonomous_decisions"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -1620,9 +1638,13 @@ def escalate_gate(state):
         u["_next"] = "ladder_judge"
     else:
         if failed_once:
-            ledger(state, u, f"ladder: {kind} already resolved autonomously once; hard trigger -> owner")
+            ledger(state, u, f"ladder: {key} already resolved autonomously once; hard trigger -> owner")
         u["_next"] = "ask_dispatch"
     return u
+
+
+def _autonomous_decisions(state, esc):
+    return list(as_list(state.get("autonomous_decisions"))) + [_decision_key(state, esc)]
 
 
 def ladder_route(state):
@@ -1645,8 +1667,7 @@ def ladder_route(state):
             basis = state.get("ladder_basis") or res
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             digest = list(as_list(state.get("autonomous_digest"))) + [line]
-            kinds = list(as_list(state.get("autonomous_kinds"))) + [esc.get("kind")]
-            u.update({"autonomous_digest": digest, "autonomous_kinds": kinds,
+            u.update({"autonomous_digest": digest, "autonomous_decisions": _autonomous_decisions(state, esc),
                       "last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
@@ -1702,7 +1723,7 @@ def consult_route(state):
                               and _stated_reason(choice, options) != NO_STATED_REASON)
         if choice and not qualified_stop:
             u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0,
-                      "answer_source": "navigator"})
+                      "answer_source": "navigator", "autonomous_decisions": _autonomous_decisions(state, esc)})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
             u["_next"] = "apply_answer"
             return u
@@ -1947,6 +1968,8 @@ def interpret_route(state):
 
     def decide(answer, how):
         u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})
+        if navigator:
+            u["autonomous_decisions"] = _autonomous_decisions(state, esc)
         ledger(state, u, f"interpret: {kind}: {said!r} -> {how} ({reason or 'no reason given'})")
         ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
         u["_next"] = "apply_answer"

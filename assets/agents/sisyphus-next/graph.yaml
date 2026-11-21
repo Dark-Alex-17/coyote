@@ -267,7 +267,7 @@ initial_state:
   discussion_message: ''
   settled_answer: ''
   autonomous_digest: []
-  autonomous_kinds: []
+  autonomous_decisions: []
   decisions: []
   # --- implementation ---
   coder_brief: {}
@@ -1210,6 +1210,8 @@ nodes:
     type: script
     description: >-
       Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder;
+      a decision already resolved autonomously once in the same subtask or final review
+      (autonomous_decisions, keyed by decision, subtask and review) -> tier 4;
       a malformed escalation (missing, not an object, no kind or a blank question) -> end_blocked.
     script: scripts/escalate_gate.py
     fallback: end_failure

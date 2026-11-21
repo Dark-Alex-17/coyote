@@ -350,8 +350,10 @@ check("escalate_gate: autonomous -> ladder_judge with rulings text", u["_next"] 
 hard = escalation("design_ask", "Design question: adopt a Strategy?", [], hard_trigger=True)
 u = gates.escalate_gate(base_state(escalation=hard, escalation_policy="autonomous"))
 check("escalate_gate: hard trigger bypasses the ladder", u["_next"] == "ask_dispatch")
-u = gates.escalate_gate(base_state(escalation=esc, escalation_policy="autonomous", autonomous_kinds=["design_choice"]))
-check("escalate_gate: a kind already resolved autonomously -> owner (failed-once rule)", u["_next"] == "ask_dispatch")
+u = gates.escalate_gate(base_state(escalation=esc, escalation_policy="autonomous", autonomous_decisions=["design_choice|s0|sub"]))
+check("escalate_gate: a decision already resolved autonomously in this subtask -> owner (failed-once rule)",
+      u["_next"] == "ask_dispatch" and any("design_choice|s0|sub already resolved autonomously" in d for d in u["decisions"]),
+      u)
 secret = escalation("yellow_findings", "rotate the API secret?", [option("yes", True)])
 check("escalation: secret/money wording auto-flags hard trigger", secret["hard_trigger"])
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="A", ladder_basis="recommended option"))
@@ -6538,6 +6540,51 @@ with scenario("base: a baseRefOid that is not a commit id is never used as a git
           bad_oid_facts)
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
 os.environ["SISYPHUS_GH_PR_READY_CMD"] = _PR_READY_DEFAULT
+
+
+# ---------------------------------------------------------------- failed-once rule keyed on the decision
+def autonomous_after(u):
+    return {k: v for k, v in u.items() if k.startswith("autonomous_")}
+
+
+with scenario("failed-once: an autonomous design approach answer on subtask 1 leaves subtask 2's approach question to "
+              "the ladder") as name:
+    approach = [{"text": "A", "recommended": True, "evidence": "e"}, {"text": "B"}]
+    first = gates.design_gate(base_state(design_options=approach, subtask_index=0))["escalation"]
+    answered = gates.ladder_route(base_state(escalation=first, subtask_index=0, ladder_resolution="recommended",
+                                             ladder_choice="A"))
+    second = gates.design_gate(base_state(design_options=approach, subtask_index=1))["escalation"]
+    u = gates.escalate_gate(base_state(escalation=second, subtask_index=1, escalation_policy="autonomous",
+                                       **autonomous_after(answered)))
+    check(name, u["_next"] == "ladder_judge", (autonomous_after(answered), u.get("_next")))
+with scenario("failed-once: a register question in the same subtask is its own decision, not the approach") as name:
+    register = gates.design_gate(base_state(register_question="I see X and Y. Which?", subtask_index=0))["escalation"]
+    u = gates.escalate_gate(base_state(escalation=register, subtask_index=0, escalation_policy="autonomous",
+                                       **autonomous_after(answered)))
+    check(name, u["_next"] == "ladder_judge", (register.get("data"), u.get("_next")))
+with scenario("failed-once: review_exhausted raised again in the same subtask after an autonomous answer -> owner, "
+              "whatever its question text") as name:
+    ex1 = escalation("review_exhausted", "3 rounds failed on lane security", [option("Stop", True)])
+    answered_ex = gates.ladder_route(base_state(escalation=ex1, subtask_index=1, ladder_resolution="recommended",
+                                                ladder_choice="Stop"))
+    ex2 = escalation("review_exhausted", "3 rounds failed on lane adversary", [option("Stop", True)])
+    u = gates.escalate_gate(base_state(escalation=ex2, subtask_index=1, escalation_policy="autonomous",
+                                       **autonomous_after(answered_ex)))
+    check(name, u["_next"] == "ask_dispatch", (autonomous_after(answered_ex), u.get("_next")))
+with scenario("failed-once: the final whole-task review is not the last subtask") as name:
+    u = gates.escalate_gate(base_state(escalation=ex2, subtask_index=1, final_review=True, escalation_policy="autonomous",
+                                       **autonomous_after(answered_ex)))
+    check(name, u["_next"] == "ladder_judge", u.get("_next"))
+with scenario("failed-once: a navigator ANSWER is an autonomous resolution; the same decision then goes to the owner") as name:
+    consulted = gates.consult_route(base_state(escalation=ex1, subtask_index=1, consult_result="CONSULT: ANSWER 1"))
+    u = gates.escalate_gate(base_state(escalation=ex2, subtask_index=1, escalation_policy="autonomous",
+                                       **autonomous_after(consulted)))
+    check(name, consulted["_next"] == "apply_answer" and u["_next"] == "ask_dispatch",
+          (autonomous_after(consulted), u.get("_next")))
+with scenario("failed-once: a resumed state's kind-only autonomous_kinds list is ignored") as name:
+    design = escalation("design_choice", "pick", [option("A", True, "e"), option("B")])
+    u = gates.escalate_gate(base_state(escalation=design, escalation_policy="autonomous", autonomous_kinds=["design_choice"]))
+    check(name, u["_next"] == "ladder_judge", u.get("_next"))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
