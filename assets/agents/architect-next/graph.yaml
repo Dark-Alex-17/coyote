@@ -1461,13 +1461,14 @@ nodes:
     id: delegate
     type: agent
     agent: sisyphus-next
-    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag and project directory ride `inputs:`.
+    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag, project directory and escalation policy ride `inputs:`.
     prompt: |
       {{delegation_prompt}}
     inputs:
       review_cadence: '{{delegate_review_cadence}}'
       parallel: '{{delegate_parallel}}'
       project_dir: '{{delegate_project_dir}}'
+      escalation_policy: '{{escalation_policy}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1722,13 +1723,14 @@ nodes:
     type: agent
     agent: sisyphus-next
     teammates: true
-    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree and the item's review cadence ride `inputs:`.
+    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree, the item's review cadence and the escalation policy ride `inputs:`.
     prompt: |
       {{wtask.prompt}}
     inputs:
       parallel: '1'
       project_dir: '{{wtask.worktree}}'
       review_cadence: '{{wtask.review_cadence}}'
+      escalation_policy: '{{escalation_policy}}'
     timeout: 0
     max_attempts: 1
     state_updates:
