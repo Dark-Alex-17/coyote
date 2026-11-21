@@ -74,7 +74,11 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   on a clean tree `git status --porcelain` is read again. When the tree changed, no red run gets
   `tree-state` and each note ends `the declared commands modified the tree`; when the dirty tree
   cannot be written again, each note ends `candidate tree dirty, whether the declared commands
-  modified it is unknown`. Otherwise, on a dirty tree, each red command held to exit 0 (a stated condition, such as
+  modified it is unknown`. When HEAD is not the diff base (or either cannot be resolved), the
+  uncommitted tree is not the whole change: nothing is rerun and each note ends `candidate tree
+  dirty beside commits since the diff base`. A run that commits some work and leaves the rest
+  uncommitted therefore gets no `tree-state` release (a false block, never a false pass), so
+  commit before review or review the worktree spec. Otherwise, on a dirty tree, each red command held to exit 0 (a stated condition, such as
   `prints nothing`, is never rerun) that neither timed out nor was killed by a signal (exit 128
   or above) runs once more, inside the same deadline, in a detached worktree of the pre-run snapshot. A
   command that exits 0 there gets baseline `tree-state`: it is red only because the change is
