@@ -1785,6 +1785,9 @@ fn the_chrome_parts_are_told_apart_by_colour() {
         ("todo done", "footer field"),
         ("runtime", "footer field"),
         ("interrupt key", "footer field"),
+        ("queued header", "footer field"),
+        ("queued text", "footer separator"),
+        ("queued header", "runtime"),
     ] {
         assert_ne!(fg(a), fg(b), "{a} and {b} share a colour: {styles:?}");
     }

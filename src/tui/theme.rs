@@ -24,6 +24,11 @@ const RULE_FALLBACK: Color = Color::DarkGray;
 /// rows' so its items never read as either.
 const TODO_OPEN: Color = Color::LightGreen;
 const TODO_DONE: Color = Color::Gray;
+/// The queued strip's header, apart from the footer's fields under it.
+const QUEUED_HEADER: Color = Color::LightBlue;
+/// The footer's ` . ` between its fields, apart from the dim queued
+/// lines above the composer.
+const FOOTER_SEPARATOR: Color = Color::DarkGray;
 /// How far each channel of the theme's background moves towards the text
 /// so the composer's field reads as its own surface.
 const SURFACE_NUDGE: u8 = 12;
@@ -210,8 +215,8 @@ impl Theme {
             status_runtime: paint(DIM, tool_fn),
             status_key: paint(DIM, HIGHLIGHT),
             footer_field: paint(DIM, tool_key),
-            footer_separator: DIM,
-            queued_header: paint(Style::new(), tool_key),
+            footer_separator: paint(DIM, FOOTER_SEPARATOR),
+            queued_header: paint(Style::new(), QUEUED_HEADER),
             queued_text: DIM,
             todo_done: paint(DIM, TODO_DONE),
             todo_open: paint(Style::new(), TODO_OPEN),

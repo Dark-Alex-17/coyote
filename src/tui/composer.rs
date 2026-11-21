@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The rule's title while the vi layer is in normal mode.
@@ -228,62 +229,81 @@ impl Composer {
 /// Columns a tab advances to the next stop, as the field draws it.
 const TAB_LEN: usize = 4;
 
-/// Screen rows `lines` take in a field `width` wide, packed the way the
-/// field wraps: chunks fill a row while they fit, a run of spaces is a
-/// chunk of its own, and a chunk wider than a whole row is broken across
-/// rows. The field also breaks at punctuation, which this does not, so
-/// the count is never below the rows the field draws. A masked field
-/// draws every character as `mask`.
+/// Screen rows `lines` take in a field `width` wide, packed as the field
+/// packs them: the Unicode word-boundary chunks of a line fill a row while
+/// they fit, a chunk wider than a whole row is broken between graphemes,
+/// and whatever follows a broken chunk starts a row of its own. A masked
+/// field draws every character as `mask`.
 pub(super) fn wrapped_rows(lines: &[String], width: u16, mask: Option<char>) -> usize {
     let width = usize::from(width.max(1));
     lines.iter().map(|line| line_rows(line, width, mask)).sum()
 }
 
-fn line_rows(line: &str, width: usize, mask: Option<char>) -> usize {
-    let advance = |c: char, at: usize| match mask {
-        Some(mask) => mask.width().unwrap_or(1),
-        None if c == '\t' => TAB_LEN - at % TAB_LEN,
-        None => c.width().unwrap_or(0),
-    };
-    let mut chunks: Vec<&str> = Vec::new();
-    let mut start = 0;
-    for (at, c) in line.char_indices().skip(1) {
-        let before = line[..at].chars().next_back().unwrap_or(c);
-        if before.is_whitespace() != c.is_whitespace() {
-            chunks.push(&line[start..at]);
-            start = at;
+/// The column `text` ends at when it starts at column `at`.
+fn width_to(text: &str, at: usize, mask: Option<char>) -> usize {
+    let cell = |c: char| {
+        if c.is_control() {
+            0
+        } else {
+            c.width().unwrap_or(0)
         }
-    }
-    chunks.push(&line[start..]);
+    };
+    text.chars().fold(at, |at, c| match mask {
+        Some(mask) => at + cell(mask),
+        None if c == '\t' => at + TAB_LEN - at % TAB_LEN,
+        None => at + cell(c),
+    })
+}
 
-    let mut rows = 1;
+fn line_rows(line: &str, width: usize, mask: Option<char>) -> usize {
+    let chunks: Vec<&str> = line.split_word_bounds().collect();
+    let mut rows = 0;
     let mut used = 0;
-    for chunk in chunks {
-        let span = chunk.chars().fold(used, |at, c| at + advance(c, at)) - used;
+    let mut open = false;
+    let mut i = 0;
+    while i < chunks.len() {
+        let chunk = chunks[i];
+        let span = width_to(chunk, used, mask) - used;
         if used + span <= width {
             used += span;
+            open = true;
+            i += 1;
             continue;
         }
-        if used > 0 {
+        if open {
             rows += 1;
             used = 0;
-            let fresh = chunk.chars().fold(0, |at, c| at + advance(c, at));
-            if fresh <= width {
-                used = fresh;
-                continue;
+            open = false;
+            continue;
+        }
+        rows += grapheme_rows(chunk, width, mask);
+        i += 1;
+    }
+    (rows + usize::from(open)).max(1)
+}
+
+/// Rows a chunk wider than a row takes once broken between graphemes,
+/// each row taking graphemes while they fit and at least one.
+fn grapheme_rows(chunk: &str, width: usize, mask: Option<char>) -> usize {
+    let graphemes: Vec<&str> = chunk.graphemes(true).collect();
+    let mut rows = 0;
+    let mut i = 0;
+    while i < graphemes.len() {
+        let mut used = 0;
+        let mut taken = 0;
+        for grapheme in &graphemes[i..] {
+            let next = width_to(grapheme, used, mask);
+            if taken > 0 && next > width {
+                break;
+            }
+            taken += 1;
+            used = next;
+            if used > width {
+                break;
             }
         }
-        for c in chunk.chars() {
-            let step = advance(c, used);
-            if used + step > width && used > 0 {
-                rows += 1;
-                used = 0;
-            }
-            used += step;
-        }
-        // The field starts whatever follows a broken chunk on a row of
-        // its own, however much of the last row the chunk left free.
-        used = width;
+        i += taken;
+        rows += 1;
     }
     rows
 }
@@ -655,13 +675,14 @@ mod tests {
         assert_eq!(
             wrapped_rows(composer.lines(), 20, None),
             3,
-            "a long word is not broken"
+            "a word wider than the row is broken across rows"
         );
     }
 
     /// The count follows the field's packing where it differs from plain
     /// word wrapping: a space is a chunk that takes a row of its own when
-    /// nothing else fits, and what follows a broken word starts a row.
+    /// nothing else fits, what follows a broken word starts a row, and a
+    /// path breaks at its punctuation rather than filling every row.
     #[test]
     fn the_row_count_packs_like_the_field() {
         let rows = |line: &str| wrapped_rows(&[line.to_string()], 20, None);
@@ -670,10 +691,38 @@ mod tests {
         assert_eq!(rows(&format!("{} y", "x".repeat(25))), 3);
         assert_eq!(rows("\tx"), 1);
         assert_eq!(rows(""), 1);
+        let path = "aaaaaaaaaaaa/bbbbbbbbbbbb/cccccccccccc/dddddddddddd/eeeeeeeeeeee";
+        assert_eq!(rows(path), 5, "a path packs at full width");
         assert_eq!(
             wrapped_rows(&["\u{4e2d}".repeat(10)], 20, Some('*')),
             1,
             "a masked field draws one mask per character"
         );
+    }
+
+    /// The count is the rows the field actually draws, for each kind of
+    /// line the packing treats differently.
+    #[test]
+    fn the_row_count_matches_the_rows_the_field_draws() {
+        let lines = [
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet",
+            "aaaaaaaaaaaa/bbbbbbbbbbbb/cccccccccccc/dddddddddddd/eeeeeeeeeeee",
+            "https://example.com/some/long-path/with.dots?and=query&more=stuff",
+            "xxxxxxxxxxxxxxxxxxxxxxxxx y",
+            "\u{4e2d}\u{6587}\u{5b57}\u{4e2d}\u{6587}\u{5b57}\u{4e2d}\u{6587}\u{5b57}\u{4e2d}\u{6587}",
+        ];
+        for line in lines {
+            let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+            composer.set_text(line);
+            let area = Rect::new(0, 0, 20, 14);
+            let mut buf = Buffer::empty(area);
+            composer
+                .view(CommandPrefix::Dot, &[], &Theme::fallback(true), false)
+                .render(area, &mut buf);
+            let drawn = (1..area.height - 1)
+                .filter(|y| (0..20).any(|x| !buf[(x, *y)].symbol().trim().is_empty()))
+                .count();
+            assert_eq!(wrapped_rows(composer.lines(), 20, None), drawn, "{line:?}");
+        }
     }
 }

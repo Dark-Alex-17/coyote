@@ -1621,6 +1621,37 @@ fn a_long_answer_never_cuts_the_question_it_answers() {
     );
 }
 
+/// Long options wrap into many rows but never into the rows the question
+/// needs: the list scrolls and Enter still picks the marked option.
+#[test]
+fn long_options_never_cut_the_question_they_answer() {
+    let mut harness = Harness::standalone(80, 24);
+    let question = "First line o7c\nsecond line\nthird line\nfourth line o7c";
+    let options: Vec<String> = (0..6)
+        .map(|n| format!("option {n} {}", "word ".repeat(40).trim_end()))
+        .collect();
+    let req = PromptRequest {
+        options: options.clone(),
+        origin: Origin {
+            agent_id: Some("agent-o7c".to_string()),
+            depth: 1,
+        },
+        ..PromptRequest::new(PromptAction::Select, question, Origin::detached())
+    };
+    let asker = ask_on_a_thread(&mut harness, req);
+    let frame = harness.draw();
+    for line in question.lines() {
+        assert!(frame.contains(line), "{line:?} is cut:\n{frame}");
+    }
+    assert!(!frame.contains("more lines; enlarge"), "{frame}");
+    harness.clock.advance(HOTKEY_IDLE);
+    assert_eq!(harness.press(KeyCode::Enter), None);
+    assert_eq!(
+        asker.join().unwrap().unwrap(),
+        PromptAnswer::Selected(options[0].clone())
+    );
+}
+
 /// Coyote's and an agent's questions are rendered as markdown; a tool's
 /// stays plain so every character it asks to approve shows, in the same
 /// question colour.
