@@ -22,6 +22,9 @@ description: |
   failure that already happened on the diff base is reported, not blocking; a
   red run held to exit 0 that exits 0 on a clean snapshot of the pre-run tree, or whose
   criteria state a pass condition other than exit 0 and are met, is advisory; a
+  red run held to exit 0 whose every failure the caller declared carried
+  (carried_failures), with every criterion naming the command met, is advisory,
+  while a new failure beside carried ones still blocks; a
   command the deadline skipped is reported as not run; a runner error blocks
   when commands were declared), plus zero implementation-debris hits from the
   mechanical debris_lint stage. Missing plan = DIVERGES (fail-closed) naming
@@ -61,6 +64,15 @@ variables:
   - name: debris_exclude
     description: Repo-relative directories holding the run's own planning files, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none. The debris lint leaves them out of its diff, the review is told the changed files under them are bookkeeping, and a scope-drift complaint located only in them does not block.
     default: ''
+  - name: carried_failures
+    description: |
+      JSON array of failures the caller declares expected to stay red in this
+      change and owed elsewhere, each {"paths": [repo paths, a directory
+      ending in "/"], "owner": display label, "evidence": optional text}.
+      Declared like verification_commands, never inferred from the prompt. A
+      red run every one of whose failures exactly matches a declared item's
+      paths is advisory; a value that is not a JSON array counts as none.
+    default: '[]'
 
 settings:
   max_loop_iterations: 10
@@ -88,6 +100,7 @@ initial_state:
   diff_base: ''
   git_facts: ''
   exec_results: ''
+  carried_error: ''
   debris_findings: []
   debris_summary: ''
   last_script_error: ''
@@ -188,7 +201,7 @@ nodes:
   run_checks:
     id: run_checks
     type: script
-    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each record carries a pass_condition (stated when the clause after a backticked span equal to the command, in a criterion or request line, makes the command the subject of a condition other than exit 0 and no naming line says it passes or exits 0, otherwise exit 0). Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); a command that timed out here gets a not-run baseline without a base run. Before the first command runs, a dirty tree is captured as a snapshot commit (built in a temporary index, so the real index and refs are untouched). After the runs a dirty live tree's id is compared with the pre-run one and a clean tree's git status is read again; when the commands modified the tree no red gets tree-state, and when that comparison fails the note says whether the commands modified the dirty tree is unknown. When HEAD is not diff_base (or either fails to resolve), nothing is rerun and the note says the candidate tree is dirty beside commits since the diff base; a run that commits some work and leaves the rest uncommitted thus gets no tree-state release (a false block, never a false pass), so commit before review or review the worktree spec. Otherwise each red command on a dirty tree that is held to exit 0 and was not killed by a signal runs once more in a worktree of the pre-run snapshot; exit 0 there gives a tree-state baseline and no base run, anything else keeps the base comparison and notes that the candidate tree is dirty, and snapshot runs are never saved. A sparse checkout takes no snapshot, so a dirty one only notes that the candidate tree is dirty; a failed git status takes no snapshot and notes that the tree state is unknown. The worktrees are added with the user's git hooks disabled and removed on normal exit. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge an execution criterion no run covers on the diff and the working tree, at best INSPECTED naming the command to declare; the verdict additionally blocks CONFORMS on the marker when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3120s total deadline, started after the review-stack lock (bounded 1200s wait) and the pre-run tree capture (capped at 120s), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each record carries a pass_condition (stated when the clause after a backticked span equal to the command, in a criterion or request line, makes the command the subject of a condition other than exit 0 and no naming line says it passes or exits 0, otherwise exit 0). Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); a command that timed out here gets a not-run baseline without a base run. Before the first command runs, a dirty tree is captured as a snapshot commit (built in a temporary index, so the real index and refs are untouched). After the runs a dirty live tree's id is compared with the pre-run one and a clean tree's git status is read again; when the commands modified the tree no red gets tree-state, and when that comparison fails the note says whether the commands modified the dirty tree is unknown. When HEAD is not diff_base (or either fails to resolve), nothing is rerun and the note says the candidate tree is dirty beside commits since the diff base; a run that commits some work and leaves the rest uncommitted thus gets no tree-state release (a false block, never a false pass), so commit before review or review the worktree spec. Otherwise each red command on a dirty tree that is held to exit 0 and was not killed by a signal runs once more in a worktree of the pre-run snapshot; exit 0 there gives a tree-state baseline and no base run, anything else keeps the base comparison and notes that the candidate tree is dirty, and snapshot runs are never saved. A sparse checkout takes no snapshot, so a dirty one only notes that the candidate tree is dirty; a failed git status takes no snapshot and notes that the tree state is unknown. The worktrees are added with the user's git hooks disabled and removed on normal exit. With a non-empty carried_failures, each red record held to exit 0 that exited below 128 and is neither pre-existing nor tree-state has its full output parsed by the shared failure-location parser and gains carried (all, matched, new, unlocated; all only when every located failure's paths exactly equal a carried item's and no failure line names no repo path), or a carried_note when the parser or git's file list is unavailable; a carried_failures that is not a JSON array counts as none and records carried_error, never a PIPELINE-FAULT. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge an execution criterion no run covers on the diff and the working tree, at best INSPECTED naming the command to declare; the verdict additionally blocks CONFORMS on the marker when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3120s total deadline, started after the review-stack lock (bounded 1200s wait) and the pre-run tree capture (capped at 120s), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
     timeout: 4600
     fallback: pipeline_fault
@@ -289,6 +302,10 @@ nodes:
         `baseline` field saying whether the same failures already occurred on
         the diff base; failures that predate the change are not attributed to
         it unless the criterion asks for them to be fixed.
+        A red record whose `carried.all` is true failed only on failures the
+        caller declares expected to stay red in this change and owed
+        elsewhere; they are not attributed to this change unless a criterion
+        asks for that command or those tests to pass.
         INSPECTED never overrides a covering red run: it stays UNMET.
       - a record whose `pass_condition.condition` is `stated` is a command
         named in a backticked span whose own clause makes the command the
@@ -455,6 +472,11 @@ nodes:
       not emit it. When everything is a nitpick, emit zero complaints and put
       1-3 non-blocking notes in `observations`.
 
+      A red record whose `carried.all` is true failed only on failures the
+      caller declares expected to stay red in this change and owed elsewhere;
+      they are not attributed to this change unless a criterion asks for that
+      command or those tests to pass.
+
       `format_rulings`: a per-criterion verdict with status UNVERIFIED means
       its check produced no valid verdict after re-asks; its evidence is the
       check's raw output. Rule on each UNVERIFIED criterion, and ONLY those,
@@ -549,7 +571,7 @@ nodes:
   verdict:
     id: verdict
     type: script
-    description: Deterministic verdict -- CONFORMS requires every criterion MET or INSPECTED (after applying holistic format rulings to UNVERIFIED criteria only; an unruled UNVERIFIED criterion is a PIPELINE-FAULT; an INSPECTED criterion whose reason starts with ENVIRONMENT counts as PARTIAL unless at least one recorded run is green), zero blocking holistic complaints, zero pipeline faults, zero recorded red verification runs other than failures that already happened on the diff base and advisory red runs (exit!=0/timeout, or an ENVIRONMENT runner-error marker when commands were declared; a deadline-skipped command is reported as not run; advisory means a tree-state baseline on a command held to exit 0, or a pass condition other than exit 0 stated by criteria, where every criterion naming the command ends MET or INSPECTED, with the pass condition recomputed from the criteria and the request; a condition stated only in the request, a timeout and a signal exit always block), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
+    description: Deterministic verdict -- CONFORMS requires every criterion MET or INSPECTED (after applying holistic format rulings to UNVERIFIED criteria only; an unruled UNVERIFIED criterion is a PIPELINE-FAULT; an INSPECTED criterion whose reason starts with ENVIRONMENT counts as PARTIAL unless at least one recorded run is green), zero blocking holistic complaints, zero pipeline faults, zero recorded red verification runs other than failures that already happened on the diff base and advisory red runs (exit!=0/timeout, or an ENVIRONMENT runner-error marker when commands were declared; a deadline-skipped command is reported as not run; advisory means a tree-state baseline on a command held to exit 0, a record whose carried.all says every failure is one the caller declared carried, or a pass condition other than exit 0 stated by criteria, where every criterion naming the command ends MET or INSPECTED, with the pass condition recomputed from the criteria and the request; a condition stated only in the request, a timeout and a signal exit always block, and a red run only partly carried blocks naming the failures not declared carried), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). A carried_note or carried_error is reported as an advisory line. Assembles the exact sentinel format.
     script: scripts/verdict.py
     timeout: 30
     next: done

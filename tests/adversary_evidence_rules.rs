@@ -3298,3 +3298,323 @@ fn each_run_record_carries_the_pass_condition_its_criteria_state() {
         "{out}"
     );
 }
+
+/// Test-runner output naming three failing test files, each followed by its
+/// package's FAIL line.
+const CARRIED_SUITE: &str = "echo '--- FAIL: TestAlpha (0.00s)'\n\
+     echo '    pkg/alpha/server_test.ext:203: status = 500, want 200'\n\
+     printf 'FAIL\\texample.org/svc/pkg/alpha\\t0.7s\\n'\n\
+     echo '--- FAIL: TestBeta (0.01s)'\n\
+     echo '    pkg/beta/flow_test.ext:152: got 1 item, want 2'\n\
+     printf 'FAIL\\texample.org/svc/pkg/beta\\t0.4s\\n'\n\
+     echo '--- FAIL: TestGamma (0.02s)'\n\
+     echo '    pkg/gamma/process_test.ext:283: state = stopped, want running'\n\
+     printf 'FAIL\\texample.org/svc/pkg/gamma\\t0.5s\\n'\n\
+     echo FAIL\n";
+
+/// The failures of `CARRIED_SUITE` as the caller declares them: a file key
+/// and a directory key per package.
+fn carried_keys() -> String {
+    json!([
+        {"paths": ["pkg/alpha/server_test.ext"], "owner": 2, "evidence": "status = 500, want 200"},
+        {"paths": ["pkg/alpha/"], "owner": 2},
+        {"paths": ["pkg/beta/flow_test.ext"], "owner": 2},
+        {"paths": ["pkg/beta/"], "owner": 2},
+        {"paths": ["pkg/gamma/process_test.ext"], "owner": 3},
+        {"paths": ["pkg/gamma/"], "owner": 3},
+    ])
+    .to_string()
+}
+
+/// A repository whose `scripts` (name, body) exit 0 at the diff base and run
+/// `body` then exit 1 at HEAD, beside the test files their output names;
+/// returns the repo and the diff-base commit.
+#[cfg(unix)]
+fn carried_repo(dir: &Path, scripts: &[(&str, &str)]) -> (PathBuf, String) {
+    let repo = dir.join("repo");
+    for file in [
+        "pkg/alpha/server_test.ext",
+        "pkg/alpha/extra_test.ext",
+        "pkg/beta/flow_test.ext",
+        "pkg/gamma/process_test.ext",
+        "pkg/delta/store_test.ext",
+    ] {
+        let path = repo.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "fixture\n").unwrap();
+    }
+    git(&repo, &["init", "-q"]);
+    for (name, _) in scripts {
+        fs::write(repo.join(name), "exit 0\n").unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    for (name, body) in scripts {
+        fs::write(repo.join(name), format!("{body}exit 1\n")).unwrap();
+    }
+    git(&repo, &["commit", "-q", "-am", "head"]);
+    (repo, base)
+}
+
+#[cfg(unix)]
+fn carried_run(
+    dir: &Path,
+    label: &str,
+    repo: &Path,
+    base: &str,
+    cmds: &[&str],
+    carried: &str,
+) -> Value {
+    script(
+        dir,
+        "run_checks.py",
+        label,
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": cmds,
+            "diff_base": base,
+            "carried_failures": carried,
+        }),
+        &[],
+    )
+}
+
+/// A red suite whose every failure the caller declared carried is advisory,
+/// while a second red suite failing on a file nobody declared still blocks.
+#[cfg(unix)]
+#[test]
+fn a_red_run_made_only_of_carried_failures_is_advisory() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("carried");
+    let other = "echo '    pkg/delta/store_test.ext:9: got 1, want 2'\n\
+                 printf 'FAIL\\texample.org/svc/pkg/delta\\t0.1s\\n'\n";
+    let (repo, base) = carried_repo(&dir.0, &[("suite.sh", CARRIED_SUITE), ("other.sh", other)]);
+
+    let out = carried_run(
+        &dir.0,
+        "carried",
+        &repo,
+        &base,
+        &["sh suite.sh"],
+        &carried_keys(),
+    );
+    let record = &out["exec_results"][0];
+    assert_eq!(record["baseline"]["status"], "regression", "{out}");
+    assert_eq!(record["carried"]["all"], true, "{out}");
+    assert_eq!(
+        record["carried"]["matched"].as_array().map(Vec::len),
+        Some(6),
+        "{out}"
+    );
+    assert_eq!(record["carried"]["new"], json!([]), "{out}");
+    assert_eq!(record["carried"]["unlocated"], 0, "{out}");
+
+    let mut state = verdict_state(json!([met("c1")]));
+    state["exec_results"] = out["exec_results"].clone();
+    let text = report(&dir.0, "carried", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(
+            "Advisory red runs (not blocking):\n- `sh suite.sh` -- exit 1 -- every failure is one the \
+             caller declared carried (owner 2): pkg/alpha/server_test.ext, pkg/alpha/, \
+             pkg/beta/flow_test.ext, pkg/beta/; (owner 3): pkg/gamma/process_test.ext, pkg/gamma/ \
+             -- baseline on the diff base: regression"
+        ),
+        "{text}"
+    );
+
+    let out = carried_run(
+        &dir.0,
+        "carried-and-new",
+        &repo,
+        &base,
+        &["sh suite.sh", "sh other.sh"],
+        &carried_keys(),
+    );
+    assert_eq!(out["exec_results"][0]["carried"]["all"], true, "{out}");
+    let record = &out["exec_results"][1];
+    assert_eq!(record["carried"]["all"], false, "{out}");
+    assert_eq!(
+        record["carried"]["new"],
+        json!([["pkg/delta/store_test.ext"], ["pkg/delta/"]]),
+        "{out}"
+    );
+    state["exec_results"] = out["exec_results"].clone();
+    let text = report(&dir.0, "carried-and-new", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(text.contains("1. Verification run `sh other.sh`"), "{text}");
+    assert!(
+        text.contains(
+            "exit 1 (recorded FAIL; a red declared command that did not already fail on the diff \
+             base blocks CONFORMS; baseline on the diff base: regression, base exit 0, the command \
+             passed on the diff base; failures not declared carried: pkg/delta/store_test.ext; \
+             pkg/delta/)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Verification run `sh suite.sh`"), "{text}");
+}
+
+/// Carried keys match exactly: a new failing file inside a carried directory,
+/// or a failure line naming no repo path, keeps the run blocking.
+#[cfg(unix)]
+#[test]
+fn a_new_failure_inside_a_carried_directory_or_an_unlocated_one_blocks() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("carried-partial");
+    let inside = format!(
+        "{CARRIED_SUITE}echo '--- FAIL: TestAlphaExtra (0.00s)'\n\
+         echo '    pkg/alpha/extra_test.ext:7: got 0, want 1'\n"
+    );
+    let unlocated = format!("{CARRIED_SUITE}echo 'panic: runtime error: index out of range'\n");
+    let (repo, base) = carried_repo(
+        &dir.0,
+        &[("inside.sh", &inside), ("unlocated.sh", &unlocated)],
+    );
+    let out = carried_run(
+        &dir.0,
+        "carried-partial",
+        &repo,
+        &base,
+        &["sh inside.sh", "sh unlocated.sh"],
+        &carried_keys(),
+    );
+    let results = &out["exec_results"];
+    assert_eq!(results[0]["carried"]["all"], false, "{out}");
+    assert_eq!(
+        results[0]["carried"]["new"],
+        json!([["pkg/alpha/extra_test.ext"]]),
+        "{out}"
+    );
+    assert_eq!(results[1]["carried"]["all"], false, "{out}");
+    assert_eq!(results[1]["carried"]["new"], json!([]), "{out}");
+    assert_eq!(results[1]["carried"]["unlocated"], 1, "{out}");
+
+    let mut state = verdict_state(json!([met("c1")]));
+    state["exec_results"] = results.clone();
+    let text = report(&dir.0, "carried-partial", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains("the command passed on the diff base; failures not declared carried: pkg/alpha/extra_test.ext)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the command passed on the diff base; 1 unlocated failure line(s))"),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
+/// carried_failures that is not a JSON array counts as none: the red run
+/// blocks as a regression and the report says the input was ignored. An
+/// empty list leaves the record as it always was.
+#[cfg(unix)]
+#[test]
+fn invalid_or_empty_carried_failures_change_nothing_but_a_note() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("carried-invalid");
+    let (repo, base) = carried_repo(&dir.0, &[("suite.sh", CARRIED_SUITE)]);
+    let regression = "exit 1 (recorded FAIL; a red declared command that did not already fail on \
+                      the diff base blocks CONFORMS; baseline on the diff base: regression, base \
+                      exit 0, the command passed on the diff base)";
+
+    let out = carried_run(
+        &dir.0,
+        "carried-invalid",
+        &repo,
+        &base,
+        &["sh suite.sh"],
+        "not json",
+    );
+    let error = out["carried_error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with("carried_failures treated as none: not valid JSON"),
+        "{out}"
+    );
+    assert!(out["exec_results"][0].get("carried").is_none(), "{out}");
+    let mut state = verdict_state(json!([met("c1")]));
+    state["exec_results"] = out["exec_results"].clone();
+    state["carried_error"] = out["carried_error"].clone();
+    let text = report(&dir.0, "carried-invalid", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(text.contains(regression), "{text}");
+    assert!(
+        text.contains(&format!("Advisory red runs (not blocking):\n- {error}\n")),
+        "{text}"
+    );
+
+    let out = carried_run(
+        &dir.0,
+        "carried-empty",
+        &repo,
+        &base,
+        &["sh suite.sh"],
+        "[]",
+    );
+    let record = &out["exec_results"][0];
+    assert!(
+        record.get("carried").is_none() && record.get("carried_note").is_none(),
+        "{out}"
+    );
+    assert!(out.get("carried_error").is_none(), "{out}");
+    state = verdict_state(json!([met("c1")]));
+    state["exec_results"] = out["exec_results"].clone();
+    let text = report(&dir.0, "carried-empty", &state);
+    assert!(text.contains(regression), "{text}");
+}
+
+/// A criterion naming the command may ask for it to pass, so a run made only
+/// of carried failures blocks while that criterion is not met.
+#[test]
+fn a_carried_red_run_blocks_while_a_criterion_naming_it_is_unmet() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("carried-criterion");
+    let mut record = red(
+        "sh suite.sh",
+        1,
+        "FAIL",
+        0,
+        "the command passed on the diff base",
+    );
+    record["pass_condition"] = json!({"condition": "exit 0", "criteria": ["c1"]});
+    record["carried"] = json!({"all": true, "matched": [{"paths": ["pkg/alpha/"], "owner": 2}],
+                               "new": [], "unlocated": 0});
+    let carried = "every failure is one the caller declared carried (owner 2): pkg/alpha/";
+    let baseline =
+        "baseline on the diff base: regression, base exit 0, the command passed on the diff base";
+
+    let state = judged_state(
+        &[("c1", "`sh suite.sh` passes", "UNMET")],
+        json!([record.clone()]),
+    );
+    let text = report(&dir.0, "carried-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `sh suite.sh` -- exit 1 (recorded FAIL; {carried}, and the criteria \
+             naming it are not all met: c1 UNMET; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+
+    let state = judged_state(&[("c1", "`sh suite.sh` passes", "MET")], json!([record]));
+    let text = report(&dir.0, "carried-met", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Advisory red runs (not blocking):\n- `sh suite.sh` -- exit 1 -- c1 MET: c1 holds: \
+             lib/report.src:3 -- {carried} -- {baseline}\n"
+        )),
+        "{text}"
+    );
+}

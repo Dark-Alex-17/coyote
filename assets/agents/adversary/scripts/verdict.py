@@ -17,7 +17,13 @@ when parsed criteria name it and every one of them ends MET or INSPECTED;
 both are reported as advisory red runs. A stated red run that no parsed
 criterion names blocks, and so does a red run that timed out (exit -1) or was
 killed by a signal (exit 128 or above), whatever its stated condition or
-baseline status. A
+baseline status. A red run whose record says every failure in its output is
+one the caller declared carried (`carried.all`, from run_checks.py) is
+advisory too, unless a parsed criterion naming it ends neither MET nor
+INSPECTED; a red run carrying only some of them blocks, and its complaint
+names the failures not declared carried and the count of failure lines that
+name no repo path. A `carried_note` on a record and a `carried_error` in the
+state are reported as advisory lines. A
 run that exited 0 under a stated condition is judged the same way as a
 stated red run and is never a green run. A
 command the runner's deadline skipped is
@@ -349,8 +355,10 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
     request states blocks, whatever its baseline status. A run that exited 0
     under a stated condition is gated the same way. A red run held to exit 0
     with a "tree-state" baseline blocks unless every criterion naming it ends
-    MET or INSPECTED, and is otherwise advisory. Any other red run blocks and
-    the complaint names the baseline outcome. A record the deadline skipped is
+    MET or INSPECTED, and is otherwise advisory; so does one whose `carried`
+    says every failure is a carried one. Any other red run blocks and the
+    complaint names the baseline outcome and any failures not declared
+    carried. A record's `carried_note` is an advisory line. A record the deadline skipped is
     not a run and yields nothing here. An "ENVIRONMENT: ..." runner-error
     marker with a non-empty declaration is one complaint: the declared
     commands never ran. Other string markers ("none declared",
@@ -388,6 +396,8 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
             continue
         outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
         judged = not killed_or_timed_out(code)
+        if note := str_field(r, "carried_note"):
+            advisory.append(f"- `{cmd}` -- carried failures {note}")
         if judged and condition["condition"] == STATED:
             blocks, text = stated_red(r, outcome, condition, by_id)
             (out if blocks else advisory).append(text)
@@ -396,9 +406,15 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
             blocks, text = tree_state_red(r, outcome, condition["criteria"], by_id)
             (out if blocks else advisory).append(text)
             continue
+        carried = r.get("carried") if isinstance(r.get("carried"), dict) else {}
+        if judged and carried.get("all") is True:
+            blocks, text = carried_red(r, outcome, condition["criteria"], by_id)
+            (out if blocks else advisory).append(text)
+            continue
         out.append(
             f"Verification run `{cmd}` — {outcome} (recorded FAIL; a red declared "
-            f"command that did not already fail on the diff base blocks CONFORMS; {baseline_text(r)})"
+            f"command that did not already fail on the diff base blocks CONFORMS; {baseline_text(r)}"
+            f"{carried_shortfall(carried)})"
         )
     return out, advisory
 
@@ -431,6 +447,49 @@ def tree_state_red(record, outcome, ids, by_id):
         f"Verification run `{cmd}` -- {outcome} (recorded FAIL; red only in the uncommitted live "
         f"tree, and the criteria naming it are not all met: {statuses}; {baseline_text(record)})"
     )
+
+
+def carried_red(record, outcome, ids, by_id):
+    """(blocks, text) for a red run whose every failure the caller declared carried. A
+    criterion naming the command may ask for it to pass, so such a run blocks unless those
+    criteria all end met."""
+    cmd = record.get("cmd", "?")
+    met, naming = naming_judged_met(ids, by_id)
+    if met:
+        reasons = f"{met_reasons(naming, by_id)} -- " if naming else ""
+        return False, f"- `{cmd}` -- {outcome} -- {reasons}{carried_text(record)} -- {baseline_text(record)}"
+    statuses = ", ".join(f"{cid} {status}" for cid, status in naming)
+    return True, (
+        f"Verification run `{cmd}` -- {outcome} (recorded FAIL; {carried_text(record)}, and the "
+        f"criteria naming it are not all met: {statuses}; {baseline_text(record)})"
+    )
+
+
+def failure_keys(keys):
+    return [", ".join(str(p) for p in k) for k in keys if isinstance(k, list)]
+
+
+def carried_text(record):
+    """The matched carried failures grouped by owner, in the order they were located."""
+    groups = {}
+    for m in record["carried"].get("matched") or []:
+        if isinstance(m, dict):
+            owner = m.get("owner")
+            label = "?" if owner is None or owner == "" else str(owner)
+            groups.setdefault(label, []).extend(failure_keys([m.get("paths")]))
+    owned = "; ".join(f"(owner {label}): {', '.join(keys)}" for label, keys in groups.items())
+    return f"every failure is one the caller declared carried {owned}"
+
+
+def carried_shortfall(carried):
+    """The complaint suffix for a red run only some of whose failures the caller declared carried."""
+    text = ""
+    if new := failure_keys(carried.get("new") or []):
+        text += f"; failures not declared carried: {'; '.join(new)}"
+    unlocated = carried.get("unlocated")
+    if type(unlocated) is int and unlocated > 0:
+        text += f"; {unlocated} unlocated failure line(s)"
+    return text
 
 
 def stated_red(record, outcome, condition, by_id):
@@ -602,6 +661,8 @@ def main():
         state.get("initial_prompt"),
         verdicts,
     )
+    if carried_error := str_field(state, "carried_error"):
+        advisory_reds.append(f"- {carried_error}")
     n_debris, debris_hits = debris_complaints(state)
     not_run = skipped_note(state.get("exec_results"))
     n = len(verdicts)
