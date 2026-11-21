@@ -3425,6 +3425,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 /// round counters among them are what the `_lib.py` bounds are checked on.
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "apply_reasks",
+    "base_integrated",
     "base_marker_retries",
     "base_merge_retries",
     "base_syncs",
@@ -3848,9 +3849,15 @@ fn initial_state_seeds_the_base_check_keys_with_their_types() {
     ] {
         assert_eq!(init[key].as_str(), Some(""), "initial_state.{key}");
     }
-    for key in ["base_syncs", "base_merge_retries"] {
+    for key in ["base_syncs", "base_integrated", "base_merge_retries"] {
         assert_eq!(init[key].as_i64(), Some(0), "initial_state.{key}");
     }
+    assert!(
+        init["base_facts"]
+            .as_mapping()
+            .is_some_and(|m| m.is_empty()),
+        "initial_state.base_facts is not an empty mapping"
+    );
     assert_eq!(
         init["base_sync_active"].as_bool(),
         Some(false),
@@ -3862,6 +3869,50 @@ fn initial_state_seeds_the_base_check_keys_with_their_types() {
             .is_some_and(|s| s.is_empty()),
         "initial_state.base_conflicted is not an empty list"
     );
+}
+
+/// Every shipped file is ASCII on disk, apart from the two review severity
+/// markers the gauntlet output carries, which the gates parse and the smoke
+/// battery feeds; their count per file is pinned.
+#[test]
+fn shipped_candidate_is_ascii_apart_from_the_severity_markers() {
+    let markers = ['\u{1f534}', '\u{1f7e1}'];
+    let expected = [("scripts/gates.py", 1), ("scripts/smoke_test.py", 3)];
+    let mut offenders = Vec::new();
+    let mut counted = Vec::new();
+    let mut seen = 0;
+    for rel in files_under(&candidate_dir()) {
+        if rel.contains("__pycache__") {
+            continue;
+        }
+        seen += 1;
+        let bytes = fs::read(candidate_dir().join(&rel)).unwrap();
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            offenders.push(format!("{rel}: not UTF-8"));
+            continue;
+        };
+        let mut kept = 0;
+        for (line_no, line) in text.lines().enumerate() {
+            for c in line.chars().filter(|c| !c.is_ascii()) {
+                if markers.contains(&c) {
+                    kept += 1;
+                } else {
+                    offenders.push(format!("{rel}:{}: U+{:04X}", line_no + 1, c as u32));
+                }
+            }
+        }
+        if kept > 0 {
+            counted.push((rel, kept));
+        }
+    }
+    assert!(seen > 40, "the ASCII sweep saw only {seen} files");
+    assert!(
+        offenders.is_empty(),
+        "non-ASCII bytes in shipped files:\n{}",
+        offenders.join("\n")
+    );
+    let counted: Vec<(&str, usize)> = counted.iter().map(|(r, n)| (r.as_str(), *n)).collect();
+    assert_eq!(counted, expected, "severity markers per shipped file");
 }
 
 /// Each `subprocess.run(...)` call in `source` as its 1-based line number and
