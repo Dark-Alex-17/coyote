@@ -6564,12 +6564,22 @@ with scenario("failed-once: an autonomous design approach answer on subtask 1 le
     second = gates.design_gate(base_state(design_options=approach, subtask_index=1))["escalation"]
     u = gates.escalate_gate(base_state(escalation=second, subtask_index=1, escalation_policy="autonomous",
                                        **autonomous_after(answered)))
-    check(name, u["_next"] == "ladder_judge", (autonomous_after(answered), u.get("_next")))
+    check(name, answered.get("autonomous_decisions") == ["approach|s0|sub"] and u["_next"] == "ladder_judge",
+          (autonomous_after(answered), u.get("_next")))
+with scenario("failed-once: the same approach question raised again in the same subtask after an autonomous answer "
+              "-> owner") as name:
+    again = gates.design_gate(base_state(design_options=approach, subtask_index=0))["escalation"]
+    u = gates.escalate_gate(base_state(escalation=again, subtask_index=0, escalation_policy="autonomous",
+                                       **autonomous_after(answered)))
+    check(name, u["_next"] == "ask_dispatch", (autonomous_after(answered), u.get("_next")))
 with scenario("failed-once: a register question in the same subtask is its own decision, not the approach") as name:
     register = gates.design_gate(base_state(register_question="I see X and Y. Which?", subtask_index=0))["escalation"]
+    register_key = gates._decision_key(base_state(subtask_index=0), register)
     u = gates.escalate_gate(base_state(escalation=register, subtask_index=0, escalation_policy="autonomous",
                                        **autonomous_after(answered)))
-    check(name, u["_next"] == "ladder_judge", (register.get("data"), u.get("_next")))
+    check(name, re.fullmatch(r"register:[0-9a-f]{8}\|s0\|sub", register_key)
+          and register_key not in answered.get("autonomous_decisions", []) and u["_next"] == "ladder_judge",
+          (register_key, u.get("_next")))
 with scenario("failed-once: review_exhausted raised again in the same subtask after an autonomous answer -> owner, "
               "whatever its question text") as name:
     ex1 = escalation("review_exhausted", "3 rounds failed on lane security", [option("Stop", True)])
@@ -6623,8 +6633,8 @@ GREEN_BASIS = "written and run green by the probe lane in passing round 2"
 
 
 def probe_pass_round(name, path):
-    """A scratch repo whose review round 2 passes after its probe lane wrote `path`; (state after route_gauntlet,
-    route_gauntlet's update)."""
+    """A scratch repo whose second gauntlet round passes after its probe lane wrote `path`; (state after
+    route_gauntlet, route_gauntlet's update)."""
     root = adopt_repo(name)
     round2 = {"round": 2, "head": "h", "code_tree": gates._worktree_tree(root)}
     put(root, path)
@@ -6671,6 +6681,24 @@ with scenario("render_coder_prompt: the first coder prompt lists the declared ve
     context = prompt.split("## CONTEXT", 1)[-1]
     check(name, "The review reruns these declared verification commands against the change:\n"
                 "- ./check --filter export_order\n- ./lint" in context, prompt[-800:])
+with scenario("render_coder_prompt: the seeded empty review list falls back to the declared verification "
+              "commands") as name:
+    prompt = gates.render_coder_prompt(base_state(verification_commands=DECLARED,
+                                                  review_verification_commands="[]"))["coder_prompt"]
+    check(name, "- ./check --filter export_order\n- ./lint" in prompt.split("## CONTEXT", 1)[-1], prompt[-800:])
+with scenario("next_subtask: subtask 2's first coder prompt does not list subtask 1's review commands") as name:
+    started = gates.next_subtask(base_state(subtasks=subs[:2], subtask_index=1, intent="trivial",
+                                            verification_commands=DECLARED,
+                                            review_verification_commands=json.dumps(["./sub1-only"])))
+    prompt = gates.render_coder_prompt(base_state(**{k: v for k, v in started.items() if k != "_next"},
+                                                  verification_commands=DECLARED))["coder_prompt"]
+    check(name, started.get("review_verification_commands") == "[]" and "./sub1-only" not in prompt
+          and "- ./lint" in prompt, (started.get("review_verification_commands"), prompt[-800:]))
+with scenario("next_subtask: the final whole-task review starts with no earlier review's commands") as name:
+    started = gates.next_subtask(base_state(subtasks=subs[:2], subtask_index=2,
+                                            review_verification_commands=json.dumps(["./sub2-only"])))
+    check(name, started.get("final_review") is True and started.get("review_verification_commands") == "[]",
+          (started.get("_next"), started.get("review_verification_commands")))
 with scenario("render_coder_prompt: a fix round lists the commands the last review ran, criterion commands "
               "included") as name:
     fixed = gates.compose_fix(base_state(fix_source="review", fix_items=["adversary: DIVERGES"]))

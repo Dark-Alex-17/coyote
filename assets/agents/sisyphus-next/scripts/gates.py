@@ -1267,7 +1267,7 @@ def next_subtask(state):
         "context_pack_degraded": False, "explore_findings": [], "librarian_findings": [],
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
-        "scope_confirmed": False, "subtask_changed_files": None,
+        "scope_confirmed": False, "subtask_changed_files": None, "review_verification_commands": "[]",
         # the failures carried in, so the red test gate can tell them from ones this subtask introduces
         "failure_baseline": [f["paths"] for f in carried],
     })
@@ -1318,6 +1318,7 @@ def _start_final_review(state, u, n):
         "coder_brief": brief,
         "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
+        "review_verification_commands": "[]",
         # rejections made against a subtask's scope are no ruling on the parent criteria
         "final_rejections_from": len(as_list(state.get("rejected_findings"))),
         # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
@@ -3139,7 +3140,11 @@ def render_coder_prompt(state):
 
 def _declared_commands(state):
     """The verification commands the review reruns: the last review's list once a review ran, else the declared one."""
-    raw = state.get("review_verification_commands") or state.get("verification_commands") or "[]"
+    return (_command_list(state.get("review_verification_commands"))
+            or _command_list(state.get("verification_commands")))
+
+
+def _command_list(raw):
     try:
         arr = json.loads(raw) if isinstance(raw, str) else raw
     except json.JSONDecodeError:
