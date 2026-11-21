@@ -126,9 +126,11 @@ const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
 /// does not fit is clipped with a marker and cannot be approved until the
 /// terminal is tall enough.
 const TRANSCRIPT_MIN_ROWS: u16 = 4;
-/// Rows of the frame that are always drawn whatever else shows: the status
-/// row and the footer.
-const FIXED_ROWS: u16 = 2;
+/// Rows of the frame drawn whatever else shows: the status row, the
+/// footer and the rule over the status row. The rule yields its row only
+/// on a frame with no transcript row left, so the transcript's minimum
+/// is counted with it.
+const FIXED_ROWS: u16 = 3;
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
 /// The UI's own command, spelled without its sigil: it opens the key help
@@ -163,7 +165,7 @@ fn hint_spans(hint: &'static str, theme: &Theme) -> Vec<Span<'static>> {
 /// whose bottom pane takes `bottom_rows`: none when drawing it would leave
 /// the transcript no row, so a short frame gives the row to the bottom pane.
 fn rule_rows(area_height: u16, bottom_rows: u16) -> u16 {
-    u16::from(area_height > FIXED_ROWS + bottom_rows + 1)
+    u16::from(area_height > FIXED_ROWS + bottom_rows)
 }
 
 /// The footer's left half, read from the context only while the UI holds
@@ -529,6 +531,9 @@ impl App {
                     self.theme = Theme::new(renderer.markdown_render(), renderer.no_color);
                     self.renderer = renderer;
                     self.transcript.forget_layout();
+                    for prompt in &mut self.prompts {
+                        prompt.forget_question_layout();
+                    }
                     if let Some(pager) = self.pager_mut() {
                         pager.forget_layout();
                     }

@@ -936,11 +936,14 @@ impl Cell {
                 row,
                 cache,
             } => cache.get(width, || {
-                let (state, error) = job_state(&row.status);
-                let reserved = "job   ".len() + state.width();
-                let subject = fit_to_row(&format!("{tool} {job_id}"), reserved, width);
-                let header = format!("job {subject}  {state}");
-                row_lines(header, error, row, width)
+                let styles = ToolHeaderStyles::new(renderer.markdown_render(), no_color);
+                let header = RowHeader {
+                    kind: "job",
+                    name: tool,
+                    id: job_id,
+                    state: job_state(&row.status),
+                };
+                row_lines(header, row, width, &styles)
             }),
             Cell::Agent {
                 agent_id,
@@ -948,11 +951,14 @@ impl Cell {
                 row,
                 cache,
             } => cache.get(width, || {
-                let (state, error) = agent_state(&row.status);
-                let reserved = "agent   ".len() + state.width();
-                let subject = fit_to_row(&format!("{name} {agent_id}"), reserved, width);
-                let header = format!("agent {subject}  {state}");
-                row_lines(header, error, row, width)
+                let styles = ToolHeaderStyles::new(renderer.markdown_render(), no_color);
+                let header = RowHeader {
+                    kind: "agent",
+                    name,
+                    id: agent_id,
+                    state: agent_state(&row.status),
+                };
+                row_lines(header, row, width, &styles)
             }),
             Cell::Welcome {
                 model,
@@ -1114,18 +1120,60 @@ fn dim_wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A job's or agent's row: one header line with its folded calls
-/// summarised, clipped by the view rather than wrapped; when open, the
-/// whole error and then each folded call's output. The header is the
-/// row's own text, so it is scrubbed rather than parsed for colour.
+/// What a job's or agent's header names: `<kind> <name> <id>  <state>`,
+/// and the whole error of a failed one.
+struct RowHeader<'a> {
+    kind: &'static str,
+    name: &'a str,
+    id: &'a str,
+    state: (String, Option<&'a str>),
+}
+
+/// A job's or agent's row: one header line behind the fold arrow, in the
+/// colours of a tool row's, with its folded calls summarised and clipped
+/// by the view rather than wrapped; when open, the whole error and then
+/// each folded call's output, indented under the header. The header is
+/// the row's own text, so it is scrubbed rather than parsed for colour.
 fn row_lines<S>(
-    header: String,
-    error: Option<&str>,
+    header: RowHeader<'_>,
     row: &TaskRow<S>,
     width: u16,
+    styles: &ToolHeaderStyles,
 ) -> Vec<Line<'static>> {
-    let header = with_folded(header, &row.calls);
-    let mut lines = vec![Line::from(Span::styled(render::plain_text(&header), DIM))];
+    let RowHeader {
+        kind,
+        name,
+        id,
+        state: (state, error),
+    } = header;
+    let arrow = if row.expanded {
+        EXPANDED_ARROW
+    } else {
+        COLLAPSED_ARROW
+    };
+    let reserved = arrow.width() + kind.len() + "   ".len() + state.width();
+    let subject = render::plain_text(&fit_to_row(&format!("{name} {id}"), reserved, width));
+    let (name, rest) = subject.split_at(subject.find(' ').unwrap_or(subject.len()));
+    let state_style = if error.is_some() {
+        styles.failed
+    } else {
+        styles.muted
+    };
+    let mut spans = vec![
+        Span::styled(arrow, styles.muted),
+        Span::styled(format!("{kind} "), styles.muted),
+        Span::styled(name.to_string(), styles.name),
+        Span::styled(format!("{rest}  "), styles.muted),
+        Span::styled(render::plain_text(&state), state_style),
+    ];
+    let summary = folded_summary(&row.calls);
+    if !summary.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", render::plain_text(&summary)),
+            styles.muted,
+        ));
+    }
+    let mut lines = vec![Line::from(spans)];
     if row.expanded {
         let mut body = Vec::new();
         if let Some(error) = error {
@@ -1134,7 +1182,11 @@ fn row_lines<S>(
         for call in &row.calls {
             body.extend(output_lines(&call.tail.lines));
         }
-        lines.extend(dim_wrapped(body, width));
+        let body_width = width.saturating_sub(BODY_INDENT.len() as u16).max(1);
+        lines.extend(dim_wrapped(body, body_width).into_iter().map(|mut line| {
+            line.spans.insert(0, Span::raw(BODY_INDENT));
+            line
+        }));
     }
     lines
 }
@@ -1781,7 +1833,8 @@ mod tests {
     }
 
     /// A job's or agent's failure keeps the collapsed row to one line
-    /// however long the message; opening the row shows it whole.
+    /// however long the message, behind the fold arrow with the name in
+    /// the call line's style; opening the row shows it whole.
     #[test]
     fn a_long_failure_stays_on_one_collapsed_line_and_opens_whole() {
         let mut renderer = renderer();
@@ -1806,10 +1859,39 @@ mod tests {
         for cell in &mut rows {
             let lines = cell.lines(40, &mut renderer);
             assert_eq!(lines.len(), 1, "{lines:?}");
-            assert!(lines[0].to_string().contains("failed: eee"));
+            let header = lines[0].to_string();
+            assert!(header.contains("failed: eee"), "{header}");
+            assert!(header.starts_with(COLLAPSED_ARROW), "{header}");
+            let bold: Vec<&str> = lines[0]
+                .spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(bold.len(), 1, "only the name is bold: {bold:?}");
+            assert!(
+                ["exe", "rev"]
+                    .iter()
+                    .any(|start| bold[0].starts_with(start)),
+                "{bold:?}"
+            );
+            let failed = lines[0]
+                .spans
+                .iter()
+                .find(|span| span.content.starts_with("failed: "))
+                .expect("the state is a span of its own");
+            assert!(!failed.style.add_modifier.contains(Modifier::BOLD));
             cell.toggle();
             let lines = cell.lines(40, &mut renderer);
-            let body: String = lines[1..].iter().map(Line::to_string).collect();
+            assert!(lines[0].to_string().starts_with(EXPANDED_ARROW));
+            let body: String = lines[1..]
+                .iter()
+                .map(|line| {
+                    let text = line.to_string();
+                    assert!(text.starts_with(BODY_INDENT), "{text:?} is not indented");
+                    text[BODY_INDENT.len()..].to_string()
+                })
+                .collect();
             assert_eq!(body, format!("error: {error}"));
             for line in &lines[1..] {
                 assert!(line.width() <= 40, "{line:?} is wider than the view");

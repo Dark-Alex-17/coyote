@@ -1470,7 +1470,7 @@ mod tests {
         for i in 0..5 {
             transcript.push(Cell::user(&format!("line {i}")));
         }
-        transcript.push(tool("a"));
+        transcript.push(open_tool("a"));
         grow_tool(&mut transcript, 5, "a", 2);
         for i in 6..16 {
             transcript.push(Cell::user(&format!("line {i}")));
@@ -1485,7 +1485,7 @@ mod tests {
         (transcript, renderer, before)
     }
 
-    /// A view starting on the blank line after a running tool row stays
+    /// A view starting on the blank line after an open tool row stays
     /// on it as the row grows, rather than starting on the new output.
     #[test]
     fn a_view_starting_between_cells_holds_as_the_cell_above_grows() {
@@ -1537,7 +1537,7 @@ mod tests {
         assert_eq!(rows(&view), before);
     }
 
-    /// A running row below the view closing brings the bottom up past
+    /// An open row below the view closing brings the bottom up past
     /// the view's last line; the view stays scrolled, with its count,
     /// rather than going back to following.
     #[test]
@@ -1546,14 +1546,14 @@ mod tests {
         for i in 0..10 {
             transcript.push(Cell::user(&format!("line {i}")));
         }
-        transcript.push(tool("b"));
+        transcript.push(open_tool("b"));
         grow_tool(&mut transcript, 10, "b", 5);
         transcript.view(area(5), &mut renderer);
         transcript.scroll_lines(-2);
         transcript.view(area(5), &mut renderer);
         transcript.push(Cell::user("late"));
         transcript.view(area(5), &mut renderer);
-        finish_tool(&mut transcript, 10);
+        finish_and_close(&mut transcript, 10);
         let view = transcript.view(area(5), &mut renderer);
         assert!(transcript.scrolled());
         assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));

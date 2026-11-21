@@ -277,6 +277,11 @@ impl PendingPrompt {
         });
     }
 
+    /// Drops the question's layout so a new renderer lays it out again.
+    pub(super) fn forget_question_layout(&mut self) {
+        self.question_markdown = LineCache::default();
+    }
+
     /// The question at `width` and the help line dimmed under it, apart,
     /// so the question alone takes the question colour. Until the frame
     /// has laid the markdown out the question reads as plain text.
@@ -354,7 +359,7 @@ impl PendingPrompt {
             + self.hint_rows(width)
             + self.origin_rows();
         let wanted = match &self.field {
-            Some(field) => wrapped_rows(field.lines(), width),
+            Some(field) => wrapped_rows(field.lines(), width, field.mask_char()),
             None => self.option_rows(width).iter().map(Vec::len).sum(),
         };
         row_count(wanted).clamp(1, height.saturating_sub(fixed).max(1))

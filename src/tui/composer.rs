@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The rule's title while the vi layer is in normal mode.
 pub(super) const NORMAL_TAG: &str = " NORMAL ";
@@ -202,7 +202,7 @@ impl Composer {
     /// they wrap, following the draft between the bounds, plus the rules
     /// above and below them.
     pub(super) fn rows(&self, width: u16) -> u16 {
-        u16::try_from(wrapped_rows(self.textarea.lines(), width))
+        u16::try_from(wrapped_rows(self.textarea.lines(), width, None))
             .unwrap_or(MAX_ROWS)
             .clamp(MIN_ROWS, MAX_ROWS)
             + RULE_ROWS
@@ -225,14 +225,67 @@ impl Composer {
     }
 }
 
-/// Screen rows `lines` take wrapped at word boundaries to `width`, a
-/// word too long for a row broken across rows, as a field wraps them.
-pub(super) fn wrapped_rows(lines: &[String], width: u16) -> usize {
+/// Columns a tab advances to the next stop, as the field draws it.
+const TAB_LEN: usize = 4;
+
+/// Screen rows `lines` take in a field `width` wide, packed the way the
+/// field wraps: chunks fill a row while they fit, a run of spaces is a
+/// chunk of its own, and a chunk wider than a whole row is broken across
+/// rows. The field also breaks at punctuation, which this does not, so
+/// the count is never below the rows the field draws. A masked field
+/// draws every character as `mask`.
+pub(super) fn wrapped_rows(lines: &[String], width: u16, mask: Option<char>) -> usize {
     let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .map(|line| textwrap::wrap(line, width).len().max(1))
-        .sum()
+    lines.iter().map(|line| line_rows(line, width, mask)).sum()
+}
+
+fn line_rows(line: &str, width: usize, mask: Option<char>) -> usize {
+    let advance = |c: char, at: usize| match mask {
+        Some(mask) => mask.width().unwrap_or(1),
+        None if c == '\t' => TAB_LEN - at % TAB_LEN,
+        None => c.width().unwrap_or(0),
+    };
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (at, c) in line.char_indices().skip(1) {
+        let before = line[..at].chars().next_back().unwrap_or(c);
+        if before.is_whitespace() != c.is_whitespace() {
+            chunks.push(&line[start..at]);
+            start = at;
+        }
+    }
+    chunks.push(&line[start..]);
+
+    let mut rows = 1;
+    let mut used = 0;
+    for chunk in chunks {
+        let span = chunk.chars().fold(used, |at, c| at + advance(c, at)) - used;
+        if used + span <= width {
+            used += span;
+            continue;
+        }
+        if used > 0 {
+            rows += 1;
+            used = 0;
+            let fresh = chunk.chars().fold(0, |at, c| at + advance(c, at));
+            if fresh <= width {
+                used = fresh;
+                continue;
+            }
+        }
+        for c in chunk.chars() {
+            let step = advance(c, used);
+            if used + step > width && used > 0 {
+                rows += 1;
+                used = 0;
+            }
+            used += step;
+        }
+        // The field starts whatever follows a broken chunk on a row of
+        // its own, however much of the last row the chunk left free.
+        used = width;
+    }
+    rows
 }
 
 pub(super) struct ComposerView<'a> {
@@ -600,9 +653,27 @@ mod tests {
 
         composer.set_text(&"x".repeat(45));
         assert_eq!(
-            wrapped_rows(composer.lines(), 20),
+            wrapped_rows(composer.lines(), 20, None),
             3,
             "a long word is not broken"
+        );
+    }
+
+    /// The count follows the field's packing where it differs from plain
+    /// word wrapping: a space is a chunk that takes a row of its own when
+    /// nothing else fits, and what follows a broken word starts a row.
+    #[test]
+    fn the_row_count_packs_like_the_field() {
+        let rows = |line: &str| wrapped_rows(&[line.to_string()], 20, None);
+        assert_eq!(rows(&"a".repeat(20)), 1, "a word that fills the row");
+        assert_eq!(rows(&format!("{} {}", "a".repeat(20), "b".repeat(20))), 3);
+        assert_eq!(rows(&format!("{} y", "x".repeat(25))), 3);
+        assert_eq!(rows("\tx"), 1);
+        assert_eq!(rows(""), 1);
+        assert_eq!(
+            wrapped_rows(&["\u{4e2d}".repeat(10)], 20, Some('*')),
+            1,
+            "a masked field draws one mask per character"
         );
     }
 }

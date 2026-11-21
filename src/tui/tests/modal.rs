@@ -1017,10 +1017,14 @@ fn a_clipped_question_shows_a_marker_and_cannot_be_approved() {
     let rendered = harness.draw();
     insta::assert_snapshot!("clipped_question_marker_40x20", &rendered);
     assert!(
-        rendered.contains("(+2 more lines; enlarge the terminal)"),
+        screen_row(&harness, ratatui::symbols::line::HORIZONTAL) >= TRANSCRIPT_MIN_ROWS,
+        "the question took the transcript's minimum\n{rendered}"
+    );
+    assert!(
+        rendered.contains("(+3 more lines; enlarge the terminal)"),
         "{rendered}"
     );
-    assert!(!rendered.contains("line 11 of"), "{rendered}");
+    assert!(!rendered.contains("line 10 of"), "{rendered}");
     assert!(
         squeezed(&rendered).contains("Esc=cancelenlargetheterminaltoanswer"),
         "{rendered}"
@@ -1504,14 +1508,17 @@ fn the_question_and_the_highlighted_option_have_colours_of_their_own() {
         let question = style_at(&harness, "Pick one q9d-s");
         let plain = style_at(&harness, "  alpha");
         let marked = style_at(&harness, "> beta");
-        let theme = &harness.app.theme;
         assert!(marked.1.contains(Modifier::BOLD), "{no_color}");
         assert!(!plain.1.contains(Modifier::BOLD), "{no_color}");
         assert_eq!(plain.0, Color::Reset, "{no_color}");
         if no_color {
             assert_eq!((question.0, marked.0), (Color::Reset, Color::Reset));
         } else {
-            assert_eq!(Some(question.0), theme.question.fg);
+            assert_eq!(
+                question.0,
+                Color::Yellow,
+                "the REPL question colour with no theme"
+            );
             assert_eq!(marked.0, Color::LightCyan);
             assert_ne!(question.0, Color::Reset);
         }
@@ -1586,30 +1593,43 @@ fn the_other_field_wraps_its_text() {
 }
 
 /// Coyote's and an agent's questions are rendered as markdown; a tool's
-/// stays plain so every character it asks to approve shows.
+/// stays plain so every character it asks to approve shows, in the same
+/// question colour.
 #[test]
 fn only_a_question_without_a_tool_is_rendered_as_markdown() {
     let source = "Keep `notes` **now**? m3d";
-    let mut harness = Harness::standalone(80, 24);
-    let expected: Vec<String> = harness
-        .app
-        .renderer
-        .markdown(source, 80)
-        .iter()
-        .map(|line| line.to_string().trim_end().to_string())
-        .collect();
-    assert_ne!(
-        expected[0], source,
-        "the renderer left the markdown as it was"
-    );
-    let req = PromptRequest::new(PromptAction::Confirm, source, Origin::detached());
-    let _asker = ask_on_a_thread(&mut harness, req);
-    let frame = harness.draw();
-    let row = screen_row(&harness, expected[0].as_str());
-    assert_eq!(row_text(&harness, row).trim_end(), expected[0], "{frame}");
-    harness.press(KeyCode::Esc);
+    let agent = Origin {
+        agent_id: Some("agent-m3d".to_string()),
+        depth: 1,
+    };
+    for origin in [Origin::detached(), agent] {
+        let mut harness = Harness::standalone(80, 24);
+        let expected: Vec<String> = harness
+            .app
+            .renderer
+            .markdown(source, 80)
+            .iter()
+            .map(|line| line.to_string().trim_end().to_string())
+            .collect();
+        assert_ne!(
+            expected[0], source,
+            "the renderer left the markdown as it was"
+        );
+        let req = PromptRequest::new(PromptAction::Confirm, source, origin.clone());
+        let _asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        let row = screen_row(&harness, expected[0].as_str());
+        assert_eq!(
+            row_text(&harness, row).trim_end(),
+            expected[0],
+            "{origin:?}\n{frame}"
+        );
+        assert!(!frame.contains(source), "{origin:?}\n{frame}");
+        harness.press(KeyCode::Esc);
+    }
 
     let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
     let req = PromptRequest {
         tool: Some("fs_rm".to_string()),
         ..PromptRequest::new(PromptAction::Confirm, source, Origin::detached())
@@ -1617,5 +1637,8 @@ fn only_a_question_without_a_tool_is_rendered_as_markdown() {
     let _asker = ask_on_a_thread(&mut harness, req);
     let frame = harness.draw();
     assert!(frame.contains(source), "{frame}");
+    assert!(frame.contains("fs_rm asks:"), "{frame}");
+    let (colour, _) = style_at(&harness, source);
+    assert_eq!(colour, Color::Yellow, "the tool's question is not orange");
     harness.press(KeyCode::Esc);
 }

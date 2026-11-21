@@ -3330,12 +3330,18 @@ fn the_palette_band_sits_above_the_rule_and_keeps_the_transcript_minimum() {
         "the rule sits between the transcript and the status row\n{frame}"
     );
 
-    harness.resize(80, 13);
+    harness.resize(80, 14);
     harness.render();
-    let room = 13 - (harness.app.composer.rows(80) + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
-    assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 13)), room);
+    let room = 14 - (harness.app.composer.rows(80) + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
+    assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 14)), room);
     let frame = harness.terminal.backend().to_string();
-    let band_top = 13 - 1 - harness.app.composer.rows(80) - room;
+    let band_top = 14 - 1 - harness.app.composer.rows(80) - room;
+    let transcript_rule = screen_row(&harness, ratatui::symbols::line::HORIZONTAL);
+    assert_eq!(transcript_rule, band_top - 2, "{frame}");
+    assert!(
+        transcript_rule >= TRANSCRIPT_MIN_ROWS,
+        "the band took the transcript's minimum\n{frame}"
+    );
     assert!(row_text(&harness, band_top).starts_with('.'), "{frame}");
     assert!(
         row_text(&harness, band_top + room - 1).contains("(+"),
@@ -4917,7 +4923,7 @@ fn the_key_help_pops_up_over_the_transcript_wide_and_narrow() {
         let frame = harness.draw();
         assert!(frame.contains("Suspend to the shell"), "{frame}");
         let open: Vec<&str> = frame.lines().collect();
-        let below = usize::from(harness.app.composer.rows(80)) + 1;
+        let below = usize::from(harness.app.composer.rows(width)) + 1;
         let first_below = open.len() - below;
         assert_eq!(open[first_below..], closed[first_below..], "{frame}");
         let status = open[first_below - 1];
