@@ -25,7 +25,8 @@ from _lib import (  # noqa: E402
     BASE_FETCH_SECS, BASE_GIT_SECS, BASE_SYNC_MAX,
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
     CI_PASS, CI_PENDING, CI_POLL_BACKOFF, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
-    DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
+    DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, HEADLESS_GUIDANCE,
+    OWNER_POLL_MAX,
     ENGINE_VISIT_CAP, POLL_VISIT_BUDGET, CI_NO_CHECKS_SECS,
     OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
@@ -316,7 +317,8 @@ def intake(state):
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
-                  "probe_adoption", "base_syncs", "base_integrated"):
+                  "probe_adoption", "base_syncs", "base_integrated", "attention_notes", "autonomous_decisions",
+                  "judge_rulings"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -806,8 +808,9 @@ def _route_intent(state, u):
         # only the fixed Abort option assess_fault adds is a stop; an assessed option such as "Stop using the
         # in-memory cache" is an answer
         stops = ["Abort"] if truthy(state.get("assess_faulted")) else []
-        return raise_escalation(state, u, escalation("clarify", q.get("question", ""), opts,
-                                                     data={"stop_options": stops}))
+        asked = q.get("question", "")
+        return raise_escalation(state, u, escalation("clarify", asked, opts, data={
+            "stop_options": stops, "decision": _hashed_decision("clarify", asked)}))
 
     if intent in ("exploration", "design_question"):
         u["_next"] = "research_answer"
@@ -1265,7 +1268,7 @@ def next_subtask(state):
         "context_pack_degraded": False, "explore_findings": [], "librarian_findings": [],
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
-        "scope_confirmed": False, "subtask_changed_files": None,
+        "scope_confirmed": False, "subtask_changed_files": None, "review_verification_commands": "[]",
         # the failures carried in, so the red test gate can tell them from ones this subtask introduces
         "failure_baseline": [f["paths"] for f in carried],
     })
@@ -1316,6 +1319,7 @@ def _start_final_review(state, u, n):
         "coder_brief": brief,
         "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
+        "review_verification_commands": "[]",
         # rejections made against a subtask's scope are no ruling on the parent criteria
         "final_rejections_from": len(as_list(state.get("rejected_findings"))),
         # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
@@ -1515,13 +1519,15 @@ def design_gate(state):
         q = state["register_question"].strip()
         u["register_question"] = ""
         return raise_escalation(state, u, escalation("design_choice", q, [], evidence="codebase register: "
-                                                     + str(state.get("codebase_register") or "")))
+                                                     + str(state.get("codebase_register") or ""),
+                                                     data={"decision": _hashed_decision("register", q)}))
     opts = [o for o in as_list(state.get("design_options")) if isinstance(o, dict) and o.get("text")]
     if opts:
         u["design_options"] = []
         return raise_escalation(state, u, escalation(
             "design_choice", "Which design approach should the implementation follow?",
-            [option(o["text"], o.get("recommended", False), o.get("evidence", "")) for o in opts]))
+            [option(o["text"], o.get("recommended", False), o.get("evidence", "")) for o in opts],
+            data={"decision": "approach"}))
     proposal = (state.get("architecture_proposal") or "").strip()
     if proposal and not truthy(state.get("proposal_confirmed")):
         u["proposal_confirmed"] = True
@@ -1529,14 +1535,28 @@ def design_gate(state):
             "design_choice", "Adopt the architecture-reviewer's refined proposal as the implementation plan?",
             [option("Adopt the proposal", recommended=True, evidence="refined into an implementation-ready interface"),
              option("Skip it; implement the request as stated")],
-            evidence=tail(proposal, 1500)))
+            evidence=tail(proposal, 1500), data={"decision": "proposal"}))
     u["_next"] = "compose_brief"
     return u
 
 
+def _hashed_decision(prefix, question):
+    return f"{prefix}:{hashlib.sha1(str(question).encode('utf-8', 'replace')).hexdigest()[:8]}"
+
+
+def _decision_key(state, esc):
+    """The decision an escalation asks about, in the subtask or final review that raised it.
+
+    A kind that carries several unrelated decisions names the one it asks in data.decision; any other kind is one
+    decision per subtask, whatever its question text says."""
+    decision = as_dict(esc.get("data")).get("decision") or esc.get("kind", "unknown")
+    review = "final" if truthy(state.get("final_review")) else "sub"
+    return f"{decision}|s{as_int(state.get('subtask_index'))}|{review}"
+
+
 # ====================================================================== 2.3
 # escalation kinds whose fixed options have an approval node of their own, never a multiple-choice prompt
-OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm", "review_incomplete")
+OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm")
 
 
 def normalize_choices(state, u, esc):
@@ -1609,7 +1629,8 @@ def escalate_gate(state):
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
-    failed_once = kind in as_list(state.get("autonomous_kinds"))
+    key = _decision_key(state, esc)
+    failed_once = key in as_list(state.get("autonomous_decisions"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -1620,9 +1641,13 @@ def escalate_gate(state):
         u["_next"] = "ladder_judge"
     else:
         if failed_once:
-            ledger(state, u, f"ladder: {kind} already resolved autonomously once; hard trigger -> owner")
+            ledger(state, u, f"ladder: {key} already resolved autonomously once; hard trigger -> owner")
         u["_next"] = "ask_dispatch"
     return u
+
+
+def _autonomous_decisions(state, esc):
+    return list(as_list(state.get("autonomous_decisions"))) + [_decision_key(state, esc)]
 
 
 def ladder_route(state):
@@ -1645,8 +1670,7 @@ def ladder_route(state):
             basis = state.get("ladder_basis") or res
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             digest = list(as_list(state.get("autonomous_digest"))) + [line]
-            kinds = list(as_list(state.get("autonomous_kinds"))) + [esc.get("kind")]
-            u.update({"autonomous_digest": digest, "autonomous_kinds": kinds,
+            u.update({"autonomous_digest": digest, "autonomous_decisions": _autonomous_decisions(state, esc),
                       "last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
@@ -1702,7 +1726,7 @@ def consult_route(state):
                               and _stated_reason(choice, options) != NO_STATED_REASON)
         if choice and not qualified_stop:
             u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0,
-                      "answer_source": "navigator"})
+                      "answer_source": "navigator", "autonomous_decisions": _autonomous_decisions(state, esc)})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
             u["_next"] = "apply_answer"
             return u
@@ -1723,8 +1747,7 @@ def consult_route(state):
     return u
 
 
-_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "handoff_confirm": "confirm_handoff",
-                     "draft_confirm": "confirm_draft",
+_TERMINAL_PROMPTS = {"handoff_confirm": "confirm_handoff", "draft_confirm": "confirm_draft",
                      "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 
 
@@ -1825,6 +1848,9 @@ def parse_answer(state):
         # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
         choice = headless
         ledger(state, u, f"headless: {kind}: no human available -> the recommended option: {tail(choice, 200)}")
+    elif text == HEADLESS_GUIDANCE and options and kind not in OWN_PROMPT_KINDS:
+        # no option is recommended, so a model judge decides; the canned reply is never interpreted or re-asked
+        return _to_headless_judge(state, u, esc)
     elif kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
         choice = _bare_pick(text, options) or text
@@ -1862,6 +1888,32 @@ def parse_answer(state):
     return u
 
 
+def _to_headless_judge(state, u, esc):
+    """Send a question with no human and no recommended option to the headless judge, at most STRIKE_LIMIT times per
+    decision, so a run whose judge keeps going on cannot loop forever. A hard trigger is the user's call: no model
+    decides it, so the run stops and reports the question."""
+    kind = esc.get("kind", "")
+    asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
+    if esc.get("hard_trigger"):
+        ledger(state, u, f"headless: {kind}: a hard trigger with no recommended option and no human -> stop and report")
+        u["failure_reason"] = (f"stopped: {kind}: a hard trigger needs a human answer and none is available; the "
+                               f"question was: {tail(asked, 500)}")
+        u["_next"] = "end_blocked"
+        return u
+    key = _decision_key(state, esc)
+    rulings = dict(as_dict(state.get("judge_rulings")))
+    if as_int(rulings.get(key)) >= STRIKE_LIMIT:
+        ledger(state, u, f"headless judge: {key}: already decided {rulings[key]} times -> stop and report")
+        u["failure_reason"] = (f"stopped: {kind}: the headless judge has decided this question {rulings[key]} times; "
+                               f"the question was: {tail(asked, 500)}")
+        u["_next"] = "end_blocked"
+        return u
+    rulings[key] = as_int(rulings.get(key)) + 1
+    u.update({"judge_rulings": rulings, "reply_source": "judge", "reply_accepts": _accepts_text(kind)})
+    u["_next"] = "headless_judge"
+    return u
+
+
 # The plan itself as the root cause: amend the criterion in place, run a fix round because the plan is not at fault,
 # accept the defect unresolved and move on, or stop.
 PLAN_DEFECT_CONTINUE = "Continue; treat the criterion as amended (state the amendment)"
@@ -1869,10 +1921,14 @@ PLAN_DEFECT_FIX = "Not a plan defect: fix round (state the fix)"
 PLAN_DEFECT_ACCEPT = "Accept the plan defect unresolved and proceed (state the reason)"
 PLAN_DEFECT_STOP = "Stop; the plan needs amending (report it)"
 
+SCOPE_PROCEED = "Proceed"
+SCOPE_NARROW = "Narrow the scope first (say how)"
+
 # The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
 ACCEPTED_INSTRUCTIONS = {
     "clarify": ("answer",),
     "design_choice": ("design",),
+    "scope_size": ("scope",),
     "design_ask": ("answer",),
     "plan_defect": ("amendment", "fix"),
     "probe_gap": ("recipe",),
@@ -1893,6 +1949,7 @@ INSTRUCTION_HELP = {
     "rescope": "proceed with the task's scope re-declared as described; value: the new scope",
     "path": "use the handoff file at a path; value: the path",
     "narrow": "do a narrower part of the work in this run, sized again first; value: the narrower scope",
+    "scope": "narrow the change before it is implemented, as described; value: how to narrow it",
     "here": "do the work in this run anyway; value: the reason",
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
@@ -1901,8 +1958,8 @@ INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}"
                        "amendment": "Continue; treat the criterion as amended: {}", "fix": PLAN_DEFECT_FIX + ": {}",
                        "recipe": "Supply it: {}",
                        "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}",
-                       "here": SIZING_HERE_REASON + ": {}"}
-FREE_FORM_SHAPES = ("answer", "design", "amendment", "fix", "recipe", "rescope", "narrow", "here")
+                       "here": SIZING_HERE_REASON + ": {}", "scope": SCOPE_NARROW + ": {}"}
+FREE_FORM_SHAPES = ("answer", "design", "amendment", "fix", "recipe", "rescope", "narrow", "here", "scope")
 
 
 def _accepts_text(kind):
@@ -1930,10 +1987,12 @@ def _exact_option(reply, options):
 
 
 def interpret_route(state):
-    """Act on the interpreter's reading of a typed reply: an option, an accepted instruction, a discussion, or unclear."""
+    """Act on the interpreter's reading of a typed reply (an option, an accepted instruction, a discussion, or unclear)
+    or on the headless judge's ruling (an option or an accepted instruction, else a judge fault)."""
     u = {}
-    harvest_anomalies(state, u, "interpret_reply")
-    note_script_error(state, u, "interpret_reply")
+    judge = str(state.get("reply_source") or "") == "judge"
+    harvest_anomalies(state, u, "headless_judge" if judge else "interpret_reply")
+    note_script_error(state, u, "headless_judge" if judge else "interpret_reply")
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "")
     text = (state.get("last_answer_text") or "").strip()
@@ -1944,9 +2003,13 @@ def interpret_route(state):
     shape = str(state.get("reply_instruction") or "").strip()
     u.update({"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "",
               "reply_reason": "", "reply_interpreted": True, "reply_source": "", "reply_author": "owner"})
+    if judge:
+        return _judge_route(state, u, esc, verdict, shape)
 
     def decide(answer, how):
         u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})
+        if navigator:
+            u["autonomous_decisions"] = _autonomous_decisions(state, esc)
         ledger(state, u, f"interpret: {kind}: {said!r} -> {how} ({reason or 'no reason given'})")
         ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
         u["_next"] = "apply_answer"
@@ -2015,6 +2078,52 @@ def _reask_navigator(state, u, esc, text, verdict):
     ledger(state, u, f"interpret: {kind}: the navigator's {said!r} was still not read as one option "
                      f"({verdict or 'no verdict'}) -> owner")
     u["_next"] = "ask_dispatch"
+    return u
+
+
+def _judge_route(state, u, esc, verdict, shape):
+    """Act on the headless judge's ruling. A faulty ruling gets one more judge turn, then the run stops and reports; the
+    judge's question is never re-asked or clarified."""
+    kind, options, data = esc.get("kind", ""), esc.get("options") or [], as_dict(esc.get("data"))
+    reason = tail(str(state.get("reply_reason") or "").strip(), 500)
+    value = str(state.get("reply_value") or "")
+    answer, how = "", ""
+    if not reason:
+        how = "gives no reason"
+    elif verdict == "option":
+        answer = _exact_option(str(state.get("reply_option") or ""), options) or ""
+        how = f"the option {answer!r}" if answer else f"names no offered option ({state.get('reply_option')!r})"
+    elif verdict == "instruction" and shape in ACCEPTED_INSTRUCTIONS.get(kind, ()):
+        answer = _apply_instruction(state, shape, value, value)
+        how = f"the instruction {shape}={tail(value, 120)!r}" + (f", applied as {tail(answer, 120)!r}" if answer
+                                                                 else ", which could not be applied")
+    elif verdict == "instruction":
+        how = f"gives the instruction {shape or '(unnamed)'}, which this question does not accept"
+    else:
+        how = f"has no verdict ({verdict or 'empty'})"
+    if not answer:
+        faults = as_int(data.get("judge_faults"))
+        if faults < RERUN_ONCE:
+            ledger(state, u, f"headless judge: {kind}: the ruling {how} -> one more ruling")
+            retry = {**data, "judge_faults": faults + 1, "judge_fault": f"the ruling {how}"}
+            u.update({"escalation": {**esc, "data": retry}, "reply_source": "judge"})
+            u["_next"] = "headless_judge"
+            return u
+        ledger(state, u, f"headless judge: {kind}: the ruling {how} again -> stop and report")
+        asked = data.get("asked") or esc.get("question", "")
+        u["failure_reason"] = (f"stopped: {kind}: the headless judge gave no usable ruling twice (the ruling {how}); the "
+                               f"question was: {tail(asked, 500)}; options: "
+                               + "; ".join(tail(o.get("text", ""), 200) for o in options))
+        u["_next"] = "end_blocked"
+        return u
+    line = f"{kind}: {answer} (basis: headless judge: {reason})"
+    # an option pick carries the reason as its note, so a branch that records the stated reason records the judge's
+    picked = f"{answer}: {reason}" if verdict == "option" else answer
+    u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": picked,
+              "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False})
+    ledger(state, u, f"headless judge: {kind}: {how}: {reason}")
+    ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
+    u["_next"] = "apply_answer"
     return u
 
 
@@ -2422,6 +2531,9 @@ def apply_answer(state):
                 "_next": "end_redirect"})
     elif kind == "design_choice":
         u["_next"] = "compose_brief"
+    elif kind == "scope_size":
+        # a bare Proceed keeps the brief as composed; any other answer is read by compose_brief from the decisions
+        u["_next"] = "render_coder_prompt" if _exact_option(answer, options) == SCOPE_PROCEED else "compose_brief"
     elif kind == "oracle_fault":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "proceed": ["proceed"]})
         if a is None:
@@ -2733,7 +2845,7 @@ def apply_answer(state):
         a = _base_answer(state, {"integrate": ["integrate"], "finish": ["finish"],
                                  "leave": ["leave", "draft", "report", "stop"]})
         if a is None and not stop:
-            _reask_unmatched(state, u, esc, answer)
+            _base_unmatched(state, u, esc, answer)
         elif a == "integrate" and not stop:
             root = state.get("git_root") or state.get("project_dir") or "."
             u["git_task"] = {"kind": "base_merge", "return_to": "ci_gate", "tip": tip, "remote": data.get("remote"),
@@ -2771,7 +2883,7 @@ def apply_answer(state):
         task = as_dict(as_dict(esc.get("data")).get("task"))
         a = "leave" if stop else _base_answer(state, {"retry": ["retry"], "leave": ["leave", "draft", "report", "stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer)
+            _base_unmatched(state, u, esc, answer)
         elif a == "retry":
             u["git_task"] = task
             u["base_merge_retries"] = 0
@@ -2787,7 +2899,7 @@ def apply_answer(state):
         a = "leave" if stop else _base_answer(state, {"resolve": ["resolve"],
                                                       "leave": ["leave", "draft", "report", "stop"]})
         if a is None:
-            _reask_unmatched(state, u, esc, answer)
+            _base_unmatched(state, u, esc, answer)
         elif a == "resolve":
             u.update(base_marker_retries=as_int(state.get("base_marker_retries")) + 1, fix_source="base_sync",
                      fix_note=str(as_dict(esc.get("data")).get("markers") or ""))
@@ -2938,11 +3050,18 @@ def scope_check(state):
             ledger(state, u, "scope check: no declared own scope in the roster; breach check skipped")
     elif not truthy(state.get("delegated")) and len(expected) >= 5 and not truthy(state.get("scope_confirmed")):
         u["scope_confirmed"] = True
+        if str(var(state, "escalation_policy", "interactive")).strip().lower() == "autonomous":
+            more = f" and {len(expected) - 20} more" if len(expected) > 20 else ""
+            line = f"proceeded on {len(expected)} expected files: {', '.join(expected[:20])}{more}"
+            u["attention_notes"] = list(as_list(state.get("attention_notes"))) + [line]
+            ledger(state, u, f"scope check: autonomous policy, not asked; {line}")
+            u["_next"] = "render_coder_prompt"
+            return u
         return raise_escalation(state, u, escalation(
-            "design_choice",
+            "scope_size",
             f"This change is expected to touch {len(expected)} files. Proceed?",
-            [option("Proceed", recommended=True, evidence="the context pack grounds the approach"),
-             option("Narrow the scope first (say how)")],
+            [option(SCOPE_PROCEED, recommended=True, evidence="the context pack grounds the approach"),
+             option(SCOPE_NARROW)],
             evidence="\n".join(expected[:20])))
     u["_next"] = "render_coder_prompt"
     return u
@@ -2999,6 +3118,9 @@ def render_coder_prompt(state):
                           "## TASK; later subtasks deliver the rest, and a final whole-task review checks these):", spec]
         else:
             parts += ["", "Acceptance criteria (verbatim):", spec]
+    if commands := _declared_commands(state):
+        parts += ["", "The review reruns these declared verification commands against the change:"]
+        parts += [f"- {c}" for c in commands]
     if state.get("quality_rigor"):
         parts += ["", f"Quality bar: rigor={state.get('quality_rigor')}, surfaces={state.get('quality_surfaces') or ''}"]
     for n in as_list(brief.get("skill_nudges")):
@@ -3017,6 +3139,20 @@ def render_coder_prompt(state):
     write_artifact(state.get("run_dir", ""), f"coder-prompt-{as_int(state.get('fix_round'))}.md", prompt)
     u["_next"] = "check_inbox_pre" if truthy(state.get("parallel_mode")) else "run_coder"
     return u
+
+
+def _declared_commands(state):
+    """The verification commands the review reruns: the last review's list once a review ran, else the declared one."""
+    return (_command_list(state.get("review_verification_commands"))
+            or _command_list(state.get("verification_commands")))
+
+
+def _command_list(raw):
+    try:
+        arr = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    return [c.strip() for c in arr if isinstance(c, str) and c.strip()] if isinstance(arr, list) else []
 
 
 def inbox_route(state):
@@ -3931,6 +4067,13 @@ def _carried_section(carried, n):
     return "\n".join([CARRIED_HEADER] + [f"- {_carried_line(f, n)}" for f in carried]) if carried else ""
 
 
+def _carried_review_section(carried):
+    """The carried failures worded for the reviewers, so no line tells them they own a failure."""
+    return "\n".join(["Carried-forward test failures (known red tests, each owned by the subtask named on its line; "
+                      "one a later subtask owns is expected to stay red in this review and is not a regression of "
+                      "this change):"] + [f"- {_carried_line(f)}" for f in carried])
+
+
 def _posture(state):
     posture = (state.get("security_posture") or "standard").strip().lower()
     rigor = (state.get("quality_rigor") or "production").strip().lower()
@@ -4038,6 +4181,9 @@ def build_gauntlet_prompt(state):
             over = f" ({capped} more dropped by the cap)" if capped else ""
             ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
     u["review_verification_commands"] = cmds
+    carried = _carried(state) if _subtask_phase(state) else []
+    if carried:
+        lines.append(_carried_review_section(carried))
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if dropped or as_list(state.get("publish_criteria")) or _publish_asks(state)["commit"]:
@@ -4060,8 +4206,8 @@ def build_gauntlet_prompt(state):
                 lines += [f"Settled lanes: {', '.join(green)}"]
     recipe = (state.get("local_run_recipe") or "").strip()
     if adopting:
-        ledger(state, u, f"gauntlet: round {n} reviews the adopted probe-written tests: no probe context, so the round "
-                         "cannot write tests again")
+        ledger(state, u, f"gauntlet: round {n} reviews the adopted probe-written tests: the prompt carries no local-run "
+                         "recipe or usage suites")
     elif state.get("pipeline_size") == "small":
         ledger(state, u, "gauntlet: proportionate review (pipeline small): no probe context")
     elif recipe or truthy(state.get("consumer_surface")):
@@ -4204,6 +4350,7 @@ def _note_probe_written(state, u, n, written, other, deleted, unavailable, unsaf
         known = as_list(state.get("probe_tests"))
         u["probe_tests"] = known + [{"path": p, "round": n} for p in written if {"path": p, "round": n} not in known]
         ledger(state, u, f"probe tests: the probe lane wrote {len(written)} file(s) in round {n}: {', '.join(written)}")
+        _intend_to_add(state, u, written)
     notes = []
     entries = []
     if other:
@@ -4231,6 +4378,19 @@ def _note_probe_written(state, u, n, written, other, deleted, unavailable, unsaf
         u["gauntlet_attention"] = "\n".join(x for x in [u.get("gauntlet_attention", ""), *notes] if x)
 
 
+def _intend_to_add(state, u, paths):
+    """Mark probe-written files intent-to-add, as debt_scan does after a coder round: no coder runs after the last
+    review round, and an untracked file is missing from the `git diff <base>` the reviewers and the declared
+    verification commands read."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    present = [p for p in paths if os.path.isfile(os.path.join(root, p))]
+    if not present:
+        return
+    code, _, err = git(root, "add", "-N", "--", *_literal(present))
+    if code:
+        ledger(state, u, f"probe tests: git add -N failed for {', '.join(present)}: {tail(err.strip(), 200)}")
+
+
 def route_gauntlet(state):
     u = {}
     note_script_error(state, u, "run_gauntlet")
@@ -4256,6 +4416,7 @@ def route_gauntlet(state):
                            "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
         if written:
             rounds[-1]["probe_written"] = written
+        rounds[-1]["tree_after"] = _worktree_tree(state.get("git_root") or state.get("project_dir") or ".")
     merged_lanes = dict(as_dict(state.get("gauntlet_lanes")))
     merged_lanes.update(lanes)
     u.update({"gauntlet_verdict": verdict, "gauntlet_incomplete": incomplete, "gauntlet_lanes": merged_lanes,
@@ -4349,6 +4510,9 @@ def _repeat_block(state, root, lane, fixes):
     if len(rounds) < 2:
         return "unknown"
     prev, cur = rounds[-2], rounds[-1]
+    if prev.get("review_key") and prev.get("review_key") == cur.get("review_key"):
+        # the same tree, prompt and verification commands: reworded findings are not a new class
+        return "unchanged"
     before = as_list(as_dict(prev.get("lane_blockers")).get(lane))
     after = as_list(as_dict(cur.get("lane_blockers")).get(lane)) or fixes
     if before and _findings_changed(before, after):
@@ -4627,10 +4791,12 @@ def _start_probe_adoption(state, u):
     the ones it did not review starts.
 
     A test still in the worktree and unchanged since that round's tree was reviewed by it, so it is adopted with no
-    extra round. One that differs needs a review round over the tree that holds it, at most ADOPTION_ROUNDS_MAX a
-    run. Past that limit, and for a test that is gone or a tree that cannot be compared, it is recorded as not
-    adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not completed. Either way it is settled and
-    never asked about again."""
+    extra round, and so is one that round's own probe lane created (absent from the round's reviewed tree), reported
+    GREEN, and left unchanged since the round ended. Any other test that differs needs a review round over the tree
+    that holds it, at most ADOPTION_ROUNDS_MAX a run. Past that limit, and for a test that is gone or a tree that
+    cannot be compared, it is recorded as not adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not
+    completed.
+    Either way it is settled and never asked about again."""
     adoption = as_dict(state.get("probe_adoption"))
     settled = {str(p) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") == "probe"
                for p in as_list(as_dict(s).get("paths"))}
@@ -4649,14 +4815,27 @@ def _start_probe_adoption(state, u):
     reviewed, tree = last.get("code_tree") or "", _worktree_tree(root)
     code, out, _ = git(root, "diff-tree", "-r", "-z", "--name-only", reviewed, tree) if reviewed and tree else (1, "", "")
     changed = set(_nul_names(out))
+    ended = last.get("tree_after") or ""
+    since_code, since_out, _ = (git(root, "diff-tree", "-r", "-z", "--name-only", ended, tree) if ended and tree
+                                else (1, "", ""))
+    ran_green = set()
+    if not since_code and reviewed and str(as_dict(last.get("lanes")).get("probe", "")).startswith("GREEN"):
+        # only a file the round's probe lane created: an edit to a file already in the reviewed tree needs review
+        ran_green = {p for p in set(as_list(last.get("probe_written"))) - set(_nul_names(since_out))
+                     if git(root, "cat-file", "-e", f"{reviewed}:{p}")[0] != 0}
+    basis = f"written and run green by the probe lane in passing round {last.get('round')}"
     adopted = {str(as_dict(a).get("path")): as_dict(a) for a in as_list(adoption.get("adopted"))}
-    newly, pending, gone, unknown = [], [], [], []
+    newly, green, pending, gone, unknown = [], [], [], [], []
     for path, written in latest.items():
         entry = {"path": path, "round": written}
         if not os.path.isfile(os.path.join(root, path)):
             gone.append(entry)
         elif code:
             unknown.append(entry)
+        elif path in changed and path in ran_green:
+            if as_dict(adopted.get(path)).get("round") != written:
+                adopted[path] = {**entry, "reviewed_in": last.get("round"), "basis": basis}
+                green.append(adopted[path])
         elif path in changed:
             pending.append(entry)
         elif as_dict(adopted.get(path)).get("round") != written:
@@ -4669,12 +4848,15 @@ def _start_probe_adoption(state, u):
                (capped, f"the run's limit of {ADOPTION_ROUNDS_MAX} adoption rounds was reached")]
     skipped = [(entries, why) for entries, why in skipped if entries]
     start = bool(pending) and not capped
-    if not (newly or skipped or start):
+    if not (newly or green or skipped or start):
         return False
     update = {**adoption, "adopted": list(adopted.values())}
     if newly:
         ledger(state, u, f"probe tests: adopted {_paths_of(newly)}, unchanged since review round {last.get('round')} "
                          "reviewed them")
+    if green:
+        _intend_to_add(state, u, [a["path"] for a in green])
+        ledger(state, u, f"probe tests: adopted {_paths_of(green)}, {basis} and unchanged since")
     attention = [u.get("gauntlet_attention", state.get("gauntlet_attention")) or ""]
     for entries, why in skipped:
         update["not_adopted"] = list(as_list(update.get("not_adopted"))) + [
@@ -4693,12 +4875,13 @@ def _start_probe_adoption(state, u):
 
 
 def _adopted_groups(adoption):
-    """The adopted tests as (written round, reviewed round, paths), in adoption order."""
+    """The adopted tests as (how each group was reviewed, paths), in adoption order."""
     groups = {}
     for a in as_list(adoption.get("adopted")):
         a = as_dict(a)
-        groups.setdefault((a.get("round"), a.get("reviewed_in")), []).append(str(a.get("path")))
-    return [(r, rv, ", ".join(paths)) for (r, rv), paths in groups.items()]
+        how = a.get("basis") or f"written in round {a.get('round')}, reviewed in round {a.get('reviewed_in')}"
+        groups.setdefault(how, []).append(str(a.get("path")))
+    return [(how, ", ".join(paths)) for how, paths in groups.items()]
 
 
 def _adoption_publish_text(state, u):
@@ -4715,8 +4898,8 @@ def _adoption_publish_text(state, u):
                                    if code or str(as_dict(a).get("path")) in dirty]}
         groups = _adopted_groups(unpublished)
         if groups:
-            text += "\n\n" + " ".join(f"Probe-written tests adopted into the reviewed change (written in round {r}, "
-                                      f"reviewed in round {rv}): {p}." for r, rv, p in groups)
+            text += "\n\n" + " ".join(f"Probe-written tests adopted into the reviewed change ({how}): {p}."
+                                      for how, p in groups)
             text += " Commit them with the task's work."
     other = [as_dict(s) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") in ("other", "deleted")]
     if other:
@@ -5462,24 +5645,31 @@ def _base_round_fits(state):
 
 
 def _base_answer(state, choices):
-    """The key a reply to a base question picks: the option it names exactly first, else the one key its free text
-    names. Free text naming several keys, or one after a negation ("do not integrate"), picks none."""
+    """The key a reply to a base question picks through the option it names (its number, its exact text, or
+    "<option>: <note>"), else None; free text is never scanned for keys."""
     ans = (state.get("last_answer") or "").strip()
     named = _named_option(ans, as_dict(state.get("escalation")).get("options") or [])
-    if named:
-        low = named.lower()
-        return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
-                or next((k for k, words in choices.items() if any(w in low for w in words)), None))
-    said = ans.lower()
-    hits, negated = set(), False
-    for key, words in choices.items():
-        for w in words:
-            for m in re.finditer(re.escape(w), said):
-                if re.search(r"\b(?:not|never|no|don't|dont|without)\W+(?:\w+\W+)?$", said[:m.start()]):
-                    negated = True
-                else:
-                    hits.add(key)
-    return next(iter(hits)) if len(hits) == 1 and not negated else None
+    if not named:
+        return None
+    low = named.lower()
+    return (next((k for k, words in choices.items() if any(low.startswith(w) for w in words)), None)
+            or next((k for k, words in choices.items() if any(w in low for w in words)), None))
+
+
+def _base_unmatched(state, u, esc, answer):
+    """A reply to a base question that names no option is read by the reply interpreter once per question, then
+    asked again. The flag lives in the escalation, since parse_answer resets reply_interpreted before apply_answer."""
+    data = as_dict(esc.get("data"))
+    if truthy(data.get("base_interpreted")):
+        _reask_unmatched(state, u, esc, answer)
+        return
+    kind = esc.get("kind", "")
+    author = "navigator" if state.get("answer_source") == "navigator" else "owner"
+    u.update({"escalation": {**esc, "data": {**data, "base_interpreted": True}}, "last_answer_text": answer,
+              "reply_accepts": _accepts_text(kind), "reply_author": author, "reply_interpreted": False,
+              "reply_source": "navigator" if author == "navigator" else ""})
+    ledger(state, u, f"apply_answer: {kind}: {tail(answer, 200)!r} names no option -> interpret")
+    u["_next"] = "interpret_reply"
 
 
 def _base_left(state, u, status):
@@ -6537,8 +6727,7 @@ def _assemble_report(state, u, pre_publish=False):
     lines += [f"- escalated to standard: {as_dict(e).get('why')} ({as_dict(e).get('at')})"
               for e in as_list(g("size_escalations", []))]
     adoption = as_dict(g("probe_adoption", {}))
-    lines += [f"Probe-written tests adopted: {p} (written in round {r}, reviewed in round {rv})"
-              for r, rv, p in _adopted_groups(adoption)]
+    lines += [f"Probe-written tests adopted: {p} ({how})" for how, p in _adopted_groups(adoption)]
     lines += [f"Probe-written tests adoption NOT completed: {_paths_of(as_list(s.get('paths')))} (adoption round "
               f"{s.get('round')} accepted NEEDS-HUMAN; no review round over them passed)"
               for s in map(as_dict, as_list(adoption.get("not_completed")))]
@@ -6608,8 +6797,9 @@ def _assemble_report(state, u, pre_publish=False):
     skipped = as_list(g("skipped_reviews", []))
     if skipped:
         lines += ["## Skipped reviews (NEEDS-HUMAN)"] + [f"- {s}" for s in skipped] + [""]
-    if g("gauntlet_attention"):
-        lines += ["## Human attention required", g("gauntlet_attention"), ""]
+    notes = [f"- {n}" for n in as_list(g("attention_notes", []))]
+    if notes or g("gauntlet_attention"):
+        lines += ["## Human attention required"] + notes + [x for x in [g("gauntlet_attention")] if x] + [""]
     rej = as_list(g("rejected_findings", []))
     if rej:
         lines += ["## Review decisions"] + [f"- {r}" for r in rej] + [""]

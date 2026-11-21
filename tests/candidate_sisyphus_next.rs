@@ -2017,8 +2017,7 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "choice-own-kinds",
                 "    if esc.get(\"kind\") in OWN_PROMPT_KINDS:\n        return None\n",
                 "    if False:\n        return None\n",
-                "choice: handoff_confirm, draft_confirm and review_incomplete keep their own approval \
-                 nodes",
+                "choice: handoff_confirm and draft_confirm keep their own approval nodes",
             ),
             (
                 "choice-no-trim",
@@ -3384,6 +3383,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("final_report", "timeout", 60),
     ("git_ops", "max_iterations", 20),
     ("git_ops", "timeout", 1800),
+    ("headless_judge", "timeout", 120),
     ("intake", "timeout", 60),
     ("interpret_reply", "timeout", 120),
     ("ladder_judge", "timeout", 300),
@@ -4000,6 +4000,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("diagnose_failure", AnomaliesChannel::Plain),
     ("draft_brief", AnomaliesChannel::Plain),
     ("git_ops", AnomaliesChannel::NoSchema),
+    ("headless_judge", AnomaliesChannel::Plain),
     ("interpret_reply", AnomaliesChannel::Plain),
     ("ladder_judge", AnomaliesChannel::Plain),
     ("observability_pass", AnomaliesChannel::Plain),

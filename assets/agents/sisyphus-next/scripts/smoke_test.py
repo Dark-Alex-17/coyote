@@ -350,8 +350,10 @@ check("escalate_gate: autonomous -> ladder_judge with rulings text", u["_next"] 
 hard = escalation("design_ask", "Design question: adopt a Strategy?", [], hard_trigger=True)
 u = gates.escalate_gate(base_state(escalation=hard, escalation_policy="autonomous"))
 check("escalate_gate: hard trigger bypasses the ladder", u["_next"] == "ask_dispatch")
-u = gates.escalate_gate(base_state(escalation=esc, escalation_policy="autonomous", autonomous_kinds=["design_choice"]))
-check("escalate_gate: a kind already resolved autonomously -> owner (failed-once rule)", u["_next"] == "ask_dispatch")
+u = gates.escalate_gate(base_state(escalation=esc, escalation_policy="autonomous", autonomous_decisions=["design_choice|s0|sub"]))
+check("escalate_gate: a decision already resolved autonomously in this subtask -> owner (failed-once rule)",
+      u["_next"] == "ask_dispatch" and any("design_choice|s0|sub already resolved autonomously" in d for d in u["decisions"]),
+      u)
 secret = escalation("yellow_findings", "rotate the API secret?", [option("yes", True)])
 check("escalation: secret/money wording auto-flags hard trigger", secret["hard_trigger"])
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="A", ladder_basis="recommended option"))
@@ -373,7 +375,8 @@ check("consult_route: A5 timeout -> tier 4", u["_next"] == "ask_dispatch")
 u = gates.ask_dispatch(base_state(escalation=esc, top_level=True, owner_away=False))
 check("ask_dispatch: terminal prompt + parked", u["_next"] == "ask_user" and u["parked"] == "design_choice")
 u = gates.ask_dispatch(base_state(escalation=escalation("review_incomplete", "q"), top_level=True))
-check("ask_dispatch: review_incomplete -> approval node", u["_next"] == "ask_review_incomplete")
+check("ask_dispatch: review_incomplete -> the typed prompt, where a no-human reply reaches the headless judge",
+      u["_next"] == "ask_user")
 u = gates.ask_dispatch(base_state(escalation=esc, top_level=True, owner_away=True))
 check("ask_dispatch: away + top-level -> ask_owner when the fork provides it", u["_next"] == ("ask_owner_poll" if gates.OWNER_REMOTE_INPUT else "ask_user"))
 u = gates.ask_dispatch(base_state(escalation=esc, top_level=False, owner_away=True))
@@ -984,8 +987,10 @@ check("choice: options with none recommended keep the typed prompt (ask_user), o
 # the engine's headless answer to a free-text question resolves to the recommended option, never to its words
 HG = _lib.HEADLESS_GUIDANCE
 u2 = gates.parse_answer(base_state(escalation=u["escalation"], last_answer_text=HG))
-check("headless: guidance on a question with no recommended option -> today's path (interpret_reply), no option picked",
-      u2["_next"] == "interpret_reply" and "last_answer" not in u2, u2)
+check("headless: guidance on a question with options and none recommended -> headless_judge, never interpret_reply, "
+      "no option picked",
+      u2["_next"] == "headless_judge" and u2["reply_source"] == "judge"
+      and u2["reply_accepts"] == gates._accepts_text("clarify") and "last_answer" not in u2, u2)
 u2 = gates.parse_answer(base_state(escalation=esc, last_answer_text=f" {HG}\n"))
 check("headless: guidance at the typed prompt -> the recommended option, never interpreted, ledgered",
       u2["_next"] == "apply_answer" and u2["last_answer"] == "A" and any(d.startswith("headless: design_choice:") for d in u2["decisions"]), u2)
@@ -1031,10 +1036,10 @@ check("choice: more than 4 or fewer than 2 options keep the typed prompt (ask_us
       and "multiple_choice" not in five["escalation"]["data"]
       and gates.ask_dispatch(base_state(escalation=one["escalation"]))["_next"] == "ask_user")
 own = [gates.raise_escalation(base_state(), {}, escalation(k, "q", [option("A", True), option("B")]))["escalation"]
-       for k in ("handoff_confirm", "draft_confirm", "review_incomplete")]
-check("choice: handoff_confirm, draft_confirm and review_incomplete keep their own approval nodes",
+       for k in ("handoff_confirm", "draft_confirm")]
+check("choice: handoff_confirm and draft_confirm keep their own approval nodes",
       [gates.ask_dispatch(base_state(escalation=e))["_next"] for e in own]
-      == ["confirm_handoff", "confirm_draft", "ask_review_incomplete"]
+      == ["confirm_handoff", "confirm_draft"]
       and not any(e["data"].get("multiple_choice") for e in own))
 u = gates.scope_check(base_state(roster_scope={"TASK-001": ["src/a/"], "TASK-002": ["src/b/"]}, own_scope=["src/a/"],
                                  expected_files=["src/b/x.py"], delegated=True, parallel_mode=True, coder_brief={}))
@@ -6323,11 +6328,15 @@ with scenario("base control: a second green at the HEAD already checked flips at
     base_seams()
     u = gates.ci_route(base_run_state(checked_run, base_checked_head=scratch_git(checked_run, "rev-parse", "HEAD")))
     check(name, u.get("_next") == "final_report" and os.path.exists(_BASE_READY), u.get("decisions"))
-with scenario("base: an unparseable base_moved answer is asked again, with no git_task and no flip") as name:
+with scenario("base: an unparseable base_moved answer goes to the reply interpreter once, then is asked again, with no "
+              "git_task and no flip") as name:
     unparsed_run, _bare, _push = base_world("unparsed")
     base_seams()
     u = gates.apply_answer(base_run_state(unparsed_run, escalation=base_question("a" * 40), last_answer="banana bread"))
-    check(name, u.get("_next") == "ask_dispatch" and not u.get("git_task") and not os.path.exists(_BASE_READY), u)
+    again = gates.apply_answer(base_run_state(unparsed_run, escalation=u.get("escalation"), last_answer="banana bread"))
+    check(name, u.get("_next") == "interpret_reply" and u.get("last_answer_text") == "banana bread"
+          and again.get("_next") == "ask_dispatch" and not u.get("git_task") and not again.get("git_task")
+          and not os.path.exists(_BASE_READY), (u, again.get("_next")))
 with scenario("base: a tip that is not a local commit, an is-ancestor timeout and an is-ancestor error read unchecked, "
               "never moved") as name:
     _run, _bare, _push = base_world("footgun")
@@ -6474,12 +6483,13 @@ with scenario("base: a base_merge whose pre-merge HEAD left the history (a rebas
     check(name, rebased.get("_next") == "git_ops" and rebased.get("base_merge_retries") == 1
           and "no longer in HEAD's history" in (rebased.get("git_task") or {}).get("text", "")
           and unrecorded.get("_next") == "compose_fix", (rebased, unrecorded.get("_next")))
-with scenario("base: a negated or several-option free-text reply to base_moved is asked again; an exact option still "
-              "integrates") as name:
+with scenario("base: a negated or several-option free-text reply to base_moved goes to the reply interpreter, never "
+              "scanned for keywords; an exact option still integrates") as name:
     replies = {r: gates.apply_answer(base_state(escalation=base_question("a" * 40), last_answer=r))
                for r in ("do not integrate, leave it", "integrate or finish, whichever", "Option 1")}
-    check(name, [replies[r].get("_next") for r in replies] == ["ask_dispatch", "ask_dispatch", "git_ops"]
-          and not replies["do not integrate, leave it"].get("git_task"),
+    check(name, [replies[r].get("_next") for r in replies] == ["interpret_reply", "interpret_reply", "git_ops"]
+          and not replies["do not integrate, leave it"].get("git_task")
+          and not replies["integrate or finish, whichever"].get("git_task"),
           {r: u.get("_next") for r, u in replies.items()})
 with scenario("base: conflicts git_ops already staged are still guarded: the staged path joins base_conflicted and "
               "pr_gate sends the markers back to compose_fix") as name:
@@ -6538,6 +6548,321 @@ with scenario("base: a baseRefOid that is not a commit id is never used as a git
           bad_oid_facts)
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
 os.environ["SISYPHUS_GH_PR_READY_CMD"] = _PR_READY_DEFAULT
+
+
+# ---------------------------------------------------------------- failed-once rule keyed on the decision
+def autonomous_after(u):
+    return {k: v for k, v in u.items() if k.startswith("autonomous_")}
+
+
+with scenario("failed-once: an autonomous design approach answer on subtask 1 leaves subtask 2's approach question to "
+              "the ladder") as name:
+    approach = [{"text": "A", "recommended": True, "evidence": "e"}, {"text": "B"}]
+    first = gates.design_gate(base_state(design_options=approach, subtask_index=0))["escalation"]
+    answered = gates.ladder_route(base_state(escalation=first, subtask_index=0, ladder_resolution="recommended",
+                                             ladder_choice="A"))
+    second = gates.design_gate(base_state(design_options=approach, subtask_index=1))["escalation"]
+    u = gates.escalate_gate(base_state(escalation=second, subtask_index=1, escalation_policy="autonomous",
+                                       **autonomous_after(answered)))
+    check(name, answered.get("autonomous_decisions") == ["approach|s0|sub"] and u["_next"] == "ladder_judge",
+          (autonomous_after(answered), u.get("_next")))
+with scenario("failed-once: the same approach question raised again in the same subtask after an autonomous answer "
+              "-> owner") as name:
+    again = gates.design_gate(base_state(design_options=approach, subtask_index=0))["escalation"]
+    u = gates.escalate_gate(base_state(escalation=again, subtask_index=0, escalation_policy="autonomous",
+                                       **autonomous_after(answered)))
+    check(name, u["_next"] == "ask_dispatch", (autonomous_after(answered), u.get("_next")))
+with scenario("failed-once: a register question in the same subtask is its own decision, not the approach") as name:
+    register = gates.design_gate(base_state(register_question="I see X and Y. Which?", subtask_index=0))["escalation"]
+    register_key = gates._decision_key(base_state(subtask_index=0), register)
+    u = gates.escalate_gate(base_state(escalation=register, subtask_index=0, escalation_policy="autonomous",
+                                       **autonomous_after(answered)))
+    check(name, re.fullmatch(r"register:[0-9a-f]{8}\|s0\|sub", register_key)
+          and register_key not in answered.get("autonomous_decisions", []) and u["_next"] == "ladder_judge",
+          (register_key, u.get("_next")))
+with scenario("failed-once: review_exhausted raised again in the same subtask after an autonomous answer -> owner, "
+              "whatever its question text") as name:
+    ex1 = escalation("review_exhausted", "3 rounds failed on lane security", [option("Stop", True)])
+    answered_ex = gates.ladder_route(base_state(escalation=ex1, subtask_index=1, ladder_resolution="recommended",
+                                                ladder_choice="Stop"))
+    ex2 = escalation("review_exhausted", "3 rounds failed on lane adversary", [option("Stop", True)])
+    u = gates.escalate_gate(base_state(escalation=ex2, subtask_index=1, escalation_policy="autonomous",
+                                       **autonomous_after(answered_ex)))
+    check(name, u["_next"] == "ask_dispatch", (autonomous_after(answered_ex), u.get("_next")))
+with scenario("failed-once: the final whole-task review is not the last subtask") as name:
+    u = gates.escalate_gate(base_state(escalation=ex2, subtask_index=1, final_review=True, escalation_policy="autonomous",
+                                       **autonomous_after(answered_ex)))
+    check(name, u["_next"] == "ladder_judge", u.get("_next"))
+with scenario("failed-once: a navigator ANSWER is an autonomous resolution; the same decision then goes to the owner") as name:
+    consulted = gates.consult_route(base_state(escalation=ex1, subtask_index=1, consult_result="CONSULT: ANSWER 1"))
+    u = gates.escalate_gate(base_state(escalation=ex2, subtask_index=1, escalation_policy="autonomous",
+                                       **autonomous_after(consulted)))
+    check(name, consulted["_next"] == "apply_answer" and u["_next"] == "ask_dispatch",
+          (autonomous_after(consulted), u.get("_next")))
+with scenario("failed-once: a resumed state's kind-only autonomous_kinds list is ignored") as name:
+    design = escalation("design_choice", "pick", [option("A", True, "e"), option("B")])
+    u = gates.escalate_gate(base_state(escalation=design, escalation_policy="autonomous", autonomous_kinds=["design_choice"]))
+    check(name, u["_next"] == "ladder_judge", u.get("_next"))
+with scenario("re-entry: a resumed run keeps its failed-once decisions, its judge rulings and its attention "
+              "notes") as name:
+    resumed_id = "20990101T000000-cafef0aa"
+    kept = {"autonomous_decisions": ["approach|s1|sub"], "judge_rulings": {"review_incomplete|s1|sub": 2},
+            "attention_notes": ["scope: 6 expected files, not asked under the autonomous policy"]}
+    _lib.snapshot({"run_id": resumed_id, "run_dir": _lib.ensure_run_dir(resumed_id), "base_sha": BASE, **kept}, {},
+                  "subtask 1")
+    resumed = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {resumed_id}", "project_dir": REPO})
+    check(name, resumed.get("resume_mode") is True and {k: resumed.get(k) for k in kept} == kept,
+          {k: resumed.get(k) for k in kept})
+
+# ---------------------------------------------------------------- the expected-file count question
+SIX_FILES = [f"src/f{i}.py" for i in range(6)]
+with scenario("scope_size: under the autonomous policy 5+ expected files are not asked; the ledger and the report's "
+              "attention section name them, and no autonomous decision is recorded") as name:
+    st, u = chain(base_state(escalation_policy="autonomous", expected_files=SIX_FILES), "scope_check")
+    report = gates._assemble_report(st, {})
+    line = "proceeded on 6 expected files: " + ", ".join(SIX_FILES)
+    attention = report.split("## Human attention required", 1)[-1]
+    check(name, u["_next"] == "render_coder_prompt" and not u.get("escalation") and line in st.get("attention_notes", [])
+          and any(line in d for d in u["decisions"]) and f"- {line}" in attention
+          and not st.get("autonomous_digest") and not st.get("autonomous_decisions"), (u, report[-600:]))
+with scenario("scope_size: interactive, 5+ expected files raise the scope_size question once") as name:
+    u = gates.scope_check(base_state(expected_files=SIX_FILES))
+    check(name, u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "scope_size" and u["scope_confirmed"],
+          u.get("escalation"))
+with scenario("scope_size: Proceed goes on to the coder prompt without composing the brief again") as name:
+    st, u = chain(base_state(expected_files=SIX_FILES), "scope_check")
+    u = gates.apply_answer({**st, "last_answer": "Proceed"})
+    check(name, u["_next"] == "render_coder_prompt", u.get("_next"))
+with scenario("scope_size: Narrow, or a Proceed with a note, recomposes the brief, which reads the answer") as name:
+    nexts = [gates.apply_answer({**st, "last_answer": a})["_next"]
+             for a in ("Narrow the scope first (say how): only the api files", "Proceed: but skip the docs")]
+    check(name, nexts == ["compose_brief", "compose_brief"], nexts)
+
+# ---------------------------------------------------------------- a passing round's own probe tests
+GREEN_BASIS = "written and run green by the probe lane in passing round 2"
+
+
+def probe_pass_round(name, path, probe_lane="GREEN", existed=False):
+    """A scratch repo whose second gauntlet round passes after its probe lane wrote `path` (into a file already in the
+    reviewed tree when `existed`); (state after route_gauntlet, route_gauntlet's update)."""
+    root = adopt_repo(name)
+    if existed:
+        put(root, path)
+    round2 = {"round": 2, "head": "h", "code_tree": gates._worktree_tree(root)}
+    if existed:
+        with open(os.path.join(root, path), "a") as f:
+            f.write("edited by the probe lane\n")
+    else:
+        put(root, path)
+    result = passed.replace("| probe | SKIPPED | not selected |", f"| probe | {probe_lane} | probe detail |")
+    state = base_state(git_root=root, project_dir=root, base_sha=scratch_git(root, "rev-parse", "HEAD"),
+                       round_heads=[{"round": 1, "head": "h", "verdict": "BLOCKED"}, round2],
+                       gauntlet_result=result + f"\n## Probe-written tests\n- {path}\n")
+    return chain(state, "route_gauntlet")
+
+
+with scenario("probe adoption: a test the passing round's own probe lane wrote, unchanged since, is adopted with no "
+              "adoption round; the publish text and the report say how") as name:
+    st, routed = probe_pass_round("green-a", "tests/green.test.ts")
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, routed["_next"] == "observability_gate" and u.get("_next") == "git_ops"
+          and (u.get("probe_adoption") or {}).get("adopted") == [
+              {"path": "tests/green.test.ts", "round": 2, "reviewed_in": 2, "basis": GREEN_BASIS}]
+          and f"Probe-written tests adopted into the reviewed change ({GREEN_BASIS}): tests/green.test.ts. Commit "
+              "them with the task's work." in u["git_task"]["text"]
+          and f"Probe-written tests adopted: tests/green.test.ts ({GREEN_BASIS})" in u["report"],
+          (u.get("_next"), u.get("probe_adoption"), u.get("decisions")))
+with scenario("probe adoption: a probe-written file is in git diff <base> once route_gauntlet has run") as name:
+    st, _ = probe_pass_round("intent-a", "tests/seen.test.ts")
+    diffed = scratch_git(st["git_root"], "diff", "--name-only", st["base_sha"]).splitlines()
+    check(name, "tests/seen.test.ts" in diffed, diffed)
+with scenario("probe adoption: a test edited after its passing round still gets the adoption round") as name:
+    st, _ = probe_pass_round("edited-a", "tests/edited.test.ts")
+    with open(os.path.join(st["git_root"], "tests/edited.test.ts"), "a") as f:
+        f.write("edited after the round\n")
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/edited.test.ts", "round": 2}],
+          (u.get("_next"), u.get("probe_adoption")))
+with scenario("probe adoption: a test from a passing round whose probe lane is not GREEN gets the adoption "
+              "round") as name:
+    st, _ = probe_pass_round("not-green-a", "tests/attn.test.ts", probe_lane="SKIPPED")
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/attn.test.ts", "round": 2}],
+          (u.get("_next"), u.get("probe_adoption")))
+with scenario("probe adoption: a probe-listed file that was already in the round's reviewed tree gets the adoption "
+              "round") as name:
+    st, _ = probe_pass_round("existed-a", "tests/old.test.ts", existed=True)
+    u = gates.pr_gate({**st, "git_actions": {"commit": True}})
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and (u.get("probe_adoption") or {}).get("due") == [{"path": "tests/old.test.ts", "round": 2}],
+          (u.get("_next"), u.get("probe_adoption")))
+with scenario("probe adoption: the adoption round's ledger line says what its prompt omits, not that the probe "
+              "cannot run") as name:
+    u = gates.build_gauntlet_prompt(base_state(probe_adoption={"due": [{"path": "tests/x.test.ts", "round": 2}]},
+                                               round_heads=[{"round": 2, "head": "h", "verdict": "PASS"}]))
+    check(name, any("the prompt carries no local-run recipe or usage suites" in d for d in u["decisions"])
+          and not any("cannot write tests" in d for d in u["decisions"]), u["decisions"])
+
+# ---------------------------------------------------------------- the coder sees the review's verification commands
+DECLARED = json.dumps(["./check --filter export_order", "./lint"])
+with scenario("render_coder_prompt: the first coder prompt lists the declared verification commands as context") as name:
+    prompt = gates.render_coder_prompt(base_state(verification_commands=DECLARED))["coder_prompt"]
+    context = prompt.split("## CONTEXT", 1)[-1]
+    check(name, "The review reruns these declared verification commands against the change:\n"
+                "- ./check --filter export_order\n- ./lint" in context, prompt[-800:])
+with scenario("render_coder_prompt: the seeded empty review list falls back to the declared verification "
+              "commands") as name:
+    prompt = gates.render_coder_prompt(base_state(verification_commands=DECLARED,
+                                                  review_verification_commands="[]"))["coder_prompt"]
+    check(name, "- ./check --filter export_order\n- ./lint" in prompt.split("## CONTEXT", 1)[-1], prompt[-800:])
+with scenario("next_subtask: subtask 2's first coder prompt does not list subtask 1's review commands") as name:
+    started = gates.next_subtask(base_state(subtasks=subs[:2], subtask_index=1, intent="trivial",
+                                            verification_commands=DECLARED,
+                                            review_verification_commands=json.dumps(["./sub1-only"])))
+    prompt = gates.render_coder_prompt(base_state(**{k: v for k, v in started.items() if k != "_next"},
+                                                  verification_commands=DECLARED))["coder_prompt"]
+    check(name, started.get("review_verification_commands") == "[]" and "./sub1-only" not in prompt
+          and "- ./lint" in prompt, (started.get("review_verification_commands"), prompt[-800:]))
+with scenario("next_subtask: the final whole-task review starts with no earlier review's commands") as name:
+    started = gates.next_subtask(base_state(subtasks=subs[:2], subtask_index=2,
+                                            review_verification_commands=json.dumps(["./sub2-only"])))
+    check(name, started.get("final_review") is True and started.get("review_verification_commands") == "[]",
+          (started.get("_next"), started.get("review_verification_commands")))
+with scenario("render_coder_prompt: a fix round lists the commands the last review ran, criterion commands "
+              "included") as name:
+    fixed = gates.compose_fix(base_state(fix_source="review", fix_items=["adversary: DIVERGES"]))
+    prompt = gates.render_coder_prompt(base_state(**{k: v for k, v in fixed.items() if k != "_next"},
+                                                  verification_commands=DECLARED,
+                                                  review_verification_commands=json.dumps(
+                                                      ["./check --filter export_order", "./lint", "./run-cli export"])))[
+        "coder_prompt"]
+    check(name, "## FIX ROUND 1" in prompt and "- ./run-cli export" in prompt.split("## CONTEXT", 1)[-1], prompt[-800:])
+with scenario("lane_stuck: the same review_key with reworded findings is unchanged review input -> lane_stuck, not a "
+              "new class of findings") as name:
+    heads = [{"round": i + 1, "head": SNAP_HEAD, "code_tree": tree_2, "review_key": "same-inputs",
+              "lane_blockers": {"adversary": [f]}} for i, f in enumerate([A6_FINDING, A6_OTHER])]
+    u = gates.triage_route(base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, review_rounds=1,
+                                      triage=[{"finding": A6_OTHER, "action": "fix", "lane": "adversary"}],
+                                      lane_block_streak={"adversary": 1}, round_heads=heads))
+    check(name, gates._repeat_block(base_state(round_heads=heads), SNAP_REPO, "adversary", [A6_OTHER]) == "unchanged"
+          and u.get("escalation", {}).get("kind") == "lane_stuck", (u.get("_next"), u.get("lane_block_streak")))
+
+# ---------------------------------------------------------------- carried failures in the subtask review
+LATER_RED = [{"paths": ["tests/later_test.ext"], "owner": 2, "since": 1, "evidence": "expected 3, got 2"}]
+with scenario("build_gauntlet: a subtask review names the carried failures above the plan block, owned by the later "
+              "subtask and not a regression") as name:
+    gp = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=0, subtask_changed_files=["f"],
+                                                carried_failures=LATER_RED))["gauntlet_prompt"].splitlines()
+    at = [i for i, l in enumerate(gp) if l.startswith("Carried-forward test failures")]
+    plan_at = next((i for i, l in enumerate(gp) if l.startswith("Plan / acceptance criteria:")), len(gp))
+    check(name, len(at) == 1 and at[0] < plan_at and "not a regression of this change" in gp[at[0]]
+          and gp[at[0] + 1] == "- tests/later_test.ext (owned by subtask 2, since subtask 1): expected 3, got 2"
+          and "you own this" not in "\n".join(gp), gp)
+with scenario("build_gauntlet: the final whole-task review names no carried failures") as name:
+    gp = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, final_review=True,
+                                                spec_text="AC1", carried_failures=LATER_RED))["gauntlet_prompt"]
+    check(name, "Carried-forward test failures" not in gp and "tests/later_test.ext" not in gp, gp)
+
+# ---------------------------------------------------------------- base answers: options only, words interpreted
+with scenario("base: free text to base_merge_failed and base_markers goes to the reply interpreter once, with the "
+              "flag in the escalation, then is asked again") as name:
+    markers = escalation("base_markers", "q", [option(gates.BASE_RESOLVE, True), option("Leave the PR in draft and report")],
+                         data={"markers": "app.txt:3"})
+    firsts = [gates.apply_answer(base_state(escalation=e, last_answer="leave it in draft, retry later", answer_source=""))
+              for e in (_merge_failed, markers)]
+    agains = [gates.apply_answer(base_state(escalation=f["escalation"], last_answer="leave it in draft, retry later",
+                                            reply_interpreted=False))
+              for f in firsts if f.get("escalation")]
+    check(name, [f.get("_next") for f in firsts] == ["interpret_reply"] * 2
+          and all(f["escalation"]["data"].get("base_interpreted") is True and f.get("reply_author") == "owner"
+                  and f.get("reply_accepts") == gates._accepts_text(f["escalation"]["kind"])
+                  and not f.get("git_task") and not f.get("follow_ups") for f in firsts)
+          and [a.get("_next") for a in agains] == ["ask_dispatch"] * 2,
+          ([f.get("_next") for f in firsts], [a.get("_next") for a in agains]))
+with scenario("base: a navigator's free text to a base question is interpreted as the navigator's") as name:
+    u = gates.apply_answer(base_state(escalation=base_question("a" * 40), last_answer="merge it in",
+                                      answer_source="navigator"))
+    check(name, u.get("_next") == "interpret_reply" and u.get("reply_author") == "navigator"
+          and u.get("reply_source") == "navigator", u)
+
+# ---------------------------------------------------------------- the headless judge
+JUDGE_WHY = "The lane faulted on a transient timeout, so one more review can complete."
+
+
+def incomplete_review_asked():
+    """A review whose pipeline faulted, raised as review_incomplete and dispatched to its prompt: (state, update)."""
+    return chain(base_state(gauntlet_result="Agent node failed: timeout", round_heads=[{"round": 1, "head": "h"}],
+                            autonomous_digest=[]),
+                 "route_gauntlet", "ask_dispatch")
+
+
+def judge_rules(state, verdict, option_text, reason):
+    state = {**state, "reply_verdict": verdict, "reply_option": option_text, "reply_reason": reason}
+    return {**state, **gates.interpret_route(state)}
+
+
+with scenario("headless judge: review_incomplete, which recommends no option, reaches the judge through the typed "
+              "prompt") as name:
+    st, asked = incomplete_review_asked()
+    st, u = chain({**st, "last_answer_text": HG}, "parse_answer")
+    check(name, st["escalation"]["kind"] == "review_incomplete" and asked["_next"] == "ask_user"
+          and u["_next"] == "headless_judge" and st["judge_rulings"] == {"review_incomplete|s0|sub": 1},
+          (asked.get("_next"), u))
+with scenario("headless judge: a ruling to retry goes through apply_answer, its reason in the autonomous digest") as name:
+    judged = judge_rules(st, "option", "Retry the review again", JUDGE_WHY)
+    applied = gates.apply_answer(judged)
+    check(name, judged["_next"] == "apply_answer" and judged["last_answer"] == f"Retry the review again: {JUDGE_WHY}"
+          and applied["_next"] == "build_gauntlet_prompt"
+          and f"review_incomplete: Retry the review again (basis: headless judge: {JUDGE_WHY})" in judged["autonomous_digest"]
+          and not any("clarifying question" in d for d in judged["decisions"]), (judged.get("_next"), applied.get("_next")))
+with scenario("headless judge: a faulty ruling gets one more ruling that carries why, then the run ends blocked with "
+              "the question and its options") as name:
+    first = judge_rules(st, "option", "Rewrite the gauntlet", "it seems best")
+    second = judge_rules(first, "option", "Rewrite the gauntlet", "it seems best")
+    check(name, first["_next"] == "headless_judge" and first["reply_source"] == "judge"
+          and "names no offered option" in first["escalation"]["data"].get("judge_fault", "")
+          and second["_next"] == "end_blocked" and "headless judge gave no usable ruling twice" in second["failure_reason"]
+          and "Retry the review again" in second["failure_reason"], (first.get("_next"), second.get("failure_reason")))
+with scenario("headless judge: a decision the judge has ruled on STRIKE_LIMIT times ends blocked without the "
+              "judge") as name:
+    u = gates.parse_answer({**st, "last_answer_text": HG, "judge_rulings": {"review_incomplete|s0|sub": STRIKE_LIMIT}})
+    check(name, u["_next"] == "end_blocked" and f"has decided this question {STRIKE_LIMIT} times" in u["failure_reason"],
+          u)
+with scenario("headless judge: the judge can pick the option that stops the run") as name:
+    judged = judge_rules(st, "option", "Abort this task", "Every retry faulted the same way; another cannot complete.")
+    applied = gates.apply_answer(judged)
+    check(name, judged["_next"] == "apply_answer" and applied["_next"] == "end_aborted", applied)
+with scenario("headless judge: the judge's reason is the pick's stated reason, so the follow-up records it") as name:
+    why = "The criterion names a file the plan later removed; the change meets the rest."
+    defect = escalation("plan_defect", "q", [option(gates.PLAN_DEFECT_CONTINUE), option(gates.PLAN_DEFECT_ACCEPT),
+                                             option("Stop; the plan needs amending (report it)")])
+    judged = judge_rules(base_state(escalation=defect, reply_source="judge", last_answer_text=HG, autonomous_digest=[]),
+                         "option", gates.PLAN_DEFECT_ACCEPT, why)
+    applied = gates.apply_answer(judged)
+    check(name, any(f.endswith(f"say-so: {why}") for f in applied.get("follow_ups", [])),
+          (judged.get("last_answer"), applied.get("follow_ups")))
+with scenario("headless judge: its instructions say what a judge_fault in the escalation's data means") as name:
+    judge_node = re.search(r"(?ms)^  headless_judge:\n(.*?)(?=^  \w+:\n)",
+                           open(os.path.join(HERE, "..", "graph.yaml")).read()).group(1)
+    check(name, "judge_fault, your previous ruling" in " ".join(judge_node.split()), judge_node[:600])
+with scenario("headless judge: guidance on a draft_confirm with options and none recommended is redraft feedback, "
+              "never judged") as name:
+    draft = escalation("draft_confirm", "q", [option("Use this draft"), option("Edit the draft")], hard_trigger=False)
+    u = gates.parse_answer(base_state(escalation=draft, last_answer_text=HG))
+    check(name, u["_next"] != "headless_judge" and u["_next"] == "apply_answer" and "judge_rulings" not in u, u)
+with scenario("headless judge: guidance on a question with no options stands as its free-text answer, never "
+              "judged") as name:
+    u = gates.parse_answer(base_state(escalation=escalation("clarify", "Which module?", []), last_answer_text=HG))
+    check(name, u["_next"] == "apply_answer" and u["last_answer"] == HG and "judge_rulings" not in u, u)
+with scenario("headless judge: a hard trigger with no recommended option is never judged; the run ends blocked with "
+              "the question") as name:
+    hard = escalation("design_ask", "Restructure the storage module outside the task?", [option("Yes"), option("No")],
+                      hard_trigger=True)
+    u = gates.parse_answer(base_state(escalation=hard, last_answer_text=HG))
+    check(name, u["_next"] == "end_blocked" and "Restructure the storage module" in u.get("failure_reason", "")
+          and "judge_rulings" not in u, u)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

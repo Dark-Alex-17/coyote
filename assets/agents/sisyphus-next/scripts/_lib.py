@@ -277,6 +277,7 @@ STATE_KEYS = (
     "ci_status", "ci_rerun_ids", "anomalies_log",
     "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests", "probe_adoption",
     "base_syncs", "base_integrated", "base_checked_head",
+    "attention_notes", "autonomous_decisions", "judge_rulings",
 )
 
 
