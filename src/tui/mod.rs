@@ -306,9 +306,11 @@ fn new_textarea() -> TextArea<'static> {
     textarea
 }
 
-/// A modal's one-line field; a password's shows a `*` per character.
+/// A question's field, wrapping its text as the composer does; a
+/// password's shows a `*` per character.
 fn new_field(masked: bool) -> TextArea<'static> {
     let mut field = new_textarea();
+    field.set_wrap_mode(ratatui_textarea::WrapMode::WordOrGlyph);
     if masked {
         field.set_mask_char('*');
     }
@@ -1569,7 +1571,7 @@ impl App {
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
         match self.prompts.front() {
             Some(prompt) => prompt.rows(area.width, area.height),
-            None => self.composer.rows() + self.band_rows(area),
+            None => self.composer.rows(area.width) + self.band_rows(area),
         }
     }
 
@@ -1580,7 +1582,7 @@ impl App {
     fn band_rows(&self, area: Rect) -> u16 {
         let room = area
             .height
-            .saturating_sub(self.composer.rows() + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
+            .saturating_sub(self.composer.rows(area.width) + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
         let wanted = match self.view {
             View::Composer => queued::preview_rows(&self.queued),
             _ => self.view.band_rows(),
@@ -1606,6 +1608,9 @@ impl App {
         // whether or not the context is in hand.
         if let View::Roster(roster) = &mut self.view {
             roster.refresh(self.roster_sources.rows());
+        }
+        if let Some(prompt) = self.prompts.front_mut() {
+            prompt.layout_question(area.width, &mut self.renderer);
         }
         let bottom_rows = self.bottom_pane_rows(area);
         let [upper, rule, status, bottom, footer] = Layout::vertical([
@@ -1650,8 +1655,14 @@ impl App {
 
         let modal_areas = match self.prompts.front() {
             Some(prompt) => {
-                let [origin, question, ..] = prompt.areas(bottom.intersection(area), area);
-                frame.render_widget(PromptModal(prompt), bottom);
+                let [_, origin, question, ..] = prompt.areas(bottom.intersection(area), area);
+                frame.render_widget(
+                    PromptModal {
+                        prompt,
+                        theme: &self.theme,
+                    },
+                    bottom,
+                );
                 Some((origin, question))
             }
             None => {

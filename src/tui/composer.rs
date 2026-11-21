@@ -12,14 +12,16 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Widget};
-use ratatui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_width::UnicodeWidthStr;
 
 /// The rule's title while the vi layer is in normal mode.
 pub(super) const NORMAL_TAG: &str = " NORMAL ";
-/// Text rows the field shows, before the rule above them.
+/// Text rows the field shows, between the rules above and below them.
 const MIN_ROWS: u16 = 3;
 const MAX_ROWS: u16 = 8;
+/// The rules that frame the field.
+pub(super) const RULE_ROWS: u16 = 2;
 
 fn placeholder(prefix: CommandPrefix) -> String {
     format!(
@@ -46,6 +48,7 @@ impl Composer {
     fn textarea(lines: Vec<String>, prefix: CommandPrefix) -> TextArea<'static> {
         let mut textarea = TextArea::new(lines);
         textarea.set_cursor_line_style(Style::new());
+        textarea.set_wrap_mode(WrapMode::WordOrGlyph);
         textarea.set_placeholder_text(placeholder(prefix));
         textarea.set_placeholder_style(DIM);
         textarea
@@ -195,13 +198,14 @@ impl Composer {
         }
     }
 
-    /// Rows the field takes in a frame: its text rows, following the
-    /// draft between the bounds, plus the rule above them.
-    pub(super) fn rows(&self) -> u16 {
-        u16::try_from(self.textarea.lines().len())
+    /// Rows the field takes in a frame `width` wide: its text rows as
+    /// they wrap, following the draft between the bounds, plus the rules
+    /// above and below them.
+    pub(super) fn rows(&self, width: u16) -> u16 {
+        u16::try_from(wrapped_rows(self.textarea.lines(), width))
             .unwrap_or(MAX_ROWS)
             .clamp(MIN_ROWS, MAX_ROWS)
-            + 1
+            + RULE_ROWS
     }
 
     pub(super) fn view<'a>(
@@ -219,6 +223,16 @@ impl Composer {
             vi_normal,
         }
     }
+}
+
+/// Screen rows `lines` take wrapped at word boundaries to `width`, a
+/// word too long for a row broken across rows, as a field wraps them.
+pub(super) fn wrapped_rows(lines: &[String], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| textwrap::wrap(line, width).len().max(1))
+        .sum()
 }
 
 pub(super) struct ComposerView<'a> {
@@ -267,7 +281,9 @@ impl Widget for ComposerView<'_> {
         if area.is_empty() {
             return;
         }
-        let mut rule = Block::new().borders(Borders::TOP).border_style(DIM);
+        let mut rule = Block::new()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(self.theme.rule.patch(DIM));
         if self.vi_normal {
             rule = rule.title(NORMAL_TAG);
         }
@@ -290,7 +306,7 @@ mod tests {
     use ratatui::style::Modifier;
     use ratatui::symbols::line::HORIZONTAL;
 
-    const AREA: Rect = Rect::new(0, 0, 20, 4);
+    const AREA: Rect = Rect::new(0, 0, 20, 5);
     const BACKGROUND: Color = Color::Indexed(236);
     const KNOWN_COLOR: Color = Color::Green;
     const UNKNOWN_COLOR: Color = Color::Red;
@@ -380,14 +396,16 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_and_the_surface_frame_the_field() {
+    fn the_rules_and_the_surface_frame_the_field() {
         let buf = render("hi", CommandPrefix::Dot, &[], false);
-        assert_eq!(buf[(0, 0)].symbol(), HORIZONTAL);
-        assert_eq!(buf[(19, 0)].symbol(), HORIZONTAL);
-        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        for y in [0, AREA.height - 1] {
+            assert_eq!(buf[(0, y)].symbol(), HORIZONTAL);
+            assert_eq!(buf[(19, y)].symbol(), HORIZONTAL);
+            assert!(buf[(0, y)].modifier.contains(Modifier::DIM));
+            assert_eq!(buf[(0, y)].bg, Color::Reset);
+        }
         assert_eq!(buf[(0, 1)].bg, BACKGROUND);
         assert_eq!(buf[(19, 3)].bg, BACKGROUND);
-        assert_eq!(buf[(0, 0)].bg, Color::Reset);
     }
 
     #[test]
@@ -550,12 +568,41 @@ mod tests {
     }
 
     #[test]
-    fn the_rows_follow_the_draft_between_the_bounds_plus_the_rule() {
+    fn the_rows_follow_the_draft_between_the_bounds_plus_the_rules() {
         let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
-        assert_eq!(composer.rows(), MIN_ROWS + 1);
+        assert_eq!(composer.rows(80), MIN_ROWS + RULE_ROWS);
         composer.set_text(&["x"; 5].join("\n"));
-        assert_eq!(composer.rows(), 6);
+        assert_eq!(composer.rows(80), 5 + RULE_ROWS);
         composer.set_text(&["x"; 20].join("\n"));
-        assert_eq!(composer.rows(), MAX_ROWS + 1);
+        assert_eq!(composer.rows(80), MAX_ROWS + RULE_ROWS);
+    }
+
+    /// A line wider than the field wraps onto rows of its own, which the
+    /// field grows to show, a word too long for a row broken across it.
+    #[test]
+    fn a_long_line_wraps_and_the_field_grows_with_it() {
+        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        composer.set_text(text);
+        assert_eq!(composer.rows(20), 4 + RULE_ROWS);
+        let area = Rect::new(0, 0, 20, composer.rows(20));
+        let mut buf = Buffer::empty(area);
+        composer
+            .view(CommandPrefix::Dot, &[], &Theme::fallback(false), false)
+            .render(area, &mut buf);
+        let row = |y: u16| -> String { (0..20).map(|x| buf[(x, y)].symbol()).collect() };
+        assert_eq!(row(0), HORIZONTAL.repeat(20));
+        assert_eq!(row(1).trim_end(), "alpha bravo charlie");
+        assert_eq!(row(2).trim_end(), "delta echo foxtrot");
+        assert_eq!(row(4).trim_end(), "juliet");
+        assert_eq!(row(area.height - 1), HORIZONTAL.repeat(20));
+        assert_eq!(composer.text(), text, "wrapping changed the draft");
+
+        composer.set_text(&"x".repeat(45));
+        assert_eq!(
+            wrapped_rows(composer.lines(), 20),
+            3,
+            "a long word is not broken"
+        );
     }
 }

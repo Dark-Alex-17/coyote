@@ -1320,19 +1320,25 @@ pub fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str) -> Strin
     panic!("{what}:\n{frame}");
 }
 
+/// The byte range of the composer's field in a repainted frame: from the
+/// end of the rule above it to the start of the rule below it, the last
+/// two runs of rule characters on screen.
+fn field_span(frame: &str) -> (usize, usize) {
+    const RULE: char = '\u{2500}';
+    let Some(last) = frame.rfind(RULE) else {
+        return (0, frame.len());
+    };
+    let bottom = frame[..last].trim_end_matches(RULE).len();
+    let top = frame[..bottom]
+        .rfind(RULE)
+        .map_or(0, |at| at + RULE.len_utf8());
+    (top, bottom)
+}
+
 /// The composer's text in a repainted frame of the dry-run config: what
-/// sits between the field's rule and the footer, runs of blanks folded
-/// to one space.
+/// sits between the field's rules, runs of blanks folded to one space.
 pub fn composer_row(frame: &str) -> String {
-    let rule = frame
-        .rfind('\u{2500}')
-        .map_or(0, |at| at + '\u{2500}'.len_utf8());
-    let after = &frame[rule..];
-    let footer = after.find("dryrun:dry-model").unwrap_or(after.len());
-    after[..footer]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    composer_row_with_footer(frame, "dryrun:dry-model")
 }
 
 /// The roster band of a repainted frame: from its legend down to the rule
@@ -1657,24 +1663,24 @@ pub fn quit_declining_save(pty: &mut Pty) -> String {
 }
 
 /// The composer's text in a repainted frame: what sits between the
-/// field's rule and the footer, runs of blanks folded to one space.
+/// field's rules, cut at `footer_marker` should the frame end before the
+/// rule below the field, runs of blanks folded to one space.
 pub fn composer_row_with_footer(frame: &str, footer_marker: &str) -> String {
-    let rule = frame
-        .rfind('\u{2500}')
-        .map_or(0, |at| at + '\u{2500}'.len_utf8());
-    let after = &frame[rule..];
-    let footer = after.find(footer_marker).unwrap_or(after.len());
-    after[..footer]
+    let (top, bottom) = field_span(frame);
+    let field = &frame[top..bottom];
+    let footer = field.find(footer_marker).unwrap_or(field.len());
+    field[..footer]
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// What sits above the composer's rule in a repainted frame: transcript
-/// rows and, while a turn runs, the status strip with the queue preview.
+/// What sits above the composer's top rule in a repainted frame:
+/// transcript rows and, while a turn runs, the status strip with the
+/// queue preview.
 pub fn above_rule(frame: &str) -> String {
-    let rule = frame.rfind('\u{2500}').unwrap_or(frame.len());
-    frame[..rule].to_string()
+    let (top, _) = field_span(frame);
+    frame[..top].trim_end_matches('\u{2500}').to_string()
 }
 
 /// The placeholder is on screen: the composer holds no draft.

@@ -2,7 +2,6 @@
 source: src/tui/tests/mod.rs
 expression: frame
 ---
-"│ coyote X.Y.Z │"
 "│ model: openai:test-model             │"
 "│                                      │"
 "│ Tip: Press Ctrl-C as the model       │"
@@ -21,4 +20,5 @@ expression: frame
 " Type a prompt or a .command; Enter send"
 "                                        "
 "                                        "
+"────────────────────────────────────────"
 "openai:test-model . no session . agents "

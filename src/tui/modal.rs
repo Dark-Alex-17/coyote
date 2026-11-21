@@ -1,5 +1,9 @@
+use super::cells::LineCache;
+use super::composer::{RULE_ROWS, wrapped_rows};
 use super::keys::ModalKind;
+use super::render::Renderer;
 use super::sink::unattended_answer;
+use super::theme::Theme;
 use super::{
     App, DIM, FIXED_ROWS, TRANSCRIPT_MIN_ROWS, escalation_kind, new_field, render, roster,
 };
@@ -7,9 +11,9 @@ use crate::events::{NoticeKind, Origin};
 use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, input_default_text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui_textarea::TextArea;
 use serde_json::Value;
 use std::sync::mpsc;
@@ -45,6 +49,9 @@ pub(super) struct PendingPrompt {
     pub(super) cursor: usize,
     /// One flag per option of a checkbox, in the options' order.
     checked: Vec<bool>,
+    /// The question rendered as markdown, laid out by the frame before
+    /// it is measured or drawn.
+    question_markdown: LineCache,
 }
 
 impl PendingPrompt {
@@ -71,6 +78,7 @@ impl PendingPrompt {
             field,
             cursor: 0,
             checked,
+            question_markdown: LineCache::default(),
         }
     }
 
@@ -241,21 +249,42 @@ impl PendingPrompt {
             .max(row_count(self.hint_lines(width, true).len()))
     }
 
-    /// The question wrapped to `width`, every line of it, with the help
-    /// line dimmed under it: what the user approves is read from here,
-    /// so none of it may be clipped away. Blank lines are dropped from
-    /// both so a run of newlines cannot push the rest of the question
-    /// past the pane or paint an empty help row.
-    pub(super) fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
-        // A tool controls the question's text; escape sequences in it
-        // are stripped so none can move the cursor or hide a word.
-        let question = render::plain_text(&self.req.question)
+    /// The question's text with its escape sequences and blank lines
+    /// gone: a tool controls it, and none may move the cursor, hide a
+    /// word or push the rest of the question past the pane.
+    fn question_source(&self) -> String {
+        render::plain_text(&self.req.question)
             .lines()
             .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
-            .join("\n");
-        let mut lines =
-            render::plain_lines(&question, width, Style::new().add_modifier(Modifier::BOLD));
+            .join("\n")
+    }
+
+    /// Renders the question as markdown at `width` for the frames that
+    /// measure and draw it, every row cut to the width. A tool's question
+    /// stays plain text: markdown would conceal its syntax characters and
+    /// re-wrap it, and every character of what is approved has to show.
+    pub(super) fn layout_question(&mut self, width: u16, renderer: &mut Renderer) {
+        if self.req.tool.is_some() {
+            return;
+        }
+        let source = self.question_source();
+        self.question_markdown.get(width, || {
+            render::hard_wrap(renderer.markdown(&source, width), width)
+                .into_iter()
+                .filter(|line| !line.to_string().trim().is_empty())
+                .collect()
+        });
+    }
+
+    /// The question at `width` and the help line dimmed under it, apart,
+    /// so the question alone takes the question colour. Until the frame
+    /// has laid the markdown out the question reads as plain text.
+    fn question_parts(&self, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+        let question = match self.question_markdown.peek(width) {
+            Some(lines) => lines.to_vec(),
+            None => render::plain_lines(&self.question_source(), width, Style::new()),
+        };
         // The help is one paragraph however its lines were broken.
         let help = self.req.help.as_deref().map(|help| {
             render::plain_text(help)
@@ -265,17 +294,28 @@ impl PendingPrompt {
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        if let Some(help) = help.filter(|help| !help.is_empty()) {
-            lines.extend(render::plain_lines(&help, width, DIM));
-        }
+        let help = help
+            .filter(|help| !help.is_empty())
+            .map(|help| render::plain_lines(&help, width, DIM))
+            .unwrap_or_default();
+        (question, help)
+    }
+
+    /// The question wrapped to `width`, every line of it, with the help
+    /// line under it: what the user approves is read from here, so none
+    /// of it may be clipped away.
+    pub(super) fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let (mut lines, help) = self.question_parts(width);
+        lines.extend(help);
         lines
     }
 
     /// Rows the question may take on a frame `height` tall: the frame's
-    /// fixed rows and the modal's origin, middle and hint rows are taken,
-    /// and `TRANSCRIPT_MIN_ROWS` stay with the transcript.
+    /// fixed rows, the box's rules and the origin, middle and hint rows
+    /// are taken, and `TRANSCRIPT_MIN_ROWS` stay with the transcript.
     fn question_cap(&self, width: u16, height: u16) -> u16 {
         let fixed = FIXED_ROWS
+            + self.rule_rows(width, height)
             + TRANSCRIPT_MIN_ROWS
             + self.hint_rows(width)
             + self.origin_rows()
@@ -283,16 +323,41 @@ impl PendingPrompt {
         height.saturating_sub(fixed).max(1)
     }
 
-    /// Rows of the field or the list, none for a confirm; a list longer
-    /// than the frame allows (one question row, the fixed rows and the
-    /// transcript's minimum kept) scrolls inside what it gets.
+    /// Rows of the box's two rules: none on a frame where keeping them
+    /// would cut the question, which needs the rows more.
+    fn rule_rows(&self, width: u16, height: u16) -> u16 {
+        let taken = FIXED_ROWS
+            + RULE_ROWS
+            + TRANSCRIPT_MIN_ROWS
+            + self.origin_rows()
+            + self.middle_rows(width, height)
+            + self.hint_rows(width);
+        if self.question_fits_rows(width, height.saturating_sub(taken)) {
+            RULE_ROWS
+        } else {
+            0
+        }
+    }
+
+    /// Rows of the field or the list as they wrap, none for a confirm; a
+    /// list or field taller than the frame allows (one question row, the
+    /// fixed rows, the rules and the transcript's minimum kept) scrolls
+    /// inside what it gets.
     fn middle_rows(&self, width: u16, height: u16) -> u16 {
         if matches!(self.kind(), ModalKind::Confirm { .. }) {
             return 0;
         }
-        let fixed =
-            1 + FIXED_ROWS + TRANSCRIPT_MIN_ROWS + self.hint_rows(width) + self.origin_rows();
-        row_count(self.list_len()).clamp(1, height.saturating_sub(fixed).max(1))
+        let fixed = 1
+            + FIXED_ROWS
+            + RULE_ROWS
+            + TRANSCRIPT_MIN_ROWS
+            + self.hint_rows(width)
+            + self.origin_rows();
+        let wanted = match &self.field {
+            Some(field) => wrapped_rows(field.lines(), width),
+            None => self.option_rows(width).iter().map(Vec::len).sum(),
+        };
+        row_count(wanted).clamp(1, height.saturating_sub(fixed).max(1))
     }
 
     fn question_rows(&self, width: u16, height: u16) -> u16 {
@@ -310,63 +375,94 @@ impl PendingPrompt {
         row_count(self.question_lines(width).len()) <= rows
     }
 
-    /// Rows of the whole modal: origin, question, field or list, hint.
+    /// Rows of the whole box: the rules around the origin, question and
+    /// field or list, then the hint under it.
     pub(super) fn rows(&self, width: u16, height: u16) -> u16 {
-        self.origin_rows()
+        self.rule_rows(width, height)
+            + self.origin_rows()
             + self.question_rows(width, height)
             + self.middle_rows(width, height)
             + self.hint_rows(width)
     }
 
-    /// The origin, question, middle and legend rows inside the modal's
-    /// `area` on a frame `frame` tall. A frame too short for the layout
-    /// squeezes the question first; what it actually received is what
-    /// answerability is judged on.
-    pub(super) fn areas(&self, area: Rect, frame: Rect) -> [Rect; 4] {
+    /// The top rule, origin, question, middle, bottom rule and legend
+    /// rows inside the box's `area` on a frame `frame` tall. A frame too
+    /// short for the layout squeezes the question first; what it
+    /// actually received is what answerability is judged on.
+    pub(super) fn areas(&self, area: Rect, frame: Rect) -> [Rect; 6] {
+        let rule = self.rule_rows(area.width, frame.height) / RULE_ROWS;
         Layout::vertical([
+            Constraint::Length(rule),
             Constraint::Length(self.origin_rows()),
             Constraint::Min(1),
             Constraint::Length(self.middle_rows(area.width, frame.height)),
+            Constraint::Length(rule),
             Constraint::Length(self.hint_rows(area.width)),
         ])
         .areas(area)
     }
 
-    /// The list's rows as drawn, windowed around the cursor when it is
-    /// taller than `visible`.
-    fn list_lines(&self, visible: usize) -> Vec<Line<'static>> {
+    /// Each row of the list as it wraps to `width`: the marker and, on a
+    /// checkbox, the tick on the first line, the rest of a long option
+    /// indented under its text.
+    fn option_rows(&self, width: u16) -> Vec<Vec<String>> {
         let checkbox = self.kind() == ModalKind::Checkbox;
-        let rows: Vec<String> = self
-            .req
+        self.req
             .options
             .iter()
             .map(|option| render::plain_text(option).replace('\n', " "))
             .chain(self.has_custom_row().then(|| CUSTOM_CHOICE_ROW.to_string()))
-            .collect();
-        let first = if self.cursor < visible {
-            0
-        } else {
-            self.cursor + 1 - visible
-        };
-        rows.into_iter()
             .enumerate()
-            .skip(first)
-            .take(visible)
             .map(|(index, text)| {
                 let marker = if index == self.cursor { ">" } else { " " };
-                let line = if checkbox {
+                let lead = if checkbox {
                     let tick = if self.checked[index] { "x" } else { " " };
-                    format!("{marker} [{tick}] {text}")
+                    format!("{marker} [{tick}] ")
                 } else {
-                    format!("{marker} {text}")
+                    format!("{marker} ")
                 };
+                let indent = " ".repeat(lead.len());
+                let room = usize::from(width).saturating_sub(lead.len()).max(1);
+                let mut lines: Vec<String> = textwrap::wrap(&text, room)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, part)| format!("{}{part}", if i == 0 { &lead } else { &indent }))
+                    .collect();
+                if lines.is_empty() {
+                    lines.push(lead);
+                }
+                lines
+            })
+            .collect()
+    }
+
+    /// The list's rows as drawn at `width`, windowed so the option under
+    /// the cursor is whole when the list is taller than `visible`; that
+    /// option is in the highlight style, the others plain.
+    fn list_lines(&self, width: u16, visible: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let options = self.option_rows(width);
+        let through_cursor: usize = options.iter().take(self.cursor + 1).map(Vec::len).sum();
+        let mut skip = through_cursor.saturating_sub(visible);
+        let mut first = 0;
+        while skip > 0 && first < self.cursor {
+            skip = skip.saturating_sub(options[first].len());
+            first += 1;
+        }
+        options
+            .into_iter()
+            .enumerate()
+            .skip(first)
+            .flat_map(|(index, lines)| {
                 let style = if index == self.cursor {
-                    Style::new().add_modifier(Modifier::BOLD)
+                    theme.option_highlight
                 } else {
                     Style::new()
                 };
-                Line::from(Span::styled(line, style))
+                lines
+                    .into_iter()
+                    .map(move |line| Line::from(Span::styled(line, style)))
             })
+            .take(visible)
             .collect()
     }
 }
@@ -375,11 +471,15 @@ fn row_count(lines: usize) -> u16 {
     u16::try_from(lines).unwrap_or(u16::MAX)
 }
 
-/// A prompt drawn where the composer was: origin, question, the field or
-/// list, hint. A question taller than its rows is cut with a marker
-/// counting the hidden lines and a legend offering only Esc; the cap
-/// grows with the terminal, so enlarging it shows them.
-pub(super) struct PromptModal<'a>(pub(super) &'a PendingPrompt);
+/// A prompt drawn in the composer's box, between its rules: origin,
+/// question, the field or list, then the hint under the box. A question
+/// taller than its rows is cut with a marker counting the hidden lines
+/// and a legend offering only Esc; the cap grows with the terminal, so
+/// enlarging it shows them.
+pub(super) struct PromptModal<'a> {
+    pub(super) prompt: &'a PendingPrompt,
+    pub(super) theme: &'a Theme,
+}
 
 impl Widget for PromptModal<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -387,8 +487,22 @@ impl Widget for PromptModal<'_> {
         if area.is_empty() {
             return;
         }
-        let [origin, question, middle, hint] = self.0.areas(area, *buf.area());
-        let mut lines = self.0.question_lines(area.width);
+        let prompt = self.prompt;
+        let [top, origin, question, middle, bottom, hint] = prompt.areas(area, *buf.area());
+        let rule = self.theme.rule.patch(DIM);
+        for row in [top, bottom] {
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(rule)
+                .render(row, buf);
+        }
+        let (mut lines, help) = prompt.question_parts(area.width);
+        for line in &mut lines {
+            for span in &mut line.spans {
+                span.style = self.theme.question.patch(span.style);
+            }
+        }
+        lines.extend(help);
         let visible = usize::from(question.height);
         let clipped = lines.len() > visible;
         if clipped && visible > 0 {
@@ -401,17 +515,22 @@ impl Widget for PromptModal<'_> {
             )));
         }
         Paragraph::new(lines).render(question, buf);
-        if let Some(line) = self.0.origin_line() {
+        if let Some(line) = prompt.origin_line() {
             Paragraph::new(Line::from(Span::styled(line, DIM))).render(origin, buf);
         }
-        match (&self.0.field, self.0.kind()) {
+        match (&prompt.field, prompt.kind()) {
             (Some(field), _) => field.render(middle, buf),
             (None, ModalKind::Confirm { .. }) => {}
             (None, _) => {
-                Paragraph::new(self.0.list_lines(usize::from(middle.height))).render(middle, buf);
+                Paragraph::new(prompt.list_lines(
+                    middle.width,
+                    usize::from(middle.height),
+                    self.theme,
+                ))
+                .render(middle, buf);
             }
         }
-        Paragraph::new(self.0.hint_lines(area.width, clipped)).render(hint, buf);
+        Paragraph::new(prompt.hint_lines(area.width, clipped)).render(hint, buf);
     }
 }
 

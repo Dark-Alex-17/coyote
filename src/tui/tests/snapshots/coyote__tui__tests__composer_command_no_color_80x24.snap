@@ -4,7 +4,6 @@ expression: frame
 ---
 "                                                                                "
 "                                                                                "
-"                                                                                "
 "┌──────────────────────────────────────────────────────────────────────────────┐"
 "│ coyote X.Y.Z │"
 "│ model: openai:test-model                                                     │"
@@ -25,4 +24,5 @@ expression: frame
 ".info tools                                                                     "
 "                                                                                "
 "                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
 "openai:test-model . no session . agents 0 . jobs 0                              "

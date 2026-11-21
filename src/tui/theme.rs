@@ -178,6 +178,11 @@ pub(super) struct Theme {
     pub(super) todo_open: Style,
     /// The key help's title and section headings, and the todo goal.
     pub(super) heading: Style,
+    /// A question's text where its markdown sets no colour of its own,
+    /// in the REPL's question colour.
+    pub(super) question: Style,
+    /// The option under a question's cursor.
+    pub(super) option_highlight: Style,
     pub(super) known_command: Style,
     pub(super) unknown_command: Style,
     pub(super) palette: RowStyles,
@@ -207,6 +212,8 @@ impl Theme {
             todo_done: paint(DIM, tool_dim),
             todo_open: paint(Style::new(), tool_fn),
             heading: paint(BOLD, heading),
+            question: paint(Style::new(), heading),
+            option_highlight: paint(BOLD, HIGHLIGHT),
             known_command: paint(BOLD, KNOWN_COMMAND),
             unknown_command: paint(BOLD, UNKNOWN_COMMAND),
             palette: if no_color { PLAIN_ROWS } else { PALETTE_ROWS },
@@ -317,6 +324,8 @@ mod tests {
             (coloured.todo_done, plain.todo_done),
             (coloured.todo_open, plain.todo_open),
             (coloured.heading, plain.heading),
+            (coloured.question, plain.question),
+            (coloured.option_highlight, plain.option_highlight),
             (coloured.known_command, plain.known_command),
             (coloured.unknown_command, plain.unknown_command),
         ];

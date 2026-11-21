@@ -44,6 +44,14 @@ impl LineCache {
             .last()
             .map_or(&[], |(_, lines)| lines.as_slice())
     }
+
+    /// The lines laid out at `width`, if they have been.
+    pub(super) fn peek(&self, width: u16) -> Option<&[Line<'static>]> {
+        self.entries
+            .iter()
+            .find(|(w, _)| *w == width)
+            .map(|(_, lines)| lines.as_slice())
+    }
 }
 
 /// Every byte a call printed, up to `FULL_OUTPUT_LIMIT`, for the pager;

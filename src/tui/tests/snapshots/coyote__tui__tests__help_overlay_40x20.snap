@@ -2,8 +2,8 @@
 source: src/tui/tests/mod.rs
 expression: frame
 ---
-"│ coyote X.Y.Z │"
-"│┌Keys─────────────────────────1-8/220┐│"
+"│ model: openai:test-model             │"
+"│┌Keys─────────────────────────1-7/220┐│"
 "││                                    ││"
 "││Anywhere                            ││"
 "││  Ctrl+Z                            ││"
@@ -12,7 +12,6 @@ expression: frame
 "││    Redraw the screen               ││"
 "││                                    ││"
 "││Transcript, also under a question   ││"
-"││  Ctrl+X                            ││"
 "│└j/k scroll  PgUp/Dn page  Esc close─┘│"
 "└──────────────────────────────────────┘"
 "────────────────────────────────────────"
@@ -21,4 +20,5 @@ expression: frame
 " Type a prompt or a .command; Enter send"
 "                                        "
 "                                        "
+"────────────────────────────────────────"
 "openai:test-model . no session . agents "

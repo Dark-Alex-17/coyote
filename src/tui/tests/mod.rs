@@ -1547,7 +1547,7 @@ fn a_painted_notice_reaches_the_frame_as_plain_words() {
 /// the transcript show their words and no escape or format bytes.
 #[test]
 fn plain_cells_are_scrubbed_when_drawn() {
-    let mut harness = Harness::standalone(60, 12);
+    let mut harness = Harness::standalone(60, 14);
     harness.app.begin_turn("hi\x1b[2Jthere\u{200b}u7p", false);
     harness.app.transcript.push(Cell::Error {
         text: "\x1b[31mbroken\x1b[0m e7p".to_string(),
@@ -2807,19 +2807,43 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
         ),
         (
             "confirm modal",
-            Box::new(|area, buf| PromptModal(&confirm).render(area, buf)),
+            Box::new(|area, buf| {
+                PromptModal {
+                    prompt: &confirm,
+                    theme: &theme,
+                }
+                .render(area, buf)
+            }),
         ),
         (
             "input modal",
-            Box::new(|area, buf| PromptModal(&input).render(area, buf)),
+            Box::new(|area, buf| {
+                PromptModal {
+                    prompt: &input,
+                    theme: &theme,
+                }
+                .render(area, buf)
+            }),
         ),
         (
             "select modal",
-            Box::new(|area, buf| PromptModal(&select).render(area, buf)),
+            Box::new(|area, buf| {
+                PromptModal {
+                    prompt: &select,
+                    theme: &theme,
+                }
+                .render(area, buf)
+            }),
         ),
         (
             "checkbox modal",
-            Box::new(|area, buf| PromptModal(&checkbox).render(area, buf)),
+            Box::new(|area, buf| {
+                PromptModal {
+                    prompt: &checkbox,
+                    theme: &theme,
+                }
+                .render(area, buf)
+            }),
         ),
         (
             "todo panel",
@@ -2947,10 +2971,11 @@ fn end_on_an_unscrolled_view_moves_the_composer_cursor() {
     assert_eq!(harness.app.composer_text(), "abcd");
 }
 
-/// Where the composer lands at 80x24 with a one-line draft: the rule
-/// above its three text rows, with the footer under them.
-const COMPOSER_RULE_ROW: u16 = 19;
-const COMPOSER_TEXT_ROW: u16 = 20;
+/// Where the composer lands at 80x24 with a one-line draft: the rules
+/// above and below its three text rows, with the footer under them.
+const COMPOSER_RULE_ROW: u16 = 18;
+const COMPOSER_TEXT_ROW: u16 = 19;
+const COMPOSER_BOTTOM_RULE_ROW: u16 = 22;
 
 fn composer_cell(harness: &Harness, x: u16) -> (Color, bool) {
     let cell = &harness.terminal.backend().buffer()[(x, COMPOSER_TEXT_ROW)];
@@ -2975,14 +3000,18 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
     let frame = harness.draw();
     assert_welcome_snapshot("composer_command_80x24", &frame);
     let buffer = harness.terminal.backend().buffer();
+    for row in [COMPOSER_RULE_ROW, COMPOSER_BOTTOM_RULE_ROW] {
+        assert_eq!(
+            row_text(&harness, row),
+            ratatui::symbols::line::HORIZONTAL.repeat(80),
+            "{frame}"
+        );
+        assert!(buffer[(0, row)].modifier.contains(Modifier::DIM));
+        assert_eq!(buffer[(0, row)].bg, Color::Reset);
+    }
     assert_eq!(
-        buffer[(0, COMPOSER_RULE_ROW)].symbol(),
-        ratatui::symbols::line::HORIZONTAL
-    );
-    assert!(
-        buffer[(0, COMPOSER_RULE_ROW)]
-            .modifier
-            .contains(Modifier::DIM)
+        buffer[(0, COMPOSER_RULE_ROW)].fg,
+        harness.app.theme.rule.fg.unwrap()
     );
     assert!(
         (0..11).all(|x| composer_cell(&harness, x) == (Color::Green, true)),
@@ -3303,10 +3332,10 @@ fn the_palette_band_sits_above_the_rule_and_keeps_the_transcript_minimum() {
 
     harness.resize(80, 13);
     harness.render();
-    let room = 13 - (harness.app.composer.rows() + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
+    let room = 13 - (harness.app.composer.rows(80) + FIXED_ROWS + TRANSCRIPT_MIN_ROWS);
     assert_eq!(harness.app.band_rows(Rect::new(0, 0, 80, 13)), room);
     let frame = harness.terminal.backend().to_string();
-    let band_top = 13 - 1 - harness.app.composer.rows() - room;
+    let band_top = 13 - 1 - harness.app.composer.rows(80) - room;
     assert!(row_text(&harness, band_top).starts_with('.'), "{frame}");
     assert!(
         row_text(&harness, band_top + room - 1).contains("(+"),
@@ -4888,7 +4917,7 @@ fn the_key_help_pops_up_over_the_transcript_wide_and_narrow() {
         let frame = harness.draw();
         assert!(frame.contains("Suspend to the shell"), "{frame}");
         let open: Vec<&str> = frame.lines().collect();
-        let below = usize::from(harness.app.composer.rows()) + 1;
+        let below = usize::from(harness.app.composer.rows(80)) + 1;
         let first_below = open.len() - below;
         assert_eq!(open[first_below..], closed[first_below..], "{frame}");
         let status = open[first_below - 1];

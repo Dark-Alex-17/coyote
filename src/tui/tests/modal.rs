@@ -1421,3 +1421,201 @@ fn a_confirm_escalation_relays_yes() {
     harness.press(KeyCode::Char('y'));
     assert_eq!(reply.try_recv().as_deref(), Ok("yes"));
 }
+
+/// The rows of the last frame from the first starting with `first` to
+/// the first after it starting with `last`, both included.
+fn box_rows(harness: &Harness, first: &str, last: &str) -> (u16, u16) {
+    let top = screen_row(harness, first);
+    let height = harness.terminal.backend().buffer().area.height;
+    let bottom = (top..height)
+        .find(|y| row_text(harness, *y).starts_with(last))
+        .unwrap_or_else(|| panic!("no row starts with {last:?} under {first:?}"));
+    (top, bottom)
+}
+
+/// Every kind of question is drawn in the composer's box: a rule over
+/// its first row and one under its last, the key legend below the box.
+/// The draft is out of sight while the question is up and back once it
+/// is cancelled.
+#[test]
+fn every_question_kind_draws_between_the_box_rules_and_hides_the_draft() {
+    let rule = ratatui::symbols::line::HORIZONTAL.repeat(80);
+    let requests = [
+        (confirm_request(None), "Proceed? tui-x7x", "y = yes"),
+        (
+            confirm_request(Some("fs_write")),
+            "fs_write asks:",
+            "y = yes",
+        ),
+        (
+            PromptRequest::new(PromptAction::Input, "Name? b4x", Origin::detached()),
+            "Name? b4x",
+            "Enter = answer",
+        ),
+        (
+            PromptRequest::new(PromptAction::Password, "Token? b4x", Origin::detached()),
+            "Token? b4x",
+            "Enter = answer",
+        ),
+        (
+            list_request(PromptAction::Select, None),
+            "Pick one q9d-s",
+            "Up/Down = move",
+        ),
+        (
+            list_request(PromptAction::Checkbox, None),
+            "Pick one q9d-s",
+            "Space = tick",
+        ),
+    ];
+    for (req, first, hint) in requests {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft-z9q");
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert!(!frame.contains("draft-z9q"), "{first}: {frame}");
+        let (top, legend) = box_rows(&harness, first, hint);
+        assert_eq!(row_text(&harness, top - 1), rule, "{first}: {frame}");
+        assert_eq!(row_text(&harness, legend - 1), rule, "{first}: {frame}");
+        assert!(
+            (top..legend - 1).all(|y| row_text(&harness, y) != rule),
+            "{first}: a rule inside the box\n{frame}"
+        );
+
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        let frame = harness.draw();
+        assert!(frame.contains("draft-z9q"), "{first}: {frame}");
+        assert_eq!(harness.app.composer_text(), "draft-z9q");
+    }
+}
+
+/// The question takes the question colour, the options are plain and
+/// the option under the cursor is bold and in the highlight colour, so
+/// it is told apart by more than bold. `NO_COLOR` keeps only the bold.
+#[test]
+fn the_question_and_the_highlighted_option_have_colours_of_their_own() {
+    for no_color in [false, true] {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(no_color);
+        let _asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, None));
+        harness.press(KeyCode::Down);
+        harness.draw();
+        let question = style_at(&harness, "Pick one q9d-s");
+        let plain = style_at(&harness, "  alpha");
+        let marked = style_at(&harness, "> beta");
+        let theme = &harness.app.theme;
+        assert!(marked.1.contains(Modifier::BOLD), "{no_color}");
+        assert!(!plain.1.contains(Modifier::BOLD), "{no_color}");
+        assert_eq!(plain.0, Color::Reset, "{no_color}");
+        if no_color {
+            assert_eq!((question.0, marked.0), (Color::Reset, Color::Reset));
+        } else {
+            assert_eq!(Some(question.0), theme.question.fg);
+            assert_eq!(marked.0, Color::LightCyan);
+            assert_ne!(question.0, Color::Reset);
+        }
+        harness.press(KeyCode::Esc);
+    }
+}
+
+/// An option wider than the box wraps under its own text, every word
+/// of it on screen, and all its rows take the highlight when it is
+/// under the cursor.
+#[test]
+fn a_long_option_wraps_under_its_text() {
+    let mut harness = Harness::standalone(40, 24);
+    let long = "a rather long option that cannot fit on a single forty column row at all";
+    let req = PromptRequest {
+        options: vec!["short".to_string(), long.to_string()],
+        ..PromptRequest::new(PromptAction::Select, "Which? w2r", Origin::detached())
+    };
+    let _asker = ask_on_a_thread(&mut harness, req);
+    harness.press(KeyCode::Down);
+    let frame = harness.draw();
+    let first = screen_row(&harness, "> a rather long");
+    let rows: Vec<String> = (first..first + 2).map(|y| row_text(&harness, y)).collect();
+    assert!(
+        rows[1].starts_with("  ") && !rows[1].starts_with("   "),
+        "{frame}"
+    );
+    assert!(rows.iter().all(|row| row.trim_end().len() <= 40), "{frame}");
+    let joined: Vec<&str> = rows.iter().flat_map(|row| row.split_whitespace()).collect();
+    assert_eq!(joined[1..].join(" "), long, "{frame}");
+    let buffer = harness.terminal.backend().buffer();
+    for y in first..first + 2 {
+        assert!(
+            buffer[(2, y)].modifier.contains(Modifier::BOLD),
+            "row {y} of the marked option is not highlighted\n{frame}"
+        );
+    }
+    assert!(
+        row_text(&harness, first + 2).starts_with(&format!("  {CUSTOM_CHOICE_ROW}")),
+        "{frame}"
+    );
+    assert!(!buffer[(2, first + 2)].modifier.contains(Modifier::BOLD));
+    harness.press(KeyCode::Esc);
+}
+
+/// The free-text answer behind "Other" wraps as the composer does, the
+/// box growing to show all of it.
+#[test]
+fn the_other_field_wraps_its_text() {
+    let mut harness = Harness::standalone(40, 24);
+    let asker = ask_on_a_thread(&mut harness, list_request(PromptAction::Select, None));
+    harness.clock.advance(HOTKEY_IDLE);
+    for _ in 0..3 {
+        harness.press(KeyCode::Down);
+    }
+    harness.press(KeyCode::Enter);
+    let text = "my own answer is longer than one row of this narrow box";
+    harness.type_text(text);
+    let frame = harness.draw();
+    let first = screen_row(&harness, "my own answer");
+    let rows: Vec<String> = (first..first + 2).map(|y| row_text(&harness, y)).collect();
+    assert_eq!(
+        rows.iter()
+            .flat_map(|row| row.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" "),
+        text,
+        "{frame}"
+    );
+    harness.press(KeyCode::Esc);
+    assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+}
+
+/// Coyote's and an agent's questions are rendered as markdown; a tool's
+/// stays plain so every character it asks to approve shows.
+#[test]
+fn only_a_question_without_a_tool_is_rendered_as_markdown() {
+    let source = "Keep `notes` **now**? m3d";
+    let mut harness = Harness::standalone(80, 24);
+    let expected: Vec<String> = harness
+        .app
+        .renderer
+        .markdown(source, 80)
+        .iter()
+        .map(|line| line.to_string().trim_end().to_string())
+        .collect();
+    assert_ne!(
+        expected[0], source,
+        "the renderer left the markdown as it was"
+    );
+    let req = PromptRequest::new(PromptAction::Confirm, source, Origin::detached());
+    let _asker = ask_on_a_thread(&mut harness, req);
+    let frame = harness.draw();
+    let row = screen_row(&harness, expected[0].as_str());
+    assert_eq!(row_text(&harness, row).trim_end(), expected[0], "{frame}");
+    harness.press(KeyCode::Esc);
+
+    let mut harness = Harness::standalone(80, 24);
+    let req = PromptRequest {
+        tool: Some("fs_rm".to_string()),
+        ..PromptRequest::new(PromptAction::Confirm, source, Origin::detached())
+    };
+    let _asker = ask_on_a_thread(&mut harness, req);
+    let frame = harness.draw();
+    assert!(frame.contains(source), "{frame}");
+    harness.press(KeyCode::Esc);
+}
