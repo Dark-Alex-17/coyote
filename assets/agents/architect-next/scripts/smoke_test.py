@@ -1001,7 +1001,7 @@ check("gate1_build: the prior verdict keeps its first item", "FIRST-LEAK" in u["
 u = gates.promote_verify(base_state(promote_retries=0))
 check("promote_verify: no promoted PLAN / no tasks -> one retry (B6 side 1)", u["_next"] == "promote_tasks" and u["promote_retries"] == 1 and ("PLAN" in u["promote_defects"] or "task dirs" in u["promote_defects"]))
 u = gates.promote_verify(base_state(promote_retries=RERUN_ONCE))
-check("promote_verify: zero promoted tasks after the retry on the default store -> promote_failed, not advisory",
+check("promote_verify: zero promoted tasks after the retry on the default task layout -> promote_failed, not advisory",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed"
       and "promotion left no task dirs for the plan" in u["escalation"]["evidence"]
       and not any("proceeding (advisory)" in d for d in u.get("decisions", [])), u.get("escalation"))
