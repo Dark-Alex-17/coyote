@@ -476,6 +476,12 @@ impl RnsdLanReader {
         self.last_tcp.lock().clone()
     }
 
+    /// The TCP client interfaces the latest read that reached rnsd listed, with no call;
+    /// `None` before any read reached it.
+    pub(crate) fn tcp_interfaces_seen(&self) -> Option<Vec<RnsdTcpInterface>> {
+        self.last_tcp.lock().clone()
+    }
+
     /// Whether the latest read that reached rnsd found an AutoInterface, with no call;
     /// `false` before any read reached it.
     pub(crate) fn lan_seen(&self) -> bool {
@@ -818,7 +824,9 @@ mod tests {
 
     /// The reads the silent-LAN note rests on, on a paused clock, counting rnsd calls:
     /// the one patient read at join makes at most `RPC_ATTEMPTS` calls, `RPC_RETRY_WAIT`
-    /// apart, and stops at the first answer; nothing reads rnsd again until the user asks.
+    /// apart, and stops at the first answer; the reader makes no call of its own after it
+    /// (a running node's other reader is the interface watcher's poll, one call per
+    /// `UPSTREAM_POLL`, which `the_upstream_poll_reads_rnsd_once_per_interval...` counts).
     /// Each `.mesh people list` (or `.mesh status`) makes one call on `QUICK_RPC_BUDGET`,
     /// or none while another read is under way, answering with the last reading then. A
     /// key rnsd refuses ends the calls for the run.
@@ -845,7 +853,7 @@ mod tests {
 
         let idle = Duration::from_secs(3600);
         tokio::time::advance(idle).await;
-        assert_eq!(source.calls(), 3, "nothing reads rnsd while nobody asks");
+        assert_eq!(source.calls(), 3, "the reader makes no call of its own");
         assert!(reader.read_quick().await.relay_online, "the first ask");
         assert!(reader.relay_online_seen());
         assert_eq!(source.calls(), 4, "one call per ask");

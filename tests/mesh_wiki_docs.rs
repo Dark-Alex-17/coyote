@@ -11175,6 +11175,8 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         "{} reconnected upstream",
         "This host's network changed",
         "{subject}; announced so other sessions can find this one again",
+        "{subject}; this session already sent its {RECONNECT_GREETINGS_PER_HOUR} greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now",
+        "{subject}, but announcing failed; the next heartbeat will announce this session (details in the log).",
     ] {
         assert!(
             literals.iter().any(|literal| literal == piece),
@@ -11199,7 +11201,8 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
     );
     for needle in lines.iter().map(String::as_str).chain([
         "every 30 seconds it reads the host's interface addresses (loopback and link-local left out)",
-        "share the limit of four an hour that a relay reconnect has, and do not move the heartbeat",
+        "share one limit of four an hour, the same number a relay reconnect is held to, and do not move the heartbeat",
+        "the next poll that finds rnsd's upstream online announces once more",
     ]) {
         assert!(
             moving.contains(needle),
@@ -11210,7 +11213,13 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
     for needle in lines
         .iter()
         .map(String::as_str)
-        .chain(["(Mesh-Deployment#moving-between-networks)"])
+        .chain([
+            "These two share one limit of four greetings an hour; past it the line ends",
+            "`; this session already sent its 4 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`",
+            "`, but announcing failed; the next heartbeat will announce this session (details in the log).`",
+            "A session with `mesh.announce` off prints nothing for these",
+            "(Mesh-Deployment#moving-between-networks)",
+        ])
     {
         assert!(
             commands.contains(needle),

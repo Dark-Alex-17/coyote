@@ -6,6 +6,7 @@
 //! keeps each transition with its interface and time in `InterfaceTransitions`.
 
 use crate::mesh::lan_count::{RnsdLanReader, RnsdTcpInterface};
+use crate::mesh::redact_hashes;
 use log::debug;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -21,25 +22,44 @@ pub(crate) const UPSTREAM_POLL: Duration = Duration::from_secs(30);
 const TRANSITIONS_KEPT: usize = 64;
 
 /// The host's interface addresses by interface name, loopback and link-local left out:
-/// those do not change when the host moves between networks. `None` when they cannot be
-/// read.
+/// those do not change when the host moves between networks. An IPv6 address counts by
+/// its /64 prefix, so the temporary addresses a host rotates on its own inside one
+/// network are not a move. `None` when they cannot be read.
 pub(crate) fn host_addresses() -> Option<BTreeSet<(String, IpAddr)>> {
     match if_addrs::get_if_addrs() {
-        Ok(interfaces) => Some(
-            interfaces
-                .into_iter()
-                .filter(|interface| !interface.is_loopback() && !interface.is_link_local())
-                .map(|interface| {
-                    let ip = interface.ip();
-                    (interface.name, ip)
-                })
-                .collect(),
-        ),
+        Ok(interfaces) => Some(network_fingerprint(interfaces.into_iter().map(
+            |interface| {
+                let ip = interface.ip();
+                (interface.name, ip)
+            },
+        ))),
         Err(err) => {
-            debug!("Mesh could not read this host's interface addresses: {err}");
+            debug!(
+                "Mesh could not read this host's interface addresses: {}",
+                redact_hashes(&err.to_string())
+            );
             None
         }
     }
+}
+
+/// What of `addresses` says which network the host is on: every address but loopback and
+/// link-local (all of `fe80::/10`), an IPv6 one cut to its /64 prefix.
+fn network_fingerprint(
+    addresses: impl IntoIterator<Item = (String, IpAddr)>,
+) -> BTreeSet<(String, IpAddr)> {
+    addresses
+        .into_iter()
+        .filter_map(|(name, ip)| match ip {
+            IpAddr::V4(v4) if v4.is_loopback() || v4.is_link_local() => None,
+            IpAddr::V6(v6) if v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80 => None,
+            IpAddr::V6(v6) => {
+                let prefix = u128::from(v6) & !u128::from(u64::MAX);
+                Some((name, IpAddr::V6(prefix.into())))
+            }
+            IpAddr::V4(_) => Some((name, ip)),
+        })
+        .collect()
 }
 
 /// What one poll found that the node greets for: the rnsd TCP interfaces that came back
@@ -63,6 +83,10 @@ impl UpstreamChange {
 pub(crate) struct UpstreamWatch {
     rnsd: Option<BTreeMap<String, bool>>,
     addresses: Option<BTreeSet<(String, IpAddr)>>,
+    /// The host's network changed at the last reading: rnsd's upstream may still have
+    /// been down then, or have dropped and come back inside one poll, so the next
+    /// reading that finds it online counts as a reconnect once more.
+    after_move: bool,
 }
 
 impl UpstreamWatch {
@@ -72,13 +96,28 @@ impl UpstreamWatch {
         Self {
             rnsd: None,
             addresses,
+            after_move: false,
+        }
+    }
+
+    /// Takes `interfaces` as the first rnsd reading, when none was taken yet: the read
+    /// made at join, so an upstream that comes back before the first poll is seen.
+    pub(crate) fn seed_rnsd(&mut self, interfaces: &[RnsdTcpInterface]) {
+        if self.rnsd.is_none() {
+            self.rnsd = Some(
+                interfaces
+                    .iter()
+                    .map(|interface| (interface.name.clone(), interface.online))
+                    .collect(),
+            );
         }
     }
 
     /// Folds one reading of rnsd's TCP interfaces in, recording each that went down or
     /// came back, and returns the ones that came back: online now and offline at the
     /// last reading. An interface first seen online is no transition, nor is anything in
-    /// the first reading.
+    /// the first reading. After a network change the first reading with an interface
+    /// online returns those online ones too, once.
     pub(crate) fn observe_rnsd(
         &mut self,
         interfaces: &[RnsdTcpInterface],
@@ -102,6 +141,17 @@ impl UpstreamWatch {
                 (Some(true), false) => transitions.record(name, TransitionKind::Down, now),
                 _ => {}
             }
+        }
+        if std::mem::take(&mut self.after_move) {
+            let online: Vec<String> = current
+                .iter()
+                .filter(|(name, online)| **online && !back.contains(*name))
+                .map(|(name, _)| name.clone())
+                .collect();
+            if online.is_empty() && back.is_empty() {
+                self.after_move = true;
+            }
+            back.extend(online);
         }
         back
     }
@@ -127,6 +177,7 @@ impl UpstreamWatch {
         for name in &changed {
             transitions.record(name, TransitionKind::AddressesChanged, now);
         }
+        self.after_move |= !changed.is_empty();
         changed.into_iter().collect()
     }
 }
@@ -156,6 +207,9 @@ impl UpstreamPoll {
 
     /// One poll: one read of rnsd when there is one (serialised with every other read
     /// through `rnsd`, and no call at all once rnsd refused the key), then `addresses`.
+    /// The first poll takes what an earlier read, the one at join, saw as its starting
+    /// point. A slow rnsd holds the watcher for the read, `RPC_ATTEMPTS` budgets at
+    /// most; the interface events wait in their streams meanwhile.
     pub(crate) async fn read(
         &mut self,
         rnsd: Option<&RnsdLanReader>,
@@ -163,13 +217,18 @@ impl UpstreamPoll {
         transitions: &InterfaceTransitions,
     ) -> UpstreamChange {
         let reconnected = match rnsd {
-            Some(reader) => match reader.read_tcp_interfaces().await {
-                Some(interfaces) => {
-                    self.watch
-                        .observe_rnsd(&interfaces, transitions, SystemTime::now())
+            Some(reader) => {
+                if let Some(seen) = reader.tcp_interfaces_seen() {
+                    self.watch.seed_rnsd(&seen);
                 }
-                None => Vec::new(),
-            },
+                match reader.read_tcp_interfaces().await {
+                    Some(interfaces) => {
+                        self.watch
+                            .observe_rnsd(&interfaces, transitions, SystemTime::now())
+                    }
+                    None => Vec::new(),
+                }
+            }
             None => Vec::new(),
         };
         let network_changed =
@@ -383,6 +442,107 @@ mod tests {
     }
 
     /// The record keeps the newest transitions only.
+    /// An IPv6 address counts by its /64 prefix: a temporary address rotating inside one
+    /// network is no move, a new prefix is, and no `fe80::/10` address is counted.
+    #[test]
+    fn ipv6_counts_by_its_prefix_and_link_local_is_left_out() {
+        let v6 = |text: &str| ("en0".to_string(), text.parse::<IpAddr>().unwrap());
+        let before = network_fingerprint([v6("2001:db8:1:2::aaaa"), v6("fe80::1")]);
+        let rotated = network_fingerprint([v6("2001:db8:1:2::bbbb"), v6("febf::1")]);
+        assert_eq!(before, rotated, "same /64, link-local left out");
+        assert_eq!(rotated.len(), 1);
+        let moved = network_fingerprint([v6("2001:db8:9:9::aaaa")]);
+        let transitions = InterfaceTransitions::default();
+        let mut watch = UpstreamWatch::with_addresses(Some(before));
+        let now = SystemTime::now();
+        assert!(
+            watch
+                .observe_addresses(Some(rotated), &transitions, now)
+                .is_empty()
+        );
+        assert_eq!(
+            watch.observe_addresses(Some(moved), &transitions, now),
+            ["en0"]
+        );
+        assert!(
+            network_fingerprint([
+                ("lo0".to_string(), "::1".parse().unwrap()),
+                ("lo0".to_string(), "127.0.0.1".parse().unwrap()),
+                ("en0".to_string(), "169.254.3.4".parse().unwrap()),
+            ])
+            .is_empty()
+        );
+    }
+
+    /// After a network change, rnsd's upstream may have been down when the change was
+    /// greeted, or dropped and came back between two readings: the next reading that
+    /// finds it online counts as a reconnect once, and the one after does not.
+    #[test]
+    fn after_a_network_change_the_next_online_upstream_reading_greets_once() {
+        let transitions = InterfaceTransitions::default();
+        let now = SystemTime::now();
+        let mut watch = UpstreamWatch::with_addresses(addresses(&[("en0", [192, 168, 0, 10])]));
+        assert!(
+            watch
+                .observe_rnsd(&[tcp(RELAY, true)], &transitions, now)
+                .is_empty()
+        );
+        assert_eq!(
+            watch.observe_addresses(addresses(&[("en0", [172, 20, 10, 4])]), &transitions, now),
+            ["en0"]
+        );
+        assert!(
+            watch
+                .observe_rnsd(&[tcp(RELAY, false)], &transitions, now)
+                .is_empty(),
+            "still down after the move"
+        );
+        assert_eq!(
+            watch.observe_rnsd(&[tcp(RELAY, true)], &transitions, now),
+            [RELAY],
+            "back online: an edge, counted once"
+        );
+        assert!(
+            watch
+                .observe_rnsd(&[tcp(RELAY, true)], &transitions, now)
+                .is_empty()
+        );
+
+        let mut quick = UpstreamWatch::with_addresses(addresses(&[("en0", [192, 168, 0, 10])]));
+        assert!(
+            quick
+                .observe_rnsd(&[tcp(RELAY, true)], &transitions, now)
+                .is_empty()
+        );
+        quick.observe_addresses(addresses(&[("en0", [172, 20, 10, 4])]), &transitions, now);
+        assert_eq!(
+            quick.observe_rnsd(&[tcp(RELAY, true)], &transitions, now),
+            [RELAY],
+            "dropped and back inside one poll: online after the move counts once"
+        );
+        assert!(
+            quick
+                .observe_rnsd(&[tcp(RELAY, true)], &transitions, now)
+                .is_empty()
+        );
+    }
+
+    /// The read made at join is the starting point: an upstream offline then and online
+    /// at the first poll is a reconnect.
+    #[test]
+    fn the_read_at_join_is_the_first_reading() {
+        let transitions = InterfaceTransitions::default();
+        let mut watch = UpstreamWatch::default();
+        watch.seed_rnsd(&[tcp(RELAY, false)]);
+        watch.seed_rnsd(&[tcp(RELAY, true)]);
+        assert_eq!(
+            watch.observe_rnsd(&[tcp(RELAY, true)], &transitions, SystemTime::now()),
+            [RELAY],
+            "a later seed does not replace the first"
+        );
+    }
+
+    /// The record keeps the newest transitions only.
     #[test]
     fn the_record_keeps_the_newest_transitions() {
         let transitions = InterfaceTransitions::default();
@@ -400,8 +560,12 @@ mod tests {
         let read = host_addresses().expect("this host's addresses can be read");
         for (name, ip) in read {
             assert!(!ip.is_loopback(), "{name} {ip}");
-            if let IpAddr::V4(v4) = ip {
-                assert!(!v4.is_link_local(), "{name} {ip}");
+            match ip {
+                IpAddr::V4(v4) => assert!(!v4.is_link_local(), "{name} {ip}"),
+                IpAddr::V6(v6) => {
+                    assert_ne!(v6.segments()[0] & 0xffc0, 0xfe80, "{name} {ip}");
+                    assert_eq!(u128::from(v6) & u128::from(u64::MAX), 0, "{name} {ip}");
+                }
             }
         }
     }

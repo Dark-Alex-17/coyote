@@ -4246,29 +4246,9 @@ async fn watch_interfaces(
                 if change.is_empty() {
                     continue;
                 }
-                let greeting = tokio::select! {
+                tokio::select! {
                     () = cancel.cancelled() => return,
-                    greeting = greet(&runtime, &mut upstream_greetings, Instant::now()) => greeting,
-                };
-                match upstream_line(&change, &greeting) {
-                    Some(line) => {
-                        match &greeting {
-                            ReconnectGreeting::Failed(err) => warn!(
-                                "Mesh {line} Cause: {}",
-                                redact_hashes(&format!("{err:#}"))
-                            ),
-                            _ => info!("Mesh {line}"),
-                        }
-                        slot.push_idle(IdleNotify {
-                            source: Source::Relay,
-                            text: line.into(),
-                            origin: Origin::Local,
-                            model_note: None,
-                        });
-                    }
-                    None => debug!(
-                        "Mesh saw {change:?}; this session does not announce, so nothing was sent"
-                    ),
+                    () = greet_upstream_change(&runtime, &slot, &mut upstream_greetings, &change) => {}
                 }
                 continue;
             }
@@ -4385,6 +4365,33 @@ async fn greet(
     }
 }
 
+/// Greets once for one poll's `change`, however many transitions it holds, and tells the
+/// user on one idle line; a node that does not announce sends and tells nothing.
+async fn greet_upstream_change(
+    runtime: &MeshRuntime,
+    slot: &MeshSlot,
+    budget: &mut GreetingBudget,
+    change: &UpstreamChange,
+) {
+    let greeting = greet(runtime, budget, Instant::now()).await;
+    let Some(line) = upstream_line(change, &greeting) else {
+        debug!("Mesh saw {change:?}; this session does not announce, so nothing was sent");
+        return;
+    };
+    match &greeting {
+        ReconnectGreeting::Failed(err) => {
+            warn!("Mesh {line} Cause: {}", redact_hashes(&format!("{err:#}")))
+        }
+        _ => info!("Mesh {line}"),
+    }
+    slot.push_idle(IdleNotify {
+        source: Source::Relay,
+        text: line.into(),
+        origin: Origin::Local,
+        model_note: None,
+    });
+}
+
 /// The idle line for an upstream reconnect of the local rnsd or a change of this host's
 /// network, worded as `reconnect_line` is; a network change names itself when both came
 /// in one poll. `None` for a node that does not announce: nothing changed for its user.
@@ -4399,7 +4406,7 @@ fn upstream_line(change: &UpstreamChange, greeting: &ReconnectGreeting) -> Optio
             format!("{subject}; announced so other sessions can find this one again")
         }
         ReconnectGreeting::PastCap => format!(
-            "{subject} again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+            "{subject}; this session already sent its {RECONNECT_GREETINGS_PER_HOUR} greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
         ),
         ReconnectGreeting::Failed(_) => format!(
             "{subject}, but announcing failed; the next heartbeat will announce this session (details in the log)."
@@ -5314,7 +5321,8 @@ impl MeshSlot {
         // Fired outside the lock: the sink is not the slot's to trust with it.
         drop(slot);
         self.hooks.fire(MeshEvent::Started(facts));
-        // A `lan` interface has nothing to watch, but its silence is told from the watcher.
+        // A `lan` interface has no client to follow, but the watcher's poll still sees
+        // this host's network change.
         if !runtime.watched_interfaces().is_empty()
             || runtime
                 .interface_states()
@@ -19418,7 +19426,7 @@ mod tests {
             );
             assert_eq!(
                 upstream_line(&moved(), &ReconnectGreeting::PastCap).unwrap(),
-                "This host's network changed again (more than 4 times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+                "This host's network changed; this session already sent its 4 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
             );
             let failed = upstream_line(
                 &reconnected(),
@@ -19483,6 +19491,53 @@ mod tests {
                 "the floor"
             );
             runtime.shutdown().await.unwrap();
+        }
+
+        /// One poll that found an upstream reconnect and a network change greets once
+        /// and tells it on one `[mesh:relay]` line; the network change names it. A node
+        /// that does not announce sends nothing and tells nothing.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_poll_with_several_transitions_greets_once_on_one_line() {
+            install_log_collector();
+            for (announce, tag) in [
+                (true, "node-upstream-burst"),
+                (false, "node-upstream-burst-silent"),
+            ] {
+                let started = started_runtime_with(tag, |config| config.announce = announce).await;
+                let runtime = started.runtime.clone();
+                let slot = Arc::new(MeshSlot::default());
+                let notifier = Arc::new(RecordingSink::default());
+                slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+                slot.install(runtime.clone()).unwrap();
+                let hash8 = short(&runtime.current_destination_hash()).to_string();
+                let before = debug_snapshot().len();
+                let mut budget = GreetingBudget::default();
+                let change = UpstreamChange {
+                    reconnected: vec![RELAY.to_string(), "TCPInterface[Backup]".to_string()],
+                    network_changed: vec!["en0".to_string(), "utun3".to_string()],
+                };
+
+                greet_upstream_change(&runtime, &slot, &mut budget, &change).await;
+
+                let line = "This host's network changed; announced so other sessions can find this one again";
+                if announce {
+                    wait_until("the one greeting line", || {
+                        mesh_lines(&notifier)
+                            .iter()
+                            .any(|text| text.ends_with(line))
+                    })
+                    .await;
+                }
+                sleep(Duration::from_millis(300)).await;
+                let told: Vec<String> = mesh_lines(&notifier)
+                    .into_iter()
+                    .filter(|text| text.contains("[mesh:relay]"))
+                    .collect();
+                assert_eq!(told.len(), usize::from(announce), "{told:?}");
+                assert_eq!(announces_since(before, &hash8), usize::from(announce));
+                assert!(slot.stop().await.unwrap());
+            }
         }
 
         /// A node that does not announce sends nothing and keeps its budget whole.
