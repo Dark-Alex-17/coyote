@@ -4014,7 +4014,7 @@ def _carried(state):
 
 
 def _failure_key(paths):
-    return _failure_locations().failure_key(as_list(paths))
+    return tuple(str(p) for p in as_list(paths))
 
 
 def _classify_test_failures(state, u, tests):
