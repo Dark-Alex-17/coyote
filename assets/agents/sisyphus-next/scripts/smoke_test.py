@@ -1217,10 +1217,11 @@ check("sizing: 'Do it here anyway' -> plan_subtasks, told to fit at most 6 subta
 seven = [{"title": f"t{i}", "outcome": "o", "acceptance_criteria": ["c"]} for i in range(SUBTASK_MAX + 1)]
 s3, u = chain({**s2, "subtasks": seven}, "record_subtasks")
 e3 = s3["escalation"]
-check("record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, never trimmed",
+check("record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, never trimmed; asked "
+      "again after the first verdict, at the typed prompt",
       e3["kind"] == "sizing_verdict" and [o["text"] for o in e3["options"]] == [gates.SIZING_ARCHITECT, gates.SIZING_NARROW]
       and e3["data"]["planned"] is True and "- t6" in e3["evidence"] and "subtask_index" not in u
-      and gates.ask_dispatch(s3)["_next"] == "ask_choice_2")
+      and gates.ask_dispatch(s3)["_next"] == "ask_user")
 u = gates.apply_answer({**s3, "last_answer": gates.SIZING_HERE})
 u2 = gates.apply_answer({**s3, "last_answer": gates.SIZING_HERE, "apply_reasks": gates.APPLY_REASK_MAX})
 check("record_subtasks: a typed do-it-here after the planner overflowed is no pick -> asked again, then end_redirect",
@@ -6971,6 +6972,57 @@ with scenario("headless judge: a hard trigger with no recommended option is neve
     u = gates.parse_answer(base_state(escalation=hard, last_answer_text=HG))
     check(name, u["_next"] == "end_blocked" and "Restructure the storage module" in u.get("failure_reason", "")
           and "judge_rulings" not in u, u)
+
+REPEAT_ESC = escalation("lane_stuck", "The adversary still blocks. How to proceed?",
+                        [option("Abort and report", True), option("One more fix round anyway")])
+REPEAT_KEY = gates._decision_key(base_state(), REPEAT_ESC)
+with scenario("repeat decisions: the engine's no-human reply to a decision the run already answered goes to the "
+              "headless judge, never the recommended default") as name:
+    u = gates.parse_answer(base_state(escalation=REPEAT_ESC, last_answer_text=HG, answered_decisions=[REPEAT_KEY]))
+    check(name, u["_next"] == "headless_judge" and u.get("judge_rulings", {}).get(REPEAT_KEY) == 1, u)
+with scenario("repeat decisions: the first no-human reply to a decision still takes its recommended option") as name:
+    u = gates.parse_answer(base_state(escalation=REPEAT_ESC, last_answer_text=HG, answered_decisions=["other|s0|sub"]))
+    check(name, u["_next"] == "apply_answer" and u["last_answer"] == "Abort and report", u)
+with scenario("repeat decisions: a repeated hard trigger keeps its recommended option, never judged") as name:
+    hard = dict(REPEAT_ESC, hard_trigger=True)
+    u = gates.parse_answer(base_state(escalation=hard, last_answer_text=HG, answered_decisions=[REPEAT_KEY]))
+    check(name, u["_next"] == "apply_answer" and u["last_answer"] == "Abort and report" and "judge_rulings" not in u, u)
+with scenario("repeat decisions: a repeated multiple-choice decision is asked at the typed prompt, the picker flag "
+              "dropped") as name:
+    picker = dict(REPEAT_ESC, data={"multiple_choice": True, "recommended_count": 1})
+    first = gates.ask_dispatch(base_state(escalation=picker))
+    u = gates.ask_dispatch(base_state(escalation=picker, answered_decisions=[REPEAT_KEY]))
+    check(name, first["_next"] == "ask_choice_2" and u["_next"] == "ask_user"
+          and "multiple_choice" not in u["escalation"]["data"] and "One more fix round anyway" in u["ask_question"]
+          and any(f"repeat decision {REPEAT_KEY} -> typed prompt" in d for d in u["decisions"]), u)
+with scenario("repeat decisions: apply_answer records a decision it acted on, never one it sent to be read or asked "
+              "again") as name:
+    acted = gates.apply_answer(base_state(escalation=REPEAT_ESC, last_answer="Abort and report"))
+    unread = gates.apply_answer(base_state(escalation=REPEAT_ESC, last_answer="maybe later"))
+    again = gates.apply_answer(base_state(escalation=dict(REPEAT_ESC, data={"reply_read": True}), last_answer="maybe later"))
+    check(name, acted.get("answered_decisions") == [REPEAT_KEY]
+          and unread["_next"] == "interpret_reply" and "answered_decisions" not in unread
+          and again["_next"] != "apply_answer" and "answered_decisions" not in again, (acted, unread, again))
+with scenario("repeat decisions: an autonomous run asks the owner for a decision it already answered, even one the "
+              "ladder never saw") as name:
+    u = gates.escalate_gate(base_state(escalation=REPEAT_ESC, escalation_policy="autonomous",
+                                       answered_decisions=[REPEAT_KEY]))
+    check(name, u["_next"] == "ask_dispatch", u)
+with scenario("repeat decisions: review_exhausted answered with the engine's recommended pick and raised again "
+              "reaches the headless judge") as name:
+    st, u = chain(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}], review_rounds=STRIKE_LIMIT),
+                  "triage_route", "escalate_gate", "ask_dispatch")
+    first_prompt = u["_next"]
+    st["last_answer_text"] = "Option 1 (recommended)"
+    st, applied = chain(st, "parse_answer", "apply_answer")
+    st, u = chain(dict(st, triage=[{"finding": "x", "action": "fix", "lane": "code-review"}], review_rounds=STRIKE_LIMIT),
+                  "triage_route", "escalate_gate", "ask_dispatch")
+    second_prompt = u["_next"]
+    st["last_answer_text"] = HG
+    st, judged = chain(st, "parse_answer")
+    check(name, first_prompt.startswith("ask_choice_") and applied["_next"] not in ("ask_dispatch", "interpret_reply")
+          and st["escalation"]["kind"] == "review_exhausted" and second_prompt == "ask_user"
+          and judged["_next"] == "headless_judge", (first_prompt, applied, second_prompt, judged))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

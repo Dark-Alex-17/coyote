@@ -269,6 +269,7 @@ initial_state:
   settled_answer: ''
   autonomous_digest: []
   autonomous_decisions: []
+  answered_decisions: []
   decisions: []
   # --- implementation ---
   coder_brief: {}
@@ -1213,7 +1214,8 @@ nodes:
     description: >-
       Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder;
       a decision already resolved autonomously once in the same subtask or final review
-      (autonomous_decisions, keyed by decision, subtask and review) -> tier 4;
+      (autonomous_decisions, keyed by decision, subtask and review), or answered once in
+      this run (answered_decisions) -> tier 4;
       a malformed escalation (missing, not an object, no kind or a blank question) -> end_blocked.
     script: scripts/escalate_gate.py
     fallback: end_failure
@@ -1331,7 +1333,9 @@ nodes:
     description: >-
       Tier 4. Parks the run (A14) and picks the terminal prompt; away/unattended
       top-level runs go through ask_owner first when the fork provides it; a
-      malformed escalation -> end_blocked instead of a prompt.
+      malformed escalation -> end_blocked instead of a prompt. A multiple-choice
+      decision the run already answered once (answered_decisions) is asked at the
+      typed prompt instead of the picker.
     script: scripts/ask_dispatch.py
     fallback: end_failure
 
@@ -1444,8 +1448,9 @@ nodes:
       prompt takes the recommended option; clears the parked marker; ledgers the
       decision; a malformed escalation -> end_blocked. The engine's no-human reply
       takes the recommended option; on a question with options and none recommended
+      or one the run already answered once (answered_decisions, not a hard trigger)
       it goes to headless_judge (at most STRIKE_LIMIT rulings per decision key),
-      except that a hard trigger ends blocked with the question.
+      except that a hard trigger with none recommended ends blocked with the question.
     script: scripts/parse_answer.py
     fallback: end_failure
 
@@ -1510,7 +1515,8 @@ nodes:
     type: llm
     description: >-
       Decide a question no human is available to answer and that recommends no
-      option: one of its options, or an instruction it accepts, with the reason.
+      option, or that the run already answered once: one of its options, or an
+      instruction it accepts, with the reason.
     instructions: |
       No human is available and the run has asked you to decide this question.
       Weigh its evidence and pick the option that best serves the run. Going on
@@ -1518,6 +1524,7 @@ nodes:
       succeed; stopping is right when it does not. If the question accepts an
       instruction and none of the options fits, give that instruction. State
       your reason in one or two sentences, grounded in the evidence.
+      A recommended mark is the gate's default, not a verdict; weigh the evidence.
       On an option that asks you to state something (an amendment, a fix),
       give the matching instruction with its text instead of the bare option.
       When the escalation's data carries judge_fault, a previous answer to

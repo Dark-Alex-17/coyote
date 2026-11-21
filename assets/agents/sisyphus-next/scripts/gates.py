@@ -318,7 +318,7 @@ def intake(state):
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
                   "probe_adoption", "base_syncs", "base_integrated", "attention_notes", "autonomous_decisions",
-                  "judge_rulings"):
+                  "judge_rulings", "answered_decisions"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -1632,7 +1632,7 @@ def escalate_gate(state):
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
     key = _decision_key(state, esc)
-    failed_once = key in as_list(state.get("autonomous_decisions"))
+    failed_once = key in as_list(state.get("autonomous_decisions")) or key in as_list(state.get("answered_decisions"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -1643,7 +1643,8 @@ def escalate_gate(state):
         u["_next"] = "ladder_judge"
     else:
         if failed_once:
-            ledger(state, u, f"ladder: {key} already resolved autonomously once; hard trigger -> owner")
+            how = "resolved autonomously" if key in as_list(state.get("autonomous_decisions")) else "answered"
+            ledger(state, u, f"ladder: {key} already {how} once -> owner")
         u["_next"] = "ask_dispatch"
     return u
 
@@ -1789,6 +1790,16 @@ def ask_dispatch(state):
     u["parked"] = esc.get("kind", "")
     # whatever answers from here on is the owner's, even after the navigator was consulted
     u["answer_source"] = ""
+    key = _decision_key(state, esc)
+    if key in as_list(state.get("answered_decisions")) and truthy(as_dict(esc.get("data")).get("multiple_choice")) \
+            and esc.get("kind") not in OWN_PROMPT_KINDS:
+        # a picker question gets the engine's own recommended pick when no human is there, so a repeat asks at the
+        # typed prompt, where a run with no human reaches the headless judge instead
+        data = {k: v for k, v in as_dict(esc.get("data")).items() if k != "multiple_choice"}
+        esc = {**esc, "data": data}
+        u["escalation"] = esc
+        u["ask_question"] = render_question(esc)
+        ledger(state, u, f"repeat decision {key} -> typed prompt")
     snapshot(state, u, "parked")
     if OWNER_REMOTE_INPUT and truthy(state.get("top_level")) and truthy(state.get("owner_away")):
         u["owner_polls"] = 0
@@ -1846,7 +1857,12 @@ def parse_answer(state):
     options = esc.get("options") or []
     kind = esc.get("kind", "")
     picker = truthy(as_dict(esc.get("data")).get("multiple_choice"))
-    if headless := headless_recommended(text, options):
+    repeat = _decision_key(state, esc) in as_list(state.get("answered_decisions")) and not esc.get("hard_trigger")
+    if text == HEADLESS_GUIDANCE and options and kind not in OWN_PROMPT_KINDS and repeat:
+        # the recommended option already answered this decision once and it came back, so a model judge weighs it
+        ledger(state, u, f"headless: {kind}: asked again after an answer -> headless judge")
+        return _to_headless_judge(state, u, esc)
+    elif headless := headless_recommended(text, options):
         # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
         choice = headless
         u["answer_source"] = "headless"
@@ -1892,9 +1908,9 @@ def parse_answer(state):
 
 
 def _to_headless_judge(state, u, esc):
-    """Send a question with no human and no recommended option to the headless judge, at most STRIKE_LIMIT times per
-    decision, so a run whose judge keeps going on cannot loop forever. A hard trigger is the user's call: no model
-    decides it, so the run stops and reports the question."""
+    """Send a question with no human, and no recommended option or one the run already answered, to the headless
+    judge, at most STRIKE_LIMIT times per decision, so a run whose judge keeps going on cannot loop forever. A hard
+    trigger is the user's call: no model decides it, so the run stops and reports the question."""
     kind = esc.get("kind", "")
     asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
     if esc.get("hard_trigger"):
@@ -3023,6 +3039,10 @@ def apply_answer(state):
     else:
         ledger(state, u, f"apply_answer: unknown escalation kind {kind!r}; continuing to the report")
         u["_next"] = "final_report"
+    key = _decision_key(state, esc)
+    answered = as_list(state.get("answered_decisions"))
+    if u.get("_next") not in ("ask_dispatch", "interpret_reply", "headless_judge") and key not in answered:
+        u["answered_decisions"] = list(answered) + [key]
     snapshot(state, u, f"answered {kind}")
     return u
 
