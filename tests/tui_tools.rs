@@ -3041,19 +3041,21 @@ mod bottom_pane {
         let fake = FakeLlm::start(vec![held_stream(&release)]);
         write_fake_llm_config(&dir, &fake);
         let mut pty = spawn_tui(&dir, &[]);
-        queue_behind_held_stream(&mut pty, &fake, b".info\r");
+        queue_behind_held_stream(&mut pty, &fake, b".clear images\r");
 
         let released_at = pty.raw().len();
         fs::write(&release, "").unwrap();
-        pty.wait_for_after("log_path", released_at, PTY_DEADLINE)
-            .expect("the queued `.info` never ran");
+        wait_for_squeezed_after(
+            &mut pty,
+            "No pending images.",
+            released_at,
+            "the queued `.clear images` never ran",
+        );
         pty.read_for(Duration::from_millis(500));
-        // Tall enough for the `.info` table to leave the reply above it on
-        // screen.
-        let repainted = repaint(&mut pty, 80, 101);
+        let repainted = repaint(&mut pty, 80, 40);
         let frame = since(&pty, repainted);
         let [tail, header, output] =
-            squeezed_positions(&frame, ["tailq9d-t", ">.info", "log_path"]);
+            squeezed_positions(&frame, ["tailq9d-t", ">.clearimages", "Nopendingimages."]);
         assert!(
             tail < header && header < output,
             "the queued command did not run as its own turn after the reply:\n{frame}"
