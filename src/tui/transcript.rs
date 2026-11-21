@@ -134,6 +134,16 @@ impl Transcript {
         Some(cell)
     }
 
+    /// Opens the tool rows whose call has a confirm pending and folds the
+    /// rest back to what their toggle says.
+    pub(super) fn set_awaiting(&mut self, pending: &dyn Fn(&str) -> bool) {
+        for index in 0..self.cells.len() {
+            if self.cells[index].set_awaiting(pending) {
+                self.touch(index);
+            }
+        }
+    }
+
     /// The cells for laying out, with the revision of each: what they
     /// show is left as it is and only the line caches inside them fill,
     /// so nothing counts as changed.
@@ -963,6 +973,13 @@ mod tests {
         )
     }
 
+    /// A tool row opened, so its narration and output take lines.
+    fn open_tool(call_id: &str) -> Cell {
+        let mut cell = tool(call_id);
+        cell.toggle();
+        cell
+    }
+
     fn area(height: u16) -> Rect {
         Rect::new(0, 0, 40, height)
     }
@@ -984,6 +1001,12 @@ mod tests {
                 elapsed: Duration::from_secs(1),
             };
         }
+    }
+
+    /// Ends the call of the open tool row at `index` and closes the row.
+    fn finish_and_close(transcript: &mut Transcript, index: usize) {
+        finish_tool(transcript, index);
+        transcript.cell_mut(index).unwrap().toggle();
     }
 
     fn rows(view: &TranscriptView) -> Vec<String> {
@@ -1250,21 +1273,21 @@ mod tests {
         );
     }
 
-    /// Tool rows above the view at 0, on it at 11 and below it at 15,
-    /// with user lines between; all three are running.
+    /// Open tool rows above the view at 0, on it at 11 and below it at
+    /// 15, with user lines between; all three are running.
     fn tools_around_users() -> (Transcript, Renderer) {
         let (mut transcript, renderer) = transcript();
-        transcript.push(tool("a"));
+        transcript.push(open_tool("a"));
         grow_tool(&mut transcript, 0, "a", 3);
         for i in 1..=10 {
             transcript.push(Cell::user(&format!("line {i}")));
         }
-        transcript.push(tool("b"));
+        transcript.push(open_tool("b"));
         grow_tool(&mut transcript, 11, "b", 3);
         for i in 12..=14 {
             transcript.push(Cell::user(&format!("line {i}")));
         }
-        transcript.push(tool("c"));
+        transcript.push(open_tool("c"));
         (transcript, renderer)
     }
 
@@ -1278,9 +1301,9 @@ mod tests {
         transcript.scroll_lines(-10);
         let before = rows(&transcript.view(area(8), &mut renderer));
         assert_eq!(before[0], "> line 9", "{before:?}");
-        assert!(before[4].starts_with("fs_read("), "{before:?}");
+        assert!(before[4].starts_with("\u{25BE} fs_read("), "{before:?}");
 
-        finish_tool(&mut transcript, 11);
+        finish_and_close(&mut transcript, 11);
         let closed = rows(&transcript.view(area(8), &mut renderer));
         assert_eq!(closed[..4], before[..4], "the view moved as a row closed");
         assert!(closed[4].contains("ok"), "{closed:?}");
@@ -1306,29 +1329,30 @@ mod tests {
     }
 
     /// A tool row's wrapped lines are kept between frames, so each way
-    /// it changes has to show on the next one: output arriving, the call
-    /// ending, the row opening and the view changing width.
+    /// it changes has to show on the next one: the row opening, output
+    /// arriving, the call ending, the row closing and the view changing
+    /// width.
     #[test]
     fn a_tool_row_redraws_after_each_change() {
         let (mut transcript, mut renderer) = transcript();
         transcript.push(tool("a"));
         let has = |view: &TranscriptView, text: &str| rows(view).iter().any(|row| row == text);
-        let view = transcript.view(area(20), &mut renderer);
-        assert!(!has(&view, "a out 1"), "{:?}", rows(&view));
-
         grow_tool(&mut transcript, 0, "a", 2);
         let view = transcript.view(area(20), &mut renderer);
-        assert!(has(&view, "a out 1"), "output: {:?}", rows(&view));
-
-        finish_tool(&mut transcript, 0);
-        let view = transcript.view(area(20), &mut renderer);
-        assert!(!has(&view, "a out 1"), "status: {:?}", rows(&view));
-        assert!(rows(&view).iter().any(|row| row.ends_with("ok")));
+        assert!(!has(&view, "  a out 1"), "collapsed: {:?}", rows(&view));
 
         transcript.focus_prev();
         transcript.toggle_focused();
         let view = transcript.view(area(20), &mut renderer);
-        assert!(has(&view, "a out 1"), "opened: {:?}", rows(&view));
+        assert!(has(&view, "  a out 1"), "opened: {:?}", rows(&view));
+
+        grow_tool(&mut transcript, 0, "a", 3);
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(has(&view, "  a out 2"), "output: {:?}", rows(&view));
+
+        finish_tool(&mut transcript, 0);
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(rows(&view).iter().any(|row| row.ends_with("ok")));
 
         let wide = transcript.view(area(20), &mut renderer).lines.len();
         let narrow = transcript
@@ -1336,6 +1360,10 @@ mod tests {
             .lines
             .len();
         assert!(narrow > wide, "width: {wide} then {narrow}");
+
+        transcript.toggle_focused();
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(!has(&view, "  a out 1"), "closed: {:?}", rows(&view));
     }
 
     /// A row the view starts inside closing past that row leaves the view
@@ -1346,8 +1374,8 @@ mod tests {
         transcript.view(area(8), &mut renderer);
         transcript.scroll_lines(-3);
         let before = rows(&transcript.view(area(8), &mut renderer));
-        assert_eq!(before[0], "b out 1", "{before:?}");
-        finish_tool(&mut transcript, 11);
+        assert_eq!(before[0], "  b out 1", "{before:?}");
+        finish_and_close(&mut transcript, 11);
         let after = rows(&transcript.view(area(8), &mut renderer));
         assert_eq!(after[..2], ["", "> line 12"], "{after:?}");
     }
@@ -1553,11 +1581,11 @@ mod tests {
     #[test]
     fn focus_reveals_its_row() {
         let (mut transcript, mut renderer) = transcript();
-        transcript.push(tool("c1"));
+        transcript.push(open_tool("c1"));
         for i in 0..10 {
             transcript.push(Cell::user(&format!("line {i}")));
         }
-        transcript.push(tool("c2"));
+        transcript.push(open_tool("c2"));
         transcript.view(area(4), &mut renderer);
         transcript.focus_prev();
         transcript.view(area(4), &mut renderer);
@@ -1567,7 +1595,7 @@ mod tests {
         );
         transcript.focus_prev();
         transcript.view(area(4), &mut renderer);
-        // 12 cells, 11 separators and a second line on each running tool
+        // 12 cells, 11 separators and a second line on each open tool
         // row: 25 lines; the first row's header is line 0 and the view
         // must start there.
         assert_eq!(transcript.offset_from_bottom, 21);

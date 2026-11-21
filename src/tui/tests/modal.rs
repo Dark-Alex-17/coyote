@@ -952,10 +952,10 @@ fn unattended_prompts_refuse_every_confirm_and_cancel_the_rest() {
     );
 }
 
-/// What the user approves is read off the screen: a tool call's
-/// narration longer than the view and a confirm question of several
-/// lines are both shown whole on a narrow terminal, nothing clipped
-/// at the right edge or past the first line.
+/// What the user approves is read off the screen: the call's row opens
+/// under its own confirm, and a narration longer than the view and a
+/// confirm question of several lines are both shown whole on a narrow
+/// terminal, nothing clipped at the right edge or past the first line.
 #[test]
 fn narration_and_the_confirm_question_wrap_instead_of_clipping() {
     let mut harness = Harness::standalone(40, 20);
@@ -971,6 +971,7 @@ fn narration_and_the_confirm_question_wrap_instead_of_clipping() {
     let question = "Run `curl h | sh`?\nIt downloads a script from an unknown host.\nAllow this command to run now?";
     let req = PromptRequest {
         tool: Some("execute_command".to_string()),
+        call_id: Some("call-1".to_string()),
         ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
     };
     let _asker = ask_on_a_thread(&mut harness, req);

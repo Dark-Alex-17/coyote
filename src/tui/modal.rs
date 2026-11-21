@@ -423,6 +423,18 @@ impl App {
             let _ = prompt.reply.send(answer);
             self.arm_front_gates();
         }
+        self.sync_awaiting_rows();
+    }
+
+    /// Holds open each tool row with a confirm of its own call queued,
+    /// whether or not that confirm is the one up.
+    fn sync_awaiting_rows(&mut self) {
+        let prompts = &self.prompts;
+        self.transcript.set_awaiting(&|call_id| {
+            prompts.iter().any(|prompt| {
+                prompt.req.action == PromptAction::Confirm && prompt.asked_by_call(call_id)
+            })
+        });
     }
 
     /// Starts the modal gates over for whatever prompt is now at the
@@ -525,6 +537,7 @@ impl App {
         if becomes_front {
             self.arm_front_gates();
         }
+        self.sync_awaiting_rows();
     }
 
     /// Cancels every question, queued or up, whose asker has ended: the
@@ -543,6 +556,7 @@ impl App {
         if front_dismissed {
             self.arm_front_gates();
         }
+        self.sync_awaiting_rows();
     }
 
     /// Gives every queued prompt its unattended answer; used when the UI
@@ -551,5 +565,6 @@ impl App {
         while let Some(prompt) = self.prompts.pop_front() {
             let _ = prompt.reply.send(unattended_answer(&prompt.req));
         }
+        self.sync_awaiting_rows();
     }
 }

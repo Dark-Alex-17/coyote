@@ -75,6 +75,28 @@ pub(super) fn chrome_style(kind: ChromeKind, no_color: bool) -> Style {
     }
 }
 
+/// A tool row's header in the colours of the REPL's `Call <tool>` line:
+/// the name as the REPL paints it, the arrow, arguments and state in its
+/// muted colour, a failure in the error colour.
+pub(super) struct ToolHeaderStyles {
+    pub(super) muted: Style,
+    pub(super) name: Style,
+    pub(super) failed: Style,
+}
+
+impl ToolHeaderStyles {
+    pub(super) fn new(markdown: &MarkdownRender, no_color: bool) -> Self {
+        let paint = |style: Style, colour: Color| {
+            if no_color { style } else { style.fg(colour) }
+        };
+        Self {
+            muted: paint(DIM, from_repl(tool_dim_color(), markdown)),
+            name: paint(BOLD, from_repl(tool_fn_color(), markdown)),
+            failed: chrome_style(ChromeKind::Error, no_color),
+        }
+    }
+}
+
 /// The field's fill: the transcript theme's background nudged a step
 /// towards the text, which only an RGB-capable terminal can show; every
 /// other case gets a fixed grey on the theme's side of the scale.

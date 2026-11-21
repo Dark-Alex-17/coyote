@@ -2,6 +2,7 @@
 //! and the rules for how a tool, job or agent row collapses to one line.
 
 use super::render::{self, RenderCache, Renderer};
+use super::theme::ToolHeaderStyles;
 use super::{
     ChromeKind, DIM, FULL_OUTPUT_LIMIT, LATE_OUTPUT_LIMIT, TOOL_OUTPUT_TAIL, chrome_style,
 };
@@ -443,8 +444,9 @@ pub(super) enum Cell {
         tail: OutputTail,
         cache: LineCache,
     },
-    /// A tool call: a one-line `name(args)` header, then the narration
-    /// line and the tail of its output while it runs or when opened. A
+    /// A tool call: a one-line `name(args)` header behind a fold arrow,
+    /// then, indented under it, the narration line and the tail of its
+    /// output once opened or while its own confirm question waits. A
     /// bookkeeping tool (memory, skills, agent listing) is only ever its
     /// header inline; the pager still shows its output.
     Tool {
@@ -458,6 +460,9 @@ pub(super) enum Cell {
         status: ToolStatus,
         tail: OutputTail,
         expanded: bool,
+        /// A confirm this call asked is pending: what is being approved
+        /// stays on screen until it is answered.
+        awaiting: bool,
         bookkeeping: bool,
         cache: LineCache,
     },
@@ -510,9 +515,16 @@ pub(super) fn narrated_tool_name(line: &str) -> String {
 /// closing `...` of a cut argument string included.
 const SHORT_ARGS_BUDGET: usize = 48;
 
+/// The fold arrows in front of a tool row's header.
+pub(super) const COLLAPSED_ARROW: &str = "\u{25B8} ";
+pub(super) const EXPANDED_ARROW: &str = "\u{25BE} ";
+/// How far an open tool row's narration and output sit in from its
+/// header.
+const BODY_INDENT: &str = "  ";
+
 /// The fewest argument characters a header keeps when the row is too
 /// narrow for `SHORT_ARGS_BUDGET`, the `...` included.
-const MIN_ARGS_BUDGET: usize = 8;
+const MIN_ARGS_BUDGET: usize = 6;
 
 /// The first line of `args` cut to the header's budget, so a header
 /// with a file's contents in it stays one row.
@@ -611,6 +623,7 @@ impl Cell {
             status: ToolStatus::Running { since },
             tail: OutputTail::default(),
             expanded: false,
+            awaiting: false,
             bookkeeping,
             cache: LineCache::default(),
         }
@@ -656,6 +669,22 @@ impl Cell {
             }
             _ => {}
         }
+    }
+
+    /// Marks whether a confirm asked by this tool row's call is pending,
+    /// returning whether that changed what the row shows.
+    pub(super) fn set_awaiting(&mut self, pending: &dyn Fn(&str) -> bool) -> bool {
+        if let Cell::Tool {
+            call_id, awaiting, ..
+        } = self
+        {
+            let now = pending(call_id);
+            if *awaiting != now {
+                *awaiting = now;
+                return true;
+            }
+        }
+        false
     }
 
     /// Where the output of call `call_id` goes: this tool row's own tail,
@@ -845,28 +874,51 @@ impl Cell {
                 status,
                 tail,
                 expanded,
+                awaiting,
                 bookkeeping,
                 cache,
                 ..
             } => cache.get(width, || {
+                let styles = ToolHeaderStyles::new(renderer.markdown_render(), no_color);
+                let open = (*expanded || *awaiting) && !*bookkeeping;
+                let arrow = match (*bookkeeping, open) {
+                    (true, _) => "  ",
+                    (false, true) => EXPANDED_ARROW,
+                    (false, false) => COLLAPSED_ARROW,
+                };
                 let state = tool_state(status);
                 // The header is one row; the view clips what does not
                 // fit, so the arguments give way to the state. The
                 // narration below it is what the user approves, so that
                 // wraps and is shown whole. The error in the header is
                 // the tool's own text, so it is scrubbed.
-                let reserved = name.width() + "()  ".len() + state.width();
+                let reserved = arrow.width() + name.width() + "()  ".len() + state.width();
                 let args = fit_to_row(args, reserved, width);
-                let header = render::plain_text(&format!("{name}({args})  {state}"));
-                let mut lines = vec![Line::from(Span::styled(header, DIM))];
-                let open = matches!(status, ToolStatus::Running { .. }) || *expanded;
-                if open && !*bookkeeping {
-                    let mut body = vec![render::styled_line(summary)];
+                let state_style = if matches!(status, ToolStatus::Failed { .. }) {
+                    styles.failed
+                } else {
+                    styles.muted
+                };
+                let mut lines = vec![Line::from(vec![
+                    Span::styled(arrow, styles.muted),
+                    Span::styled(render::plain_text(name), styles.name),
+                    Span::styled(render::plain_text(&format!("({args})  ")), styles.muted),
+                    Span::styled(render::plain_text(&state), state_style),
+                ])];
+                if open {
+                    let body_width = width.saturating_sub(BODY_INDENT.len() as u16).max(1);
+                    let mut body =
+                        render::hard_wrap(vec![render::styled_line(summary)], body_width);
+                    let mut rest = Vec::new();
                     if let ToolStatus::Failed { error, .. } = status {
-                        body.extend(render::preformatted_lines(error));
+                        rest.extend(render::preformatted_lines(error));
                     }
-                    body.extend(output_lines(&tail.lines));
-                    lines.extend(dim_wrapped(body, width));
+                    rest.extend(output_lines(&tail.lines));
+                    body.extend(dim_wrapped(rest, body_width));
+                    lines.extend(body.into_iter().map(|mut line| {
+                        line.spans.insert(0, Span::raw(BODY_INDENT));
+                        line
+                    }));
                 }
                 lines
             }),
@@ -1626,7 +1678,8 @@ mod tests {
     }
 
     /// A `content` argument of kilobytes leaves the collapsed row one
-    /// line; the whole narration waits in the body for the row to open.
+    /// line, running or done; the whole narration waits in the body,
+    /// indented under the header, for the row to open.
     #[test]
     fn a_large_argument_keeps_the_header_to_one_line_and_the_narration_in_the_body() {
         let mut renderer = renderer();
@@ -1635,14 +1688,32 @@ mod tests {
             format!("Call fs_write {{\"path\":\"src/x.rs\",\"content\":\"{content}\"}}");
         let mut cell = Cell::tool("c1".to_string(), narration.clone(), Instant::now());
         let header = "fs_write({\"path\":\"src/x.rs\",\"content\":\"xxxxxxxxxxxxxxx...)";
+        let body = |lines: &[Line<'_>]| -> String {
+            lines[1..]
+                .iter()
+                .map(|line| {
+                    let text = line.to_string();
+                    assert!(text.starts_with(BODY_INDENT), "{text:?} is not indented");
+                    assert!(line.width() <= 80, "{line:?} is wider than the view");
+                    text[BODY_INDENT.len()..].to_string()
+                })
+                .collect()
+        };
 
         let lines = cell.lines(80, &mut renderer);
-        assert_eq!(lines[0].to_string(), format!("{header}  running"));
-        let body: String = lines[1..].iter().map(Line::to_string).collect();
+        assert_eq!(lines.len(), 1, "a running row did not start collapsed");
         assert_eq!(
-            body, narration,
-            "the running row does not show the narration whole"
+            lines[0].to_string(),
+            format!("{COLLAPSED_ARROW}{header}  running")
         );
+
+        cell.toggle();
+        let lines = cell.lines(80, &mut renderer);
+        assert_eq!(
+            lines[0].to_string(),
+            format!("{EXPANDED_ARROW}{header}  running")
+        );
+        assert_eq!(body(&lines), narration, "the narration is not whole");
 
         let Cell::Tool { status, .. } = &mut cell else {
             unreachable!();
@@ -1652,20 +1723,19 @@ mod tests {
         };
         cell.forget_wrapped_lines();
         let lines = cell.lines(80, &mut renderer);
-        assert_eq!(lines.len(), 1, "a collapsed row took more than one line");
-        assert_eq!(lines[0].to_string(), format!("{header}  1.2s  ok"));
+        assert_eq!(
+            lines[0].to_string(),
+            format!("{EXPANDED_ARROW}{header}  1.2s  ok")
+        );
+        assert_eq!(body(&lines), narration, "the narration is not whole");
 
         cell.toggle();
         let lines = cell.lines(80, &mut renderer);
-        assert_eq!(lines[0].to_string(), format!("{header}  1.2s  ok"));
-        let body: String = lines[1..].iter().map(Line::to_string).collect();
+        assert_eq!(lines.len(), 1, "a collapsed row took more than one line");
         assert_eq!(
-            body, narration,
-            "the opened row does not show the narration whole"
+            lines[0].to_string(),
+            format!("{COLLAPSED_ARROW}{header}  1.2s  ok")
         );
-        for line in &lines[1..] {
-            assert!(line.width() <= 80, "{line:?} is wider than the view");
-        }
     }
 
     /// The error a tool reports is its own text; a bidi override or an
@@ -1689,7 +1759,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0].to_string(),
-            "fs_read({\"path\":\"x\"})  0.1s  failed: no such elif red"
+            "\u{25B8} fs_read({\"path\":\"x\"})  0.1s  failed: no such elif red"
         );
         cell.toggle();
         let text: Vec<String> = cell

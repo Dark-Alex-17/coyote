@@ -1938,17 +1938,115 @@ fn row_modifier(harness: &Harness, prefix: &str) -> Modifier {
 }
 
 #[test]
-fn a_running_tool_row_shows_its_output_tail() {
+fn a_running_tool_row_starts_collapsed_behind_its_arrow() {
     let mut harness = Harness::standalone(80, 24);
     running_fs_read(&mut harness);
     let frame = harness.draw();
     insta::assert_snapshot!("tool_running_80x24", &frame);
-    assert!(frame.contains("fs_read({\"path\":\"src/main.rs\"})  running"));
     assert!(
-        frame.contains("Call fs_read {\"path\":\"src/main.rs\"}"),
+        frame.contains("\u{25B8} fs_read({\"path\":\"src/main.rs\"})  running"),
         "{frame}"
     );
-    assert!(frame.contains("println!(\"hi\");"));
+    assert!(!frame.contains("Call fs_read"), "{frame}");
+    assert!(!frame.contains("println!(\"hi\");"), "{frame}");
+}
+
+/// Opened, the row's arrow turns down and the narration and output sit
+/// two columns in under the header.
+#[test]
+fn an_opened_tool_row_indents_its_call_line_under_the_header() {
+    let mut harness = Harness::standalone(80, 24);
+    running_fs_read(&mut harness);
+    harness.draw();
+    harness.app.handle_key(ctrl(KeyCode::Up));
+    harness.press(KeyCode::Enter);
+    let frame = harness.draw();
+    let header = screen_row(&harness, "\u{25BE} fs_read(");
+    assert_eq!(
+        row_text(&harness, header + 1).trim_end(),
+        "  Call fs_read {\"path\":\"src/main.rs\"}",
+        "{frame}"
+    );
+    assert_eq!(
+        row_text(&harness, header + 2).trim_end(),
+        "  fn main() {",
+        "{frame}"
+    );
+}
+
+/// The header takes the REPL call line's colours: the name in its
+/// function colour and bold, the arrow and arguments in its muted
+/// colour. `NO_COLOR` keeps the attributes and drops the colours.
+#[test]
+fn a_tool_header_is_painted_like_the_repl_call_line() {
+    for no_color in [false, true] {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(no_color);
+        running_fs_read(&mut harness);
+        harness.draw();
+        let arrow = style_at(&harness, "\u{25B8} fs_read(");
+        let name = style_at(&harness, "fs_read(");
+        let args = style_at(&harness, "({\"path\"");
+        assert!(name.1.contains(Modifier::BOLD), "{no_color}: {name:?}");
+        assert!(!args.1.contains(Modifier::BOLD), "{no_color}: {args:?}");
+        if no_color {
+            for style in [arrow, name, args] {
+                assert_eq!(style.0, Color::Reset);
+            }
+        } else {
+            let repl = |colour| match colour {
+                nu_ansi_term::Color::Fixed(index) => Color::Indexed(index),
+                other => panic!("the REPL default is a palette entry: {other:?}"),
+            };
+            assert_eq!(name.0, repl(crate::utils::tool_fn_color()));
+            assert_eq!(args.0, repl(crate::utils::tool_dim_color()));
+            assert_eq!(arrow.0, args.0);
+            assert_ne!(name.0, args.0);
+        }
+    }
+}
+
+/// A tool row opens while a confirm its own call asked is up, so what
+/// is being approved is on screen, and folds back once it is answered.
+/// Another call's confirm, or one with no call, leaves it folded.
+#[test]
+fn a_tool_row_stays_open_while_its_own_confirm_waits() {
+    let folded = "\u{25B8} fs_read(";
+    let opened = "\u{25BE} fs_read(";
+    let has_row = |harness: &Harness, prefix: &str| {
+        let buffer = harness.terminal.backend().buffer();
+        (0..buffer.area.height).any(|y| row_text(harness, y).starts_with(prefix))
+    };
+    for (call_id, opens) in [
+        (Some("call-1"), true),
+        (Some("call-9"), false),
+        (None, false),
+    ] {
+        let mut harness = Harness::standalone(80, 30);
+        running_fs_read(&mut harness);
+        let req = PromptRequest {
+            call_id: call_id.map(str::to_string),
+            ..confirm_request(Some("fs_read"))
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert_eq!(has_row(&harness, opened), opens, "{call_id:?}\n{frame}");
+        assert_eq!(
+            frame.contains("Call fs_read {\"path\":\"src/main.rs\"}"),
+            opens,
+            "{call_id:?}\n{frame}"
+        );
+
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Char('n'));
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(false)
+        );
+        let frame = harness.draw();
+        assert!(has_row(&harness, folded), "{call_id:?}\n{frame}");
+        assert!(!frame.contains("Call fs_read"), "{call_id:?}\n{frame}");
+    }
 }
 
 /// The start hook's compact JSON and the narration's text after the
@@ -1975,7 +2073,7 @@ fn the_hooks_arguments_render_the_same_header_as_the_narration() {
     tool_output(&mut from_hook, "call-1", "    println!(\"hi\");\n}\n");
     let header = |harness: &mut Harness| {
         let frame = harness.draw();
-        let row = screen_row(harness, "fs_read(");
+        let row = screen_row(harness, "\u{25B8} fs_read(");
         frame.lines().nth(usize::from(row)).unwrap().to_string()
     };
     let expected = header(&mut from_narration);
@@ -2006,7 +2104,7 @@ fn a_finished_tool_row_collapses_and_opens_from_the_keyboard() {
         "{frame}"
     );
     assert!(
-        row_modifier(&harness, "fs_read(").contains(Modifier::REVERSED),
+        row_modifier(&harness, "\u{25BE} fs_read(").contains(Modifier::REVERSED),
         "the focused header is not reversed"
     );
 }
@@ -2056,7 +2154,10 @@ fn a_narrow_folded_header_keeps_its_state_and_cuts_the_arguments() {
     let frame = harness.draw();
     insta::assert_snapshot!("tool_failed_40x20", &frame);
     assert!(frame.contains("1.2s  failed: exit 2"), "{frame}");
-    assert!(frame.contains("fs_read({\"path...)  1.2s"), "{frame}");
+    assert!(
+        frame.contains("fs_read({\"pa...)  1.2s  failed: exit 2"),
+        "{frame}"
+    );
 }
 
 #[test]
@@ -2800,7 +2901,7 @@ fn the_mouse_scrolls_the_view_and_opens_the_row_it_clicks() {
             modifiers: KeyModifiers::NONE,
         })
     };
-    let row = screen_row(&harness, "fs_read(");
+    let row = screen_row(&harness, "\u{25B8} fs_read(");
     assert!(
         harness
             .app
@@ -2815,7 +2916,7 @@ fn the_mouse_scrolls_the_view_and_opens_the_row_it_clicks() {
     let frame = harness.draw();
     assert!(frame.contains("fn main()"), "{frame}");
     assert!(
-        row_modifier(&harness, "fs_read(").contains(Modifier::REVERSED),
+        row_modifier(&harness, "\u{25BE} fs_read(").contains(Modifier::REVERSED),
         "the clicked header is not reversed"
     );
 
