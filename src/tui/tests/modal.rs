@@ -1592,6 +1592,35 @@ fn the_other_field_wraps_its_text() {
     assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
 }
 
+/// A long answer grows the field only into rows the question does not
+/// need: the question stays whole and Enter still sends the answer.
+#[test]
+fn a_long_answer_never_cuts_the_question_it_answers() {
+    let mut harness = Harness::standalone(80, 24);
+    let question = "First line q5f\nsecond line\nthird line\nfourth line q5f";
+    let req = PromptRequest {
+        origin: Origin {
+            agent_id: Some("agent-q5f".to_string()),
+            depth: 1,
+        },
+        ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
+    };
+    let asker = ask_on_a_thread(&mut harness, req);
+    let answer = "word ".repeat(200);
+    harness.type_text(answer.trim_end());
+    let frame = harness.draw();
+    for line in question.lines() {
+        assert!(frame.contains(line), "{line:?} is cut:\n{frame}");
+    }
+    assert!(!frame.contains("more lines; enlarge"), "{frame}");
+    harness.clock.advance(HOTKEY_IDLE);
+    assert_eq!(harness.press(KeyCode::Enter), None);
+    assert_eq!(
+        asker.join().unwrap().unwrap(),
+        PromptAnswer::Text(answer.trim_end().to_string())
+    );
+}
+
 /// Coyote's and an agent's questions are rendered as markdown; a tool's
 /// stays plain so every character it asks to approve shows, in the same
 /// question colour.

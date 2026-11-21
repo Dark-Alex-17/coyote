@@ -358,9 +358,15 @@ impl PendingPrompt {
             + TRANSCRIPT_MIN_ROWS
             + self.hint_rows(width)
             + self.origin_rows();
-        let wanted = match &self.field {
-            Some(field) => wrapped_rows(field.lines(), width, field.mask_char()),
-            None => self.option_rows(width).iter().map(Vec::len).sum(),
+        let (wanted, fixed) = match &self.field {
+            // A field grows with what is typed but never into the rows the
+            // question needs: a cut question cannot be answered, and the
+            // field scrolls inside what it gets.
+            Some(field) => (
+                wrapped_rows(field.lines(), width, field.mask_char()),
+                fixed + row_count(self.question_lines(width).len()).saturating_sub(1),
+            ),
+            None => (self.option_rows(width).iter().map(Vec::len).sum(), fixed),
         };
         row_count(wanted).clamp(1, height.saturating_sub(fixed).max(1))
     }

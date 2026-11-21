@@ -1899,6 +1899,54 @@ mod tests {
         }
     }
 
+    /// Under `NO_COLOR` a tool, job or agent header keeps its bold name
+    /// and dim rest, running or failed, and loses every colour.
+    #[test]
+    fn no_color_headers_keep_their_attributes_and_lose_their_colours() {
+        let mut renderer = renderer();
+        renderer.no_color = true;
+        let narration = "Call fs_read {\"path\":\"x\"}".to_string();
+        let running = Cell::tool("c1".to_string(), narration.clone(), Instant::now());
+        let mut failed = Cell::tool("c2".to_string(), narration, Instant::now());
+        if let Cell::Tool { status, .. } = &mut failed {
+            *status = ToolStatus::Failed {
+                elapsed: Duration::from_millis(100),
+                error: "no such file".to_string(),
+            };
+        }
+        let mut cells = [
+            running,
+            failed,
+            Cell::Job {
+                job_id: "job-1".to_string(),
+                tool: "execute_command".to_string(),
+                row: TaskRow::new(JobStatus::Running),
+                cache: LineCache::default(),
+            },
+            Cell::Agent {
+                agent_id: "agent-1".to_string(),
+                name: "reviewer".to_string(),
+                row: TaskRow::new(AgentStatus::Failed("boom".to_string())),
+                cache: LineCache::default(),
+            },
+        ];
+        for cell in &mut cells {
+            let lines = cell.lines(80, &mut renderer);
+            let header = &lines[0];
+            for span in &header.spans {
+                assert_eq!(span.style.fg, None, "{header:?}");
+            }
+            let has = |modifier: Modifier| {
+                header
+                    .spans
+                    .iter()
+                    .any(|span| span.style.add_modifier.contains(modifier))
+            };
+            assert!(has(Modifier::BOLD), "{header:?}");
+            assert!(has(Modifier::DIM), "{header:?}");
+        }
+    }
+
     /// A bookkeeping row has no body, so toggling it leaves it closed
     /// and one line tall.
     #[test]

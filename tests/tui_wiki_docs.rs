@@ -1214,6 +1214,71 @@ fn tui_page_quotes_the_code() {
     }
 }
 
+/// What the page says about how the UI is drawn holds for the code that
+/// draws it: each pair is a fact in the source and the words the page
+/// uses for it, so changing one without the other fails here. The page
+/// is ASCII, so the fold arrows are described rather than quoted.
+#[test]
+fn tui_page_describes_the_drawn_chrome() {
+    let cells = src(&["tui", "cells.rs"]);
+    let composer = src(&["tui", "composer.rs"]);
+    let modal = src(&["tui", "modal.rs"]);
+    let theme = src(&["tui", "theme.rs"]);
+    let tui = src(&["tui", "mod.rs"]);
+    let facts: [(&str, &str, &str); 7] = [
+        (
+            &cells,
+            "COLLAPSED_ARROW: &str = \"\\u{25B8} \"",
+            "behind an arrow pointing right",
+        ),
+        (
+            &cells,
+            "EXPANDED_ARROW: &str = \"\\u{25BE} \"",
+            "Opened, the arrow points down",
+        ),
+        (
+            &modal,
+            "prompt.req.action == PromptAction::Confirm && prompt.asked_by_call(call_id)",
+            "its row is held open so what you approve is on screen",
+        ),
+        (
+            &composer,
+            ".borders(Borders::TOP | Borders::BOTTOM)",
+            "It sits between two horizontal rules",
+        ),
+        (
+            &modal,
+            "if self.req.tool.is_some() {",
+            "a tool's question stays plain text",
+        ),
+        (
+            &theme,
+            "const HIGHLIGHT: Color = Color::LightCyan;",
+            "bold in the REPL's highlight color (light cyan)",
+        ),
+        (
+            &theme,
+            "const HEADING_FALLBACK: Color = Color::Yellow;",
+            "the REPL's yellow when no theme gives one",
+        ),
+    ];
+    for (code, fact, _) in facts {
+        assert!(production(code).contains(fact), "the source lost {fact}");
+    }
+    assert!(
+        production(&tui).contains("Borders::TOP"),
+        "mod.rs draws no rule"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join(PAGE)));
+    for (_, _, words) in facts {
+        assert!(page.contains(words), "{PAGE} says {words}");
+    }
+    let rule = "A horizontal line under the transcript";
+    assert!(page.contains(rule), "{PAGE} says {rule}");
+}
+
 #[test]
 fn the_word_cut_keys_on_the_page_match_the_key_help() {
     let keys = src(&["tui", "keys.rs"]);

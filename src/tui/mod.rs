@@ -129,7 +129,8 @@ const TRANSCRIPT_MIN_ROWS: u16 = 4;
 /// Rows of the frame drawn whatever else shows: the status row, the
 /// footer and the rule over the status row. The rule yields its row only
 /// on a frame with no transcript row left, so the transcript's minimum
-/// is counted with it.
+/// is counted with it, and a question too tall for the rest is cut (and
+/// waits for a taller terminal) rather than take that minimum.
 const FIXED_ROWS: u16 = 3;
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);

@@ -20,6 +20,10 @@ const KNOWN_COMMAND: Color = Color::Green;
 const UNKNOWN_COMMAND: Color = Color::Red;
 const HEADING_FALLBACK: Color = Color::Yellow;
 const RULE_FALLBACK: Color = Color::DarkGray;
+/// The todo panel's own colours, kept apart from the hint and status
+/// rows' so its items never read as either.
+const TODO_OPEN: Color = Color::LightGreen;
+const TODO_DONE: Color = Color::Gray;
 /// How far each channel of the theme's background moves towards the text
 /// so the composer's field reads as its own surface.
 const SURFACE_NUDGE: u8 = 12;
@@ -209,8 +213,8 @@ impl Theme {
             footer_separator: DIM,
             queued_header: paint(Style::new(), tool_key),
             queued_text: DIM,
-            todo_done: paint(DIM, tool_dim),
-            todo_open: paint(Style::new(), tool_fn),
+            todo_done: paint(DIM, TODO_DONE),
+            todo_open: paint(Style::new(), TODO_OPEN),
             heading: paint(BOLD, heading),
             question: paint(Style::new(), heading),
             option_highlight: paint(BOLD, HIGHLIGHT),
