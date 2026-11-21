@@ -186,6 +186,7 @@ initial_state:
   posture_reason: ''
   verification_commands: '[]'
   review_verification_commands: '[]'
+  review_carried_failures: '[]'
   local_run_recipe: ''
   git_actions: {}
   publish_criteria: []
@@ -1979,6 +1980,7 @@ nodes:
       {{gauntlet_prompt}}
     inputs:
       verification_commands: '{{review_verification_commands}}'
+      carried_failures: '{{review_carried_failures}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'

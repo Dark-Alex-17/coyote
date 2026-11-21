@@ -1269,6 +1269,7 @@ def next_subtask(state):
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
         "scope_confirmed": False, "subtask_changed_files": None, "review_verification_commands": "[]",
+        "review_carried_failures": "[]",
         # the failures carried in, so the red test gate can tell them from ones this subtask introduces
         "failure_baseline": [f["paths"] for f in carried],
     })
@@ -1319,7 +1320,7 @@ def _start_final_review(state, u, n):
         "coder_brief": brief,
         "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
-        "review_verification_commands": "[]",
+        "review_verification_commands": "[]", "review_carried_failures": "[]",
         # rejections made against a subtask's scope are no ruling on the parent criteria
         "final_rejections_from": len(as_list(state.get("rejected_findings"))),
         # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
@@ -4195,6 +4196,8 @@ def build_gauntlet_prompt(state):
             ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
     u["review_verification_commands"] = cmds
     carried = _carried(state) if _subtask_phase(state) else []
+    owed = _owed_carried(state, carried)
+    u["review_carried_failures"] = json.dumps([f for f in carried if f not in owed])
     if carried:
         lines.append(_carried_review_section(carried))
     if spec:
@@ -4230,7 +4233,7 @@ def build_gauntlet_prompt(state):
         lines += ["Local-run recipe / usage suites:", note]
     u["gauntlet_prompt"] = "\n".join(lines)
     tree = _worktree_tree(root)
-    key = _inputs_key(tree, u["gauntlet_prompt"], cmds)
+    key = _inputs_key(tree, u["gauntlet_prompt"], cmds, u["review_carried_failures"])
     u["head_sha"] = head
     u["prior_review_decisions"] = "\n".join(_review_decisions(state))
     last = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}

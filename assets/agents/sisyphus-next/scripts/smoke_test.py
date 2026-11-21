@@ -7102,6 +7102,41 @@ with scenario("failure locations: with the shared parser unavailable the red tes
           and "unclassified: failure locator unavailable" in _cu.get("last_coder_error", ""),
           (_cu.get("_next"), _cu.get("last_coder_error"), _located))
 
+# ---------------------------------------------------------------- carried failures handed to the gauntlet
+OWED_RED = [{"paths": ["tests/owed_test.ext"], "owner": 1, "since": 1, "evidence": "expected 1, got 0"}]
+with scenario("build_gauntlet: a subtask review hands the gauntlet the carried failures not yet owed") as name:
+    u = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, subtask_changed_files=["f"],
+                                               carried_failures=LATER_RED + OWED_RED))
+    check(name, json.loads(u["review_carried_failures"]) == LATER_RED, u.get("review_carried_failures"))
+with scenario("build_gauntlet: the final whole-task review hands the gauntlet no carried failures") as name:
+    u = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, final_review=True,
+                                               spec_text="AC1", carried_failures=LATER_RED))
+    check(name, u["review_carried_failures"] == "[]", u.get("review_carried_failures"))
+with scenario("build_gauntlet: a PASS round is not reused when only the carried failures handed on changed") as name:
+    _real_section = gates._carried_review_section
+    gates._carried_review_section = lambda carried: "Carried-forward test failures: (listed)"
+    try:
+        _cs1 = dict(subtasks=CC_SUBS, subtask_index=1, subtask_changed_files=["f"], carried_failures=LATER_RED)
+        _first = gates.build_gauntlet_prompt(base_state(**_cs1))
+        _passed = [dict(_first["round_heads"][-1], verdict="PASS", incomplete=[])]
+        _same = gates.build_gauntlet_prompt(base_state(**_cs1, round_heads=_passed))
+        _moved = [dict(LATER_RED[0], paths=["tests/other_test.ext"])]
+        _changed = gates.build_gauntlet_prompt(base_state(**{**_cs1, "carried_failures": _moved}, round_heads=_passed))
+    finally:
+        gates._carried_review_section = _real_section
+    check(name, _same.get("_next") == "route_gauntlet" and _changed["gauntlet_prompt"] == _first["gauntlet_prompt"]
+          and "_next" not in _changed and len(_changed.get("round_heads", [])) == 2
+          and _changed["round_heads"][-1].get("review_key") not in ("", _passed[0].get("review_key")),
+          (_same.get("_next"), _changed.get("round_heads")))
+with scenario("next_subtask: each subtask and the final review start with no carried failures handed to the "
+              "gauntlet") as name:
+    _was = json.dumps(LATER_RED)
+    _starts = [gates.next_subtask(base_state(subtasks=CC_SUBS, subtask_index=i, intent="trivial",
+                                             review_carried_failures=_was)) for i in (1, 2)]
+    check(name, [s.get("review_carried_failures") for s in _starts] == ["[]", "[]"]
+          and _starts[1].get("final_review") is True, [(s.get("_next"), s.get("review_carried_failures"))
+                                                       for s in _starts])
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
