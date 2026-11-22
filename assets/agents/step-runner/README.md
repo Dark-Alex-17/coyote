@@ -188,9 +188,10 @@ coyote -a step-runner --agent-variable plans_dir docs/plans "Execute the next st
 coyote -a step-runner --agent-variable build_lock 'flock -w 240 /tmp/coyote-cargo.lock' "Execute the next step"
 ```
 
-**Invoke from the project root.** The coder sub-agent resolves its own
-`project_dir` from the invocation directory; overriding `project_dir` here
-does not propagate to the spawned coder.
+**Invoke from the project root, or pass `project_dir`.** A `project_dir`
+given to step-runner (`--agent-variable project_dir <path>`) reaches the
+spawned coder as its own `project_dir`; without one, both resolve it from
+the invocation directory.
 
 ## Tuning
 
@@ -206,8 +207,8 @@ does not propagate to the spawned coder.
 - `build_lock` (default empty): command prefix applied to every gate
   (format, lint, build and tests), e.g. `flock /tmp/coyote-cargo.lock` so
   parallel agents sharing one target directory serialise their gate runs
-  (the spawned coder's own gates inherit the prefix: parent agent variables
-  are cloned into the child; its ad-hoc cargo calls are not covered). The
+  (the spawned coder's own gates inherit the prefix step-runner was started
+  or spawned with; its ad-hoc cargo calls are not covered). The
   whole gate command runs under the prefix as one unit. Waiting on the lock counts
   toward the gate node's timeout (300 s format/lint, 600 s build, 1200 s
   tests), so prefer `flock -w <secs>` or raise those timeouts when runs are
