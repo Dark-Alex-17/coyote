@@ -1,7 +1,7 @@
 //! Real-process checks of commands typed during a turn, the welcome
-//! screen and the footer, and the elapsed time a long turn shows. Every
-//! module drives the binary through the shared pty harness in `common`,
-//! so the file is unix-only.
+//! screen and the footer, the elapsed time a long turn shows, and the mouse
+//! switch. Every module drives the binary through the shared pty harness in
+//! `common`, so the file is unix-only.
 #![cfg(unix)]
 
 mod common;
@@ -431,6 +431,54 @@ mod elapsed_format {
         assert!(
             has_seconds,
             "no `<n>s` elapsed while the tool runs:\n{frame}"
+        );
+        quit_and_check(&mut pty);
+    }
+}
+
+mod mouse {
+    //! A mouse handed to the terminal with `Alt+M` stays handed over when
+    //! the screen comes back from a `!` command.
+    use std::time::Duration;
+
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    const ALT_M: &[u8] = b"\x1bm";
+
+    #[test]
+    #[serial]
+    fn the_mouse_stays_with_the_terminal_after_a_bang_command() {
+        let dir = fresh_config_dir("mouse-after-bang");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.read_for(HOTKEY_GAP);
+        let off_at = pty.raw().len();
+        pty.send(ALT_M).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        assert!(
+            find(pty.raw(), b"\x1b[?1000l", off_at).is_some(),
+            "Alt+M did not switch the mouse reports off"
+        );
+
+        let bang_at = pty.raw().len();
+        pty.send(b"!echo bang-mouse-m5b\r").unwrap();
+        let left = pty
+            .wait_for_raw(LEAVE_ALT, bang_at, PTY_DEADLINE)
+            .expect("`!echo` did not release the terminal");
+        let re_entered = wait_for_re_entry(&mut pty, left);
+        pty.read_for(Duration::from_millis(800));
+        let back = String::from_utf8_lossy(&pty.raw()[re_entered..]).into_owned();
+        assert!(
+            !back.contains("\x1b[?1000h"),
+            "the return from `!` took the mouse back: {back:?}"
+        );
+        let frame = repainted_frame_after_resize(&mut pty, 24, 101);
+        assert!(
+            frame.contains("mouse select"),
+            "the footer no longer says `mouse select` after `!`:\n{frame}"
         );
         quit_and_check(&mut pty);
     }

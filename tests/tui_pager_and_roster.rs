@@ -2963,6 +2963,137 @@ mod binary_threads {
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
     }
 
+    /// The kid as a graph agent: node `scout` calls the mark tool, node
+    /// `waiter` the gated one.
+    fn write_graph_kid(dir: &Path) {
+        let kid = dir.join("agents").join("kid");
+        let _ = fs::remove_file(kid.join("config.yaml"));
+        fs::write(
+            kid.join("graph.yaml"),
+            "name: kid\n\
+             description: Does the kid task in two nodes.\n\
+             version: \"1.0\"\n\
+             model: kidfake:fake-model\n\
+             global_tools:\n\
+             \x20 - kid_mark.sh\n\
+             \x20 - kid_gate.sh\n\
+             start: scout\n\
+             nodes:\n\
+             \x20 scout:\n\
+             \x20   type: llm\n\
+             \x20   prompt: \"Scout {{initial_prompt}}\"\n\
+             \x20   tools: [kid_mark]\n\
+             \x20   next: waiter\n\
+             \x20 waiter:\n\
+             \x20   type: llm\n\
+             \x20   prompt: \"Wait for the gate\"\n\
+             \x20   tools: [kid_gate]\n\
+             \x20   next: done\n\
+             \x20 done: { type: end, output: \"graph kid over g9k\" }\n",
+        )
+        .unwrap();
+    }
+
+    /// A spawned graph agent's thread, opened while its second node sits in
+    /// the gated call, shows one row per node it ran, in start order, with
+    /// the calls folded under them; opening the running node's row shows
+    /// its call, live.
+    #[test]
+    #[serial]
+    fn a_graph_kids_thread_shows_a_row_per_node_with_its_calls_folded_under() {
+        let scene = scene(
+            "thr-graph-nodes",
+            |_| {
+                vec![
+                    Reply::ToolCall {
+                        name: "kid_mark".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    Reply::Text("scout done g1n".to_string()),
+                    Reply::ToolCall {
+                        name: "kid_gate".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    Reply::Text("waiter done g2n".to_string()),
+                ]
+            },
+            "",
+        );
+        write_graph_kid(&scene.dir);
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+        wait_for_file(
+            &mut pty,
+            &scene.dir.join("kid.gated"),
+            "the kid's gate tool",
+        );
+
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"\t").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Threads  Enter = open  Esc = back",
+            "Tab did not open the picker",
+        );
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\r").unwrap();
+        let (nodes, thread) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+            let scout = frame.find("scout");
+            let waiter = frame.find("waiter");
+            matches!((scout, waiter), (Some(s), Some(w)) if s < w)
+        });
+        assert!(
+            nodes,
+            "the graph kid's thread does not show a `scout` then a `waiter` node row:\n{thread}\nlog: {}",
+            scene.log.display()
+        );
+        assert_eq!(
+            thread.matches("kid_gate").count(),
+            1,
+            "the waiter node's call is not folded under its node row (only its header names it):\n{thread}"
+        );
+
+        pty.send(b"\x1b[1;5A").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\r").unwrap();
+        let (opened, open) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
+            frame.matches("kid_gate").count() >= 2
+                && row_after(frame, "kid_gate").is_some_and(|row| row.contains("running"))
+        });
+        assert!(
+            opened,
+            "opening the focused node row does not show its running call:\n{open}"
+        );
+
+        // The kid finishes and saves: the live rows and the saved session
+        // merge into one row per node and one row per call, none doubled.
+        fs::write(&scene.kid_gate, "").unwrap();
+        let (settled, after) = frame_until(&mut pty, Duration::from_secs(20), |frame| {
+            row_after(frame, "node waiter").is_some_and(|row| row.contains("completed"))
+        });
+        assert!(
+            settled,
+            "the waiter node did not turn completed in the open thread:\n{after}"
+        );
+        for (needle, want) in [("node scout", 1), ("node waiter", 1), ("kid_gate", 2)] {
+            assert_eq!(
+                after.matches(needle).count(),
+                want,
+                "`{needle}` shows {} times once the kid saved, not {want}:\n{after}",
+                after.matches(needle).count()
+            );
+        }
+        pty.send(b"q").unwrap();
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
     /// The boss's first turn: spawn the kid, then text answers to the
     /// turn-end reminders until the turn ends with the UI idle again.
     fn first_turn_spawning(prompt: &str) -> Vec<Reply> {
