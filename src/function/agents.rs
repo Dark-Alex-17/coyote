@@ -2783,6 +2783,12 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         }
 
         if ctx.user_message_waiting() {
+            // An agent that finished since the check above is collected:
+            // its result is not given up for the message, which reaches
+            // the model with it.
+            if supervisor.read().is_finished(id).unwrap_or(false) {
+                break;
+            }
             return Ok(message_arrived());
         }
 
@@ -3028,6 +3034,17 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         }
 
         if ctx.user_message_waiting() {
+            // An agent that finished since the pass above is reported
+            // ready on the next pass rather than given up for the message.
+            let finished_since = {
+                let sup = supervisor.read();
+                running
+                    .iter()
+                    .any(|id| sup.is_finished(id).unwrap_or(false))
+            };
+            if finished_since {
+                continue;
+            }
             break json!({
                 "status": "user_message",
                 "ready": [],
@@ -17389,6 +17406,62 @@ mod tests {
             .expect("the agent kept running and finishes")
             .unwrap();
             assert_eq!(result["status"], "completed", "{result}");
+        });
+    }
+
+    /// An agent that finishes at the moment the user's message arrives is
+    /// collected, not given up for the message: agent__collect returns its
+    /// real result and agent__wait reports it ready, whether the two land
+    /// together mid-wait or are both there before the call. The message
+    /// stays queued, to reach the model with the result.
+    #[test]
+    fn an_agent_finishing_as_the_message_arrives_returns_its_result() {
+        run_async(async {
+            for already in [false, true] {
+                let mut ctx = ctx_with_supervisor(4, 3);
+                ctx.session_abort = Some(create_abort_signal());
+                let run_for = if already {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(50)
+                };
+                register_agent_running_for(&mut ctx, "quick", "test", run_for);
+                let queue = Arc::clone(&ctx.notification_queue);
+                let message = async move {
+                    time::sleep(run_for).await;
+                    queue.push(SystemNotification::UserMessage {
+                        text: "landed together r2c".to_string(),
+                    });
+                };
+                if already {
+                    message.await;
+                    time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    tokio::spawn(message);
+                }
+                let waited =
+                    time::timeout(Duration::from_secs(2), handle_wait(&mut ctx, &json!({})))
+                        .await
+                        .expect("the wait must end")
+                        .unwrap();
+                assert_eq!(waited["status"], "ready", "already={already}: {waited}");
+
+                let collected = time::timeout(
+                    Duration::from_secs(2),
+                    handle_collect(&mut ctx, &json!({"id": "quick"})),
+                )
+                .await
+                .expect("the collect must end")
+                .unwrap();
+                assert_eq!(
+                    collected["status"], "completed",
+                    "already={already}: {collected}"
+                );
+                assert!(
+                    ctx.notification_queue.has_user_message(),
+                    "already={already}: the message was lost"
+                );
+            }
         });
     }
 
