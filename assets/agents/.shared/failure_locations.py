@@ -18,6 +18,18 @@ RUNNER_BANNER_RE = re.compile(r"\S*: \*\*\* \[[^\]]*\] Error \d+\s*$")
 GIT_SECS = 60
 
 
+class RepoIndex(tuple):
+    """(files, dirs), plus a basename -> files map and a per-token memo built on first use, so resolving many tokens
+    against one index scans only the files sharing a token's basename."""
+
+    def lookups(self):
+        if not hasattr(self, "by_name"):
+            self.by_name, self.memo = {}, {}
+            for f in self[0]:
+                self.by_name.setdefault(f.rsplit("/", 1)[-1], []).append(f)
+        return self.by_name, self.memo
+
+
 def parse_failure_locations(tests):
     """(token, is_file, line) for every path:LINE token, and every slash token on a line carrying a failure word."""
     out = []
@@ -31,17 +43,17 @@ def parse_failure_locations(tests):
     return out
 
 
-def repo_index(root):
+def repo_index(root, timeout=GIT_SECS):
     """(files, dirs) git knows in the worktree, untracked included, or None when git cannot list them."""
     try:
         p = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                           capture_output=True, text=True, timeout=GIT_SECS)
+                           capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if p.returncode != 0:
         return None
     files = {n for n in p.stdout.split("\0") if n.strip()}
-    return files, {f.rsplit("/", i)[0] for f in files for i in range(1, f.count("/") + 1)}
+    return RepoIndex((files, {f.rsplit("/", i)[0] for f in files for i in range(1, f.count("/") + 1)}))
 
 
 def resolve_failure_tokens(root, tokens, index=None):
@@ -50,22 +62,28 @@ def resolve_failure_tokens(root, tokens, index=None):
     index = index or repo_index(root)
     if index is None:
         return []
+    index = index if isinstance(index, RepoIndex) else RepoIndex(index)
     files, dirs = index
+    by_name, memo = index.lookups()
     prefix = os.path.realpath(root).rstrip("/") + "/"
     found, seen = [], set()
     for token, is_file, line in tokens:
         t = token.removeprefix(prefix).removeprefix(root.rstrip("/") + "/").rstrip("/").removesuffix("/...")
         while t.startswith("./"):
             t = t[2:]
-        if is_file:
-            paths = sorted(f for f in files if f == t or f.endswith("/" + t))
-        else:
-            parts = [p for p in t.split("/") if p not in ("", ".")]
-            suffixes = ("/".join(parts[i:]) for i in range(len(parts)))
-            paths = next(([s] if s in files else [s + "/"] for s in suffixes if s in files or s in dirs), [])
+        if (t, is_file) not in memo:
+            if is_file:
+                same_name = by_name.get(t.rsplit("/", 1)[-1], [])
+                memo[t, is_file] = sorted(f for f in same_name if f == t or f.endswith("/" + t))
+            else:
+                parts = [p for p in t.split("/") if p not in ("", ".")]
+                suffixes = ("/".join(parts[i:]) for i in range(len(parts)))
+                memo[t, is_file] = next(([s] if s in files else [s + "/"] for s in suffixes
+                                         if s in files or s in dirs), [])
+        paths = memo[t, is_file]
         if paths and tuple(paths) not in seen:
             seen.add(tuple(paths))
-            found.append({"paths": paths, "evidence": line.strip()[:200]})
+            found.append({"paths": list(paths), "evidence": line.strip()[:200]})
     return found
 
 
