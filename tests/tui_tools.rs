@@ -4657,6 +4657,52 @@ mod binary {
         assert_tty_restored(&transcript);
     }
 
+    /// A `.list` table is fitted to the screen: on a narrow screen a long
+    /// description wraps inside its cell, so the table's right-hand edge is
+    /// painted rather than cut off. The probe agent makes sure one row is
+    /// far wider than the screen whatever agents the install ships.
+    #[test]
+    #[serial]
+    fn a_dot_list_table_wraps_its_cells_to_fit_a_narrow_screen() {
+        let dir = fresh_config_dir("list-wrap");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let agent_dir = dir.join("agents").join("wrapprobe");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            "name: wrapprobe\n\
+             description: a probe agent whose description is far too long to sit on \
+             one row of a sixty column screen so it must wrap\n\
+             version: 0.1.0\n\
+             instructions: Reply briefly.\n",
+        )
+        .unwrap();
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(60, 60).unwrap();
+        pty.read_for(Duration::from_millis(500));
+
+        let at = pty.raw().len();
+        pty.send(b".list agents\r").unwrap();
+        // The bottom border's column join is painted whether or not the
+        // table fits, so it marks the listing as drawn either way.
+        pty.wait_for_after("\u{2534}", at, PTY_DEADLINE)
+            .expect("`.list agents` did not draw its table");
+        // One column wider, so the resize is real and the whole screen is
+        // painted again; the table was fitted to sixty.
+        let frame = repainted_frame(&mut pty, 60, 61);
+        let bottom = frame
+            .rfind('\u{2534}')
+            .unwrap_or_else(|| panic!("the table's bottom border is off the screen:\n{frame}"));
+        let closed = frame[bottom..].chars().skip(1).find(|c| *c != '\u{2500}') == Some('\u{2518}');
+        assert!(
+            closed && frame.contains('\u{2524}'),
+            "the table's right-hand edge was cut off instead of its cells wrapping:\n{frame}"
+        );
+        assert_ui_alive_then_quit(&mut pty, "`.list agents`");
+    }
+
     /// `.skill <name>` scaffolds the skill file and opens it in `$EDITOR` on
     /// the lent terminal: the alternate screen is left for the editor, the
     /// editor is handed the skill file's path, the file exists afterwards,

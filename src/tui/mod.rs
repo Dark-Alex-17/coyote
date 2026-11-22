@@ -85,6 +85,7 @@ use sink::{AgentOutcome, LendJob, UiMsg};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use terminal::MOUSE_CAPTURE_DEFAULT;
@@ -96,6 +97,16 @@ use transcript::{Transcript, WHEEL_LINES};
 
 pub(crate) fn active() -> bool {
     matches!(owner(), Owner::Tui(_))
+}
+
+/// The transcript's width on the last frame that showed it; 0 before one.
+static TABLE_WIDTH: AtomicU16 = AtomicU16::new(0);
+
+/// The width a command's table must fit to show whole in the transcript,
+/// while the full-screen UI has the terminal; None otherwise.
+pub(crate) fn table_width() -> Option<u16> {
+    let width = TABLE_WIDTH.load(Ordering::Relaxed);
+    (width > 0 && active()).then_some(width)
 }
 
 /// How long the composer must have been untouched before a bare hotkey
@@ -1960,6 +1971,9 @@ impl App {
             }
             (true, None) => (Rect::ZERO, Some(upper)),
         };
+        if transcript.width > 0 {
+            TABLE_WIDTH.store(transcript.width, Ordering::Relaxed);
+        }
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
         if let Some(todo) = todo {

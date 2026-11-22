@@ -372,9 +372,17 @@ fn asset_names_listing(kind: &str, names: &[String]) -> String {
 }
 
 pub(crate) fn asset_table(header: &[&str]) -> Table {
+    fitted_table(header, crate::tui::table_width())
+}
+
+/// A listing table; with a `width`, long cells wrap so the table fits it.
+fn fitted_table(header: &[&str], width: Option<u16>) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_content_arrangement(ContentArrangement::Dynamic);
+    if let Some(width) = width {
+        table.set_width(width);
+    }
     table.set_header(header.to_vec());
     table
 }
@@ -8488,6 +8496,36 @@ mod tests {
     use std::process::Command;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use std::{env, mem};
+
+    #[test]
+    fn a_listing_table_given_a_width_wraps_its_cells_to_fit_it() {
+        let description = "a long description that cannot fit on one row of a narrow screen";
+        let mut table = fitted_table(&["name", "description"], Some(40));
+        table.add_row(vec!["planner", description]);
+        let text = table.to_string();
+        for line in text.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= 40,
+                "{line:?} is wider than 40:\n{text}"
+            );
+        }
+        let words: Vec<&str> = text
+            .lines()
+            .flat_map(|line| line.split(|c: char| c == '│' || c.is_whitespace()))
+            .filter(|word| !word.is_empty())
+            .collect();
+        for word in description.split(' ') {
+            assert!(words.contains(&word), "{word:?} was lost:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_listing_table_without_a_width_keeps_each_row_on_one_line() {
+        let description = "a long description that cannot fit on one row of a narrow screen";
+        let mut table = fitted_table(&["name", "description"], None);
+        table.add_row(vec!["planner", description]);
+        assert!(table.to_string().contains(description));
+    }
 
     // `list_client_names` / `list_all_models` cache the first AppConfig they
     // see in process-wide OnceLocks. Several tests reach them through configs
