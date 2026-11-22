@@ -7143,8 +7143,11 @@ with scenario("carried failures: the adversary's run_checks matches the carry ga
     _pending = _cs.get("carried_failures") or []
     _out_file = os.path.join(TMP, "carry-out.txt")
     open(_out_file, "w").write(CARRY_OUT + "\n")
+    # the declared command replays the gate's output under either shell run_checks may use
+    _replay = (f"\"{sys.executable}\" -c \"import sys; sys.stdout.write(open(r'{_out_file}').read()); "
+               f"sys.exit(1)\"")
     _env = dict(os.environ, ADVERSARY_STACK_LOCK_PATH=os.path.join(TMP, "stack.lock"), GRAPH_STATE=json.dumps({
-        "project_dir": CARRY, "verification_commands": [f"cat '{_out_file}'; exit 1"],
+        "project_dir": CARRY, "verification_commands": [_replay],
         "carried_failures": json.dumps(_pending)}))
     _env.pop("GRAPH_STATE_FILE", None)
     _rc = subprocess.run([sys.executable, "-B", os.path.join(HERE, "..", "..", "adversary", "scripts", "run_checks.py")],

@@ -3301,6 +3301,7 @@ fn each_run_record_carries_the_pass_condition_its_criteria_state() {
 
 /// Test-runner output naming three failing test files, each followed by its
 /// package's FAIL line.
+#[cfg(unix)]
 const CARRIED_SUITE: &str = "echo '--- FAIL: TestAlpha (0.00s)'\n\
      echo '    pkg/alpha/server_test.ext:203: status = 500, want 200'\n\
      printf 'FAIL\\texample.org/svc/pkg/alpha\\t0.7s\\n'\n\
@@ -3314,6 +3315,7 @@ const CARRIED_SUITE: &str = "echo '--- FAIL: TestAlpha (0.00s)'\n\
 
 /// The failures of `CARRIED_SUITE` as the caller declares them: a file key
 /// and a directory key per package.
+#[cfg(unix)]
 fn carried_keys() -> String {
     json!([
         {"paths": ["pkg/alpha/server_test.ext"], "owner": 2, "evidence": "status = 500, want 200"},
