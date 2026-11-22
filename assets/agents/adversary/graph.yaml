@@ -71,7 +71,9 @@ variables:
       ending in "/"], "owner": display label, "evidence": optional text}.
       Declared like verification_commands, never inferred from the prompt. A
       red run every one of whose failures exactly matches a declared item's
-      paths is advisory; a value that is not a JSON array counts as none.
+      paths is advisory when every criterion naming the command is met;
+      matching is per location, so a further failure at a carried location
+      is not told apart. A value that is not a JSON array counts as none.
     default: '[]'
 
 settings:

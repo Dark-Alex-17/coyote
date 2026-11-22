@@ -148,7 +148,9 @@ the repository, untracked included. The record gains `carried`: {"all",
 trimmed, is under CARRIED_OUTPUT_CAP bytes, locates at least one failure,
 has no failure line naming no repo path, and every located failure's paths
 exactly equal a carried item's; a new failure inside a carried directory is
-new. When the parser cannot be imported or git cannot list the files, the
+new. Matching is per location, so a further failure at a carried location is
+not told apart; the owner's own gate still has to see it green. When the
+parser cannot be loaded or git cannot list the files, the
 record gets a `carried_note` instead and is judged as if nothing were
 carried; so does every record the deadline leaves no time to match.
 """
