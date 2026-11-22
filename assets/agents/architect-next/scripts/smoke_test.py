@@ -2826,6 +2826,33 @@ AA_ESC = {
                                              option("Leave the PR in draft and report")]),
     "review_push_mismatch": escalation("review_push_mismatch", "q", [option("Re-check the PR head"),
                                                                      option("Stop watching and report", True)]),
+    "gate_fault": escalation("gate_fault", "q", [option("Retry the gatekeeper", True), option("Abort the run")], data={"gate": "gate1"}),
+    "tasks_stuck": escalation("tasks_stuck", "q", [option("Retry the failed blocker"), option("Skip the blocked tasks and finish (follow-ups)"),
+                                                   option("Stop and report", True)], hard_trigger=True),
+    "task_failed": escalation("task_failed", "q", [option("Retry with the oracle's direction (one round)", True),
+                                                   option(gates.TASK_RESCOPE), option("Abort this task and stop")], hard_trigger=True),
+    "conformance_stuck": escalation("conformance_stuck", "q", [
+        option(gates.CONFORMANCE_ONE_MORE, True), option("Accept the findings unresolved and close the task (recorded)"),
+        option("Stop and report")], hard_trigger=True),
+    "design_ask": escalation("design_ask", "Design question: q", [option("Adopt the pattern (work: one fix round follows)"),
+                                                                  option("Record the decision without adopting")], hard_trigger=True),
+    "batch_strikeout": escalation("batch_strikeout", "q", [option(gates.BATCH_STRIKEOUT_MORE, True),
+                                                           option("Accept the batch unresolved (recorded)"), option("Stop and report")],
+                                  hard_trigger=True),
+    "integration_conflict": escalation("integration_conflict", "q", [option(gates.INTEGRATION_CONFLICT_MORE, True),
+                                                                     option("Abort this task (branch kept)"), option("Stop and report")],
+                                       hard_trigger=True),
+    "integration_red": escalation("integration_red", "q", [option(gates.INTEGRATION_RED_MORE, True), option("Stop and report")],
+                                  hard_trigger=True),
+    "hygiene_base_missing": escalation("hygiene_base_missing", "q", [option("Stop and report", True),
+                                                                     option("Skip the hygiene pass (recorded as a follow-up)")],
+                                       hard_trigger=True),
+    "review_exhausted": escalation("review_exhausted", "q", [option("Keep watching (re-arm the review watch)"),
+                                                             option("Stop watching and report", True)]),
+    "review_read_truncated": escalation("review_read_truncated", "q", [option("Keep watching (re-arm the review watch)"),
+                                                                       option("Stop watching and report", True)]),
+    "review_round_cap": escalation("review_round_cap", "q", [option("Resume with one more fix round"),
+                                                             option("Stop watching and report", True)]),
 }
 
 
@@ -2909,15 +2936,19 @@ check("apply_answer: a non-empty unknown escalation kind still stops -> end_fail
       _unknown["_next"] == "end_failure" and "no_such_kind" in _unknown.get("failure_reason", ""), _unknown)
 check("apply_answer: gate2_stuck stop -> end_blocked", AA("gate2_stuck", "Stop and report")["_next"] == "end_blocked")
 check("apply_answer: gate2_stuck override -> reseal_return (recorded)", AA("gate2_stuck", "Override: promote the plan as reviewed (recorded)")["_next"] == "reseal_return")
-u = AA("gate_fault", "Retry the gatekeeper", esc=escalation("gate_fault", "q", data={"gate": "gate1"}), gate_fault_retries=0)
+u = AA("gate_fault", "Retry the gatekeeper", gate_fault_retries=0)
 check("apply_answer: gate_fault retry -> gate1_build (B23 side 1)", u["_next"] == "gate1_build" and u["gate_fault_retries"] == 1)
-check("apply_answer: gate_fault abort -> end_aborted", AA("gate_fault", "Abort the run", esc=escalation("gate_fault", "q", data={"gate": "gate2"}))["_next"] == "end_aborted")
+check("apply_answer: gate_fault abort -> end_aborted", AA("gate_fault", "Abort the run", esc={**AA_ESC["gate_fault"], "data": {"gate": "gate2"}})["_next"] == "end_aborted")
 check("apply_answer: approve_breakdown approve -> promote_tasks", AA("approve_breakdown", "Approve the breakdown")["_next"] == "promote_tasks")
 check("apply_answer: approve_breakdown revise -> amend_plan", AA("approve_breakdown", "Revise the breakdown (describe the change)")["_next"] == "amend_plan")
 check("apply_answer: approve_breakdown abort -> end_aborted", AA("approve_breakdown", "Abort the run")["_next"] == "end_aborted")
-check("apply_answer: promote_failed retry -> promote_verify", AA("promote_failed", "Retry the planning commit")["_next"] == "promote_verify")
-check("apply_answer: promote_failed retry the close -> task_done_verify", AA("promote_failed", "Retry the close")["_next"] == "task_done_verify")
-check("apply_answer: promote_failed continue -> branch_setup", AA("promote_failed", "Continue with the tasks as promoted")["_next"] == "branch_setup")
+E_PROMOTE_COMMIT = escalation("promote_failed", "q", [option("Retry the planning commit", True), option("Abort the run")])
+E_PROMOTE_CLOSE = escalation("promote_failed", "q", [option("Retry the close", True), option("Abort the run")], hard_trigger=True)
+E_PROMOTE_DEFECTS = escalation("promote_failed", "q", [option("Abort the run", True), option("Continue with the tasks as promoted")],
+                               hard_trigger=True)
+check("apply_answer: promote_failed retry -> promote_verify", AA("promote_failed", "Retry the planning commit", esc=E_PROMOTE_COMMIT)["_next"] == "promote_verify")
+check("apply_answer: promote_failed retry the close -> task_done_verify", AA("promote_failed", "Retry the close", esc=E_PROMOTE_CLOSE)["_next"] == "task_done_verify")
+check("apply_answer: promote_failed continue -> branch_setup", AA("promote_failed", "Continue with the tasks as promoted", esc=E_PROMOTE_DEFECTS)["_next"] == "branch_setup")
 check("apply_answer: git_setup_failed retry -> branch_setup", AA("git_setup_failed", "Retry the branch setup")["_next"] == "branch_setup")
 u = AA("tasks_stuck", "Retry the failed blocker", tasks=tasks_with(**{T1: "failed"}))
 check("apply_answer: tasks_stuck retry -> failed tasks pending again", u["_next"] == "select_tasks" and gates.task_by_id(u["tasks"], T1)["status"] == "pending")
@@ -2930,9 +2961,9 @@ u = AA("task_failed", "Retry with the oracle's direction (one round)", current_t
 check("apply_answer: task_failed retry -> the fix note keeps the oracle's first point", "- ORACLE-POINT-1:" in u["fix_note"], u.get("fix_note", "")[:200])
 u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), task_rounds={T1: {"retry_rounds": 1}})
 check("apply_answer: task_failed retry at B8 -> abort path (task failed, end_aborted)", u["_next"] == "end_aborted")
-u = AA("task_failed", "Re-scope: amend the plan/task", current_task=T1, tasks=tasks_with())
+u = AA("task_failed", gates.TASK_RESCOPE, current_task=T1, tasks=tasks_with())
 check("apply_answer: task_failed re-scope -> amend_plan (task pending again)", u["_next"] == "amend_plan" and gates.task_by_id(u["tasks"], T1)["status"] == "pending")
-u = AA("conformance_stuck", "One more fix round anyway", esc=escalation("conformance_stuck", "q", evidence="- finding A"), current_task=T1, tasks=tasks_with())
+u = AA("conformance_stuck", gates.CONFORMANCE_ONE_MORE, esc={**AA_ESC["conformance_stuck"], "evidence": "- finding A"}, current_task=T1, tasks=tasks_with())
 check("apply_answer: conformance_stuck one more round -> fix with the findings", u["_next"] == "compose_delegation" and u["fix_items"] == ["finding A"])
 check("apply_answer: conformance_stuck accept -> post_round + follow-up", AA("conformance_stuck", "Accept the findings unresolved and close the task (recorded)", current_task=T1, tasks=tasks_with())["_next"] == "post_round")
 check("apply_answer: conformance_stuck stop -> end_blocked", AA("conformance_stuck", "Stop and report", current_task=T1, tasks=tasks_with())["_next"] == "end_blocked")
@@ -2947,12 +2978,12 @@ check("apply_answer: review_incomplete retry -> verify_gate", AA("review_incompl
 u = AA("review_incomplete", "Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)", current_task=T1, tasks=TS_W, verify_unit=T1, round_log={T1: [{"round": 1, "incomplete": ["security"]}]})
 check("apply_answer: review_incomplete accept -> skipped review recorded (lane names) -> post_round", u["_next"] == "post_round" and "security" in u["skipped_reviews"][0])
 check("apply_answer: review_incomplete abort -> end_aborted", AA("review_incomplete", "Abort this task", current_task=T1, tasks=TS_W)["_next"] == "end_aborted")
-u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc=escalation("design_ask", "Design question: share the store?"), current_task=T1, tasks=tasks_with(), task_rounds={}, design_asks=[])
+u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc={**AA_ESC["design_ask"], "question": "Design question: share the store?"}, current_task=T1, tasks=tasks_with(), task_rounds={}, design_asks=[])
 check("apply_answer: design_ask adopt -> design-decision ledgered + adopting fix round queued (B12 side 1) -> next ask", u["_next"] == "design_ask_gate" and u["design_decisions"][0].startswith("share the store? ->") and u["pending_fixes"][0]["source"] == "design_ask" and any(l.startswith("design-decision:") for l in u["ledger_lines"]))
-u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc=escalation("design_ask", "Design question: q2"), current_task=T1, tasks=tasks_with(), task_rounds={T1: {"design_ask_rounds": 1}})
+u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc={**AA_ESC["design_ask"], "question": "Design question: q2"}, current_task=T1, tasks=tasks_with(), task_rounds={T1: {"design_ask_rounds": 1}})
 check("apply_answer: design_ask adopt at B12 -> recorded only, no second round", "pending_fixes" not in u)
-check("apply_answer: design_ask record -> no fix round", "pending_fixes" not in AA("design_ask", "Record the decision without adopting", esc=escalation("design_ask", "Design question: q"), current_task=T1, tasks=tasks_with()))
-u = AA("batch_strikeout", "One more batch round anyway", current_batch="B1", batch_state={"B1": {"strikes": 4}})
+check("apply_answer: design_ask record -> no fix round", "pending_fixes" not in AA("design_ask", "Record the decision without adopting", current_task=T1, tasks=tasks_with()))
+u = AA("batch_strikeout", gates.BATCH_STRIKEOUT_MORE, current_batch="B1", batch_state={"B1": {"strikes": 4}})
 check("apply_answer: batch_strikeout one more -> batch_fix_route with strikes reset below the cap", u["_next"] == "batch_fix_route" and u["batch_state"]["B1"]["strikes"] == STRIKE_LIMIT - 1)
 check("apply_answer: batch_strikeout accept -> batch passed (recorded) -> select_tasks", AA("batch_strikeout", "Accept the batch unresolved (recorded)", current_batch="B1", batch_state={})["batch_state"]["B1"]["passed"])
 check("apply_answer: batch_strikeout stop -> end_blocked", AA("batch_strikeout", "Stop and report", current_batch="B1")["_next"] == "end_blocked")
@@ -3040,6 +3071,102 @@ check("apply_answer: review_push_mismatch past APPLY_REASK_MAX re-asks -> a stop
 check("raise_escalation: a new escalation starts with no apply_answer re-asks, and the count is snapshotted",
       _lib.raise_escalation(base_state(apply_reasks=2), {}, escalation("x", "q")).get("apply_reasks") == 0
       and "apply_reasks" in _lib.STATE_KEYS)
+E_CI_OVER = escalation("ci_exhausted", "q", [option(gates.CI_FIX_MORE, True), option("Leave the PR in draft and report")],
+                       hard_trigger=True, data={"over": ["test"], "failing": ["test"]})
+E_CI_INC = escalation("ci_inconclusive", "q", [option(gates.CI_KEEP_WAITING), option(gates.CI_TREAT_GREEN),
+                                               option("Leave the PR in draft and report", True)])
+E_CI_NONE = escalation("ci_no_checks", "q", [option(gates.CI_NO_CI, True), option(gates.CI_KEEP_WAITING),
+                                             option("Leave the PR in draft and report")])
+E_VERIFY = escalation("verification_command", "q", [option(gates.VERIFY_ADOPT), option(gates.VERIFY_KEEP), option("Stop and report")],
+                      hard_trigger=True, data={"task": T1, "failed_command": "./run_tests.sh", "replacement": "./check.sh"})
+E_CHECKOUT = escalation("integration_checkout", "q", [option("Retry the integration", True), option("Stop and report")],
+                        hard_trigger=True, data={"task": T3})
+E_UNTRUSTED = escalation("review_owner_judgment", "q", [option("Skip it and keep watching"), option("Stop watching and report", True)],
+                         hard_trigger=True, data={"items": ["comment:I9"], "untrusted": True})
+AA_ACTED = ("tasks", "pending_amendments", "pending_fixes", "fix_request", "follow_ups", "failure_reason", "delegation_kind",
+            "gate_fault_retries", "promote_retries", "skip_promote_defects", "ci_polls", "review_seen", "review_fix_rounds",
+            "verification_changes", "cap_continues")
+AA_WORDS = (
+    ("gate_fault", AA_ESC["gate_fault"], "please don't retry the gatekeeper", dict(gate_fault_retries=1)),
+    ("promote_failed", E_PROMOTE_COMMIT, "no need to retry the commit", {}),
+    ("promote_failed", E_PROMOTE_CLOSE, "don't retry the close yet", dict(current_task=T1, tasks=tasks_with())),
+    ("promote_failed", E_PROMOTE_DEFECTS, "do not continue with these", {}),
+    ("tasks_stuck", AA_ESC["tasks_stuck"], "please don't retry the failed blocker", dict(tasks=tasks_with(**{T1: "failed"}))),
+    ("task_failed", AA_ESC["task_failed"], "re-scope later, not now", dict(current_task=T1, tasks=tasks_with(), task_rounds={})),
+    ("conformance_stuck", AA_ESC["conformance_stuck"], "one more, I suppose", dict(current_task=T1, tasks=tasks_with(), task_rounds={})),
+    ("batch_strikeout", AA_ESC["batch_strikeout"], "one more batch round, sure", dict(current_batch="B1", batch_state={})),
+    ("integration_conflict", AA_ESC["integration_conflict"], "abort? no, not yet", dict(current_task=T3, tasks=TS_W)),
+    ("integration_red", AA_ESC["integration_red"], "one more fix round please", dict(current_task=T1, tasks=TS_W)),
+    ("verification_command", E_VERIFY, "keep the declared one, I think", dict(current_task=T1, tasks=TS_W)),
+    ("integration_checkout", E_CHECKOUT, "retry later", dict(current_task=T3, tasks=TS_W)),
+    ("ci_exhausted", E_CI_OVER, "resume, I guess", dict(pr_number="99", tasks=TS_W, ci_owning_task=T1)),
+    ("ci_inconclusive", E_CI_INC, "treat as green, I suppose", dict(pr_number="99", tasks=TS_W)),
+    ("ci_no_checks", E_CI_NONE, "finish without ci then", dict(pr_number="99", tasks=TS_W)),
+    ("review_round_cap", AA_ESC["review_round_cap"], "resume with one more round", dict(pr_number="99")),
+    ("review_owner_judgment", E_UNTRUSTED, "address them as a fix round", dict(pr_number="99")),
+    ("hygiene_base_missing", AA_ESC["hygiene_base_missing"], "skip it for now", {}),
+)
+for kind, esc_, text, over in AA_WORDS:
+    u = gates.apply_answer(base_state(escalation=esc_, last_answer=text, **over))
+    check(f"apply_answer: {kind} free text {text!r} that mentions an option's words -> interpret_reply, nothing acted on",
+          u.get("_next") == "interpret_reply" and not set(AA_ACTED) & set(u), (u.get("_next"), sorted(set(AA_ACTED) & set(u))))
+AA_PREFIX = (
+    ("tasks_stuck", AA_ESC["tasks_stuck"], "Retry", dict(tasks=tasks_with(**{T1: "failed"}))),
+    ("task_failed", AA_ESC["task_failed"], "Re-scope", dict(current_task=T1, tasks=tasks_with(), task_rounds={})),
+    ("conformance_stuck", AA_ESC["conformance_stuck"], "One", dict(current_task=T1, tasks=tasks_with(), task_rounds={})),
+    ("integration_red", AA_ESC["integration_red"], "One", dict(current_task=T1, tasks=TS_W)),
+    ("promote_failed", E_PROMOTE_DEFECTS, "Continue", {}),
+    ("hygiene_base_missing", AA_ESC["hygiene_base_missing"], "Skip", {}),
+)
+for kind, esc_, text, over in AA_PREFIX:
+    u = gates.apply_answer(base_state(escalation=esc_, last_answer=text, **over))
+    check(f"apply_answer: {kind} {text!r}, a prefix of an option's text, is no pick -> interpret_reply, nothing acted on",
+          u.get("_next") == "interpret_reply" and not set(AA_ACTED) & set(u), (u.get("_next"), sorted(set(AA_ACTED) & set(u))))
+_amend_prefix = gates.apply_answer(base_state(
+    escalation=escalation("amend_cap", "q", [option(gates.AMEND_ONE_MORE), option("Stop and report", True)],
+                          data={"source": "gate1", "over": ["source"]}), last_answer="Allow one more", amend_counts={"gate1": 9}))
+_gate1_prefix = gates.apply_answer(base_state(escalation=escalation("gate1_stuck", "q", gates._gate1_stuck_options()),
+                                              last_answer="Another revise"))
+_gate2_prefix = gates.apply_answer(base_state(escalation=escalation("gate2_stuck", "q", gates._gate2_stuck_options()),
+                                              last_answer="Another fix", oracle_rejects=1))
+check("apply_answer: a prefix of the one-more option on amend_cap, gate1_stuck or gate2_stuck spends no extra round",
+      _amend_prefix.get("_next") == "escalate_gate" and "amend_counts" not in _amend_prefix
+      and _gate1_prefix.get("_next") == "amend_plan" and "cap_continues" not in _gate1_prefix
+      and _gate2_prefix.get("_next") == "escalate_gate" and "oracle_rejects" not in _gate2_prefix,
+      (_amend_prefix.get("_next"), _gate1_prefix.get("_next"), _gate2_prefix.get("_next")))
+_promote_free = gates.apply_answer(base_state(escalation=E_PROMOTE_DEFECTS, last_answer="not sure what to do here"))
+_promote_read = gates.apply_answer(base_state(escalation={**E_PROMOTE_DEFECTS, "data": {"reply_read": True}},
+                                              last_answer="not sure what to do here"))
+check("apply_answer: promote_failed free text never aborts -> interpret_reply, then asked again",
+      _promote_free.get("_next") == "interpret_reply" and _promote_read.get("_next") == "ask_dispatch"
+      and "failure_reason" not in _promote_free and "failure_reason" not in _promote_read,
+      (_promote_free.get("_next"), _promote_read.get("_next")))
+for reply in ("yes, adopt it", "adopt it, yes please", "Adopt"):
+    u = gates.apply_answer(base_state(escalation=AA_ESC["design_ask"], last_answer=reply, current_task=T1, tasks=tasks_with(), task_rounds={}))
+    check(f"apply_answer: design_ask free {reply!r} -> recorded as the decision, never adopted",
+          u.get("_next") == "design_ask_gate" and "pending_fixes" not in u and any(reply in d for d in u.get("design_decisions", [])),
+          (u.get("_next"), u.get("pending_fixes")))
+u = gates.apply_answer(base_state(escalation=AA_ESC["design_ask"], last_answer="1: share the store", current_task=T1, tasks=tasks_with(),
+                                  task_rounds={}))
+check("apply_answer: design_ask '1: <note>' -> the Adopt option, a fix round queued",
+      u.get("_next") == "design_ask_gate" and u.get("pending_fixes", [{}])[0].get("source") == "design_ask", u.get("pending_fixes"))
+RESCOPE_FORMS = {f"{gates.TASK_RESCOPE}: split the parser out": None, "2: split the parser out": None}
+for reply in RESCOPE_FORMS:
+    u = gates.apply_answer(base_state(escalation=AA_ESC["task_failed"], last_answer=reply, current_task=T1, tasks=tasks_with(), task_rounds={}))
+    RESCOPE_FORMS[reply] = (u.get("_next"), (u.get("pending_amendments") or [""])[0])
+check("apply_answer: task_failed re-scope by '<option text>: <text>' or '2: <text>' -> the amendment carries only the typed text",
+      all(n == "amend_plan" and a.endswith(":\nsplit the parser out") for n, a in RESCOPE_FORMS.values()), RESCOPE_FORMS)
+AA_NOTED = (
+    ("gate_fault", AA_ESC["gate_fault"], "1", "the model timed out", "gate1_build", {}),
+    ("promote_failed", E_PROMOTE_DEFECTS, "2", "the defects are cosmetic", "branch_setup", {}),
+    ("hygiene_base_missing", AA_ESC["hygiene_base_missing"], "2", "the base was rewritten", "hygiene_create", {}),
+    ("conformance_stuck", AA_ESC["conformance_stuck"], "2", "known debt", "post_round", dict(current_task=T1, tasks=tasks_with())),
+)
+for kind, esc_, number, note, want, over in AA_NOTED:
+    own = esc_["options"][int(number) - 1]["text"]
+    got = [gates.apply_answer(base_state(escalation=esc_, last_answer=a, **over)).get("_next") for a in (number, own, f"{own}: {note}")]
+    check(f"apply_answer: {kind} an option by its number, its exact text, or '<option text>: <note>' -> that option's branch",
+          got == [want] * 3, got)
 check("apply_answer: scope_surprise -> end_blocked", AA("scope_surprise", "x")["_next"] == "end_blocked")
 check("apply_answer: unknown kind -> end_failure (never silent)", AA("bogus", "x")["_next"] == "end_failure")
 
@@ -3169,10 +3296,10 @@ check("route_verdict: round-2 findings tagged REPEAT or NEW against round 1, bot
 u = AA("conformance_stuck", "One more fix round (state reason)", esc=e5, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"],
        last_answer_text="1 - the security finding is new")
 u_hmm = AA("conformance_stuck", "hmm", esc=e5, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"])
-check("apply_answer: conformance_stuck one more round fixes the latest findings with the reason; an unparseable reply asks again, never stops",
+check("apply_answer: conformance_stuck one more round fixes the latest findings with the reason; an unparseable reply goes to interpret_reply, never stops",
       u["_next"] == "compose_delegation" and u.get("fix_items") == ["adversary: Criterion 2 not met (api/h.go:10).", "security: token logged at api/h.go:22"]
       and "the security finding is new" in u.get("fix_note", "") and any("the security finding is new" in d for d in u.get("decisions", []))
-      and u_hmm["_next"] == "escalate_gate" and u_hmm.get("escalation", {}).get("kind") == "conformance_stuck", (u.get("fix_items"), u_hmm["_next"]))
+      and u_hmm["_next"] == "interpret_reply" and u_hmm.get("escalation", {}).get("kind") == "conformance_stuck", (u.get("fix_items"), u_hmm["_next"]))
 s_cap = verdict_state(G_ROUND2, run_dir=RD_FIX, delegation_kind="fix", fix_source="review", fix_return_to="verify",
                       task_rounds={T1: {"conformance_rounds": STRIKE_LIMIT, "conformance_origin": "implement", "conformance_blockers": ["x"]}})
 e_cap = gates.route_verdict(s_cap).get("escalation") or {}
@@ -3340,8 +3467,9 @@ for k, opts in STOP_KINDS.items():
     for reply in ("don't stop, one more round", "hmm"):
         v = AA(k, reply, esc=e, **copy.deepcopy(stop_ctx))
         stop_[(k, reply)] = (v["_next"], (v.get("escalation") or {}).get("kind"))
-check("apply_answer: 'don't stop' is no stop and a reply that picks no option asks again, for every cap that offers a stop",
-      all(v == ("escalate_gate", k) for (k, _), v in stop_.items()), {k: v for k, v in stop_.items() if v != ("escalate_gate", k[0])})
+stop_want_ = {k: "escalate_gate" if k == "amend_cap" else "interpret_reply" for k in STOP_KINDS}
+check("apply_answer: 'don't stop' is no stop and a reply that picks no option goes to interpret_reply (amend_cap asks again), for every cap that offers a stop",
+      all(v == (stop_want_[k], k) for (k, _), v in stop_.items()), {k: v for k, v in stop_.items() if v != (stop_want_[k[0]], k[0])})
 picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]), **copy.deepcopy(stop_ctx))["_next"],
           "batch_strikeout": AA("batch_strikeout", "One more batch round (state reason)",
                                 esc=escalation("batch_strikeout", "q", STOP_KINDS["batch_strikeout"]), **copy.deepcopy(stop_ctx))["_next"],
@@ -3350,7 +3478,7 @@ picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q
           "integration_conflict abort": AA("integration_conflict", "Abort this task (branch kept)",
                                            esc=escalation("integration_conflict", "q", STOP_KINDS["integration_conflict"]),
                                            **copy.deepcopy(stop_ctx))["_next"],
-          "task_failed rescope": AA("task_failed", "Re-scope: split the parser out",
+          "task_failed rescope": AA("task_failed", "2: split the parser out",
                                     esc=escalation("task_failed", "q", STOP_KINDS["task_failed"]), **copy.deepcopy(stop_ctx))["_next"],
           "task_failed abort": AA("task_failed", "3", esc=escalation("task_failed", "q", STOP_KINDS["task_failed"]),
                                   **copy.deepcopy(stop_ctx))["_next"],
@@ -3585,8 +3713,8 @@ check("apply_answer: ci_exhausted continue -> a coder fix round for the owning t
       and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
       (cc_["ci_exhausted"]["_next"], fr_["ci_exhausted"], cc_["ci_exhausted"].get("ci_fix_strikes")))
 ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
-check("apply_answer: a reply that picks none of a cap's options is asked again, never stopped",
-      all(v["_next"] == "escalate_gate" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
+check("apply_answer: a reply that picks none of a cap's options goes to interpret_reply, never stopped",
+      all(v["_next"] == "interpret_reply" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
       {n: v["_next"] for n, v in ask_.items()})
 check("ci_apply: infra -> escalation ci_infra (wait-or-escalate)", gates.ci_apply(base_state(pr_number="99", ci_verdict="infra", failing_checks=["test"]))["escalation"]["kind"] == "ci_infra")
 check("ci_apply: unsure defaults UP (never a re-run)", gates.ci_apply(base_state(pr_number="99", ci_verdict="unsure", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
@@ -3820,7 +3948,8 @@ u = AA("review_round_cap", "Resume with one more fix round", **TRIAGED, review_t
 check("review watch: apply_answer review_round_cap one more -> review_apply one below the cap", u["_next"] == "review_apply" and u["review_fix_rounds"] == REVIEW_MAX_ROUNDS - 1)
 u = AA("review_round_cap", "Stop watching and report", **WATCH, review_status="round_cap")
 check("review watch: apply_answer review_round_cap stop -> finish_plan, outcome round_cap", u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "round_cap"})
-OJ = escalation("review_owner_judgment", "q", [], data={"items": rids[1:2]})
+OJ = escalation("review_owner_judgment", "q", [option("Address it as a fix round"), option("Skip it and keep watching"),
+                                               option("Stop watching and report", True)], hard_trigger=True, data={"items": rids[1:2]})
 u = AA("review_owner_judgment", "Address it as a fix round", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE)
 check("review watch: apply_answer review_owner_judgment address -> fix_round with the owner item as a fix item",
       u["_next"] == "fix_round" and u["fix_request"]["source"] == "review" and len(u["fix_request"]["items"]) == 3 and u["review_fix_rounds"] == 1)
@@ -4456,16 +4585,9 @@ try:
     check("review trust: apply_answer address with only untrusted items -> review_poll, no fix_request, no fix round counted",
           u.get("_next") == "review_poll" and "fix_request" not in u and "review_fix_rounds" not in u and no_sentinel(u), u)
     u = AA("review_owner_judgment", "Address it as a fix round", esc=ESC, **LEAKED)
-    RE = u.get("escalation", {})
-    refusal = "Addressing is not available for untrusted items."
-    check("cleanup: apply_answer address on the untrusted escalation -> refused and ledgered, the same escalation re-raised with the prefixed question, no fix_request",
-          u.get("_next") == "escalate_gate" and "fix_request" not in u and "review_fix_rounds" not in u
-          and ledgered(u, "review-watch: PR #99 refused: untrusted items cannot become a fix round")
-          and RE.get("kind") == ESC.get("kind") and RE.get("data") == ESC.get("data") and RE.get("options") == ESC.get("options")
-          and RE.get("hard_trigger") is True and RE.get("question") == f"{refusal} {ESC.get('question')}" and no_sentinel(u), u)
-    u = AA("review_owner_judgment", "address", esc=RE, **TRUST)
-    check("cleanup: a second address on the re-raised escalation -> refused again, the question prefixed once",
-          u.get("_next") == "escalate_gate" and "fix_request" not in u and u.get("escalation", {}).get("question") == RE.get("question"), u.get("escalation"))
+    check("cleanup: address on the untrusted escalation names none of its options -> interpret_reply, no fix_request",
+          u.get("_next") == "interpret_reply" and "fix_request" not in u and "review_fix_rounds" not in u and "review_seen" not in u
+          and no_sentinel(u), u.get("_next"))
 
     TRIAGE = NODES.get("review_triage", {})
     check("review trust: review_triage instructions call the bodies untrusted data and the prompt wraps review_items in the markers",
@@ -5970,8 +6092,8 @@ check("apply_answer: ci_inconclusive treat as green while watching -> review_pol
 u = AA("ci_inconclusive", "1", esc=ESC_INC, pr_number="99", tasks=ts_f, ci_status="inconclusive")
 check("apply_answer: ci_inconclusive re-run -> ci_poll with the watch reset", u.get("_next") == "ci_poll" and u.get("ci_polls") == 0, u.get("_next"))
 u = AA("ci_inconclusive", "whatever you think", esc=ESC_INC, pr_number="99", tasks=ts_f, ci_status="inconclusive")
-check("apply_answer: ci_inconclusive reply naming no option -> asked again",
-      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "ci_inconclusive" and u["escalation"]["data"].get("unmatched_replies") == 1, u.get("_next"))
+check("apply_answer: ci_inconclusive reply naming no option -> interpret_reply, nothing acted on",
+      u.get("_next") == "interpret_reply" and u["escalation"]["kind"] == "ci_inconclusive" and "ci_polls" not in u, u.get("_next"))
 u = AA("ci_no_checks", CI_NO_CI, esc=ESC_NONE, pr_number="99", tasks=ts_f, ci_status="no_checks")
 check("apply_answer: ci_no_checks finish without CI -> flip_ready with a follow-up, never CI green",
       u.get("_next") == "flip_ready" and any("no CI checks" in f for f in u.get("follow_ups", [])) and u.get("ci_status") != "green", u)
