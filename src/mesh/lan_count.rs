@@ -31,8 +31,21 @@ const DEFAULT_CONTROL_PORT: u16 = 37429;
 /// The class rnsd names an AutoInterface by. The per-host interfaces it spawns report
 /// another class, so only the parent entries are counted.
 const AUTO_INTERFACE_KIND: &str = "AutoInterface";
-/// The class rnsd names an outbound TCP connection by, a relay it dials.
+/// The class rnsd names an outbound TCP connection by, a relay it dials. A TCP server
+/// spawns one of these per client that dialled it, with a parent interface: those are
+/// the server's clients, not relays this rnsd reaches, and are left out.
 const TCP_CLIENT_INTERFACE_KIND: &str = "TCPClientInterface";
+/// The class rnsd names an outbound Backbone connection by, a relay it dials as well.
+const BACKBONE_CLIENT_INTERFACE_KIND: &str = "BackboneClientInterface";
+
+/// Whether `entry` is an upstream connection of rnsd: a TCP or Backbone client it
+/// dialled itself, not one a server of its own spawned for a client that dialled in.
+fn is_upstream(entry: &InterfaceHosts) -> bool {
+    matches!(
+        entry.kind.as_str(),
+        TCP_CLIENT_INTERFACE_KIND | BACKBONE_CLIENT_INTERFACE_KIND
+    ) && !entry.spawned
+}
 /// The system-wide config dir rnsd and scripts/mesh-relay.sh look in first.
 const ETC_CONFIG_DIR: &str = "/etc/reticulum";
 
@@ -124,17 +137,26 @@ pub(crate) async fn lan_readings(
     }
 }
 
-/// Where the local rnsd's config dir is. `dir_override` is for tests, which point it at
-/// an rnsd of their own; it is never read from the user's config or environment.
+/// Where the local rnsd's config dir is. `dir_override` is for unit tests, which point it
+/// at an rnsd of their own; it is never read from the user's config.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RnsdLocator {
     pub dir_override: Option<PathBuf>,
 }
 
+/// Read by a debug build only, for the integration tests that run the real binary: the
+/// rnsd config dir to use in place of `/etc/reticulum` and the home dir, so a test never
+/// reads the developer's own rnsd. A release build never reads it.
+#[cfg(debug_assertions)]
+pub(crate) const TEST_RNSD_CONFIG_DIR_ENV: &str = "COYOTE_TEST_RNSD_CONFIG_DIR";
+
 impl RnsdLocator {
-    fn config_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn config_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.dir_override {
             return Some(dir.clone());
+        }
+        if let Some(dir) = test_config_dir() {
+            return Some(dir);
         }
         // A test that names no rnsd of its own never reads the developer's.
         if cfg!(test) {
@@ -142,6 +164,16 @@ impl RnsdLocator {
         }
         dirs::home_dir().map(|home| default_config_dir(Path::new(ETC_CONFIG_DIR), &home))
     }
+}
+
+#[cfg(debug_assertions)]
+fn test_config_dir() -> Option<PathBuf> {
+    std::env::var_os(TEST_RNSD_CONFIG_DIR_ENV).map(PathBuf::from)
+}
+
+#[cfg(not(debug_assertions))]
+fn test_config_dir() -> Option<PathBuf> {
+    None
 }
 
 /// The order rnsd and scripts/mesh-relay.sh look in: `etc` when it holds a `config`,
@@ -246,13 +278,15 @@ fn resolve_target(
 }
 
 /// The interface name (`Type[name]`), kind, host count and whether it is up, of one entry
-/// of rnsd's stats.
+/// of rnsd's stats, and whether a parent interface spawned it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfaceHosts {
     pub name: String,
     pub kind: String,
     pub hosts: Option<u64>,
     pub online: bool,
+    /// The entry carries a `parent_interface_name`: a server's child for one client.
+    pub spawned: bool,
 }
 
 /// One of the local rnsd's TCP client interfaces, its upstream connections, by its
@@ -276,6 +310,16 @@ pub(crate) trait LanStatsSource: Send + Sync {
 
 struct SharedInstanceRpc;
 
+/// Whether an rnsd stats entry names a parent interface (`parent_interface_name`, set by
+/// rnsd for an interface a server spawned for one client).
+fn has_parent_interface(raw: &rmpv::Value) -> bool {
+    raw.as_map().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|(key, value)| key.as_str() == Some("parent_interface_name") && !value.is_nil())
+    })
+}
+
 #[async_trait]
 impl LanStatsSource for SharedInstanceRpc {
     async fn interface_hosts(
@@ -289,6 +333,7 @@ impl LanStatsSource for SharedInstanceRpc {
             .interfaces
             .into_iter()
             .map(|stat| InterfaceHosts {
+                spawned: has_parent_interface(&stat.raw),
                 name: stat.name,
                 kind: stat.kind,
                 hosts: stat.peers,
@@ -415,13 +460,13 @@ impl RnsdLanReader {
                         lan: auto_interface_hosts(&entries),
                         relay_online: entries
                             .iter()
-                            .any(|entry| entry.kind == TCP_CLIENT_INTERFACE_KIND && entry.online),
+                            .any(|entry| is_upstream(entry) && entry.online),
                     };
                     *self.last.lock() = reading;
                     *self.last_tcp.lock() = Some(
                         entries
                             .into_iter()
-                            .filter(|entry| entry.kind == TCP_CLIENT_INTERFACE_KIND)
+                            .filter(is_upstream)
                             .map(|entry| RnsdTcpInterface {
                                 name: entry.name,
                                 online: entry.online,
@@ -609,6 +654,7 @@ mod tests {
             kind: kind.to_string(),
             hosts,
             online: true,
+            spawned: false,
         }
     }
 
@@ -754,6 +800,78 @@ mod tests {
             lan_readings(None, &[], Some(&reader), ReadEffort::Quick).await;
             assert_eq!(reader.relay_online_seen(), relay_online);
         }
+    }
+
+    /// A TCP server's child for one client that dialled in (rnsd gives it a parent
+    /// interface), as the relay script's `[[Coyote Sessions]]` server spawns one per
+    /// session, is no relay: it neither counts as one nor is watched as an upstream. A
+    /// Backbone client rnsd dials itself is one.
+    #[tokio::test]
+    async fn a_servers_spawned_clients_are_no_relay_and_a_backbone_client_is() {
+        let raw = |parent: rmpv::Value| {
+            rmpv::Value::Map(vec![
+                (rmpv::Value::from("name"), rmpv::Value::from("x")),
+                (rmpv::Value::from("parent_interface_name"), parent),
+            ])
+        };
+        assert!(has_parent_interface(&raw(rmpv::Value::from(
+            "TCPServerInterface[Coyote Sessions]"
+        ))));
+        assert!(!has_parent_interface(&raw(rmpv::Value::Nil)));
+        assert!(!has_parent_interface(&rmpv::Value::Map(Vec::new())));
+
+        let child = InterfaceHosts {
+            name: "TCPClientInterface[Client on Coyote Sessions]".to_string(),
+            spawned: true,
+            ..tcp_client(true)
+        };
+        let backbone = |online| InterfaceHosts {
+            name: "BackboneClientInterface[Hub]".to_string(),
+            online,
+            ..entry(BACKBONE_CLIENT_INTERFACE_KIND, None)
+        };
+        let dir = keyed_dir("lan-count-spawned-clients");
+        let source = Scripted::new([
+            Ok(vec![auto(0), child.clone()]),
+            Ok(vec![auto(0), child, backbone(true)]),
+        ]);
+        let reader = reader_at(&dir.path, source);
+        assert_eq!(reader.read_tcp_interfaces().await, Some(Vec::new()));
+        assert!(!reader.relay_online_seen(), "a spawned client is no relay");
+        assert_eq!(
+            reader.read_tcp_interfaces().await,
+            Some(vec![RnsdTcpInterface {
+                name: "BackboneClientInterface[Hub]".to_string(),
+                online: true,
+            }])
+        );
+        assert!(reader.relay_online_seen(), "a Backbone client is a relay");
+    }
+
+    /// A host that sleeps through several poll periods reads rnsd once on waking, not
+    /// once per period missed, and the next poll is a whole period after that one.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_slept_through_reads_once_on_waking() {
+        use crate::mesh::upstream::{InterfaceTransitions, UPSTREAM_POLL, UpstreamPoll};
+        let dir = keyed_dir("lan-count-upstream-slept");
+        let source = Scripted::new([Ok(vec![auto(0)]), Ok(vec![auto(0)])]);
+        let reader = paced_reader_at(&dir.path, source.clone());
+        let transitions = InterfaceTransitions::default();
+        let mut poll = UpstreamPoll::new(None);
+        // A blocking sleep would not move the paused clock; this is the host asleep.
+        tokio::time::advance(UPSTREAM_POLL * 5 + Duration::from_secs(1)).await;
+        poll.tick().await;
+        poll.read(Some(&reader), || None, &transitions).await;
+        assert!(
+            tokio::time::timeout(UPSTREAM_POLL - Duration::from_secs(1), poll.tick())
+                .await
+                .is_err(),
+            "no burst of missed ticks"
+        );
+        poll.tick().await;
+        poll.read(Some(&reader), || None, &transitions).await;
+        assert_eq!(source.calls(), 2);
+        assert_eq!(source.gaps(), [UPSTREAM_POLL]);
     }
 
     /// The upstream watch's poll on a paused clock, counting rnsd calls: one call per
@@ -1173,6 +1291,37 @@ mod tests {
         assert_eq!(default_config_dir(&etc, &home), xdg);
         fs::write(etc.join("config"), "").unwrap();
         assert_eq!(default_config_dir(&etc, &home), etc);
+    }
+
+    /// A unit test that names no rnsd of its own finds none: neither `/etc/reticulum`
+    /// nor the developer's home is ever read.
+    #[test]
+    fn a_test_that_names_no_rnsd_finds_none() {
+        assert_eq!(
+            std::env::var_os(TEST_RNSD_CONFIG_DIR_ENV),
+            None,
+            "the unit tests run without the integration harness's redirect"
+        );
+        assert_eq!(RnsdLocator::default().config_dir(), None);
+    }
+
+    /// An RPC failure whose text carries a hash-like string is logged with it redacted.
+    #[tokio::test]
+    async fn a_hash_in_an_rpc_failure_is_redacted_in_the_debug_line() {
+        crate::testing::install_log_collector();
+        let hash = "0123456789abcdef0123456789abcdef";
+        let dir = keyed_dir("lan-count-redacted");
+        let source = Scripted::new([Err(RpcError::Protocol(format!("bad frame from {hash}")))]);
+        let reader = reader_at(&dir.path, source);
+        let before = crate::testing::debug_snapshot().len();
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
+        let lines: Vec<String> = crate::testing::debug_snapshot()
+            .into_iter()
+            .skip(before)
+            .filter(|line| line.contains("bad frame from"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains(hash), "{lines:?}");
     }
 
     #[test]

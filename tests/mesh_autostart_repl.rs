@@ -292,6 +292,11 @@ impl Probe {
         self
     }
 
+    /// The rnsd config dir a probe's binary reads in place of the developer's.
+    fn rnsd_config_dir(&self) -> PathBuf {
+        self.temp_root.join("rnsd-config")
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
         cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
@@ -308,6 +313,10 @@ impl Probe {
             .env_remove("COYOTE_PLATFORM")
             .env_remove("COYOTE_ENV_FILE")
             .env("COYOTE_CACHE_DIR", self.temp_root.join("coyote"))
+            // The rnsd stats reader looks in /etc/reticulum before HOME; this points a
+            // debug build at a dir of the test's own, so no test reads the developer's
+            // rnsd.
+            .env("COYOTE_TEST_RNSD_CONFIG_DIR", self.rnsd_config_dir())
             .env_remove("COYOTE_LEFT_PROMPT")
             .env_remove("COYOTE_RIGHT_PROMPT")
             .env_remove("COYOTE_SESSIONS_DIR")
@@ -6006,6 +6015,53 @@ fn people_addressing_against_heard_sessions_refuses_a_user_with_two_and_reaches_
     let status = exit_clean(&mut mine);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The real binary in a test reads its rnsd stats from the dir the harness names, never
+/// from /etc/reticulum or a home dir: joined through a local rnsd, its read at join logs
+/// that dir as the one it looked in.
+#[test]
+fn the_binary_reads_its_rnsd_config_from_the_harness_dir() {
+    let mut rnsd = LocalRnsd::absent();
+    rnsd.listen();
+    let probe = Probe::new("rnsd-config-redirect", false, &[])
+        .with_local_interface(rnsd.port(), rnsd.instance());
+    let log_path = probe.temp_root.join("probe-coyote.log");
+    let mut command = probe.command();
+    command
+        .env("COYOTE_LOG_PATH", &log_path)
+        .env("COYOTE_LOG_LEVEL", "debug")
+        .args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    command_prints(
+        &mut session,
+        ".mesh on --yes",
+        JOINED_PROBE_PATTERN,
+        SESSION_PROMPT,
+    );
+    probe.wait_for_marker("MESH_STARTED");
+    let expected = format!(
+        "no rnsd config directory at {}",
+        probe.rnsd_config_dir().display()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains(&expected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the read at join never named the harness dir: {:?}",
+            log.lines()
+                .filter(|line| line.contains("rnsd"))
+                .collect::<Vec<_>>()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
 const SAM_OWN_ID: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";

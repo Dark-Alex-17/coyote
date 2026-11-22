@@ -3534,8 +3534,10 @@ impl AnnounceFiler<'_> {
         if !followed {
             return self.file(announced, app_data, hops, now);
         }
+        self.peers
+            .note_route_alive(&announced.destination_hash, now);
         debug!(
-            "Followed the route to mesh peer {} from a path response it may not have made now",
+            "Followed the route to session {} from a path response it may not have made now",
             short(&announced.destination_hash)
         );
         self.note_key_change(&announced.identity_hash, &announced.name_hash, now);
@@ -3557,7 +3559,7 @@ impl AnnounceFiler<'_> {
         });
         if followed {
             debug!(
-                "Followed the route to mesh peer {} from a replayed announce",
+                "Followed the route to session {} from a replayed announce",
                 short(&announced.destination_hash)
             );
         }
@@ -19739,6 +19741,21 @@ mod tests {
                     "peers {knows_peers}, relay {on_relay}"
                 );
             }
+        }
+
+        /// What the LAN reads never brings the note: an unknown count or no LAN reading at
+        /// all, with a session heard, keeps it away, and with no LAN interface known there
+        /// is no LAN to be silent.
+        #[test]
+        fn an_unknown_or_empty_lan_reading_never_tells_the_note_over_a_heard_session() {
+            for has_lan in [true, false] {
+                assert_eq!(
+                    lan_silent_note(true, false, has_lan),
+                    None,
+                    "heard, lan {has_lan}"
+                );
+            }
+            assert_eq!(lan_silent_note(false, false, false), None, "no LAN read");
         }
 
         /// No interval or idle line prints it: the interface watcher and the idle driver

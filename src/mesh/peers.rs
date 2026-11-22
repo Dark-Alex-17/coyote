@@ -331,6 +331,11 @@ pub(crate) struct PeerTable {
     /// `presence`, so a replay is known and a fetched farewell is ordered on its
     /// sender's clock.
     announce_clocks: Mutex<BTreeMap<String, AnnounceClock>>,
+    /// When each row was last heard by a path response that may be a relay's stored
+    /// copy, which is neither presence nor a sighting: it only keeps the row from aging
+    /// out while the route stays known. Never read for farewell ordering and never lifts
+    /// a `left` mark. Held in memory only.
+    route_alive: Mutex<BTreeMap<String, SystemTime>>,
     /// The node this table marks `served_instances` for, set by `claim_served`; until
     /// then nothing is marked.
     own_instance: Mutex<Option<String>>,
@@ -390,6 +395,7 @@ impl PeerTable {
             link_failed: Mutex::new(BTreeSet::new()),
             presence: Mutex::new(BTreeMap::new()),
             announce_clocks: Mutex::new(BTreeMap::new()),
+            route_alive: Mutex::new(BTreeMap::new()),
             own_instance: Mutex::new(None),
             served_previous_run: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -506,10 +512,13 @@ impl PeerTable {
 
     /// Whether a fresh path response stamped `stamp` was made by the instance about now:
     /// its emission, moved onto this node's clock by the offset plain announces taught,
-    /// is within `CURRENT_EMISSION_MS` of `now`. Only such a response says the instance is
-    /// there; one a relay answers from a copy it stored, perhaps from before the
-    /// instance left, says only where it was. Without a learnt offset, as after a
-    /// restart, nothing can tell the two apart, so none is.
+    /// is within `CURRENT_EMISSION_MS` of `now` on either side. Only such a response says
+    /// the instance is there; one a relay answers from a copy it stored, perhaps from
+    /// before the instance left, says only where it was. Without a learnt offset, as
+    /// after a restart, nothing can tell the two apart, so none is. An emission is cut to
+    /// whole seconds, which only makes it read older, so the bound ahead needs no
+    /// allowance for it. A false "not current" costs only presence: the route is still
+    /// followed and the row kept alive.
     pub(crate) fn emission_is_current(
         &self,
         destination_hash: &str,
@@ -521,11 +530,21 @@ impl PeerTable {
             .get(destination_hash)
             .and_then(AnnounceClock::offset)
             .is_some_and(|offset| {
-                unix_millis(now)
+                let age = unix_millis(now)
                     .saturating_sub(emitted_millis(stamp.emitted))
-                    .saturating_sub(offset)
-                    <= CURRENT_EMISSION_MS
+                    .saturating_sub(offset);
+                (-CURRENT_EMISSION_MS..=CURRENT_EMISSION_MS).contains(&age)
             })
+    }
+
+    /// Notes that a route to `destination_hash` was heard at `at` from a path response
+    /// that may be a stored copy: the row does not age out for `PEER_TTL` after it.
+    pub(crate) fn note_route_alive(&self, destination_hash: &str, at: SystemTime) {
+        if self.inner.lock().contains_key(destination_hash) {
+            self.route_alive
+                .lock()
+                .insert(destination_hash.to_string(), at);
+        }
     }
 
     /// Notes a fresh announce (`plain`) or path response for `destination_hash` received
@@ -690,9 +709,15 @@ impl PeerTable {
 
     pub(crate) fn sweep(&self, now: SystemTime) -> Vec<String> {
         let mut peers = self.inner.lock();
+        let mut route_alive = self.route_alive.lock();
         let expired: Vec<String> = peers
             .values()
-            .filter(|record| is_expired(record, now))
+            .filter(|record| {
+                is_expired(record, now)
+                    && route_alive
+                        .get(&record.destination_hash)
+                        .is_none_or(|at| now.duration_since(*at).unwrap_or_default() >= PEER_TTL)
+            })
             .map(|record| record.destination_hash.clone())
             .collect();
         let mut link_failed = self.link_failed.lock();
@@ -703,6 +728,7 @@ impl PeerTable {
             link_failed.remove(hash);
             presence.remove(hash);
             announce_clocks.remove(hash);
+            route_alive.remove(hash);
         }
         if !expired.is_empty() {
             self.dirty.store(true, Ordering::Release);
@@ -1379,6 +1405,97 @@ mod tests {
         table.observe(sighting("aa", None), heard);
         table.note_stamp("aa", stamp, true, heard);
         stamp
+    }
+
+    /// With an offset of about an hour learnt, a path response emitted ten seconds
+    /// before now on this node's clock is current, eleven seconds before is not, and one
+    /// eleven seconds ahead is not either: the bound holds on both sides.
+    #[test]
+    fn a_current_emission_is_bounded_on_both_sides() {
+        let (table, _tmp) = table("peers-current-bounds");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        hear_behind(&table, t0, 1);
+        let now = t0 + Duration::from_secs(100);
+        // The learnt offset is the hour less the second an emission may have lost.
+        let on_their_clock = |at: SystemTime| at - Duration::from_secs(3599);
+        let current = |ahead: i64, tag| {
+            let at = if ahead >= 0 {
+                now + Duration::from_secs(ahead.unsigned_abs())
+            } else {
+                now - Duration::from_secs(ahead.unsigned_abs())
+            };
+            table.emission_is_current("aa", &stamp(on_their_clock(at), tag), now)
+        };
+        assert!(current(0, 2));
+        assert!(current(-10, 3), "10 s behind");
+        assert!(!current(-11, 4), "11 s behind");
+        assert!(current(10, 5), "10 s ahead");
+        assert!(!current(11, 6), "11 s ahead");
+    }
+
+    /// A path response that is not current only follows the route: a row already marked
+    /// left keeps its mark and its `last_seen`.
+    #[test]
+    fn following_a_route_keeps_the_left_mark_and_last_seen() {
+        let (table, _tmp) = table("peers-follow-left");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        hear_behind(&table, t0, 1);
+        let left = t0 + Duration::from_secs(60);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Arrived(left)),
+            LeftMark::Marked
+        );
+        let before = table.get("aa").unwrap();
+        assert!(table.follow_route(sighting("aa", Some("Renamed"))));
+        table.note_route_alive("aa", t0 + Duration::from_secs(120));
+        let after = table.get("aa").unwrap();
+        assert_eq!(after.left_at, Some(left));
+        assert_eq!(after.last_seen, before.last_seen);
+    }
+
+    /// After a restart no offset is learnt, so a path response is not current; its
+    /// emission still counts against a fetched farewell sent before it.
+    #[test]
+    fn a_farewell_stamped_before_a_not_current_path_response_was_heard_since() {
+        let (table, _tmp) = table("peers-restart-path-response");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        table.observe(sighting("aa", None), t0);
+        let emitted = t0 + Duration::from_secs(30);
+        let response = stamp(emitted, 7);
+        assert!(!table.emission_is_current("aa", &response, emitted));
+        table.note_stamp("aa", response, false, emitted);
+        assert_eq!(
+            table.mark_left(
+                "aa",
+                FarewellTime::Stamped(emitted - Duration::from_secs(1))
+            ),
+            LeftMark::HeardSince
+        );
+    }
+
+    /// A row heard only through path responses that may be stored copies is not aged
+    /// out while they keep coming, and is once they stop; a fetched farewell after such
+    /// a response is still applied, as the response is no presence.
+    #[test]
+    fn a_row_kept_alive_by_path_responses_is_not_swept_and_still_takes_a_farewell() {
+        let (table, _tmp) = table("peers-route-alive");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let emitted = hear_behind(&table, t0, 1).emitted;
+        let late = t0 + PEER_TTL - Duration::from_secs(60);
+        table.note_route_alive("aa", late);
+        assert!(table.sweep(t0 + PEER_TTL).is_empty(), "kept by the route");
+        assert_eq!(
+            table.mark_left(
+                "aa",
+                FarewellTime::Stamped(SystemTime::UNIX_EPOCH + Duration::from_secs(emitted + 10))
+            ),
+            LeftMark::Marked,
+            "the stored-copy response is no presence"
+        );
+        assert!(table.clear_left("aa"));
+        assert_eq!(table.sweep(late + PEER_TTL), ["aa"]);
+        table.note_route_alive("unknown", t0);
+        assert!(table.get("unknown").is_none());
     }
 
     /// A direct farewell keeps its arrival time once an announce time is held, even from
