@@ -605,6 +605,59 @@ fn the_picker_lists_a_finished_child_known_only_from_its_start() {
     });
 }
 
+/// With no turn running, `t` in the tasks pop-up and `.threads` both open
+/// the thread picker straight away, listing a finished child. Leaving the
+/// picker opened from the pop-up goes back through the transcript view to
+/// the pop-up.
+#[test]
+#[serial]
+fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-picker-direct");
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 17 }));
+        let tasks = supervisor();
+        tasks.write().register(finished_agent(AGENT)).unwrap();
+        ctx.supervisor = Some(Arc::clone(&tasks));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        started(&mut harness);
+        harness.app.handle_msg(UiMsg::AgentFinished {
+            agent_id: AGENT.to_string(),
+            outcome: AgentOutcome::Completed,
+        });
+
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+        harness.draw();
+        harness.press(KeyCode::Char('t'));
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Threads  Enter = open  Esc = back"),
+            "{frame}"
+        );
+        assert!(frame.contains("planner  sess_5d6e  completed"), "{frame}");
+        harness.press(KeyCode::Esc);
+        assert!(harness.app.pager().is_some_and(Pager::shows_root));
+        harness.press(KeyCode::Char('q'));
+        assert!(
+            harness.app.roster().is_some(),
+            "the pop-up did not come back"
+        );
+        harness.press(KeyCode::Esc);
+        assert!(harness.app.overlay.is_none());
+
+        harness.type_text(".threads");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(harness.app.composer_text(), "");
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Threads  Enter = open  Esc = back"),
+            "{frame}"
+        );
+        assert!(frame.contains("planner  sess_5d6e  completed"), "{frame}");
+    });
+}
+
 /// With no child-session root there is no file to open a child from, so
 /// the picker does not offer one known only from its start.
 #[test]

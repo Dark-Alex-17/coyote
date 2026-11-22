@@ -5666,6 +5666,61 @@ fn a_keys_macro_takes_the_keys_command_from_the_help() {
     );
 }
 
+/// `.threads` opens the transcript view on the thread picker under the
+/// active prefix, between turns and during one, and is never handed on
+/// as a line to run or hold; the line goes to this session's history.
+#[test]
+fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
+    for (prefix, line) in [
+        (crate::config::CommandPrefix::Dot, ".threads"),
+        (crate::config::CommandPrefix::Slash, "/threads"),
+    ] {
+        let config = Arc::new(AppConfig {
+            command_prefix: prefix,
+            ..(*plain_config()).clone()
+        });
+        let mut harness = Harness::new(80, 24, config, FooterInfo::default());
+        harness.type_text(line);
+        assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
+        assert_eq!(harness.app.composer_text(), "");
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Threads  Enter = open  Esc = back"),
+            "{line}: {frame}"
+        );
+        assert!(frame.contains("No child sessions yet"), "{line}: {frame}");
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.overlay.is_none(), "{line}");
+        harness.press(KeyCode::Up);
+        assert_eq!(harness.app.composer_text(), line, "not in the history");
+        harness.press(KeyCode::Down);
+
+        harness.app.begin_turn("work", false);
+        harness.type_text(line);
+        assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
+        assert!(harness.app.queued.is_empty(), "{line}");
+        assert!(
+            harness.draw().contains("Threads  Enter = open  Esc = back"),
+            "{line}"
+        );
+    }
+}
+
+/// A macro named `threads` shadows the command: the line goes to the REPL
+/// as typed and no picker opens.
+#[test]
+fn a_threads_macro_takes_the_threads_command() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.macros = vec![(THREADS_COMMAND.to_string(), "my threads".to_string())];
+    harness.type_text(".threads");
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit(".threads".to_string()))
+    );
+    assert!(harness.app.overlay.is_none());
+}
+
 /// Only a draft that is the command alone, under the active prefix,
 /// opens the help; arguments, a second line or the other sigil send
 /// the line on as typed.

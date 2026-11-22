@@ -1388,6 +1388,53 @@ mod transcript {
     // Ctrl+X shows the Todo panel and hides it again.
     // ---------------------------------------------------------------------
 
+    /// With nothing running and no child ever started, `.threads` opens the
+    /// thread picker straight away, and so does `t` in the tasks pop-up;
+    /// leaving the picker and the transcript view opened from the pop-up
+    /// brings the pop-up back.
+    #[test]
+    #[serial]
+    fn dot_threads_and_t_in_the_tasks_popup_open_the_thread_picker() {
+        const PICKER: &str = "Threads  Enter = open  Esc = back";
+        let (_guard, mut pty) = boot("threads-cmd", &[]);
+
+        pty.send(b".threads\r").unwrap();
+        let picker =
+            repainted_frame_showing(&mut pty, PICKER, "`.threads` did not open the picker");
+        assert!(
+            squeezed(&picker).contains(&squeezed("No child sessions yet")),
+            "the picker does not say no child has started:\n{picker}"
+        );
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"q").unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        pty.send(ALT_T).unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Esc = close",
+            "Alt+T did not open the tasks pop-up",
+        );
+        pty.send(b"t").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            PICKER,
+            "`t` in the tasks pop-up did not open the picker",
+        );
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"q").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Esc = close",
+            "leaving the transcript view did not bring the tasks pop-up back",
+        );
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(300));
+        quit(pty);
+    }
+
     #[test]
     #[serial]
     fn ctrl_x_shows_and_hides_the_todo_panel() {

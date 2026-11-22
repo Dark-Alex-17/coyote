@@ -78,7 +78,7 @@ fn timing(line: &str) -> Option<Timing> {
 #[test]
 fn every_command_has_exactly_one_timing_and_every_timing_a_command() {
     let commands: BTreeSet<&str> = repl_command_names()
-        .chain([".keys"])
+        .chain([".keys", ".threads"])
         .chain(DISPATCHER_ONLY.iter().copied())
         .chain(
             COMMAND_TIMINGS

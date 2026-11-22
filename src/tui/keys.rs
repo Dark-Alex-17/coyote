@@ -250,6 +250,9 @@ pub(crate) enum Action {
     RosterCancel,
     /// Show the highlighted roster row's transcript in the pager.
     RosterOpen,
+    /// Open the pager on its thread picker, listing every thread of the
+    /// session, finished ones too.
+    OpenThreads,
     /// Move the roster's highlight by this many rows, down when positive.
     RosterMove(i32),
     /// Ask the question on the roster's highlighted row in the modal.
@@ -551,6 +554,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "o",
             "Show the highlighted task in the transcript view",
         ),
+        row(Roster, "t", "Pick a thread to show in the transcript view"),
         row(Roster, "Enter", "Answer the highlighted question"),
         row(Roster, "Ctrl+T", "Open the transcript view"),
         row(Roster, "Mouse wheel", "Move between the rows"),
@@ -859,6 +863,7 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
         KeyCode::Enter => Action::RosterAnswer,
         KeyCode::Char('x') => Action::RosterCancel,
         KeyCode::Char('o') => Action::RosterOpen,
+        KeyCode::Char('t') => Action::OpenThreads,
         _ => Action::Nothing,
     }
 }
@@ -2104,6 +2109,7 @@ mod tests {
             (plain(KeyCode::Char('x')), roster, Action::RosterCancel),
             (plain(KeyCode::Char('x')), running, Action::RosterCancel),
             (plain(KeyCode::Char('o')), roster, Action::RosterOpen),
+            (plain(KeyCode::Char('t')), roster, Action::OpenThreads),
             (plain(KeyCode::Char('a')), roster, Action::Nothing),
             (plain(KeyCode::Char('?')), roster, Action::Nothing),
             (plain(KeyCode::Char('q')), roster, Action::Nothing),
@@ -2912,6 +2918,11 @@ mod tests {
                 H::Roster,
                 "o",
                 vec![(letter('o'), ROSTER, Action::RosterOpen)],
+            ),
+            (
+                H::Roster,
+                "t",
+                vec![(letter('t'), ROSTER, Action::OpenThreads)],
             ),
             (
                 H::Roster,

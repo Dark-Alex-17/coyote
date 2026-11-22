@@ -1150,6 +1150,7 @@ fn tui_page_quotes_the_code() {
     let idle_status = flat(&const_str(tui, "IDLE_STATUS"));
     let idle_status_with_help = flat(&const_str(tui, "IDLE_STATUS_WITH_HELP"));
     let keys_command = const_str(tui, "KEYS_COMMAND");
+    let threads_command = const_str(tui, "THREADS_COMMAND");
     let welcome_keys = literal_with(production(&cells), "Empty prompt: ")
         .replace("{}{}", &format!(".{keys_command}"));
     let normal = const_str(&src(&["tui", "composer.rs"]), "NORMAL_TAG");
@@ -1193,6 +1194,7 @@ fn tui_page_quotes_the_code() {
         format!("`{idle_status_with_help}`"),
         format!("`{welcome_keys}`"),
         format!("`.{keys_command}`"),
+        format!("`.{threads_command}`"),
         format!("`{}`", normal.trim()),
         "1 second".to_string(),
         "100 ms".to_string(),

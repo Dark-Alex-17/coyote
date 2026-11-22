@@ -38,6 +38,7 @@ const STARTS_MCP_SERVERS: Timing = Timing::Queue("starts or stops MCP servers");
 pub(super) const COMMAND_TIMINGS: &[(&str, Timing)] = &[
     (".help", Timing::Now),
     (".keys", Timing::Now),
+    (".threads", Timing::Now),
     (".info", Timing::Now),
     (".info role", Timing::Now),
     (".info session", Timing::Now),

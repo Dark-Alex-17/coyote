@@ -153,9 +153,10 @@ const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const FIXED_ROWS: u16 = 3;
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
-/// The UI's own command, spelled without its sigil: it opens the key help
-/// and never reaches the REPL.
+/// The UI's own commands, spelled without their sigil: one opens the key
+/// help, the other the thread picker, and neither reaches the REPL.
 const KEYS_COMMAND: &str = "keys";
+const THREADS_COMMAND: &str = "threads";
 /// The status row between turns, naming the chords of the panels that
 /// nothing else on screen points to.
 const IDLE_STATUS: &str = "Alt+T = tasks  Ctrl+X = todo";
@@ -864,7 +865,7 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Option<Command> {
-        if self.take_keys_command() {
+        if self.take_ui_command() {
             return None;
         }
         self.take_composer_line().map(Command::Submit)
@@ -874,14 +875,15 @@ impl App {
         if self.exiting {
             return None;
         }
-        if self.take_keys_command() {
+        if self.take_ui_command() {
             return None;
         }
-        // `.keys` gets this far only when a macro of that name shadows
-        // it, and the macro waits like any other.
+        // `.keys` or `.threads` gets this far only when a macro of that
+        // name shadows it, and the macro waits like any other.
         let now = matches!(
             command_timing::lookup(&self.composer_text(), self.config.command_prefix),
-            Some((name, Timing::Now | Timing::Deferred)) if name.strip_prefix('.') != Some(KEYS_COMMAND)
+            Some((name, Timing::Now | Timing::Deferred))
+                if !matches!(name.strip_prefix('.'), Some(KEYS_COMMAND | THREADS_COMMAND))
         );
         if now {
             return self.take_composer_line().map(Command::RunNow);
@@ -889,35 +891,45 @@ impl App {
         self.hold_composer_line().map(Command::Queue)
     }
 
-    /// Takes a draft that is the `.keys` command and nothing else out of
-    /// the composer, as any sent line is, and opens the key help in
-    /// place of sending it. The plain REPL shares the history file and
-    /// does not know `.keys`, so the line is kept in this session's
-    /// history only. An enabled macro named `keys` wins: the line is
-    /// left for the REPL, which runs the macro.
-    fn take_keys_command(&mut self) -> bool {
+    /// Takes a draft that is the `.keys` or `.threads` command and nothing
+    /// else out of the composer, as any sent line is, and opens the key
+    /// help or the thread picker in place of sending it. The plain REPL
+    /// shares the history file and knows neither, so the line is kept in
+    /// this session's history only. An enabled macro of the same name
+    /// wins: the line is left for the REPL, which runs the macro.
+    fn take_ui_command(&mut self) -> bool {
         let text = self.composer_text();
         let command = self.config.command_prefix.normalize(text.trim());
-        if command
+        let Some(name) = command
             .as_deref()
             .and_then(|command| command.strip_prefix('.'))
-            != Some(KEYS_COMMAND)
-            || self.macros.iter().any(|(name, _)| name == KEYS_COMMAND)
-        {
+            .and_then(|name| {
+                [KEYS_COMMAND, THREADS_COMMAND]
+                    .into_iter()
+                    .find(|ui| *ui == name)
+            })
+        else {
+            return false;
+        };
+        if self.macros.iter().any(|(macro_name, _)| macro_name == name) {
             return false;
         }
         if let Some(line) = self.clear_sent_draft() {
             self.history.push(&line);
         }
-        self.overlay = Some(Overlay::Help(Help::default()));
+        if name == KEYS_COMMAND {
+            self.overlay = Some(Overlay::Help(Help::default()));
+        } else {
+            self.open_threads();
+        }
         true
     }
 
     /// Holds the draft for the running turn. A prompt is returned for the
     /// loop, which offers it to the model; a command only waits, and
-    /// `.keys` opens the help without waiting.
+    /// `.keys` and `.threads` open their view without waiting.
     fn hold_composer_line(&mut self) -> Option<String> {
-        if self.take_keys_command() {
+        if self.take_ui_command() {
             return None;
         }
         let line = self.take_composer_line()?;
@@ -1375,6 +1387,10 @@ impl App {
                 self.open_focused_task();
                 None
             }
+            Action::OpenThreads => {
+                self.open_threads();
+                None
+            }
             Action::RosterMove(delta) => {
                 if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
                     roster.move_highlight(delta);
@@ -1553,6 +1569,12 @@ impl App {
             Some(Overlay::Help(_)) | None => None,
         });
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
+    }
+
+    /// The pager on the root thread with the thread picker open over it.
+    fn open_threads(&mut self) {
+        self.open_pager(Pager::root());
+        self.open_thread_picker();
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
