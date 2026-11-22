@@ -3335,6 +3335,11 @@ fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
             "run_gauntlet still forwards {key}: {gauntlet_inputs:?}"
         );
     }
+    assert_eq!(
+        gauntlet_inputs.get("carried_failures"),
+        Some(&serde_yaml::Value::from("{{review_carried_failures}}")),
+        "run_gauntlet hands the gauntlet the carried failures a later subtask owns"
+    );
 }
 
 /// The graph-level integer bounds as the staging baseline records them: the

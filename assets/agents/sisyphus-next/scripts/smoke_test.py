@@ -7137,6 +7137,38 @@ with scenario("next_subtask: each subtask and the final review start with no car
           and _starts[1].get("final_review") is True, [(s.get("_next"), s.get("review_carried_failures"))
                                                        for s in _starts])
 
+with scenario("carried failures: the adversary's run_checks matches the carry gate's pending list on the same "
+              "output") as name:
+    _cs = sub_step(carry_start(), "route_coder_result")
+    _pending = _cs.get("carried_failures") or []
+    _out_file = os.path.join(TMP, "carry-out.txt")
+    open(_out_file, "w").write(CARRY_OUT + "\n")
+    _env = dict(os.environ, ADVERSARY_STACK_LOCK_PATH=os.path.join(TMP, "stack.lock"), GRAPH_STATE=json.dumps({
+        "project_dir": CARRY, "verification_commands": [f"cat '{_out_file}'; exit 1"],
+        "carried_failures": json.dumps(_pending)}))
+    _env.pop("GRAPH_STATE_FILE", None)
+    _rc = subprocess.run([sys.executable, "-B", os.path.join(HERE, "..", "..", "adversary", "scripts", "run_checks.py")],
+                         capture_output=True, text=True, env=_env, timeout=120)
+    _rec = (json.loads(_rc.stdout or "{}").get("exec_results") or [{}])[0]
+    check(name, len(_pending) >= 4 and (_rec.get("carried") or {}).get("all") is True
+          and len(_rec["carried"]["matched"]) == len(_pending), (_pending, _rec, _rc.stderr[-500:]))
+
+with scenario("failure locations: a shared dir without the parser makes the red test gate block unclassified") as name:
+    _real_dir = gates.SHARED_DIR
+    _real_path, _real_mod = list(sys.path), sys.modules.pop("failure_locations", None)
+    sys.path[:] = [p for p in sys.path if os.path.realpath(p) != os.path.realpath(_real_dir)]
+    gates.SHARED_DIR = tempfile.mkdtemp(dir=TMP)
+    try:
+        _cu = sub_step(carry_start(), "route_coder_result")
+    finally:
+        gates.SHARED_DIR = _real_dir
+        sys.path[:] = _real_path
+        if _real_mod is not None:
+            sys.modules["failure_locations"] = _real_mod
+    check(name, _cu["_next"] == "compose_fix" and not _cu.get("carried_failures")
+          and "unclassified: failure locator unavailable" in _cu.get("last_coder_error", ""),
+          (_cu.get("_next"), _cu.get("last_coder_error")))
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)

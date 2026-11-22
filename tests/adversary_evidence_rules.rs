@@ -3571,6 +3571,79 @@ fn invalid_or_empty_carried_failures_change_nothing_but_a_note() {
     assert!(text.contains(regression), "{text}");
 }
 
+/// A trimmed output is never matched, and malformed carried items are dropped
+/// and counted while the well-formed ones still match.
+#[cfg(unix)]
+#[test]
+fn trimmed_output_is_not_matched_and_malformed_items_are_counted() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("carried-guards");
+    let trimmed = format!("{CARRIED_SUITE}echo '[1024 bytes trimmed: output exceeded the cap]'\n");
+    let (repo, base) = carried_repo(
+        &dir.0,
+        &[("suite.sh", CARRIED_SUITE), ("trimmed.sh", &trimmed)],
+    );
+    let mut items: Vec<Value> = serde_json::from_str(&carried_keys()).unwrap();
+    items.push(json!({"paths": []}));
+    items.push(json!({"owner": 2}));
+    let out = carried_run(
+        &dir.0,
+        "carried-guards",
+        &repo,
+        &base,
+        &["sh suite.sh", "sh trimmed.sh"],
+        &Value::from(items).to_string(),
+    );
+    assert_eq!(
+        out["carried_error"],
+        "carried_failures: 2 malformed item(s) dropped (an item needs a non-empty list of string paths)",
+        "{out}"
+    );
+    let results = &out["exec_results"];
+    assert_eq!(results[0]["carried"]["all"], true, "{out}");
+    assert_eq!(results[1]["carried"]["all"], false, "{out}");
+    assert_eq!(
+        results[1]["carried_note"],
+        "not matched: the output was trimmed",
+        "{out}"
+    );
+
+    let mut state = verdict_state(json!([met("c1")]));
+    state["exec_results"] = results.clone();
+    let text = report(&dir.0, "carried-guards", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(text.contains("1. Verification run `sh trimmed.sh`"), "{text}");
+    assert!(
+        text.contains("- `sh trimmed.sh` -- carried failures not matched: the output was trimmed"),
+        "{text}"
+    );
+}
+
+/// A run killed by a signal blocks even when its record says every failure
+/// is carried.
+#[test]
+fn a_killed_run_blocks_whatever_its_carried_record_says() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("carried-killed");
+    let mut record = red("sh suite.sh", 137, "Killed", 0, "the command passed on the diff base");
+    record["pass_condition"] = json!({"condition": "exit 0", "criteria": []});
+    record["carried"] = json!({"all": true, "matched": [{"paths": ["pkg/alpha/"], "owner": 2}],
+                               "new": [], "unlocated": 0});
+    let mut state = verdict_state(json!([met("c1")]));
+    state["exec_results"] = json!([record]);
+    let text = report(&dir.0, "carried-killed", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains("1. Verification run `sh suite.sh`") && text.contains("exit 137 (recorded FAIL"),
+        "{text}"
+    );
+    assert!(!text.contains("declared carried"), "{text}");
+}
+
 /// A criterion naming the command may ask for it to pass, so a run made only
 /// of carried failures blocks while that criterion is not met.
 #[test]
