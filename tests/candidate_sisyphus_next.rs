@@ -1450,6 +1450,11 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("review-gauntlet").join("scripts"),
         &agents.join("review-gauntlet").join("scripts"),
     );
+    // the carried-failure round trip runs the adversary's own run_checks on the carry gate's list
+    copy_tree(
+        &agents_dir().join("adversary").join("scripts"),
+        &agents.join("adversary").join("scripts"),
+    );
     // the red-gate rows render the coder's own end_failure template
     fs::create_dir_all(agents.join("coder")).unwrap();
     fs::copy(
@@ -3335,6 +3340,11 @@ fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
             "run_gauntlet still forwards {key}: {gauntlet_inputs:?}"
         );
     }
+    assert_eq!(
+        gauntlet_inputs.get("carried_failures"),
+        Some(&serde_yaml::Value::from("{{review_carried_failures}}")),
+        "run_gauntlet hands the gauntlet the carried failures a later subtask owns"
+    );
 }
 
 /// The graph-level integer bounds as the staging baseline records them: the

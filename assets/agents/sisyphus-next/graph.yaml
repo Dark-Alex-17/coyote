@@ -186,6 +186,7 @@ initial_state:
   posture_reason: ''
   verification_commands: '[]'
   review_verification_commands: '[]'
+  review_carried_failures: '[]'
   local_run_recipe: ''
   git_actions: {}
   publish_criteria: []
@@ -1964,7 +1965,7 @@ nodes:
   build_gauntlet_prompt:
     id: build_gauntlet_prompt
     type: script
-    description: The gauntlet spawn template field by field (Diff, Rigor/posture, spec, prior decisions, re-review delta, settled lanes, recipe); records the round's HEAD; reuses the previous PASS round when the code tree, prompt and verification commands are identical -> route_gauntlet.
+    description: The gauntlet spawn template field by field (Diff, Rigor/posture, spec, prior decisions, re-review delta, settled lanes, recipe); records the round's HEAD; sets review_carried_failures to the carried failures a later subtask owns ([] at the final review); reuses the previous PASS round when the code tree, prompt, verification commands and carried failures handed on are identical -> route_gauntlet.
     script: scripts/build_gauntlet_prompt.py
     timeout: 60
     fallback: end_failure
@@ -1979,6 +1980,7 @@ nodes:
       {{gauntlet_prompt}}
     inputs:
       verification_commands: '{{review_verification_commands}}'
+      carried_failures: '{{review_carried_failures}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'

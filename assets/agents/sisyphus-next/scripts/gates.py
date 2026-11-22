@@ -1269,6 +1269,7 @@ def next_subtask(state):
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
         "scope_confirmed": False, "subtask_changed_files": None, "review_verification_commands": "[]",
+        "review_carried_failures": "[]",
         # the failures carried in, so the red test gate can tell them from ones this subtask introduces
         "failure_baseline": [f["paths"] for f in carried],
     })
@@ -1319,7 +1320,7 @@ def _start_final_review(state, u, n):
         "coder_brief": brief,
         "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
-        "review_verification_commands": "[]",
+        "review_verification_commands": "[]", "review_carried_failures": "[]",
         # rejections made against a subtask's scope are no ruling on the parent criteria
         "final_rejections_from": len(as_list(state.get("rejected_findings"))),
         # a strikeout in the final review's fix rounds resets to the tree all subtasks left, never past it
@@ -3893,84 +3894,41 @@ def _subtask_changes(state):
     return result
 
 
-FAILURE_FILE_RE = re.compile(r"(?<![\w.~@+/-])((?:\.\.?/|/)?[\w.~@+-]+(?:/[\w.~@+-]+)*\.[A-Za-z]\w*):\d+")
-FAILURE_SLASH_RE = re.compile(r"[\w.~@+-]*/[\w./~@+-]*")
-FAILURE_WORD_RE = re.compile(r"\b(?:fail|failed|failure|error)\b", re.I)
-FAILURE_LINE_CAP = 4096
-TRIMMED_MARK = "bytes trimmed: output exceeded"
 # the coder's verdict lines list at most 20 failure ids, then this count of the hidden rest
 CAP_MARK = re.compile(r"\(\+\d+ more\)")
-RUNNER_BANNER_RE = re.compile(r"\S*: \*\*\* \[[^\]]*\] Error \d+\s*$")
 CARRIED_HEADER = "Carried-forward test failures (pending from earlier subtasks):"
 
 
+def _failure_locations():
+    """The shared failure-location parser, or None when it cannot be imported or fails to load."""
+    if SHARED_DIR not in sys.path:
+        sys.path.insert(0, SHARED_DIR)
+    try:
+        import failure_locations  # noqa: WPS433
+    except Exception:  # noqa: BLE001 -- a broken module must fail closed like a missing one
+        return None
+    return failure_locations
+
+
+# Without the locator each wrapper returns what makes its caller block: nothing located, no index, one unlocated line.
 def _parse_failure_locations(tests):
-    """(token, is_file, line) for every path:LINE token, and every slash token on a line carrying a failure word."""
-    out = []
-    for line in tests.splitlines():
-        line = line[:FAILURE_LINE_CAP]
-        if re.match(r"(?:Ran|Ran in|Exit code):", line):
-            continue
-        out += [(t, True, line) for t in FAILURE_FILE_RE.findall(line)]
-        if FAILURE_WORD_RE.search(line):
-            out += [(t, False, line) for t in FAILURE_SLASH_RE.findall(line)]
-    return out
+    locator = _failure_locations()
+    return locator.parse_failure_locations(tests) if locator else []
 
 
 def _repo_index(root):
-    """(files, dirs) git knows in the worktree, untracked included, or None when git cannot list them."""
-    code, out, _ = git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
-    if code != 0:
-        return None
-    files = set(_nul_names(out))
-    return files, {f.rsplit("/", i)[0] for f in files for i in range(1, f.count("/") + 1)}
+    locator = _failure_locations()
+    return locator.repo_index(root) if locator else None
 
 
 def _resolve_failure_tokens(root, tokens, index=None):
-    """[{"paths", "evidence"}] for the tokens that name repo paths (a directory ends in "/"), one per distinct set of
-    paths; tokens naming nothing in the repo (toolchain frames, paths outside it) are dropped."""
-    index = index or _repo_index(root)
-    if index is None:
-        return []
-    files, dirs = index
-    prefix = os.path.realpath(root).rstrip("/") + "/"
-    found, seen = [], set()
-    for token, is_file, line in tokens:
-        t = token.removeprefix(prefix).removeprefix(root.rstrip("/") + "/").rstrip("/").removesuffix("/...")
-        while t.startswith("./"):
-            t = t[2:]
-        if is_file:
-            paths = sorted(f for f in files if f == t or f.endswith("/" + t))
-        else:
-            parts = [p for p in t.split("/") if p not in ("", ".")]
-            suffixes = ("/".join(parts[i:]) for i in range(len(parts)))
-            paths = next(([s] if s in files else [s + "/"] for s in suffixes if s in files or s in dirs), [])
-        if paths and tuple(paths) not in seen:
-            seen.add(tuple(paths))
-            found.append({"paths": paths, "evidence": line.strip()[:200]})
-    return found
+    locator = _failure_locations()
+    return locator.resolve_failure_tokens(root, tokens, index) if locator else []
 
 
 def _unlocated_failure_lines(root, tests, index):
-    """How many failure-word lines name no repo path, on the line or on the more-indented lines under it; a line of
-    marker words alone (a bare FAIL) or a runner's exit banner (`runner: *** [check] Error 1`) is not counted."""
-    lines = [l[:FAILURE_LINE_CAP] for l in tests.splitlines()]
-    count = 0
-    for i, line in enumerate(lines):
-        words = re.findall(r"[A-Za-z]+", line)
-        if (re.match(r"(?:Ran|Ran in|Exit code):", line) or not FAILURE_WORD_RE.search(line)
-                or all(FAILURE_WORD_RE.fullmatch(w) for w in words) or RUNNER_BANNER_RE.match(line)):
-            continue
-        depth, group = len(line) - len(line.lstrip()), [line]
-        for follow in lines[i + 1:]:
-            if not follow.strip() or len(follow) - len(follow.lstrip()) <= depth:
-                break
-            group.append(follow)
-        tokens = [(t, True, l) for l in group for t in FAILURE_FILE_RE.findall(l)]
-        tokens += [(t, False, l) for l in group for t in FAILURE_SLASH_RE.findall(l)]
-        if not _resolve_failure_tokens(root, tokens, index):
-            count += 1
-    return count
+    locator = _failure_locations()
+    return locator.unlocated_failure_lines(root, tests, index) if locator else 1
 
 
 def _paths_overlap(a, b):
@@ -3991,10 +3949,13 @@ def _verdict_locations(state, lines):
     """Repo paths verdict lines name as failing, read as path tokens and as plain words split on whitespace and commas.
     A plain word counts only in path form (holding a slash) or as a file name, so prose such as `2 tests failed` never
     names a top-level directory."""
+    locator = _failure_locations()
+    if locator is None:
+        return []
     root = state.get("git_root") or state.get("project_dir") or "."
     tokens = _parse_failure_locations("\n".join(lines))
     for line in lines:
-        for t in re.split(r"[\s,]+", line[:FAILURE_LINE_CAP]):
+        for t in re.split(r"[\s,]+", line[:locator.FAILURE_LINE_CAP]):
             t = t.strip("()[]{};:'\"`")
             if "/" in t:
                 tokens.append((t, False, line))
@@ -4065,10 +4026,14 @@ def _classify_test_failures(state, u, tests):
     """{"pending", "blocks"} for a red test gate: a failure is pending when a later subtask owns it and it was carried
     in at subtask start or lies outside this subtask's changes; anything else, or anything unclear, blocks, including a
     failure line that names no repo path (a panic with no location)."""
+    locator = _failure_locations()
+    if locator is None:
+        ledger(state, u, "coder: red test gate not classified (failure locator unavailable); it blocks")
+        return {"pending": [], "blocks": ["unclassified: failure locator unavailable"]}
     cur, subtasks = as_int(state.get("subtask_index")), as_list(state.get("subtasks"))
     root = state.get("git_root") or state.get("project_dir") or "."
     changes = _subtask_changes(state)
-    trimmed = TRIMMED_MARK in tests
+    trimmed = locator.TRIMMED_MARK in tests
     index = _repo_index(root) if changes is not None and not trimmed else None
     located = _resolve_failure_tokens(root, _parse_failure_locations(tests), index) if index else []
     if not located:
@@ -4236,6 +4201,8 @@ def build_gauntlet_prompt(state):
             ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
     u["review_verification_commands"] = cmds
     carried = _carried(state) if _subtask_phase(state) else []
+    owed = _owed_carried(state, carried)
+    u["review_carried_failures"] = json.dumps([f for f in carried if f not in owed])
     if carried:
         lines.append(_carried_review_section(carried))
     if spec:
@@ -4271,7 +4238,7 @@ def build_gauntlet_prompt(state):
         lines += ["Local-run recipe / usage suites:", note]
     u["gauntlet_prompt"] = "\n".join(lines)
     tree = _worktree_tree(root)
-    key = _inputs_key(tree, u["gauntlet_prompt"], cmds)
+    key = _inputs_key(tree, u["gauntlet_prompt"], cmds, u["review_carried_failures"])
     u["head_sha"] = head
     u["prior_review_decisions"] = "\n".join(_review_decisions(state))
     last = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}

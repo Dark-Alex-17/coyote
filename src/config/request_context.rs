@@ -8448,6 +8448,8 @@ mod tests {
     /// the installed tree, not the source tree, is what production runs.
     /// A dot-directory the embed or the installer skipped would leave every
     /// gauntlet BLOCKED with `GAUNTLET_REVIEW_INCOMPLETE: debris`.
+    /// The adversary's run_checks imports `failure_locations.py` from the
+    /// same directory; without it, carried failures are never matched.
     #[test]
     #[serial]
     fn install_builtin_agents_ships_the_shared_debris_lint_the_review_graphs_import() {
@@ -8465,6 +8467,14 @@ mod tests {
             read_to_string(&shared).expect(".shared/debris.py must be installed"),
             read_to_string(&source).unwrap(),
             "the installed shared module must be the embedded source"
+        );
+        let locator = agents.join(".shared").join("failure_locations.py");
+        let locator_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/.shared/failure_locations.py");
+        assert_eq!(
+            read_to_string(&locator).expect(".shared/failure_locations.py must be installed"),
+            read_to_string(&locator_source).unwrap(),
+            "the installed failure-location parser must be the embedded source"
         );
 
         let repo = debris_repo();
