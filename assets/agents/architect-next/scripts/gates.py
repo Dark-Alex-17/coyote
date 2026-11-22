@@ -267,7 +267,7 @@ def intake(state):
             return raise_escalation(state, u, escalation(
                 "mode_invalid", f"Unknown mode value(s): {bad}. Which value should apply?",
                 [option(f"{k} = {MODE_ENUMS.get(k, PR_TRACKING_ENUM)[0]}", recommended=True, evidence="the documented default") for k in bad]
-                + [option("Abort the run")], tier3_ok=False))
+                + [option("Abort the run")], tier3_ok=False, quoted=(str(bad),)))
         seed = "" if dd else _find_seed(u)
         draft = not dd and not seed and bool(brief.strip() or str(state.get("previous_turns") or "").strip())
         if not seed and not draft and (not u["design_doc_path"] or not os.path.isfile(u["design_doc_path"])):
@@ -318,7 +318,7 @@ def orient_fault(state):
     note_script_error(state, u, "orient_read")
     return raise_escalation(state, u, escalation(
         "clarify", f"The design doc at {state.get('design_doc_path')} could not be read/oriented. Give the correct path, or abort.",
-        [option("Abort the run")], tier3_ok=False))
+        [option("Abort the run")], tier3_ok=False, quoted=(state.get("design_doc_path"),)))
 
 
 def draft_route(state):
@@ -529,7 +529,7 @@ def _ask_choice(state, u, heading, evidence=""):
         data["batch"] = True
     return raise_escalation(state, u, escalation(
         s.get("choice_kind"), f"{heading} {idx + 1} of {len(queue)}: {item['question']}", item["options"], evidence=evidence,
-        data=data))
+        data=data, quoted=item.get("quoted", ())))
 
 
 def _choice_pick(text, options):
@@ -681,7 +681,7 @@ def quality_bar_gate(state):
     options += [option(f"rigor={r}, surfaces=(as proposed)") for r in QUALITY_RIGORS if r != rigor]
     _start_choices(u, "quality_bar", [{
         "question": f"Quality bar for this plan: rigor and surfaces. Proposal: rigor={rigor}, surfaces={surfaces or '(none)'}.",
-        "options": options[:CHOICE_OPTIONS_MAX], "rigor": rigor, "surfaces": surfaces}])
+        "options": options[:CHOICE_OPTIONS_MAX], "rigor": rigor, "surfaces": surfaces, "quoted": [rigor, surfaces]}])
     return _ask_choice(state, u, "Quality bar question")
 
 
@@ -752,7 +752,7 @@ def checklist_round(state):
         _start_choices(u, "checklist_accept", [{
             "question": (f"The checklist reviewers returned {n} items:\n" + "\n".join(f"- {it}" for it in items)
                          + "\nAccept them as acceptance criteria (or long-tail criteria) in the plan?"),
-            "batch": True, "items": items,
+            "batch": True, "items": items, "quoted": items,
             "options": [option(f"Accept all {n} items", recommended=True, evidence="the checklist reviewers' findings"),
                         option(CHECKLIST_REVIEW_EACH), option(f"Drop all {n} items")]}])
         return _ask_choice(state, u, "Best-practice checklist question")
@@ -762,7 +762,7 @@ def checklist_round(state):
 
 def _checklist_each(items):
     return [{"question": f"{it}\nAccept this as an acceptance criterion (or a long-tail criterion) in the plan?", "item": it,
-             "options": [option(CHECKLIST_ACCEPT, recommended=True, evidence="the checklist reviewer's finding"),
+             "quoted": [it], "options": [option(CHECKLIST_ACCEPT, recommended=True, evidence="the checklist reviewer's finding"),
                          option(CHECKLIST_DROP)]} for it in items]
 
 
@@ -1136,7 +1136,8 @@ def autonomy_gate(state):
         u["ask_question"] = (f"plan-gate: the breakdown at {state.get('plan_path')} is SEALED and OKAY'd. Approve it to create "
                              "tasks and run them autonomously?")
         u["escalation"] = escalation("approve_breakdown", u["ask_question"], [
-            option(BREAKDOWN_APPROVE, recommended=True), option(BREAKDOWN_REVISE), option(ABORT_RUN)])
+            option(BREAKDOWN_APPROVE, recommended=True), option(BREAKDOWN_REVISE), option(ABORT_RUN)],
+            quoted=(state.get("plan_path"),))
         u["apply_reasks"] = 0
         u["_next"] = "approve_breakdown"
     else:
@@ -1287,11 +1288,12 @@ def _git_setup_escalation(state, u, branch, base, code, step, detail):
             "git_setup_failed", f"The run branch {branch} is already checked out in the worktree at {where}, so it cannot be "
                                 f"checked out in {code}. Use that worktree, pick a different branch name, or abort?",
             [option(USE_WORKTREE, recommended=True, evidence=where), option(PICK_BRANCH), option(ABORT_RUN)],
-            evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base}))
+            evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base},
+            quoted=(branch, where, code)))
     return raise_escalation(state, u, escalation(
         "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(step)} failed. Retry, or abort?",
         [option(RETRY_BRANCH, recommended=True), option(ABORT_RUN)], evidence=tail(detail, 1500),
-        data={"branch": branch, "base": base}))
+        data={"branch": branch, "base": base}, quoted=(branch, base, code, " ".join(step))))
 
 
 def _git_common_dir(path):
@@ -2299,7 +2301,7 @@ def route_verdict(state):
         f"NEEDS-HUMAN (proceed without the {lanes_txt} review, recorded in the report / PR body), or abort?",
         [option("Retry the review again"),
          option("Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)"),
-         option("Abort this task")], evidence=tail(text, 1500)))
+         option("Abort this task")], evidence=tail(text, 1500), quoted=(unit, lanes_txt)))
 
 
 def fix_round(state):
@@ -2663,8 +2665,9 @@ NEXT_CONTINUE = "Continue"
 NEXT_PARK = "Stop here (park the run)"
 
 
-def _approve_next_escalation(question):
-    return escalation("approve_next", question, [option(NEXT_CONTINUE, recommended=True), option(NEXT_PARK), option(ABORT_RUN)])
+def _approve_next_escalation(question, quoted):
+    return escalation("approve_next", question, [option(NEXT_CONTINUE, recommended=True), option(NEXT_PARK), option(ABORT_RUN)],
+                      quoted=quoted)
 
 
 def task_done_route(state):
@@ -2690,7 +2693,7 @@ def task_done_route(state):
         return u
     if mode(state)["autonomy"] == "phase-gate":
         u["ask_question"] = f"phase-gate: {task.get('id')} ({task.get('title', '')}) is complete. Continue to the next task?"
-        u["escalation"] = _approve_next_escalation(u["ask_question"])
+        u["escalation"] = _approve_next_escalation(u["ask_question"], (task.get("id"), task.get("title", "")))
         u["apply_reasks"] = 0
         u["_next"] = "approve_next"
         return u
@@ -2811,7 +2814,7 @@ def wave_integrate(state):
         if mode(state)["autonomy"] == "phase-gate" and results:
             done = [r.get("task") for r in results if isinstance(r, dict)]
             u["ask_question"] = f"phase-gate: parallel wave {done} is integrated. Continue to the next task(s)?"
-            u["escalation"] = _approve_next_escalation(u["ask_question"])
+            u["escalation"] = _approve_next_escalation(u["ask_question"], (str(done),))
             u["apply_reasks"] = 0
             u["_next"] = "approve_next"
             return u
@@ -4440,9 +4443,10 @@ def apply_answer(state):
         if answer == USE_WORKTREE and not _use_code_dir(state, u, data.get("worktree") or ""):
             ledger(state, u, f"branch: the worktree {data.get('worktree') or '(none named)'} cannot be used; retrying as is")
         if answer == PICK_BRANCH:
+            current = data.get("branch") or _run_branch(state)
             raise_escalation(state, u, escalation(
-                "branch_name", f"Which branch name should the run use instead of {data.get('branch') or _run_branch(state)}?",
-                tier3_ok=False, data={"branch": data.get("branch") or ""}))
+                "branch_name", f"Which branch name should the run use instead of {current}?",
+                tier3_ok=False, data={"branch": data.get("branch") or ""}, quoted=(current,)))
         else:
             u["_next"] = "branch_setup"
     elif kind == "branch_name":
@@ -4457,7 +4461,8 @@ def apply_answer(state):
         else:
             ledger(state, u, f"branch: {name!r} is not a valid branch name; asking again")
             raise_escalation(state, u, escalation("branch_name", f"{name!r} is not a valid branch name. Which branch name "
-                                                                "should the run use?", tier3_ok=False, data=as_dict(esc.get("data"))))
+                                                                "should the run use?", tier3_ok=False, data=as_dict(esc.get("data")),
+                                                  quoted=(repr(name),)))
     elif kind == "tasks_stuck":
         a = "stop" if stop else _picked_key(answer, options, {"retry": ["retry"], "skip": ["skip"], "stop": ["stop"]})
         if a == "retry":
@@ -5235,7 +5240,7 @@ def _ci_unclear_escalation(state, status):
         return escalation(
             "ci_no_checks", f"PR #{pr} reports no CI checks, so CI cannot go green. Finish without CI (recorded as a follow-up; "
                             f"the report never says CI green), keep waiting, or {leave_q}?",
-            [option(CI_NO_CI, recommended=True), option(CI_KEEP_WAITING), option(leave)], evidence=evidence)
+            [option(CI_NO_CI, recommended=True), option(CI_KEEP_WAITING), option(leave)], evidence=evidence, quoted=(pr,))
     cancelled = [l for _, b, l in rows if b in CI_CANCELLED]
     rerunnable = bool(_run_ids(cancelled))
     non_pass = [f"{n}: {b or '(no bucket)'}" for n, b, _ in rows if b not in CI_PASS]
@@ -5245,7 +5250,7 @@ def _ci_unclear_escalation(state, status):
                            f"Re-run, treat it as green (say why), or {leave_q}?",
         [option(CI_RERUN_CANCELLED if cancelled else CI_KEEP_WAITING, recommended=rerunnable),
          option(CI_TREAT_GREEN, recommended=quiet and not rerunnable), option(leave, recommended=not rerunnable and not quiet)],
-        evidence=evidence, data={"cancelled_links": cancelled, "non_pass": non_pass})
+        evidence=evidence, data={"cancelled_links": cancelled, "non_pass": non_pass}, quoted=(pr, ", ".join(non_pass)))
 
 
 def ci_route(state):
@@ -5276,7 +5281,7 @@ def ci_route(state):
             ledger(state, u, f"review-watch: PR #{pr} stop: watch_visit_cap")
         return raise_escalation(state, u, escalation(
             "watch_visit_cap", f"The CI watch on PR #{pr} used its run-wide budget of {POLL_VISIT_BUDGET} polls. Stop watching and report.",
-            [option("Stop watching and report", recommended=True)]))
+            [option("Stop watching and report", recommended=True)], quoted=(pr,)))
     elif watching:
         ledger(state, u, f"review-watch: PR #{pr} stop: ci_exhausted")
         return raise_escalation(state, u, escalation(
@@ -5284,14 +5289,14 @@ def ci_route(state):
                             f"wall {CI_WALL_SECS}s). Keep waiting, or stop watching and report?",
             [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True,
                                                                  evidence="the PR stays open and ready; the report names the stop reason")],
-            evidence=tail(state.get("ci_evidence", ""), 1500)))
+            evidence=tail(state.get("ci_evidence", ""), 1500), quoted=(pr, status, state.get("ci_rounds"))))
     else:
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"The CI watch on PR #{pr} ended without a verdict ({status}: rounds {state.get('ci_rounds')}, "
                             f"wall {CI_WALL_SECS}s). Keep waiting, or leave the PR in draft and report?",
             [option("Keep waiting (re-run the watch)"), option("Leave the PR in draft and report", recommended=True,
                                                                  evidence="a draft with a named blocker beats a ready PR on red/pending")],
-            evidence=tail(state.get("ci_evidence", ""), 1500)))
+            evidence=tail(state.get("ci_evidence", ""), 1500), quoted=(pr, status, state.get("ci_rounds"))))
     return u
 
 
@@ -5435,13 +5440,13 @@ def ci_apply(state):
             "ci_infra", f"CI failed{during} for infrastructure reasons (runner lost / timeout / 429 / cancelled). "
                         + ("Wait and re-watch, or stop watching and report?" if watching else "Wait and re-watch, or leave in draft?"),
             [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
-             option(leave)]))
+             option(leave)], quoted=(during,)))
     if watching:
         ledger(state, u, f"review-watch: PR #{pr} stop: ci_unsure")
     return raise_escalation(state, u, escalation(
         "ci_unsure", f"CI diagnosis{during} is unsure (unsure defaults up, never to a re-run). How to proceed?",
         [option("Re-run the failing checks once"), option("Resume with a coder fix round"), option(leave, recommended=True)],
-        evidence=tail(state.get("ci_evidence", ""), 2000)))
+        evidence=tail(state.get("ci_evidence", ""), 2000), quoted=(during,)))
 
 
 def flip_ready(state):
@@ -5818,7 +5823,7 @@ def review_route(state):
         then = "report" if status == "closed" else "continue"
         return raise_escalation(state, u, escalation(
             "review_external_close", f"PR #{pr} was {status} externally during the review watch. Stop watching and {then}.",
-            [option(f"Stop watching and {then}", recommended=True)], data={"status": status}))
+            [option(f"Stop watching and {then}", recommended=True)], data={"status": status}, quoted=(pr, status)))
     if status == "comments":
         untrusted = [as_dict(i) for i in as_list(state.get("review_untrusted"))]
         if not untrusted:
@@ -5843,21 +5848,23 @@ def review_route(state):
         if [i.get("list") for i in lists] == ["comments"]:
             return raise_escalation(state, u, escalation(
                 "review_read_truncated", f"The review read on PR #{pr} holds more than the {REVIEW_PAGE} items it fetches per list ({listed}), "
-                                         "so the watch cannot see every new comment. Stop watching and report.", [stop]))
+                                         "so the watch cannot see every new comment. Stop watching and report.", [stop],
+                quoted=(pr, listed)))
         return raise_escalation(state, u, escalation(
             "review_read_truncated", f"The review read on PR #{pr} holds more than the {REVIEW_PAGE} items it fetches per list ({listed}), "
                                      "so the watch cannot see every review item. Keep watching, or stop watching and report?",
-            [option("Keep watching (re-arm the review watch)"), stop]))
+            [option("Keep watching (re-arm the review watch)"), stop], quoted=(pr, listed)))
     _review_event(state, u, f"stop: {status}")
     if status == "visit_cap":
         return raise_escalation(state, u, escalation(
             "watch_visit_cap", f"The review watch on PR #{pr} used its run-wide budget of {POLL_VISIT_BUDGET} polls. Stop watching and report.",
-            [option("Stop watching and report", recommended=True)]))
+            [option("Stop watching and report", recommended=True)], quoted=(pr,)))
     return raise_escalation(state, u, escalation(
         "review_exhausted", f"The review watch on PR #{pr} ended without an approval ({status}: polls {state.get('review_rounds')}, "
                             f"wall {REVIEW_WALL_SECS}s). Keep watching, or stop watching and report?",
         [option("Keep watching (re-arm the review watch)"),
-         option("Stop watching and report", recommended=True, evidence="the PR stays open and ready; the report names the stop reason")]))
+         option("Stop watching and report", recommended=True, evidence="the PR stays open and ready; the report names the stop reason")],
+        quoted=(pr, status, state.get("review_rounds"))))
 
 
 def _triaged(state):
@@ -5933,7 +5940,7 @@ def review_apply(state):
         return raise_escalation(state, u, escalation(
             "review_round_cap", f"PR #{pr} drew new review comments after {REVIEW_MAX_ROUNDS} review fix rounds without an approval. How to proceed?",
             [option("Resume with one more fix round"), option("Stop watching and report", recommended=True)],
-            evidence=tail("\n".join(f"- {i['id']}: {i['fix_item']}" for i in fixes), 1500)))
+            evidence=tail("\n".join(f"- {i['id']}: {i['fix_item']}" for i in fixes), 1500), quoted=(pr,)))
     return _review_fix(state, u, fixes)
 
 
@@ -5976,7 +5983,7 @@ def review_update(state):
         return raise_escalation(state, u, escalation(
             "review_push_mismatch", f"The fix for PR #{pr} is not on the PR head (local {sha or 'unknown'}, PR {oid or 'unreadable'}): "
                                     "the push may have failed.",
-            [option("Re-check the PR head"), option("Stop watching and report", recommended=True)]))
+            [option("Re-check the PR head"), option("Stop watching and report", recommended=True)], quoted=(pr, sha, oid)))
     items = _triaged(state)
     usable = _trusted_with_body(state, items)
     untrusted = _untrusted_ids(state)
@@ -6235,7 +6242,8 @@ def _state_fault(state, name, notes, err):
         [option(STATE_FAULT_RETRY, recommended=_continue_recommended(retries)), option(STATE_FAULT_RESUME), option("Abort the run")],
         evidence=tail(traceback.format_exc()),
         data={"gate": name, "error": said, "phase": read_snapshot(state.get("run_dir")).get("phase") or "",
-              "prior": esc if name in ESCALATION_GATES and esc.get("question") else {}}))
+              "prior": esc if name in ESCALATION_GATES and esc.get("question") else {}},
+        quoted=(name, said[:300], keys)))
 
 
 def run(name):

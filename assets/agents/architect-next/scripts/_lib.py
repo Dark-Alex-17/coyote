@@ -447,13 +447,22 @@ def option(text, recommended=False, evidence=""):
     return {"text": text, "recommended": bool(recommended), "evidence": evidence or ""}
 
 
-def escalation(kind, question, options=None, evidence="", hard_trigger=False, tier3_ok=True, data=None, return_to=""):
+def _own_text(question, quoted):
+    """The question with the data it quotes blanked out; longest first so a quoted string inside another goes too."""
+    text = question or ""
+    for q in sorted({str(q) for q in quoted if q not in (None, "")}, key=len, reverse=True):
+        text = text.replace(q, " ")
+    return text
+
+
+def escalation(kind, question, options=None, evidence="", hard_trigger=False, tier3_ok=True, data=None, return_to="",
+               quoted=()):
     return {
         "kind": kind,
         "question": question,
         "options": options or [],
         "evidence": evidence or "",
-        "hard_trigger": bool(hard_trigger) or bool(HARD_TRIGGER_RE.search(question or "")),
+        "hard_trigger": bool(hard_trigger) or bool(HARD_TRIGGER_RE.search(_own_text(question, quoted))),
         "tier3_ok": bool(tier3_ok),
         "data": data or {},
         "return_to": return_to,

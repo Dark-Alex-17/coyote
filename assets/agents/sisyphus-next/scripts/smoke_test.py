@@ -356,6 +356,20 @@ check("escalate_gate: a decision already resolved autonomously in this subtask -
       u)
 secret = escalation("yellow_findings", "rotate the API secret?", [option("yes", True)])
 check("escalation: secret/money wording auto-flags hard trigger", secret["hard_trigger"])
+
+
+def quoted_trigger(question, quoted):
+    try:
+        return escalation("retry", question, quoted=quoted)["hard_trigger"]
+    except TypeError:
+        return None
+
+
+_err = "the token expired"
+check("escalation: a trigger word only in the quoted error text -> no hard trigger",
+      quoted_trigger(f"Retry {_err}?", (_err,)) is False)
+check("escalation: the same error text not marked as quoted -> hard trigger",
+      escalation("retry", f"Retry {_err}?")["hard_trigger"] is True)
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="A", ladder_basis="recommended option"))
 check("ladder_route: recommended -> digest + apply", u["_next"] == "apply_answer" and u["autonomous_digest"] and u["last_answer"] == "A")
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="Z"))

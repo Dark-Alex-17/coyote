@@ -6224,6 +6224,43 @@ check("verify_gate: the ledger line says how many criterion commands the cap dro
       any("declared 8 criterion command(s) as verification runs (4 more dropped by the cap): true a0;" in d for d in u["decisions"]),
       u["decisions"])
 
+# ---------------------------------------------------------------- hard trigger: the question's own text, never the data it quotes
+u = gates.quality_bar_gate(base_state(rigor_proposal="production", surfaces_proposal="http,other:token"))
+check("quality_bar_gate: a proposed surface holding a trigger word -> the quality_bar question is no hard trigger",
+      u.get("escalation", {}).get("kind") == "quality_bar" and u.get("escalation", {}).get("hard_trigger") is False, u.get("escalation"))
+u = gates.checklist_round(base_state(checklist_labels=["auth"], checklist_findings=["1. rotate the credential\n2. scope the token\n"]))
+check("checklist_round: an item holding a trigger word -> the per-item checklist_accept question is no hard trigger",
+      u.get("escalation", {}).get("kind") == "checklist_accept" and u.get("escalation", {}).get("hard_trigger") is False, u.get("escalation"))
+u = gates.checklist_round(base_state(checklist_labels=["auth"],
+                                     checklist_findings=["".join(f"{i}. keep the secret {i} out of logs\n" for i in range(1, 11))]))
+check("checklist_round: a long list holding a trigger word -> the batch checklist_accept question is no hard trigger",
+      u.get("escalation", {}).get("kind") == "checklist_accept" and u.get("escalation", {}).get("data", {}).get("batch")
+      and u.get("escalation", {}).get("hard_trigger") is False, u.get("escalation"))
+ts_title = copy.deepcopy(TS_DONE1)
+gates.task_by_id(ts_title, T1)["title"] = "Rotate the signing token"
+u = gates.task_done_route(base_state(plan_path=PROMOTED, tasks=ts_title, current_task=T1, autonomy="phase-gate"))
+check("task_done_route: phase-gate on a task whose title holds a trigger word -> approve_next is no hard trigger",
+      u.get("escalation", {}).get("kind") == "approve_next" and u.get("escalation", {}).get("hard_trigger") is False, u.get("escalation"))
+
+
+def token_fault(state):
+    raise ValueError("the token expired")
+
+
+heal_disk()
+guarded("run: a fault whose error text holds a trigger word -> the state_fault question is no hard trigger",
+        lambda: (lambda e: (e.get("kind") == "state_fault" and "token expired" in e.get("question", "") and e.get("hard_trigger") is False, e))(
+            run_gate("claim_task", heal_base(), token_fault).get("escalation", {})))
+check("escalation: a trigger word in the question's own stem still trips",
+      escalation("x", "Rotate the credential?").get("hard_trigger") is True)
+guarded("escalation: a stem matching on its own still trips with the quoted name blanked",
+        lambda: (escalation("x", "Delete the branch feat-a?", quoted=("feat-a",)).get("hard_trigger") is True, ""))
+u = gates.open_questions_gate(base_state(open_questions=[{"question": "Which token store?",
+                                                          "options": [{"text": "a", "recommended": True}, {"text": "b"}]}],
+                                         design_rounds=0))
+check("open_questions_gate: a design question framed with a trigger word is the question itself -> hard trigger",
+      u.get("escalation", {}).get("kind") == "design_round" and u.get("escalation", {}).get("hard_trigger") is True, u.get("escalation"))
+
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",
