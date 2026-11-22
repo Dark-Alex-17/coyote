@@ -3093,10 +3093,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4727, 4736],
+        vec![51, 4925, 4934],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4727, 4736] {
+    for line in [4925, 4934] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -5311,6 +5311,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 /// round counters among them are what the `_lib.py` bounds are checked on.
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "amend_cycles",
+    "apply_reasks",
     "author_retries",
     "body_fix_rounds",
     "choice_index",

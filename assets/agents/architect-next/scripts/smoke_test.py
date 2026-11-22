@@ -316,10 +316,11 @@ check("parse_answer: seed_confirm unmatched text that is not a path -> interpret
       gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="banana"))["_next"] == "interpret_reply"
       and gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="banana", reply_interpreted=True))["_next"] == "confirm_seed")
 for answer, row in (("Abort the run", "abort -> end_aborted"), ("Give a doc path instead", "doc path -> need_design_doc"),
-                    ("Draft a brief from this conversation instead", "draft -> draft_brief"), ("banana", "unmatched -> need_design_doc")):
+                    ("Draft a brief from this conversation instead", "draft -> draft_brief"),
+                    ("banana", "unmatched -> interpret_reply")):
     u = gates.apply_answer(base_state(escalation=E_SEED, last_answer=answer, seed_path=SEED))
-    want = {"Abort the run": ("end_aborted", ""), "Draft a brief from this conversation instead": ("draft_brief", "")}.get(
-        answer, ("escalate_gate", "need_design_doc"))
+    want = {"Abort the run": ("end_aborted", ""), "Draft a brief from this conversation instead": ("draft_brief", ""),
+            "banana": ("interpret_reply", "seed_confirm")}.get(answer, ("escalate_gate", "need_design_doc"))
     check(f"apply_answer: seed_confirm {row}, seed still ready",
           (u["_next"], u.get("escalation", {}).get("kind", "")) == want and seed_status(SEED) == "ready" and "design_doc_path" not in u,
           u.get("_next"))
@@ -838,8 +839,11 @@ check("gate2_route: empty -> gate_fault", u["escalation"]["kind"] == "gate_fault
 for after, tasks, exp in [("verify", [], "verify_gate"), ("phase_f", [], "hygiene_create"), ("", [{"id": "TASK-101"}], "select_tasks"), ("", [], "autonomy_gate")]:
     u = gates.reseal_return(base_state(after_reseal=after, tasks=tasks))
     check(f"reseal_return: after={after!r} tasks={bool(tasks)} -> {exp}", u["_next"] == exp)
-u = gates.autonomy_gate(base_state(autonomy="plan-gate"))
+u = gates.autonomy_gate(base_state(autonomy="plan-gate", apply_reasks=2))
 check("autonomy_gate: plan-gate -> approve_breakdown", u["_next"] == "approve_breakdown" and u["escalation"]["kind"] == "approve_breakdown")
+check("autonomy_gate: the plan-gate question offers approve, revise and abort, with no re-asks carried over from an earlier question",
+      [o["text"] for o in u["escalation"]["options"]] == ["Approve the breakdown", "Revise the breakdown (describe the change)",
+                                                          "Abort the run"] and u.get("apply_reasks") == 0, u.get("escalation"))
 check("autonomy_gate: full -> promote_tasks", gates.autonomy_gate(base_state(autonomy="full"))["_next"] == "promote_tasks")
 check("autonomy_gate: phase-gate -> promote_tasks (gates later)", gates.autonomy_gate(base_state(autonomy="phase-gate"))["_next"] == "promote_tasks")
 
@@ -2454,6 +2458,9 @@ first, s = interpreted(escalation("approve_breakdown", "Approve?", [option("Appr
 s.update(gates.apply_answer(s))
 check("interpret_route -> apply_answer: a revision instruction that mentions approve is still a revision (prefix wins)",
       s["_next"] == "amend_plan" and "merge the two api tasks" in s["pending_amendments"][0], s)
+check("interpret_route: an applied revision instruction names the revise option, with the owner's words as its note",
+      first == "interpret_reply" and str(s.get("last_answer", "")).startswith(
+          "Revise the breakdown (describe the change): merge the two api tasks"), s.get("last_answer"))
 E_G1 = escalation("gate1_stuck", "Gate 1 is still LEAKY. Answer the questions here, or stop?",
                   [option("Stop and report", True), option("I will answer: (type the answers)")])
 
@@ -2476,14 +2483,19 @@ check("apply_answer: branch_name 'fix/abort-handling' is a branch name; only a w
       u["_next"] == "branch_setup" and u["run_branch_override"] == "fix/abort-handling"
       and all(answered("branch_name", a, E_BN, code_repo_path=WT_LOCAL)["_next"] == "end_aborted" for a in ("abort", "Abort the run")), u)
 E_PG = escalation("probe_gap", "The probe could not run. Supply the recipe, or record a follow-up?",
-                  [option("Supply the recipe (describe it)"), option("Record a follow-up", True)])
+                  [option("Supply the recipe (type it); amend the plan and re-run the probe once"),
+                   option("Surface the gap as a follow-up and proceed", True)])
 RECIPE = "docker compose up -d db && PORT=8081 ./bin/server --seed 'fixtures/a b.json'\n  curl -sf localhost:8081/healthz | jq '.ok'"
 first, s = interpreted(E_PG, RECIPE, reply_verdict="instruction", reply_instruction="recipe",
                        reply_value="start the db and the server, then check health", state={"tasks": tasks_with(), "current_task": T2})
 s.update(gates.apply_answer(s))
 check("interpret_route -> apply_answer: a recipe of literal commands reaches the amendment byte for byte, never paraphrased",
-      s["_next"] == "amend_plan" and s["pending_amendments"][0].endswith(f"Supply the recipe: {RECIPE}")
+      s["_next"] == "amend_plan"
+      and s["pending_amendments"][0].endswith(f"Supply the recipe (type it); amend the plan and re-run the probe once: {RECIPE}")
       and "start the db" not in s["pending_amendments"][0], s)
+check("interpret_route: an applied recipe instruction names the supply option, with the owner's words as its note",
+      first == "interpret_reply" and str(s.get("last_answer", "")).startswith(
+          "Supply the recipe (type it); amend the plan and re-run the probe once: docker compose"), s.get("last_answer"))
 first, s = interpreted(E_HELD, "reuse the other checkout", reply_verdict="instruction", reply_instruction="reuse_worktree",
                        reply_value=CODE, state={"code_repo_path": WT_LOCAL})
 check("interpret_route: reuse_worktree naming a checkout of another repo -> rejected, ledgered, one clarifying question",
@@ -2789,8 +2801,36 @@ check("ladder_route: a multiple-choice question records its kind and index, task
       u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2.get("autonomous_decisions") == ["design_round#0||task"], u2)
 
 # ---------------------------------------------------------------- apply_answer (every kind)
+# The options each kind is raised with, since apply_answer reads a reply only by the option it names.
+AA_ESC = {
+    "approve_breakdown": escalation("approve_breakdown", "q", [option("Approve the breakdown", True),
+                                                               option("Revise the breakdown (describe the change)"),
+                                                               option("Abort the run")]),
+    "probe_gap": escalation("probe_gap", "q", [option("Supply the recipe (type it); amend the plan and re-run the probe once"),
+                                               option("Surface the gap as a follow-up and proceed", True)]),
+    "review_incomplete": escalation("review_incomplete", "q", [
+        option("Retry the review again"),
+        option("Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)"),
+        option("Abort this task")]),
+    "wave_escalation": escalation("wave_escalation", "q", [
+        option("Retry the task sequentially (one fix round with the evidence)", True),
+        option("Accept as-is and close the task (recorded)"), option("Abort this task (worktree removed, branch kept)")],
+        hard_trigger=True),
+    "approve_next": escalation("approve_next", "q", [option("Continue", True), option("Stop here (park the run)"),
+                                                     option("Abort the run")]),
+    "ci_unsure": escalation("ci_unsure", "q", [option("Re-run the failing checks once"), option("Resume with a coder fix round"),
+                                               option("Leave the PR in draft and report", True)]),
+    "ci_exhausted": escalation("ci_exhausted", "q", [option("Keep waiting (re-run the watch)"),
+                                                     option("Leave the PR in draft and report", True)]),
+    "ci_infra": escalation("ci_infra", "q", [option("Keep waiting (re-run the watch)", True),
+                                             option("Leave the PR in draft and report")]),
+    "review_push_mismatch": escalation("review_push_mismatch", "q", [option("Re-check the PR head"),
+                                                                     option("Stop watching and report", True)]),
+}
+
+
 def AA(kind, answer, **over):
-    esc = over.pop("esc", None) or escalation(kind, "q", [])
+    esc = over.pop("esc", None) or AA_ESC.get(kind) or escalation(kind, "q", [])
     return gates.apply_answer(base_state(escalation=esc, last_answer=answer, **over))
 
 
@@ -2899,9 +2939,9 @@ check("apply_answer: conformance_stuck stop -> end_blocked", AA("conformance_stu
 u = AA("plan_defect", "Amend the plan: criterion 2 means X", current_task=T1, tasks=tasks_with())
 check("apply_answer: plan_defect amend -> amend_plan, returning to verify after re-seal", u["_next"] == "amend_plan" and u["after_reseal"] == "verify")
 check("apply_answer: plan_defect stop -> end_blocked", AA("plan_defect", "Stop and report", current_task=T1, tasks=tasks_with())["_next"] == "end_blocked")
-u = AA("probe_gap", "Supply the recipe: make run", current_task=T2, tasks=tasks_with())
+u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", current_task=T2, tasks=tasks_with())
 check("apply_answer: probe_gap supply -> amend_plan (recipe) -> verify after re-seal", u["_next"] == "amend_plan" and u["after_reseal"] == "verify")
-u = AA("probe_gap", "Surface the gap and proceed", current_task=T2, tasks=tasks_with())
+u = AA("probe_gap", "Surface the gap as a follow-up and proceed", current_task=T2, tasks=tasks_with())
 check("apply_answer: probe_gap surface -> follow-up + post_round (never PASS/FAIL)", u["_next"] == "post_round" and u["follow_ups"])
 check("apply_answer: review_incomplete retry -> verify_gate", AA("review_incomplete", "Retry the review again", current_task=T1, tasks=tasks_with())["_next"] == "verify_gate")
 u = AA("review_incomplete", "Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)", current_task=T1, tasks=TS_W, verify_unit=T1, round_log={T1: [{"round": 1, "incomplete": ["security"]}]})
@@ -2916,7 +2956,7 @@ u = AA("batch_strikeout", "One more batch round anyway", current_batch="B1", bat
 check("apply_answer: batch_strikeout one more -> batch_fix_route with strikes reset below the cap", u["_next"] == "batch_fix_route" and u["batch_state"]["B1"]["strikes"] == STRIKE_LIMIT - 1)
 check("apply_answer: batch_strikeout accept -> batch passed (recorded) -> select_tasks", AA("batch_strikeout", "Accept the batch unresolved (recorded)", current_batch="B1", batch_state={})["batch_state"]["B1"]["passed"])
 check("apply_answer: batch_strikeout stop -> end_blocked", AA("batch_strikeout", "Stop and report", current_batch="B1")["_next"] == "end_blocked")
-u = AA("wave_escalation", "Retry the task sequentially (one fix round with the evidence)", esc=escalation("wave_escalation", "q", evidence="- e1"), current_task=T3, tasks=TS_W)
+u = AA("wave_escalation", "Retry the task sequentially (one fix round with the evidence)", esc={**AA_ESC["wave_escalation"], "evidence": "- e1"}, current_task=T3, tasks=TS_W)
 check("apply_answer: wave_escalation retry -> sequential fix round in the worktree", u["_next"] == "compose_delegation" and u["fix_items"] == ["e1"])
 check("apply_answer: wave_escalation accept -> integration_test (single)", AA("wave_escalation", "Accept as-is and close the task (recorded)", current_task=T3, tasks=TS_W)["_next"] == "integration_test")
 check("apply_answer: wave_escalation abort -> wave_cleanup (task failed, branch kept)", AA("wave_escalation", "Abort this task (worktree removed, branch kept)", current_task=T3, tasks=TS_W)["_next"] == "wave_cleanup")
@@ -2935,10 +2975,71 @@ check("apply_answer: hygiene_base_missing stop -> end_blocked", AA("hygiene_base
 u = AA("hygiene_base_missing", "Skip the hygiene pass (recorded as a follow-up)")
 check("apply_answer: hygiene_base_missing skip -> follow-up + next unit (hygiene_create)", u["_next"] == "hygiene_create" and u["follow_ups"])
 check("apply_answer: ci_unsure re-run -> ci_poll (watch reset)", AA("ci_unsure", "Re-run the failing checks once")["_next"] == "ci_poll")
-u = AA("ci_exhausted", "Resume with one more coder fix round", tasks=TS_W, ci_owning_task=T1)
+u = AA("ci_unsure", "Resume with a coder fix round", tasks=TS_W, ci_owning_task=T1)
 check("apply_answer: ci_* fix -> fix_round to the owning task", u["_next"] == "fix_round" and u["fix_request"]["task"] == T1)
 u = AA("ci_infra", "Leave the PR in draft and report", pr_number="5")
 check("apply_answer: ci_* leave -> follow-up + finish_plan", u["_next"] == "finish_plan" and "draft" in u["follow_ups"][0])
+AA_FREE = (
+    ("seed_confirm", E_SEED, "maybe use this seed later", dict(seed_path=SEED)),
+    ("approve_breakdown", AA_ESC["approve_breakdown"], "please don't approve yet", {}),
+    ("probe_gap", AA_ESC["probe_gap"], "I cannot supply anything here", dict(current_task=T2, tasks=tasks_with())),
+    ("review_incomplete", AA_ESC["review_incomplete"], "please don't retry, just leave it", dict(current_task=T1, tasks=TS_W)),
+    ("wave_escalation", AA_ESC["wave_escalation"], "please don't retry, just leave it", dict(current_task=T3, tasks=TS_W)),
+    ("approve_next", AA_ESC["approve_next"], "do not continue yet", {}),
+    ("ci_unsure", AA_ESC["ci_unsure"], "please don't re-run, just leave it", {}),
+    ("review_push_mismatch", AA_ESC["review_push_mismatch"], "no need to re-check", {}),
+)
+for kind, esc_, text, over in AA_FREE:
+    u = gates.apply_answer(base_state(escalation=esc_, last_answer=text, **over))
+    check(f"apply_answer: {kind} free text that mentions an option's words -> interpret_reply once, nothing acted on",
+          u.get("_next") == "interpret_reply" and u.get("escalation", {}).get("data", {}).get("reply_read") is True
+          and "failure_reason" not in u and "design_doc_path" not in u and "pending_amendments" not in u, u.get("_next"))
+    read = {**esc_, "data": {**_lib.as_dict(esc_.get("data")), "reply_read": True}}
+    u = gates.apply_answer(base_state(escalation=read, last_answer=text, **over))
+    check(f"apply_answer: {kind} the same free text once interpreted -> asked again, nothing acted on",
+          u.get("_next") == "ask_dispatch" and u.get("apply_reasks") == 1 and "failure_reason" not in u
+          and "Could not act on the reply" in u.get("escalation", {}).get("question", ""), u.get("_next"))
+AA_PICKS = (
+    ("seed_confirm", E_SEED, "2", "keep it short", "draft_brief", dict(seed_path=SEED)),
+    ("approve_breakdown", AA_ESC["approve_breakdown"], "2", "merge tasks 1 and 2", "amend_plan", {}),
+    ("probe_gap", AA_ESC["probe_gap"], "1", "./run.sh --seed", "amend_plan", dict(current_task=T2, tasks=tasks_with())),
+    ("review_incomplete", AA_ESC["review_incomplete"], "2", "the lane is flaky", "post_round",
+     dict(current_task=T1, tasks=TS_W, verify_unit=T1, round_log={T1: [{"round": 1, "incomplete": ["security"]}]})),
+    ("wave_escalation", AA_ESC["wave_escalation"], "3", "it is obsolete", "wave_cleanup", dict(current_task=T3, tasks=TS_W)),
+    ("approve_next", AA_ESC["approve_next"], "2", "back tomorrow", "end_blocked", {}),
+    ("ci_unsure", AA_ESC["ci_unsure"], "1", "looks flaky", "ci_poll", {}),
+    ("review_push_mismatch", AA_ESC["review_push_mismatch"], "1", "pushed again", "review_update", {}),
+)
+for kind, esc_, number, note, want, over in AA_PICKS:
+    own = esc_["options"][int(number) - 1]["text"]
+    got = [gates.apply_answer(base_state(escalation=esc_, last_answer=a, **over)).get("_next")
+           for a in (number, own, f"{own}: {note}")]
+    check(f"apply_answer: {kind} an option by its number, its exact text, or '<option text>: <note>' -> that option's branch",
+          got == [want] * 3, got)
+for kind in ("approve_breakdown", "review_incomplete", "wave_escalation", "approve_next", "ci_unsure", "ci_exhausted", "ci_infra"):
+    u = AA(kind, "sounds fine to me", current_task=T3, tasks=TS_W)
+    check(f"apply_answer: {kind} a reply naming no option takes no default -> interpret_reply", u.get("_next") == "interpret_reply",
+          u.get("_next"))
+u = AA("approve_next", "")
+check("apply_answer: approve_next an empty reply -> asked again straight away, never the default",
+      u.get("_next") == "ask_dispatch" and u.get("apply_reasks") == 1, u.get("_next"))
+REASK_MAX = getattr(gates, "APPLY_REASK_MAX", 2)
+u = AA("approve_next", "whatever", esc={**AA_ESC["approve_next"], "data": {"reply_read": True}}, apply_reasks=REASK_MAX)
+check("apply_answer: approve_next past APPLY_REASK_MAX re-asks -> the recommended Continue taken, with a ledger line",
+      u.get("_next") == "select_tasks" and any("the recommended option: Continue" in d for d in u.get("decisions", [])),
+      u.get("decisions"))
+u = AA("wave_escalation", "whatever", esc={**AA_ESC["wave_escalation"], "data": {"reply_read": True}}, apply_reasks=REASK_MAX,
+       current_task=T3, tasks=TS_W)
+check("apply_answer: wave_escalation (a hard trigger) past APPLY_REASK_MAX re-asks -> end_blocked with the question open",
+      u.get("_next") == "end_blocked" and "stayed unanswered" in u.get("failure_reason", "") and "tasks" not in u, u.get("_next"))
+u = AA("review_push_mismatch", "whatever", esc={**AA_ESC["review_push_mismatch"], "data": {"reply_read": True}},
+       apply_reasks=REASK_MAX)
+check("apply_answer: review_push_mismatch past APPLY_REASK_MAX re-asks -> a stop recommendation is never taken, end_blocked",
+      u.get("_next") == "end_blocked" and "stayed unanswered" in u.get("failure_reason", "") and "follow_ups" not in u,
+      u.get("_next"))
+check("raise_escalation: a new escalation starts with no apply_answer re-asks, and the count is snapshotted",
+      _lib.raise_escalation(base_state(apply_reasks=2), {}, escalation("x", "q")).get("apply_reasks") == 0
+      and "apply_reasks" in _lib.STATE_KEYS)
 check("apply_answer: scope_surprise -> end_blocked", AA("scope_surprise", "x")["_next"] == "end_blocked")
 check("apply_answer: unknown kind -> end_failure (never silent)", AA("bogus", "x")["_next"] == "end_failure")
 
@@ -4223,7 +4324,9 @@ for kind, over, question, opts in CI_CASES:
         want = (question.format(d=d, w=w), [(t.format(l=l), r) for t, r in opts])
         check(f"watch: ci_apply {kind} {'while watching -> review-aware text, stop option, stop ledgered' if watching else 'outside the watch -> text and options unchanged'}",
               u.get("escalation", {}).get("kind") == kind and esc_shape(u) == want and ledgered(u, f"review-watch: PR #99 stop: {kind}") == watching, esc_shape(u))
-u = AA("ci_unsure", STOP, **WATCH, ci_status="red")
+u = AA("ci_unsure", STOP, esc=escalation("ci_unsure", "q", [option("Re-run the failing checks once"),
+                                                           option("Resume with a coder fix round"), option(STOP, True)]),
+       **WATCH, ci_status="red")
 check("watch: apply_answer ci_unsure 'Stop watching and report' while watching -> finish_plan, watch closed, never the left-in-draft follow-up",
       u["_next"] == "finish_plan" and u.get("review_watching") is False and not any("left in draft" in f for f in u.get("follow_ups", [])))
 
