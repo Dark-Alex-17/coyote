@@ -154,3 +154,36 @@ fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
     assert!(touched, "{}", path.display());
     assert_eq!(lent.load(Ordering::SeqCst), 2);
 }
+
+/// Under the TUI `.copy` hands the reply to the loop, which copies it
+/// over the screen's descriptor, rather than writing an OSC 52 request
+/// into the turn's capture; the app keeps it for the loop to take.
+#[test]
+#[serial]
+fn dot_copy_under_the_tui_hands_the_reply_to_the_loop() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-dot-copy");
+        let mut ctx = chat_ctx();
+        let input = Input::from_str(&ctx, "question", None).unwrap();
+        ctx.last_message = Some(crate::config::LastMessage::new(
+            input,
+            "the reply c7y".to_string(),
+        ));
+        let (tx, mut rx) = unbounded_channel();
+        let owner = OwnerGuard::tui(tx);
+        Box::pin(crate::repl::run_repl_command(
+            &mut ctx,
+            create_abort_signal(),
+            ".copy",
+        ))
+        .await
+        .unwrap();
+        drop(owner);
+        let msg = rx.try_recv().expect("the reply did not reach the loop");
+        assert!(matches!(&msg, UiMsg::Copy(text) if text == "the reply c7y"));
+
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.handle_msg(msg);
+        assert_eq!(harness.app.take_copy_requests(), ["the reply c7y"]);
+    });
+}

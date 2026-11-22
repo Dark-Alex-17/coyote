@@ -8,7 +8,7 @@ use super::run_now::{CommandOutput, replay_deferred};
 use super::sink::{LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use super::terminal::Screen;
 use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, redirect, render};
-use crate::config::RequestContext;
+use crate::config::{CommandPrefix, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command};
 use crate::supervisor::notification::NotificationQueue;
@@ -97,6 +97,8 @@ pub(super) struct ImmediateCommands {
     /// Counts the turns started, so a command that outlived its turn
     /// cannot hand its copy to the next turn's fork.
     turn: u64,
+    /// How the lines typed during the turn are read; set as it starts.
+    prefix: CommandPrefix,
     running: Option<RunningCommand>,
     waiting: VecDeque<String>,
     /// Settings the snapshot took, in the order typed, for the live
@@ -117,6 +119,7 @@ struct RunningCommand {
 impl ImmediateCommands {
     pub(super) fn turn_started(&mut self, ctx: &RequestContext) {
         self.turn += 1;
+        self.prefix = ctx.command_prefix();
         self.snapshot = Some(ctx.fork_for_branch());
     }
 
@@ -141,10 +144,15 @@ impl ImmediateCommands {
         self.running.is_some()
     }
 
-    /// Whether a setting is still being checked: the turn's end waits for
-    /// it, or the line held behind the turn would start without it.
-    pub(super) fn checking_setting(&self) -> bool {
+    /// Whether a setting is still being checked or waits its turn to be:
+    /// the turn's end waits for it, or the line held behind the turn
+    /// would start without it.
+    pub(super) fn setting_pending(&self) -> bool {
         self.running.as_ref().is_some_and(|running| running.setting)
+            || self
+                .waiting
+                .iter()
+                .any(|line| is_setting(line, self.prefix))
     }
 
     /// Trips the running command's abort signal and lets go of it; what
@@ -173,10 +181,7 @@ impl ImmediateCommands {
         let Some(line) = self.waiting.pop_front() else {
             return;
         };
-        let setting = matches!(
-            command_timing::lookup(&line, snapshot.command_prefix()),
-            Some((_, Timing::Deferred))
-        );
+        let setting = is_setting(&line, self.prefix);
         let abort = create_abort_signal();
         let handle = spawn_run_now(snapshot.fork_for_branch(), line.clone(), abort.clone());
         self.running = Some(RunningCommand {
@@ -229,6 +234,13 @@ impl ImmediateCommands {
         }
         UiMsg::CommandRan { line, result }
     }
+}
+
+fn is_setting(line: &str, prefix: CommandPrefix) -> bool {
+    matches!(
+        command_timing::lookup(line, prefix),
+        Some((_, Timing::Deferred))
+    )
 }
 
 /// Sends `line` off with the context as a turn, keeping a fork of the
@@ -873,6 +885,14 @@ pub(super) fn copy_to_clipboard_with(
     }
 }
 
+/// Copies `text` over the screen's descriptor and says in the transcript
+/// where it went.
+fn copy_and_report(app: &mut App, screen: &mut Screen, text: &str, from: &str, dropped: usize) {
+    let outcome = copy_to_clipboard_with(screen.writer(), text, crate::utils::set_text_native);
+    let (kind, text) = copy_notice(&outcome, text.lines().count(), from, dropped);
+    app.handle_msg(UiMsg::Notice { kind, text });
+}
+
 /// The notice after a copy of `lines` lines from `from`, which had
 /// already dropped its oldest `dropped` bytes.
 pub(super) fn copy_notice(
@@ -966,9 +986,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             msg = rx.recv() => Step::Msg(msg),
             _ = app.frames.next_frame() => Step::Frame,
             // A turn that ends while a setting typed during it is still
-            // being checked is joined once the check is in: the line held
-            // behind the turn starts with the setting, as its notice said.
-            done = join(&mut task), if task.is_some() && !immediate.checking_setting() => Step::Work(Box::new(done)),
+            // being checked, or waits behind another command to be, is
+            // joined once the check is in: the line held behind the turn
+            // starts with the setting, as its notice said.
+            done = join(&mut task), if task.is_some() && !immediate.setting_pending() => Step::Work(Box::new(done)),
             ran = immediate.join(), if immediate.is_running() => Step::Ran(Box::new(ran)),
             _ = termination.recv() => Step::Signal,
         };
@@ -1117,16 +1138,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         text,
                         from,
                         dropped,
-                    }) => {
-                        let outcome = copy_to_clipboard_with(
-                            screen.writer(),
-                            &text,
-                            crate::utils::set_text_native,
-                        );
-                        let (kind, text) =
-                            copy_notice(&outcome, text.lines().count(), &from, dropped);
-                        app.handle_msg(UiMsg::Notice { kind, text });
-                    }
+                    }) => copy_and_report(app, screen, &text, &from, dropped),
                     Some(Command::Rewind(target)) => {
                         if let Some(ctx) = ctx.as_mut() {
                             apply_rewind(app, ctx, target);
@@ -1200,6 +1212,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         Err(err) => {
                             let late = app.turn_late_output();
                             app.abandon_prompts();
+                            immediate.clear();
                             return Leave::Lost(err, late);
                         }
                     }
@@ -1230,6 +1243,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 warn!("Failed to re-enter the alternate screen: {err}");
             }
             app.schedule_frame();
+        }
+        for text in app.take_copy_requests() {
+            copy_and_report(app, screen, &text, "the last reply", 0);
         }
         let requests = app.take_control_requests();
         if let Some(control) = &app.control {

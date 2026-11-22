@@ -1614,7 +1614,12 @@ async fn dispatch_repl_line(
                     });
                 match output {
                     Some(v) if !v.is_empty() => {
-                        set_text(&v).context("Failed to copy the last chat response")?;
+                        // Under the TUI fd 1 is the turn's capture pipe,
+                        // so an OSC 52 fallback written here would never
+                        // reach the terminal.
+                        if !crate::tui::request_copy(&v) {
+                            set_text(&v).context("Failed to copy the last chat response")?;
+                        }
                     }
                     _ => bail!("No chat response to copy"),
                 }

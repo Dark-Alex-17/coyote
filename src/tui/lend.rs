@@ -184,6 +184,15 @@ pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
     }
 }
 
+/// Hands `text` to the loop to put on the clipboard, from anywhere in
+/// the process. False when no UI is running to take it.
+pub(crate) fn request_copy(text: &str) -> bool {
+    match owner() {
+        Owner::Tui(lender) => lender.tx.send(UiMsg::Copy(text.to_string())).is_ok(),
+        Owner::Shell => false,
+    }
+}
+
 /// Runs `job` with the terminal released to it (alternate screen left,
 /// line discipline cooked), the way Ctrl+O hands it to the editor, and
 /// blocks until the loop has taken the screen back. For the shell

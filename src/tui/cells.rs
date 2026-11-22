@@ -755,7 +755,15 @@ impl Cell {
             Cell::Tool { status, .. } => matches!(status, ToolStatus::Running { .. }),
             Cell::Job { row, .. } => matches!(row.status, JobStatus::Running { .. }),
             Cell::Agent { row, .. } => matches!(row.status, AgentStatus::Running { .. }),
-            Cell::Node { row, .. } => matches!(row.status, NodeStatus::Running { .. }),
+            // A call can still run under a node that has ended, as one
+            // started after the node's end is filed under it.
+            Cell::Node { row, .. } => {
+                matches!(row.status, NodeStatus::Running { .. })
+                    || row
+                        .calls
+                        .iter()
+                        .any(|call| matches!(call.status, Some(ToolStatus::Running { .. })))
+            }
             _ => false,
         }
     }

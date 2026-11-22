@@ -130,6 +130,8 @@ pub(super) fn spawn_run_now(
     abort: AbortSignal,
 ) -> JoinHandle<(RequestContext, Result<CommandOutput, String>)> {
     spawn_work(async move {
+        // Cancelling relies on this select: `JoinHandle::abort` does
+        // nothing to a task that already started on a blocking thread.
         let result = tokio::select! {
             result = run_now(&mut snapshot, &line, abort.clone()) => {
                 result.map_err(|err| crate::utils::pretty_error(&err))

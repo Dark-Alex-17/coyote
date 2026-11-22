@@ -99,21 +99,13 @@ impl ChildThread {
     /// of whole output this added.
     fn settle_running(&mut self, error: &str, now: Instant) -> isize {
         let mut grew = 0;
-        let mut settle = |status: &mut ToolStatus, full: &mut cells::FullOutput| {
-            if matches!(status, ToolStatus::Running { .. }) {
-                status.finish(now, false, Some(error.to_string()), None);
-                grew += full.settle();
-            }
-        };
         for cell in &mut self.rows {
             match cell {
-                Cell::Tool { status, tail, .. } => settle(status, &mut tail.full),
+                Cell::Tool { status, tail, .. } => {
+                    grew += settle_call(status, &mut tail.full, error, now);
+                }
                 Cell::Node { row, .. } => {
-                    for call in &mut row.calls {
-                        if let Some(status) = &mut call.status {
-                            settle(status, &mut call.tail.full);
-                        }
-                    }
+                    grew += settle_folded_calls(&mut row.calls, error, now);
                     if matches!(row.status, NodeStatus::Running { .. }) {
                         row.status = NodeStatus::Failed(error.to_string());
                     }
@@ -131,6 +123,30 @@ impl ChildThread {
     fn forget_wrapped_lines(&mut self) {
         self.rows.iter_mut().for_each(Cell::forget_wrapped_lines);
     }
+}
+
+/// Settles a call still running as failed with `error`, with the time it
+/// ran up to `now`; returns the bytes of whole output this added.
+fn settle_call(
+    status: &mut ToolStatus,
+    full: &mut cells::FullOutput,
+    error: &str,
+    now: Instant,
+) -> isize {
+    if !matches!(status, ToolStatus::Running { .. }) {
+        return 0;
+    }
+    status.finish(now, false, Some(error.to_string()), None);
+    full.settle()
+}
+
+fn settle_folded_calls(calls: &mut [FoldedCall], error: &str, now: Instant) -> isize {
+    calls
+        .iter_mut()
+        .filter_map(|FoldedCall { status, tail, .. }| {
+            Some(settle_call(status.as_mut()?, &mut tail.full, error, now))
+        })
+        .sum()
 }
 
 /// Every live child thread by agent id, in the order the children
@@ -212,6 +228,14 @@ impl ChildLive {
             .values_mut()
             .flat_map(|thread| thread.rows.iter_mut())
             .for_each(Cell::forget_layout);
+    }
+
+    /// Lets go of the whole output any child row laid out for the pager,
+    /// as the transcript's rows do once it closes.
+    pub(super) fn release_full_output_caches(&mut self) {
+        for thread in self.threads.values_mut() {
+            cells::release_full_output_caches(&mut thread.rows);
+        }
     }
 
     /// Drops the thread of every finished child `listed` no longer names,
@@ -396,10 +420,17 @@ impl ChildLive {
             },
             ChildNodeState::Failed { error } => NodeStatus::Failed(error),
         };
-        if let Some(row) = thread.node_row(&node_id) {
+        // The node's calls whose finish never came end with it.
+        let error = match &status {
+            NodeStatus::Failed(error) if !error.is_empty() => error.clone(),
+            _ => "node finished".to_string(),
+        };
+        let grew = thread.node_row(&node_id).map_or(0, |row| {
             row.status = status;
-        }
+            settle_folded_calls(&mut row.calls, &error, now)
+        });
         thread.forget_wrapped_lines();
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
     fn cap_rows(&mut self, agent_id: &str) {

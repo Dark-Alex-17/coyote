@@ -42,7 +42,7 @@ pub fn classify_clipboard(
 
 #[cfg(not(any(target_os = "android", target_os = "emscripten")))]
 mod internal {
-    use super::{ClipboardContent, classify_clipboard, osc52_sequence};
+    use super::{ClipboardContent, classify_clipboard, write_osc52};
     use arboard::Clipboard;
     use std::cell::RefCell;
     use std::io::Cursor;
@@ -107,17 +107,8 @@ mod internal {
         Some(cursor.into_inner())
     }
 
-    /// Attempts to set text to clipboard with OSC52 escape sequence
-    /// Works in many modern terminals, including over SSH.
     fn set_text_osc52(text: &str) -> anyhow::Result<()> {
-        let seq = osc52_sequence(text);
-        if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), seq.as_bytes()) {
-            return Err(anyhow::anyhow!("Failed to send OSC52 sequence").context(e));
-        }
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
-            return Err(anyhow::anyhow!("Failed to flush OSC52 sequence").context(e));
-        }
-        Ok(())
+        write_osc52(&mut std::io::stdout(), text)
     }
 }
 
@@ -186,6 +177,19 @@ pub fn osc52_payload_cap(text: &str) -> &str {
 pub fn osc52_sequence(text: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
+}
+
+/// Asks the terminal behind `writer` to put as much of `text` on the
+/// clipboard as one OSC 52 request carries.
+fn write_osc52(writer: &mut impl std::io::Write, text: &str) -> anyhow::Result<()> {
+    let seq = osc52_sequence(osc52_payload_cap(text));
+    if let Err(e) = writer.write_all(seq.as_bytes()) {
+        return Err(anyhow::anyhow!("Failed to send OSC52 sequence").context(e));
+    }
+    if let Err(e) = writer.flush() {
+        return Err(anyhow::anyhow!("Failed to flush OSC52 sequence").context(e));
+    }
+    Ok(())
 }
 
 pub fn read_for_paste() -> anyhow::Result<ClipboardContent> {
@@ -307,5 +311,21 @@ mod tests {
 
         let one_line = format!("{}\n", "v".repeat(OSC52_TEXT_LIMIT * 2));
         assert_eq!(osc52_payload_cap(&one_line).len(), OSC52_TEXT_LIMIT);
+    }
+
+    /// The REPL's fallback sends the same capped request Alt+C does.
+    #[test]
+    fn the_osc52_fallback_writes_the_capped_request() {
+        let text = "u".repeat(3 * OSC52_PAYLOAD_LIMIT);
+        let mut written = Vec::new();
+        write_osc52(&mut written, &text).unwrap();
+        assert_eq!(
+            written,
+            osc52_sequence(osc52_payload_cap(&text)).into_bytes()
+        );
+        assert_eq!(
+            written.len(),
+            OSC52_PAYLOAD_LIMIT + osc52_sequence("").len()
+        );
     }
 }

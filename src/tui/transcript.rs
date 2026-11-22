@@ -76,8 +76,11 @@ pub(super) struct Transcript {
     /// oldest first. Until the next delta opens another, the reply has
     /// no open cell.
     stream_parts: Vec<usize>,
-    /// What the next part of a cut reply starts with.
+    /// The fence or think tag a cut reply's next part reopens.
     stream_carry: String,
+    /// The unfinished last line a cut took off the reply; the next part
+    /// shows it, after `stream_carry`.
+    stream_held: String,
     /// Set when the focus moved; the next frame scrolls so the focused
     /// row's header is in view.
     reveal_focus: bool,
@@ -109,6 +112,7 @@ impl Transcript {
             stream: None,
             stream_parts: Vec::new(),
             stream_carry: String::new(),
+            stream_held: String::new(),
             reveal_focus: false,
             last_layout: Vec::new(),
             last_area: Rect::ZERO,
@@ -248,33 +252,60 @@ impl Transcript {
         match self.stream_cell_mut() {
             Some(Cell::Assistant { source, .. }) => source.push_str(delta),
             _ => {
-                let source = std::mem::take(&mut self.stream_carry) + delta;
-                self.open_stream(Cell::assistant(source, false));
+                self.open_carried_stream(delta);
             }
         }
     }
 
+    /// Opens the next part of a cut reply with what the cut carried and
+    /// held back, followed by `delta`.
+    fn open_carried_stream(&mut self, delta: &str) {
+        let source =
+            std::mem::take(&mut self.stream_carry) + &std::mem::take(&mut self.stream_held) + delta;
+        self.open_stream(Cell::assistant(source, false));
+    }
+
     /// Ends the streaming reply's open cell where it is, so the next cell
     /// pushed sits below the text so far and the next delta opens a cell
-    /// below that one.
+    /// below that one. The unfinished last line moves to the next cell:
+    /// a fence or think tag on it may not be whole yet, so the state the
+    /// next cell carries over is read from complete lines only. A cell
+    /// left with nothing goes.
     pub(super) fn cut_stream(&mut self) {
         let Some(index) = self.stream.take() else {
             return;
         };
-        self.stream_carry = match self.touch(index) {
+        let (carry, held, emptied) = match self.touch(index) {
             Some(Cell::Assistant { source, done, .. }) => {
                 *done = true;
-                cells::reply_continuation(source)
+                let held = source.rfind('\n').map_or(0, |at| at + 1);
+                let unfinished = source.split_off(held);
+                (
+                    cells::reply_continuation(source),
+                    unfinished,
+                    source.is_empty(),
+                )
             }
-            _ => String::new(),
+            _ => (String::new(), String::new(), false),
         };
-        self.stream_parts.push(index);
+        self.stream_carry = carry;
+        self.stream_held = held;
+        if emptied {
+            self.remove(index);
+        } else {
+            self.stream_parts.push(index);
+        }
     }
 
     /// Forgets the streaming cell and hands it over to be finalised; the
-    /// cells a command cut off the reply are already final.
+    /// cells a command cut off the reply are already final. A line a cut
+    /// held back with no delta since gets a cell of its own, so the
+    /// reply ending there does not lose it.
     pub(super) fn close_stream(&mut self) -> Option<&mut Cell> {
         self.stream_parts.clear();
+        if self.stream.is_none() && !self.stream_held.is_empty() {
+            self.open_carried_stream("");
+        }
         self.stream_carry.clear();
         let stream = self.stream.take()?;
         self.touch(stream)
@@ -1759,5 +1790,95 @@ mod tests {
             Some(1),
             "a click outside the area did something"
         );
+    }
+
+    /// Streams `before`, cuts the reply, streams `after`, and returns the
+    /// cut cell's source and the next cell's.
+    fn cut_between(before: &str, after: &str) -> (String, String) {
+        let (mut transcript, _) = transcript();
+        transcript.stream_delta(before);
+        transcript.cut_stream();
+        transcript.stream_delta(after);
+        let sources: Vec<String> = transcript
+            .cells()
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Assistant { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+        let [cut, next] = <[String; 2]>::try_from(sources).expect("two reply cells");
+        (cut, next)
+    }
+
+    #[test]
+    fn a_cut_inside_a_fence_carries_its_opening_line() {
+        let (cut, next) = cut_between("```rust\nlet a = 1;\n", "let b = 2;\n```\n");
+        assert_eq!(cut, "```rust\nlet a = 1;\n");
+        assert_eq!(next, "```rust\nlet b = 2;\n```\n");
+    }
+
+    #[test]
+    fn a_closing_fence_with_no_newline_yet_moves_on_and_carries_nothing() {
+        let (cut, next) = cut_between("```rust\nlet a = 1;\n```", "\nafter\n");
+        assert_eq!(cut, "```rust\nlet a = 1;\n");
+        assert_eq!(next, "```rust\n```\nafter\n");
+    }
+
+    #[test]
+    fn an_opening_fence_with_no_newline_yet_moves_on_whole() {
+        let (cut, next) = cut_between("intro\n```rust", "\nlet a = 1;\n");
+        assert_eq!(cut, "intro\n");
+        assert_eq!(next, "```rust\nlet a = 1;\n");
+    }
+
+    #[test]
+    fn a_partial_think_close_moves_on_after_the_open_tag() {
+        let (cut, next) = cut_between("<think>\nweighing\n</thi", "nk>answer");
+        assert_eq!(cut, "<think>\nweighing\n");
+        assert_eq!(next, "<think></think>answer");
+        assert_eq!(cells::without_think_spans(&next, true), "answer");
+    }
+
+    /// A reply cut before its first line ends leaves no empty cell
+    /// behind; all of it goes on in the next one.
+    #[test]
+    fn a_cut_inside_the_first_line_moves_the_whole_reply_on() {
+        let (mut transcript, _) = transcript();
+        transcript.stream_delta("<think>weigh");
+        transcript.cut_stream();
+        assert!(transcript.cells().is_empty());
+        transcript.stream_delta("ing</think>answer");
+        assert!(matches!(
+            transcript.cells(),
+            [Cell::Assistant { source, .. }] if source == "<think>weighing</think>answer"
+        ));
+    }
+
+    /// A reply that ends right after a cut, with no delta since, keeps
+    /// the line the cut held back in a closed cell of its own.
+    #[test]
+    fn closing_after_a_cut_keeps_the_held_line() {
+        let (mut transcript, _) = transcript();
+        transcript.stream_delta("```sh\nls\n```\nDone.");
+        transcript.cut_stream();
+        transcript.push(Cell::user("an at-once command"));
+        if let Some(Cell::Assistant { done, .. }) = transcript.close_stream() {
+            *done = true;
+        }
+        let sources: Vec<(&str, bool)> = transcript
+            .cells()
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Assistant { source, done, .. } => Some((source.as_str(), *done)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, [("```sh\nls\n```\n", true), ("Done.", true)]);
+        assert!(matches!(
+            transcript.cells().last(),
+            Some(Cell::Assistant { .. })
+        ));
+        assert!(transcript.close_stream().is_none(), "the held line stayed");
     }
 }

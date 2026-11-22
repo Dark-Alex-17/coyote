@@ -115,7 +115,10 @@ fn interleaved_node_calls_fold_under_their_own_node() {
     let ids: Vec<&str> = left.iter().map(|call| call.call_id.as_str()).collect();
     assert_eq!(ids, ["call-l1", "call-l2"]);
     assert!(matches!(left[0].status, Some(ToolStatus::Ok { .. })));
-    assert!(matches!(left[1].status, Some(ToolStatus::Running { .. })));
+    assert!(matches!(
+        &left[1].status,
+        Some(ToolStatus::Failed { error, .. }) if error == "node finished"
+    ));
     let right = node_calls(&rows[1], "right");
     assert_eq!(right.len(), 1);
     assert!(matches!(
@@ -157,6 +160,53 @@ fn a_failed_node_keeps_its_error() {
         thread(&harness).rows(),
         [Cell::Node { row, .. }] if row.status == NodeStatus::Failed("exit 3".to_string())
     ));
+}
+
+/// A node that ends settles the calls under it whose finish never came,
+/// with its error or that it finished; a call filed under a node that
+/// already ended keeps the row running until it ends.
+#[test]
+fn a_node_that_ends_settles_its_running_calls() {
+    let mut harness = Harness::standalone(80, 24);
+    started(&mut harness);
+    child_node(&mut harness, "plan", ChildNodeState::Started);
+    child_tool(&mut harness, Some("plan"), "call-p1", "fs_read");
+    child_node(&mut harness, "build", ChildNodeState::Started);
+    child_tool(&mut harness, Some("build"), "call-b1", "fs_read");
+    child_node(
+        &mut harness,
+        "plan",
+        ChildNodeState::Completed {
+            duration_ms: Some(10),
+            route: None,
+        },
+    );
+    child_node(
+        &mut harness,
+        "build",
+        ChildNodeState::Failed {
+            error: "exit 3".to_string(),
+        },
+    );
+    let rows = thread(&harness).rows();
+    for (row, id, said) in [
+        (&rows[0], "plan", "node finished"),
+        (&rows[1], "build", "exit 3"),
+    ] {
+        assert!(
+            matches!(
+                &node_calls(row, id)[0].status,
+                Some(ToolStatus::Failed { error, .. }) if error == said
+            ),
+            "{id}"
+        );
+        assert!(!row.running(), "{id}");
+    }
+
+    child_tool(&mut harness, Some("plan"), "call-p2", "fs_read");
+    assert!(thread(&harness).rows()[0].running());
+    child_tool_done(&mut harness, Some("plan"), "call-p2", true);
+    assert!(!thread(&harness).rows()[0].running());
 }
 
 /// A call that reports its node before the node's own start opens a row
@@ -484,6 +534,46 @@ fn the_fold_keys_work_in_a_child_thread_and_not_in_the_root_one() {
     harness.press(KeyCode::Enter);
     assert_eq!(harness.draw(), before);
     assert!(!harness.app.transcript.focused());
+}
+
+/// The whole output a child's row lays out when opened is freed once
+/// the pager closes, and once another thread takes the child's place.
+#[test]
+fn leaving_a_child_thread_frees_what_its_rows_laid_out() {
+    let mut harness = Harness::standalone(80, 24);
+    started(&mut harness);
+    child_tool(&mut harness, None, "call-r1", "execute_command");
+    harness.app.handle_msg(UiMsg::ChildToolOutput {
+        agent_id: AGENT.to_string(),
+        node: None,
+        call_id: "call-r1".to_string(),
+        chunk: b"compiled r1\n".to_vec(),
+    });
+    child_tool_done(&mut harness, None, "call-r1", true);
+    let laid_out = |harness: &mut Harness| {
+        let thread = harness
+            .app
+            .child_live
+            .by_session_mut("sess_5d6e")
+            .expect("the started child has a thread");
+        cells::any_full_output_laid_out(thread.rows_mut())
+    };
+    open_thread(&mut harness);
+    harness
+        .app
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    harness.press(KeyCode::Enter);
+    assert!(harness.draw().contains("compiled r1"));
+    assert!(laid_out(&mut harness));
+    harness.press(KeyCode::Char('q'));
+    assert!(harness.app.pager().is_none());
+    assert!(!laid_out(&mut harness));
+
+    open_thread(&mut harness);
+    assert!(harness.draw().contains("compiled r1"), "the row closed");
+    assert!(laid_out(&mut harness));
+    harness.app.open_pager(Pager::root());
+    assert!(!laid_out(&mut harness));
 }
 
 /// With no turn running and a child-session root that does not list it,

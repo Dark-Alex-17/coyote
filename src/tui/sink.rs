@@ -125,6 +125,9 @@ pub(crate) enum UiMsg {
     /// passthrough, an editor on a file): the loop releases the screen,
     /// runs it, and takes the screen back.
     LendTerminal(LendJob),
+    /// Text `.copy` puts on the clipboard. Fd 1 is a turn's capture pipe,
+    /// so the loop copies it over the screen's descriptor as Alt+C does.
+    Copy(String),
     /// A child agent wrote its session file.
     ChildTranscriptFlushed {
         session_id: String,

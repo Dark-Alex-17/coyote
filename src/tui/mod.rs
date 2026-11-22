@@ -65,7 +65,7 @@ use keys::{Action, KeyContext, Layer, OverlayKind, PagerMode, PopupKind, ViMode}
 #[cfg(test)]
 pub(crate) use lend::OwnerGuard;
 use lend::{Owner, owner};
-pub(crate) use lend::{TtyHandles, ensure_terminal_lendable, lend_terminal, notice};
+pub(crate) use lend::{TtyHandles, ensure_terminal_lendable, lend_terminal, notice, request_copy};
 use modal::{PendingPrompt, PromptModal};
 use pager::{Pager, PagerView};
 use queued::{QueuedLine, QueuedPreview, remove_sent};
@@ -379,6 +379,8 @@ pub(crate) struct App {
     /// Work waiting for the terminal to be released to it; the loop runs
     /// each after the step that queued it.
     lend_requests: Vec<LendJob>,
+    /// Text waiting for the loop to copy; see [`UiMsg::Copy`].
+    copy_requests: Vec<String>,
     turn: Option<TurnStatus>,
     /// The teardown task owns the context: nothing new can be submitted,
     /// interrupted or quit until it reports back.
@@ -509,6 +511,7 @@ impl App {
             queued: Vec::new(),
             prompts: VecDeque::new(),
             lend_requests: Vec::new(),
+            copy_requests: Vec::new(),
             turn: None,
             exiting: false,
             exit_first_cell: 0,
@@ -1517,6 +1520,7 @@ impl App {
         };
         self.overlay = pager.take_tasks().map(Overlay::Tasks);
         cells::release_full_output_caches(self.transcript.cells_for_layout().0);
+        self.child_live.release_full_output_caches();
         // Rows that ran under a child's thread hold the throbber frame
         // they were last drawn with.
         self.transcript.touch_running();
@@ -1527,7 +1531,14 @@ impl App {
     fn open_pager(&mut self, mut pager: Pager) {
         pager.set_tasks(match self.overlay.take() {
             Some(Overlay::Tasks(roster)) => Some(roster),
-            Some(Overlay::Pager(mut previous)) => previous.take_tasks(),
+            Some(Overlay::Pager(mut previous)) => {
+                // A child's thread giving way to another thread, or to
+                // the root, frees what its rows laid out.
+                if !previous.shows_root() {
+                    self.child_live.release_full_output_caches();
+                }
+                previous.take_tasks()
+            }
             Some(Overlay::Help(_)) | None => None,
         });
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
@@ -1745,6 +1756,7 @@ impl App {
             }
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
             UiMsg::LendTerminal(job) => self.lend_requests.push(job),
+            UiMsg::Copy(text) => self.copy_requests.push(text),
             UiMsg::ChildTranscriptFlushed { session_id } => {
                 if !is_plain_session_id(&session_id) {
                     warn!("Ignored a flush of a child session with the id {session_id:?}");
@@ -1798,6 +1810,10 @@ impl App {
 
     fn take_lend_requests(&mut self) -> Vec<LendJob> {
         std::mem::take(&mut self.lend_requests)
+    }
+
+    fn take_copy_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.copy_requests)
     }
 
     /// The cells of the turns that ended: none of the exit's own, nor of

@@ -528,7 +528,7 @@ fn a_quit_drops_the_settings_taken_during_the_turn() {
         assert!(immediate.is_running());
         immediate.clear();
         assert!(!immediate.is_running(), "the quit waited on the check");
-        assert!(!immediate.checking_setting());
+        assert!(!immediate.setting_pending());
         harness.app.queued.push(QueuedLine {
             text: ".agent x".to_string(),
             command: true,
@@ -569,14 +569,14 @@ fn a_turn_end_waits_for_a_setting_still_being_checked() {
         immediate.turn_started(&ctx);
         immediate.push(".info".to_string());
         immediate.start_next();
-        assert!(!immediate.checking_setting());
+        assert!(!immediate.setting_pending());
         let ran = immediate.join().await;
         harness.app.handle_msg(immediate.finish(ran));
 
         immediate.push(".set temperature 0.5".to_string());
         immediate.start_next();
         assert!(
-            immediate.checking_setting(),
+            immediate.setting_pending(),
             "the turn could end with the setting still out"
         );
         let queue = NotificationQueue::new();
@@ -588,7 +588,60 @@ fn a_turn_end_waits_for_a_setting_still_being_checked() {
 
         let ran = immediate.join().await;
         harness.app.handle_msg(immediate.finish(ran));
-        assert!(!immediate.checking_setting());
+        assert!(!immediate.setting_pending());
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &queue,
+            false,
+        )
+        .await;
+        let AfterTurn::Next(next, line) = after else {
+            panic!("the held line did not run next");
+        };
+        assert_eq!(line, "held line");
+        assert_eq!(next.app.config.temperature, Some(0.5));
+    });
+}
+
+/// A setting waiting behind a slow command holds the turn's end too:
+/// it runs once that command is done, and the held line starts with it.
+#[test]
+#[serial]
+fn a_turn_end_waits_for_a_setting_queued_behind_another_command() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-finish-turn-waiting-setting");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = ImmediateCommands::default();
+        harness.app.begin_turn("explain", false);
+        immediate.turn_started(&ctx);
+        immediate.push(".info".to_string());
+        immediate.push(".set temperature 0.5".to_string());
+        immediate.start_next();
+        assert!(
+            immediate.setting_pending(),
+            "the turn could end with a setting still waiting"
+        );
+        let queue = NotificationQueue::new();
+        harness.type_text("held line");
+        let Some(Command::Queue(text)) = harness.press(KeyCode::Enter) else {
+            panic!("a line typed during a turn was not held");
+        };
+        queued::queue_user_message(&queue, &text);
+
+        let ran = immediate.join().await;
+        harness.app.handle_msg(immediate.finish(ran));
+        assert!(immediate.setting_pending());
+        immediate.start_next();
+        let ran = immediate.join().await;
+        let (line, result) = command_result(immediate.finish(ran));
+        assert_eq!(line, ".set temperature 0.5");
+        assert_eq!(result, Ok(CommandOutput::Deferred));
+        assert!(!immediate.setting_pending());
         let after = finish_turn(
             &mut harness.app,
             &mut immediate,
