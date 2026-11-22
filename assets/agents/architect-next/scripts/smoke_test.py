@@ -4588,6 +4588,10 @@ try:
     check("cleanup: address on the untrusted escalation names none of its options -> interpret_reply, no fix_request",
           u.get("_next") == "interpret_reply" and "fix_request" not in u and "review_fix_rounds" not in u and "review_seen" not in u
           and no_sentinel(u), u.get("_next"))
+    U_ESC = {**OWNER_ESC, "data": {**OWNER_ESC["data"], "untrusted": True}}
+    u = AA("review_owner_judgment", "Address it as a fix round", esc=U_ESC, **LEAKED)
+    check("review trust: an untrusted escalation that offers an address option still never makes a fix round",
+          u.get("_next") != "fix_round" and "fix_request" not in u and "review_fix_rounds" not in u and no_sentinel(u), u.get("_next"))
 
     TRIAGE = NODES.get("review_triage", {})
     check("review trust: review_triage instructions call the bodies untrusted data and the prompt wraps review_items in the markers",

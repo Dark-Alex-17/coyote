@@ -4761,7 +4761,9 @@ def apply_answer(state):
     elif kind in ("review_exhausted", "review_read_truncated", "review_round_cap", "review_owner_judgment"):
         a = "stop" if stop else _picked_key(answer, options, {"skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
                                                               "more": ["one more", "resume", "address", "fix round"], "stop": ["stop"]})
-        if a is None:
+        untrusted = as_dict(esc.get("data")).get("untrusted")
+        # untrusted items never become a fix round, whatever the options say
+        if a is None or (a == "more" and kind == "review_owner_judgment" and untrusted):
             _unmatched(state, u, esc, answer)
         elif a == "keep" and kind in ("review_exhausted", "review_read_truncated"):
             u.update({"review_polls": 0, "review_rounds": 0, "review_poll_fails": 0, "review_started_at": int(time.time()), "review_status": "",
