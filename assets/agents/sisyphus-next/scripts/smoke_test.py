@@ -213,6 +213,10 @@ check("intake: roster parse", roster.get("TASK-002") == ["src/auth/", "src/api/u
 # ---------------------------------------------------------------- assess_fault / route_intent (B1)
 u = gates.assess_fault(base_state(last_script_error="boom"))
 check("assess_fault: fail-safe -> ambiguous with options", u["intent"] == "ambiguous" and u["clarifying_questions"])
+u = gates.route_intent(base_state(**gates.assess_fault(base_state(last_script_error="the token expired")), clarify_rounds=0))
+check("assess_fault: a trigger word only in the error text -> the clarify question is no hard trigger",
+      u.get("escalation", {}).get("kind") == "clarify" and u.get("escalation", {}).get("hard_trigger") is False,
+      u.get("escalation"))
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "which module?", "options": [{"text": "a", "recommended": True, "evidence": "e"}]}], clarify_rounds=0))
 check("route_intent: ambiguous -> escalation clarify (round 1)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "clarify" and u["clarify_rounds"] == 1)
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "q"}], clarify_rounds=CLARIFY_MAX))
@@ -370,6 +374,10 @@ check("escalation: a trigger word only in the quoted error text -> no hard trigg
       quoted_trigger(f"Retry {_err}?", (_err,)) is False)
 check("escalation: the same error text not marked as quoted -> hard trigger",
       escalation("retry", f"Retry {_err}?")["hard_trigger"] is True)
+check("escalation: a one-letter quoted value does not blank the letter inside the stem's own words",
+      quoted_trigger("Delete the branch a?", ("a",)) is True)
+check("escalation: a stem matching on its own still trips with the quoted name blanked",
+      quoted_trigger("Delete the branch feat-a?", ("feat-a",)) is True)
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="A", ladder_basis="recommended option"))
 check("ladder_route: recommended -> digest + apply", u["_next"] == "apply_answer" and u["autonomous_digest"] and u["last_answer"] == "A")
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="Z"))
@@ -2288,6 +2296,10 @@ _esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=_u2.get("ci
 check("ci_route: a cancelled run already re-run this run -> re-run not offered, leaving the PR in draft recommended",
       opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
 _esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["lint", "cancel", ""]])).get("escalation", {})
+_esc_secret = gates.ci_route(base_state(ci_status="inconclusive",
+                                        ci_checks=[["build", "pass", ""], ["secret-scan", "skipping", ""]])).get("escalation", {})
+check("ci_route: an inconclusive check named with a trigger word outside a review watch -> no hard trigger",
+      _esc_secret.get("kind") == "ci_inconclusive" and _esc_secret.get("hard_trigger") is False, _esc_secret)
 check("ci_route: a cancelled check naming no run -> re-run not offered, leaving the PR in draft recommended",
       opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
 _u2 = {}
@@ -6455,6 +6467,9 @@ with scenario("base: at the integration budget the question asks for a reason, s
           and base_rec(_full) == "Leave the PR in draft and report"
           and not any(o["text"].startswith("Integrate") for o in _full["options"])
           and not any(e["hard_trigger"] for e in (_below, _at, _clean, _full)), (_at, _clean, _full))
+_esc_secret = gates._base_moved(base_state(), {}, dict(CAP_FACTS, conflicted=["secret.txt"]))["escalation"]
+check("base: a conflicted path holding a trigger word before the review watch -> no hard trigger",
+      "secret.txt" in _esc_secret.get("question", "") and _esc_secret.get("hard_trigger") is False, _esc_secret)
 with scenario("base: the report's Base line says contained, integrated, not integrated with the decision, or not "
               "checked with the reason, and not checked when a push ran without a base check") as name:
     report_facts = {"remote": "origin", "base": "main", "tip": "d" * 40, "count": 2}

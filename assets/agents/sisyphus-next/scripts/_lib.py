@@ -348,10 +348,10 @@ def option(text, recommended=False, evidence=""):
 
 
 def _own_text(question, quoted):
-    """The question with the data it quotes blanked out; longest first so a quoted string inside another goes too."""
+    """The question with the data it quotes blanked out as whole tokens; longest first so a quoted string inside another goes too."""
     text = question or ""
     for q in sorted({str(q) for q in quoted if q not in (None, "")}, key=len, reverse=True):
-        text = text.replace(q, " ")
+        text = re.sub(r"(?<!\w)" + re.escape(q) + r"(?!\w)", " ", text)
     return text
 
 

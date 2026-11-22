@@ -407,6 +407,7 @@ def assess_fault(state):
                 option("Treat it as a question (research answer, no edits)"),
                 option("Abort"),
             ],
+            "quoted": [err[:200]],
         }],
     })
     return u
@@ -810,7 +811,7 @@ def _route_intent(state, u):
         stops = ["Abort"] if truthy(state.get("assess_faulted")) else []
         asked = q.get("question", "")
         return raise_escalation(state, u, escalation("clarify", asked, opts, data={
-            "stop_options": stops, "decision": _hashed_decision("clarify", asked)}))
+            "stop_options": stops, "decision": _hashed_decision("clarify", asked)}, quoted=as_list(q.get("quoted"))))
 
     if intent in ("exploration", "design_question"):
         u["_next"] = "research_answer"
@@ -6077,8 +6078,7 @@ def ci_route(state):
         options = (keep if fits else []) + [option(_ci_leave_option(state), recommended=not fits, evidence=evidence)]
         return raise_escalation(state, u, escalation(
             "ci_poll_cap", f"{prefix}: the run's CI polls reached the {limit} ({budget}) after {polls_run} poll(s). "
-                           "How to proceed?", options, evidence=evidence, hard_trigger=_watch_started(state),
-            quoted=(limit,)))
+                           "How to proceed?", options, evidence=evidence, hard_trigger=_watch_started(state)))
     elif _watch_started(state):
         u["pr_review_status"] = f"ci_{status}"
         ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_{status}")

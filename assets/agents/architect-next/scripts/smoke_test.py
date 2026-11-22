@@ -6255,6 +6255,8 @@ check("escalation: a trigger word in the question's own stem still trips",
       escalation("x", "Rotate the credential?").get("hard_trigger") is True)
 guarded("escalation: a stem matching on its own still trips with the quoted name blanked",
         lambda: (escalation("x", "Delete the branch feat-a?", quoted=("feat-a",)).get("hard_trigger") is True, ""))
+guarded("escalation: a one-letter quoted value does not blank the letter inside the stem's own words",
+        lambda: (escalation("x", "Delete the branch a?", quoted=("a",)).get("hard_trigger") is True, ""))
 u = gates.open_questions_gate(base_state(open_questions=[{"question": "Which token cache?",
                                                           "options": [{"text": "a", "recommended": True}, {"text": "b"}]}],
                                          design_rounds=0))
