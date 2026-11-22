@@ -209,6 +209,8 @@ fn start_turn(
 /// Hands the live context the settings the snapshot took during the
 /// turn, then refreshes what the screen shows of them. Runs on an
 /// interrupted turn too: the settings are the user's, not the turn's.
+/// It runs on the loop thread, which holds only because the timing table
+/// queues every key whose update does more than change memory.
 async fn apply_deferred(
     app: &mut App,
     immediate: &mut ImmediateCommands,
@@ -232,6 +234,51 @@ async fn apply_deferred(
     }
     app.sync_from_ctx(ctx);
     app.refresh_palette(Some(ctx));
+}
+
+/// Where a finished turn leaves the context it handed back.
+pub(super) enum AfterTurn {
+    /// Back in hand: nothing is held, or the session is ending.
+    Idle(RequestContext),
+    /// The oldest held line runs next on it.
+    Next(RequestContext, String),
+}
+
+/// Closes a finished turn on screen, hands the returned context the
+/// settings taken during it unless the session is ending, and picks
+/// what runs next on that context.
+pub(super) async fn finish_turn(
+    app: &mut App,
+    immediate: &mut ImmediateCommands,
+    mut returned: RequestContext,
+    command: bool,
+    outcome: &TurnOutcome,
+    queue: &NotificationQueue,
+    quit_requested: bool,
+) -> AfterTurn {
+    immediate.turn_ended();
+    app.end_turn(command, outcome);
+    app.sync_from_ctx(&mut returned);
+    app.refresh_palette(Some(&returned));
+    if !quit_requested {
+        apply_deferred(app, immediate, &mut returned).await;
+    }
+    reconcile_queue(&mut app.queued, &take_user_messages(queue));
+    // An `.exit` that ran from the queue ends the session for the lines
+    // and settings behind it as well.
+    if quit_requested {
+        immediate.clear();
+        app.drop_queued();
+    }
+    if quit_requested || app.queued.is_empty() {
+        return AfterTurn::Idle(returned);
+    }
+    // What the model did not get runs as turns of its own, the rest
+    // offered to each of them in turn, on the returned context's queue:
+    // an agent switch during the turn left the finished turn's behind.
+    let next = app.queued.remove(0);
+    carry_over(&returned.notification_queue, &app.queued);
+    AfterTurn::Next(returned, next.text)
 }
 
 #[cfg(unix)]
@@ -744,6 +791,71 @@ pub(super) fn purge_turn_queue(task: &Option<Task>) {
     }
 }
 
+/// Where a copy went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CopyOutcome {
+    Native,
+    /// Sent to the terminal over OSC 52; `kept_lines` counts the newest
+    /// lines kept when the whole text was too long for the request.
+    Osc52 {
+        kept_lines: Option<usize>,
+    },
+    Failed(String),
+}
+
+/// Puts `text` on the system clipboard or, with none, asks the terminal
+/// to take it over the screen's own descriptor: fd 1 may be a turn's
+/// capture pipe.
+fn copy_to_clipboard(screen: &mut Screen, text: &str) -> CopyOutcome {
+    if crate::utils::set_text_native(text) {
+        return CopyOutcome::Native;
+    }
+    let kept = crate::utils::osc52_payload_cap(text);
+    match screen.write_sequence(&crate::utils::osc52_sequence(kept)) {
+        Ok(()) => CopyOutcome::Osc52 {
+            kept_lines: (kept.len() < text.len()).then(|| kept.lines().count()),
+        },
+        Err(err) => CopyOutcome::Failed(err.to_string()),
+    }
+}
+
+/// The notice after a copy of `lines` lines from `from`, which had
+/// already dropped its oldest `dropped` bytes.
+pub(super) fn copy_notice(
+    outcome: &CopyOutcome,
+    lines: usize,
+    from: &str,
+    dropped: usize,
+) -> (NoticeKind, String) {
+    let count = |n: usize| format!("{n} {}", if n == 1 { "line" } else { "lines" });
+    let mut notice = match outcome {
+        CopyOutcome::Failed(err) => {
+            return (NoticeKind::ToolWarning, format!("Copy failed: {err}"));
+        }
+        CopyOutcome::Native => format!("Copied {} from {from}", count(lines)),
+        CopyOutcome::Osc52 {
+            kept_lines: Some(kept),
+        } => format!(
+            "Sent the last {} from {from} to the terminal clipboard; only those fit",
+            count(*kept)
+        ),
+        CopyOutcome::Osc52 { kept_lines: None } => {
+            format!(
+                "Sent {} from {from} to the terminal clipboard",
+                count(lines)
+            )
+        }
+    };
+    if dropped > 0 {
+        notice.push_str(&format!(
+            "; the oldest {dropped} bytes were already dropped"
+        ));
+    }
+    // The kind only picks the style: dim, like the engine's own status
+    // notices.
+    (NoticeKind::Checkpoint, notice)
+}
+
 /// Replaces the event stream, dropping the old one first. Constructing a
 /// crossterm stream takes the shared reader lock, and the old stream's
 /// pending poll holds that lock until the stream is dropped (dropping it
@@ -938,20 +1050,18 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::SetMouseCapture(on)) => {
                         if let Err(err) = screen.set_mouse_capture(on) {
                             warn!("Failed to switch the mouse reports: {err}");
+                            app.mouse_capture_failed(!on, &err);
                         }
                     }
-                    Some(Command::Copy(text)) => {
-                        // Without a system clipboard the terminal is asked
-                        // to take it, over the screen's own descriptor.
-                        if !crate::utils::set_text_native(&text)
-                            && let Err(err) =
-                                screen.write_sequence(&crate::utils::osc52_sequence(&text))
-                        {
-                            app.handle_msg(UiMsg::Notice {
-                                kind: NoticeKind::ToolWarning,
-                                text: format!("Copy failed: {err}"),
-                            });
-                        }
+                    Some(Command::Copy {
+                        text,
+                        from,
+                        dropped,
+                    }) => {
+                        let outcome = copy_to_clipboard(screen, &text);
+                        let (kind, text) =
+                            copy_notice(&outcome, text.lines().count(), &from, dropped);
+                        app.handle_msg(UiMsg::Notice { kind, text });
                     }
                     Some(Command::Rewind(target)) => {
                         if let Some(ctx) = ctx.as_mut() {
@@ -991,8 +1101,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         continue;
                     };
                     match joined {
-                        Ok((mut returned, outcome)) => {
-                            immediate.turn_ended();
+                        Ok((returned, outcome)) => {
                             // The select is unbiased: a tool's last report
                             // may still sit in the channel next to the join
                             // that won, and the end-of-turn sweep would
@@ -1000,39 +1109,29 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             while let Ok(msg) = rx.try_recv() {
                                 app.handle_msg(msg);
                             }
-                            app.end_turn(command, &outcome);
-                            app.sync_from_ctx(&mut returned);
-                            app.refresh_palette(Some(&returned));
-                            if outcome.exit {
-                                quit_requested = true;
-                            }
-                            if !quit_requested {
-                                apply_deferred(app, &mut immediate, &mut returned).await;
-                            }
-                            reconcile_queue(&mut app.queued, &take_user_messages(&queue));
-                            // An `.exit` that ran from the queue ends the
-                            // session for the lines behind it as well.
-                            if quit_requested {
-                                app.drop_queued();
-                            }
-                            if quit_requested || app.queued.is_empty() {
-                                ctx = Some(returned);
-                            } else {
-                                // What the model did not get runs as turns
-                                // of its own, the rest offered to each of
-                                // them in turn, on the returned context's
-                                // queue: an agent switch during the turn
-                                // left the finished turn's behind.
-                                let next = app.queued.remove(0);
-                                carry_over(&returned.notification_queue, &app.queued);
-                                task = Some(start_turn(
-                                    app,
-                                    returned,
-                                    &mut immediate,
-                                    abort,
-                                    tx,
-                                    next.text,
-                                ));
+                            quit_requested |= outcome.exit;
+                            let after = finish_turn(
+                                app,
+                                &mut immediate,
+                                returned,
+                                command,
+                                &outcome,
+                                &queue,
+                                quit_requested,
+                            )
+                            .await;
+                            match after {
+                                AfterTurn::Idle(returned) => ctx = Some(returned),
+                                AfterTurn::Next(returned, line) => {
+                                    task = Some(start_turn(
+                                        app,
+                                        returned,
+                                        &mut immediate,
+                                        abort,
+                                        tx,
+                                        line,
+                                    ));
+                                }
                             }
                         }
                         Err(err) => {

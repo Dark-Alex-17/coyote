@@ -8,7 +8,7 @@ use super::cells::{
     self, AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTail, TaskRow, ToolStatus,
     append_output,
 };
-use super::render::Renderer;
+use super::render::{RenderCache, Renderer};
 use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
 use crate::config::CommandPrefix;
 use crate::events::NoticeKind;
@@ -72,6 +72,12 @@ pub(super) struct Transcript {
     /// mid-stream (a background job's output, a notice) lands after it
     /// and the next delta still finds it.
     stream: Option<usize>,
+    /// The cells of the streaming reply that a command's cell cut off,
+    /// oldest first. Until the next delta opens another, the reply has
+    /// no open cell.
+    stream_parts: Vec<usize>,
+    /// What the next part of a cut reply starts with.
+    stream_carry: String,
     /// Set when the focus moved; the next frame scrolls so the focused
     /// row's header is in view.
     reveal_focus: bool,
@@ -101,6 +107,8 @@ impl Transcript {
             unseen: 0,
             focus: None,
             stream: None,
+            stream_parts: Vec::new(),
+            stream_carry: String::new(),
             reveal_focus: false,
             last_layout: Vec::new(),
             last_area: Rect::ZERO,
@@ -234,10 +242,63 @@ impl Transcript {
         self.touch(stream)
     }
 
-    /// Forgets the streaming cell and hands it over to be finalised.
+    /// Adds a delta to the streaming reply, opening a cell for it when
+    /// none is open.
+    pub(super) fn stream_delta(&mut self, delta: &str) {
+        match self.stream_cell_mut() {
+            Some(Cell::Assistant { source, .. }) => source.push_str(delta),
+            _ => {
+                let source = std::mem::take(&mut self.stream_carry) + delta;
+                self.open_stream(Cell::assistant(source, false));
+            }
+        }
+    }
+
+    /// Ends the streaming reply's open cell where it is, so the next cell
+    /// pushed sits below the text so far and the next delta opens a cell
+    /// below that one.
+    pub(super) fn cut_stream(&mut self) {
+        let Some(index) = self.stream.take() else {
+            return;
+        };
+        self.stream_carry = match self.touch(index) {
+            Some(Cell::Assistant { source, done, .. }) => {
+                *done = true;
+                cells::reply_continuation(source)
+            }
+            _ => String::new(),
+        };
+        self.stream_parts.push(index);
+    }
+
+    /// Forgets the streaming cell and hands it over to be finalised; the
+    /// cells a command cut off the reply are already final.
     pub(super) fn close_stream(&mut self) -> Option<&mut Cell> {
+        self.stream_parts.clear();
+        self.stream_carry.clear();
         let stream = self.stream.take()?;
         self.touch(stream)
+    }
+
+    /// Puts a round's final text in place of what streamed of it: the
+    /// cells a command cut off go, and the text takes the open cell, or a
+    /// cell of its own at the end when none is open.
+    pub(super) fn finish_stream(&mut self, text: String) {
+        for index in std::mem::take(&mut self.stream_parts).into_iter().rev() {
+            self.remove(index);
+        }
+        match self.close_stream() {
+            Some(Cell::Assistant {
+                source,
+                done,
+                cache,
+            }) => {
+                *source = text;
+                *done = true;
+                *cache = RenderCache::default();
+            }
+            _ => self.push(Cell::assistant(text, true)),
+        }
     }
 
     /// Puts `cell` where another was; the row keeps its place and its
@@ -271,6 +332,11 @@ impl Transcript {
         };
         self.focus = shift(self.focus);
         self.stream = shift(self.stream);
+        self.stream_parts = self
+            .stream_parts
+            .iter()
+            .filter_map(|&part| shift(Some(part)))
+            .collect();
         self.anchor = match self.anchor {
             Some(anchor) if anchor.cell == index && index < self.cells.len() => Some(Anchor {
                 cell: index,
@@ -311,6 +377,7 @@ impl Transcript {
         if self.stream.is_some_and(|stream| stream >= len) {
             self.stream = None;
         }
+        self.stream_parts.retain(|&part| part < len);
         self.anchor = match self.anchor {
             Some(anchor) if anchor.gap && anchor.cell == len => {
                 len.checked_sub(1).map(|cell| Anchor {

@@ -96,6 +96,11 @@ In a session, press it again at the idle prompt to cancel background work.";
 /// Spelled with the dot prefix; `render_hints` swaps in the active one.
 pub(crate) const WELCOME_HELP_HINT: &str = r#"Type ".help" for additional help."#;
 
+/// Printed for a bare `.set` or `.reasoning`, with the dot prefix that
+/// `render_hints` swaps for the active one.
+pub(crate) const SET_USAGE: &str = "Usage: .set <key> <value>...";
+pub(crate) const REASONING_USAGE: &str = "Usage: .reasoning <level>";
+
 /// Brackets one user-visible turn at an outer boundary (`ask`,
 /// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
 /// `finish` fires exactly one of `turn.completed` / `turn.interrupted` /
@@ -1547,7 +1552,7 @@ async fn dispatch_repl_line(
                     ctx.update(args, abort_signal).await?;
                 }
                 _ => {
-                    println!("{}", ctx.render_hints("Usage: .set <key> <value>..."))
+                    println!("{}", ctx.render_hints(SET_USAGE))
                 }
             },
             ".reasoning" => match args {
@@ -1556,7 +1561,7 @@ async fn dispatch_repl_line(
                     ctx.update(&set_args, abort_signal).await?;
                 }
                 None => {
-                    println!("{}", ctx.render_hints("Usage: .reasoning <level>"))
+                    println!("{}", ctx.render_hints(REASONING_USAGE))
                 }
             },
             ".delete" => match args {

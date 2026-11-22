@@ -72,6 +72,10 @@ static ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
 static SCREEN_ENTERED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 
+/// Whether mouse reports are on when the UI starts, read by both the
+/// screen and the footer that shows the mode.
+pub(crate) const MOUSE_CAPTURE_DEFAULT: bool = true;
+
 /// One terminal mode toggled on enter and back off on leave. The `bool` is
 /// the state the step moves the terminal to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -931,7 +935,7 @@ impl Screen {
         let input_mode = snapshot_input_mode();
         #[cfg(windows)]
         CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
-        if let Err(err) = enter(terminal.backend_mut(), enhancement, true) {
+        if let Err(err) = enter(terminal.backend_mut(), enhancement, MOUSE_CAPTURE_DEFAULT) {
             // Taken back before `terminal` drops the writer: the hook must
             // never write to a closed or reused descriptor.
             #[cfg(unix)]
@@ -946,7 +950,7 @@ impl Screen {
         Ok(Self {
             terminal,
             enhancement,
-            mouse: true,
+            mouse: MOUSE_CAPTURE_DEFAULT,
             #[cfg(unix)]
             fd,
             #[cfg(windows)]
@@ -1029,10 +1033,11 @@ impl Screen {
 
     /// Turns mouse reports on (the wheel scrolls, a click folds a row) or
     /// off (the terminal selects text), and keeps the choice for every
-    /// re-entry after.
+    /// re-entry after. A failed write keeps the previous choice.
     pub(crate) fn set_mouse_capture(&mut self, on: bool) -> io::Result<()> {
+        TerminalStep::MouseCapture(on).apply(self.terminal.backend_mut())?;
         self.mouse = on;
-        TerminalStep::MouseCapture(on).apply(self.terminal.backend_mut())
+        Ok(())
     }
 
     /// Writes an escape sequence for the terminal itself, such as an OSC 52

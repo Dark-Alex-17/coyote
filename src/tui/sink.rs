@@ -73,6 +73,8 @@ pub(crate) enum UiMsg {
         agent_id: String,
         node: Option<String>,
         call_id: String,
+        name: String,
+        args: Option<Value>,
         ok: bool,
         error: Option<String>,
         duration_ms: Option<u64>,
@@ -378,17 +380,19 @@ impl EventSink for TuiSink {
             Event::Hook {
                 event: event @ (HookEvent::ToolCompleted | HookEvent::ToolFailed),
                 envs,
+                payload,
                 origin:
                     Origin {
                         agent_id: Some(agent_id),
                         node,
                         ..
                     },
-                ..
             } => self.send(UiMsg::ChildToolFinished {
                 agent_id: agent_id.clone(),
                 node: node.clone(),
                 call_id: hook_env_or_empty(envs, "COYOTE_TOOL_CALL_ID"),
+                name: hook_env_or_empty(envs, "COYOTE_TOOL_NAME"),
+                args: tool_args(payload),
                 ok: *event == HookEvent::ToolCompleted,
                 error: hook_env(envs, "COYOTE_TOOL_ERROR"),
                 duration_ms: tool_duration_ms(envs),
@@ -713,7 +717,7 @@ mod tests {
         assert!(matches!(
             &msgs[1],
             UiMsg::ChildToolFinished {
-                agent_id, node: Some(node), call_id, ok: false, error: Some(error), duration_ms: Some(40)
+                agent_id, node: Some(node), call_id, ok: false, error: Some(error), duration_ms: Some(40), ..
             } if agent_id == "agent_graph_9f8e" && node == "plan" && call_id == "call-c1" && error == "missing"
         ));
         assert!(matches!(

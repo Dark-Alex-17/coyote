@@ -3731,7 +3731,7 @@ mod tests {
         }
         let alt_c = press(KeyCode::Char('c'), KeyModifiers::ALT);
         for ctx in [
-            IDLE, TYPING, FOCUSED, RUNNING, VI_NORMAL, CONFIRM, INPUT, SELECT, SEARCH,
+            IDLE, TYPING, FOCUSED, RUNNING, VI_NORMAL, CONFIRM, INPUT, PASSWORD, SELECT, SEARCH,
         ] {
             assert_eq!(map_key(alt_c, &ctx), Action::CopyToolOutput, "{ctx:?}");
         }

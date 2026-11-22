@@ -786,6 +786,55 @@ fn an_agent_switch_entered_during_a_turn_still_waits() {
     assert!(harness.draw().contains("pending: 1"));
 }
 
+/// A session switch and a cleared conversation change what the turn
+/// runs on, so each waits behind it in the order typed.
+#[test]
+fn session_and_conversation_changes_entered_during_a_turn_wait() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    for (pending, line) in [".session foo", ".clear messages"].iter().enumerate() {
+        harness.type_text(line);
+        assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
+        assert_eq!(harness.app.queued.len(), pending + 1);
+        assert_eq!(harness.app.queued[pending].text, *line);
+        let frame = harness.draw();
+        assert!(
+            frame.contains(&format!("pending: {}", pending + 1)),
+            "{frame}"
+        );
+    }
+}
+
+/// A `.set` whose key starts servers or saves the RAG waits for the turn
+/// instead of being checked beside it; a plain setting does not.
+#[test]
+fn settings_with_side_effects_entered_during_a_turn_wait() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    let lines = [
+        ".set enabled_mcp_servers x",
+        ".set rag_top_k 3",
+        ".set skills_enabled false",
+    ];
+    for line in lines {
+        harness.type_text(line);
+        assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
+    }
+    let queued: Vec<&str> = harness
+        .app
+        .queued
+        .iter()
+        .map(|queued| queued.text.as_str())
+        .collect();
+    assert_eq!(queued, lines);
+    harness.type_text(".set temperature 0.5");
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::RunNow(".set temperature 0.5".to_string()))
+    );
+    assert_eq!(harness.app.queued.len(), lines.len());
+}
+
 /// What a command run beside the turn printed comes back as the same
 /// command cell an idle run leaves; a failure adds the error cell after
 /// it, as an idle run does.
@@ -827,6 +876,114 @@ fn a_command_run_beside_the_turn_adds_its_command_cell() {
         cells.last(),
         Some(Cell::Error { text, .. }) if text == "Unknown command"
     ));
+}
+
+/// A command's cell arriving mid-stream cuts the reply around it: the
+/// text so far stays above, and the deltas after it grow below, in view.
+#[test]
+fn a_command_cell_mid_stream_keeps_the_live_reply_below_it() {
+    let mut harness = Harness::standalone(80, 30);
+    harness.app.begin_turn("explain", false);
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("first part c4k\n\n".to_string()));
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".info".to_string(),
+        result: Ok(CommandOutput::Text("model openai:info-c4k\n".to_string())),
+    });
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("second part c4k".to_string()));
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta(" newest c4k".to_string()));
+    let frame = harness.draw();
+    let row = |needle: &str| {
+        frame
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is not in view:\n{frame}"))
+    };
+    assert!(row("info-c4k") < row("newest c4k"), "{frame}");
+    assert!(row("first part c4k") < row("info-c4k"), "{frame}");
+
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let replies: Vec<(&str, bool)> = harness
+        .app
+        .transcript
+        .cells()
+        .iter()
+        .filter_map(|cell| match cell {
+            Cell::Assistant { source, done, .. } => Some((source.as_str(), *done)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        [
+            ("first part c4k\n\n", true),
+            ("second part c4k newest c4k", true)
+        ]
+    );
+}
+
+/// A reply cut inside a code fence or its reasoning reads on the same
+/// way in its next cell, and a round's final text replaces every cell
+/// the round streamed into.
+#[test]
+fn a_cut_reply_carries_its_open_fence_and_takes_its_final_text_whole() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("```rust\nlet a = 1;\n".to_string()));
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".help".to_string(),
+        result: Ok(CommandOutput::Text("help\n".to_string())),
+    });
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("let b = 2;\n```\n".to_string()));
+    let Some(Cell::Assistant { source, .. }) = harness.app.transcript.cells().last() else {
+        panic!("the reply did not go on below the command cell");
+    };
+    assert_eq!(source, "```rust\nlet b = 2;\n```\n");
+
+    harness
+        .app
+        .handle_msg(UiMsg::AssistantText("the whole reply".to_string()));
+    let cells = harness.app.transcript.cells();
+    let replies = cells
+        .iter()
+        .filter(|cell| matches!(cell, Cell::Assistant { .. }))
+        .count();
+    assert_eq!(replies, 1);
+    assert!(matches!(
+        cells.last(),
+        Some(Cell::Assistant { source, done: true, .. }) if source == "the whole reply"
+    ));
+    assert!(matches!(
+        &cells[cells.len() - 2],
+        Cell::Command { name, .. } if name == ".help"
+    ));
+
+    harness.app.begin_turn("think", false);
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("<think>weighing".to_string()));
+    harness.app.handle_msg(UiMsg::CommandRan {
+        line: ".help".to_string(),
+        result: Ok(CommandOutput::Text("help\n".to_string())),
+    });
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta(" more</think>answer t2r".to_string()));
+    let frame = harness.draw();
+    assert!(frame.contains("answer t2r"), "{frame}");
+    assert!(
+        !frame.contains("weighing") && !frame.contains("more"),
+        "{frame}"
+    );
 }
 
 /// A setting typed during a turn goes to the loop like a reading
@@ -5696,9 +5853,7 @@ fn footer_counts(harness: &mut Harness) -> String {
     let frame = harness.draw();
     let footer = frame.lines().last().unwrap_or_default();
     let start = footer.find("agents").expect("the footer has its counts");
-    let end = footer
-        .find(" . mouse")
-        .expect("the footer has the mouse mode");
+    let end = footer.find("mouse").expect("the footer has the mouse mode");
     footer[start..end].trim().to_string()
 }
 

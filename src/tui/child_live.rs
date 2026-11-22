@@ -4,8 +4,8 @@
 //! file has its messages; only this store has its calls as they happen.
 
 use super::FULL_OUTPUT_BUDGET;
-use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow};
-use super::sink::ChildNodeState;
+use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow, ToolStatus};
+use super::sink::{AgentOutcome, ChildNodeState};
 use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,11 +14,23 @@ use std::time::{Duration, Instant};
 /// The most rows one child keeps; the oldest goes first.
 pub(super) const CHILD_ROW_LIMIT: usize = 500;
 
-/// How a child's tool call ended, as its finish hook reports it.
+/// How a child's tool call ended, as its finish hook reports it. The
+/// call's name and arguments pair a call that has no id with its start.
 pub(super) struct ToolEnd {
+    pub(super) name: String,
+    pub(super) args: Option<Value>,
     pub(super) ok: bool,
     pub(super) error: Option<String>,
     pub(super) duration_ms: Option<u64>,
+}
+
+/// A child's top-level call row's text: a child's call has no narration
+/// line, so it is the call's name and arguments.
+fn call_summary(name: String, args: Option<&Value>) -> String {
+    match args {
+        Some(args) => format!("{name} {args}"),
+        None => name,
+    }
 }
 
 /// One child's rows: its top-level tool calls and, for a graph agent, a
@@ -61,6 +73,55 @@ impl ChildThread {
             } if id == node_id => Some(row),
             _ => None,
         })
+    }
+
+    /// The top-level call row a finish of `call_id` settles; for a call
+    /// with no id, the oldest running one with the same `summary`, as
+    /// calls run side by side finish in any order.
+    fn tool_to_finish(&mut self, call_id: &str, summary: &str) -> Option<&mut Cell> {
+        if call_id.is_empty() {
+            return self.rows.iter_mut().find(|cell| {
+                cell.running()
+                    && matches!(cell, Cell::Tool { call_id: id, summary: text, .. }
+                        if id.is_empty() && text == summary)
+            });
+        }
+        self.rows
+            .iter_mut()
+            .rev()
+            .find(|cell| matches!(cell, Cell::Tool { call_id: id, .. } if id == call_id))
+    }
+
+    /// Settles every call and node of the child still running as failed
+    /// with `error`, the calls with the time they ran up to `now`; their
+    /// finish hooks never come once the child has ended. Returns the bytes
+    /// of whole output this added.
+    fn settle_running(&mut self, error: &str, now: Instant) -> isize {
+        let mut grew = 0;
+        let mut settle = |status: &mut ToolStatus, full: &mut cells::FullOutput| {
+            if matches!(status, ToolStatus::Running { .. }) {
+                status.finish(now, false, Some(error.to_string()), None);
+                grew += full.settle();
+            }
+        };
+        for cell in &mut self.rows {
+            match cell {
+                Cell::Tool { status, tail, .. } => settle(status, &mut tail.full),
+                Cell::Node { row, .. } => {
+                    for call in &mut row.calls {
+                        if let Some(status) = &mut call.status {
+                            settle(status, &mut call.tail.full);
+                        }
+                    }
+                    if matches!(row.status, NodeStatus::Running { .. }) {
+                        row.status = NodeStatus::Failed(error.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.forget_wrapped_lines();
+        grew
     }
 
     /// A row's state changed in place, so its cached lines are stale.
@@ -128,10 +189,20 @@ impl ChildLive {
         thread.finished = false;
     }
 
-    pub(super) fn agent_finished(&mut self, agent_id: &str) {
-        if let Some(thread) = self.threads.get_mut(agent_id) {
-            thread.finished = true;
-        }
+    /// The child ended: whatever it left running is settled as failed,
+    /// with why the child ended.
+    pub(super) fn agent_finished(&mut self, agent_id: &str, outcome: &AgentOutcome, now: Instant) {
+        let Some(thread) = self.threads.get_mut(agent_id) else {
+            return;
+        };
+        thread.finished = true;
+        let error = match outcome {
+            AgentOutcome::Interrupted => "interrupted",
+            AgentOutcome::Failed(error) if !error.is_empty() => error,
+            AgentOutcome::Failed(_) | AgentOutcome::Completed => "agent finished",
+        };
+        let grew = thread.settle_running(error, now);
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
     /// Drops every row's cached lines, for when the renderer changed.
@@ -189,12 +260,7 @@ impl ChildLive {
                 thread.forget_wrapped_lines();
             }
             None => {
-                // A child's call has no narration line, so the row's text
-                // is its name and arguments.
-                let summary = match args {
-                    Some(args) => format!("{name} {args}"),
-                    None => name,
-                };
+                let summary = call_summary(name, args.as_ref());
                 thread.rows.push(Cell::tool(call_id, summary, now));
             }
         }
@@ -213,36 +279,46 @@ impl ChildLive {
             return;
         };
         let ToolEnd {
+            name,
+            args,
             ok,
             error,
             duration_ms,
         } = end;
-        let grew =
-            match node {
-                Some(node_id) => {
-                    let Some(call) = thread.node_row(node_id).and_then(|row| {
+        let grew = match node {
+            Some(node_id) => {
+                let Some(call) = thread.node_row(node_id).and_then(|row| {
+                    if call_id.is_empty() {
+                        row.calls.iter_mut().find(|call| {
+                            call.call_id.is_empty()
+                                && call.name == name
+                                && matches!(call.status, Some(ToolStatus::Running { .. }))
+                        })
+                    } else {
                         row.calls
                             .iter_mut()
                             .rev()
                             .find(|call| call.call_id == call_id)
-                    }) else {
-                        return;
-                    };
-                    if let Some(status) = &mut call.status {
-                        status.finish(now, ok, error, duration_ms);
                     }
-                    call.tail.full.settle()
-                }
-                None => {
-                    let Some(Cell::Tool { status, tail, .. }) = thread.rows.iter_mut().rev().find(
-                        |cell| matches!(cell, Cell::Tool { call_id: id, .. } if id == call_id),
-                    ) else {
-                        return;
-                    };
+                }) else {
+                    return;
+                };
+                if let Some(status) = &mut call.status {
                     status.finish(now, ok, error, duration_ms);
-                    tail.full.settle()
                 }
-            };
+                call.tail.full.settle()
+            }
+            None => {
+                let summary = call_summary(name, args.as_ref());
+                let Some(Cell::Tool { status, tail, .. }) =
+                    thread.tool_to_finish(call_id, &summary)
+                else {
+                    return;
+                };
+                status.finish(now, ok, error, duration_ms);
+                tail.full.settle()
+            }
+        };
         thread.forget_wrapped_lines();
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
@@ -284,6 +360,19 @@ impl ChildLive {
         };
         let status = match state {
             ChildNodeState::Started => {
+                // A call can report its node before the node's own start
+                // does; the row it opened then is this start's.
+                if let Some(Cell::Node {
+                    node_type: placeholder,
+                    ..
+                }) = thread.rows.iter_mut().rev().find(|cell| {
+                    matches!(cell, Cell::Node { node_id: id, node_type, .. }
+                        if *id == node_id && node_type.is_empty() && cell.running())
+                }) {
+                    *placeholder = node_type;
+                    thread.forget_wrapped_lines();
+                    return;
+                }
                 thread.rows.push(Cell::node(node_id, node_type, now));
                 self.cap_rows(agent_id);
                 return;

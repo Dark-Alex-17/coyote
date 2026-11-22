@@ -431,7 +431,8 @@ impl App {
 
     /// Shows a command that ran beside the turn the way `end_turn` shows
     /// the same command run as a turn of its own; a setting says when it
-    /// takes effect.
+    /// takes effect. A reply streaming meanwhile is cut around the cell,
+    /// so its newest text stays at the bottom.
     pub(crate) fn push_command_result(
         &mut self,
         line: &str,
@@ -451,6 +452,7 @@ impl App {
             }
             Err(error) => Some(error),
         };
+        self.transcript.cut_stream();
         self.transcript.push(cell);
         if let Some(error) = error {
             self.transcript.push(Cell::Error {

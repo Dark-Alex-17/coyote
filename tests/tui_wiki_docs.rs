@@ -1120,7 +1120,10 @@ fn tui_page_quotes_the_code() {
         .to_string();
     let footer_text = fn_body(
         tui,
-        "fn parts(&self, (agents, jobs): (usize, usize), mouse_capture: bool) -> Vec<String> {",
+        "fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {",
+    ) + &fn_body(
+        tui,
+        "fn footer_right(mouse_capture: bool, usage: &str, theme: &Theme) -> Line<'static> {",
     );
     let mut footer: Vec<String> = string_literals(&footer_text)
         .iter()

@@ -28,6 +28,8 @@ fn child_tool_done(harness: &mut Harness, node: Option<&str>, call_id: &str, ok:
         agent_id: AGENT.to_string(),
         node: node.map(str::to_string),
         call_id: call_id.to_string(),
+        name: "fs_read".to_string(),
+        args: Some(serde_json::json!({"path": "src/lib.rs"})),
         ok,
         error: (!ok).then(|| "denied".to_string()),
         duration_ms: Some(250),
@@ -155,6 +157,131 @@ fn a_failed_node_keeps_its_error() {
         thread(&harness).rows(),
         [Cell::Node { row, .. }] if row.status == NodeStatus::Failed("exit 3".to_string())
     ));
+}
+
+/// A call that reports its node before the node's own start opens a row
+/// for it; the start then fills that row in rather than adding another.
+#[test]
+fn a_nodes_start_after_its_first_call_fills_in_the_row_the_call_opened() {
+    let mut harness = Harness::standalone(80, 24);
+    started(&mut harness);
+    child_tool(&mut harness, Some("plan"), "call-e1", "fs_read");
+    child_node(&mut harness, "plan", ChildNodeState::Started);
+    let rows = thread(&harness).rows();
+    assert_eq!(rows.len(), 1, "the start added a second row");
+    assert!(matches!(
+        &rows[0],
+        Cell::Node { node_type, row, .. } if node_type == "llm" && row.calls.len() == 1
+    ));
+
+    child_node(
+        &mut harness,
+        "plan",
+        ChildNodeState::Completed {
+            duration_ms: None,
+            route: None,
+        },
+    );
+    child_node(&mut harness, "plan", ChildNodeState::Started);
+    assert_eq!(thread(&harness).rows().len(), 2, "a second visit has a row");
+}
+
+/// Calls with no id that run side by side are finished by their name and
+/// arguments, the oldest running one first.
+#[test]
+fn a_call_with_no_id_finishes_the_oldest_running_call_like_it() {
+    let mut harness = Harness::standalone(80, 24);
+    started(&mut harness);
+    let start = |harness: &mut Harness, name: &str| {
+        harness.app.handle_msg(UiMsg::ChildToolStarted {
+            agent_id: AGENT.to_string(),
+            node: None,
+            call_id: String::new(),
+            name: name.to_string(),
+            args: Some(serde_json::json!({"path": "src/lib.rs"})),
+        });
+    };
+    start(&mut harness, "fs_read");
+    start(&mut harness, "fs_grep");
+    start(&mut harness, "fs_read");
+    harness.app.handle_msg(UiMsg::ChildToolFinished {
+        agent_id: AGENT.to_string(),
+        node: None,
+        call_id: String::new(),
+        name: "fs_read".to_string(),
+        args: Some(serde_json::json!({"path": "src/lib.rs"})),
+        ok: true,
+        error: None,
+        duration_ms: Some(250),
+    });
+    let states: Vec<bool> = thread(&harness).rows().iter().map(Cell::running).collect();
+    assert_eq!(states, [false, true, true]);
+}
+
+/// A child that ends with calls and nodes still running settles them
+/// failed with why it ended, the calls with the time they ran; nothing
+/// keeps the throbber turning after.
+#[test]
+#[serial]
+fn a_child_that_ends_settles_what_it_left_running() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-child-ends-settled");
+        for (outcome, said) in [
+            (AgentOutcome::Interrupted, "interrupted"),
+            (AgentOutcome::Failed("quota".to_string()), "quota"),
+            (AgentOutcome::Failed(String::new()), "agent finished"),
+            (AgentOutcome::Completed, "agent finished"),
+        ] {
+            // The roster lists the child, so its thread outlasts its end.
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            tasks.write().register(finished_agent(AGENT)).unwrap();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            started(&mut harness);
+            child_tool(&mut harness, None, "call-s1", "execute_command");
+            child_node(&mut harness, "plan", ChildNodeState::Started);
+            child_tool(&mut harness, Some("plan"), "call-s2", "fs_read");
+            open_thread(&mut harness);
+            harness.draw();
+            harness.app.frame_drawn();
+            assert!(harness.app.frames.due_at().is_some());
+
+            harness.clock.advance(Duration::from_secs(3));
+            harness.app.handle_msg(UiMsg::AgentFinished {
+                agent_id: AGENT.to_string(),
+                outcome: outcome.clone(),
+            });
+            let rows = thread(&harness).rows();
+            assert!(
+                matches!(
+                    &rows[0],
+                    Cell::Tool { status: ToolStatus::Failed { elapsed, error }, .. }
+                        if *elapsed == Duration::from_secs(3) && error == said
+                ),
+                "{outcome:?}"
+            );
+            assert!(
+                matches!(
+                    &node_calls(&rows[1], "plan")[0].status,
+                    Some(ToolStatus::Failed { error, .. }) if error == said
+                ),
+                "{outcome:?}"
+            );
+            assert!(
+                matches!(
+                    &rows[1],
+                    Cell::Node { row, .. } if row.status == NodeStatus::Failed(said.to_string())
+                ),
+                "{outcome:?}"
+            );
+            let frame = harness.draw();
+            assert!(frame.contains(&format!("3s  failed: {said}")), "{frame}");
+            harness.app.frame_drawn();
+            assert_eq!(harness.app.frames.due_at(), None, "{outcome:?}");
+        }
+    });
 }
 
 /// A child's output lands in the tail of the call it belongs to, folded

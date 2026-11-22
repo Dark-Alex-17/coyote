@@ -1,7 +1,7 @@
 use super::*;
 use crate::tui::run_loop::{
-    DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished, dump_route,
-    flush_typeahead, join_unattended, purge_turn_queue, quit_abort,
+    AfterTurn, DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished,
+    dump_route, finish_turn, flush_typeahead, join_unattended, purge_turn_queue, quit_abort,
 };
 #[cfg(unix)]
 use crate::tui::run_loop::{Termination, edit_in_editor};
@@ -384,25 +384,170 @@ fn a_setting_beside_a_turn_reaches_the_returned_context() {
     });
 }
 
-/// The settings reach the returned context before the next held line
-/// starts its turn on it, and not when the session is ending.
+/// A turn on `ctx` with `setting` typed during it and checked beside it,
+/// as the loop runs one: the setting's cell is on screen when it returns.
+async fn turn_with_setting(
+    harness: &mut Harness,
+    ctx: &RequestContext,
+    setting: &str,
+) -> ImmediateCommands {
+    let mut immediate = ImmediateCommands::default();
+    harness.app.begin_turn("explain", false);
+    immediate.turn_started(ctx);
+    harness.type_text(setting);
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::RunNow(setting.to_string()))
+    );
+    immediate.push(setting.to_string());
+    immediate.start_next();
+    let ran = immediate.join().await;
+    harness.app.handle_msg(immediate.finish(ran, true));
+    immediate
+}
+
+/// A setting taken during a turn is on the context the held line's turn
+/// starts with.
 #[test]
-fn a_finished_turn_applies_settings_before_the_next_held_line() {
-    let body = fn_body(
-        include_str!("../run_loop.rs"),
-        "async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext)",
-    );
-    let ended = body.find("Done::Turn(joined) =>").unwrap();
-    let arm = &body[ended..];
-    let applied = arm
-        .find("apply_deferred(app, &mut immediate, &mut returned)")
-        .unwrap();
-    let next = arm.find("start_turn(").unwrap();
-    assert!(applied < next, "the next held line started first");
-    assert!(
-        arm[..applied].contains("if !quit_requested {"),
-        "settings were applied to a session that is ending"
-    );
-    let quit = body.find("Some(Command::Quit) =>").unwrap();
-    assert!(body[quit..].contains("immediate.clear();"));
+#[serial]
+fn a_finished_turn_hands_its_settings_to_the_next_held_line() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-finish-turn-held");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = turn_with_setting(&mut harness, &ctx, ".set temperature 0.5").await;
+        let queue = NotificationQueue::new();
+        harness.type_text("held line");
+        let Some(Command::Queue(text)) = harness.press(KeyCode::Enter) else {
+            panic!("a line typed during a turn was not held");
+        };
+        queued::queue_user_message(&queue, &text);
+
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &queue,
+            false,
+        )
+        .await;
+        let AfterTurn::Next(next, line) = after else {
+            panic!("the held line did not run next");
+        };
+        assert_eq!(line, "held line");
+        assert_eq!(next.app.config.temperature, Some(0.5));
+        assert!(immediate.take_deferred().is_empty());
+    });
+}
+
+/// With nothing held, the context parked for the next idle line has the
+/// setting.
+#[test]
+#[serial]
+fn a_finished_turn_parks_its_context_with_the_settings() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-finish-turn-idle");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = turn_with_setting(&mut harness, &ctx, ".set temperature 0.5").await;
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &NotificationQueue::new(),
+            false,
+        )
+        .await;
+        let AfterTurn::Idle(parked) = after else {
+            panic!("a turn with nothing held started another");
+        };
+        assert_eq!(parked.app.config.temperature, Some(0.5));
+    });
+}
+
+/// A setting the snapshot took but the returned context refuses is named
+/// in a notice, and the context keeps its old value.
+#[test]
+#[serial]
+fn a_setting_the_returned_context_refuses_says_it_did_not_apply() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-finish-turn-refused");
+        let snapshot = chat_ctx();
+        let mut harness = Harness::for_ctx(&snapshot);
+        harness.resize(120, 30);
+        let mut immediate =
+            turn_with_setting(&mut harness, &snapshot, ".set auto_continue true").await;
+        let mut returned = chat_ctx();
+        returned
+            .update("function_calling_support false", create_abort_signal())
+            .await
+            .unwrap();
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            returned,
+            false,
+            &TurnOutcome::default(),
+            &NotificationQueue::new(),
+            false,
+        )
+        .await;
+        let AfterTurn::Idle(parked) = after else {
+            panic!("a turn with nothing held started another");
+        };
+        assert!(!parked.app.config.auto_continue);
+        let frame = harness.draw();
+        assert!(
+            frame.contains(".set auto_continue true did not apply"),
+            "{frame}"
+        );
+    });
+}
+
+/// A quit while a setting is still being checked drops it: the context
+/// the exit work gets never takes it, and nothing held runs.
+#[test]
+#[serial]
+fn a_quit_drops_the_settings_taken_during_the_turn() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-finish-turn-quit");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = ImmediateCommands::default();
+        harness.app.begin_turn("explain", false);
+        immediate.turn_started(&ctx);
+        immediate.push(".set temperature 0.5".to_string());
+        immediate.push(".info".to_string());
+        immediate.start_next();
+        assert!(immediate.is_running());
+        immediate.clear();
+        let ran = immediate.join().await;
+        harness.app.handle_msg(immediate.finish(ran, true));
+        harness.app.queued.push(QueuedLine {
+            text: ".agent x".to_string(),
+            command: true,
+        });
+
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &NotificationQueue::new(),
+            true,
+        )
+        .await;
+        let AfterTurn::Idle(parked) = after else {
+            panic!("a held line ran after the quit");
+        };
+        assert_eq!(parked.app.config.temperature, None);
+        assert!(harness.app.queued.is_empty());
+        assert!(immediate.take_deferred().is_empty());
+        assert_eq!(immediate.take_idle_line(), None);
+    });
 }

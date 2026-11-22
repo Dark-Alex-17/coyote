@@ -27,11 +27,68 @@ const DISPATCHER_ONLY: &[&str] = &[
     ".macro disable",
 ];
 
+/// The `.set` keys whose update writes files, starts processes, prints or
+/// rebuilds the tools.
+const SIDE_EFFECT_SET_KEYS: &[&str] = &[
+    "skills_enabled",
+    "enabled_mcp_servers",
+    "mcp_server_support",
+    "mcp_tools.github",
+    "rag_top_k",
+    "rag_reranker_model",
+];
+
+/// The reasons a command that switches what the turn runs with gives.
+const SWITCHING_REASONS: &[&str] = &[
+    "changes the agent",
+    "changes the conversation",
+    "changes the model",
+    "changes the RAG",
+    "changes the role",
+    "changes the session",
+    "changes the tools the model is offered",
+];
+
+/// The first words of commands that switch what the turn runs with.
+const SWITCHING_COMMANDS: &[&str] = &[
+    ".agent",
+    ".session",
+    ".role",
+    ".temp-role",
+    ".model",
+    ".rag",
+    ".fork",
+    ".undo",
+    ".compress",
+    ".empty",
+    ".recover",
+    ".exit",
+    ".clear",
+    ".mcp",
+    ".tool",
+];
+
+fn timing(line: &str) -> Option<Timing> {
+    lookup(line, CommandPrefix::Dot).map(|(_, timing)| *timing)
+}
+
 #[test]
 fn every_command_has_exactly_one_timing_and_every_timing_a_command() {
     let commands: BTreeSet<&str> = repl_command_names()
         .chain([".keys"])
         .chain(DISPATCHER_ONLY.iter().copied())
+        .chain(
+            COMMAND_TIMINGS
+                .iter()
+                .map(|(name, _)| *name)
+                .filter(|name| {
+                    name.strip_prefix(".set ").is_some_and(|key| {
+                        SIDE_EFFECT_SET_KEYS.iter().any(|known| {
+                            *known == key || (key.ends_with('.') && known.starts_with(key))
+                        })
+                    })
+                }),
+        )
         .collect();
     let mut table = BTreeSet::new();
     for (name, _) in COMMAND_TIMINGS {
@@ -77,7 +134,6 @@ fn macros_shell_lines_and_prompts_have_no_entry() {
 
 #[test]
 fn reading_and_editor_commands_run_now_and_switches_wait() {
-    let timing = |line: &str| lookup(line, CommandPrefix::Dot).map(|(_, timing)| *timing);
     for line in [
         ".help",
         ".info tools",
@@ -91,6 +147,56 @@ fn reading_and_editor_commands_run_now_and_switches_wait() {
     for line in [".agent coder", ".model x", ".edit role", ".vault list"] {
         assert!(matches!(timing(line), Some(Timing::Queue(_))), "{line}");
     }
+}
+
+#[test]
+fn commands_that_switch_the_context_wait_for_the_turn() {
+    for line in [
+        ".session x",
+        ".exit session",
+        ".clear messages",
+        ".undo",
+        ".compress session",
+        ".fork",
+        ".model x",
+        ".agent x",
+        ".role x",
+        ".rag x",
+    ] {
+        match timing(line) {
+            Some(Timing::Queue(reason)) => assert!(
+                SWITCHING_REASONS.contains(&reason),
+                "{line} queues for {reason:?}"
+            ),
+            other => panic!("{line} does not queue: {other:?}"),
+        }
+    }
+    for (name, timing) in COMMAND_TIMINGS {
+        let first = name.split_whitespace().next().unwrap_or_default();
+        if SWITCHING_COMMANDS.contains(&first) {
+            assert!(matches!(timing, Timing::Queue(_)), "{name} does not queue");
+        }
+    }
+}
+
+#[test]
+fn set_keys_with_side_effects_wait_and_other_settings_defer() {
+    for key in SIDE_EFFECT_SET_KEYS {
+        let line = format!(".set {key} x");
+        let entry = lookup(&line, CommandPrefix::Dot).map(|(name, _)| *name);
+        assert_ne!(entry, Some(".set"), "{line} has no entry of its own");
+        assert!(matches!(timing(&line), Some(Timing::Queue(_))), "{line}");
+    }
+    for line in [
+        ".set enabled_mcp_servers x",
+        ".set rag_top_k 3",
+        ".set skills_enabled false",
+    ] {
+        assert!(matches!(timing(line), Some(Timing::Queue(_))), "{line}");
+    }
+    assert_eq!(timing(".set temperature 0.5"), Some(Timing::Deferred));
+    assert_eq!(timing(".set mcp_tools null"), Some(Timing::Deferred));
+    assert_eq!(timing(".reasoning high"), Some(Timing::Deferred));
 }
 
 #[test]

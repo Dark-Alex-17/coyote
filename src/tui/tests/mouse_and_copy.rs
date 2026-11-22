@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::run_loop::{CopyOutcome, copy_notice};
 
 fn alt_char(c: char) -> KeyEvent {
     alt(KeyCode::Char(c))
@@ -11,18 +12,26 @@ fn finished_tool(harness: &mut Harness, call_id: &str, name: &str, output: &str)
     finish_tool(harness, call_id, true, None);
 }
 
+fn copy(text: &str, from: &str) -> Option<Command> {
+    Some(Command::Copy {
+        text: text.to_string(),
+        from: from.to_string(),
+        dropped: 0,
+    })
+}
+
 #[test]
 fn alt_m_flips_the_mouse_mode_the_footer_shows() {
     let mut harness = Harness::standalone(80, 24);
     let frame = harness.draw();
-    assert!(frame.contains("jobs 0 . mouse scroll"), "{frame}");
+    assert!(frame.contains("mouse scroll\""), "{frame}");
 
     assert_eq!(
         harness.app.handle_key(alt_char('m')),
         Some(Command::SetMouseCapture(false))
     );
     let frame = harness.draw();
-    assert!(frame.contains("jobs 0 . mouse select"), "{frame}");
+    assert!(frame.contains("mouse select\""), "{frame}");
 
     harness.app.handle_key(ctrl(KeyCode::Char('t')));
     assert_eq!(
@@ -34,7 +43,42 @@ fn alt_m_flips_the_mouse_mode_the_footer_shows() {
         .app
         .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     let frame = harness.draw();
-    assert!(frame.contains("jobs 0 . mouse scroll"), "{frame}");
+    assert!(frame.contains("mouse scroll\""), "{frame}");
+}
+
+/// At 40 columns the left half gives way: the model's start and the
+/// whole mouse mode both stay.
+#[test]
+fn a_narrow_footer_keeps_the_mouse_mode_whole() {
+    let mut harness = Harness::standalone(40, 20);
+    harness.app.handle_key(alt_char('m'));
+    let frame = harness.draw();
+    let footer = frame.lines().rfind(|line| !line.is_empty()).unwrap();
+    assert!(footer.starts_with("\"openai:test-model"), "{frame}");
+    assert!(footer.ends_with(" mouse select\""), "{frame}");
+}
+
+#[test]
+fn a_failed_mouse_switch_puts_the_footer_back_and_says_so() {
+    let mut harness = Harness::standalone(80, 24);
+    assert_eq!(
+        harness.app.handle_key(alt_char('m')),
+        Some(Command::SetMouseCapture(false))
+    );
+    harness
+        .app
+        .mouse_capture_failed(true, &std::io::Error::other("tty gone"));
+    let frame = harness.draw();
+    assert!(frame.contains("mouse scroll\""), "{frame}");
+    assert!(
+        frame.contains("Could not switch the mouse mode: tty gone"),
+        "{frame}"
+    );
+    assert_eq!(
+        harness.app.handle_key(alt_char('m')),
+        Some(Command::SetMouseCapture(false)),
+        "the next Alt+M starts from the mode the terminal is in"
+    );
 }
 
 #[test]
@@ -54,10 +98,41 @@ fn alt_c_copies_the_focused_tool_rows_whole_output_without_escapes() {
 
     assert_eq!(
         harness.app.handle_key(alt_char('c')),
-        Some(Command::Copy("red line\nsecond\n".to_string()))
+        copy("red line\nsecond\n", "fs_read")
     );
     let frame = harness.draw();
-    assert!(frame.contains("Copied 2 lines from fs_read"), "{frame}");
+    assert!(
+        !frame.contains("Copied"),
+        "the loop reports the copy once it is done: {frame}"
+    );
+}
+
+/// Alt+C under a password question still copies the focused row, and
+/// nothing typed into the field comes along.
+#[test]
+fn alt_c_under_a_password_modal_copies_the_tool_row_not_the_field() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("look", false);
+    finished_tool(&mut harness, "call-1", "fs_read", "row output\n");
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.app.handle_key(ctrl(KeyCode::Up));
+    let req = PromptRequest::new(PromptAction::Password, "Token:", Origin::detached());
+    let asker = ask_on_a_thread(&mut harness, req);
+    harness.type_text("hunter2");
+
+    let copied = harness.app.handle_key(alt_char('c'));
+    assert_eq!(copied, copy("row output\n", "fs_read"));
+    let Some(Command::Copy { text, .. }) = copied else {
+        unreachable!()
+    };
+    assert!(!text.contains("hunter2"));
+
+    harness.clock.advance(HOTKEY_IDLE);
+    assert_eq!(harness.press(KeyCode::Enter), None);
+    assert_eq!(
+        asker.join().unwrap().unwrap(),
+        PromptAnswer::Text("hunter2".to_string())
+    );
 }
 
 #[test]
@@ -77,11 +152,9 @@ fn alt_c_with_no_focus_copies_the_newest_open_tool_row() {
 
     assert_eq!(
         harness.app.handle_key(alt_char('c')),
-        Some(Command::Copy("second\n".to_string())),
+        copy("second\n", "fs_ls"),
         "the closed newer row is passed over"
     );
-    let frame = harness.draw();
-    assert!(frame.contains("Copied 1 line from fs_ls"), "{frame}");
 }
 
 #[test]
@@ -118,14 +191,10 @@ fn alt_c_on_a_job_row_joins_its_calls_under_their_names() {
 
     assert_eq!(
         harness.app.handle_key(alt_char('c')),
-        Some(Command::Copy(
-            "job__start:\nstarted\njob__check:\nstill running\n".to_string()
-        ))
-    );
-    let frame = harness.draw();
-    assert!(
-        frame.contains("Copied 4 lines from job execute_command"),
-        "{frame}"
+        copy(
+            "job__start:\nstarted\njob__check:\nstill running\n",
+            "job execute_command"
+        )
     );
 }
 
@@ -146,4 +215,52 @@ fn alt_c_with_nothing_to_copy_says_so() {
     assert_eq!(harness.app.handle_key(alt_char('c')), None);
     let frame = harness.draw();
     assert!(frame.contains("Nothing to copy from fs_read"), "{frame}");
+}
+
+#[test]
+fn the_copy_notice_says_where_the_text_went_and_what_was_left_out() {
+    let notice = |outcome, lines, dropped| copy_notice(&outcome, lines, "fs_read", dropped);
+
+    assert_eq!(
+        notice(CopyOutcome::Native, 1, 0),
+        (
+            NoticeKind::Checkpoint,
+            "Copied 1 line from fs_read".to_string()
+        )
+    );
+    assert_eq!(
+        notice(CopyOutcome::Native, 3, 512),
+        (
+            NoticeKind::Checkpoint,
+            "Copied 3 lines from fs_read; the oldest 512 bytes were already dropped".to_string()
+        )
+    );
+    assert_eq!(
+        notice(CopyOutcome::Osc52 { kept_lines: None }, 2, 0),
+        (
+            NoticeKind::Checkpoint,
+            "Sent 2 lines from fs_read to the terminal clipboard".to_string()
+        )
+    );
+    assert_eq!(
+        notice(
+            CopyOutcome::Osc52 {
+                kept_lines: Some(40)
+            },
+            900,
+            0
+        ),
+        (
+            NoticeKind::Checkpoint,
+            "Sent the last 40 lines from fs_read to the terminal clipboard; only those fit"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        notice(CopyOutcome::Failed("broken pipe".to_string()), 2, 512),
+        (
+            NoticeKind::ToolWarning,
+            "Copy failed: broken pipe".to_string()
+        )
+    );
 }

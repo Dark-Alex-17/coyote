@@ -336,6 +336,17 @@ fn fence_open(source: &str) -> bool {
     source.split('\n').filter(|line| is_fence(line)).count() % 2 == 1
 }
 
+/// The whole line that opened a code fence `source` leaves open, if any.
+pub(super) fn open_fence_line(source: &str) -> Option<&str> {
+    let mut open = None;
+    for line in source.split_inclusive('\n') {
+        if line.ends_with('\n') && is_fence(line) {
+            open = if open.is_some() { None } else { Some(line) };
+        }
+    }
+    open
+}
+
 /// Byte offset where the live tail of a streaming reply begins: the last
 /// blank line outside a code fence. Everything before it is complete
 /// paragraphs that render the same on every frame.

@@ -2,14 +2,14 @@
 source: src/tui/pager.rs
 expression: "&frame"
 ---
-"Thread: planner (ro) planner-b2  1-10/10"
-"Read-only. Tool calls show live; replies"
-"show up at the child's next checkpoint. "
+"Thread: planner (ro) planner-b2  3-12/12"
 "                                        "
 "> plan the release                      "
 "                                        "
 "▾ node pla...  completed in 2s, route bu"
+"  fs_read  0s  ok                       "
 "  read Cargo.toml                       "
+"  fs_grep  0s  ok                       "
 "  3 matches                             "
 "                                        "
 "▸ node build tool  failed: exit 3       "

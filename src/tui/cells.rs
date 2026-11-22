@@ -709,12 +709,14 @@ impl Cell {
     }
 
     /// A call read back from a saved session: a finished tool row, folded,
-    /// with the tail of what the call returned as its output.
+    /// with what the call returned as its output.
     pub(super) fn recorded_tool(call_id: String, summary: String, output: &str) -> Self {
         let mut cell = Self::tool(call_id, summary, Instant::now());
         if let Cell::Tool { status, tail, .. } = &mut cell {
             *status = ToolStatus::Recorded;
-            append_output(tail, output.as_bytes());
+            let text = append_output(tail, output.as_bytes());
+            tail.full.push(&text);
+            tail.full.settle();
         }
         cell
     }
@@ -1204,6 +1206,65 @@ impl Cell {
         }
     }
 
+    /// The row as a child's thread shows it: folded as in the transcript,
+    /// or open on everything its calls printed, each call under a node
+    /// with its own state. The call line under a tool row's header is left
+    /// out when the header already shows the arguments whole, since a
+    /// child's call has no narration of its own.
+    pub(super) fn thread_lines(
+        &mut self,
+        width: u16,
+        renderer: &mut Renderer,
+    ) -> Vec<Line<'static>> {
+        let mut lines = self.lines(width, renderer);
+        if !self.expanded() {
+            return lines;
+        }
+        let tick = Some(renderer.tick);
+        let styles = ToolHeaderStyles::new(renderer.markdown_render(), renderer.no_color);
+        let body_width = width.saturating_sub(BODY_INDENT.len() as u16).max(1);
+        let body = match self {
+            Cell::Tool {
+                args,
+                summary,
+                status,
+                tail,
+                ..
+            } => {
+                let mut body = Vec::new();
+                if narrated_call(summary).1 != *args {
+                    body = render::hard_wrap(vec![render::styled_line(summary)], body_width);
+                }
+                if let ToolStatus::Failed { error, .. } = status {
+                    body.extend(dim_wrapped(render::preformatted_lines(error), body_width));
+                }
+                body.extend_from_slice(tail.full.lines(body_width));
+                body
+            }
+            Cell::Node { row, .. } => {
+                let mut body = Vec::new();
+                if let NodeStatus::Failed(error) = &row.status {
+                    body.extend(dim_wrapped(
+                        render::preformatted_lines(&format!("error: {error}")),
+                        body_width,
+                    ));
+                }
+                for call in &mut row.calls {
+                    body.extend(folded_call_line(call, tick, &styles));
+                    body.extend_from_slice(call.tail.full.lines(body_width));
+                }
+                body
+            }
+            _ => return lines,
+        };
+        lines.truncate(1);
+        lines.extend(body.into_iter().map(|mut line| {
+            line.spans.insert(0, Span::raw(BODY_INDENT));
+            line
+        }));
+        lines
+    }
+
     /// The one-line, unclipped header of a tool, job or agent row, with
     /// no escape left in it, a running row's throbber and elapsed time
     /// read at `tick`; None for every other cell.
@@ -1282,8 +1343,34 @@ fn tool_state(status: &ToolStatus, tick: Option<Tick>) -> String {
         ToolStatus::Failed { elapsed, error } => {
             format!("{}  failed: {}", elapsed_text(*elapsed), first_line(error))
         }
-        ToolStatus::Recorded => "ok".to_string(),
+        ToolStatus::Recorded => "done".to_string(),
     }
+}
+
+/// A call folded under a node, as a line of the node's open row: its name
+/// and its state in the colours of a tool row's header. None for a call
+/// that tracks no state, as under a job or agent row.
+fn folded_call_line(
+    call: &FoldedCall,
+    tick: Option<Tick>,
+    styles: &ToolHeaderStyles,
+) -> Option<Line<'static>> {
+    let status = call.status.as_ref()?;
+    let state_style = if matches!(status, ToolStatus::Failed { .. }) {
+        styles.failed
+    } else {
+        styles.muted
+    };
+    let mut spans = vec![
+        Span::styled(render::plain_text(&call.name), styles.name),
+        Span::styled("  ", styles.muted),
+    ];
+    spans.extend(state_spans(
+        &tool_state(status, tick),
+        state_style,
+        styles.throbber,
+    ));
+    Some(Line::from(spans))
 }
 
 /// The state word of a job row and the whole error of a failed one.
@@ -1817,6 +1904,19 @@ pub(super) fn without_think_spans(source: &str, done: bool) -> &str {
         partial_tag_at(shown).unwrap_or(shown.len())
     };
     &shown[..kept]
+}
+
+/// What the next part of a reply cut off after `source` starts with so
+/// it reads on as the same reply: the reasoning tag left open, else the
+/// line of the code fence left open, else nothing.
+pub(super) fn reply_continuation(source: &str) -> String {
+    let body = source.trim_start();
+    if body.starts_with(THINK_OPEN) && !body.contains(THINK_CLOSE) {
+        return THINK_OPEN.to_string();
+    }
+    render::open_fence_line(source)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Byte offset of a trailing fragment that could still grow into a
@@ -2471,6 +2571,110 @@ mod tests {
                 assert!(dumped.ends_with("  running"), "{dumped}");
             }
         }
+    }
+
+    /// A saved call says neither how long it took nor how it ended, so
+    /// its state is `done`, with no time.
+    #[test]
+    fn a_recorded_call_says_done_with_no_time() {
+        assert_eq!(tool_state(&ToolStatus::Recorded, None), "done");
+        let mut renderer = renderer();
+        let mut cell = Cell::recorded_tool(
+            "c1".to_string(),
+            "fs_read {\"path\":\"x\"}".to_string(),
+            "body\n",
+        );
+        let header = cell.lines(80, &mut renderer)[0].to_string();
+        assert_eq!(header, "\u{25B8} fs_read({\"path\":\"x\"})  done");
+    }
+
+    /// An open row in a child's thread shows every line its call printed,
+    /// past the tail the transcript's row keeps, and no call line that
+    /// says again what the header says.
+    #[test]
+    fn an_open_thread_row_shows_the_whole_output_and_no_repeated_call() {
+        let mut renderer = renderer();
+        let output: String = (1..=TOOL_OUTPUT_TAIL + 5)
+            .map(|n| format!("line {n:02}\n"))
+            .collect();
+        let mut cell = Cell::recorded_tool(
+            "c1".to_string(),
+            "execute_command {\"command\":\"seq\"}".to_string(),
+            &output,
+        );
+        cell.toggle();
+        let lines: Vec<String> = cell
+            .thread_lines(80, &mut renderer)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        assert_eq!(
+            lines[0],
+            "\u{25BE} execute_command({\"command\":\"seq\"})  done"
+        );
+        assert_eq!(lines[1], format!("{BODY_INDENT}line 01"));
+        assert_eq!(lines.len(), 1 + TOOL_OUTPUT_TAIL + 5, "{lines:?}");
+
+        let content = "x".repeat(200);
+        let summary = format!("fs_write {{\"content\":\"{content}\"}}");
+        let mut cut = Cell::recorded_tool("c2".to_string(), summary, "");
+        cut.toggle();
+        let text: String = cut
+            .thread_lines(80, &mut renderer)
+            .iter()
+            .skip(1)
+            .map(|line| line.to_string().trim_start().to_string())
+            .collect();
+        assert!(text.contains(&content), "a cut call lost its arguments");
+    }
+
+    /// Each call under an open node row shows its own state as a tool row
+    /// does: the throbber and time while it runs, the error once failed.
+    #[test]
+    fn calls_under_a_node_show_their_state() {
+        let mut renderer = renderer();
+        renderer.no_color = false;
+        let since = Instant::now();
+        renderer.tick = Tick {
+            origin: since,
+            now: since + Duration::from_millis(2_300),
+        };
+        let frame = throbber::frame_at(since, renderer.tick.now);
+        let mut failed = FoldedCall::running("c2".to_string(), "fs_grep".to_string(), since);
+        failed.status = Some(ToolStatus::Failed {
+            elapsed: Duration::from_secs(1),
+            error: "denied".to_string(),
+        });
+        let mut cell = Cell::node("plan".to_string(), "llm".to_string(), since);
+        if let Cell::Node { row, .. } = &mut cell {
+            row.calls = vec![
+                FoldedCall::running("c1".to_string(), "fs_read".to_string(), since),
+                failed,
+            ];
+        }
+        cell.toggle();
+        let lines = cell.thread_lines(80, &mut renderer);
+        let text: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            text[1..],
+            [
+                format!("{BODY_INDENT}fs_read  {frame} running 2s"),
+                format!("{BODY_INDENT}fs_grep  1s  failed: denied"),
+            ]
+        );
+        let styles = ToolHeaderStyles::new(renderer.markdown_render(), false);
+        let glyph = lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content == frame)
+            .expect("the frame is a span of its own");
+        assert_eq!(glyph.style, styles.throbber);
+        let failure = lines[2]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("failed"))
+            .expect("the state is a span of its own");
+        assert_eq!(failure.style, styles.failed);
     }
 
     /// A bookkeeping row has no body, so toggling it leaves it closed

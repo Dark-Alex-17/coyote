@@ -25,4 +25,4 @@ expression: frame
 "                                                            "
 "                                                            "
 "────────────────────────────────────────────────────────────"
-"openai:test-model . no session . agents 0 . jobs 0 . mouse s"
+"openai:test-model . no session . agents 0 . job mouse scroll"

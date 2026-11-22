@@ -149,10 +149,23 @@ pub fn set_text_native(text: &str) -> bool {
     match internal::set_text_native(text) {
         Ok(copied) => copied,
         Err(err) => {
-            debug!("Failed to copy to the system clipboard: {err}");
+            warn!("Failed to copy to the system clipboard: {err}");
             false
         }
     }
+}
+
+/// The most text an OSC 52 request carries: many terminals drop a larger
+/// payload, and the write blocks until the terminal has read it all.
+const OSC52_PAYLOAD_LIMIT: usize = 100_000;
+
+/// The tail of `text` that fits an OSC 52 request, cut on a char boundary.
+pub fn osc52_payload_cap(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(OSC52_PAYLOAD_LIMIT);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// The OSC 52 escape that asks the terminal to put `text` on the clipboard;
@@ -236,5 +249,22 @@ mod tests {
     fn the_osc52_sequence_carries_the_text_in_base64() {
         assert_eq!(osc52_sequence("hi\n"), "\x1b]52;c;aGkK\x07");
         assert_eq!(osc52_sequence(""), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn the_osc52_payload_keeps_the_newest_text_whole_chars_only() {
+        assert_eq!(osc52_payload_cap("short"), "short");
+
+        let text = format!("old\n{}", "x".repeat(OSC52_PAYLOAD_LIMIT));
+        assert_eq!(osc52_payload_cap(&text), &text[4..]);
+
+        let text = format!(
+            "{}{}",
+            "\u{e9}".repeat(10),
+            "y".repeat(OSC52_PAYLOAD_LIMIT - 1)
+        );
+        let kept = osc52_payload_cap(&text);
+        assert_eq!(kept.len(), OSC52_PAYLOAD_LIMIT - 1);
+        assert!(kept.chars().all(|c| c == 'y'));
     }
 }

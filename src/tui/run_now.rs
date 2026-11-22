@@ -1,6 +1,7 @@
 use crate::config::RequestContext;
 use crate::repl::{
-    edit_skill_output, info_output, list_output, parse_command, repl_help_text, unfence,
+    REASONING_USAGE, SET_USAGE, edit_skill_output, info_output, list_output, parse_command,
+    repl_help_text, unfence,
 };
 use crate::utils::create_abort_signal;
 use anyhow::{Result, bail};
@@ -87,8 +88,8 @@ pub(super) async fn replay_deferred(
 /// arguments, or `None` for any other command.
 fn setting_usage(cmd: &str) -> Option<&'static str> {
     match cmd {
-        ".set" => Some("Usage: .set <key> <value>..."),
-        ".reasoning" => Some("Usage: .reasoning <level>"),
+        ".set" => Some(SET_USAGE),
+        ".reasoning" => Some(REASONING_USAGE),
         _ => None,
     }
 }

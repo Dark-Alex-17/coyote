@@ -228,14 +228,11 @@ mod queue_vi_and_headless {
         let dir = fresh_config_dir("info-mid-stream");
         let _guard = TempDirGuard(dir.clone());
         let release = dir.join("release");
-        let fake = FakeLlm::start(vec![
-            Reply::Streamed(vec![
-                Chunk::Text("part one ni4 ".to_string()),
-                Chunk::WaitFor(release.clone()),
-                Chunk::Text("reply one ni4".to_string()),
-            ]),
-            Reply::Text("reply two ni4".to_string()),
-        ]);
+        let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+            Chunk::Text("part one ni4 ".to_string()),
+            Chunk::WaitFor(release.clone()),
+            Chunk::Text("reply one ni4".to_string()),
+        ])]);
         write_fake_llm_config(&dir, &fake);
         let mut pty = spawn_tui(&dir, &[]);
 
@@ -259,19 +256,21 @@ mod queue_vi_and_headless {
             "`.info` was queued behind the turn:\n{shown}"
         );
 
-        // The held reply grows above the command's cell, out of view, so
-        // the turn's end shows as the next prompt's reply.
+        // The rest of the reply goes on below the command's cell, in view.
+        let release_at = pty.raw().len();
         fs::write(&release, b"").unwrap();
-        let next_at = pty.raw().len();
-        pty.send(b"second prompt ni4\r").unwrap();
-        wait_for_squeezed_after(
-            &mut pty,
-            "reply two ni4",
-            next_at,
-            "the reply after the held turn",
+        wait_for_squeezed_after(&mut pty, "? = keys", release_at, "the end of the turn");
+        let frame = repainted_frame_after_resize(&mut pty, 40, 100);
+        let frame = squeezed(&frame);
+        let (above, below) = frame
+            .split_once("replyoneni4")
+            .unwrap_or_else(|| panic!("the rest of the reply is out of view:\n{frame}"));
+        assert!(
+            above.contains("log_path") && !below.contains("log_path"),
+            "the rest of the reply is not below the output of `.info`:\n{frame}"
         );
         pty.read_for(Duration::from_millis(500));
-        assert_eq!(fake.served(), 2);
+        assert_eq!(fake.served(), 1);
         quit_and_check(&mut pty);
     }
 
@@ -330,6 +329,114 @@ mod queue_vi_and_headless {
             squeezed(&info).contains("temperature0.5"),
             "the setting typed during the turn did not reach the session:\n{info}"
         );
+        quit_and_check(&mut pty);
+    }
+
+    /// `.help` typed while the model streams lists the commands at once,
+    /// and a bad `.set` is refused at once: neither joins the queue, and
+    /// the refused value never reaches the session.
+    #[test]
+    #[serial]
+    fn a_dot_help_and_a_bad_dot_set_mid_stream_answer_at_once() {
+        let dir = fresh_config_dir("help-badset-mid-stream");
+        let _guard = TempDirGuard(dir.clone());
+        let release = dir.join("release");
+        let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+            Chunk::Text("part one hb7 ".to_string()),
+            Chunk::WaitFor(release.clone()),
+            Chunk::Text("reply one hb7".to_string()),
+        ])]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        let turn_at = pty.raw().len();
+        pty.send(b"first prompt hb7\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "part one hb7", turn_at, "the held stream");
+
+        let help_at = pty.raw().len();
+        pty.send(b".help\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "Exit REPL", help_at, "the `.help` listing");
+        let set_at = pty.raw().len();
+        pty.send(b".set temperature abc\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "Invalid value", set_at, "the refusal of `.set`");
+        let shown = since(&pty, help_at);
+        assert!(
+            !shown.contains("pending:"),
+            "`.help` or the bad `.set` was queued behind the turn:\n{shown}"
+        );
+        assert!(
+            !squeezed(&since(&pty, set_at)).contains(&squeezed("applies from the next turn")),
+            "the bad `.set` was confirmed for the next turn:\n{shown}"
+        );
+        assert!(
+            !squeezed(&shown).contains("replyonehb7"),
+            "the turn ended before the commands answered, so they did not run during it"
+        );
+
+        let release_at = pty.raw().len();
+        fs::write(&release, b"").unwrap();
+        wait_for_squeezed_after(&mut pty, "? = keys", release_at, "the end of the turn");
+        let frame = squeezed(&repainted_frame_after_resize(&mut pty, 40, 101));
+        let (above, _) = frame
+            .split_once("replyonehb7")
+            .unwrap_or_else(|| panic!("the rest of the reply is out of view:\n{frame}"));
+        assert!(
+            above.contains(&squeezed("Invalid value")),
+            "the rest of the reply is not below the command cells:\n{frame}"
+        );
+        pty.read_for(Duration::from_millis(500));
+        assert_eq!(fake.served(), 1, "a command reached the model");
+        let info_at = pty.raw().len();
+        pty.send(b".info\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "log_path", info_at, "the idle `.info`");
+        let info = repainted_frame_after_resize(&mut pty, 90, 101);
+        let info = squeezed(&info);
+        let listing = info
+            .rsplit_once(">.info")
+            .map_or(info.as_str(), |(_, listing)| listing);
+        assert!(
+            listing.contains("temperaturenull"),
+            "the refused value changed the session's temperature:\n{listing}"
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// `.model` typed while the model streams changes the model, so it
+    /// waits for the turn: the `pending:` strip shows it until the turn
+    /// ends.
+    #[test]
+    #[serial]
+    fn a_dot_model_typed_mid_stream_waits_for_the_turn() {
+        let dir = fresh_config_dir("model-mid-stream");
+        let _guard = TempDirGuard(dir.clone());
+        let release = dir.join("release");
+        let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+            Chunk::Text("part one mq3 ".to_string()),
+            Chunk::WaitFor(release.clone()),
+            Chunk::Text("reply one mq3".to_string()),
+        ])]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        let turn_at = pty.raw().len();
+        pty.send(b"first prompt mq3\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "part one mq3", turn_at, "the held stream");
+
+        let model_at = pty.raw().len();
+        pty.send(b".model nosuch:model-mq3\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "pending:", model_at, "the queued `.model`");
+        let shown = since(&pty, model_at);
+        assert!(
+            !squeezed(&shown).contains("replyonemq3"),
+            "the turn ended before `.model` showed as pending:\n{shown}"
+        );
+
+        fs::write(&release, b"").unwrap();
+        wait_for_squeezed_after(&mut pty, "reply one mq3", model_at, "the end of the reply");
+        wait_until_no_pending(&mut pty);
+        assert_eq!(fake.served(), 1, "`.model` reached the model as a prompt");
         quit_and_check(&mut pty);
     }
 
@@ -1737,6 +1844,81 @@ mod key_help_discovery {
             composer_row(&frame),
             "k7q",
             "a modified F-key left escape debris in the composer:\n{frame}"
+        );
+        leave(pty);
+    }
+
+    /// Paging through the key help reaches the mouse switch and the copy
+    /// chord, each with its description.
+    #[test]
+    #[serial]
+    fn the_key_help_lists_the_mouse_switch_and_the_copy_chord() {
+        let (_guard, mut pty) = boot("discovery-mouse-copy", "");
+        let at = pty.raw().len();
+        pty.send(b"?").unwrap();
+        repainted_frame_showing(&mut pty, HELP_MARK, "`?` did not open the key help");
+        for _ in 0..20 {
+            pty.send(b"\x1b[6~").unwrap();
+            pty.read_for(Duration::from_millis(150));
+        }
+        let help = squeezed(&super::common::pty::strip_ansi(&String::from_utf8_lossy(
+            &pty.raw()[at..],
+        )));
+        for (chord, row) in [
+            ("Alt+M", "Alt+M Mouse on: the wheel scrolls"),
+            ("Alt+C", "Alt+C Copy the focused tool call"),
+        ] {
+            assert!(
+                help.contains(&squeezed(row)),
+                "the key help does not list {chord} as {row:?}:\n{help}"
+            );
+        }
+        pty.send(ESC).unwrap();
+        repainted_frame_showing(&mut pty, IDLE_HINT, "Esc did not close the key help");
+        leave(pty);
+    }
+
+    /// With nothing running, Alt+T opens the tasks pop-up over the
+    /// transcript with its title and way out; it takes the keys typed
+    /// while it is up, and Esc or a second Alt+T closes it.
+    #[test]
+    #[serial]
+    fn the_idle_tasks_popup_shows_its_title_holds_focus_and_closes() {
+        let (_guard, mut pty) = boot("discovery-tasks-popup", "");
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_T).unwrap();
+        let open = repainted_frame_showing(&mut pty, ROSTER_MARK, "Alt+T did not open the pop-up");
+        assert!(
+            open.contains("\u{250c}Tasks"),
+            "the tasks pop-up has no `Tasks` title on its border:\n{open}"
+        );
+        assert!(
+            shows(&open, "Type a prompt or a .command"),
+            "the composer is not in view under the pop-up:\n{open}"
+        );
+
+        pty.send(b"z7").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(ESC).unwrap();
+        let closed = repainted_frame_showing(&mut pty, IDLE_HINT, "Esc did not close the pop-up");
+        assert!(
+            !closed.contains("\u{250c}Tasks") && !shows(&closed, ROSTER_MARK),
+            "the tasks pop-up is still up after Esc:\n{closed}"
+        );
+        assert!(
+            !composer_row(&closed).contains("z7"),
+            "keys typed over the pop-up reached the composer:\n{closed}"
+        );
+
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_T).unwrap();
+        repainted_frame_showing(&mut pty, ROSTER_MARK, "Alt+T did not reopen the pop-up");
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_T).unwrap();
+        let closed = repainted_frame_showing(&mut pty, IDLE_HINT, "Alt+T did not close the pop-up");
+        assert!(
+            !closed.contains("\u{250c}Tasks"),
+            "a second Alt+T left the pop-up up:\n{closed}"
         );
         leave(pty);
     }

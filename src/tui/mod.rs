@@ -76,8 +76,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui_textarea::TextArea;
+use render::Renderer;
 pub(crate) use render::plain_text;
-use render::{RenderCache, Renderer};
 use rewind::opens_exchange;
 use roster::{RosterPopup, RosterRow, RosterSources, RosterState};
 pub use run_loop::{ensure_tty, run};
@@ -87,6 +87,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use terminal::MOUSE_CAPTURE_DEFAULT;
 use theme::{ChromeKind, DIM, Theme, chrome_style, field_background};
 use throbber::{THROBBER_INTERVAL, Tick};
 use todo::TodoPanel;
@@ -199,7 +200,7 @@ impl FooterInfo {
         }
     }
 
-    fn parts(&self, (agents, jobs): (usize, usize), mouse_capture: bool) -> Vec<String> {
+    fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(who) = &self.who {
             parts.push(who.clone());
@@ -212,21 +213,13 @@ impl FooterInfo {
         );
         parts.push(format!("agents {agents}"));
         parts.push(format!("jobs {jobs}"));
-        parts.push(
-            if mouse_capture {
-                "mouse scroll"
-            } else {
-                "mouse select"
-            }
-            .to_string(),
-        );
         parts
     }
 
     /// The fields joined by ` . `, which is drawn in a style of its own.
-    fn line(&self, counts: (usize, usize), mouse_capture: bool, theme: &Theme) -> Line<'static> {
+    fn line(&self, counts: (usize, usize), theme: &Theme) -> Line<'static> {
         let mut spans = Vec::new();
-        for (i, part) in self.parts(counts, mouse_capture).into_iter().enumerate() {
+        for (i, part) in self.parts(counts).into_iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" . ", theme.footer_separator));
             }
@@ -234,6 +227,26 @@ impl FooterInfo {
         }
         Line::from(spans)
     }
+}
+
+/// The footer's right half: the mouse mode, then the usage line dimmed.
+fn footer_right(mouse_capture: bool, usage: &str, theme: &Theme) -> Line<'static> {
+    let mode = if mouse_capture {
+        "mouse scroll"
+    } else {
+        "mouse select"
+    };
+    let mut spans = vec![Span::styled(mode, theme.footer_field)];
+    let usage = render::styled_line(usage);
+    if usage.width() > 0 {
+        spans.push(Span::styled(" . ", theme.footer_separator));
+        let base = usage.style.patch(DIM);
+        spans.extend(usage.spans.into_iter().map(|mut span| {
+            span.style = base.patch(span.style);
+            span
+        }));
+    }
+    Line::from(spans)
 }
 
 /// What is drawn over the transcript while open: Ctrl+T's full-screen
@@ -303,8 +316,13 @@ pub(crate) enum Command {
     Redraw,
     /// Switch the terminal's mouse reports on or off.
     SetMouseCapture(bool),
-    /// Put this text on the clipboard.
-    Copy(String),
+    /// Put a row's output on the clipboard; the notice of how it went
+    /// names `from` and the `dropped` bytes the row no longer held.
+    Copy {
+        text: String,
+        from: String,
+        dropped: usize,
+    },
     /// Take the chosen exchanges out of the session and the transcript
     /// and give the oldest one's prompt back to the composer.
     Rewind(RewindTarget),
@@ -492,7 +510,7 @@ impl App {
             committed_end: 0,
             footer,
             usage: String::new(),
-            mouse_capture: true,
+            mouse_capture: MOUSE_CAPTURE_DEFAULT,
             last_keystroke: None,
             front_since: None,
             frame_area: None,
@@ -918,43 +936,37 @@ impl App {
     }
 
     /// The target row's whole output for the loop to put on the
-    /// clipboard, with a notice saying what was copied or why nothing was.
+    /// clipboard, or a notice saying why there is none.
     fn copy_tool_output(&mut self) -> Option<Command> {
         let copied = cells::copy_target(self.transcript.cells(), self.transcript.focus())
             .and_then(Cell::copied_output);
-        let (kind, notice, command) = match copied {
-            None => (
-                NoticeKind::ToolWarning,
-                "No tool call to copy: focus one with Ctrl+Up or a click".to_string(),
-                None,
-            ),
-            Some(copied) if copied.text.is_empty() => (
-                NoticeKind::ToolWarning,
-                format!("Nothing to copy from {}", copied.from),
-                None,
-            ),
+        let notice = match copied {
+            None => "No tool call to copy: focus one with Ctrl+Up or a click".to_string(),
+            Some(copied) if copied.text.is_empty() => {
+                format!("Nothing to copy from {}", copied.from)
+            }
             Some(copied) => {
-                let lines = copied.text.lines().count();
-                let unit = if lines == 1 { "line" } else { "lines" };
-                let mut notice = format!("Copied {lines} {unit} from {}", copied.from);
-                if copied.dropped > 0 {
-                    notice.push_str(&format!(
-                        "; the oldest {} bytes were already dropped",
-                        copied.dropped
-                    ));
-                }
-                // The kind only picks the style: dim, like the engine's
-                // own status notices.
-                (
-                    NoticeKind::Checkpoint,
-                    notice,
-                    Some(Command::Copy(copied.text)),
-                )
+                return Some(Command::Copy {
+                    text: copied.text,
+                    from: copied.from,
+                    dropped: copied.dropped,
+                });
             }
         };
         self.transcript
-            .push_notice(self.notice_merge_from(), kind, notice);
-        command
+            .push_notice(self.notice_merge_from(), NoticeKind::ToolWarning, notice);
+        None
+    }
+
+    /// Takes back an Alt+M the terminal never got, so the footer shows
+    /// the mode the terminal is still in.
+    pub(crate) fn mouse_capture_failed(&mut self, prev: bool, err: &std::io::Error) {
+        self.mouse_capture = prev;
+        self.transcript.push_notice(
+            self.notice_merge_from(),
+            NoticeKind::ToolWarning,
+            format!("Could not switch the mouse mode: {err}"),
+        );
     }
 
     /// Takes the band's highlighted row: the palette's into the typed
@@ -1523,23 +1535,9 @@ impl App {
             turn.requested = true;
         }
         match msg {
-            UiMsg::TextDelta(delta) => match self.transcript.stream_cell_mut() {
-                Some(Cell::Assistant { source, .. }) => source.push_str(&delta),
-                _ => self.transcript.open_stream(Cell::assistant(delta, false)),
-            },
+            UiMsg::TextDelta(delta) => self.transcript.stream_delta(&delta),
             UiMsg::StreamDone => self.close_stream(),
-            UiMsg::AssistantText(text) => match self.transcript.close_stream() {
-                Some(Cell::Assistant {
-                    source,
-                    done,
-                    cache,
-                }) => {
-                    *source = text;
-                    *done = true;
-                    *cache = RenderCache::default();
-                }
-                _ => self.transcript.push(Cell::assistant(text, true)),
-            },
+            UiMsg::AssistantText(text) => self.transcript.finish_stream(text),
             UiMsg::Notice { kind, text } => {
                 self.transcript
                     .push_notice(self.notice_merge_from(), kind, text);
@@ -1598,12 +1596,16 @@ impl App {
                 agent_id,
                 node,
                 call_id,
+                name,
+                args,
                 ok,
                 error,
                 duration_ms,
             } => {
                 let now = self.clock.now();
                 let end = ToolEnd {
+                    name,
+                    args,
                     ok,
                     error,
                     duration_ms,
@@ -1682,13 +1684,14 @@ impl App {
                 );
             }
             UiMsg::AgentFinished { agent_id, outcome } => {
+                self.child_live
+                    .agent_finished(&agent_id, &outcome, self.clock.now());
                 let status = match outcome {
                     AgentOutcome::Completed => AgentStatus::Completed,
                     AgentOutcome::Failed(error) => AgentStatus::Failed(error),
                     AgentOutcome::Interrupted => AgentStatus::Interrupted,
                 };
                 self.transcript.set_agent_status(&agent_id, status);
-                self.child_live.agent_finished(&agent_id);
                 // Before the prune, which may forget the child and the
                 // session that leads to it.
                 self.child_rows_changed(&agent_id);
@@ -2010,12 +2013,10 @@ impl App {
 
         frame.render_widget(
             FooterBar {
-                left: self.footer.line(
-                    self.roster_sources.running_counts(),
-                    self.mouse_capture,
-                    &self.theme,
-                ),
-                right: render::styled_line(&self.usage),
+                left: self
+                    .footer
+                    .line(self.roster_sources.running_counts(), &self.theme),
+                right: footer_right(self.mouse_capture, &self.usage, &self.theme),
             },
             footer,
         );
@@ -2067,17 +2068,33 @@ struct FooterBar {
 }
 
 impl Widget for FooterBar {
+    /// The right half is laid out first, so the left half is the one cut
+    /// short; within the right half the mouse mode comes first, so a long
+    /// usage line loses its end before the mode loses any of it.
     fn render(self, area: Rect, buf: &mut Buffer) {
         let area = area.intersection(*buf.area());
         if area.is_empty() {
             return;
         }
-        Paragraph::new(self.left).render(area, buf);
-        if self.right.width() > 0 {
-            Paragraph::new(self.right.patch_style(DIM))
-                .right_aligned()
-                .render(area, buf);
-        }
+        let right_width = u16::try_from(self.right.width())
+            .unwrap_or(u16::MAX)
+            .min(area.width);
+        let left_width = area.width.saturating_sub(right_width.saturating_add(1));
+        Paragraph::new(self.left).render(
+            Rect {
+                width: left_width,
+                ..area
+            },
+            buf,
+        );
+        Paragraph::new(self.right).render(
+            Rect {
+                x: area.right() - right_width,
+                width: right_width,
+                ..area
+            },
+            buf,
+        );
     }
 }
 

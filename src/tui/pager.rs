@@ -22,7 +22,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -148,6 +148,11 @@ fn entry_lines(entry: &ChildEntry, width: u16, renderer: &mut Renderer) -> Vec<L
     }
 }
 
+/// A saved call's row text, as a live row of the same call has it.
+fn entry_summary(name: &str, args: &str) -> String {
+    format!("{name} {args}")
+}
+
 /// A saved call as a finished tool row of the main view's, for a call
 /// no live row reports; None for a text entry.
 fn recorded_row(entry: &ChildEntry) -> Option<Cell> {
@@ -162,7 +167,7 @@ fn recorded_row(entry: &ChildEntry) -> Option<Cell> {
     };
     Some(Cell::recorded_tool(
         call_id.clone(),
-        format!("{name} {args}"),
+        entry_summary(name, args),
         output,
     ))
 }
@@ -178,16 +183,22 @@ enum ChildRow {
 
 /// The rows of a child's thread: the saved session in order, each call
 /// in it drawn as its live row when it has one and left out when a node
-/// row holds it, then every live row the session does not name yet.
+/// row holds it, then every live row the session does not name yet. A
+/// call with no id (some providers give none) is its live row when one
+/// has its name and arguments: the first such saved call pairs with the
+/// first such live row, and so on.
 fn merged_rows(entries: &[ChildEntry], live: &[Cell]) -> Vec<ChildRow> {
-    let live_tools: HashMap<&str, usize> = live
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cell)| match cell {
-            Cell::Tool { call_id, .. } if !call_id.is_empty() => Some((call_id.as_str(), index)),
-            _ => None,
-        })
-        .collect();
+    let mut live_tools: HashMap<&str, usize> = HashMap::new();
+    let mut unnamed: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, cell) in live.iter().enumerate() {
+        match cell {
+            Cell::Tool { call_id, .. } if !call_id.is_empty() => {
+                live_tools.insert(call_id, index);
+            }
+            Cell::Tool { summary, .. } => unnamed.entry(summary).or_default().push_back(index),
+            _ => {}
+        }
+    }
     let in_node = |call_id: &str| {
         live.iter()
             .any(|cell| matches!(cell, Cell::Node { .. }) && cell.takes_output_of(call_id))
@@ -207,11 +218,42 @@ fn merged_rows(entries: &[ChildEntry], live: &[Cell]) -> Vec<ChildRow> {
                     None => rows.push(ChildRow::Disk(index)),
                 }
             }
+            ChildEntry::Tool { name, args, .. } => {
+                let paired = unnamed
+                    .get_mut(entry_summary(name, args).as_str())
+                    .and_then(VecDeque::pop_front);
+                match paired {
+                    Some(at) => {
+                        shown[at] = true;
+                        rows.push(ChildRow::Live(at));
+                    }
+                    None => rows.push(ChildRow::Disk(index)),
+                }
+            }
             _ => rows.push(ChildRow::Disk(index)),
         }
     }
     rows.extend((0..live.len()).filter(|at| !shown[*at]).map(ChildRow::Live));
     rows
+}
+
+/// What the focus in a child's thread holds on to, so it stays on its row
+/// when rows above it come or go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildRowKey {
+    Call(String),
+    /// A call with no id, by its row text (its name and arguments) and
+    /// how many calls with the same text come before it.
+    CallWithoutId {
+        summary: String,
+        nth: usize,
+    },
+    /// A node's row, by node id and how many earlier rows the node has: a
+    /// graph that loops back to a node gives it a row per visit.
+    Node {
+        node_id: String,
+        visit: usize,
+    },
 }
 
 fn status_word(status: EffectiveStatus) -> &'static str {
@@ -307,7 +349,7 @@ pub(super) struct ChildView {
     /// The rows as last laid out, which a click is matched against.
     rows: Vec<ChildRow>,
     /// The foldable row Ctrl+Up and Ctrl+Down last moved to.
-    focus: Option<ChildRow>,
+    focus: Option<ChildRowKey>,
     /// The read under way, by generation. At most one runs at a time.
     loading: Option<u64>,
     /// The child wrote its file again while a read was under way: one
@@ -328,6 +370,47 @@ impl ChildView {
             ChildRow::Disk(index) => self.recorded.get_mut(index)?.as_mut(),
             ChildRow::Live(index) => live.get_mut(index),
         }
+    }
+
+    /// The rows merged afresh with `live`.
+    fn merge(&mut self, live: &[Cell]) {
+        self.rows = merged_rows(self.entries.as_deref().unwrap_or_default(), live);
+    }
+
+    /// The focus key of each row; None for text.
+    fn keys(&self, live: &[Cell]) -> Vec<Option<ChildRowKey>> {
+        fn nth<'a>(seen: &mut HashMap<&'a str, usize>, key: &'a str) -> usize {
+            let count = seen.entry(key).or_default();
+            *count += 1;
+            *count - 1
+        }
+        let mut unnamed = HashMap::new();
+        let mut visits = HashMap::new();
+        self.rows
+            .iter()
+            .map(|&row| match self.cell(row, live)? {
+                Cell::Tool { call_id, .. } if !call_id.is_empty() => {
+                    Some(ChildRowKey::Call(call_id.clone()))
+                }
+                Cell::Tool { summary, .. } => Some(ChildRowKey::CallWithoutId {
+                    summary: summary.clone(),
+                    nth: nth(&mut unnamed, summary),
+                }),
+                Cell::Node { node_id, .. } => Some(ChildRowKey::Node {
+                    node_id: node_id.clone(),
+                    visit: nth(&mut visits, node_id),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where the focused row is among the rows, if it is still there.
+    fn focused_row(&self, live: &[Cell]) -> Option<usize> {
+        let focus = self.focus.as_ref()?;
+        self.keys(live)
+            .iter()
+            .position(|key| key.as_ref() == Some(focus))
     }
 
     /// Takes a good read, keeping the recorded row of each call that is
@@ -589,16 +672,14 @@ impl Pager {
             return;
         };
         let cells = live_rows(live, &view.session_id);
-        view.rows = merged_rows(view.entries.as_deref().unwrap_or_default(), cells);
+        view.merge(cells);
         let foldable: Vec<usize> = (0..view.rows.len())
             .filter(|&index| {
                 view.cell(view.rows[index], cells)
                     .is_some_and(Cell::collapsible)
             })
             .collect();
-        let at = view
-            .focus
-            .and_then(|focus| view.rows.iter().position(|row| *row == focus));
+        let at = view.focused_row(cells);
         let target = match (at, forward) {
             (None, true) => foldable.first().copied(),
             (None, false) => foldable.last().copied(),
@@ -617,7 +698,7 @@ impl Pager {
         let Some(target) = target else {
             return;
         };
-        view.focus = Some(view.rows[target]);
+        view.focus = view.keys(cells).swap_remove(target);
         self.jump = Some(Jump::Reveal(target));
         self.laid_out = None;
     }
@@ -627,9 +708,11 @@ impl Pager {
         let Thread::Child(view) = &mut self.thread else {
             return;
         };
-        let Some(focus) = view.focus else {
+        view.merge(live_rows(live, &view.session_id));
+        let Some(focus) = view.focused_row(live_rows(live, &view.session_id)) else {
             return;
         };
+        let focus = view.rows[focus];
         let cells = live
             .by_session_mut(&view.session_id)
             .map_or(&mut [][..], ChildThread::rows_mut);
@@ -665,6 +748,9 @@ impl Pager {
         let Some(&clicked) = view.rows.get(index) else {
             return;
         };
+        let key = view
+            .keys(live_rows(live, &view.session_id))
+            .swap_remove(index);
         let cells = live
             .by_session_mut(&view.session_id)
             .map_or(&mut [][..], ChildThread::rows_mut);
@@ -672,7 +758,7 @@ impl Pager {
             && cell.collapsible()
         {
             cell.toggle();
-            view.focus = Some(clicked);
+            view.focus = key;
             self.laid_out = None;
         }
     }
@@ -927,8 +1013,9 @@ impl Pager {
                 let live = live
                     .by_session_mut(&view.session_id)
                     .map_or(&mut [][..], ChildThread::rows_mut);
+                view.merge(live);
+                let focused = view.focused_row(live);
                 let entries = view.entries.as_deref().unwrap_or_default();
-                view.rows = merged_rows(entries, live);
                 view.layouts.resize_with(entries.len(), || None);
                 let mut total = head.len();
                 let mut pieces = vec![Piece {
@@ -938,9 +1025,9 @@ impl Pager {
                 }];
                 for (index, &row) in view.rows.iter().enumerate() {
                     let mut lines = match row {
-                        ChildRow::Live(at) => live[at].lines(width, renderer),
+                        ChildRow::Live(at) => live[at].thread_lines(width, renderer),
                         ChildRow::Disk(at) => match view.recorded[at].as_mut() {
-                            Some(cell) => cell.lines(width, renderer),
+                            Some(cell) => cell.thread_lines(width, renderer),
                             None => {
                                 let entry = &entries[at];
                                 let hash = entry_hash(entry);
@@ -964,7 +1051,7 @@ impl Pager {
                             }
                         },
                     };
-                    if view.focus == Some(row)
+                    if focused == Some(index)
                         && let Some(header) = lines.first_mut()
                     {
                         *header = header.clone().patch_style(REVERSED);
@@ -1575,6 +1662,8 @@ mod tests {
 
     fn ok_end(duration_ms: u64) -> ToolEnd {
         ToolEnd {
+            name: String::new(),
+            args: None,
             ok: true,
             error: None,
             duration_ms: Some(duration_ms),
@@ -1658,7 +1747,7 @@ mod tests {
                 .to_string()
         };
         assert!(row("fs_grep(").contains("pattern"), "{frame}");
-        assert!(row("fs_grep(").contains("})  ok "), "{frame}");
+        assert!(row("fs_grep(").contains("})  done "), "{frame}");
         assert!(row("fs_read(").contains("1s  ok"), "{frame}");
         assert!(row("execute_command(").contains("running"), "{frame}");
         assert_eq!(frame.matches("fs_read(").count(), 1, "{frame}");
@@ -1684,7 +1773,10 @@ mod tests {
         let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
         insta::assert_snapshot!("pager_child_live_expanded_80x24", &frame);
         assert!(frame.contains("running 3 tests"), "{frame}");
-        assert!(frame.contains("execute_command {\"command\""), "{frame}");
+        assert!(
+            !frame.contains("execute_command {\"command\""),
+            "the open row says its call again: {frame}"
+        );
         pager.child_rows_changed();
         let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
         assert!(frame.contains("running 3 tests"), "{frame}");
@@ -1729,6 +1821,64 @@ mod tests {
         pager.click(&mut live, 3, y(&frame, "execute_command("), area);
         let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
         assert!(frame.contains("running 3 tests"), "{frame}");
+    }
+
+    /// The focus stays on its call when a re-read puts entries above it.
+    #[test]
+    fn the_focus_stays_on_its_call_across_a_reread() {
+        let mut cells = Vec::new();
+        let mut live = reviewer_live();
+        let mut pager = reviewer_pager();
+        draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        pager.step_focus(&live, true);
+        let mut entries = reviewer_entries();
+        entries.insert(0, ChildEntry::User("an earlier line".to_string()));
+        entries.insert(1, ChildEntry::Assistant("An earlier reply.".to_string()));
+        deliver(&mut pager, "reviewer-a1", Ok(entries));
+        pager.toggle_focused(&mut live);
+        let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
+        assert!(frame.contains("no matches"), "{frame}");
+    }
+
+    /// A call with no id is shown once: a saved one pairs with the live
+    /// row that has its name and arguments, in the order both came.
+    #[test]
+    fn calls_with_no_id_pair_with_their_live_rows_by_name_and_arguments() {
+        let now = Instant::now();
+        let mut live = ChildLive::default();
+        live.agent_started(
+            REVIEWER.to_string(),
+            "reviewer".to_string(),
+            Some("reviewer-a1".to_string()),
+        );
+        for name in ["fs_read", "fs_grep", "fs_read"] {
+            live.tool_started(
+                REVIEWER,
+                None,
+                String::new(),
+                name.to_string(),
+                Some(serde_json::json!({"path": "a"})),
+                now,
+            );
+        }
+        let saved = |name: &str| ChildEntry::Tool {
+            call_id: String::new(),
+            name: name.to_string(),
+            args: "{\"path\":\"a\"}".to_string(),
+            output: String::new(),
+        };
+        let entries = vec![saved("fs_read"), saved("fs_read"), saved("fs_grep")];
+        let rows = merged_rows(&entries, live_rows(&live, "reviewer-a1"));
+        assert_eq!(
+            rows,
+            [ChildRow::Live(0), ChildRow::Live(2), ChildRow::Live(1)]
+        );
+
+        let mut pager = reviewer_pager();
+        deliver(&mut pager, "reviewer-a1", Ok(entries));
+        let frame = draw_live(&mut pager, &mut Vec::new(), &mut live, 80, 24);
+        assert_eq!(frame.matches("fs_read(").count(), 2, "{frame}");
+        assert!(!frame.contains("done"), "{frame}");
     }
 
     /// A graph child shows a row per node in start order, its calls

@@ -25,8 +25,14 @@ const CHANGES_SKILLS: Timing = Timing::Queue("changes the loaded skills");
 const CHANGES_TOOLS: Timing = Timing::Queue("changes the tools the model is offered");
 const PROMPTS_MODEL: Timing = Timing::Queue("sends a prompt to the model");
 const PROMPTS_USER: Timing = Timing::Queue("asks questions while it runs");
+const SAVES_RAG: Timing = Timing::Queue("saves the RAG");
+const STARTS_MCP_SERVERS: Timing = Timing::Queue("starts or stops MCP servers");
 
-/// Every command the TUI knows by name, with its timing.
+/// Every command the TUI knows by name, with its timing. A `.set <key>`
+/// entry queues a key whose update writes files, starts processes, talks
+/// to an MCP server, prints or rebuilds the tools, so a deferred `.set`
+/// only changes settings in memory and replaying it on the loop thread
+/// stays cheap.
 pub(super) const COMMAND_TIMINGS: &[(&str, Timing)] = &[
     (".help", Timing::Now),
     (".keys", Timing::Now),
@@ -56,6 +62,15 @@ pub(super) const COMMAND_TIMINGS: &[(&str, Timing)] = &[
     (".sources rag", Timing::Now),
     (".skill loaded", Timing::Now),
     (".set", Timing::Deferred),
+    (".set skills_enabled", STARTS_MCP_SERVERS),
+    (".set enabled_mcp_servers", STARTS_MCP_SERVERS),
+    (".set mcp_server_support", STARTS_MCP_SERVERS),
+    (
+        ".set mcp_tools.",
+        Timing::Queue("asks the MCP server for its tools"),
+    ),
+    (".set rag_top_k", SAVES_RAG),
+    (".set rag_reranker_model", SAVES_RAG),
     (".reasoning", Timing::Deferred),
     (".authenticate", PROMPTS_USER),
     (".mcp auth", PROMPTS_USER),
@@ -143,7 +158,9 @@ pub(super) const COMMAND_TIMINGS: &[(&str, Timing)] = &[
 /// The entry whose words begin the line under the active prefix, the
 /// longest such entry when several do: `.info mcp-server foo` is
 /// `.info mcp-server`, `.info foo` is `.info`. A line no entry names (a
-/// macro, a `!shell` line) has none and waits like `Queue`.
+/// macro, a `!shell` line) has none and waits like `Queue`. An entry
+/// word ending in `.` matches any word it begins, so `.set mcp_tools.`
+/// covers `.set mcp_tools.github`.
 pub(super) fn lookup(line: &str, prefix: CommandPrefix) -> Option<&'static (&'static str, Timing)> {
     let line = prefix.normalize(unfence(line).trim())?;
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -151,7 +168,10 @@ pub(super) fn lookup(line: &str, prefix: CommandPrefix) -> Option<&'static (&'st
         .iter()
         .filter(|(name, _)| {
             let name_words: Vec<&str> = name.split_whitespace().collect();
-            words.starts_with(&name_words)
+            name_words.len() <= words.len()
+                && name_words.iter().zip(&words).all(|(name, word)| {
+                    name == word || (name.ends_with('.') && word.starts_with(name))
+                })
         })
         .max_by_key(|(name, _)| name.split_whitespace().count())
 }
