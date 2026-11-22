@@ -1238,9 +1238,7 @@ async fn dispatch_repl_line(
                     if variables.len() != variable_pairs.len() {
                         bail!("Some variable values are not key=value pairs");
                     }
-                    if !variables.is_empty() {
-                        ctx.agent_variables = Some(variables.clone());
-                    }
+                    ctx.agent_variables = (!variables.is_empty()).then_some(variables);
                     let app = Arc::clone(&ctx.app.config);
                     ctx.use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
                         .await?;

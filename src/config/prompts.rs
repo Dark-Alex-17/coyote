@@ -99,7 +99,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
 
     | Tool | Purpose |
     |------|----------|
-    | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. Optional `variables` (string map) sets the target agent's declared variables, overriding inherited values. |
+    | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. Optional `variables` (string map) sets the target agent's declared variables, overriding per key the values inherited from your own start or spawn variables. |
     | `agent__check` | Non-blocking status probe: running or finished. Never returns/consumes the result — use `agent__collect`. |
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
     | `agent__wait` | Block until ANY of several agents (default: every agent you started) finishes, or `timeout_secs` passes. Lists the finished ids without consuming them; collect those next. |

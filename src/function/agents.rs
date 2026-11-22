@@ -123,6 +123,27 @@ fn merge_spawn_variables(inherited: &mut Option<AgentVariables>, provided: Agent
         .extend(provided);
 }
 
+/// The agent node `inputs:` that name a variable the child declares, as
+/// variable values. They override the inherited ones, so the child's
+/// `LLM_AGENT_VAR_*` env and its own children see what the node passed;
+/// any other input only seeds the child's graph state.
+fn declared_inputs_as_variables(
+    declared: &[AgentVariable],
+    inputs: &HashMap<String, Value>,
+) -> AgentVariables {
+    declared
+        .iter()
+        .filter_map(|variable| {
+            let value = match inputs.get(&variable.name)? {
+                Value::Null => return None,
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            Some((variable.name.clone(), value))
+        })
+        .collect()
+}
+
 fn dispatch_spawn_args(
     agent: &str,
     prompt: &str,
@@ -394,7 +415,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "variables".to_string(),
                         JsonSchema {
                             type_value: Some("object".to_string()),
-                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides values inherited from the parent. String values only. On a `session_id` resume the values must equal the stored ones (omitted = stored); a mismatch is refused. Discover an agent's declared variables via `agent__list_available`.".into()),
+                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides, per key, the values inherited from the parent (the variables the parent was started or spawned with; its declared defaults are not passed on). String values only. On a `session_id` resume the values must equal the stored ones (omitted = stored); a mismatch is refused. Discover an agent's declared variables via `agent__list_available`.".into()),
                             ..Default::default()
                         },
                     ),
@@ -1209,6 +1230,13 @@ pub async fn run_agent_for_graph(
                 "agent '{agent_name}': `inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})"
             );
         }
+        let declared = child_ctx
+            .agent
+            .as_ref()
+            .map(Agent::defined_variables)
+            .unwrap_or_default();
+        let seated = declared_inputs_as_variables(declared, inputs);
+        merge_spawn_variables(&mut child_ctx.agent_variables, seated);
     }
     if assigned_peer {
         child_ctx.peer_registry = peer_registry.clone();
@@ -16324,6 +16352,35 @@ mod tests {
         );
 
         assert_eq!(inherited.unwrap().get("pr").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn declared_inputs_as_variables_keeps_only_declared_non_null_inputs() {
+        let declared: Vec<AgentVariable> = ["project_dir", "parallel", "build_lock"]
+            .into_iter()
+            .map(|name| AgentVariable {
+                name: name.to_string(),
+                description: String::new(),
+                default: None,
+                value: String::new(),
+            })
+            .collect();
+        let inputs = HashMap::from([
+            ("project_dir".to_string(), json!("/wt")),
+            ("parallel".to_string(), json!(3)),
+            ("build_lock".to_string(), Value::Null),
+            ("review_cadence".to_string(), json!("per-task")),
+        ]);
+
+        let seated = declared_inputs_as_variables(&declared, &inputs);
+
+        assert_eq!(
+            seated,
+            AgentVariables::from([
+                ("project_dir".to_string(), "/wt".to_string()),
+                ("parallel".to_string(), "3".to_string()),
+            ])
+        );
     }
 
     #[test]

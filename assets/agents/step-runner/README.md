@@ -166,9 +166,10 @@ coyote -a step-runner --agent-variable plans_dir docs/plans "Execute the next st
 coyote -a step-runner --agent-variable build_lock 'flock -w 240 /tmp/coyote-cargo.lock' "Execute the next step"
 ```
 
-**Invoke from the project root.** The coder sub-agent resolves its own
-`project_dir` from the invocation directory; overriding `project_dir` here
-does not propagate to the spawned coder.
+**Invoke from the project root, or pass `project_dir`.** A `project_dir`
+given to step-runner (`--agent-variable project_dir <path>`) reaches the
+spawned coder as its own `project_dir`; without one, both resolve it from
+the invocation directory.
 
 ## Tuning
 
