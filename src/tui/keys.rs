@@ -181,8 +181,11 @@ pub(crate) enum Action {
     DeleteToLineHead,
     /// Undo the last edit of the composer or a question's text field.
     Undo,
-    /// Soft-interrupt the running turn.
+    /// Soft-interrupt the running turn; the lines held for it are sent
+    /// next, as a turn of their own.
     Interrupt,
+    /// Soft-interrupt the running turn and drop the lines held for it.
+    InterruptDroppingHeld,
     /// Cancel the command a finished turn left running.
     CancelCommand,
     /// An Esc with nothing to cancel on an empty composer; two of them
@@ -521,7 +524,16 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Shift+Left / Shift+Right",
             "Select text to type over or delete; there is no cut, Ctrl+X opens the todo panel",
         ),
-        row(TurnRunning, "Esc / Ctrl+C", "Interrupt the turn"),
+        row(
+            TurnRunning,
+            "Esc",
+            "Interrupt the turn; held lines are sent next",
+        ),
+        row(
+            TurnRunning,
+            "Ctrl+C",
+            "Interrupt the turn and drop the held lines",
+        ),
         row(TurnRunning, "Enter", "Hold the line for the running turn"),
         row(Question, "y / n", "Answer yes or no"),
         row(
@@ -734,7 +746,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('c' | 'd') if ctrl && ctx.popup.is_some() => Action::ClosePopup,
             KeyCode::Char('c') if ctrl => {
                 if ctx.turn_running {
-                    Action::Interrupt
+                    Action::InterruptDroppingHeld
                 } else if ctx.composer_empty {
                     Action::Quit
                 } else {
@@ -1016,7 +1028,7 @@ mod tests {
         let cases = [
             (ctrl('c'), IDLE, Action::Quit),
             (ctrl('c'), typing, Action::ClearComposer),
-            (ctrl('c'), running, Action::Interrupt),
+            (ctrl('c'), running, Action::InterruptDroppingHeld),
             (ctrl('d'), IDLE, Action::Quit),
             (ctrl('d'), typing, Action::ComposerInput(ctrl('d'))),
             (ctrl('d'), running, Action::Quit),
@@ -1138,7 +1150,10 @@ mod tests {
             turn_running: true,
             ..IDLE
         };
-        assert_eq!(map_key(shifted('C'), &running), Action::Interrupt);
+        assert_eq!(
+            map_key(shifted('C'), &running),
+            Action::InterruptDroppingHeld
+        );
         assert_eq!(map_key(shifted('D'), &IDLE), Action::Quit);
         assert_eq!(map_key(shifted('L'), &IDLE), Action::ScheduleFrame);
         assert_eq!(map_key(shifted('Z'), &IDLE), Action::Suspend);
@@ -2783,11 +2798,13 @@ mod tests {
             ),
             (
                 H::TurnRunning,
-                "Esc / Ctrl+C",
-                vec![
-                    (plain(KeyCode::Esc), RUNNING, Action::Interrupt),
-                    (ctrl('c'), RUNNING_TYPING, Action::Interrupt),
-                ],
+                "Esc",
+                vec![(plain(KeyCode::Esc), RUNNING, Action::Interrupt)],
+            ),
+            (
+                H::TurnRunning,
+                "Ctrl+C",
+                vec![(ctrl('c'), RUNNING_TYPING, Action::InterruptDroppingHeld)],
             ),
             (
                 H::TurnRunning,

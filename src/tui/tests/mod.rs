@@ -1185,11 +1185,12 @@ fn the_mid_turn_marker_survives_no_color() {
     assert_eq!(placeholder.bg, Color::Reset, "{frame}");
 }
 
-/// Esc during a turn drops what was lined up behind it and says so.
-/// The second held line went in through the palette, which the queue
-/// closes: the Esc that follows reaches the turn, not a band.
+/// Esc during a turn interrupts it and keeps what was lined up behind
+/// it, which runs next rather than being thrown away. The second held
+/// line went in through the palette, which the queue closes: the Esc
+/// that follows reaches the turn, not a band.
 #[test]
-fn an_interrupt_drops_the_queued_lines_with_a_notice() {
+fn esc_during_a_turn_keeps_the_queued_lines_to_send_next() {
     let mut harness = Harness::standalone(80, 24);
     harness.app.begin_turn("explain", false);
     harness.type_text("later");
@@ -1202,6 +1203,29 @@ fn an_interrupt_drops_the_queued_lines_with_a_notice() {
     assert!(palette(&harness).is_none());
     assert_eq!(harness.app.vi_mode, None);
     assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+    assert_eq!(harness.app.queued.len(), 2);
+    let frame = harness.draw();
+    assert!(!frame.contains("Dropped"), "{frame}");
+    assert!(frame.contains("pending: 2"), "{frame}");
+}
+
+/// Ctrl+C during a turn is the hard stop: it drops what was lined up
+/// behind the turn and says so.
+#[test]
+fn ctrl_c_during_a_turn_drops_the_queued_lines_with_a_notice() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    harness.type_text("later");
+    harness.press(KeyCode::Enter);
+    harness.type_text(".agent");
+    assert_eq!(harness.press(KeyCode::Enter), None);
+    assert_eq!(harness.app.queued.len(), 2);
+    assert_eq!(
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(Command::InterruptDroppingHeld)
+    );
     assert!(harness.app.queued.is_empty());
     let frame = harness.draw();
     assert!(frame.contains("Dropped 2 queued line(s)"), "{frame}");
@@ -1226,9 +1250,9 @@ fn a_quit_drops_the_queued_lines_with_a_notice() {
     assert!(frame.contains("Dropped 1 queued line(s)"), "{frame}");
 }
 
-/// A line queued after the interrupt, before the turn actually ends,
-/// survives the reconcile even when the dropped one is still on the
-/// queue the turn hands back.
+/// A line queued after a Ctrl+C, before the turn actually ends, survives
+/// the reconcile even when the dropped one is still on the queue the
+/// turn hands back.
 #[test]
 #[serial]
 fn a_line_queued_after_an_interrupt_survives_the_reconcile() {
@@ -1241,7 +1265,12 @@ fn a_line_queued_after_an_interrupt_survives_the_reconcile() {
         Some(Command::Queue("a".to_string()))
     );
     queued::queue_user_message(&queue, "a");
-    assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+    assert_eq!(
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(Command::InterruptDroppingHeld)
+    );
     assert!(harness.app.queued.is_empty());
     harness.type_text("b");
     assert_eq!(

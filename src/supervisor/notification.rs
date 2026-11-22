@@ -113,6 +113,14 @@ impl NotificationQueue {
         std::mem::take(&mut *self.pending.lock())
     }
 
+    /// Whether a message the user sent mid-turn is waiting for the model.
+    pub fn has_user_message(&self) -> bool {
+        self.pending
+            .lock()
+            .iter()
+            .any(|notification| matches!(notification, SystemNotification::UserMessage { .. }))
+    }
+
     /// Removes and returns, in order, the entries `take` accepts; the rest
     /// stay in place. One lock, so a concurrent drain sees either the whole
     /// queue or the kept remainder, never a half-moved one.

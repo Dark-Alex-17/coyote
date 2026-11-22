@@ -12,7 +12,7 @@ use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, r
 use crate::config::{CommandPrefix, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command};
-use crate::supervisor::notification::NotificationQueue;
+use crate::supervisor::notification::{NotificationQueue, SystemNotification};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, bail};
 use crossterm::event::EventStream;
@@ -857,6 +857,19 @@ pub(super) fn purge_turn_queue(task: &Option<Task>) {
     }
 }
 
+/// Puts the lines an Esc held back on the ended turn's queue, ahead of any
+/// typed since, in the order they were typed, so the end of the turn
+/// finds them unsent and runs them next.
+pub(super) fn restore_held_back(queue: &NotificationQueue, held_back: &mut Vec<String>) {
+    if held_back.is_empty() {
+        return;
+    }
+    let later = take_user_messages(queue);
+    for text in held_back.drain(..).chain(later) {
+        queue.push(SystemNotification::UserMessage { text });
+    }
+}
+
 /// Where a copy went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CopyOutcome {
@@ -987,6 +1000,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let mut immediate = ImmediateCommands::default();
     let mut quit_requested = false;
     let mut frame_failing = false;
+    // The user's lines an Esc took off the stopping turn's queue, so that
+    // turn cannot hand them to its model; they go back once it has ended.
+    let mut held_back: Vec<String> = Vec::new();
     loop {
         let step = tokio::select! {
             event = stream.as_mut().expect("the event stream is renewed in place").next() => Step::Input(event),
@@ -1077,6 +1093,14 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     }
                     Some(Command::Interrupt) => {
                         abort.set_ctrlc();
+                        if let Some(Task::Turn { queue, .. }) = &task {
+                            held_back.extend(take_user_messages(queue));
+                        }
+                        cancel_command(app, &mut immediate);
+                    }
+                    Some(Command::InterruptDroppingHeld) => {
+                        abort.set_ctrlc();
+                        held_back.clear();
                         purge_turn_queue(&task);
                         cancel_command(app, &mut immediate);
                     }
@@ -1182,6 +1206,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     let Some(Task::Turn { command, queue, .. }) = task.take() else {
                         continue;
                     };
+                    restore_held_back(&queue, &mut held_back);
                     match joined {
                         Ok((returned, outcome)) => {
                             // The select is unbiased: a tool's last report

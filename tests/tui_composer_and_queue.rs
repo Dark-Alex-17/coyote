@@ -946,6 +946,147 @@ mod queue_vi_and_headless {
             quit_and_check(&mut pty);
         }
     }
+
+    /// Kills the recorded pid when the test ends, however it ends.
+    struct KillOnDrop(i32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            let _ = unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+
+    /// A line sent while the model waits in `job__wait` ends the wait at
+    /// once: the model's next request carries the line and the wait's
+    /// `user_message` status long before the job could finish, and the job
+    /// keeps running.
+    #[test]
+    #[serial]
+    fn a_line_sent_during_a_job_wait_reaches_the_model_and_the_job_keeps_running() {
+        let dir = fresh_config_dir("wait-user-message");
+        let _guard = TempDirGuard(dir.clone());
+        let job_pid = dir.join("job.pid");
+        let fake = FakeLlm::start(vec![
+            Reply::ToolCall {
+                name: "job__start".to_string(),
+                arguments: r#"{"tool":"fixture_sleep","arguments":{}}"#.to_string(),
+            },
+            Reply::ToolCall {
+                name: "job__wait".to_string(),
+                arguments: "{}".to_string(),
+            },
+            Reply::Text("saw it w4t".to_string()),
+        ]);
+        write_fake_llm_config_with(&dir, &fake, "enabled_tools:\n  - fixture_sleep\n");
+        write_tool(&dir, "fixture_sleep.sh", &sleeping_tool(&job_pid));
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+
+        pty.send(b"start it and wait\r").unwrap();
+        wait_for_file(&mut pty, &job_pid, "the job's pid file");
+        let pid: i32 = fs::read_to_string(&job_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _kill = KillOnDrop(pid);
+        let deadline = Instant::now() + PTY_DEADLINE;
+        while fake.served() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the model never called job__wait"
+            );
+            pty.read_for(Duration::from_millis(100));
+        }
+        pty.read_for(Duration::from_millis(800));
+        assert_eq!(fake.served(), 2, "the wait ended before the line was sent");
+
+        let sent = Instant::now();
+        pty.send(b"look at this m5q\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "saw it w4t", 0, "the reply after the wait");
+        assert!(
+            sent.elapsed() < Duration::from_secs(10),
+            "the line waited {:?} for the wait to end",
+            sent.elapsed()
+        );
+        // The third request answers the wait; a later one may be the
+        // engine's reminder about the job still running.
+        let bodies = fake.bodies();
+        let after_wait = bodies.get(2).expect("no request followed the wait");
+        assert!(
+            after_wait.contains("look at this m5q"),
+            "the line did not reach the model with the wait's result: {after_wait}"
+        );
+        assert!(
+            after_wait.contains("user_message"),
+            "the wait did not say why it ended: {after_wait}"
+        );
+        assert!(alive(pid), "the job died with the interrupted wait");
+        quit_clearing_any_draft(&mut pty);
+    }
+
+    /// A line sent while a real tool runs waits for it: the tool is not
+    /// stopped for it and the model is not asked again. Esc then stops
+    /// the turn and sends the held line at once, as the next turn, rather
+    /// than dropping it.
+    #[test]
+    #[serial]
+    fn esc_sends_a_line_held_behind_a_running_tool() {
+        let dir = fresh_config_dir("esc-sends-held");
+        let _guard = TempDirGuard(dir.clone());
+        let tool_pid = dir.join("tool.pid");
+        let fake = FakeLlm::start(vec![
+            Reply::ToolCall {
+                name: "fixture_sleep".to_string(),
+                arguments: "{}".to_string(),
+            },
+            Reply::Text("answered the held line n8x".to_string()),
+        ]);
+        write_fake_llm_config_with(&dir, &fake, "enabled_tools:\n  - fixture_sleep\n");
+        write_tool(&dir, "fixture_sleep.sh", &sleeping_tool(&tool_pid));
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+
+        pty.send(b"run the slow tool\r").unwrap();
+        wait_for_file(&mut pty, &tool_pid, "the tool's pid file");
+        let pid: i32 = fs::read_to_string(&tool_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _kill = KillOnDrop(pid);
+        pty.send(b"held line h3d\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "pending: 1", 0, "the held line's strip");
+        pty.read_for(Duration::from_millis(1500));
+        assert_eq!(
+            fake.served(),
+            1,
+            "the held line asked the model while the tool ran"
+        );
+        assert!(alive(pid), "the held line stopped the running tool");
+
+        let esc_at = pty.raw().len();
+        pty.send(ESC).unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "answered the held line n8x",
+            esc_at,
+            "the held line's turn after Esc",
+        );
+        let bodies = fake.bodies();
+        let next = bodies.get(1).expect("Esc sent nothing to the model");
+        assert!(
+            next.contains("held line h3d"),
+            "Esc did not send the held line: {next}"
+        );
+        let shown = since(&pty, esc_at);
+        assert!(
+            !shown.contains("Dropped"),
+            "Esc dropped the held line:\n{shown}"
+        );
+        quit_clearing_any_draft(&mut pty);
+    }
 }
 
 mod readline_and_text_field_keys {

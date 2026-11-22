@@ -959,15 +959,16 @@ mod rewind_macros_and_queue_drain {
     // An interrupt takes the queued lines off the turn's queue too.
     // ---------------------------------------------------------------------
 
-    /// A line queued while a tool sleeps, then Esc: the turn is interrupted,
-    /// the queue strip goes, and the line is neither sent as the next prompt
-    /// nor left on the turn's queue. The next turn's own queued line still
-    /// rides its tool round. Regression target: the interrupt dropped the
-    /// preview but left the `UserMessage` on the turn queue, and the stale
-    /// entry made the reconcile walk drop the line queued in the next turn.
+    /// A line queued while a tool sleeps, then Ctrl+C, the interrupt that
+    /// drops what is held: the turn is interrupted, the queue strip goes,
+    /// and the line is neither sent as the next prompt nor left on the
+    /// turn's queue. The next turn's own queued line still rides its tool
+    /// round. Regression target: the interrupt dropped the preview but left
+    /// the `UserMessage` on the turn queue, and the stale entry made the
+    /// reconcile walk drop the line queued in the next turn.
     #[test]
     #[serial]
-    fn esc_during_a_tool_round_drops_the_queued_line_from_the_turn_queue_too() {
+    fn ctrl_c_during_a_tool_round_drops_the_queued_line_from_the_turn_queue_too() {
         let dir = fresh_config_dir("esc-drains-queue");
         let _guard = TempDirGuard(dir.clone());
         let tool_a = dir.join("tool-a");
@@ -982,7 +983,7 @@ mod rewind_macros_and_queue_drain {
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
-        // Turn 1: the tool sleeps; one line is queued; Esc interrupts.
+        // Turn 1: the tool sleeps; one line is queued; Ctrl+C interrupts.
         pty.send(b"first-turn\r").unwrap();
         wait_for_file(
             &mut pty,
@@ -999,7 +1000,7 @@ mod rewind_macros_and_queue_drain {
         );
 
         let esc_at = pty.raw().len();
-        pty.send(b"\x1b").unwrap();
+        pty.send(b"\x03").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             pty.read_for(Duration::from_millis(200));
@@ -1011,7 +1012,7 @@ mod rewind_macros_and_queue_drain {
             }
             assert!(
                 Instant::now() < deadline,
-                "no cell said the turn was interrupted or the tool aborted after Esc:\n{}",
+                "no cell said the turn was interrupted or the tool aborted after Ctrl+C:\n{}",
                 since(&pty, esc_at)
             );
         }

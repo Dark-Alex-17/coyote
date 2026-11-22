@@ -2,7 +2,7 @@ use super::*;
 use crate::tui::run_loop::{
     AfterTurn, DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished,
     cancel_command, dump_route, finish_turn, flush_typeahead, join_unattended, purge_turn_queue,
-    quit_abort,
+    quit_abort, restore_held_back,
 };
 #[cfg(unix)]
 use crate::tui::run_loop::{Termination, edit_in_editor};
@@ -405,6 +405,58 @@ async fn turn_with_setting(
     let ran = immediate.join().await;
     harness.app.handle_msg(immediate.finish(ran));
     immediate
+}
+
+/// The lines an Esc held back go back on the ended turn's queue ahead of
+/// one typed after the Esc, in typing order, and the end of the turn runs
+/// the oldest next with the rest offered to it: Esc sends them rather
+/// than dropping them.
+#[test]
+#[serial]
+fn lines_held_back_by_esc_run_next_in_the_order_typed() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-esc-held-back");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = ImmediateCommands::default();
+        let queue = NotificationQueue::new();
+        harness.app.begin_turn("explain", false);
+        for text in ["first e1", "second e2"] {
+            harness.type_text(text);
+            assert_eq!(
+                harness.press(KeyCode::Enter),
+                Some(Command::Queue(text.to_string()))
+            );
+            queued::queue_user_message(&queue, text);
+        }
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        let mut held_back = take_user_messages(&queue);
+        harness.type_text("third e3");
+        harness.press(KeyCode::Enter);
+        queued::queue_user_message(&queue, "third e3");
+        assert!(queue.has_user_message());
+
+        restore_held_back(&queue, &mut held_back);
+        assert!(held_back.is_empty());
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &queue,
+            false,
+        )
+        .await;
+        let AfterTurn::Next(next, line) = after else {
+            panic!("the lines Esc held back did not run next");
+        };
+        assert_eq!(line, "first e1");
+        assert_eq!(
+            take_user_messages(&next.notification_queue),
+            ["second e2", "third e3"]
+        );
+    });
 }
 
 /// A setting taken during a turn is on the context the held line's turn

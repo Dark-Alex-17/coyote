@@ -785,6 +785,14 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
             return Ok(interrupted());
         }
 
+        if ctx.user_message_waiting() {
+            return Ok(json!({
+                "status": "user_message",
+                "id": id,
+                "message": format!("job__collect stopped waiting because the user sent a message (in system_notifications); job '{id}' is still running in the background. Answer the user, then collect it again later."),
+            }));
+        }
+
         if let Some(queue) = ctx.root_escalation_queue()
             && queue.has_pending()
         {
@@ -1044,6 +1052,16 @@ async fn handle_wait(ctx: &RequestContext, args: &Value) -> Result<Value> {
 
         if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             break interrupted();
+        }
+
+        if ctx.user_message_waiting() {
+            break json!({
+                "status": "user_message",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The wait stopped because the user sent a message (in system_notifications); the watched jobs are still running in the background. Answer the user, then wait again later.",
+            });
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -4430,6 +4448,80 @@ mod tests {
     /// hermetically, so this pins that the child's wait ends on its timeout.
     #[test]
     fn handle_wait_in_a_spawned_child_times_out_instead_of_interrupting() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            assert!(!ctx.user_interrupts_here());
+            register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+            ctx.notification_queue.push(
+                crate::supervisor::notification::SystemNotification::UserMessage {
+                    text: "not for the child".to_string(),
+                },
+            );
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&ctx, &json!({"timeout_secs": 0.3})),
+            )
+            .await
+            .expect("the spawned child wait must honour timeout_secs")
+            .unwrap();
+
+            assert_eq!(
+                result["status"], "timeout",
+                "a child's wait answers no user"
+            );
+        });
+    }
+
+    /// A message the user sends mid-wait ends job__wait and job__collect
+    /// promptly with a `user_message` status; the job keeps running and
+    /// stays registered for a later collect.
+    #[test]
+    fn a_user_message_mid_wait_ends_wait_and_collect_and_the_job_keeps_running() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            let state = register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+            ctx.session_abort = Some(create_abort_signal());
+            let queue = Arc::clone(&ctx.notification_queue);
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(50)).await;
+                queue.push(
+                    crate::supervisor::notification::SystemNotification::UserMessage {
+                        text: "stop and look j7m".to_string(),
+                    },
+                );
+            });
+            let result = time::timeout(Duration::from_secs(2), handle_wait(&ctx, &json!({})))
+                .await
+                .expect("a user message mid-wait must end the wait promptly")
+                .unwrap();
+            assert_eq!(result["status"], "user_message");
+            assert_eq!(result["running"], json!(["job_slow"]));
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&ctx, &json!({"id": "job_slow"})),
+            )
+            .await
+            .expect("a waiting user message must end the collect promptly")
+            .unwrap();
+            assert_eq!(result["status"], "user_message");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("still running")
+            );
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("job_slow"));
+            assert!(matches!(state.lock().status, JobStatus::Running));
+            assert!(ctx.notification_queue.has_user_message());
+        });
+    }
+
+    #[test]
+    fn handle_wait_in_a_spawned_child_times_out_with_no_message_waiting() {
         run_async(async {
             let mut ctx = ctx_with_job_supervisor(4);
             ctx.self_agent_id = Some("c1".to_string());

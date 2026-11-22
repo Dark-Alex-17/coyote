@@ -1129,6 +1129,13 @@ impl RequestContext {
         self.self_agent_id.is_none() || self.session_abort.is_some()
     }
 
+    /// Whether a wait on background work should hand the turn back now:
+    /// the user sent a message mid-turn and this context answers the
+    /// user. The work waited on keeps running.
+    pub(crate) fn user_message_waiting(&self) -> bool {
+        self.user_interrupts_here() && self.notification_queue.has_user_message()
+    }
+
     /// The full-screen UI reads the keyboard itself and turns Esc into an
     /// abort, so the derivation says `NotOwned` while it runs; the spinner
     /// entry point enforces the same rule for sites that pass a literal.

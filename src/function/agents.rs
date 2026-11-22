@@ -2758,6 +2758,14 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             "message": format!("agent__collect was interrupted by the user; agent '{id}' is still running in the background. Collect it again later, cancel it with agent__cancel, or continue with other work."),
         })
     };
+    let message_arrived = || {
+        json!({
+            "status": "user_message",
+            "id": id,
+            "session_id": session_id,
+            "message": format!("agent__collect stopped waiting because the user sent a message (in system_notifications); agent '{id}' is still running in the background. Answer the user, then collect it again later."),
+        })
+    };
 
     let user_interrupts_here = ctx.user_interrupts_here();
     loop {
@@ -2772,6 +2780,10 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 
         if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             return Ok(interrupted());
+        }
+
+        if ctx.user_message_waiting() {
+            return Ok(message_arrived());
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -3013,6 +3025,16 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
         if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             break interrupted();
+        }
+
+        if ctx.user_message_waiting() {
+            break json!({
+                "status": "user_message",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The wait stopped because the user sent a message (in system_notifications); the watched agents are still running in the background. Answer the user, then wait again later.",
+            });
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -17302,6 +17324,79 @@ mod tests {
             assert_eq!(result["status"], "interrupted");
             assert_eq!(result["running"], json!(["slow"]));
             assert!(ctx.supervisor.as_ref().unwrap().read().has_agent("slow"));
+        });
+    }
+
+    /// A message the user sends mid-wait ends agent__wait and
+    /// agent__collect promptly with a `user_message` status; the agent
+    /// waited on is neither cancelled nor collected and keeps running.
+    #[test]
+    fn a_user_message_mid_wait_ends_wait_and_collect_and_the_agent_keeps_running() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let abort = register_running_agent(&mut ctx, "slow", "test");
+            ctx.session_abort = Some(create_abort_signal());
+            let queue = Arc::clone(&ctx.notification_queue);
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(50)).await;
+                queue.push(SystemNotification::UserMessage {
+                    text: "stop and look u7m".to_string(),
+                });
+            });
+            let result = time::timeout(Duration::from_secs(2), handle_wait(&mut ctx, &json!({})))
+                .await
+                .expect("a user message mid-wait must end the wait promptly")
+                .unwrap();
+            assert_eq!(result["status"], "user_message");
+            assert_eq!(result["running"], json!(["slow"]));
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&mut ctx, &json!({"id": "slow"})),
+            )
+            .await
+            .expect("a waiting user message must end the collect promptly")
+            .unwrap();
+            assert_eq!(result["status"], "user_message");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("still running")
+            );
+
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert!(sup.has_agent("slow"), "the agent was taken");
+            assert_eq!(sup.is_finished("slow"), Some(false), "the agent stopped");
+            assert!(!abort.aborted(), "the agent was cancelled");
+            assert!(
+                ctx.notification_queue.has_user_message(),
+                "the message was consumed"
+            );
+        });
+    }
+
+    /// A spawned child's wait answers no user, so a message on its queue
+    /// does not end it.
+    #[test]
+    fn a_spawned_childs_wait_ignores_a_user_message() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            ctx.notification_queue
+                .push(SystemNotification::UserMessage {
+                    text: "not for the child".to_string(),
+                });
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&mut ctx, &json!({"timeout_secs": 0.3})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result["status"], "timeout");
         });
     }
 

@@ -323,7 +323,11 @@ pub(crate) enum Command {
         held: Option<String>,
         draft: Option<String>,
     },
+    /// Interrupt the turn; the lines held for it run next instead of
+    /// reaching the model inside the turn being stopped.
     Interrupt,
+    /// Interrupt the turn and drop the lines held for it.
+    InterruptDroppingHeld,
     /// Cancel the command still running from a turn that has ended.
     Cancel,
     Quit,
@@ -1191,8 +1195,12 @@ impl App {
             }
             Action::Interrupt => {
                 self.transcript.clear_focus();
-                self.drop_queued();
                 (!self.exiting).then_some(Command::Interrupt)
+            }
+            Action::InterruptDroppingHeld => {
+                self.transcript.clear_focus();
+                self.drop_queued();
+                (!self.exiting).then_some(Command::InterruptDroppingHeld)
             }
             Action::CancelCommand => (!self.exiting).then_some(Command::Cancel),
             Action::IdleEsc => {
