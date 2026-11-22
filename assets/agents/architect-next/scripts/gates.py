@@ -2992,24 +2992,61 @@ VERIFY_ADOPT = "Run the proposed command in place of the declared one (recorded)
 VERIFY_KEEP = "Keep the declared command and run a fix round"
 VERIFY_REPLACED_RERUN = "Run the verification again with the replaced command"
 CITED_PLACE_RE = re.compile(r"([\w./-]+):(\d+)")
+PATH_TOKEN_RE = re.compile(r"[\w./-]+")
+DOC_MATCH_CAP = 12
 
 
 def _verification_decided(state, command, replacement):
     return any(as_dict(c).get("from") == command and as_dict(c).get("to") == replacement for c in as_list(state.get("verification_changes")))
 
 
-def _cited_place_check(state, replacement, reason):
-    """The lines around the `path:line` a proposal cites, and whether its command appears in that file."""
+def _documentation_check(state, replacement, reason):
+    """What the files a proposal cites or names, and the project convention files, say about its command: the lines
+    around each cited `path:line`, and every line holding the command or one of its words. Only regular files inside
+    the code repo are read."""
     code = os.path.realpath(state.get("code_repo_path") or ".")
-    m = CITED_PLACE_RE.search(reason or "")
-    path = os.path.realpath(os.path.join(code, m.group(1))) if m else ""
-    if not path.startswith(code + os.sep) or not os.path.isfile(path):
-        return "Documentation check: cited place not found"
-    text = read_file(path)
-    lines, n = text.splitlines(), int(m.group(2))
-    excerpt = "\n".join(f"{i}: {lines[i - 1]}" for i in range(max(1, n - 3), min(len(lines), n + 3) + 1)) or f"(the file has {len(lines)} lines)"
-    return (f"Documentation check: {m.group(1)}:{n}\n{excerpt}\n"
-            f"replacement text appears verbatim in the cited file: {'yes' if replacement in text else 'no'}")
+    reason = reason or ""
+
+    def in_repo(rel):
+        path = os.path.realpath(os.path.join(code, rel))
+        return path if path.startswith(code + os.sep) and os.path.isfile(path) else ""
+
+    cited, missing = {}, []
+    for m in CITED_PLACE_RE.finditer(reason):
+        path = in_repo(m.group(1))
+        if not path:
+            missing.append(m.group(0))
+        elif int(m.group(2)) not in cited.setdefault(path, []):
+            cited[path].append(int(m.group(2)))
+    named = [t.rstrip(".") for t in PATH_TOKEN_RE.findall(CITED_PLACE_RE.sub(" ", reason))]
+    files = []
+    for path in [*cited, *map(in_repo, named), *map(in_repo, dict(_lib.CONVENTION_FILES)["code"])]:
+        if path and path not in files:
+            files.append(path)
+    words = [w for w in replacement.split() if not w.startswith("-") and len(w) >= 3]
+    blocks, verbatim = [], []
+    for path in files:
+        rel, text = os.path.relpath(path, code), read_file(path)
+        lines = text.splitlines()
+        block = [f"== {rel}"]
+        for n in cited.get(path, []):
+            excerpt = "\n".join(f"{i}: {lines[i - 1]}" for i in range(max(1, n - 3), min(len(lines), n + 3) + 1))
+            block.append(f"cited line {n}:\n{excerpt or f'(the file has {len(lines)} lines)'}")
+        hits = [f"{rel}:{i}: {line}" for i, line in enumerate(lines, 1)
+                if (replacement and replacement in line) or any(w in line for w in words)]
+        block += hits[:DOC_MATCH_CAP] or ["no line holds the command or one of its words"]
+        if len(hits) > DOC_MATCH_CAP:
+            block.append(f"({len(hits) - DOC_MATCH_CAP} more matching lines not shown)")
+        if replacement and replacement in text:
+            verbatim.append(rel)
+        blocks.append("\n".join(block))
+    if blocks:
+        report = ["Documentation check:", *blocks, f"replacement text appears verbatim in: {', '.join(verbatim) or 'none'}"]
+    else:
+        report = ["Documentation check: no cited or convention file found in the repo"]
+    if missing:
+        report.append(f"cited but not found: {', '.join(missing)}")
+    return "\n".join(report)
 
 
 def _verification_question(state, u, scope, tid, out, failed):
@@ -3026,7 +3063,7 @@ def _verification_question(state, u, scope, tid, out, failed):
     if _verification_decided(state, cmd, new):
         ledger(state, u, f"verification: `{cmd}` -> `{new}` was already decided; not asked again")
         return None
-    evidence = f"{tail(out, 2500)}\n\n{_cited_place_check(state, new, reason)}"
+    evidence = f"{tail(out, 2500)}\n\n{_documentation_check(state, new, reason)}"
     # No option is recommended: the fix round proposed the command, so whether it runs the same check is for the owner or
     # the headless judge to weigh, never the proposer.
     return escalation(

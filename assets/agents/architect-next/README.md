@@ -482,7 +482,8 @@ run here and the project documents another way to run the same check, the fix ro
 `verification-command: <command> -- <path:line and why>`. At the next RED of that command the
 `verification_command` question asks whether to run the proposed command in its place, keep
 the declared one, or stop; no option is recommended, since the proposer is the fix round. The
-evidence shows the cited lines and whether the command appears in that file. `integration_red`
+evidence reads every file the reason cites or names plus the convention files, showing the
+cited lines and each line holding the command or one of its words. `integration_red`
 also accepts a `verification_command` instruction. An adopted replacement is recorded in
 `verification_changes` and listed in the final report and the PR summary, and every later gate
 runs it.
