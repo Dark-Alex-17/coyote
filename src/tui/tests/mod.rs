@@ -4131,6 +4131,88 @@ fn on_a_narrow_frame_the_todo_panel_takes_the_transcripts_place() {
     assert!(!frame.contains("Working through it."), "{frame}");
 }
 
+/// A todo list longer than its panel scrolls: Alt+PgDn pages it with the
+/// borders counting what is out of view, the wheel over the panel moves
+/// it a line and leaves the transcript where it was, and the wheel over
+/// the transcript moves only the transcript. With the panel hidden,
+/// Alt+PgUp pages the transcript as PgUp does.
+#[test]
+fn a_long_todo_list_scrolls_by_alt_page_keys_and_the_wheel_over_it() {
+    use crate::config::todo::TodoItem;
+    let wheel = |kind: MouseEventKind, column: u16| {
+        TermInput::Mouse(MouseEvent {
+            kind,
+            column,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let mut harness = Harness::standalone(80, 16);
+    for n in 0..30 {
+        harness.app.begin_turn(&format!("prompt {n}"), false);
+        harness.app.end_turn(false, &TurnOutcome::default());
+    }
+    let items = (1..=30)
+        .map(|id| TodoItem {
+            id,
+            desc: format!("step {id}"),
+            done: false,
+        })
+        .collect();
+    harness.app.handle_msg(UiMsg::TodoUpdated(items));
+    harness.app.handle_key(ctrl(KeyCode::Char('x')));
+    let frame = harness.draw();
+    assert!(frame.contains("[ ] step 1 "), "{frame}");
+    assert!(frame.contains("below)"), "{frame}");
+    assert!(!frame.contains("above)"), "{frame}");
+
+    harness.app.handle_key(alt(KeyCode::PageDown));
+    let frame = harness.draw();
+    assert!(!frame.contains("[ ] step 1 "), "{frame}");
+    assert!(frame.contains("above)"), "{frame}");
+    assert!(
+        !harness.app.transcript.scrolled(),
+        "Alt+PgDn moved the transcript"
+    );
+
+    harness
+        .app
+        .handle_input(wheel(MouseEventKind::ScrollUp, 70));
+    harness
+        .app
+        .handle_input(wheel(MouseEventKind::ScrollUp, 70));
+    harness.app.handle_key(alt(KeyCode::PageUp));
+    let frame = harness.draw();
+    assert!(frame.contains("[ ] step 1 "), "{frame}");
+    assert!(
+        !harness.app.transcript.scrolled(),
+        "the wheel over the panel moved the transcript"
+    );
+
+    harness.app.handle_input(wheel(MouseEventKind::ScrollUp, 5));
+    harness.draw();
+    assert!(
+        harness.app.transcript.scrolled(),
+        "the wheel over the transcript did nothing"
+    );
+    assert!(
+        harness.draw().contains("[ ] step 1 "),
+        "the panel moved with the transcript"
+    );
+
+    harness
+        .app
+        .handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    harness.app.handle_key(ctrl(KeyCode::Char('x')));
+    harness.draw();
+    harness.app.handle_key(alt(KeyCode::PageUp));
+    harness.draw();
+    assert!(
+        harness.app.transcript.scrolled(),
+        "Alt+PgUp with the panel hidden"
+    );
+}
+
 #[test]
 fn the_welcome_block_greets_an_empty_transcript_until_the_first_turn() {
     let mut harness = Harness::standalone(80, 24);

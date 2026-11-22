@@ -238,6 +238,9 @@ pub(crate) enum Action {
     /// The `d` of `dd`: the second press deletes the cursor's line.
     ViDeleteLine,
     ToggleTodo,
+    /// Move the todo panel's list by this many pages, down when positive;
+    /// with the panel hidden, the transcript instead.
+    TodoPage(i32),
     /// Open the tasks pop-up, or close it when it is open.
     ToggleRoster,
     /// Open the key help, or close it when it is open.
@@ -377,6 +380,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(Transcript, "PgUp / PgDn", "Scroll the transcript a page"),
         row(
             Transcript,
+            "Alt+PgUp / Alt+PgDn",
+            "Scroll the todo panel a page, while it is open",
+        ),
+        row(
+            Transcript,
             "Shift+Up / Shift+Down",
             "Scroll the transcript a line",
         ),
@@ -385,7 +393,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "End",
             "Jump back to the newest output when scrolled",
         ),
-        row(Transcript, "Mouse wheel", "Scroll the transcript"),
+        row(
+            Transcript,
+            "Mouse wheel",
+            "Scroll the transcript, or the todo panel under the pointer",
+        ),
         row(
             Transcript,
             "Alt+C",
@@ -642,6 +654,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     match code {
         KeyCode::Char('x') if ctrl => return Action::ToggleTodo,
         KeyCode::Char('c') if alt && !ctrl => return Action::CopyToolOutput,
+        KeyCode::PageUp if alt => return Action::TodoPage(-1),
+        KeyCode::PageDown if alt => return Action::TodoPage(1),
         KeyCode::PageUp => return Action::ScrollPage(-1),
         KeyCode::PageDown => return Action::ScrollPage(1),
         KeyCode::Up if shift => return Action::ScrollLines(-1),
@@ -2505,6 +2519,14 @@ mod tests {
                 vec![
                     (plain(KeyCode::PageUp), IDLE, Action::ScrollPage(-1)),
                     (plain(KeyCode::PageDown), INPUT, Action::ScrollPage(1)),
+                ],
+            ),
+            (
+                H::Transcript,
+                "Alt+PgUp / Alt+PgDn",
+                vec![
+                    (alt(KeyCode::PageUp), IDLE, Action::TodoPage(-1)),
+                    (alt(KeyCode::PageDown), CONFIRM, Action::TodoPage(1)),
                 ],
             ),
             (

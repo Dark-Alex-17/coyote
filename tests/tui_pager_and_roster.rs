@@ -1340,6 +1340,69 @@ mod transcript {
         quit(pty);
     }
 
+    /// A todo list longer than the panel scrolls in the real binary:
+    /// Alt+PgDn pages it and the top border then counts the lines above,
+    /// and a wheel notch over the panel moves it back a line.
+    #[test]
+    #[serial]
+    fn a_long_todo_list_scrolls_with_alt_page_down_and_the_wheel() {
+        const ALT_PAGE_DOWN: &[u8] = b"\x1b[6;3~";
+        const WHEEL_UP_OVER_THE_PANEL: &[u8] = b"\x1b[<64;85;4M";
+        let dir = fresh_config_dir("todo-scroll");
+        let _guard = TempDirGuard(dir.clone());
+        let mut replies = vec![Reply::ToolCall {
+            name: "todo__init".to_string(),
+            arguments: "{\"goal\": \"a long list\"}".to_string(),
+        }];
+        replies.extend((1..=14).map(|n| Reply::ToolCall {
+            name: "todo__add".to_string(),
+            arguments: format!("{{\"task\": \"item {n:02} of the list\"}}"),
+        }));
+        replies.push(Reply::Text("listed m2t".to_string()));
+        let fake = FakeLlm::start(replies);
+        write_fake_llm_config_with(&dir, &fake, "auto_continue: true\nmax_auto_continues: 0\n");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(16, 100).unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        pty.send(b"make a list\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "listed m2t", 0, "the reply after the todo calls");
+        pty.read_for(HOTKEY_GAP);
+        pty.send(CTRL_X).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let panel = ctrl_l_repaint(&mut pty);
+        assert!(
+            panel.contains("item01") && panel.contains("below)"),
+            "the panel does not show the first items with a count below:\n{panel}"
+        );
+
+        pty.send(ALT_PAGE_DOWN).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let paged = ctrl_l_repaint(&mut pty);
+        assert!(
+            !paged.contains("item01") && paged.contains("above)"),
+            "Alt+PgDn did not page the panel:\n{paged}"
+        );
+
+        pty.send(WHEEL_UP_OVER_THE_PANEL).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let wheeled = ctrl_l_repaint(&mut pty);
+        assert_ne!(
+            above_count(&paged),
+            above_count(&wheeled),
+            "a wheel notch over the panel did not move it:\n{wheeled}"
+        );
+        quit(pty);
+    }
+
+    /// The `(+N above)` count on the todo panel's top border.
+    fn above_count(frame: &str) -> Option<String> {
+        let end = frame.find("above)")?;
+        let start = frame[..end].rfind("(+")?;
+        Some(frame[start..end].to_string())
+    }
+
     // ---------------------------------------------------------------------
     // With the reasoning delta held open on the wire, the "Thinking for Ns"
     // status row is on screen well before the hold limit, and it is gone

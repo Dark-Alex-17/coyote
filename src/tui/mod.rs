@@ -1113,6 +1113,14 @@ impl App {
                         }
                     }
                     Layer::Modal(_) | Layer::Band(_) | Layer::Composer => match mouse.kind {
+                        MouseEventKind::ScrollUp if self.todo.contains(mouse.column, mouse.row) => {
+                            self.todo.scroll(-WHEEL_LINES);
+                        }
+                        MouseEventKind::ScrollDown
+                            if self.todo.contains(mouse.column, mouse.row) =>
+                        {
+                            self.todo.scroll(WHEEL_LINES);
+                        }
                         MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
                         MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -1353,6 +1361,14 @@ impl App {
             }
             Action::ToggleTodo => {
                 self.todo.toggle();
+                None
+            }
+            Action::TodoPage(direction) => {
+                if self.todo.visible() {
+                    self.todo.page(direction);
+                } else {
+                    self.transcript.scroll_page(direction);
+                }
                 None
             }
             Action::ToggleRoster => {
