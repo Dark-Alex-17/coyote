@@ -836,6 +836,14 @@ u = gates.gate2_route(base_state(gate2_result="PLAN_REVIEW: REJECT", oracle_reje
 check("gate2_route: B5 exhausted -> gate2_stuck", u["escalation"]["kind"] == "gate2_stuck")
 u = gates.gate2_route(base_state(gate2_result=""))
 check("gate2_route: empty -> gate_fault", u["escalation"]["kind"] == "gate_fault")
+GATE_FAULTS = {"first": (gates.gate1_route(base_state(gate1_result="")), gates.gate2_route(base_state(gate2_result=""))),
+               "second": (gates.gate1_route(base_state(gate1_result="", gate_fault_retries=1)),
+                          gates.gate2_route(base_state(gate2_result="", gate_fault_retries=1)))}
+GATE_FAULT_RECS = {k: [[o.get("text") for o in (f.get("escalation") or {}).get("options", []) if o.get("recommended")] for f in v]
+                   for k, v in GATE_FAULTS.items()}
+check("gate1_route / gate2_route: the first gate fault recommends Retry, a second one after a retry recommends no option",
+      all(len(r) == 1 and r[0].startswith("Retry") for r in GATE_FAULT_RECS["first"])
+      and GATE_FAULT_RECS["second"] == [[], []], GATE_FAULT_RECS)
 for after, tasks, exp in [("verify", [], "verify_gate"), ("phase_f", [], "hygiene_create"), ("", [{"id": "TASK-101"}], "select_tasks"), ("", [], "autonomy_gate")]:
     u = gates.reseal_return(base_state(after_reseal=after, tasks=tasks))
     check(f"reseal_return: after={after!r} tasks={bool(tasks)} -> {exp}", u["_next"] == exp)
@@ -2510,7 +2518,7 @@ first, s = interpreted(E_PG, RECIPE, reply_verdict="instruction", reply_instruct
 s.update(gates.apply_answer(s))
 check("interpret_route -> apply_answer: a recipe of literal commands reaches the amendment byte for byte, never paraphrased",
       s["_next"] == "amend_plan"
-      and s["pending_amendments"][0].endswith(f"Supply the recipe (type it); amend the plan and re-run the probe once: {RECIPE}")
+      and s["pending_amendments"][0].endswith(f"probe:\n{RECIPE}")
       and "start the db" not in s["pending_amendments"][0], s)
 check("interpret_route: an applied recipe instruction names the supply option, with the owner's words as its note",
       first == "interpret_reply" and str(s.get("last_answer", "")).startswith(
@@ -2959,7 +2967,8 @@ u = AA("gate_fault", "Retry the gatekeeper", gate_fault_retries=0)
 check("apply_answer: gate_fault retry -> gate1_build (B23 side 1)", u["_next"] == "gate1_build" and u["gate_fault_retries"] == 1)
 check("apply_answer: gate_fault abort -> end_aborted", AA("gate_fault", "Abort the run", esc={**AA_ESC["gate_fault"], "data": {"gate": "gate2"}})["_next"] == "end_aborted")
 check("apply_answer: approve_breakdown approve -> promote_tasks", AA("approve_breakdown", "Approve the breakdown")["_next"] == "promote_tasks")
-check("apply_answer: approve_breakdown revise -> amend_plan", AA("approve_breakdown", "Revise the breakdown (describe the change)")["_next"] == "amend_plan")
+check("apply_answer: approve_breakdown revise with the change typed after it -> amend_plan",
+      AA("approve_breakdown", "Revise the breakdown (describe the change): merge tasks 1 and 2")["_next"] == "amend_plan")
 check("apply_answer: approve_breakdown abort -> end_aborted", AA("approve_breakdown", "Abort the run")["_next"] == "end_aborted")
 E_PROMOTE_COMMIT = escalation("promote_failed", "q", [option("Retry the planning commit", True), option("Abort the run")])
 E_PROMOTE_CLOSE = escalation("promote_failed", "q", [option("Retry the close", True), option("Abort the run")], hard_trigger=True)
@@ -2980,7 +2989,7 @@ u = AA("task_failed", "Retry with the oracle's direction (one round)", current_t
 check("apply_answer: task_failed retry -> the fix note keeps the oracle's first point", "- ORACLE-POINT-1:" in u["fix_note"], u.get("fix_note", "")[:200])
 u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), task_rounds={T1: {"retry_rounds": 1}})
 check("apply_answer: task_failed retry at B8 -> abort path (task failed, end_aborted)", u["_next"] == "end_aborted")
-u = AA("task_failed", gates.TASK_RESCOPE, current_task=T1, tasks=tasks_with())
+u = AA("task_failed", f"{gates.TASK_RESCOPE}: split the parser out", current_task=T1, tasks=tasks_with())
 check("apply_answer: task_failed re-scope -> amend_plan (task pending again)", u["_next"] == "amend_plan" and gates.task_by_id(u["tasks"], T1)["status"] == "pending")
 u = AA("conformance_stuck", gates.CONFORMANCE_ONE_MORE, esc={**AA_ESC["conformance_stuck"], "evidence": "- finding A"}, current_task=T1, tasks=tasks_with())
 check("apply_answer: conformance_stuck one more round -> fix with the findings", u["_next"] == "compose_delegation" and u["fix_items"] == ["finding A"])
@@ -3051,8 +3060,6 @@ for kind, esc_, text, over in AA_FREE:
           and "Could not act on the reply" in u.get("escalation", {}).get("question", ""), u.get("_next"))
 AA_PICKS = (
     ("seed_confirm", E_SEED, "2", "keep it short", "draft_brief", dict(seed_path=SEED)),
-    ("approve_breakdown", AA_ESC["approve_breakdown"], "2", "merge tasks 1 and 2", "amend_plan", {}),
-    ("probe_gap", AA_ESC["probe_gap"], "1", "./run.sh --seed", "amend_plan", dict(current_task=T2, tasks=tasks_with())),
     ("review_incomplete", AA_ESC["review_incomplete"], "2", "the lane is flaky", "post_round",
      dict(current_task=T1, tasks=TS_W, verify_unit=T1, round_log={T1: [{"round": 1, "incomplete": ["security"]}]})),
     ("wave_escalation", AA_ESC["wave_escalation"], "3", "it is obsolete", "wave_cleanup", dict(current_task=T3, tasks=TS_W)),
@@ -3066,6 +3073,24 @@ for kind, esc_, number, note, want, over in AA_PICKS:
            for a in (number, own, f"{own}: {note}")]
     check(f"apply_answer: {kind} an option by its number, its exact text, or '<option text>: <note>' -> that option's branch",
           got == [want] * 3, got)
+AA_TEXT_PICKS = (
+    ("approve_breakdown", AA_ESC["approve_breakdown"], "2", "merge the first two tasks", {}),
+    ("probe_gap", AA_ESC["probe_gap"], "1", "./run.sh --seed", dict(current_task=T2)),
+    ("task_failed", AA_ESC["task_failed"], "2", "split the parser out", dict(current_task=T1, task_rounds={})),
+)
+for kind, esc_, number, note, over in AA_TEXT_PICKS:
+    own = esc_["options"][int(number) - 1]["text"]
+    bare = [gates.apply_answer(base_state(escalation=esc_, last_answer=a, last_answer_text=a, tasks=tasks_with(), **over))
+            for a in (number, own)]
+    check(f"apply_answer: {kind} a bare pick of the option that asks for text -> asked again for the text, nothing amended",
+          all(b.get("_next") == "ask_dispatch" and b.get("apply_reasks") == 1 and "pending_amendments" not in b
+              and f"{number}: <the change>" in (b.get("escalation") or {}).get("question", "") for b in bare),
+          [b.get("_next") for b in bare])
+    typed = [gates.apply_answer(base_state(escalation=esc_, last_answer=a, tasks=tasks_with(), **over))
+             for a in (f"{own}: {note}", f"{number}: {note}")]
+    check(f"apply_answer: {kind} '<option text>: <text>' or '{number}: <text>' -> amend_plan with only the typed text",
+          all(t.get("_next") == "amend_plan" and (t.get("pending_amendments") or [""])[0].endswith(f":\n{note}") for t in typed),
+          [(t.get("_next"), t.get("pending_amendments")) for t in typed])
 for kind in ("approve_breakdown", "review_incomplete", "wave_escalation", "approve_next", "ci_unsure", "ci_exhausted", "ci_infra"):
     u = AA(kind, "sounds fine to me", current_task=T3, tasks=TS_W)
     check(f"apply_answer: {kind} a reply naming no option takes no default -> interpret_reply", u.get("_next") == "interpret_reply",
@@ -3073,7 +3098,7 @@ for kind in ("approve_breakdown", "review_incomplete", "wave_escalation", "appro
 u = AA("approve_next", "")
 check("apply_answer: approve_next an empty reply -> asked again straight away, never the default",
       u.get("_next") == "ask_dispatch" and u.get("apply_reasks") == 1, u.get("_next"))
-REASK_MAX = getattr(gates, "APPLY_REASK_MAX", 2)
+REASK_MAX = gates.APPLY_REASK_MAX
 u = AA("approve_next", "whatever", esc={**AA_ESC["approve_next"], "data": {"reply_read": True}}, apply_reasks=REASK_MAX)
 check("apply_answer: approve_next past APPLY_REASK_MAX re-asks -> the recommended Continue taken, with a ledger line",
       u.get("_next") == "select_tasks" and any("the recommended option: Continue" in d for d in u.get("decisions", [])),
@@ -3709,6 +3734,15 @@ check("consult: conformance_stuck one more from the navigator with no reason sta
       s.get("answer_source") == "navigator" and v["_next"] == "headless_judge"
       and ledgered(v, "conformance_stuck: one more fix round picked by the navigator with no reason stated -> headless judge"),
       (s.get("answer_source"), v["_next"]))
+red_esc, _, red_more, _, red_ctx = CAP_CASES["integration_red"]
+s = base_state(escalation=red_esc, cap_continues={}, consult_result=f"CONSULT: ANSWER {red_more}: the flaky port is pinned now",
+               **copy.deepcopy(red_ctx))
+s.update(gates.consult_route(s))
+v = gates.apply_answer(s)
+check("consult: integration_red '<one more option>: <why>' from the navigator -> a fix round carrying <why>, never the judge",
+      s.get("answer_source") == "navigator" and v.get("_next") == "fix_round"
+      and any("the flaky port is pinned now" in i for i in (v.get("fix_request") or {}).get("items", [])),
+      (v.get("_next"), v.get("fix_request")))
 rounds5 = _lib.as_int(_lib.as_dict(s5["task_rounds"]).get(T1, {}).get("conformance_rounds"))
 v = AA("conformance_stuck", "One more fix round (state reason)", esc=e5, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"],
        answer_source="")

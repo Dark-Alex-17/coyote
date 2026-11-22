@@ -37,7 +37,8 @@ BOUNDED = {
     "select_tasks": "B7 list-bounded tasks + fix queue",
     "route_verdict": "B9 adopt<=1 / B10 conformance re-run once / B11 debris<=1",
     "apply_answer": ("B8 retry<=1 / B12 design ask<=1 / B23 gate fault<=1 / draft rounds<=DRAFT_ROUNDS_MAX / "
-                     "apply_reasks<=APPLY_REASK_MAX re-asks and one interpretation (reply_read) per escalation / "
+                     "per escalation one interpretation in parse_answer (reply_interpreted) and one in apply_answer "
+                     "(reply_read), then apply_reasks<=APPLY_REASK_MAX re-asks / "
                      "user-driven choices / user-driven relay answers"),
     "design_ask_gate": "B12 asks list-bounded",
     "wave_route": "B13 wave_fix_rounds<=1",

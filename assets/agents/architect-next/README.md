@@ -371,8 +371,8 @@ explicit path, so no later go-ahead picks it again. "Use this seed" when the fil
 back to `need_design_doc`; a reply that names an existing file is used as the design doc and
 leaves the seed ready; "Draft a brief from this conversation instead" leaves it ready and
 drafts a brief as below; "Give a doc path instead" leaves it ready and asks through
-`need_design_doc`. A reply that names no option is read by `interpret_reply` once, then asked
-again.
+`need_design_doc`. A reply that names no option is read by `interpret_reply` once in
+`parse_answer` and once in `apply_answer`, then asked again.
 An explicit path never looks for a seed or drafts one; an explicit path that is not readable
 stops on `need_design_doc` as before.
 
@@ -464,7 +464,15 @@ existing worktree as the code dir). `interpret_route` then acts on its verdict:
 Each reading and the action taken are ledgered. The interpretation happens once per reply
 (`reply_interpreted`, reset by every new escalation and every resume). After the
 clarifying question, after an interpreter fault, and at the park cap, an unmatched reply
-gets up to `STRIKE_LIMIT` (3) re-asks and then stands as typed. A typed existing path on
+gets up to `STRIKE_LIMIT` (3) re-asks in `parse_answer`, which never acts on it as typed:
+`apply_answer` reads a reply only by the option it names (its number, its exact text, or
+`<option text>: <note>`). A reply that names none gets one more interpretation there per
+escalation (`reply_read` in the escalation's data), then up to `APPLY_REASK_MAX`
+(`RERUN_ONCE`, 1) re-asks, never a default. After those the recommended option is taken
+only when it does not stop the run and the question is no hard trigger; otherwise the run
+ends blocked with the question open. An option that asks for text (revising the breakdown,
+supplying a probe recipe, re-scoping a failed task) picked with nothing typed after it is
+asked again the same way, with a note to reply as `2: <the change>`. A typed existing path on
 `need_design_doc` or `seed_confirm` is taken as given, never interpreted. Stop and abort
 are read from the whole reply or the option it names, never from a word inside prose, so
 a `gate1_stuck` answer such as "the worker should stop retrying" stays an answer and
@@ -480,6 +488,12 @@ blocked with the question. Each kind and task is ruled on at most `STRIKE_LIMIT`
 A one-more fix round on `integration_red` or `conformance_stuck` picked with no reason stated
 goes to the judge for one when the headless default, the ladder or the navigator picked it and
 the judge has rulings left for the question; any other bare pick runs as a plain fix round.
+Under `escalation_policy=autonomous` a decision goes to the ladder once and to the owner after
+that, keyed `<decision>|<task>|<phase>` (`_decision_key`: the decision is `data.decision`,
+else `kind#index` for a multiple-choice question, else the kind; the phase is `run` during
+the run close-out and `task` otherwise) in the `autonomous_decisions` seed; the
+`answer_source` seed names who picked the answer (headless default, ladder, navigator or
+judge) and `apply_reasks` counts `apply_answer`'s re-asks, reset by every new escalation.
 
 Verification commands the project cannot run as declared: a RED integration run (per task
 or at Phase F) hands the fix round the failing command and its exit. If the command cannot

@@ -904,6 +904,12 @@ def _leak_fingerprint(text):
     return hashlib.sha1("\n".join(qs).encode()).hexdigest()[:10], qs
 
 
+def _retry_gate_recommended(state):
+    """Retry is recommended for the first gate fault only, so a headless run cannot loop on a gate that keeps
+    faulting: past it nothing is recommended and the judge or the owner decides."""
+    return as_int(state.get("gate_fault_retries")) < RERUN_ONCE
+
+
 def gate1_route(state):
     u = {}
     note_script_error(state, u, "gate1")
@@ -912,8 +918,8 @@ def gate1_route(state):
     if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The gatekeeper produced no verdict (agent fault). Retry the gate, or abort?",
-            [option("Retry the gatekeeper", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
-            data={"gate": "gate1"}))
+            [option("Retry the gatekeeper", recommended=_retry_gate_recommended(state)), option("Abort the run")],
+            evidence=trim_items(text, 1000), data={"gate": "gate1"}))
     u["gate1_verdict"] = verdict
     if verdict == "SEALED" or verdict == "FRICTION":
         if verdict == "FRICTION":
@@ -1056,8 +1062,8 @@ def gate2_route(state):
     if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The oracle produced no PLAN_REVIEW verdict (agent fault). Retry, or abort?",
-            [option("Retry the oracle review", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
-            data={"gate": "gate2"}))
+            [option("Retry the oracle review", recommended=_retry_gate_recommended(state)), option("Abort the run")],
+            evidence=trim_items(text, 1000), data={"gate": "gate2"}))
     u["gate2_verdict"] = verdict
     if verdict == "OKAY":
         ledger(state, u, "gate2: OKAY")
@@ -3537,8 +3543,9 @@ def parse_answer(state):
         rounds = as_int(state.get("reask_rounds"))
         if rounds < STRIKE_LIMIT:
             u["reask_rounds"] = rounds + 1
-            u["ask_question"] = (f"Could not match '{text}' to an option (reply with a number or the option text; "
-                                 f"free text stands after {STRIKE_LIMIT} tries).\n\n" + state.get("ask_question", ""))
+            u["ask_question"] = (f"Could not match '{text}' to an option (reply with a number or the option text, "
+                                 f"optionally followed by ': <note>'; a reply that names no option is not acted on)."
+                                 f"\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
         if not text and options and as_dict(esc.get("data")).get("multiple_choice"):
@@ -3964,7 +3971,7 @@ def _option_note(answer, options):
     return answer[len(picked) + 1:].strip() if picked and answer.lower().startswith(picked.lower() + ":") else ""
 
 
-APPLY_REASK_MAX = 2
+APPLY_REASK_MAX = RERUN_ONCE
 
 
 def _unmatched(state, u, esc, answer):
@@ -3988,7 +3995,10 @@ def _is_stop_text(text):
     return (text or "").strip().lower().startswith(("stop", "abort"))
 
 
-def _reask_unmatched(state, u, esc, answer):
+NO_OPTION_NAMED = "it names none of the options. Pick an option by its number or its text."
+
+
+def _reask_unmatched(state, u, esc, answer, why=NO_OPTION_NAMED):
     """Ask a question again for an answer that names none of its options, never mapping it to a default.
 
     After APPLY_REASK_MAX re-asks the recommended option is taken when it does not stop the run and the question is
@@ -4002,11 +4012,10 @@ def _reask_unmatched(state, u, esc, answer):
         asked = data.get("asked") or esc.get("question", "")
         # the note goes into the escalation itself so a remote owner sees it too
         u["escalation"] = {**esc, "data": {**data, "asked": asked},
-                           "question": f"Could not act on the reply {reply!r}: it names none of the options. Pick an "
-                                       f"option by its number or its text.\n\n{asked}"}
+                           "question": f"Could not act on the reply {reply!r}: {why}\n\n{asked}"}
         u["ask_question"] = render_question(u["escalation"])
         u.update({"apply_reasks": rounds + 1, "reply_interpreted": False, "last_answer": "", "last_answer_text": ""})
-        ledger(state, u, f"apply_answer: {kind}: {reply!r} names no option -> asked again ({rounds + 1}/{APPLY_REASK_MAX})")
+        ledger(state, u, f"apply_answer: {kind}: {reply!r} not acted on -> asked again ({rounds + 1}/{APPLY_REASK_MAX})")
         u["_next"] = "ask_dispatch"
         return u
     rec = next((o.get("text") for o in esc.get("options") or [] if truthy(o.get("recommended"))), None)
@@ -4025,6 +4034,18 @@ def _reask_unmatched(state, u, esc, answer):
     ledger(state, u, f"apply_answer: {kind}: {u['failure_reason']} -> end_blocked")
     u["_next"] = "end_blocked"
     return u
+
+
+def _typed_text(state, u, esc, answer):
+    """The text typed after a pick of an option that asks for it ("2: <the change>"); when there is none the question
+    is asked again and "" returned, so a bare pick never queues an empty amendment."""
+    options = esc.get("options") or []
+    text = _option_note(answer, options) or _owner_reason(state, answer, options)
+    if not text:
+        picked = _named_option(answer, options) or ""
+        number = next((i for i, o in enumerate(options, 1) if o.get("text") == picked), 1)
+        _reask_unmatched(state, u, esc, answer, f"that option needs its text typed after it, as in \"{number}: <the change>\".")
+    return text
 
 
 def _keyed(text, choices):
@@ -4063,18 +4084,19 @@ def _whole_reply_stop(answer, options=(), replies=STOP_REPLIES):
 
 
 def _owner_reason(state, picked, options):
-    """The reason given beside a pick: the headless judge's, else the owner's own words (the free text after its
-    number, or a typed reply the interpreter read as that option); "" when the reply is the pick alone or the engine's
-    no-human answer."""
+    """The reason given beside a pick: the headless judge's, else the owner's own words (the note after its number or
+    its text, or a typed reply the interpreter read as that option); "" when the reply is the pick alone or the
+    engine's no-human answer."""
     if state.get("answer_reason"):
         return state["answer_reason"]
     raw = (state.get("last_answer_text") or "").strip()
-    if not raw or raw == picked or raw == _lib.HEADLESS_GUIDANCE:
+    if not raw or raw == _lib.HEADLESS_GUIDANCE:
         return ""
-    numbered, rest = split_option_reply(raw, options)
-    if numbered:
-        return rest
-    return "" if _exact_option(raw, options) else raw
+    if note := _option_note(raw, options):
+        return note
+    if raw == picked or split_option_reply(raw, options)[0] or _exact_option(raw, options):
+        return ""
+    return raw
 
 
 def _decided_by(state):
@@ -4437,8 +4459,9 @@ def apply_answer(state):
         if a == "approve":
             u["_next"] = "promote_tasks"
         elif a == "revise":
-            queue_amendments(u, "rework", [f"Owner's revision at plan-gate:\n{answer}"])
-            u["_next"] = "amend_plan"
+            if revision := _typed_text(state, u, esc, answer):
+                queue_amendments(u, "rework", [f"Owner's revision at plan-gate:\n{revision}"])
+                u["_next"] = "amend_plan"
         elif a == "abort":
             u["failure_reason"] = "aborted at plan-gate"
             u["_next"] = "end_aborted"
@@ -4517,11 +4540,11 @@ def apply_answer(state):
                       "fix_note": "Oracle diagnosis:\n" + trim_items(state.get("oracle_result", ""), 4000)})
             u["_next"] = "compose_delegation"
         elif a == "rescope":
-            amendment = _option_note(answer, options) or _owner_reason(state, answer, options) or answer
-            queue_amendments(u, "rework", [f"Re-scope of {task.get('id')} after a failed implementation:\n{amendment}"])
-            task["status"] = "pending"
-            save_tasks(state, u, tasks)
-            u["_next"] = "amend_plan"
+            if amendment := _typed_text(state, u, esc, answer):
+                queue_amendments(u, "rework", [f"Re-scope of {task.get('id')} after a failed implementation:\n{amendment}"])
+                task["status"] = "pending"
+                save_tasks(state, u, tasks)
+                u["_next"] = "amend_plan"
         elif a in ("abort", "retry"):
             task["status"] = "failed"
             save_tasks(state, u, tasks)
@@ -4566,9 +4589,10 @@ def apply_answer(state):
     elif kind == "probe_gap":
         a = _answered(state, {"supply": ["supply"], "surface": ["surface"]})
         if a == "supply":
-            queue_amendments(u, "rework", [f"Local-run recipe supplied by the owner for the probe:\n{answer}"])
-            u["after_reseal"] = "verify"
-            u["_next"] = "amend_plan"
+            if recipe := _typed_text(state, u, esc, answer):
+                queue_amendments(u, "rework", [f"Local-run recipe supplied by the owner for the probe:\n{recipe}"])
+                u["after_reseal"] = "verify"
+                u["_next"] = "amend_plan"
         elif a == "surface":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) consumer-facing change could not be exercised locally (probe INCONCLUSIVE): provide the local-run recipe and re-probe"]
             u["_next"] = "post_round" if state.get("verify_scope") != "batch" else "batch_close"
