@@ -151,16 +151,27 @@ fn run_parent(dir: &Path, cli_vars: &[&str]) -> Output {
     run_coyote(dir, &args)
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd)
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("HOME", dir)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("LLM_AGENT_VAR_BUILD_LOCK")
         .stdin(Stdio::null())
