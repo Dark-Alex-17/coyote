@@ -82,7 +82,7 @@ use rewind::opens_exchange;
 use roster::{RosterPopup, RosterRow, RosterSources, RosterState};
 pub use run_loop::{ensure_tty, run};
 use sink::{AgentOutcome, LendJob, UiMsg};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -310,6 +310,8 @@ pub(crate) enum Command {
         draft: Option<String>,
     },
     Interrupt,
+    /// Cancel the command still running from a turn that has ended.
+    Cancel,
     Quit,
     Suspend,
     OpenEditor,
@@ -460,6 +462,9 @@ pub(crate) struct App {
     control_requests: Vec<ControlRequest>,
     /// The control requests still running, which the exit work waits on.
     control_tasks: JoinSet<()>,
+    /// Whether a command typed during a turn is still running beside it
+    /// or after it; Esc cancels it. The loop keeps it current.
+    command_running: bool,
     /// Escalations put to the user through the prompt modal, by id, with
     /// the kind of modal asked and where its answer arrives.
     escalation_answers: Vec<(String, PromptAction, mpsc::Receiver<PromptAnswer>)>,
@@ -539,6 +544,7 @@ impl App {
             child_root: None,
             control_requests: Vec::new(),
             control_tasks: JoinSet::new(),
+            command_running: false,
             child_reads: 0,
             escalation_answers: Vec::new(),
         })
@@ -639,6 +645,7 @@ impl App {
             supervisor: ctx.supervisor.clone(),
             escalations: ctx.escalation_queue.clone(),
         };
+        self.settle_vanished_tasks();
         self.child_root = ctx.child_session_root.clone();
         self.control = Some(Arc::new(ctx.fork_for_branch()));
         self.schedule_frame();
@@ -690,6 +697,7 @@ impl App {
         };
         KeyContext {
             turn_running: self.turn.is_some() || self.exiting,
+            command_running: self.command_running,
             composer_empty: self.composer.is_empty(),
             single_line: self.composer.lines().len() <= 1,
             modal: self.prompts.front().map(PendingPrompt::kind),
@@ -1150,6 +1158,7 @@ impl App {
                 self.drop_queued();
                 (!self.exiting).then_some(Command::Interrupt)
             }
+            Action::CancelCommand => (!self.exiting).then_some(Command::Cancel),
             Action::IdleEsc => {
                 self.idle_esc();
                 None
@@ -1454,18 +1463,19 @@ impl App {
         None
     }
 
+    /// Settles the running job and agent rows of tasks the supervisor no
+    /// longer tracks. Only called with the context in hand, when no turn
+    /// can be registering a task its row already shows.
+    fn settle_vanished_tasks(&mut self) {
+        let tracked = self.roster_sources.task_ids();
+        self.transcript
+            .settle_vanished(&|id: &str| tracked.contains(id));
+    }
+
     /// Forgets the live thread of every finished child the roster no
     /// longer lists, so collected children free what they held.
     fn prune_child_threads(&mut self) {
-        let listed: HashSet<String> = self
-            .roster_sources
-            .rows()
-            .into_iter()
-            .filter_map(|row| match row {
-                RosterRow::Task(task) => Some(task.id),
-                RosterRow::Escalation(_) => None,
-            })
-            .collect();
+        let listed = self.roster_sources.task_ids();
         self.child_live.retain_listed(|id| listed.contains(id));
     }
 
@@ -1507,6 +1517,9 @@ impl App {
         };
         self.overlay = pager.take_tasks().map(Overlay::Tasks);
         cells::release_full_output_caches(self.transcript.cells_for_layout().0);
+        // Rows that ran under a child's thread hold the throbber frame
+        // they were last drawn with.
+        self.transcript.touch_running();
     }
 
     /// Takes the overlay's place. Over the tasks pop-up, or in place of a
@@ -1616,10 +1629,12 @@ impl App {
             }
             UiMsg::ChildToolOutput {
                 agent_id,
+                node,
                 call_id,
                 chunk,
             } => {
-                self.child_live.tool_output(&agent_id, &call_id, &chunk);
+                self.child_live
+                    .tool_output(&agent_id, node.as_deref(), &call_id, &chunk);
                 self.child_rows_changed(&agent_id);
             }
             UiMsg::ChildNode {

@@ -1,3 +1,4 @@
+use super::command_timing::{self, Timing};
 use super::control::{TurnOutcome, spawn_control_request, spawn_exit, spawn_run_now, spawn_turn};
 use super::events::SystemClock;
 use super::lend::{OwnerGuard, TtyHandles, remember_tty};
@@ -86,20 +87,36 @@ type RanCommand = Result<CommandRun, tokio::task::JoinError>;
 
 /// The commands typed during a turn that run beside it rather than
 /// after it: one at a time, in the order typed, each on a fork of the
-/// context taken as the turn started.
+/// context taken as the turn started. A command runs on a copy of that
+/// fork, which replaces it when the command finishes, so a cancelled
+/// command takes nothing the lines behind it need.
 #[derive(Default)]
 pub(super) struct ImmediateCommands {
-    /// The fork, while its turn runs and no command has it out.
+    /// The fork, while its turn runs.
     snapshot: Option<RequestContext>,
-    running: Option<(String, JoinHandle<CommandRun>)>,
+    /// Counts the turns started, so a command that outlived its turn
+    /// cannot hand its copy to the next turn's fork.
+    turn: u64,
+    running: Option<RunningCommand>,
     waiting: VecDeque<String>,
     /// Settings the snapshot took, in the order typed, for the live
     /// context to take when the turn ends.
     deferred: Vec<String>,
 }
 
+struct RunningCommand {
+    line: String,
+    turn: u64,
+    /// Whether the line is a setting being checked, which the live
+    /// context takes when the turn ends.
+    setting: bool,
+    abort: AbortSignal,
+    handle: JoinHandle<CommandRun>,
+}
+
 impl ImmediateCommands {
     pub(super) fn turn_started(&mut self, ctx: &RequestContext) {
+        self.turn += 1;
         self.snapshot = Some(ctx.fork_for_branch());
     }
 
@@ -112,8 +129,10 @@ impl ImmediateCommands {
     }
 
     /// Forgets the lines still to run and the settings still to apply,
-    /// for a session that is ending.
+    /// for a session that is ending, and cancels the running command
+    /// without waiting for it.
     pub(super) fn clear(&mut self) {
+        self.cancel();
         self.waiting.clear();
         self.deferred.clear();
     }
@@ -122,23 +141,51 @@ impl ImmediateCommands {
         self.running.is_some()
     }
 
+    /// Whether a setting is still being checked: the turn's end waits for
+    /// it, or the line held behind the turn would start without it.
+    pub(super) fn checking_setting(&self) -> bool {
+        self.running.as_ref().is_some_and(|running| running.setting)
+    }
+
+    /// Trips the running command's abort signal and lets go of it; what
+    /// it returns is never shown. Returns its line. The lines behind it
+    /// keep their order and run next.
+    pub(super) fn cancel(&mut self) -> Option<String> {
+        let running = self.running.take()?;
+        running.abort.set_ctrlc();
+        running.handle.abort();
+        Some(running.line)
+    }
+
     pub(super) fn take_deferred(&mut self) -> Vec<String> {
         std::mem::take(&mut self.deferred)
     }
 
-    /// Sends the oldest waiting line off with the snapshot, when nothing
-    /// else has it out.
+    /// Sends the oldest waiting line off on a copy of the snapshot, when
+    /// no other command runs.
     pub(super) fn start_next(&mut self) {
         if self.running.is_some() {
             return;
         }
-        let Some(snapshot) = self.snapshot.take() else {
+        let Some(snapshot) = &self.snapshot else {
             return;
         };
-        match self.waiting.pop_front() {
-            Some(line) => self.running = Some((line.clone(), spawn_run_now(snapshot, line))),
-            None => self.snapshot = Some(snapshot),
-        }
+        let Some(line) = self.waiting.pop_front() else {
+            return;
+        };
+        let setting = matches!(
+            command_timing::lookup(&line, snapshot.command_prefix()),
+            Some((_, Timing::Deferred))
+        );
+        let abort = create_abort_signal();
+        let handle = spawn_run_now(snapshot.fork_for_branch(), line.clone(), abort.clone());
+        self.running = Some(RunningCommand {
+            line,
+            turn: self.turn,
+            setting,
+            abort,
+            handle,
+        });
     }
 
     /// The oldest waiting line, once nothing runs: with no turn left to
@@ -151,27 +198,27 @@ impl ImmediateCommands {
     }
 
     pub(super) async fn join(&mut self) -> RanCommand {
-        let (_, handle) = self
+        let running = self
             .running
             .as_mut()
             .expect("polled only while a command runs");
-        handle.await
+        (&mut running.handle).await
     }
 
-    /// The message the finished command's cell comes from. The snapshot
-    /// goes back only while the turn it was taken for still runs: a turn
-    /// that ended took its snapshot with it, and the next one brought its
-    /// own. A setting the snapshot took is kept for the live context
-    /// either way.
-    pub(super) fn finish(&mut self, joined: RanCommand, turn_running: bool) -> UiMsg {
-        let (line, _) = self
+    /// The message the finished command's cell comes from. Its copy
+    /// replaces the snapshot only while the turn it was taken for still
+    /// runs: a turn that ended took its snapshot with it, and the next one
+    /// brought its own. A setting the copy took is kept for the live
+    /// context either way.
+    pub(super) fn finish(&mut self, joined: RanCommand) -> UiMsg {
+        let RunningCommand { line, turn, .. } = self
             .running
             .take()
             .expect("finish follows a command's join");
         let result = match joined {
-            Ok((snapshot, result)) => {
-                if turn_running && self.snapshot.is_none() {
-                    self.snapshot = Some(snapshot);
+            Ok((copy, result)) => {
+                if turn == self.turn && self.snapshot.is_some() {
+                    self.snapshot = Some(copy);
                 }
                 result
             }
@@ -803,15 +850,22 @@ pub(super) enum CopyOutcome {
     Failed(String),
 }
 
-/// Puts `text` on the system clipboard or, with none, asks the terminal
-/// to take it over the screen's own descriptor: fd 1 may be a turn's
-/// capture pipe.
-fn copy_to_clipboard(screen: &mut Screen, text: &str) -> CopyOutcome {
-    if crate::utils::set_text_native(text) {
+/// Puts `text` on the system clipboard through `native` or, when that
+/// finds none, asks the terminal to take it over `writer`. The loop
+/// passes the screen's own descriptor: fd 1 may be a turn's capture pipe.
+pub(super) fn copy_to_clipboard_with(
+    writer: &mut impl std::io::Write,
+    text: &str,
+    native: impl FnOnce(&str) -> bool,
+) -> CopyOutcome {
+    if native(text) {
         return CopyOutcome::Native;
     }
     let kept = crate::utils::osc52_payload_cap(text);
-    match screen.write_sequence(&crate::utils::osc52_sequence(kept)) {
+    let sent = writer
+        .write_all(crate::utils::osc52_sequence(kept).as_bytes())
+        .and_then(|()| writer.flush());
+    match sent {
         Ok(()) => CopyOutcome::Osc52 {
             kept_lines: (kept.len() < text.len()).then(|| kept.lines().count()),
         },
@@ -911,7 +965,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             event = stream.as_mut().expect("the event stream is renewed in place").next() => Step::Input(event),
             msg = rx.recv() => Step::Msg(msg),
             _ = app.frames.next_frame() => Step::Frame,
-            done = join(&mut task), if task.is_some() => Step::Work(Box::new(done)),
+            // A turn that ends while a setting typed during it is still
+            // being checked is joined once the check is in: the line held
+            // behind the turn starts with the setting, as its notice said.
+            done = join(&mut task), if task.is_some() && !immediate.checking_setting() => Step::Work(Box::new(done)),
             ran = immediate.join(), if immediate.is_running() => Step::Ran(Box::new(ran)),
             _ = termination.recv() => Step::Signal,
         };
@@ -923,6 +980,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 auto_cancel.store(true, Ordering::SeqCst);
                 app.begin_exit();
                 app.abandon_prompts();
+                immediate.clear();
                 purge_turn_queue(&task);
                 return match task.take() {
                     Some(Task::Turn { handle, .. }) => {
@@ -992,7 +1050,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Interrupt) => {
                         abort.set_ctrlc();
                         purge_turn_queue(&task);
+                        cancel_command(app, &mut immediate);
                     }
+                    Some(Command::Cancel) => cancel_command(app, &mut immediate),
                     Some(Command::Quit) => {
                         quit_requested = true;
                         immediate.clear();
@@ -1058,7 +1118,11 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         from,
                         dropped,
                     }) => {
-                        let outcome = copy_to_clipboard(screen, &text);
+                        let outcome = copy_to_clipboard_with(
+                            screen.writer(),
+                            &text,
+                            crate::utils::set_text_native,
+                        );
                         let (kind, text) =
                             copy_notice(&outcome, text.lines().count(), &from, dropped);
                         app.handle_msg(UiMsg::Notice { kind, text });
@@ -1078,8 +1142,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             Step::Msg(Some(msg)) => app.handle_msg(msg),
             Step::Msg(None) => {}
             Step::Ran(ran) => {
-                let turn_running = matches!(task, Some(Task::Turn { .. }));
-                app.handle_msg(immediate.finish(*ran, turn_running));
+                app.handle_msg(immediate.finish(*ran));
             }
             Step::Frame => {
                 // One line per streak of failed frames, not one per frame:
@@ -1180,13 +1243,6 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             }
         }
         immediate.start_next();
-        // A setting whose check outlived its turn finds the context idle.
-        if task.is_none()
-            && !quit_requested
-            && let Some(idle) = ctx.as_mut()
-        {
-            apply_deferred(app, &mut immediate, idle).await;
-        }
         if task.is_none()
             && !quit_requested
             && ctx.is_some()
@@ -1208,5 +1264,16 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 tx.clone(),
             )));
         }
+        app.command_running = immediate.is_running();
+    }
+}
+
+/// Cancels the command running beside the turn, if any, and says so.
+pub(super) fn cancel_command(app: &mut App, immediate: &mut ImmediateCommands) {
+    if let Some(line) = immediate.cancel() {
+        app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::ToolWarning,
+            text: format!("{} cancelled", line.trim()),
+        });
     }
 }

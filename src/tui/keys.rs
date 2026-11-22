@@ -105,6 +105,9 @@ pub(crate) enum ViMotion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyContext {
     pub(crate) turn_running: bool,
+    /// Whether a command typed during a turn still runs after the turn
+    /// ended; Esc cancels it.
+    pub(crate) command_running: bool,
     pub(crate) composer_empty: bool,
     /// Whether the composer holds one line (an empty one counts): only
     /// then do the plain arrows walk the history instead of the draft.
@@ -180,6 +183,8 @@ pub(crate) enum Action {
     Undo,
     /// Soft-interrupt the running turn.
     Interrupt,
+    /// Cancel the command a finished turn left running.
+    CancelCommand,
     /// An Esc with nothing to cancel on an empty composer; two of them
     /// close together open the rewind picker.
     IdleEsc,
@@ -756,6 +761,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             // Interrupting the turn outranks a focused row; the focus
             // goes with it.
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
+            KeyCode::Esc if ctx.command_running => Action::CancelCommand,
             KeyCode::Esc if ctx.focused => Action::ClearFocus,
             KeyCode::Esc if ctx.vi == Some(ViMode::Insert) => Action::ViNormal,
             KeyCode::Esc if ctx.composer_empty => Action::IdleEsc,
@@ -945,6 +951,7 @@ mod tests {
 
     const IDLE: KeyContext = KeyContext {
         turn_running: false,
+        command_running: false,
         composer_empty: true,
         single_line: true,
         modal: None,
@@ -969,6 +976,11 @@ mod tests {
             turn_running: true,
             ..IDLE
         };
+        let command_left_running = KeyContext {
+            command_running: true,
+            focused: true,
+            ..IDLE
+        };
         let running_vi_insert = KeyContext {
             vi: Some(ViMode::Insert),
             ..running
@@ -990,6 +1002,11 @@ mod tests {
             (ctrl('d'), typing, Action::ComposerInput(ctrl('d'))),
             (ctrl('d'), running, Action::Quit),
             (plain(KeyCode::Esc), IDLE, Action::IdleEsc),
+            (
+                plain(KeyCode::Esc),
+                command_left_running,
+                Action::CancelCommand,
+            ),
             (plain(KeyCode::Esc), typing, Action::Nothing),
             (plain(KeyCode::Esc), running, Action::Interrupt),
             (plain(KeyCode::Esc), running_vi_insert, Action::Interrupt),

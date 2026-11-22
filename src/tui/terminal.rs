@@ -1040,13 +1040,11 @@ impl Screen {
         Ok(())
     }
 
-    /// Writes an escape sequence for the terminal itself, such as an OSC 52
-    /// clipboard request, through the dup'd descriptor: fd 1 may be a
-    /// turn's capture pipe.
-    pub(crate) fn write_sequence(&mut self, sequence: &str) -> io::Result<()> {
-        let writer = self.terminal.backend_mut();
-        writer.write_all(sequence.as_bytes())?;
-        Write::flush(writer)
+    /// The dup'd descriptor, for an escape sequence meant for the terminal
+    /// itself, such as an OSC 52 clipboard request: fd 1 may be a turn's
+    /// capture pipe.
+    pub(crate) fn writer(&mut self) -> &mut impl Write {
+        self.terminal.backend_mut()
     }
 
     /// Hands the terminal to `f` in its normal modes (a suspended shell, an

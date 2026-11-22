@@ -155,13 +155,26 @@ pub fn set_text_native(text: &str) -> bool {
     }
 }
 
-/// The most text an OSC 52 request carries: many terminals drop a larger
-/// payload, and the write blocks until the terminal has read it all.
+/// The most base64 an OSC 52 request carries: many terminals drop a
+/// larger payload, and the write blocks until the terminal has read it
+/// all.
 const OSC52_PAYLOAD_LIMIT: usize = 100_000;
+/// The most text whose base64 fits `OSC52_PAYLOAD_LIMIT`.
+const OSC52_TEXT_LIMIT: usize = OSC52_PAYLOAD_LIMIT / 4 * 3;
 
-/// The tail of `text` that fits an OSC 52 request, cut on a char boundary.
+/// The tail of `text` that fits an OSC 52 request. A cut inside a line
+/// moves on to the start of the next one, so every line kept is whole;
+/// a tail with no line break left is cut on a char boundary instead.
 pub fn osc52_payload_cap(text: &str) -> &str {
-    let mut start = text.len().saturating_sub(OSC52_PAYLOAD_LIMIT);
+    let mut start = text.len().saturating_sub(OSC52_TEXT_LIMIT);
+    if start == 0 || text.as_bytes()[start - 1] == b'\n' {
+        return &text[start..];
+    }
+    if let Some(newline) = text.as_bytes()[start..].iter().position(|&b| b == b'\n')
+        && start + newline + 1 < text.len()
+    {
+        return &text[start + newline + 1..];
+    }
     while !text.is_char_boundary(start) {
         start += 1;
     }
@@ -255,16 +268,44 @@ mod tests {
     fn the_osc52_payload_keeps_the_newest_text_whole_chars_only() {
         assert_eq!(osc52_payload_cap("short"), "short");
 
-        let text = format!("old\n{}", "x".repeat(OSC52_PAYLOAD_LIMIT));
+        let text = format!("old\n{}", "x".repeat(OSC52_TEXT_LIMIT));
         assert_eq!(osc52_payload_cap(&text), &text[4..]);
 
         let text = format!(
             "{}{}",
             "\u{e9}".repeat(10),
-            "y".repeat(OSC52_PAYLOAD_LIMIT - 1)
+            "y".repeat(OSC52_TEXT_LIMIT - 1)
         );
         let kept = osc52_payload_cap(&text);
-        assert_eq!(kept.len(), OSC52_PAYLOAD_LIMIT - 1);
+        assert_eq!(kept.len(), OSC52_TEXT_LIMIT - 1);
         assert!(kept.chars().all(|c| c == 'y'));
+    }
+
+    #[test]
+    fn the_osc52_cap_bounds_the_encoded_request() {
+        let text = "z".repeat(3 * OSC52_PAYLOAD_LIMIT);
+        let frame = osc52_sequence("").len();
+        assert_eq!(
+            osc52_sequence(osc52_payload_cap(&text)).len(),
+            OSC52_PAYLOAD_LIMIT + frame
+        );
+    }
+
+    #[test]
+    fn the_osc52_cap_drops_a_partial_first_line() {
+        let line = format!("{}\n", "w".repeat(97));
+        let text = line.repeat(2 * OSC52_TEXT_LIMIT / line.len());
+        assert_ne!(
+            (text.len() - OSC52_TEXT_LIMIT) % line.len(),
+            0,
+            "the byte cut has to fall inside a line"
+        );
+        let kept = osc52_payload_cap(&text);
+        assert!(kept.len() <= OSC52_TEXT_LIMIT);
+        assert!(kept.lines().all(|kept| kept.len() == 97), "a line was cut");
+        assert_eq!(kept.lines().count(), OSC52_TEXT_LIMIT / line.len());
+
+        let one_line = format!("{}\n", "v".repeat(OSC52_TEXT_LIMIT * 2));
+        assert_eq!(osc52_payload_cap(&one_line).len(), OSC52_TEXT_LIMIT);
     }
 }

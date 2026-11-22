@@ -8,6 +8,7 @@
 use super::bottom_pane::{first_line, step_highlight};
 use super::cells::elapsed_text;
 use super::help::MARGIN;
+use super::pager::keep_tail;
 use super::theme::Theme;
 use super::throbber::Tick;
 use super::{ChromeKind, DIM, chrome_style};
@@ -20,6 +21,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
+use std::collections::HashSet;
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
@@ -58,6 +60,21 @@ impl RosterSources {
             rows.extend(asks.into_iter().map(RosterRow::Escalation));
         }
         rows
+    }
+
+    /// The ids of the tasks the supervisor tracks, finished ones included.
+    pub(super) fn task_ids(&self) -> HashSet<String> {
+        self.supervisor
+            .as_ref()
+            .map(|supervisor| {
+                supervisor
+                    .read()
+                    .task_snapshot()
+                    .into_iter()
+                    .map(|task| task.id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The running agents and jobs for the footer, counted the way the
@@ -123,11 +140,10 @@ impl RosterRow {
         super::render::plain_text(&format!("{kind:<5} {name}"))
     }
 
-    /// The row's text after its label: a task's id, padded to `id_width`
-    /// columns so the states line up, and its state, which while it runs
-    /// is the throbber's frame in `throbber`, `running` and how long it
-    /// has run by `tick`; a question's first line, without the `[kind] `
-    /// that names its modal, and how many follow. The rest is in `style`.
+    /// The row's text after its label: a task's id, padded or cut from
+    /// the front to `id_width` columns so the states line up, and its
+    /// state; a question's first line, without the `[kind] ` that names
+    /// its modal, and how many follow.
     fn detail(
         &self,
         id_width: usize,
@@ -137,28 +153,11 @@ impl RosterRow {
     ) -> Vec<Span<'static>> {
         match self {
             RosterRow::Task(task) => {
-                let status = match task.status {
-                    TaskRowStatus::Running => "running",
-                    TaskRowStatus::Finished => "finished",
-                    TaskRowStatus::Completed => "completed",
-                    TaskRowStatus::Failed => "failed",
-                };
-                let id = super::render::plain_text(&task.id);
+                let id = keep_tail(&super::render::plain_text(&task.id), id_width);
                 let pad = id_width.saturating_sub(id.width());
-                let head = format!("{id}{:pad$}  ", "");
-                if task.status != TaskRowStatus::Running {
-                    return vec![Span::styled(format!("{head}{status}"), style)];
-                }
-                let mut state = format!(" {status}");
-                if let Some(started) = task.started_at {
-                    state.push_str("  ");
-                    state.push_str(&elapsed_text(tick.elapsed(started)));
-                }
-                vec![
-                    Span::styled(head, style),
-                    Span::styled(tick.frame(), throbber),
-                    Span::styled(state, style),
-                ]
+                let mut spans = vec![Span::styled(format!("{id}{:pad$}  ", ""), style)];
+                spans.extend(task_state(task, tick, style, throbber));
+                spans
             }
             RosterRow::Escalation(ask) => {
                 let (_, question) = super::escalation_kind(&ask.question);
@@ -187,6 +186,40 @@ impl RosterRow {
             RosterRow::Task(_) => Style::new(),
         }
     }
+
+    /// The columns a task's state takes after its id; none for a question.
+    fn state_width(&self, tick: Tick) -> usize {
+        match self {
+            RosterRow::Task(task) => {
+                Line::from(task_state(task, tick, Style::new(), Style::new())).width()
+            }
+            RosterRow::Escalation(_) => 0,
+        }
+    }
+}
+
+/// A task's state, which while it runs is the throbber's frame in
+/// `throbber`, `running` and how long it has run by `tick`. The rest is
+/// in `style`.
+fn task_state(task: &TaskRow, tick: Tick, style: Style, throbber: Style) -> Vec<Span<'static>> {
+    let status = match task.status {
+        TaskRowStatus::Running => "running",
+        TaskRowStatus::Finished => "finished",
+        TaskRowStatus::Completed => "completed",
+        TaskRowStatus::Failed => "failed",
+    };
+    if task.status != TaskRowStatus::Running {
+        return vec![Span::styled(status, style)];
+    }
+    let mut state = format!(" {status}");
+    if let Some(started) = task.started_at {
+        state.push_str("  ");
+        state.push_str(&elapsed_text(tick.elapsed(started)));
+    }
+    vec![
+        Span::styled(tick.frame(), throbber),
+        Span::styled(state, style),
+    ]
 }
 
 #[derive(Debug, Default)]
@@ -333,6 +366,15 @@ impl Widget for RosterView<'_> {
             })
             .max()
             .unwrap_or(0);
+        // A frame too narrow for every column cuts the ids before the
+        // states, which say whether a task still runs.
+        let state_width = rows
+            .iter()
+            .map(|row| row.state_width(self.tick))
+            .max()
+            .unwrap_or(0);
+        let id_room = usize::from(area.width).saturating_sub(label_width + 2 + 2 + state_width);
+        let id_width = id_width.min(id_room);
         let visible = &rows[start..(start + height).min(rows.len())];
         for (offset, row) in visible.iter().enumerate() {
             let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);

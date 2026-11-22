@@ -12,6 +12,7 @@ use crate::events::NoticeKind;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -390,6 +391,9 @@ pub(super) enum NodeStatus {
 pub(super) struct FoldedCall {
     pub(super) call_id: String,
     pub(super) name: String,
+    /// A node's call keeps its arguments, which pair it with its finish
+    /// and its saved entry when the provider gave it no id.
+    pub(super) args: Option<Value>,
     pub(super) tail: OutputTail,
     /// Only a call folded into a node row has one; a job or agent row
     /// tracks no state per call.
@@ -401,13 +405,20 @@ impl FoldedCall {
         Self {
             call_id,
             name,
+            args: None,
             tail: OutputTail::default(),
             status: None,
         }
     }
 
-    pub(super) fn running(call_id: String, name: String, since: Instant) -> Self {
+    pub(super) fn running(
+        call_id: String,
+        name: String,
+        args: Option<Value>,
+        since: Instant,
+    ) -> Self {
         Self {
+            args,
             status: Some(ToolStatus::Running { since }),
             ..Self::new(call_id, name)
         }
@@ -2640,7 +2651,7 @@ mod tests {
             now: since + Duration::from_millis(2_300),
         };
         let frame = throbber::frame_at(since, renderer.tick.now);
-        let mut failed = FoldedCall::running("c2".to_string(), "fs_grep".to_string(), since);
+        let mut failed = FoldedCall::running("c2".to_string(), "fs_grep".to_string(), None, since);
         failed.status = Some(ToolStatus::Failed {
             elapsed: Duration::from_secs(1),
             error: "denied".to_string(),
@@ -2648,7 +2659,7 @@ mod tests {
         let mut cell = Cell::node("plan".to_string(), "llm".to_string(), since);
         if let Cell::Node { row, .. } = &mut cell {
             row.calls = vec![
-                FoldedCall::running("c1".to_string(), "fs_read".to_string(), since),
+                FoldedCall::running("c1".to_string(), "fs_read".to_string(), None, since),
                 failed,
             ];
         }

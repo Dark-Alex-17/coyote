@@ -11,8 +11,8 @@ use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
 use crate::events::NoticeKind;
 use crate::repl::{EXIT_CANCEL_WAIT, run_repl_command};
 use crate::supervisor::{TaskKind, TaskRow};
-use crate::utils::AbortSignal;
 use crate::utils::process::ProcessStamp;
+use crate::utils::{AbortSignal, wait_abort_signal};
 use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -121,14 +121,21 @@ pub(crate) fn spawn_turn(
 /// another reason too: `.edit` borrows the terminal, and a lend asked for
 /// on the loop thread would wait on itself. The snapshot comes back with
 /// what the command left to show or the error it failed with.
+/// A wait on an MCP server or the network ends once `abort` trips; a
+/// blocking call such as an editor runs to its end, and the loop drops
+/// what it returns.
 pub(super) fn spawn_run_now(
     mut snapshot: RequestContext,
     line: String,
+    abort: AbortSignal,
 ) -> JoinHandle<(RequestContext, Result<CommandOutput, String>)> {
     spawn_work(async move {
-        let result = run_now(&mut snapshot, &line)
-            .await
-            .map_err(|err| crate::utils::pretty_error(&err));
+        let result = tokio::select! {
+            result = run_now(&mut snapshot, &line, abort.clone()) => {
+                result.map_err(|err| crate::utils::pretty_error(&err))
+            }
+            () = wait_abort_signal(&abort) => Err("Cancelled".to_string()),
+        };
         (snapshot, result)
     })
 }
@@ -657,12 +664,12 @@ impl App {
         // With no root there is no file to open it from, so it is left out.
         if self.child_root.is_some() {
             let listed = rows.len();
-            for (session_id, agent, finished) in self.child_live.sessions() {
+            for (session_id, agent, outcome) in self.child_live.sessions() {
                 if !rows[..listed]
                     .iter()
                     .any(|row| row.session_id.as_deref() == Some(session_id))
                 {
-                    rows.push(ThreadRow::live(session_id, agent, finished));
+                    rows.push(ThreadRow::live(session_id, agent, outcome));
                 }
             }
         }

@@ -294,6 +294,7 @@ fn a_childs_output_reaches_its_calls_tail() {
     child_tool(&mut harness, Some("plan"), "call-o1", "execute_command");
     harness.app.handle_msg(UiMsg::ChildToolOutput {
         agent_id: AGENT.to_string(),
+        node: Some("plan".to_string()),
         call_id: "call-o1".to_string(),
         chunk: b"compiled\n".to_vec(),
     });
@@ -439,6 +440,7 @@ fn the_fold_keys_work_in_a_child_thread_and_not_in_the_root_one() {
     child_tool(&mut harness, None, "call-k1", "execute_command");
     harness.app.handle_msg(UiMsg::ChildToolOutput {
         agent_id: AGENT.to_string(),
+        node: None,
         call_id: "call-k1".to_string(),
         chunk: b"compiled k1\n".to_vec(),
     });
@@ -508,7 +510,7 @@ fn the_picker_lists_a_finished_child_known_only_from_its_start() {
         press_ctrl(&mut harness, 't');
         harness.press(KeyCode::Tab);
         let frame = harness.draw();
-        assert!(frame.contains("planner  sess_5d6e  finished"), "{frame}");
+        assert!(frame.contains("planner  sess_5d6e  completed"), "{frame}");
         assert!(!frame.contains("No child sessions yet"), "{frame}");
     });
 }

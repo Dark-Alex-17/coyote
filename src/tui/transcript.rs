@@ -790,6 +790,7 @@ impl Transcript {
                     calls.push(FoldedCall {
                         call_id,
                         name,
+                        args: None,
                         tail,
                         status: None,
                     });
@@ -820,6 +821,32 @@ impl Transcript {
             .rposition(|cell| matches!(cell, Cell::Agent { agent_id: id, .. } if id == agent_id));
         if let Some(Cell::Agent { row: task, .. }) = row.and_then(|row| self.cell_mut(row)) {
             task.status = status;
+        }
+    }
+
+    /// Settles every running job and agent row whose task `tracked` no
+    /// longer names: a dropped supervisor aborts its tasks without
+    /// reporting how they ended, so nothing else would stop those rows
+    /// counting up. A job reads cancelled and an agent interrupted.
+    pub(super) fn settle_vanished(&mut self, tracked: &dyn Fn(&str) -> bool) {
+        for index in 0..self.cells.len() {
+            let vanished = match &self.cells[index] {
+                Cell::Job {
+                    job_id: id, row, ..
+                } => matches!(row.status, JobStatus::Running { .. }) && !tracked(id),
+                Cell::Agent {
+                    agent_id: id, row, ..
+                } => matches!(row.status, AgentStatus::Running { .. }) && !tracked(id),
+                _ => false,
+            };
+            if !vanished {
+                continue;
+            }
+            match self.touch(index) {
+                Some(Cell::Job { row, .. }) => row.status = JobStatus::Cancelled,
+                Some(Cell::Agent { row, .. }) => row.status = AgentStatus::Interrupted,
+                _ => {}
+            }
         }
     }
 

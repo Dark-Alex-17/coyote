@@ -5468,6 +5468,9 @@ fn the_tasks_popup_is_framed_over_the_transcript_wide_and_narrow() {
             assert!(open[bottom].contains("Esc = close"), "{frame}");
             if width == 40 {
                 assert!(open[bottom].contains("\u{2514}Esc = close"), "{frame}");
+                for row in &open[top + 1..top + 3] {
+                    assert!(row.contains("running"), "the ids give way first:\n{frame}");
+                }
             }
             for row in &open[top + 1..bottom] {
                 assert!(row.contains('\u{2502}'), "{frame}");
@@ -5490,8 +5493,8 @@ fn the_tasks_popup_is_framed_over_the_transcript_wide_and_narrow() {
     });
 }
 
-/// Under `NO_COLOR` the pop-up keeps its text, the bold title and the
-/// reversed focus, and loses every colour.
+/// Under `NO_COLOR` the pop-up keeps its text, the same as in colour,
+/// the bold title and the reversed focus, and loses every colour.
 #[test]
 #[serial]
 fn the_tasks_popup_drops_its_colours_under_no_color() {
@@ -5501,7 +5504,7 @@ fn the_tasks_popup_drops_its_colours_under_no_color() {
         harness.app.set_no_color(true);
         harness.app.handle_key(alt(KeyCode::Char('t')));
         let frame = harness.draw();
-        assert_welcome_snapshot("tasks_popup_no_color", &frame);
+        assert_welcome_snapshot("tasks_popup_80x24", &frame);
         let open: Vec<&str> = frame.lines().collect();
         let (top, bottom) = tasks_box(&open);
         let top = u16::try_from(top).unwrap();

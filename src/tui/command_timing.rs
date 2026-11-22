@@ -29,10 +29,12 @@ const SAVES_RAG: Timing = Timing::Queue("saves the RAG");
 const STARTS_MCP_SERVERS: Timing = Timing::Queue("starts or stops MCP servers");
 
 /// Every command the TUI knows by name, with its timing. A `.set <key>`
-/// entry queues a key whose update writes files, starts processes, talks
-/// to an MCP server, prints or rebuilds the tools, so a deferred `.set`
-/// only changes settings in memory and replaying it on the loop thread
-/// stays cheap.
+/// entry queues a key whose update does I/O, starts processes, saves
+/// files, prints or reads the network, or one that changes how the lines
+/// held behind the turn are read. Every other key only changes memory and
+/// is deferred, the in-memory switches for the tools the next turn offers
+/// among them, so replaying a deferred `.set` on the loop thread stays
+/// cheap.
 pub(super) const COMMAND_TIMINGS: &[(&str, Timing)] = &[
     (".help", Timing::Now),
     (".keys", Timing::Now),
@@ -71,6 +73,10 @@ pub(super) const COMMAND_TIMINGS: &[(&str, Timing)] = &[
     ),
     (".set rag_top_k", SAVES_RAG),
     (".set rag_reranker_model", SAVES_RAG),
+    (
+        ".set command_prefix",
+        Timing::Queue("changes how lines are read"),
+    ),
     (".reasoning", Timing::Deferred),
     (".authenticate", PROMPTS_USER),
     (".mcp auth", PROMPTS_USER),

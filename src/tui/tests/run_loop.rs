@@ -1,7 +1,8 @@
 use super::*;
 use crate::tui::run_loop::{
     AfterTurn, DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished,
-    dump_route, finish_turn, flush_typeahead, join_unattended, purge_turn_queue, quit_abort,
+    cancel_command, dump_route, finish_turn, flush_typeahead, join_unattended, purge_turn_queue,
+    quit_abort,
 };
 #[cfg(unix)]
 use crate::tui::run_loop::{Termination, edit_in_editor};
@@ -318,7 +319,7 @@ fn commands_beside_a_turn_share_its_snapshot_one_at_a_time() {
         // The second line waits while the first has the snapshot out.
         immediate.start_next();
         let ran = immediate.join().await;
-        let (line, result) = command_result(immediate.finish(ran, true));
+        let (line, result) = command_result(immediate.finish(ran));
         assert_eq!(line, ".info");
         assert_eq!(result, Ok(CommandOutput::Text(sysinfo)));
         assert!(!immediate.is_running());
@@ -326,7 +327,7 @@ fn commands_beside_a_turn_share_its_snapshot_one_at_a_time() {
         immediate.start_next();
         assert!(immediate.is_running(), "the snapshot did not come back");
         let ran = immediate.join().await;
-        let (line, result) = command_result(immediate.finish(ran, true));
+        let (line, result) = command_result(immediate.finish(ran));
         assert_eq!(line, ".info bogus");
         let err = result.unwrap_err();
         assert!(err.contains("Unknown command"), "{err}");
@@ -335,7 +336,7 @@ fn commands_beside_a_turn_share_its_snapshot_one_at_a_time() {
         immediate.start_next();
         immediate.turn_ended();
         let ran = immediate.join().await;
-        let (line, result) = command_result(immediate.finish(ran, false));
+        let (line, result) = command_result(immediate.finish(ran));
         assert_eq!(line, ".help");
         assert!(result.is_ok());
         immediate.push(".info".to_string());
@@ -363,13 +364,13 @@ fn a_setting_beside_a_turn_reaches_the_returned_context() {
         immediate.push(".set temperature 0.5".to_string());
         immediate.start_next();
         let ran = immediate.join().await;
-        let (_, result) = command_result(immediate.finish(ran, true));
+        let (_, result) = command_result(immediate.finish(ran));
         assert!(result.is_err());
         assert!(immediate.take_deferred().is_empty());
 
         immediate.start_next();
         let ran = immediate.join().await;
-        let (line, result) = command_result(immediate.finish(ran, true));
+        let (line, result) = command_result(immediate.finish(ran));
         assert_eq!(line, ".set temperature 0.5");
         assert_eq!(result, Ok(CommandOutput::Deferred));
         immediate.turn_ended();
@@ -402,7 +403,7 @@ async fn turn_with_setting(
     immediate.push(setting.to_string());
     immediate.start_next();
     let ran = immediate.join().await;
-    harness.app.handle_msg(immediate.finish(ran, true));
+    harness.app.handle_msg(immediate.finish(ran));
     immediate
 }
 
@@ -508,8 +509,9 @@ fn a_setting_the_returned_context_refuses_says_it_did_not_apply() {
     });
 }
 
-/// A quit while a setting is still being checked drops it: the context
-/// the exit work gets never takes it, and nothing held runs.
+/// A quit while a setting is still being checked cancels the check
+/// without waiting for it: the context the exit work gets never takes
+/// the setting, and nothing held runs.
 #[test]
 #[serial]
 fn a_quit_drops_the_settings_taken_during_the_turn() {
@@ -525,8 +527,8 @@ fn a_quit_drops_the_settings_taken_during_the_turn() {
         immediate.start_next();
         assert!(immediate.is_running());
         immediate.clear();
-        let ran = immediate.join().await;
-        harness.app.handle_msg(immediate.finish(ran, true));
+        assert!(!immediate.is_running(), "the quit waited on the check");
+        assert!(!immediate.checking_setting());
         harness.app.queued.push(QueuedLine {
             text: ".agent x".to_string(),
             command: true,
@@ -550,4 +552,104 @@ fn a_quit_drops_the_settings_taken_during_the_turn() {
         assert!(immediate.take_deferred().is_empty());
         assert_eq!(immediate.take_idle_line(), None);
     });
+}
+
+/// The turn's end waits on a setting still being checked, so the line
+/// held behind the turn starts with it; a reading command does not hold
+/// the turn's end.
+#[test]
+#[serial]
+fn a_turn_end_waits_for_a_setting_still_being_checked() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-finish-turn-late-setting");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = ImmediateCommands::default();
+        harness.app.begin_turn("explain", false);
+        immediate.turn_started(&ctx);
+        immediate.push(".info".to_string());
+        immediate.start_next();
+        assert!(!immediate.checking_setting());
+        let ran = immediate.join().await;
+        harness.app.handle_msg(immediate.finish(ran));
+
+        immediate.push(".set temperature 0.5".to_string());
+        immediate.start_next();
+        assert!(
+            immediate.checking_setting(),
+            "the turn could end with the setting still out"
+        );
+        let queue = NotificationQueue::new();
+        harness.type_text("held line");
+        let Some(Command::Queue(text)) = harness.press(KeyCode::Enter) else {
+            panic!("a line typed during a turn was not held");
+        };
+        queued::queue_user_message(&queue, &text);
+
+        let ran = immediate.join().await;
+        harness.app.handle_msg(immediate.finish(ran));
+        assert!(!immediate.checking_setting());
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &queue,
+            false,
+        )
+        .await;
+        let AfterTurn::Next(next, line) = after else {
+            panic!("the held line did not run next");
+        };
+        assert_eq!(line, "held line");
+        assert_eq!(next.app.config.temperature, Some(0.5));
+    });
+}
+
+/// Cancelling the running command drops it with a notice, and the line
+/// typed after it runs next on the turn's fork.
+#[test]
+#[serial]
+fn a_cancelled_command_is_dropped_and_the_next_line_runs() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-run-now-cancel");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.resize(120, 30);
+        let mut immediate = ImmediateCommands::default();
+        harness.app.begin_turn("explain", false);
+        immediate.turn_started(&ctx);
+        immediate.push(".info".to_string());
+        immediate.push(".help".to_string());
+        immediate.start_next();
+        assert!(immediate.is_running());
+
+        cancel_command(&mut harness.app, &mut immediate);
+        assert!(!immediate.is_running());
+        let frame = harness.draw();
+        assert!(frame.contains(".info cancelled"), "{frame}");
+
+        immediate.start_next();
+        assert!(immediate.is_running(), "the cancel took the fork with it");
+        let ran = immediate.join().await;
+        let (line, result) = command_result(immediate.finish(ran));
+        assert_eq!(line, ".help");
+        assert!(result.is_ok());
+        assert_eq!(immediate.cancel(), None);
+    });
+}
+
+/// Esc during a turn interrupts it, which cancels the command beside
+/// it too; once the turn is over Esc cancels a command it left running.
+#[test]
+fn esc_cancels_a_command_left_running_after_the_turn() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("explain", false);
+    assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.app.command_running = true;
+    assert_eq!(harness.press(KeyCode::Esc), Some(Command::Cancel));
+    harness.app.command_running = false;
+    assert_eq!(harness.press(KeyCode::Esc), None);
 }

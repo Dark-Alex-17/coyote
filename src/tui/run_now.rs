@@ -3,8 +3,8 @@ use crate::repl::{
     REASONING_USAGE, SET_USAGE, edit_skill_output, info_output, list_output, parse_command,
     repl_help_text, unfence,
 };
-use crate::utils::create_abort_signal;
-use anyhow::{Result, bail};
+use crate::utils::{AbortSignal, create_abort_signal};
+use anyhow::{Result, anyhow, bail};
 
 /// What a command run beside a turn leaves to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,8 +20,13 @@ pub(crate) enum CommandOutput {
 /// the turn started with. A `Now` line returns what the REPL prints for
 /// it; a `Deferred` one changes the snapshot only, which checks it the
 /// way an idle run would. Nothing here may print: while a turn runs, fds
-/// 1 and 2 feed that turn's capture.
-pub(super) async fn run_now(ctx: &mut RequestContext, line: &str) -> Result<CommandOutput> {
+/// 1 and 2 feed that turn's capture. `abort` is the command's own, which
+/// Esc and a quit trip.
+pub(super) async fn run_now(
+    ctx: &mut RequestContext,
+    line: &str,
+    abort: AbortSignal,
+) -> Result<CommandOutput> {
     let prefix = ctx.command_prefix();
     let Some((cmd, args)) = parse_command(unfence(line).trim(), prefix) else {
         bail!("Not a command: {line}");
@@ -29,7 +34,7 @@ pub(super) async fn run_now(ctx: &mut RequestContext, line: &str) -> Result<Comm
     if let Some(usage) = setting_usage(&cmd) {
         return match setting_args(&cmd, args) {
             Some(args) => {
-                ctx.update(&args, create_abort_signal()).await?;
+                ctx.update(&args, abort).await?;
                 Ok(CommandOutput::Deferred)
             }
             None => Ok(CommandOutput::Text(format!(
@@ -50,6 +55,9 @@ pub(super) async fn run_now(ctx: &mut RequestContext, line: &str) -> Result<Comm
         ".skill" if args.and_then(|args| args.split_whitespace().next()) == Some("loaded") => {
             ctx.loaded_skills_listing()
         }
+        ".edit" if ctx.macro_flag => {
+            bail!("Cannot perform this operation because you are in a macro")
+        }
         ".edit" => match args {
             Some("config") => ctx.edit_config()?,
             Some("mcp-config") => ctx.edit_mcp_config()?,
@@ -66,7 +74,8 @@ pub(super) async fn run_now(ctx: &mut RequestContext, line: &str) -> Result<Comm
 
 /// Applies settings taken during a turn to the context the turn handed
 /// back, in the order they were typed and by the path an idle `.set`
-/// takes. Returns each line that failed with its error.
+/// takes. Returns each line that failed with its error; a line that no
+/// longer reads as a setting (the prefix changed under it) fails too.
 pub(super) async fn replay_deferred(
     ctx: &mut RequestContext,
     lines: Vec<String>,
@@ -75,6 +84,10 @@ pub(super) async fn replay_deferred(
     for line in lines {
         let parsed = parse_command(unfence(&line).trim(), ctx.command_prefix());
         let Some(args) = parsed.and_then(|(cmd, args)| setting_args(&cmd, args)) else {
+            failed.push((
+                line,
+                anyhow!("not a setting under the current command prefix"),
+            ));
             continue;
         };
         if let Err(err) = ctx.update(&args, create_abort_signal()).await {

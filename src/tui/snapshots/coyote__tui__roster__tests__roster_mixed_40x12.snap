@@ -2,8 +2,8 @@
 source: src/tui/roster.rs
 expression: terminal.backend().to_string()
 ---
-"agent reviewer         agent_reviewer_1a"
-"job   execute_command  job_5e6f7a8b     "
+"agent reviewer         ...c4d  ⠋ running"
+"job   execute_command  ...a8b  failed   "
 "ask   reviewer         Ship the fix to m"
 "                                        "
 "                                        "

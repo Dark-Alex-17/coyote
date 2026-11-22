@@ -7,10 +7,11 @@
 
 use super::bottom_pane::{render_header, render_rows, step_highlight};
 use super::cells::{Cell, without_think_spans};
-use super::child_live::{ChildLive, ChildThread};
+use super::child_live::{ChildLive, ChildThread, call_summary};
 use super::keys::PagerMode;
 use super::render::{self, Renderer};
 use super::roster::RosterState;
+use super::sink::AgentOutcome;
 use super::{ChromeKind, DIM, chrome_style};
 use crate::client::{Message, MessageContent, MessageContentPart, MessageRole};
 use crate::config::child_sessions::{ChildMeta, EffectiveStatus};
@@ -184,18 +185,31 @@ enum ChildRow {
 /// The rows of a child's thread: the saved session in order, each call
 /// in it drawn as its live row when it has one and left out when a node
 /// row holds it, then every live row the session does not name yet. A
-/// call with no id (some providers give none) is its live row when one
-/// has its name and arguments: the first such saved call pairs with the
-/// first such live row, and so on.
+/// call with no id (some providers give none) is its live call when one
+/// has its name and arguments, top-level or under a node: the first such
+/// saved call pairs with the first such live call, and so on.
 fn merged_rows(entries: &[ChildEntry], live: &[Cell]) -> Vec<ChildRow> {
     let mut live_tools: HashMap<&str, usize> = HashMap::new();
-    let mut unnamed: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    // Each id-less live call by its row text: the row drawing it, or None
+    // for a call folded under a node.
+    let mut unnamed: HashMap<String, VecDeque<Option<usize>>> = HashMap::new();
     for (index, cell) in live.iter().enumerate() {
         match cell {
             Cell::Tool { call_id, .. } if !call_id.is_empty() => {
                 live_tools.insert(call_id, index);
             }
-            Cell::Tool { summary, .. } => unnamed.entry(summary).or_default().push_back(index),
+            Cell::Tool { summary, .. } => unnamed
+                .entry(summary.clone())
+                .or_default()
+                .push_back(Some(index)),
+            Cell::Node { row, .. } => {
+                for call in row.calls.iter().filter(|call| call.call_id.is_empty()) {
+                    unnamed
+                        .entry(call_summary(&call.name, call.args.as_ref()))
+                        .or_default()
+                        .push_back(None);
+                }
+            }
             _ => {}
         }
     }
@@ -223,10 +237,11 @@ fn merged_rows(entries: &[ChildEntry], live: &[Cell]) -> Vec<ChildRow> {
                     .get_mut(entry_summary(name, args).as_str())
                     .and_then(VecDeque::pop_front);
                 match paired {
-                    Some(at) => {
+                    Some(Some(at)) => {
                         shown[at] = true;
                         rows.push(ChildRow::Live(at));
                     }
+                    Some(None) => {}
                     None => rows.push(ChildRow::Disk(index)),
                 }
             }
@@ -292,12 +307,18 @@ impl ThreadRow {
     }
 
     /// A child the UI saw start, which the child-session root does not
-    /// list (yet).
-    pub(super) fn live(session_id: &str, agent: &str, finished: bool) -> Self {
+    /// list (yet), with how it ended: None while it runs.
+    pub(super) fn live(session_id: &str, agent: &str, outcome: Option<&AgentOutcome>) -> Self {
+        let status = match outcome {
+            None => EffectiveStatus::Running,
+            Some(AgentOutcome::Completed) => EffectiveStatus::Completed,
+            Some(AgentOutcome::Failed(_)) => EffectiveStatus::Failed,
+            Some(AgentOutcome::Interrupted) => EffectiveStatus::Cancelled,
+        };
         Self {
             session_id: Some(session_id.to_string()),
             agent: agent.to_string(),
-            status: if finished { "finished" } else { "running" }.to_string(),
+            status: status_word(status).to_string(),
         }
     }
 
@@ -1257,7 +1278,7 @@ fn elide_middle(text: &str, width: usize) -> String {
 
 /// `text` cut to its last characters behind `...`, `width` in all; the
 /// end alone when even the `...` does not fit.
-fn keep_tail(text: &str, width: usize) -> String {
+pub(super) fn keep_tail(text: &str, width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= width {
         return text.to_string();
@@ -1688,7 +1709,7 @@ mod tests {
             Some(serde_json::json!({"path": "src/lib.rs"})),
             now,
         );
-        live.tool_output(REVIEWER, "call-r1", b"fn main() {}\n");
+        live.tool_output(REVIEWER, None, "call-r1", b"fn main() {}\n");
         live.tool_finished(REVIEWER, None, "call-r1", ok_end(1200), now);
         live.tool_started(
             REVIEWER,
@@ -1698,7 +1719,7 @@ mod tests {
             Some(serde_json::json!({"command": "cargo test"})),
             now,
         );
-        live.tool_output(REVIEWER, "call-r2", b"running 3 tests\n");
+        live.tool_output(REVIEWER, None, "call-r2", b"running 3 tests\n");
         live
     }
 
@@ -1911,7 +1932,12 @@ mod tests {
                 None,
                 now,
             );
-            live.tool_output(PLANNER, call_id, format!("{said}\n").as_bytes());
+            live.tool_output(
+                PLANNER,
+                Some("plan"),
+                call_id,
+                format!("{said}\n").as_bytes(),
+            );
             live.tool_finished(PLANNER, Some("plan"), call_id, ok_end(300), now);
         }
         live.node(
@@ -1975,6 +2001,88 @@ mod tests {
         );
         let frame = draw_live(&mut pager, &mut cells, &mut live, 40, 12);
         insta::assert_snapshot!("pager_child_graph_40x12", &frame);
+    }
+
+    /// Calls with no id inside a node are shown once, folded under it:
+    /// each saved one pairs with the node's call of the same name and
+    /// arguments. Run side by side, each finish settles the call with its
+    /// own arguments, whatever order they end in.
+    #[test]
+    fn a_nodes_calls_with_no_id_show_once_and_finish_by_arguments() {
+        let now = Instant::now();
+        let mut live = ChildLive::default();
+        live.agent_started(
+            PLANNER.to_string(),
+            "planner".to_string(),
+            Some("planner-b2".to_string()),
+        );
+        live.node(
+            PLANNER,
+            "plan".to_string(),
+            "llm".to_string(),
+            ChildNodeState::Started,
+            now,
+        );
+        for path in ["a.rs", "b.rs"] {
+            live.tool_started(
+                PLANNER,
+                Some("plan".to_string()),
+                String::new(),
+                "fs_read".to_string(),
+                Some(serde_json::json!({ "path": path })),
+                now,
+            );
+        }
+        live.tool_finished(
+            PLANNER,
+            Some("plan"),
+            "",
+            ToolEnd {
+                name: "fs_read".to_string(),
+                args: Some(serde_json::json!({"path": "b.rs"})),
+                ok: false,
+                error: Some("denied".to_string()),
+                duration_ms: Some(10),
+            },
+            now,
+        );
+        let [Cell::Node { row, .. }] = live_rows(&live, "planner-b2") else {
+            panic!("not one node row");
+        };
+        let calls = &row.calls;
+        assert!(matches!(calls[0].status, Some(ToolStatus::Running { .. })));
+        assert!(matches!(calls[1].status, Some(ToolStatus::Failed { .. })));
+
+        let saved = |path: &str| ChildEntry::Tool {
+            call_id: String::new(),
+            name: "fs_read".to_string(),
+            args: format!("{{\"path\":\"{path}\"}}"),
+            output: String::new(),
+        };
+        let entries = vec![
+            ChildEntry::User("plan the release".to_string()),
+            saved("a.rs"),
+            saved("b.rs"),
+        ];
+        let rows = merged_rows(&entries, live_rows(&live, "planner-b2"));
+        assert_eq!(rows, [ChildRow::Disk(0), ChildRow::Live(0)]);
+
+        let mut pager = Pager::child(
+            "planner-b2".to_string(),
+            "planner".to_string(),
+            PathBuf::from("/nonexistent/planner-b2.yaml"),
+        );
+        deliver(&mut pager, "planner-b2", Ok(entries));
+        pager.step_focus(&live, true);
+        pager.toggle_focused(&mut live);
+        let frame = draw_live(&mut pager, &mut Vec::new(), &mut live, 80, 24);
+        assert!(!frame.contains("fs_read("), "{frame}");
+        assert!(!frame.contains("done"), "{frame}");
+        let call_lines = frame
+            .lines()
+            .filter(|line| line.trim_matches('"').trim_start().starts_with("fs_read"))
+            .count();
+        assert_eq!(call_lines, 2, "{frame}");
     }
 
     /// Under NO_COLOR a child's tool rows keep their text and lose every

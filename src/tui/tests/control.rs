@@ -735,3 +735,49 @@ fn a_session_id_with_a_path_in_it_is_refused() {
     assert!(harness.app.pager().is_none());
     assert!(harness.app.take_control_requests().is_empty());
 }
+
+/// Dropping a supervisor aborts its tasks without a word to the UI; the
+/// next return of the context settles the rows of tasks it no longer
+/// tracks, so none of them keeps the throbber ticking.
+#[test]
+fn a_return_settles_the_rows_of_tasks_the_supervisor_dropped() {
+    run_async(async {
+        let mut ctx = chat_ctx();
+        let tasks = supervisor();
+        tasks.write().register(running_job("job-v1d")).unwrap();
+        tasks.write().register(running_agent("agent-v2d")).unwrap();
+        ctx.supervisor = Some(tasks);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.handle_msg(UiMsg::JobStarted {
+            job_id: "job-v1d".to_string(),
+            tool: "execute_command".to_string(),
+        });
+        harness.app.handle_msg(UiMsg::AgentStarted {
+            agent_id: "agent-v2d".to_string(),
+            name: "reviewer".to_string(),
+            session_id: None,
+        });
+        harness.app.sync_from_ctx(&mut ctx);
+        let running: Vec<bool> = harness
+            .app
+            .transcript
+            .cells()
+            .iter()
+            .map(Cell::running)
+            .collect();
+        assert_eq!(running, [true, true], "tracked rows keep running");
+
+        ctx.supervisor = None;
+        harness.app.sync_from_ctx(&mut ctx);
+        let cells = harness.app.transcript.cells();
+        let [Cell::Job { row: job, .. }, Cell::Agent { row: agent, .. }] = cells else {
+            panic!("not a job row and an agent row");
+        };
+        assert_eq!(job.status, JobStatus::Cancelled);
+        assert_eq!(agent.status, AgentStatus::Interrupted);
+        let frame = harness.draw();
+        assert!(frame.contains("job-v1d  cancelled"), "{frame}");
+        harness.app.frame_drawn();
+        assert_eq!(harness.app.frames.due_at(), None);
+    });
+}

@@ -38,6 +38,9 @@ const SIDE_EFFECT_SET_KEYS: &[&str] = &[
     "rag_reranker_model",
 ];
 
+/// The `.set` keys that change how the lines held behind a turn are read.
+const READING_SET_KEYS: &[&str] = &["command_prefix"];
+
 /// The reasons a command that switches what the turn runs with gives.
 const SWITCHING_REASONS: &[&str] = &[
     "changes the agent",
@@ -83,9 +86,12 @@ fn every_command_has_exactly_one_timing_and_every_timing_a_command() {
                 .map(|(name, _)| *name)
                 .filter(|name| {
                     name.strip_prefix(".set ").is_some_and(|key| {
-                        SIDE_EFFECT_SET_KEYS.iter().any(|known| {
-                            *known == key || (key.ends_with('.') && known.starts_with(key))
-                        })
+                        SIDE_EFFECT_SET_KEYS
+                            .iter()
+                            .chain(READING_SET_KEYS)
+                            .any(|known| {
+                                *known == key || (key.ends_with('.') && known.starts_with(key))
+                            })
                     })
                 }),
         )
@@ -200,6 +206,18 @@ fn set_keys_with_side_effects_wait_and_other_settings_defer() {
 }
 
 #[test]
+fn a_prefix_change_waits_so_the_held_lines_read_as_typed() {
+    for key in READING_SET_KEYS {
+        let line = format!(".set {key} slash");
+        assert_eq!(
+            timing(&line),
+            Some(Timing::Queue("changes how lines are read")),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 #[serial]
 fn run_now_gives_what_the_repl_prints() {
     run_async(async {
@@ -207,18 +225,42 @@ fn run_now_gives_what_the_repl_prints() {
         let mut ctx = chat_ctx();
         let sysinfo = ctx.sysinfo(&ctx.app.config).unwrap();
         assert_eq!(
-            run_now(&mut ctx, ".info").await.unwrap(),
+            run_now(&mut ctx, ".info", create_abort_signal())
+                .await
+                .unwrap(),
             CommandOutput::Text(sysinfo)
         );
         assert_eq!(
-            run_now(&mut ctx, ".help").await.unwrap(),
+            run_now(&mut ctx, ".help", create_abort_signal())
+                .await
+                .unwrap(),
             CommandOutput::Text(format!("{}\n", repl_help_text(CommandPrefix::Dot)))
         );
-        let err = run_now(&mut ctx, ".info bogus")
+        let err = run_now(&mut ctx, ".info bogus", create_abort_signal())
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unknown command"), "{err}");
+    });
+}
+
+/// Inside a macro `.edit` is refused before any editor opens, as the
+/// REPL refuses it.
+#[test]
+#[serial]
+fn run_now_refuses_an_editor_inside_a_macro() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-run-now-macro-edit");
+        let mut ctx = chat_ctx();
+        ctx.macro_flag = true;
+        let err = run_now(&mut ctx, ".edit config", create_abort_signal())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Cannot perform this operation because you are in a macro"
+        );
     });
 }
 
@@ -232,21 +274,29 @@ fn run_now_checks_a_setting_on_the_snapshot() {
         let _guard = TestConfigDirGuard::new("tui-run-now-setting");
         let mut snapshot = chat_ctx();
         assert_eq!(
-            run_now(&mut snapshot, ".set temperature 0.5")
+            run_now(&mut snapshot, ".set temperature 0.5", create_abort_signal())
                 .await
                 .unwrap(),
             CommandOutput::Deferred
         );
         assert_eq!(snapshot.app.config.temperature, Some(0.5));
-        assert!(run_now(&mut snapshot, ".set bogus 1").await.is_err());
-        let CommandOutput::Text(usage) = run_now(&mut snapshot, ".set").await.unwrap() else {
+        assert!(
+            run_now(&mut snapshot, ".set bogus 1", create_abort_signal())
+                .await
+                .is_err()
+        );
+        let CommandOutput::Text(usage) = run_now(&mut snapshot, ".set", create_abort_signal())
+            .await
+            .unwrap()
+        else {
             panic!("a bare .set was taken as a setting");
         };
         assert!(usage.contains("Usage: .set"), "{usage}");
     });
 }
 
-/// The replay applies each line in order and names the ones that fail.
+/// The replay applies each line in order and names the ones that fail,
+/// a line that no longer reads as a setting among them.
 #[test]
 #[serial]
 fn replaying_settings_applies_them_in_order_and_reports_failures() {
@@ -256,11 +306,12 @@ fn replaying_settings_applies_them_in_order_and_reports_failures() {
         let lines = [
             ".set temperature 0.5",
             ".set bogus 1",
+            "/set temperature 0.6",
             ".set temperature 0.7",
         ];
         let failed = replay_deferred(&mut ctx, lines.map(String::from).to_vec()).await;
         assert_eq!(ctx.app.config.temperature, Some(0.7));
         let failed: Vec<&str> = failed.iter().map(|(line, _)| line.as_str()).collect();
-        assert_eq!(failed, [".set bogus 1"]);
+        assert_eq!(failed, [".set bogus 1", "/set temperature 0.6"]);
     });
 }

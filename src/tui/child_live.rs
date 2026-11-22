@@ -24,12 +24,12 @@ pub(super) struct ToolEnd {
     pub(super) duration_ms: Option<u64>,
 }
 
-/// A child's top-level call row's text: a child's call has no narration
-/// line, so it is the call's name and arguments.
-fn call_summary(name: String, args: Option<&Value>) -> String {
+/// A child's call as row text: a child's call has no narration line, so
+/// it is the call's name and arguments.
+pub(super) fn call_summary(name: &str, args: Option<&Value>) -> String {
     match args {
         Some(args) => format!("{name} {args}"),
-        None => name,
+        None => name.to_string(),
     }
 }
 
@@ -39,7 +39,8 @@ fn call_summary(name: String, args: Option<&Value>) -> String {
 pub(crate) struct ChildThread {
     name: String,
     session_id: Option<String>,
-    finished: bool,
+    /// How the child ended; None while it runs.
+    outcome: Option<AgentOutcome>,
     rows: Vec<Cell>,
 }
 
@@ -163,11 +164,11 @@ impl ChildLive {
     }
 
     /// Each child that keeps a session, in start order: its session id,
-    /// its agent's name and whether it finished.
-    pub(super) fn sessions(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+    /// its agent's name and how it ended, None while it runs.
+    pub(super) fn sessions(&self) -> impl Iterator<Item = (&str, &str, Option<&AgentOutcome>)> {
         self.threads.values().filter_map(|thread| {
             let session_id = thread.session_id.as_deref()?;
-            Some((session_id, thread.name.as_str(), thread.finished))
+            Some((session_id, thread.name.as_str(), thread.outcome.as_ref()))
         })
     }
 
@@ -186,7 +187,7 @@ impl ChildLive {
         let thread = self.threads.entry(agent_id).or_default();
         thread.name = name;
         thread.session_id = session_id;
-        thread.finished = false;
+        thread.outcome = None;
     }
 
     /// The child ended: whatever it left running is settled as failed,
@@ -195,13 +196,13 @@ impl ChildLive {
         let Some(thread) = self.threads.get_mut(agent_id) else {
             return;
         };
-        thread.finished = true;
         let error = match outcome {
             AgentOutcome::Interrupted => "interrupted",
             AgentOutcome::Failed(error) if !error.is_empty() => error,
             AgentOutcome::Failed(_) | AgentOutcome::Completed => "agent finished",
         };
         let grew = thread.settle_running(error, now);
+        thread.outcome = Some(outcome.clone());
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
@@ -219,7 +220,7 @@ impl ChildLive {
     pub(super) fn retain_listed(&mut self, listed: impl Fn(&str) -> bool) {
         let mut freed = 0;
         self.threads.retain(|agent_id, thread| {
-            let keep = !thread.finished || listed(agent_id);
+            let keep = thread.outcome.is_none() || listed(agent_id);
             if !keep {
                 freed += thread
                     .rows
@@ -255,12 +256,13 @@ impl ChildLive {
                         .push(Cell::node(node_id.clone(), String::new(), now));
                 }
                 if let Some(row) = thread.node_row(&node_id) {
-                    row.calls.push(FoldedCall::running(call_id, name, now));
+                    row.calls
+                        .push(FoldedCall::running(call_id, name, args, now));
                 }
                 thread.forget_wrapped_lines();
             }
             None => {
-                let summary = call_summary(name, args.as_ref());
+                let summary = call_summary(&name, args.as_ref());
                 thread.rows.push(Cell::tool(call_id, summary, now));
             }
         }
@@ -292,6 +294,7 @@ impl ChildLive {
                         row.calls.iter_mut().find(|call| {
                             call.call_id.is_empty()
                                 && call.name == name
+                                && call.args == args
                                 && matches!(call.status, Some(ToolStatus::Running { .. }))
                         })
                     } else {
@@ -309,7 +312,7 @@ impl ChildLive {
                 call.tail.full.settle()
             }
             None => {
-                let summary = call_summary(name, args.as_ref());
+                let summary = call_summary(&name, args.as_ref());
                 let Some(Cell::Tool { status, tail, .. }) =
                     thread.tool_to_finish(call_id, &summary)
                 else {
@@ -323,19 +326,29 @@ impl ChildLive {
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
-    pub(super) fn tool_output(&mut self, agent_id: &str, call_id: &str, chunk: &[u8]) {
+    /// Output of a call that ran inside `node`, or at the child's top
+    /// level for None; the node tells apart calls the provider gave no id.
+    pub(super) fn tool_output(
+        &mut self,
+        agent_id: &str,
+        node: Option<&str>,
+        call_id: &str,
+        chunk: &[u8],
+    ) {
         if chunk.is_empty() {
             return;
         }
         let Some(thread) = self.threads.get_mut(agent_id) else {
             return;
         };
-        let Some(cell) = thread
-            .rows
-            .iter_mut()
-            .rev()
-            .find(|cell| cell.takes_output_of(call_id))
-        else {
+        let Some(cell) = thread.rows.iter_mut().rev().find(|cell| {
+            let in_place = match (&**cell, node) {
+                (Cell::Node { node_id, .. }, Some(node)) => node_id == node,
+                (Cell::Node { .. }, None) | (_, Some(_)) => false,
+                (_, None) => true,
+            };
+            in_place && cell.takes_output_of(call_id)
+        }) else {
             return;
         };
         cell.forget_wrapped_lines();

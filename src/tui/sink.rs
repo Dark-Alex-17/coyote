@@ -81,6 +81,7 @@ pub(crate) enum UiMsg {
     },
     ChildToolOutput {
         agent_id: String,
+        node: Option<String>,
         call_id: String,
         chunk: Vec<u8>,
     },
@@ -405,11 +406,13 @@ impl EventSink for TuiSink {
                 origin:
                     Origin {
                         agent_id: Some(agent_id),
+                        node,
                         ..
                     },
                 ..
             } => self.send(UiMsg::ChildToolOutput {
                 agent_id: agent_id.clone(),
+                node: node.clone(),
                 call_id: call_id.clone(),
                 chunk: bytes.clone(),
             }),
@@ -804,8 +807,11 @@ mod tests {
         let msgs = drain(&mut rx);
         assert!(matches!(
             &msgs[..],
-            [UiMsg::ChildToolOutput { agent_id, call_id, chunk }]
-                if agent_id == "agent_graph_9f8e" && call_id == "call-o1" && chunk == b"line\n"
+            [UiMsg::ChildToolOutput { agent_id, node, call_id, chunk }]
+                if agent_id == "agent_graph_9f8e"
+                    && node.as_deref() == Some("plan")
+                    && call_id == "call-o1"
+                    && chunk == b"line\n"
         ));
     }
 

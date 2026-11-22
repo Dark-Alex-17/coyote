@@ -1,5 +1,5 @@
 use super::*;
-use crate::tui::run_loop::{CopyOutcome, copy_notice};
+use crate::tui::run_loop::{CopyOutcome, copy_notice, copy_to_clipboard_with};
 
 fn alt_char(c: char) -> KeyEvent {
     alt(KeyCode::Char(c))
@@ -262,5 +262,64 @@ fn the_copy_notice_says_where_the_text_went_and_what_was_left_out() {
             NoticeKind::ToolWarning,
             "Copy failed: broken pipe".to_string()
         )
+    );
+}
+
+#[test]
+fn a_native_copy_writes_nothing_to_the_terminal() {
+    let mut written = Vec::new();
+    let mut handed = None;
+    let outcome = copy_to_clipboard_with(&mut written, "two\nlines\n", |text| {
+        handed = Some(text.to_string());
+        true
+    });
+    assert_eq!(outcome, CopyOutcome::Native);
+    assert_eq!(handed.as_deref(), Some("two\nlines\n"));
+    assert!(written.is_empty());
+}
+
+#[test]
+fn without_a_system_clipboard_the_terminal_gets_an_osc52_request() {
+    let mut written = Vec::new();
+    let outcome = copy_to_clipboard_with(&mut written, "hi\n", |_| false);
+    assert_eq!(outcome, CopyOutcome::Osc52 { kept_lines: None });
+    assert_eq!(written, b"\x1b]52;c;aGkK\x07");
+}
+
+#[test]
+fn an_osc52_copy_too_long_for_one_request_keeps_the_newest_whole_lines() {
+    let line = format!("{}\n", "q".repeat(63));
+    let text = line.repeat(4000);
+    let mut written = Vec::new();
+    let outcome = copy_to_clipboard_with(&mut written, &text, |_| false);
+    let CopyOutcome::Osc52 {
+        kept_lines: Some(kept),
+    } = outcome
+    else {
+        panic!("the cut was not reported: {outcome:?}");
+    };
+    assert!(kept < 4000);
+    let kept_text = line.repeat(kept);
+    assert_eq!(
+        written,
+        crate::utils::osc52_sequence(&kept_text).into_bytes()
+    );
+}
+
+#[test]
+fn a_failed_terminal_write_is_a_failed_copy() {
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the terminal is gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let outcome = copy_to_clipboard_with(&mut Broken, "hi", |_| false);
+    assert_eq!(
+        outcome,
+        CopyOutcome::Failed("the terminal is gone".to_string())
     );
 }
