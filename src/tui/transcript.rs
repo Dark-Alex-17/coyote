@@ -1610,7 +1610,6 @@ mod tests {
         );
     }
 
-    /// A resumed history reads as the live rows do: the user line, the
     /// A resumed history's saved outputs count against the whole-output
     /// budget at once, the oldest given up first; a view scrolled away
     /// counts the whole history as one entry below.

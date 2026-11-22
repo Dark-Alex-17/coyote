@@ -969,7 +969,7 @@ mod rewind_macros_and_queue_drain {
     #[test]
     #[serial]
     fn ctrl_c_during_a_tool_round_drops_the_queued_line_from_the_turn_queue_too() {
-        let dir = fresh_config_dir("esc-drains-queue");
+        let dir = fresh_config_dir("ctrl-c-drains-queue");
         let _guard = TempDirGuard(dir.clone());
         let tool_a = dir.join("tool-a");
         let tool_b = dir.join("tool-b");
@@ -999,12 +999,12 @@ mod rewind_macros_and_queue_drain {
             "the line queued while the tool slept did not show `pending: 1`:\n{frame}"
         );
 
-        let esc_at = pty.raw().len();
+        let ctrl_c_at = pty.raw().len();
         pty.send(b"\x03").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             pty.read_for(Duration::from_millis(200));
-            let text = since(&pty, esc_at).to_lowercase();
+            let text = since(&pty, ctrl_c_at).to_lowercase();
             // A tool round ends with the tool aborted; a held stream with the
             // interrupted marker.
             if text.contains("interrupted") || text.contains("aborted") {
@@ -1013,7 +1013,7 @@ mod rewind_macros_and_queue_drain {
             assert!(
                 Instant::now() < deadline,
                 "no cell said the turn was interrupted or the tool aborted after Ctrl+C:\n{}",
-                since(&pty, esc_at)
+                since(&pty, ctrl_c_at)
             );
         }
         // Long enough for a wrongly surviving queued line to open a turn.

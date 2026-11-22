@@ -4215,10 +4215,10 @@ mod binary {
         assert_tty_restored(&transcript);
     }
 
-    /// Ctrl+C while a turn runs is the same soft interrupt as Esc: the held
-    /// stream ends at once, the process does NOT exit, the rest of the reply
-    /// never lands, and the next command is handled well before the model
-    /// would have let go.
+    /// Ctrl+C while a turn runs interrupts it as Esc does, and drops any
+    /// held lines besides: the held stream ends at once, the process does
+    /// NOT exit, the rest of the reply never lands, and the next command is
+    /// handled well before the model would have let go.
     #[test]
     #[serial]
     fn ctrl_c_during_a_held_stream_interrupts_the_turn_and_the_ui_stays_up() {

@@ -459,7 +459,6 @@ fn lines_held_back_by_esc_run_next_in_the_order_typed() {
     });
 }
 
-/// A setting taken during a turn is on the context the held line's turn
 /// Alt+Up after an Esc takes the newest held line back from the lines the
 /// Esc held back, so it is not reported as already sent, and the older
 /// line still runs next once the turn ends.

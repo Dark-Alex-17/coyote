@@ -196,8 +196,6 @@ fn a_replayed_history_under_the_tui_goes_to_the_transcript_as_rows() {
     }
 }
 
-/// Under the TUI `.copy` hands the reply to the loop, which copies it
-/// `.redraw session` under the TUI adds no second copy of the history:
 /// While the TUI holds the terminal, a `.list` table is fitted to the
 /// width of the transcript it last drew: a long description wraps inside
 /// its cell and every row fits. With no TUI the width is not set.
@@ -227,6 +225,12 @@ fn a_list_table_under_the_tui_fits_the_transcripts_width() {
         let listing = crate::repl::list_output(&ctx, Some("agents"))
             .await
             .unwrap();
+        // On a frame too narrow to share, the todo panel takes the
+        // transcript's place; tables keep to the whole width meanwhile.
+        let mut narrow = Harness::standalone(50, 20);
+        narrow.app.handle_key(ctrl(KeyCode::Char('x')));
+        narrow.draw();
+        assert_eq!(crate::tui::table_width(), Some(50));
         drop(owner);
         let table: Vec<&str> = listing
             .lines()

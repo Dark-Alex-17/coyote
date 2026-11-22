@@ -1475,6 +1475,7 @@ mod transcript {
 
         pty.send(b"run the slow tool\r").unwrap();
         wait_for_file(&mut pty, &tool_pid, "the tool's pid file");
+        let _sleepers = Sleepers(vec![tool_pid.clone()]);
         let pid: i32 = fs::read_to_string(&tool_pid)
             .unwrap()
             .trim()

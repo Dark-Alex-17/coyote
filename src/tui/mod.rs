@@ -2027,7 +2027,11 @@ impl App {
         } else {
             upper.width
         };
-        TABLE_WIDTH.store(table_width, Ordering::Relaxed);
+        // Only the UI that holds the terminal sets it; a frame drawn by
+        // anything else (a test's own app) leaves it alone.
+        if active() {
+            TABLE_WIDTH.store(table_width, Ordering::Relaxed);
+        }
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
         if let Some(todo) = todo {

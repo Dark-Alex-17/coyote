@@ -8530,6 +8530,8 @@ mod tests {
     fn a_listing_table_without_a_width_keeps_each_row_on_one_line() {
         let description = "a long description that cannot fit on one row of a narrow screen";
         let mut table = fitted_table(&["name", "description"], None);
+        // No width and no terminal to read one from, wherever the tests run.
+        table.force_no_tty();
         table.add_row(vec!["planner", description]);
         assert!(table.to_string().contains(description));
     }

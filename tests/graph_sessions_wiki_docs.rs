@@ -2908,6 +2908,36 @@ fn ctrl_c_wording_names_the_session_split() {
     }
 }
 
+/// Both collect tools stop on a line the user sends under the TUI, and
+/// their rows say so.
+#[test]
+fn wiki_documents_the_collect_tools_user_message_status() {
+    let status = "{\"status\":\"user_message\"}";
+    for (file, page, heading, tool) in [
+        ("agents.rs", "Agents.md", None, "`agent__collect`"),
+        (
+            "jobs.rs",
+            "Background-Jobs.md",
+            Some("## The Six Tools"),
+            "`job__collect`",
+        ),
+    ] {
+        let collect = fn_body(&src(&["function", file]), "async fn handle_collect(");
+        assert!(
+            collect.contains("\"status\": \"user_message\""),
+            "{file} handle_collect no longer returns status \"user_message\""
+        );
+        let Some(wiki) = wiki_dir() else { continue };
+        let text = read(wiki.join(page));
+        let scope = heading.map_or(text.clone(), |heading| section(page, &text, heading));
+        let row = table_row(page, &scope, tool);
+        assert!(
+            row[1].contains(status),
+            "the {page} {tool} row does not name {status}: {row:?}"
+        );
+    }
+}
+
 #[test]
 fn wiki_documents_the_wait_tools() {
     let Some(wiki) = wiki_dir() else { return };

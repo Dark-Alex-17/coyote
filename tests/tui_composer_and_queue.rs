@@ -947,16 +947,6 @@ mod queue_vi_and_headless {
         }
     }
 
-    /// Kills the recorded pid when the test ends, however it ends.
-    struct KillOnDrop(i32);
-
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            // SAFETY: kill takes a pid and a signal number and touches no memory.
-            let _ = unsafe { libc::kill(self.0, libc::SIGKILL) };
-        }
-    }
-
     /// A line sent while the model waits in `job__wait` ends the wait at
     /// once: the model's next request carries the line and the wait's
     /// `user_message` status long before the job could finish, and the job
@@ -990,7 +980,7 @@ mod queue_vi_and_headless {
             .trim()
             .parse()
             .unwrap();
-        let _kill = KillOnDrop(pid);
+        let _sleepers = Sleepers(vec![job_pid.clone()]);
         let deadline = Instant::now() + PTY_DEADLINE;
         while fake.served() < 2 {
             assert!(
@@ -1018,8 +1008,10 @@ mod queue_vi_and_headless {
             after_wait.contains("look at this m5q"),
             "the line did not reach the model with the wait's result: {after_wait}"
         );
+        // The tool result is JSON inside the request's JSON, so its quotes
+        // arrive escaped; the notification event says `event`, not `status`.
         assert!(
-            after_wait.contains("user_message"),
+            after_wait.contains(r#"\"status\":\"user_message\""#),
             "the wait did not say why it ended: {after_wait}"
         );
         assert!(alive(pid), "the job died with the interrupted wait");
@@ -1055,7 +1047,7 @@ mod queue_vi_and_headless {
             .trim()
             .parse()
             .unwrap();
-        let _kill = KillOnDrop(pid);
+        let _sleepers = Sleepers(vec![tool_pid.clone()]);
         pty.send(b"held line h3d\r").unwrap();
         wait_for_squeezed_after(&mut pty, "pending: 1", 0, "the held line's strip");
         pty.read_for(Duration::from_millis(1500));
@@ -1079,6 +1071,11 @@ mod queue_vi_and_headless {
         assert!(
             next.contains("held line h3d"),
             "Esc did not send the held line: {next}"
+        );
+        assert_eq!(
+            next.matches("held line h3d").count(),
+            1,
+            "the held line reached the model twice: {next}"
         );
         let shown = since(&pty, esc_at);
         assert!(

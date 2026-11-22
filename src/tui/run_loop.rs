@@ -1016,8 +1016,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let mut quit_requested = false;
     let mut frame_failing = false;
     // The user's lines an Esc took off the stopping turn's queue, so that
-    // turn cannot hand them to its model; they go back once it has ended.
+    // turn cannot hand them to its model, and those typed while it stops;
+    // they go back once it has ended.
     let mut held_back: Vec<String> = Vec::new();
+    let mut stopping = false;
     loop {
         let step = tokio::select! {
             event = stream.as_mut().expect("the event stream is renewed in place").next() => Step::Input(event),
@@ -1086,7 +1088,11 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                     }
                     Some(Command::Queue(text)) => {
-                        if let Some(Task::Turn { queue, .. }) = &task {
+                        // After an Esc the stopping turn must not hand a
+                        // line to its model either; it joins the held ones.
+                        if stopping {
+                            held_back.push(text);
+                        } else if let Some(Task::Turn { queue, .. }) = &task {
                             queued::queue_user_message(queue, &text);
                         }
                     }
@@ -1109,12 +1115,14 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Interrupt) => {
                         abort.set_ctrlc();
                         if let Some(Task::Turn { queue, .. }) = &task {
+                            stopping = true;
                             held_back.extend(take_user_messages(queue));
                         }
                         cancel_command(app, &mut immediate);
                     }
                     Some(Command::InterruptDroppingHeld) => {
                         abort.set_ctrlc();
+                        stopping = false;
                         held_back.clear();
                         purge_turn_queue(&task);
                         cancel_command(app, &mut immediate);
@@ -1221,6 +1229,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     let Some(Task::Turn { command, queue, .. }) = task.take() else {
                         continue;
                     };
+                    stopping = false;
                     restore_held_back(&queue, &mut held_back);
                     match joined {
                         Ok((returned, outcome)) => {
