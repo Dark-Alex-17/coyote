@@ -2495,7 +2495,7 @@ check("interpret_route -> apply_answer: a recipe of literal commands reaches the
       and "start the db" not in s["pending_amendments"][0], s)
 check("interpret_route: an applied recipe instruction names the supply option, with the owner's words as its note",
       first == "interpret_reply" and str(s.get("last_answer", "")).startswith(
-          "Supply the recipe (type it); amend the plan and re-run the probe once: docker compose"), s.get("last_answer"))
+          f"Supply the recipe (type it); amend the plan and re-run the probe once: {RECIPE[:14]}"), s.get("last_answer"))
 first, s = interpreted(E_HELD, "reuse the other checkout", reply_verdict="instruction", reply_instruction="reuse_worktree",
                        reply_value=CODE, state={"code_repo_path": WT_LOCAL})
 check("interpret_route: reuse_worktree naming a checkout of another repo -> rejected, ledgered, one clarifying question",
@@ -2978,8 +2978,8 @@ check("apply_answer: review_incomplete retry -> verify_gate", AA("review_incompl
 u = AA("review_incomplete", "Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)", current_task=T1, tasks=TS_W, verify_unit=T1, round_log={T1: [{"round": 1, "incomplete": ["security"]}]})
 check("apply_answer: review_incomplete accept -> skipped review recorded (lane names) -> post_round", u["_next"] == "post_round" and "security" in u["skipped_reviews"][0])
 check("apply_answer: review_incomplete abort -> end_aborted", AA("review_incomplete", "Abort this task", current_task=T1, tasks=TS_W)["_next"] == "end_aborted")
-u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc={**AA_ESC["design_ask"], "question": "Design question: share the store?"}, current_task=T1, tasks=tasks_with(), task_rounds={}, design_asks=[])
-check("apply_answer: design_ask adopt -> design-decision ledgered + adopting fix round queued (B12 side 1) -> next ask", u["_next"] == "design_ask_gate" and u["design_decisions"][0].startswith("share the store? ->") and u["pending_fixes"][0]["source"] == "design_ask" and any(l.startswith("design-decision:") for l in u["ledger_lines"]))
+u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc={**AA_ESC["design_ask"], "question": "Design question: share the cache?"}, current_task=T1, tasks=tasks_with(), task_rounds={}, design_asks=[])
+check("apply_answer: design_ask adopt -> design-decision ledgered + adopting fix round queued (B12 side 1) -> next ask", u["_next"] == "design_ask_gate" and u["design_decisions"][0].startswith("share the cache? ->") and u["pending_fixes"][0]["source"] == "design_ask" and any(l.startswith("design-decision:") for l in u["ledger_lines"]))
 u = AA("design_ask", "Adopt the pattern (work: one fix round follows)", esc={**AA_ESC["design_ask"], "question": "Design question: q2"}, current_task=T1, tasks=tasks_with(), task_rounds={T1: {"design_ask_rounds": 1}})
 check("apply_answer: design_ask adopt at B12 -> recorded only, no second round", "pending_fixes" not in u)
 check("apply_answer: design_ask record -> no fix round", "pending_fixes" not in AA("design_ask", "Record the decision without adopting", current_task=T1, tasks=tasks_with()))
@@ -3146,7 +3146,7 @@ for reply in ("yes, adopt it", "adopt it, yes please", "Adopt"):
     check(f"apply_answer: design_ask free {reply!r} -> recorded as the decision, never adopted",
           u.get("_next") == "design_ask_gate" and "pending_fixes" not in u and any(reply in d for d in u.get("design_decisions", [])),
           (u.get("_next"), u.get("pending_fixes")))
-u = gates.apply_answer(base_state(escalation=AA_ESC["design_ask"], last_answer="1: share the store", current_task=T1, tasks=tasks_with(),
+u = gates.apply_answer(base_state(escalation=AA_ESC["design_ask"], last_answer="1: share the cache", current_task=T1, tasks=tasks_with(),
                                   task_rounds={}))
 check("apply_answer: design_ask '1: <note>' -> the Adopt option, a fix round queued",
       u.get("_next") == "design_ask_gate" and u.get("pending_fixes", [{}])[0].get("source") == "design_ask", u.get("pending_fixes"))
@@ -6255,7 +6255,7 @@ check("escalation: a trigger word in the question's own stem still trips",
       escalation("x", "Rotate the credential?").get("hard_trigger") is True)
 guarded("escalation: a stem matching on its own still trips with the quoted name blanked",
         lambda: (escalation("x", "Delete the branch feat-a?", quoted=("feat-a",)).get("hard_trigger") is True, ""))
-u = gates.open_questions_gate(base_state(open_questions=[{"question": "Which token store?",
+u = gates.open_questions_gate(base_state(open_questions=[{"question": "Which token cache?",
                                                           "options": [{"text": "a", "recommended": True}, {"text": "b"}]}],
                                          design_rounds=0))
 check("open_questions_gate: a design question framed with a trigger word is the question itself -> hard trigger",
