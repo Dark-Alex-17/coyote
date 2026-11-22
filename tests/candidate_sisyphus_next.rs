@@ -2015,7 +2015,8 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "choice-own-kinds",
-                "    if esc.get(\"kind\") in OWN_PROMPT_KINDS:\n        return None\n",
+                "    if esc.get(\"kind\") in OWN_PROMPT_KINDS + TYPED_PROMPT_KINDS:\n        \
+                 return None\n",
                 "    if False:\n        return None\n",
                 "choice: handoff_confirm and draft_confirm keep their own approval nodes",
             ),
