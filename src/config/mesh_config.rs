@@ -137,7 +137,8 @@ pub struct MeshConfig {
     /// at join, and whenever its table holds none at a post or a sync, so it need not wait
     /// for their next announce: a team relay that is also a propagation node, or a first
     /// run before the node's hourly announce. These are pinned: never evicted from the
-    /// node table, and while one is filed the only nodes posted to and fetched from.
+    /// node table and not counted against its cap of 32 other nodes, and while one is
+    /// filed the only nodes posted to and fetched from.
     /// Read in lower case.
     pub propagation_nodes: Vec<String>,
     pub fetch: MeshFetch,
@@ -299,12 +300,21 @@ impl MeshConfig {
         propagation_sync_every(self.propagation_sync_interval_secs, self.announce)
     }
 
-    /// `propagation_nodes` in lower case, as the propagation node table keys them.
+    /// `propagation_nodes` in lower case, as the propagation node table keys them, each
+    /// once in the order first listed: the same hash in two cases is one node, which
+    /// a sync must not ask twice.
     pub(crate) fn propagation_node_hashes(&self) -> Vec<String> {
-        self.propagation_nodes
+        let mut hashes: Vec<String> = Vec::with_capacity(self.propagation_nodes.len());
+        for hash in self
+            .propagation_nodes
             .iter()
             .map(|hash| hash.to_ascii_lowercase())
-            .collect()
+        {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+        hashes
     }
 
     /// Blank counts as unset and yields the built-in prompt.
@@ -1551,6 +1561,14 @@ mod tests {
         assert_eq!(
             pinned.mesh.propagation_node_hashes(),
             ["9af2fd91".repeat(4), "0".repeat(32)]
+        );
+        let mut twice = pinned.mesh.clone();
+        twice.propagation_nodes.push("9af2fd91".repeat(4));
+        twice.validate(true).unwrap();
+        assert_eq!(
+            twice.propagation_node_hashes(),
+            ["9af2fd91".repeat(4), "0".repeat(32)],
+            "the same hash in another case is one node"
         );
 
         for bad in [

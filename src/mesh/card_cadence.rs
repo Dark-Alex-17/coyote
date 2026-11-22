@@ -42,8 +42,9 @@ pub(crate) enum CardTrigger {
     /// the trust list covers, so a new session of a user trusted as a whole is named
     /// from its card without waiting for it to make contact.
     Heard,
-    /// The session answered a path request for the first time in a run, counted as a
-    /// hearing as `Heard` is. Asked only when it served this node: the path was asked for
+    /// The session answered a path request for the first time in a run. Asked only when
+    /// it served this node, and counted as the run's hearing only then, so an unserved
+    /// session's next announce is still its first hearing: the path was asked for
     /// because this node is about to reach it, and a card fetch beside that request would
     /// share its link, so a send on its way waits on the fetch's link instead of its own.
     Answered,
@@ -213,6 +214,15 @@ impl CardCadence {
             }
         };
         let admitted = Self::admits(&mut state, destination, trigger, served, now);
+        // A path response held back only by the served gate leaves the first hearing to
+        // the session's next announce, which asks it unserved.
+        if trigger == CardTrigger::Answered
+            && !admitted
+            && !served
+            && !state.refused.contains(destination)
+        {
+            state.heard.remove(destination);
+        }
         let deferred = state.deferred.contains_key(destination);
         if lifted && let Some(order) = order {
             self.save_refusals(order, state);
@@ -477,17 +487,40 @@ impl SiblingTrustSink for CardStopsOnSiblingTrust {
     }
 }
 
+/// What `drive_card_cadence` drives: the node's cadence, the fetch it starts and the
+/// sessions a grant covers. The node is the one host; a test stands in for it to watch
+/// what the driver asks for on a paused clock.
+pub(crate) trait CadenceHost: Send + Sync + 'static {
+    fn cadence(&self) -> &CardCadence;
+    fn fetch(self: &Arc<Self>, destination: &str, trigger: CardTrigger);
+    fn covered_by(&self, grant: &TrustGranted) -> Vec<String>;
+}
+
+impl CadenceHost for MeshRuntime {
+    fn cadence(&self) -> &CardCadence {
+        self.card_cadence()
+    }
+
+    fn fetch(self: &Arc<Self>, destination: &str, trigger: CardTrigger) {
+        self.consider_card_fetch(destination, trigger);
+    }
+
+    fn covered_by(&self, grant: &TrustGranted) -> Vec<String> {
+        self.sessions_a_grant_covers(&grant.identity_hash, grant.destination_hash.as_deref())
+    }
+}
+
 /// Turns each grant into a background card fetch of every session it covers that the
 /// peer table holds: the one destination of a destination grant, every session of the
 /// identity for an identity grant. Fires each fetch the interval deferred once it is due.
-pub(crate) async fn drive_card_cadence(
+pub(crate) async fn drive_card_cadence<H: CadenceHost>(
     mut grants: mpsc::UnboundedReceiver<TrustGranted>,
-    runtime: Weak<MeshRuntime>,
+    runtime: Weak<H>,
     cancel: CancellationToken,
 ) {
     let Some(deferred_changed) = runtime
         .upgrade()
-        .map(|runtime| runtime.card_cadence().deferred_changed.clone())
+        .map(|runtime| runtime.cadence().deferred_changed.clone())
     else {
         return;
     };
@@ -495,7 +528,7 @@ pub(crate) async fn drive_card_cadence(
         // A runtime that is gone has nothing due; its stop cancels this loop.
         let due_in = runtime
             .upgrade()
-            .and_then(|runtime| runtime.card_cadence().next_due_in());
+            .and_then(|runtime| runtime.cadence().next_due_in());
         let grant = tokio::select! {
             () = cancel.cancelled() => break,
             () = deferred_changed.notified() => continue,
@@ -503,12 +536,12 @@ pub(crate) async fn drive_card_cadence(
                 let Some(runtime) = runtime.upgrade() else {
                     break;
                 };
-                for (destination, trigger) in runtime.card_cadence().take_due() {
+                for (destination, trigger) in runtime.cadence().take_due() {
                     debug!(
                         "Mesh background status card for {} ({trigger:?}): the interval has lapsed, asking now",
                         short(&destination)
                     );
-                    runtime.consider_card_fetch(&destination, trigger);
+                    runtime.fetch(&destination, trigger);
                 }
                 continue;
             }
@@ -520,10 +553,8 @@ pub(crate) async fn drive_card_cadence(
         let Some(runtime) = runtime.upgrade() else {
             break;
         };
-        for destination in
-            runtime.sessions_a_grant_covers(&grant.identity_hash, grant.destination_hash.as_deref())
-        {
-            runtime.consider_card_fetch(&destination, CardTrigger::Granted);
+        for destination in runtime.covered_by(&grant) {
+            runtime.fetch(&destination, CardTrigger::Granted);
         }
     }
 }
@@ -619,12 +650,18 @@ impl MeshRuntime {
         }
         let cadence = self.card_cadence();
         let served = self.peers().served_recently(destination);
-        // A session of this node's own user is named from the session registry, not a
+        // A session of yours on this computer is named from the session registry, not a
         // card, so being heard asks it only when it served this node; an unserved
-        // hearing is still noted, so it counts once per run as any other.
+        // hearing is still noted, so it counts once per run as any other. One of yours on
+        // another computer is not in the registry and is asked as any trusted session.
         if trigger == CardTrigger::Heard
             && !served
             && peer.identity_hash.eq_ignore_ascii_case(self.fingerprint())
+            && {
+                let registry = self.registered_sessions();
+                registry.running.contains_key(destination)
+                    || registry.gone.contains_key(destination)
+            }
         {
             self.card_cadence().note_heard(destination);
             return None;
@@ -764,16 +801,18 @@ mod tests {
         );
     }
 
-    /// A first path response counts as the hearing but keeps the served gate; a served
-    /// session is asked on it.
+    /// A first path response keeps the served gate: an unserved session is not asked on
+    /// it and its next announce is still the first hearing, which asks it; a served one
+    /// is asked on the path response.
     #[test]
     fn a_first_path_response_asks_only_a_session_that_served_this_node() {
         let cadence = CardCadence::default();
         assert!(!cadence.admit(D, CardTrigger::Answered, false));
         assert!(
-            !cadence.admit(D, CardTrigger::Heard, false),
-            "the path response was the hearing"
+            cadence.admit(D, CardTrigger::Heard, false),
+            "the announce after the path response is the first hearing"
         );
+        assert!(!cadence.admit(D, CardTrigger::Heard, false), "and only it");
         let served = "e".repeat(32);
         assert!(cadence.admit(&served, CardTrigger::Answered, true));
     }
@@ -790,6 +829,73 @@ mod tests {
             !cadence.admit(D, CardTrigger::Heard, false),
             "it went out this time"
         );
+    }
+
+    /// Stands in for the node under `drive_card_cadence`, recording each fetch it asks
+    /// for and when.
+    #[derive(Default)]
+    struct RecordingHost {
+        cadence: CardCadence,
+        fetched: parking_lot::Mutex<Vec<(String, CardTrigger, Instant)>>,
+    }
+
+    impl CadenceHost for RecordingHost {
+        fn cadence(&self) -> &CardCadence {
+            &self.cadence
+        }
+
+        fn fetch(self: &Arc<Self>, destination: &str, trigger: CardTrigger) {
+            self.fetched
+                .lock()
+                .push((destination.to_string(), trigger, Instant::now()));
+        }
+
+        fn covered_by(&self, _grant: &TrustGranted) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    /// The driver on a paused clock: a session heard again 95 s after its card was
+    /// fetched is deferred; the driver wakes, sleeps until the interval lapses and asks
+    /// once then, not a second before, and never again while nothing new is deferred.
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_asks_a_deferred_fetch_once_when_the_interval_lapses() {
+        let host = Arc::new(RecordingHost::default());
+        let fetched_at = Instant::now();
+        assert!(host.cadence.admit(D, CardTrigger::Reheard, true));
+        tokio::time::advance(Duration::from_secs(95)).await;
+        assert!(
+            !host.cadence.admit(D, CardTrigger::Reheard, true),
+            "deferred"
+        );
+        let (_grants, grants_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let driver = tokio::spawn(drive_card_cadence(
+            grants_rx,
+            Arc::downgrade(&host),
+            cancel.clone(),
+        ));
+
+        let due = fetched_at + CARD_FETCH_MIN_INTERVAL;
+        tokio::time::sleep_until(due - Duration::from_secs(1)).await;
+        assert!(
+            host.fetched.lock().is_empty(),
+            "nothing before the interval"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        {
+            let fetched = host.fetched.lock();
+            assert_eq!(fetched.len(), 1, "{:?}", fetched.len());
+            assert_eq!(
+                (fetched[0].0.as_str(), fetched[0].1),
+                (D, CardTrigger::Reheard)
+            );
+            assert!(fetched[0].2 >= due);
+        }
+        tokio::time::sleep(CARD_FETCH_MIN_INTERVAL * 3).await;
+        assert_eq!(host.fetched.lock().len(), 1, "one fetch per deferral");
+        cancel.cancel();
+        driver.await.unwrap();
     }
 
     #[test]
@@ -1362,6 +1468,45 @@ mod network {
 
         assert!(slot_a.stop().await.unwrap());
         assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// A session of your own identity on another computer is not in this computer's
+    /// session registry, so its first hearing asks for its card, unserved, as any trusted
+    /// session's does, and it is named from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn your_own_session_on_another_computer_is_asked_for_its_card() {
+        use crate::mesh::test_support::started_session_of;
+
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let here = started_runtime_on("cadence-own-elsewhere-a", relay.port).await;
+        let slot_here = Arc::new(MeshSlot::default());
+        slot_here.install(here.runtime.clone()).unwrap();
+        let before = status_requests(&here.runtime);
+        let there = started_session_of("cadence-own-elsewhere-b", relay.port, &here, |_| {}).await;
+        let slot_there = Arc::new(MeshSlot::default());
+        slot_there.install(there.runtime.clone()).unwrap();
+        let there_dest = there.runtime.current_destination_hash();
+        wait_for_peer(&here.runtime, &there_dest).await;
+        assert!(
+            !here
+                .runtime
+                .registered_sessions()
+                .running
+                .contains_key(&there_dest)
+        );
+        let started = Instant::now();
+        while status_requests(&here.runtime) == before {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "its first hearing never asked for its card"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status_requests(&here.runtime), before + 1);
+
+        assert!(slot_here.stop().await.unwrap());
+        assert!(slot_there.stop().await.unwrap());
         relay.stop().await;
     }
 

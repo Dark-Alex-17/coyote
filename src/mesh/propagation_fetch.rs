@@ -587,6 +587,13 @@ pub(crate) const ASKED_FOR_SOURCE: &str =
     "the sender is not known yet; asked the mesh for its announce";
 
 impl FetchReport {
+    /// Whether the node holds more for this node than the fetch took: a body deferred for
+    /// its sender's announce, or a page that filled `MAX_WANTS_PER_FETCH`. The follow-up
+    /// fetch asks the same node.
+    pub(crate) fn more_to_come(&self) -> bool {
+        self.deferred > 0 || self.wanted == MAX_WANTS_PER_FETCH
+    }
+
     fn new(node: String) -> Self {
         Self {
             node,

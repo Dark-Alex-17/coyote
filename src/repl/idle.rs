@@ -22,7 +22,7 @@ use crate::mesh::idle::{
     SyncSchedule,
 };
 use crate::mesh::notify::{Notification, Source};
-use crate::mesh::{FetchError, FetchReport, LoggingInboundSink, redact_hashes, short};
+use crate::mesh::{FetchError, FetchReport, LoggingInboundSink, NodePurpose, redact_hashes, short};
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, mesh_events_dropped,
 };
@@ -444,6 +444,12 @@ impl DriverLoop {
             return;
         };
         let Ok(node) = runtime.propagation_nodes().select() else {
+            // The configured nodes the table lacks are asked for in the background; the
+            // retry `no_node` arms finds one filed meanwhile.
+            let asking = runtime.clone();
+            tokio::spawn(async move {
+                let _ = asking.propagation_node_for(NodePurpose::Fetching).await;
+            });
             if !self.no_node_logged {
                 debug!("Propagation sync waits for a propagation node to announce itself");
                 self.no_node_logged = true;

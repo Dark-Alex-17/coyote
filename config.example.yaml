@@ -421,9 +421,9 @@ mesh:
                                       # while `announce` is false
   propagation_nodes: []          # Destination hashes (32 hex characters each) of propagation nodes to ask the mesh for by path request at join, and again
                                  # whenever none is filed at a post or a sync, rather than waiting up to an hour for the node's next announce: a team relay
-                                 # that is also a propagation node, or a first run before the node's hourly announce; listed nodes are never evicted, and
-                                 # while one is filed held mail is posted to and fetched from listed nodes only, each synced once per interval (default:
-                                 # [] = none)
+                                 # that is also a propagation node, or a first run before the node's hourly announce; listed nodes are never evicted and
+                                 # do not count against the 32 others kept, and while one is filed held mail is posted to and fetched from listed nodes
+                                 # only, each synced once per interval (default: [] = none)
   fetch:                         # File sharing between trusted peers; see the mesh.fetch keys below
     inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to
                                  # 98304, the per-message total)

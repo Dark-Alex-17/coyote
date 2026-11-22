@@ -21,6 +21,7 @@ use crate::mesh::propagation::{
     OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
 use crate::mesh::propagation_fetch::{Delivery, HoldPolicy, InboundMessage, InboundSink};
+use crate::mesh::propagation_nodes::NodePurpose;
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, NoAnswer,
@@ -2498,11 +2499,7 @@ impl MeshRuntime {
         };
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
-        let selected = self.propagation_nodes().select_for_posting();
-        if selected.is_err() {
-            self.resolve_configured_propagation_nodes_in_background(|| {})
-                .await;
-        }
+        let selected = self.propagation_node_for(NodePurpose::Posting).await;
         let node = selected.map_err(|_| match unreachable {
             Some(RequestError::Timeout { .. }) => SendError::NoAnswer(self.no_answer(&destination)),
             _ => match departed {
@@ -2771,6 +2768,9 @@ impl MeshRuntime {
             debug!("Mesh farewell for {dest8} not held: no stored key or description for it");
             return Err(FarewellSkip::NoStoredKey);
         };
+        // Not `propagation_node_for`: a farewell is sent while the node leaves, and a
+        // round of path requests started then would only be cancelled by the stop it
+        // races; with no node filed the farewell is skipped and said so.
         let Ok(node) = self.propagation_nodes().select_for_posting() else {
             debug!("Mesh farewell for {dest8} not held: no propagation node is filed");
             return Err(FarewellSkip::NoPropagationNode);

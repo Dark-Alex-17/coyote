@@ -713,11 +713,9 @@ impl MeshRuntime {
         };
         // Selected before queueing behind another post: a requester with no node to fall
         // back on is told so at once rather than after someone else's transfer.
-        let selected = self.propagation_nodes().select_for_posting();
-        if selected.is_err() {
-            self.resolve_configured_propagation_nodes_in_background(|| {})
-                .await;
-        }
+        let selected = self
+            .propagation_node_for(crate::mesh::propagation_nodes::NodePurpose::Posting)
+            .await;
         let node = selected.map_err(|_| match unreachable {
             Some(RequestError::Timeout { .. }) => AccessError::NoAnswer(self.no_answer(&dest_hex)),
             _ => AccessError::NoPropagationNode,

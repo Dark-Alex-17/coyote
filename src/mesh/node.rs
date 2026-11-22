@@ -62,7 +62,8 @@ use crate::mesh::propagation::{
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::{
-    ConfiguredPropagationNodes, PROPAGATION_NODE_TABLE_FILE, PersistTrigger, PropagationNodeTable,
+    ConfiguredPropagationNodes, NodePurpose, PROPAGATION_NODE_TABLE_FILE, PersistTrigger,
+    PropagationNodeTable,
 };
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(all(test, unix))]
@@ -1938,6 +1939,25 @@ impl MeshRuntime {
         .await
     }
 
+    /// The propagation node a post goes to (`select_for_posting`), or a fetch asks
+    /// (`select`). When none is filed, one round of path requests for the configured
+    /// nodes the table lacks starts in the background, so the next post or sync finds
+    /// one, and the error is returned at once: no caller waits on the mesh for it.
+    pub(crate) async fn propagation_node_for(
+        &self,
+        purpose: NodePurpose,
+    ) -> Result<PropagationNode, FetchError> {
+        let selected = match purpose {
+            NodePurpose::Posting => self.propagation_nodes.select_for_posting(),
+            NodePurpose::Fetching => self.propagation_nodes.select(),
+        };
+        if selected.is_err() {
+            self.resolve_configured_propagation_nodes_in_background(|| {})
+                .await;
+        }
+        selected
+    }
+
     /// One round of `resolve_configured_nodes` in the background, with `filed` run when it
     /// filed a node. Nothing starts while the table holds every configured node.
     pub(crate) async fn resolve_configured_propagation_nodes_in_background(
@@ -2279,8 +2299,8 @@ impl MeshRuntime {
         // Selected before queueing behind another post: a knocker with no node to fall
         // back on is told so at once rather than after someone else's transfer.
         let node = self
-            .propagation_nodes
-            .select_for_posting()
+            .propagation_node_for(NodePurpose::Posting)
+            .await
             .map_err(|_| match fallback {
                 KnockFallback::Unanswered => KnockError::Unanswered {
                     who: self.who_at(&dest_hex).to_string(),
@@ -2330,11 +2350,24 @@ impl MeshRuntime {
     /// store is read from disk for each fetch and written back before the node is told to
     /// delete anything, so a message survives a restart between the two as a remembered id
     /// rather than a second delivery. One fetch runs at a time across every Coyote process
-    /// of this identity; stopping the node cancels it. Each fetch that picked a node moves
-    /// the pinned rotation on, so the next asks the next pinned node.
+    /// of this identity; stopping the node cancels it. A fetch that leaves nothing more to
+    /// come there moves the pinned rotation on, so the next asks the next pinned node;
+    /// one that left more (a deferred body or a full page) keeps the turn, so the drain
+    /// that follows asks the same node. A failed fetch moves the turn on too, so one dead
+    /// pinned node does not hold the others' mail back; the schedule's backoff is shared.
     pub(crate) async fn fetch_propagated(
         &self,
         sink: &dyn InboundSink,
+    ) -> Result<FetchReport, FetchError> {
+        self.fetch_propagated_from(sink, None).await
+    }
+
+    /// `fetch_propagated` from `node` when given, which moves no rotation: a typed sync
+    /// asks each pinned node once this way.
+    pub(crate) async fn fetch_propagated_from(
+        &self,
+        sink: &dyn InboundSink,
+        node: Option<PropagationNode>,
     ) -> Result<FetchReport, FetchError> {
         let Ok(_fetching) = self.fetching.try_lock() else {
             return Err(FetchError::AlreadyRunning);
@@ -2347,16 +2380,30 @@ impl MeshRuntime {
             .await
             .clone()
             .ok_or(FetchError::Link(RequestError::NotRunning))?;
-        let selected = self.propagation_nodes.select();
-        if selected.is_err() {
-            self.resolve_configured_propagation_nodes_in_background(|| {})
-                .await;
+        let rotating = node.is_none();
+        let node = match node {
+            Some(node) => node,
+            None => self.propagation_node_for(NodePurpose::Fetching).await?,
+        };
+        let outcome = self
+            .fetch_from_node(sink, &transport, &node, store_path)
+            .await;
+        if moves_fetch_turn(rotating, &outcome) {
+            self.propagation_nodes.advance_fetch_turn();
         }
-        let node = selected?;
-        self.propagation_nodes.advance_fetch_turn();
+        outcome
+    }
+
+    async fn fetch_from_node(
+        &self,
+        sink: &dyn InboundSink,
+        transport: &Arc<Transport>,
+        node: &PropagationNode,
+        store_path: PathBuf,
+    ) -> Result<FetchReport, FetchError> {
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
         let cancel = self.cancellation_token();
-        let asked = request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
+        let asked = request_path_to_node(transport, node, &cancel, FetchError::Cancelled).await?;
         let peers = PeerRouting {
             trust: &self.trust,
             surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
@@ -2376,9 +2423,9 @@ impl MeshRuntime {
             instance_id: self.current_instance_id(),
         };
         propagation_fetch::fetch(
-            &transport,
+            transport,
             &self.transport_identity,
-            &node,
+            node,
             &self.peers,
             &self.trust,
             &mut store,
@@ -4803,6 +4850,13 @@ async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
 /// own error for a stop. Whether a request was sent: the post or fetch that follows opens
 /// its link as one whose path was already asked for when it was, so it never waits again
 /// outside this cancellable wait.
+/// Whether a fetch moves the pinned rotation on: a rotating fetch does unless it left
+/// more to come there, which the drain that follows takes from the same node; a fetch
+/// from a named node, as a typed sync makes, never does.
+fn moves_fetch_turn(rotating: bool, outcome: &Result<FetchReport, FetchError>) -> bool {
+    rotating && !outcome.as_ref().is_ok_and(FetchReport::more_to_come)
+}
+
 async fn request_path_to_node<E>(
     transport: &Transport,
     node: &PropagationNode,
@@ -4834,8 +4888,9 @@ async fn request_path_to_node<E>(
 }
 
 /// Asks the mesh for a path to each configured propagation node `table` does not hold and
-/// files the announce each path response carries as heard now, through
-/// `PropagationNodeTable::file_configured`, so an aged-out record is filed afresh too,
+/// files the announce each path response carries through
+/// `PropagationNodeTable::file_configured`, by the path-response rules (a node not on
+/// file is filed, an aged-out record stays aged out until the node announces),
 /// waiting up to `PATH_REQUEST_TIMEOUT` for them all. A hash answered by an
 /// announce that is not a usable propagation node's, or not answered at all, is logged
 /// once per run and not filed. Whether a node was filed; `false` at once while another
@@ -4888,13 +4943,18 @@ async fn resolve_configured_nodes(
         }
         let now = SystemTime::now();
         match table.file_configured(&desc, event.app_data.as_slice(), event.hops, now) {
-            Ok(()) => {
+            Ok(true) => {
                 debug!(
                     "Mesh filed configured propagation node {} from its path response",
                     short(&hash)
                 );
                 filed = true;
             }
+            Ok(false) => debug!(
+                "Mesh configured propagation node {} answered its path request, but its record \
+                 has aged out and a path response does not renew it; it waits for its next announce",
+                short(&hash)
+            ),
             Err(PropagationNodeError::NotAPropagationNode) => {
                 if configured.first_telling(&hash) {
                     info!(
@@ -21099,6 +21159,39 @@ mod tests {
             node.stop().await;
         }
 
+        /// A fetch that left more to come on a pinned node keeps the turn, so the drain
+        /// asks that node again; one that finished, or failed, moves on; a typed sync's
+        /// fetch from a named node never moves it.
+        #[test]
+        fn only_a_finished_or_failed_rotating_fetch_moves_the_pinned_turn() {
+            use crate::mesh::propagation_fetch::MAX_WANTS_PER_FETCH;
+            let report = |wanted, deferred| FetchReport {
+                node: String::new(),
+                listed: wanted,
+                wanted,
+                received: wanted,
+                delivered: wanted,
+                presence: 0,
+                duplicates: 0,
+                discarded: 0,
+                deferred,
+                deferred_after_ask: 0,
+                acknowledged: wanted,
+                left_for_session: 0,
+            };
+            assert!(moves_fetch_turn(true, &Ok(report(3, 0))));
+            assert!(
+                !moves_fetch_turn(true, &Ok(report(MAX_WANTS_PER_FETCH, 0))),
+                "a full page"
+            );
+            assert!(
+                !moves_fetch_turn(true, &Ok(report(3, 1))),
+                "a deferred body"
+            );
+            assert!(moves_fetch_turn(true, &Err(FetchError::NoPropagationNode)));
+            assert!(!moves_fetch_turn(false, &Ok(report(3, 0))), "a named node");
+        }
+
         /// Two configured nodes are filed beside a nearer stranger: each fetch asks the
         /// configured node whose turn it is and moves the turn on, so two fetches ask both
         /// and the stranger is never asked.
@@ -21144,6 +21237,74 @@ mod tests {
 
             stop(&runtime).await;
             relay.stop().await;
+        }
+
+        /// Picking a node to post to, as a send, an access request and a knock do, or to
+        /// fetch from, as the idle sync does, with none filed: the error comes back at
+        /// once and the configured node is asked for in the background and filed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn picking_a_node_with_none_filed_asks_for_the_configured_one() {
+            use crate::mesh::propagation::pn_announce_app_data;
+
+            for purpose in [NodePurpose::Posting, NodePurpose::Fetching] {
+                let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+                node.transport
+                    .set_destination_announce_app_data(
+                        &node.dest,
+                        Some(pn_announce_app_data(true, 0, 256)),
+                    )
+                    .await;
+                let hex = node.desc.address_hash.to_hex_string();
+                let tmp = TempDir::new("node-configured-pn-pick");
+                let runtime =
+                    start_with_configured(&tmp, node.port, std::slice::from_ref(&hex)).await;
+
+                let picked = runtime.propagation_node_for(purpose).await;
+                assert!(
+                    matches!(picked, Err(FetchError::NoPropagationNode)),
+                    "{purpose:?}"
+                );
+                wait_until("the configured node to be filed", || {
+                    runtime.propagation_nodes().holds(&hex, SystemTime::now())
+                })
+                .await;
+                let picked = runtime.propagation_node_for(purpose).await.unwrap();
+                assert_eq!(picked.destination.address_hash.to_hex_string(), hex);
+
+                stop(&runtime).await;
+                node.stop().await;
+            }
+        }
+
+        /// Every post path and the idle sync pick their node through
+        /// `propagation_node_for`, so each asks for the configured nodes when none is
+        /// filed; only the farewell, sent while the node leaves, picks without asking,
+        /// beside the helper itself.
+        #[test]
+        fn every_post_path_and_the_idle_sync_pick_through_the_resolving_helper() {
+            use crate::mesh::test_support::read_source;
+            for (file, uses) in [
+                ("src/mesh/message.rs", 1),
+                ("src/mesh/access.rs", 1),
+                ("src/mesh/node.rs", 2),
+                ("src/repl/idle.rs", 1),
+            ] {
+                let source = read_source(Path::new(file));
+                let code = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+                assert_eq!(
+                    code.matches("propagation_node_for(").count()
+                        - usize::from(file.ends_with("node.rs")),
+                    uses,
+                    "{file}"
+                );
+                let direct = code.matches(".select_for_posting()").count();
+                let expected =
+                    usize::from(file.ends_with("message.rs") || file.ends_with("node.rs"));
+                assert_eq!(
+                    direct, expected,
+                    "{file} picks a node to post to without asking"
+                );
+            }
         }
 
         /// A sync that finds no node filed asks the mesh for the configured one in the

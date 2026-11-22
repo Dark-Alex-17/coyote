@@ -178,8 +178,8 @@ impl PropagationNodeTable {
     }
 
     /// Loads the table at `path`, dropping nodes not heard for `PROPAGATION_NODE_TTL` at
-    /// `now` and keeping, of the rest, every node in `pinned` (lower case) and the most
-    /// recently heard others up to `PROPAGATION_NODE_TABLE_MAX_ENTRIES` in all; the table
+    /// `now` and keeping, of the rest, every node in `pinned` (lower case) and the
+    /// `PROPAGATION_NODE_TABLE_MAX_ENTRIES` most recently heard others besides; the table
     /// is marked with `pinned` as `pin` does. A missing file is an empty table. A file
     /// whose version is readable but not `PROPAGATION_NODE_TABLE_VERSION` is refused and
     /// left in place, since the
@@ -224,8 +224,9 @@ impl PropagationNodeTable {
         };
         let (kept, rest): (Vec<_>, Vec<_>) =
             records.into_iter().partition(|record| is_pinned(record));
-        let room = PROPAGATION_NODE_TABLE_MAX_ENTRIES.saturating_sub(kept.len());
-        let records = kept.into_iter().chain(rest.into_iter().take(room));
+        let records = kept
+            .into_iter()
+            .chain(rest.into_iter().take(PROPAGATION_NODE_TABLE_MAX_ENTRIES));
         let table = Self::empty(path);
         table.pin(pinned);
         table.inner.lock().extend(
@@ -325,19 +326,22 @@ impl PropagationNodeTable {
     }
 
     /// Files the announce that answered this node's own path request for a configured
-    /// propagation node: the owner named the node, and the request was this node's, so
-    /// the answer files it as heard at `now`, an aged-out record included. Why it was not
-    /// filed otherwise.
+    /// propagation node, by the path-response rules: a relay may answer from a copy it
+    /// stored, so a node not on file is filed as first heard at `now` and ages out as
+    /// any other, and one on file only has its route refreshed, its `last_seen` kept, so
+    /// an aged-out record is never revived by it. Whether the node is filed and current
+    /// afterwards; why it was not filed otherwise.
     pub(crate) fn file_configured(
         &self,
         destination: &DestinationDesc,
         app_data: &[u8],
         hops: u8,
         now: SystemTime,
-    ) -> Result<(), PropagationNodeError> {
+    ) -> Result<bool, PropagationNodeError> {
         let node = PropagationNode::from_announce(destination, app_data)?;
-        self.observe(node, hops, now);
-        Ok(())
+        let hash = node.destination.address_hash.to_hex_string();
+        self.refresh_route(node, hops, now);
+        Ok(self.holds(&hash, now))
     }
 
     /// Files a path response: a known node keeps its `last_seen`, anything else is
@@ -373,18 +377,18 @@ impl PropagationNodeTable {
                 last_seen: now,
             },
         );
-        // A pinned node is never the one evicted, so the table can run past its cap by
-        // the pinned nodes alone: only when the owner lists more than the cap, and then
-        // by no more than the list.
-        while nodes.len() > PROPAGATION_NODE_TABLE_MAX_ENTRIES {
-            let Some(oldest) = nodes
-                .iter()
-                .filter(|(key, _)| !pinned.contains(*key))
-                .min_by_key(|(_, record)| record.last_seen)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
+        // The cap counts the nodes heard, not the owner's pinned ones: those are never
+        // evicted and never take a heard node's place.
+        let mut heard: Vec<(SystemTime, String)> = nodes
+            .iter()
+            .filter(|(key, _)| !pinned.contains(*key))
+            .map(|(key, record)| (record.last_seen, key.clone()))
+            .collect();
+        let excess = heard
+            .len()
+            .saturating_sub(PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        heard.sort();
+        for (_, oldest) in heard.into_iter().take(excess) {
             nodes.remove(&oldest);
             debug!("Evicted propagation node {}", short(&oldest));
         }
@@ -414,6 +418,14 @@ impl PropagationNodeTable {
     /// How many nodes a full round of fetches asks: every pinned node on file, else one.
     pub(crate) fn fetch_rotation(&self) -> usize {
         self.filed_pinned(SystemTime::now()).len().max(1)
+    }
+
+    /// The pinned nodes on file and current, in the order the owner lists them.
+    pub(crate) fn pinned_nodes(&self) -> Vec<PropagationNode> {
+        self.filed_pinned(SystemTime::now())
+            .into_iter()
+            .map(|record| record.node)
+            .collect()
     }
 
     /// Moves the fetch rotation on to the next pinned node.
@@ -484,6 +496,14 @@ impl PropagationNodeTable {
             .get(destination_hex)
             .is_some_and(|record| !record.is_expired(now))
     }
+}
+
+/// What a propagation node is picked for: posting takes only one that takes posts at a
+/// cost this node will mine, fetching any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodePurpose {
+    Posting,
+    Fetching,
 }
 
 /// The propagation nodes the owner lists in `mesh.propagation_nodes`, which the node asks
@@ -1148,11 +1168,12 @@ mod tests {
         );
     }
 
-    /// The answer to a configured node's own path request files it as heard at that
-    /// moment, so a record that aged out is held again where a plain path response
-    /// would leave it aged out; an announce that is no propagation node's is refused.
+    /// The answer to a configured node's own path request follows the path-response
+    /// rules: it files a node not on file, but never revives an aged-out record, as a
+    /// relay may answer from a copy it stored; an announce that is no propagation node's
+    /// is refused.
     #[test]
-    fn a_configured_nodes_own_path_response_files_an_aged_out_record_afresh() {
+    fn a_configured_nodes_own_path_response_never_revives_an_aged_out_record() {
         let table = PropagationNodeTable::new();
         let pn = desc("propagation");
         let key = pn.address_hash.to_hex_string();
@@ -1160,21 +1181,25 @@ mod tests {
         let aged = t(1) + PROPAGATION_NODE_TTL + Duration::from_secs(1);
         assert!(!table.holds(&key, aged));
 
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 3, true, aged));
-        assert!(
-            !table.holds(&key, aged),
-            "a plain path response is no sighting"
-        );
-
         assert_eq!(
             table.file_configured(&pn, &pn_announce_app_data(true, 8, 256), 3, aged),
-            Ok(())
+            Ok(false)
         );
-        assert!(
-            table.holds(&key, aged),
-            "the configured node's own answer is"
-        );
+        assert!(!table.holds(&key, aged), "a stored copy does not revive it");
         assert_eq!(table.snapshot().pop().unwrap().hops, 3);
+
+        let fresh = desc("propagation");
+        assert_eq!(
+            table.file_configured(&fresh, &pn_announce_app_data(true, 8, 256), 1, aged),
+            Ok(true),
+            "a node not on file is filed from its first path response"
+        );
+        let later = aged + PROPAGATION_NODE_TTL;
+        assert_eq!(
+            table.file_configured(&fresh, &pn_announce_app_data(true, 8, 256), 1, later),
+            Ok(false),
+            "and ages out as any other"
+        );
 
         let coyote = desc("delivery");
         assert_eq!(
@@ -1182,6 +1207,30 @@ mod tests {
             Err(PropagationNodeError::NotAPropagationNode)
         );
         assert!(!table.holds(&coyote.address_hash.to_hex_string(), aged));
+    }
+
+    /// A relay's cached path for a dead pinned node does not keep it filed: its record
+    /// stays aged out, so posts and fetches fall back to a live stranger's node.
+    #[test]
+    fn a_cached_path_for_a_dead_pinned_node_does_not_block_a_live_stranger() {
+        let table = PropagationNodeTable::new();
+        let pinned = desc("propagation");
+        table.pin(&[pinned.address_hash.to_hex_string()]);
+        let old = SystemTime::now() - PROPAGATION_NODE_TTL - Duration::from_secs(60);
+        table
+            .file_configured(&pinned, &pn_announce_app_data(true, 8, 256), 1, old)
+            .unwrap();
+        let stranger = node(true);
+        table.observe(stranger.clone(), 4, SystemTime::now());
+        let cached = table.file_configured(
+            &pinned,
+            &pn_announce_app_data(true, 8, 256),
+            1,
+            SystemTime::now(),
+        );
+        assert_eq!(cached, Ok(false));
+        assert_eq!(hex(&table.select_for_posting().unwrap()), hex(&stranger));
+        assert_eq!(hex(&table.select().unwrap()), hex(&stranger));
     }
 
     /// A path response refreshes a known node's record and hops but not its `last_seen`,
@@ -1290,14 +1339,18 @@ mod tests {
             .iter()
             .map(|record| hex(&record.node))
             .collect();
-        assert_eq!(held.len(), PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        assert_eq!(
+            held.len(),
+            PROPAGATION_NODE_TABLE_MAX_ENTRIES + 1,
+            "32 others + pinned"
+        );
         assert!(
             held.contains(&hex(&pinned)),
             "the pinned node is never evicted"
         );
         assert!(
-            !held.contains(&hex(&strangers[0])) && !held.contains(&hex(&strangers[1])),
-            "the two oldest strangers made room"
+            !held.contains(&hex(&strangers[0])) && held.contains(&hex(&strangers[1])),
+            "only the oldest stranger made room: the pinned node takes no heard node's place"
         );
         assert_eq!(hex(&table.select_for_posting().unwrap()), hex(&pinned));
         assert_eq!(hex(&table.select().unwrap()), hex(&pinned));
@@ -1371,7 +1424,11 @@ mod tests {
             .iter()
             .map(|record| hex(&record.node))
             .collect();
-        assert_eq!(held.len(), PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        assert_eq!(
+            held.len(),
+            PROPAGATION_NODE_TABLE_MAX_ENTRIES + 2,
+            "32 others + pinned"
+        );
         assert!(held.contains(&hex(&first)) && held.contains(&hex(&second)));
         assert_eq!(reloaded.fetch_rotation(), 2);
     }

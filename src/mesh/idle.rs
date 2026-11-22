@@ -5,9 +5,7 @@
 
 use crate::config::mesh_config::propagation_sync_every;
 use crate::mesh::notify::{NoticeText, Notification, Source};
-use crate::mesh::propagation_fetch::{
-    ASKED_FOR_SOURCE, FetchError, FetchReport, MAX_WANTS_PER_FETCH,
-};
+use crate::mesh::propagation_fetch::{ASKED_FOR_SOURCE, FetchError, FetchReport};
 use crate::mesh::request::{RequestError, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
@@ -403,7 +401,7 @@ impl SyncSchedule {
         let node = self.in_flight.take().unwrap_or_default();
         let line = match outcome {
             Ok(report) => {
-                let more_to_come = report.deferred > 0 || report.wanted == MAX_WANTS_PER_FETCH;
+                let more_to_come = report.more_to_come();
                 let progressed = report.delivered + report.presence > 0;
                 if progressed {
                     self.backoff = None;
@@ -506,9 +504,12 @@ impl SyncSchedule {
             return;
         }
         let rotation = self.rotation;
-        self.due_at = self
-            .interval
-            .and_then(|interval| now.checked_add((interval / rotation).min(wait)));
+        self.due_at = self.interval.and_then(|interval| {
+            // Split between the pinned nodes, but never below the short retry, so
+            // many pinned nodes cannot turn the schedule into a busy loop.
+            let share = (interval / rotation).max(PROPAGATION_SYNC_SHORT_RETRY.min(interval));
+            now.checked_add(share.min(wait))
+        });
     }
 }
 
@@ -700,6 +701,7 @@ mod synced_ask_line_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::propagation_fetch::MAX_WANTS_PER_FETCH;
 
     #[test]
     fn a_burst_admits_exactly_the_bucket_capacity() {
@@ -950,6 +952,29 @@ mod tests {
 
     fn link_failure(text: &str) -> Result<FetchReport, FetchError> {
         Err(FetchError::Link(RequestError::LinkFailed(text.to_string())))
+    }
+
+    /// Many pinned nodes split the interval no finer than the short retry, and an
+    /// interval shorter than that retry is never stretched by the floor.
+    #[test]
+    fn the_split_interval_is_floored_at_the_short_retry() {
+        let now = Instant::now();
+        for (interval, nodes, due) in [
+            (300, 100, PROPAGATION_SYNC_SHORT_RETRY),
+            (300, 2, Duration::from_secs(150)),
+            (5, 3, Duration::from_secs(5)),
+        ] {
+            let mut schedule = SyncSchedule::new(interval, true);
+            assert!(schedule.accepts_request());
+            schedule.rotate_over(nodes);
+            schedule.started(NODE.to_string());
+            assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), now), None);
+            assert_eq!(
+                schedule.due_at(),
+                Some(now + due),
+                "{interval} s over {nodes}"
+            );
+        }
     }
 
     #[test]

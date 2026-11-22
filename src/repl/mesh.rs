@@ -3847,7 +3847,15 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     parse_args(rest, &[], "messaging", "sync")?;
     let runtime = live(ctx)?;
-    let rounds = runtime.propagation_nodes().fetch_rotation();
+    // Each pinned node is asked by name, so none is asked twice whatever the automatic
+    // rotation does meanwhile; with fewer than two, the usual pick.
+    let pinned = runtime.propagation_nodes().pinned_nodes();
+    let targets: Vec<Option<_>> = if pinned.len() > 1 {
+        pinned.into_iter().map(Some).collect()
+    } else {
+        vec![None]
+    };
+    let rounds = targets.len();
     if rounds == 1 {
         out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
     } else {
@@ -3857,9 +3865,9 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     }
     result_follows();
     let mut failed = 0;
-    for _ in 0..rounds {
+    for target in targets {
         let outcome = tokio::select! {
-            outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
+            outcome = runtime.fetch_propagated_from(&LoggingInboundSink, target) => outcome,
             _ = wait_user_interrupt(Some(abort_signal)) => {
                 out_text("Sync interrupted.");
                 return Ok(());
@@ -8524,9 +8532,8 @@ fn resolve_known(
     also_known: impl FnOnce() -> Vec<String>,
 ) -> Result<String> {
     resolve_known_names(ctx, token, kind, also_known).map_err(|err| {
-        // Two or more known candidates make the refusal an ambiguity, not a name that
-        // resolves to nobody.
-        if known_hashes(ctx, kind).into_iter().nth(1).is_some() {
+        // A token that names several is no token that resolves to nobody.
+        if is_ambiguity(&err) {
             return err;
         }
         let note = ctx
@@ -8539,6 +8546,19 @@ fn resolve_known(
             None => err,
         }
     })
+}
+
+/// Whether a refusal from `resolve_known_names` says the token names more than one
+/// user or session, in each of the ways those refusals word it.
+fn is_ambiguity(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    [
+        "names more than one",
+        "; give more characters.",
+        "Type the one you mean in its place",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 /// `resolve_known` without the silent-LAN note a refusal on a node that heard nobody gets.
@@ -16496,6 +16516,27 @@ mod tests {
         );
     }
 
+    /// The silent-LAN note's test of a refusal: each way a token names several reads as
+    /// an ambiguity, and a token that names nobody does not.
+    #[test]
+    fn a_refusal_is_read_as_ambiguous_only_when_the_token_names_several() {
+        let sessions = ["aa".repeat(16), "bb".repeat(16)];
+        let unpicked = QuotingError::wrap(unpicked_user("maki", &sessions, &[]));
+        assert!(is_ambiguity(&unpicked), "{unpicked}");
+        assert!(is_ambiguity(&anyhow!(
+            "'0123' matches 2 known sessions: a..., b...; give more characters."
+        )));
+        assert!(!is_ambiguity(&QuotingError::wrap(no_such_user(
+            "kim", "kim"
+        ))));
+        let theirs: Vec<&str> = sessions.iter().map(String::as_str).collect();
+        let unknown = no_such_session("maki/x", "maki", &"01".repeat(16), &theirs, &[]);
+        assert!(
+            !is_ambiguity(&QuotingError::wrap(unknown)),
+            "a session nobody has"
+        );
+    }
+
     #[test]
     fn cwd_warning_fires_for_home_and_roots_only() {
         let home = PathBuf::from("/Users/ann");
@@ -24263,6 +24304,7 @@ mod tests {
                         }
 
                         let before = stdout_lines().len();
+                        let turn = table.select().unwrap().destination.address_hash;
                         let err = run(&mut ctx, ".mesh messaging sync").await.unwrap_err();
                         let out = stdout_lines()[before..].join("\n");
                         assert!(
@@ -24281,6 +24323,11 @@ mod tests {
                             err.to_string()
                                 .contains("None of your 2 configured propagation nodes"),
                             "{err}"
+                        );
+                        assert_eq!(
+                            table.select().unwrap().destination.address_hash,
+                            turn,
+                            "a typed sync names each node and moves no rotation"
                         );
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
@@ -24314,6 +24361,23 @@ mod tests {
 
                         let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         assert_eq!(out.trim(), LAN_SILENT_NOTE, "{out}");
+                        // Trusted contacts whose rows aged out are known hashes, not heard
+                        // sessions: they leave a name that matches nobody unknown.
+                        let long_ago = SystemTime::now() - crate::mesh::PEER_TTL * 2;
+                        for name in ["Ann", "Bo"] {
+                            let (contact, _) = heard_peer(&runtime, name, long_ago);
+                            runtime
+                                .trust()
+                                .trust_destination(
+                                    ctx.app.mesh.as_ref(),
+                                    &contact,
+                                    crate::mesh::trust::TrustOptions::default(),
+                                    SystemTime::now(),
+                                )
+                                .unwrap();
+                        }
+                        runtime.peers().sweep(SystemTime::now());
+                        assert!(runtime.peers().snapshot().is_empty(), "the rows aged out");
                         let err = out_of(&mut ctx, ".mesh people status kim")
                             .await
                             .unwrap_err()

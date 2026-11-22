@@ -10854,7 +10854,7 @@ fn the_configured_propagation_nodes_key_is_described_on_the_deployment_and_confi
         "## `propagation_nodes`",
     ));
     for needle in [
-        "A listed node is also pinned: it is never evicted from the table of 32 nodes",
+        "A listed node is also pinned: it is never evicted from the table and does not count against the 32 other nodes it keeps",
         "while any listed node is filed the node posts to and fetches from listed nodes only",
         "Nodes heard but not listed are used only when no listed node is filed",
     ] {
