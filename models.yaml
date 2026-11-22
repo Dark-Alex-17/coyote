@@ -8938,9 +8938,10 @@
   - name: google/gemma-3-4b-it
     type: chat
     max_input_tokens: 131072
-    input_price: 0.05
-    output_price: 0.1
-    max_output_tokens: 16384
+    input_price: 0.04
+    output_price: 0.05
+    cache_read_price: 0.02
+    max_output_tokens: 117964
     supports_vision: true
   - name: google/gemma-4-26b-a4b-it
     type: chat
@@ -8992,9 +8993,10 @@
   - name: gryphe/mythomax-l2-13b
     type: chat
     max_input_tokens: 8192
-    input_price: 0.08
-    output_price: 0.11
-    max_output_tokens: 3686
+    input_price: 0.3
+    output_price: 0.5
+    cache_read_price: 0.2
+    max_output_tokens: 7372
   - name: ibm-granite/granite-4.2-8b
     type: chat
     max_input_tokens: 131072
@@ -9272,9 +9274,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -11101,9 +11103,9 @@
   - name: qwen/qwen3.5-27b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.195
-    output_price: 1.56
-    max_output_tokens: 65536
+    input_price: 0.26
+    output_price: 2.6
+    max_output_tokens: 81920
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-35b-a3b
@@ -11235,7 +11237,7 @@
     input_price: 2.0
     output_price: 6.0
     cache_read_price: 0.25
-    max_output_tokens: 131072
+    max_output_tokens: 65536
     supports_function_calling: true
   - name: qwen/qwen3.8-27b
     type: chat
@@ -11469,10 +11471,10 @@
   - name: tencent/hy3
     type: chat
     max_input_tokens: 262144
-    input_price: 0.132
-    output_price: 0.528
-    cache_read_price: 0.033
-    max_output_tokens: 128000
+    input_price: 0.14
+    output_price: 0.58
+    cache_read_price: 0.035
+    max_output_tokens: 235929
     supports_function_calling: true
   - name: tencent/hy4
     type: chat
@@ -11532,9 +11534,9 @@
   - name: thinkingmachines/inkling-2-mini
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.1
-    output_price: 0.4
-    cache_read_price: 0.02
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.015
     max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
@@ -11827,9 +11829,9 @@
   - name: z-ai/glm-5.1
     type: chat
     max_input_tokens: 204800
-    input_price: 1.4
-    output_price: 4.4
-    cache_read_price: 0.26
+    input_price: 1.19
+    output_price: 3.74
+    cache_read_price: 0.6
     max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-5.2
@@ -12005,7 +12007,7 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.1805
+    input_price: 0.1824
     output_price: 11.0055
     cache_read_price: 0.18
     max_output_tokens: 943718
