@@ -433,6 +433,9 @@ impl Transcript {
         let unseen_from = self.cells.len().saturating_sub(self.unseen);
         self.next_revision();
         self.revisions.remove(index);
+        if index < self.laid_out.len() {
+            self.laid_out.remove(index);
+        }
         let removed = self.cells.remove(index);
         self.full_output_bytes = self
             .full_output_bytes
@@ -486,6 +489,7 @@ impl Transcript {
         self.next_revision();
         self.cells.truncate(len);
         self.revisions.truncate(len);
+        self.laid_out.truncate(len);
         if self.focus.is_some_and(|focus| focus >= len) {
             self.focus = None;
         }
@@ -578,11 +582,17 @@ impl Transcript {
         self.set_focus(target);
     }
 
-    /// Focus the next row that opens and closes; from no focus, the
-    /// first one.
+    /// Focus the next row that opens and closes; from no focus, the first
+    /// one from the top of the view down, or the last above it when none
+    /// is, so a long history above is not laid out to reach its oldest.
     pub(super) fn focus_next(&mut self) {
         let target = match self.focus {
-            None => self.collapsible_indices().next(),
+            None => {
+                let top = self.anchor.map_or(0, |anchor| anchor.cell);
+                self.collapsible_indices()
+                    .find(|index| *index >= top)
+                    .or_else(|| self.collapsible_indices().next_back())
+            }
             Some(focus) => self
                 .collapsible_indices()
                 .find(|index| *index > focus)
@@ -1572,6 +1582,30 @@ mod tests {
         assert!(
             shown.iter().any(|row| row.contains("another")),
             "{shown:#?}"
+        );
+    }
+
+    /// Paging up through a long resumed history reaches its very first
+    /// Ctrl+Down with nothing focused picks a row in view, not the oldest
+    /// saved call far above, so the next frame lays out only what it shows.
+    #[test]
+    fn focusing_from_no_focus_in_a_long_history_stays_in_view() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push_history(long_history(2_000));
+        transcript.view(area(10), &mut renderer);
+        transcript.focus_next();
+        let focus = transcript.focus.expect("a row took the focus");
+        assert!(
+            focus > transcript.len() - 20,
+            "the focus jumped to row {focus}"
+        );
+        transcript.view(area(10), &mut renderer);
+        let laid_out = (0..transcript.len())
+            .filter(|&index| transcript.rows_laid_out(index, 40, None).is_some())
+            .count();
+        assert!(
+            laid_out < 30,
+            "{laid_out} cells were laid out to show the focus"
         );
     }
 

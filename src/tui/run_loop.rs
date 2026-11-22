@@ -1122,7 +1122,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     }
                     Some(Command::InterruptDroppingHeld) => {
                         abort.set_ctrlc();
-                        stopping = false;
+                        // What is typed while the turn stops still waits
+                        // for its end, as after Esc; only what was held
+                        // before the Ctrl+C is dropped.
+                        stopping = matches!(task, Some(Task::Turn { .. }));
                         held_back.clear();
                         purge_turn_queue(&task);
                         cancel_command(app, &mut immediate);

@@ -4482,7 +4482,7 @@ mod tests {
     fn a_user_message_mid_wait_ends_wait_and_collect_and_the_job_keeps_running() {
         run_async(async {
             let mut ctx = ctx_with_job_supervisor(4);
-            let state = register_job_running_for(&ctx, "job_slow", Duration::from_secs(60));
+            let state = register_job_running_for(&ctx, "job_slow", Duration::from_secs(2));
             ctx.session_abort = Some(create_abort_signal());
             let queue = Arc::clone(&ctx.notification_queue);
             tokio::spawn(async move {
@@ -4517,6 +4517,21 @@ mod tests {
             assert!(ctx.supervisor.as_ref().unwrap().read().has_job("job_slow"));
             assert!(matches!(state.lock().status, JobStatus::Running));
             assert!(ctx.notification_queue.has_user_message());
+
+            ctx.notification_queue.take_where(|notification| {
+                matches!(
+                    notification,
+                    crate::supervisor::notification::SystemNotification::UserMessage { .. }
+                )
+            });
+            let collected = time::timeout(
+                Duration::from_secs(10),
+                handle_collect(&ctx, &json!({"id": "job_slow"})),
+            )
+            .await
+            .expect("the job kept running and finishes")
+            .unwrap();
+            assert_eq!(collected["status"], "completed", "{collected}");
         });
     }
 
