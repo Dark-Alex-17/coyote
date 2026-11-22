@@ -1815,8 +1815,8 @@ fn run_smoke_sabotages(python: &Path, sabotages: &[(&str, &str, &str, &str)]) {
 /// `continue:` with a colon carries an answer, one park is resumed once, and
 /// the live variables survive a resume; then the fix-round guards: a clarify
 /// option that starts with "Stop" is an answer, the park cap is per question,
-/// the strikeout and owner-judgment replies stop only on the whole reply, and
-/// only a `vehicle: sisyphus` handoff is consumed.
+/// the strikeout and owner-judgment replies stop only on the whole reply or
+/// the stop option, and only a `vehicle: sisyphus` handoff is consumed.
 #[test]
 #[ignore = "twenty-one smoke battery runs take about four minutes; run with -- --ignored"]
 fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
@@ -1967,8 +1967,8 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
                  \"address\"], \"stop\": [\"stop\"]})",
                 "a = _answered(state, {\"stop\": [\"stop\"], \"skip\": [\"skip\"], \"fix\": [\"fix\", \
                  \"address\"]})",
-                "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is a fix \
-                 round, never a stop",
+                "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is \
+                 interpreted, never a stop; a bare stop still stops",
             ),
             (
                 "consume-vehicle",
@@ -2015,7 +2015,8 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "choice-own-kinds",
-                "    if esc.get(\"kind\") in OWN_PROMPT_KINDS:\n        return None\n",
+                "    if esc.get(\"kind\") in OWN_PROMPT_KINDS + TYPED_PROMPT_KINDS:\n        \
+                 return None\n",
                 "    if False:\n        return None\n",
                 "choice: handoff_confirm and draft_confirm keep their own approval nodes",
             ),
@@ -2088,14 +2089,14 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "        if truthy(state.get(\"top_level\")):\n            # never silently",
                 "        if False:\n            # never silently",
                 "record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, \
-                 never trimmed",
+                 never trimmed; asked again after the first verdict, at the typed prompt",
             ),
             (
                 "overflow-no-here",
                 "    if planned is None:\n        opts.append(",
                 "    if True:\n        opts.append(",
                 "record_subtasks: over the cap at the top level -> sizing_verdict without do-it-here, \
-                 never trimmed",
+                 never trimmed; asked again after the first verdict, at the typed prompt",
             ),
         ],
     );

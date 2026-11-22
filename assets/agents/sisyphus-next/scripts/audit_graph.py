@@ -46,8 +46,8 @@ BOUNDED = {
     "observability_route": "B12 obs_rounds<=1",
     "ask_owner_route": "B13 owner_polls<=2",
     "parse_answer": "B14 reask_rounds<=3 per escalation, not reset by apply_answer's APPLY_REASK_MAX re-asks",
-    "interpret_route": ("one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask; a base "
-                        "question's answer naming no option once more (esc.data.base_interpreted), then apply_answer's "
+    "interpret_route": ("one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask; an "
+                        "answer naming no option once more (esc.data.reply_read), then apply_answer's "
                         "re-ask; judge retry <=1 per question; judge_rulings <= STRIKE_LIMIT per decision key"),
     "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
     "ci_poll": "B15 elapsed-time limit + CI_MAX_ROUNDS per watch + poll fails<=3; POLL_VISIT_BUDGET per run in every mode",
