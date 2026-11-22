@@ -148,8 +148,12 @@ fn run_parent(dir: &Path, cli_vars: &[&str]) -> Output {
     let mut args = vec!["--agent", PARENT];
     args.extend_from_slice(cli_vars);
     args.push("go");
+    run_coyote(dir, &args)
+}
+
+fn run_coyote(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(&args)
+        .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
@@ -235,4 +239,62 @@ fn a_parents_own_default_is_not_passed_to_the_child() {
     let line = child_line("default", None, false, &[]);
 
     assert_eq!(line, "CHILD env=[child-default] state=[child-default]");
+}
+
+fn child_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .replace("\r\n", "\n")
+        .lines()
+        .filter(|line| line.starts_with("CHILD "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn an_input_the_child_does_not_declare_stays_graph_state_only() {
+    let dir = fresh_dir("undeclared");
+    write_fixture(&dir.0, Some("review_cadence: per-task"), false);
+    let child_dir = dir.0.join("agents").join(CHILD);
+    fs::write(
+        child_dir.join("probe.sh"),
+        "#!/usr/bin/env bash\nprintf '{\"seen\": \"%s\"}' \"${LLM_AGENT_VAR_REVIEW_CADENCE-unset}\"\n",
+    )
+    .unwrap();
+    let graph = fs::read_to_string(child_dir.join("graph.yaml"))
+        .unwrap()
+        .replace("state=[{{build_lock}}]", "state=[{{review_cadence}}]");
+    fs::write(child_dir.join("graph.yaml"), graph).unwrap();
+
+    let out = run_parent(&dir.0, &["--agent-variable", "build_lock", "from-cli"]);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        child_lines(&out.stdout),
+        ["CHILD env=[unset] state=[per-task]"]
+    );
+}
+
+#[test]
+fn repl_agent_values_do_not_leak_into_a_later_agent() {
+    let dir = fresh_dir("repl");
+    write_fixture(&dir.0, None, false);
+    fs::create_dir_all(dir.0.join("macros")).unwrap();
+    fs::write(
+        dir.0.join("macros").join("reenter.yaml"),
+        format!(
+            "isolated: false\nsteps:\n  - \".agent {PARENT} build_lock=from-repl\"\n  - \"go\"\n  - \".exit agent\"\n  - \".agent {PARENT}\"\n  - \"go\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = run_coyote(&dir.0, &["--macro", "reenter"]);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        child_lines(&out.stdout),
+        [
+            "CHILD env=[from-repl] state=[from-repl]",
+            "CHILD env=[child-default] state=[child-default]",
+        ]
+    );
 }

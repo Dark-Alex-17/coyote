@@ -123,8 +123,9 @@ fn merge_spawn_variables(inherited: &mut Option<AgentVariables>, provided: Agent
         .extend(provided);
 }
 
-/// The agent node `inputs:` that name a variable the child declares, as
-/// variable values. They override the inherited ones, so the child's
+/// Renders the agent-node `inputs:` that name a variable the child declares
+/// as variable values (strings kept, other JSON serialized, `null` meaning
+/// no override). They override the inherited ones, so the child's
 /// `LLM_AGENT_VAR_*` env and its own children see what the node passed;
 /// any other input only seeds the child's graph state.
 fn declared_inputs_as_variables(
@@ -4982,6 +4983,41 @@ mod tests {
         let meta: ChildMeta = read_yaml(&grandchild_root.child_meta_file(&sid));
         assert_eq!(meta.spawner_session_id, Some(child_sid));
         assert_eq!(meta.spawner_agent_id, Some(child_agent_id));
+    }
+
+    #[test]
+    #[serial]
+    fn a_spawned_child_inherits_what_its_parent_was_started_with() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let parent_agent = unique_agent_name("test_started_parent");
+        let child_agent = unique_agent_name("test_started_child");
+        write_config_only_agent(&parent_agent);
+        let child_dir = paths::agent_data_dir(&child_agent);
+        create_dir_all(&child_dir).unwrap();
+        write(
+            child_dir.join("config.yaml"),
+            format!(
+                "name: {child_agent}\ninstructions: hi\nvariables:\n  \
+                 - name: build_lock\n    description: gate\n    default: child-default\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "build_lock".to_string(),
+            "from-cli".to_string(),
+        )]));
+        let app = Arc::clone(&ctx.app.config);
+        run_async(ctx.use_agent(&app, &parent_agent, None, create_abort_signal())).unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+
+        let child = build_ready_spawn(&mut ctx, json!({"agent": child_agent, "prompt": "hi"}));
+
+        let seated = child.child_ctx.agent.as_ref().unwrap().variables();
+        assert_eq!(
+            seated.get("build_lock").map(String::as_str),
+            Some("from-cli")
+        );
     }
 
     #[test]
