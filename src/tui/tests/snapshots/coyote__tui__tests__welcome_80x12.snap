@@ -3,8 +3,8 @@ source: src/tui/tests/mod.rs
 expression: frame
 ---
 "            ┌──────────────────────────────────────────────────────┐            "
-"            │ coyote X.Y.Z │            "
-"            │ model: openai:test-model                             │            "
+"            │ coyote X.Y.Z  model: openai:test-model │            "
+"            │ Empty prompt: "?" or ".keys" = keys                  │            "
 "            └──────────────────────────────────────────────────────┘            "
 "────────────────────────────────────────────────────────────────────────────────"
 "? = keys  Alt+T = tasks  Ctrl+X = todo                                          "

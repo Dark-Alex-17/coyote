@@ -16,6 +16,8 @@ const ITALIC: Style = Style::new().add_modifier(Modifier::ITALIC);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 /// What the REPL's selection prompts paint the highlighted option with.
 const HIGHLIGHT: Color = Color::LightCyan;
+/// The bright band of the welcome wordmark's startup sweep.
+pub(super) const SWEEP_HIGHLIGHT: Color = Color::White;
 const KNOWN_COMMAND: Color = Color::Green;
 const UNKNOWN_COMMAND: Color = Color::Red;
 const HEADING_FALLBACK: Color = Color::Yellow;
@@ -135,7 +137,8 @@ pub(super) fn field_background(config: &AppConfig, options: &RenderOptions) -> C
     Color::Rgb(nudge(base.r), nudge(base.g), nudge(base.b))
 }
 
-/// The greeting's logo: the heading colour, without the heading's bold.
+/// The greeting's wordmark colour: the heading colour; the wordmark adds
+/// its own weight.
 pub(super) fn logo_style(markdown: &MarkdownRender, no_color: bool) -> Style {
     if no_color {
         Style::new()

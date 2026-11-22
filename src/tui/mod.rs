@@ -155,6 +155,8 @@ const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const FIXED_ROWS: u16 = 3;
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
+/// How long each step of the welcome wordmark's startup sweep shows.
+const WELCOME_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 /// The UI's own commands, spelled without their sigil: one opens the key
 /// help, the other the thread picker, and neither reaches the REPL.
 const KEYS_COMMAND: &str = "keys";
@@ -432,6 +434,12 @@ pub(crate) struct App {
     /// What the throbber counts its frames from, fixed at start so the
     /// frame a given instant shows depends on the clock alone.
     throbber_origin: Instant,
+    /// When the welcome wordmark's startup sweep began; None before it is
+    /// started and once it has settled or input stopped it.
+    welcome_sweep_from: Option<Instant>,
+    /// The sweep was started and begins with the next frame drawn, so time
+    /// spent entering the screen does not use it up.
+    welcome_sweep_pending: bool,
     frames: FrameScheduler,
     renderer: Renderer,
     theme: Theme,
@@ -543,6 +551,8 @@ impl App {
             question_area: None,
             origin_area: None,
             throbber_origin: clock.now(),
+            welcome_sweep_from: None,
+            welcome_sweep_pending: false,
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
@@ -586,6 +596,39 @@ impl App {
     fn set_no_color(&mut self, no_color: bool) {
         self.renderer.no_color = no_color;
         self.theme = Theme::new(self.renderer.markdown_render(), no_color);
+    }
+
+    /// Starts the welcome wordmark's sweep from the next frame drawn, while
+    /// the greeting is all the transcript holds; under `NO_COLOR` it stays
+    /// still.
+    pub(crate) fn start_welcome_sweep(&mut self) {
+        if !self.renderer.no_color && self.transcript.welcome_only() {
+            self.welcome_sweep_pending = true;
+            self.schedule_frame();
+        }
+    }
+
+    /// Settles the welcome sweep at once; for input the user made.
+    fn settle_welcome_sweep(&mut self) {
+        self.welcome_sweep_pending = false;
+        self.welcome_sweep_from = None;
+    }
+
+    /// The sweep's step for the frame being drawn, None once it has run
+    /// its course (which ends it) or while it is not running.
+    fn welcome_sweep_step(&mut self) -> Option<usize> {
+        if std::mem::take(&mut self.welcome_sweep_pending) {
+            self.welcome_sweep_from = Some(self.clock.now());
+        }
+        let from = self.welcome_sweep_from?;
+        let elapsed = self.clock.now().saturating_duration_since(from);
+        let step = usize::try_from(elapsed.as_millis() / WELCOME_SWEEP_INTERVAL.as_millis())
+            .unwrap_or(usize::MAX);
+        if step >= cells::SWEEP_STEPS || self.renderer.no_color {
+            self.welcome_sweep_from = None;
+            return None;
+        }
+        Some(step)
     }
 
     pub(crate) fn composer_text(&self) -> String {
@@ -1052,6 +1095,11 @@ impl App {
     }
 
     pub(crate) fn handle_input(&mut self, input: TermInput) -> Option<Command> {
+        // Input the user made settles the welcome sweep at once; a resize
+        // or an event the UI ignores leaves it running.
+        if matches!(input, TermInput::Paste(_) | TermInput::Mouse(_)) {
+            self.settle_welcome_sweep();
+        }
         match input {
             TermInput::Key(key) => self.handle_key(key),
             TermInput::Paste(text) => {
@@ -1141,6 +1189,7 @@ impl App {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
+        self.settle_welcome_sweep();
         let action = keys::map_key(key, &self.key_context());
         // Every key pressed while no question is up re-arms the idle gate,
         // the ignored ones included: an Enter tapped during a turn is a
@@ -2032,6 +2081,8 @@ impl App {
         if active() {
             TABLE_WIDTH.store(table_width, Ordering::Relaxed);
         }
+        let sweep = self.welcome_sweep_step();
+        self.transcript.set_welcome_sweep(sweep);
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
         if let Some(todo) = todo {
@@ -2145,6 +2196,11 @@ impl App {
         let roster = matches!(self.overlay, Some(Overlay::Tasks(_)));
         if self.turn.is_some() || rows_run || child_runs || (roster && tasks_run) {
             self.frames.schedule_frame_in(THROBBER_INTERVAL);
+        } else if (self.welcome_sweep_from.is_some() || self.welcome_sweep_pending)
+            && self.transcript.welcome_only()
+            && self.pager().is_none()
+        {
+            self.frames.schedule_frame_in(WELCOME_SWEEP_INTERVAL);
         } else if roster || (self.pager().is_none() && tasks_run) {
             self.frames.schedule_frame_in(STATUS_TICK);
         }

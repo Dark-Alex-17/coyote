@@ -681,6 +681,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         app.transcript
             .push_history(session_entries(&compressed, &active));
     }
+    app.start_welcome_sweep();
 
     // Fd 1 is still the terminal here; a turn's capture takes it over.
     if let Some(reason) = remember_tty() {

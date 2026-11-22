@@ -524,8 +524,18 @@ impl Transcript {
         }
     }
 
-    fn welcome_only(&self) -> bool {
+    pub(super) fn welcome_only(&self) -> bool {
         matches!(self.cells.as_slice(), [Cell::Welcome { .. }])
+    }
+
+    /// Puts the greeting's wordmark at `step` of its startup sweep, or
+    /// settles it; the greeting is drawn anew only when that changes.
+    pub(super) fn set_welcome_sweep(&mut self, step: Option<usize>) {
+        if matches!(self.cells.first(), Some(Cell::Welcome { sweep, .. }) if *sweep != step)
+            && let Some(Cell::Welcome { sweep, .. }) = self.touch(0)
+        {
+            *sweep = step;
+        }
     }
 
     pub(super) fn scrolled(&self) -> bool {
