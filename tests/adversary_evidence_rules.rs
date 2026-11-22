@@ -3546,9 +3546,10 @@ fn invalid_or_empty_carried_failures_change_nothing_but_a_note() {
     assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
     assert!(text.contains(regression), "{text}");
     assert!(
-        text.contains(&format!("Advisory red runs (not blocking):\n- {error}\n")),
+        text.contains(&format!("Carried failures input:\n- {error}\n")),
         "{text}"
     );
+    assert!(!text.contains("Advisory red runs"), "{text}");
 
     let out = carried_run(
         &dir.0,

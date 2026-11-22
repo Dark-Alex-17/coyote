@@ -22,8 +22,8 @@ one the caller declared carried (`carried.all`, from run_checks.py) is
 advisory too, unless a parsed criterion naming it ends neither MET nor
 INSPECTED; a red run carrying only some of them blocks, and its complaint
 names the failures not declared carried and the count of failure lines that
-name no repo path. A `carried_note` on a record and a `carried_error` in the
-state are reported as advisory lines. A
+name no repo path. A `carried_note` on a record is an advisory line, and a
+`carried_error` in the state is reported under its own heading. A
 run that exited 0 under a stated condition is judged the same way as a
 stated red run and is never a green run. A
 command the runner's deadline skipped is
@@ -661,8 +661,6 @@ def main():
         state.get("initial_prompt"),
         verdicts,
     )
-    if carried_error := str_field(state, "carried_error"):
-        advisory_reds.append(f"- {carried_error}")
     n_debris, debris_hits = debris_complaints(state)
     not_run = skipped_note(state.get("exec_results"))
     n = len(verdicts)
@@ -809,6 +807,11 @@ def main():
         lines.append("")
         lines.append("Advisory red runs (not blocking):")
         lines.extend(advisory_reds)
+
+    if carried_error := str_field(state, "carried_error"):
+        lines.append("")
+        lines.append("Carried failures input:")
+        lines.append(f"- {carried_error}")
 
     lines.append("")
     lines.append("Verification runs:")

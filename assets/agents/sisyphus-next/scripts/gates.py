@@ -3900,30 +3900,35 @@ CARRIED_HEADER = "Carried-forward test failures (pending from earlier subtasks):
 
 
 def _failure_locations():
-    """The shared failure-location parser, or None when it cannot be imported."""
+    """The shared failure-location parser, or None when it cannot be imported or fails to load."""
     if SHARED_DIR not in sys.path:
         sys.path.insert(0, SHARED_DIR)
     try:
         import failure_locations  # noqa: WPS433
-    except ImportError:
+    except Exception:  # noqa: BLE001 -- a broken module must fail closed like a missing one
         return None
     return failure_locations
 
 
+# Without the locator each wrapper returns what makes its caller block: nothing located, no index, one unlocated line.
 def _parse_failure_locations(tests):
-    return _failure_locations().parse_failure_locations(tests)
+    locator = _failure_locations()
+    return locator.parse_failure_locations(tests) if locator else []
 
 
 def _repo_index(root):
-    return _failure_locations().repo_index(root)
+    locator = _failure_locations()
+    return locator.repo_index(root) if locator else None
 
 
 def _resolve_failure_tokens(root, tokens, index=None):
-    return _failure_locations().resolve_failure_tokens(root, tokens, index)
+    locator = _failure_locations()
+    return locator.resolve_failure_tokens(root, tokens, index) if locator else []
 
 
 def _unlocated_failure_lines(root, tests, index):
-    return _failure_locations().unlocated_failure_lines(root, tests, index)
+    locator = _failure_locations()
+    return locator.unlocated_failure_lines(root, tests, index) if locator else 1
 
 
 def _paths_overlap(a, b):
