@@ -792,6 +792,55 @@ fn rnsd_gets_its_scoped_environment_and_a_term_after_the_main_command_returns() 
 #[test]
 fn a_daemon_that_ignores_term_is_killed_after_the_bounded_wait() {
     let home = Home::new("rnsd-stubborn");
+    let (code, elapsed, stderr) = stubborn_daemon_stop(&home);
+    assert_eq!(code, 8, "{stderr}");
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
+        "bounded wait (5 s by the clock) then KILL; took {elapsed:?}"
+    );
+}
+
+/// On a starved host each poll's `sleep 0.2` takes far longer: here a `sleep` that
+/// always takes a second. The wait is read off the clock, so KILL still lands about 5 s
+/// after the stop began (whole seconds, so up to 7), not after 25 slow polls.
+#[test]
+fn a_slow_sleep_does_not_stretch_the_bounded_wait() {
+    let home = Home::new("rnsd-slow-sleep");
+    home.write_executable("sleep", "#!/bin/sh\n/bin/sleep 1\n");
+    let (code, elapsed, stderr) = stubborn_daemon_stop(&home);
+    assert_eq!(code, 8, "{stderr}");
+    assert!(
+        stderr.contains("did not exit within 5 s after TERM; sending KILL"),
+        "{stderr}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
+        "KILL about 5-7 s by the wall clock, not ~25 s of slow polls; took {elapsed:?}"
+    );
+}
+
+/// A `date` that prints nothing, as one a group signal ended mid-read: the wait falls
+/// back to counting polls, five to a second, and KILL still lands after about 6 s.
+#[test]
+fn a_date_that_prints_nothing_falls_back_to_counting_polls() {
+    let home = Home::new("rnsd-no-date");
+    home.write_executable("date", "#!/bin/sh\nexit 0\n");
+    let (code, elapsed, stderr) = stubborn_daemon_stop(&home);
+    assert_eq!(code, 8, "{stderr}");
+    assert!(
+        stderr.contains("did not exit within 5 s after TERM; sending KILL"),
+        "{stderr}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(12),
+        "KILL after about 30 counted polls; took {elapsed:?}"
+    );
+}
+
+/// Runs the script with a stand-in rnsd that ignores TERM and a main command that exits
+/// 8 once the stand-in is up; returns the exit code, the time from then to the script's
+/// exit, and its stderr.
+fn stubborn_daemon_stop(home: &Home) -> (i32, Duration, String) {
     let log = home.rnsd_log();
     home.write_executable(
         "rnsd",
@@ -833,12 +882,7 @@ fn a_daemon_that_ignores_term_is_killed_after_the_bounded_wait() {
     let elapsed = started.elapsed();
     let stderr = stderr.finish(pgid);
     drop(group);
-    let code = status.code().unwrap_or(-1);
-    assert_eq!(code, 8, "{stderr}");
-    assert!(
-        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
-        "bounded wait (5 s by the clock) then KILL; took {elapsed:?}"
-    );
+    (status.code().unwrap_or(-1), elapsed, stderr)
 }
 
 /// The `&` child is `env`, then `setsid`, then rnsd, and a main command can return

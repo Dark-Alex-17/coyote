@@ -6935,11 +6935,11 @@ fn a_sigkilled_sibling_session_reads_ended_and_status_of_it_fails_at_once() {
         timings.push((line, waited, control));
     }
     eprintln!("(line, waited, people info just before): {timings:?}");
-    // The pty round trip of a debug build is the floor; a refusal at once stays well
-    // under the 2 s path wait above it, and far under the 10 s link timeout.
+    // Timed from Enter, so the editor's echo of the typed line is not counted: a refusal
+    // at once stays within 3 s, under the path wait and far under the 10 s link timeout.
     for (line, waited, control) in &timings {
         assert!(
-            *waited <= Duration::from_secs(3) || *waited <= *control + Duration::from_millis(1500),
+            *waited <= Duration::from_secs(3),
             "{line} took {waited:?} (people info took {control:?}); all: {timings:?}"
         );
     }

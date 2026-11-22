@@ -529,7 +529,7 @@ const PUBLIC_DIALS_NOTE: &str = "Note: this config also dials 3 public Reticulum
 
 /// The line a `--relay` run ends with, pointing at the config key that pins the relay's
 /// propagation node.
-const PROPAGATION_NODE_POINTER: &str = "[coyote-mesh] If that relay is also a propagation node, add its hash to mesh.propagation_nodes in config.yaml so this host files it at join; .mesh config show lists the nodes heard.\n";
+const PROPAGATION_NODE_POINTER: &str = "[coyote-mesh] If that relay also runs a propagation node, add the destination hash of that propagation node (not the relay host:port) to mesh.propagation_nodes in config.yaml; .mesh config show lists the propagation nodes heard, with their hashes.\n";
 
 /// An existing `~/.config/reticulum/config` that carries neither the 4242 listener nor
 /// `enable_transport` stops the run with exit 2 right after the printed stanzas, on a real

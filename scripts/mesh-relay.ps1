@@ -899,7 +899,7 @@ mesh:
     Write-Info 'Next: start coyote and run `.mesh on`'
   }
   if ($script:RelayHost) {
-    Write-Info 'If that relay is also a propagation node, add its hash to mesh.propagation_nodes in config.yaml so this host files it at join; .mesh config show lists the nodes heard.'
+    Write-Info 'If that relay also runs a propagation node, add the destination hash of that propagation node (not the relay host:port) to mesh.propagation_nodes in config.yaml; .mesh config show lists the propagation nodes heard, with their hashes.'
   }
 }
 

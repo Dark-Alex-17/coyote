@@ -3079,21 +3079,33 @@ mod tests {
                 cancel.cancel();
                 at
             });
-            let outcome = send_envelope(
-                &post.client.transport,
-                &post.learned,
-                &prepared,
-                post.cancel.clone(),
-                &post.options,
-            )
-            .await
-            .err();
-            let returned = StdInstant::now();
-            if outcome != Some(PropagationError::Cancelled) {
-                canceller.abort();
-                panic!("the post ended with {outcome:?}, not cancelled");
-            }
-            let elapsed = returned.saturating_duration_since(canceller.await.unwrap());
+            let (outcome, cancelled_at, returned) = {
+                let send = send_envelope(
+                    &post.client.transport,
+                    &post.learned,
+                    &prepared,
+                    post.cancel.clone(),
+                    &post.options,
+                );
+                tokio::pin!(send);
+                // The canceller is awaited beside the post, so one that panics fails the
+                // test at once instead of leaving the post to run out its transfer timeout.
+                let mut canceller = canceller;
+                tokio::select! {
+                    joined = &mut canceller => {
+                        let cancelled_at = joined.expect("the canceller panicked");
+                        let outcome = send.await.err();
+                        (outcome, cancelled_at, StdInstant::now())
+                    }
+                    outcome = &mut send => {
+                        // The cancel can end the post before its task hands back when.
+                        let returned = StdInstant::now();
+                        let cancelled_at = canceller.await.expect("the canceller panicked");
+                        (outcome.err(), cancelled_at, returned)
+                    }
+                }
+            };
+            let elapsed = returned.saturating_duration_since(cancelled_at);
             assert_eq!(outcome, Some(PropagationError::Cancelled));
             assert!(
                 elapsed < PROMPT && PROMPT < post.options.transfer_timeout,

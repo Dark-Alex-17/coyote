@@ -1135,7 +1135,7 @@ EOF
     log "Next: add the [[Team Relay]] stanza above to $RNS_CONFIG, then $(restart_command)"
   fi
   if [[ -n "$RELAY_HOST" ]]; then
-    log "If that relay is also a propagation node, add its hash to mesh.propagation_nodes in config.yaml so this host files it at join; .mesh config show lists the nodes heard."
+    log "If that relay also runs a propagation node, add the destination hash of that propagation node (not the relay host:port) to mesh.propagation_nodes in config.yaml; .mesh config show lists the propagation nodes heard, with their hashes."
   fi
 }
 

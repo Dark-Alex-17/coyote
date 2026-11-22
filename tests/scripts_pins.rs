@@ -1250,7 +1250,7 @@ fn relay_scripts_print_the_local_entry_as_the_matching_config() {
             !snippet.contains("type: private"),
             "{name}'s matching-config snippet still carries `type: private`:\n{snippet}"
         );
-        let pointer = "If that relay is also a propagation node, add its hash to mesh.propagation_nodes in config.yaml so this host files it at join; .mesh config show lists the nodes heard.";
+        let pointer = "If that relay also runs a propagation node, add the destination hash of that propagation node (not the relay host:port) to mesh.propagation_nodes in config.yaml; .mesh config show lists the propagation nodes heard, with their hashes.";
         let next = snippet
             .rfind("Next: start coyote")
             .unwrap_or_else(|| panic!("{name}'s next steps lack the Next line:\n{snippet}"));
@@ -1807,6 +1807,10 @@ fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
     );
     for needle in [
         "PYTHONUNBUFFERED=1 setsid rnsd -vv",
+        // The stop phase times its 5 s off the clock and falls back to counting polls
+        // where `date` prints nothing.
+        "started=$(date +%s 2>/dev/null) || started=",
+        "now=$(date +%s 2>/dev/null) || now=",
         "env -i HOME=",
         "COYOTE_MESH_RNSD",
         "COYOTE_MESH_RELAY",
