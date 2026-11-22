@@ -1489,6 +1489,9 @@ u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\nLast script 
 check("route_coder_result: B5 strike 3 -> strikeout", u["_next"] == "strikeout")
 u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' failed: exit 2\n\nLast build output:\n", fix_strikes=0))
 check("route_coder_result: crashed gate -> engine_fault escalation (not a code fix)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "engine_fault")
+u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' failed: token expired\n\nLast build output:\n", fix_strikes=0))
+check("route_coder_result: a trigger word only in the crash text -> engine_fault is no hard trigger",
+      u.get("escalation", {}).get("kind") == "engine_fault" and u.get("escalation", {}).get("hard_trigger") is False)
 # the coder's own end_failure template, rendered the way a red test gate leaves it: no script error
 _coder_end = re.search(r"(?ms)^  end_failure:\n.*?^    output: \|\n(.*?)(?=^  \w+:\n|\Z)",
                        open(os.path.join(HERE, "..", "..", "coder", "graph.yaml")).read()).group(1)
@@ -1788,6 +1791,9 @@ u = gates.route_gauntlet(base_state(gauntlet_result=inc, debris_reruns=RERUN_ONC
 check("route_gauntlet: B11 exhausted -> three-option escalation", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "review_incomplete" and len(u["escalation"]["options"]) == 3)
 u = gates.route_gauntlet(base_state(gauntlet_result="GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: security, pipeline\n", round_heads=[{}]))
 check("route_gauntlet: other lane incomplete -> straight to the options", u["escalation"]["kind"] == "review_incomplete" and u["gauntlet_incomplete"] == ["security", "pipeline"])
+u = gates.route_gauntlet(base_state(gauntlet_result="GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: secret-scan\n", round_heads=[{}]))
+check("route_gauntlet: a trigger word only in a lane name -> review_incomplete is no hard trigger",
+      u.get("escalation", {}).get("kind") == "review_incomplete" and u.get("escalation", {}).get("hard_trigger") is False)
 u = gates.route_gauntlet(base_state(gauntlet_result="Agent node failed: killed", round_heads=[{}]))
 check("route_gauntlet: agent-node failure -> incomplete pipeline (never PASS)", u["gauntlet_verdict"] == "BLOCKED" and u["gauntlet_incomplete"] == ["pipeline"])
 tri = [{"finding": "🔴 null deref", "action": "reject", "citation": "src/x.go:1", "lane": "code-review"},
@@ -1803,6 +1809,17 @@ _same = [{"code_tree": "t1", "lane_blockers": {"adversary": ["DIVERGES: c1"]}}] 
 u = gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "adversary"}], review_rounds=0,
                                   lane_block_streak={"adversary": 1}, round_heads=_same))
 check("triage_route: adversary blocking twice after a fix -> lane_stuck escalation (re-run once rule)", u["escalation"]["kind"] == "lane_stuck")
+_same_secret = [{"code_tree": "t1", "lane_blockers": {"secret-scan": ["DIVERGES: c1"]}}] * 2
+_saved_lanes = gates.GAUNTLET_LANES, gates.RERUN_ONCE_LANES
+gates.GAUNTLET_LANES, gates.RERUN_ONCE_LANES = (lanes + ("secret-scan",) for lanes in _saved_lanes)
+try:
+    u = gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "secret-scan"}],
+                                      review_rounds=0, lane_block_streak={"secret-scan": 1}, round_heads=_same_secret))
+finally:
+    gates.GAUNTLET_LANES, gates.RERUN_ONCE_LANES = _saved_lanes
+check("triage_route: a trigger word only in a lane name -> lane_stuck is no hard trigger",
+      u.get("escalation", {}).get("kind") == "lane_stuck" and u.get("escalation", {}).get("hard_trigger") is False,
+      u.get("escalation"))
 u = gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}], review_rounds=STRIKE_LIMIT))
 check("triage_route: B10 review rounds exhausted -> review_exhausted escalation", u["escalation"]["kind"] == "review_exhausted")
 u = gates.triage_route(base_state(triage=[{"finding": "USAGE_PROBE: INCONCLUSIVE no recipe", "action": "fix", "lane": "probe"}], review_rounds=0))
