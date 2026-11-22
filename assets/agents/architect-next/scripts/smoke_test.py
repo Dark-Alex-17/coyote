@@ -2172,8 +2172,29 @@ u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous")
 check("escalate_gate: autonomous -> ladder_judge (rulings file absent noted)", u["_next"] == "ladder_judge" and "no standing rulings" in u["standing_rulings"])
 u = gates.escalate_gate(base_state(escalation=escalation("design_ask", "Design question: share the store?", hard_trigger=True), escalation_policy="autonomous"))
 check("escalate_gate: hard trigger bypasses the ladder", u["_next"] == "ask_dispatch")
-u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", autonomous_kinds=["conformance_stuck"]))
-check("escalate_gate: a kind already resolved autonomously once -> owner", u["_next"] == "ask_dispatch")
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", current_task=T1, autonomous_decisions=["conformance_stuck|" + T1 + "|task"]))
+check("escalate_gate: a decision already resolved autonomously once in this task and phase -> owner, ledgered by its key",
+      u["_next"] == "ask_dispatch" and any(f"ladder: conformance_stuck|{T1}|task already resolved autonomously once -> owner" in d for d in u["decisions"]), u)
+def autonomous_after(u):
+    return {k: u[k] for k in ("autonomous_decisions", "autonomous_kinds") if k in u}
+answered_t1 = gates.ladder_route(base_state(escalation=E, current_task=T1, ladder_resolution="recommended", ladder_choice=""))
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", current_task=T2, **autonomous_after(answered_t1)))
+check("escalate_gate: the same kind resolved autonomously in another task -> ladder_judge again", u["_next"] == "ladder_judge", u)
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", current_task=T1, closeout_scope="run",
+                                   **autonomous_after(answered_t1)))
+check("escalate_gate: the same kind and task, now in the run close-out -> ladder_judge again", u["_next"] == "ladder_judge", u)
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", current_task=T1, **autonomous_after(answered_t1)))
+check("escalate_gate: the same decision, task and phase resolved autonomously -> owner", u["_next"] == "ask_dispatch", u)
+E_DEC_A = escalation("conformance_stuck", "lane a", [option("Stop", True)], data={"decision": "lane_a"})
+E_DEC_B = escalation("conformance_stuck", "lane b", [option("Stop", True)], data={"decision": "lane_b"})
+answered_a = gates.ladder_route(base_state(escalation=E_DEC_A, current_task=T1, ladder_resolution="recommended", ladder_choice=""))
+check("escalate_gate: data.decision tells two escalations of one kind in one task apart",
+      gates.escalate_gate(base_state(escalation=E_DEC_B, escalation_policy="autonomous", current_task=T1,
+                                     **autonomous_after(answered_a)))["_next"] == "ladder_judge"
+      and gates.escalate_gate(base_state(escalation=E_DEC_A, escalation_policy="autonomous", current_task=T1,
+                                         **autonomous_after(answered_a)))["_next"] == "ask_dispatch", answered_a)
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", current_task=T1, autonomous_kinds=["conformance_stuck"]))
+check("escalate_gate: a resumed state carrying only the old autonomous_kinds list is ignored -> ladder_judge", u["_next"] == "ladder_judge", u)
 u = gates.ladder_route(base_state(escalation=E, ladder_resolution="recommended", ladder_choice="", anomalies=["branch smells"]))
 check("ladder_route: recommended -> the single recommended option, digest + ledger + apply; A10 harvested", u["_next"] == "apply_answer" and u["last_answer"] == "Stop and report" and u["autonomous_digest"] and u["anomalies_log"])
 u = gates.ladder_route(base_state(escalation=E, ladder_resolution="ruling", ladder_choice="2", ladder_basis="ruling: R1"))
@@ -2183,6 +2204,9 @@ check("ladder_route: consult refused when tier3_ok false", gates.ladder_route(ba
 check("ladder_route: escalate -> owner", gates.ladder_route(base_state(escalation=E, ladder_resolution="escalate"))["_next"] == "ask_dispatch")
 u = gates.consult_route(base_state(escalation=E, consult_result="...\nCONSULT: ANSWER 2"))
 check("consult_route: answer -> apply", u["_next"] == "apply_answer" and u["last_answer"] == "One more round")
+u = gates.consult_route(base_state(escalation=E, current_task=T1, consult_result="CONSULT: ANSWER 2"))
+check("consult_route: a navigator answer records the decision key as resolved without the owner",
+      u.get("autonomous_decisions") == [f"conformance_stuck|{T1}|task"], u)
 check("consult_route: defer -> owner", gates.consult_route(base_state(escalation=E, consult_result="CONSULT: DEFER owner's call"))["_next"] == "ask_dispatch")
 check("consult_route: fault/timeout -> owner", gates.consult_route(base_state(escalation=E, consult_result="Agent node failed"))["_next"] == "ask_dispatch")
 os.environ["ARCHITECT_SLACK_PING_BIN"] = os.path.join(TMP, "nope-slack")
@@ -2723,11 +2747,11 @@ u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask
 check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
 E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
 check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
-      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ladder_judge"
-      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_kinds=["design_round#0"]))["_next"] == "ask_dispatch")
+      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_decisions=["design_round#0||task"]))["_next"] == "ladder_judge"
+      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_decisions=["design_round#0||task"]))["_next"] == "ask_dispatch")
 u2 = gates.ladder_route(base_state(escalation=E_DQ, ladder_resolution="recommended", ladder_choice=""))
-check("ladder_route: a multiple-choice question records its kind and index as ruled autonomously",
-      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2["autonomous_kinds"] == ["design_round#0"], u2)
+check("ladder_route: a multiple-choice question records its kind and index, task and phase as ruled autonomously",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2.get("autonomous_decisions") == ["design_round#0||task"], u2)
 
 # ---------------------------------------------------------------- apply_answer (every kind)
 def AA(kind, answer, **over):

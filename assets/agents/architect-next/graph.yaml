@@ -363,7 +363,7 @@ initial_state:
   base_branch_override: ''
   code_dir_override: ''
   autonomous_digest: []
-  autonomous_kinds: []
+  autonomous_decisions: []
   # --- phase F ---
   integration_checked: false
   final_integration_strikes: 0

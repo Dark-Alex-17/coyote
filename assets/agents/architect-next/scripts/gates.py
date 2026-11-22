@@ -3236,12 +3236,20 @@ def batch_close(state):
 
 
 # ====================================================================== 2.8 escalation ladder
-def _autonomy_key(esc):
-    """What the resolve-autonomously-once rule counts: the kind, or the kind and question index of a multiple choice."""
+def _decision_key(state, esc):
+    """What the resolve-autonomously-once rule counts: the decision, the task it was raised in and the phase."""
     data = as_dict(esc.get("data"))
-    if data.get("multiple_choice"):
-        return f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
-    return esc.get("kind", "unknown")
+    decision = data.get("decision")
+    if not decision and data.get("multiple_choice"):
+        decision = f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
+    decision = decision or esc.get("kind", "unknown")
+    task = data.get("task") or state.get("current_task") or ""
+    phase = "run" if state.get("closeout_scope") == "run" else "task"
+    return f"{decision}|{task}|{phase}"
+
+
+def _autonomous_decisions(state, esc):
+    return list(as_list(state.get("autonomous_decisions"))) + [_decision_key(state, esc)]
 
 
 def escalate_gate(state):
@@ -3256,7 +3264,8 @@ def escalate_gate(state):
         u["_next"] = "choice_park"
         return u
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
-    failed_once = _autonomy_key(esc) in as_list(state.get("autonomous_kinds"))
+    key = _decision_key(state, esc)
+    failed_once = key in as_list(state.get("autonomous_decisions"))
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -3267,7 +3276,7 @@ def escalate_gate(state):
         u["_next"] = "ladder_judge"
     else:
         if failed_once:
-            ledger(state, u, f"ladder: {kind} already resolved autonomously once; hard trigger -> owner")
+            ledger(state, u, f"ladder: {key} already resolved autonomously once -> owner")
         u["_next"] = "ask_dispatch"
     return u
 
@@ -3288,7 +3297,7 @@ def ladder_route(state):
             basis = state.get("ladder_basis") or res
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line],
-                      "autonomous_kinds": list(as_list(state.get("autonomous_kinds"))) + [_autonomy_key(esc)],
+                      "autonomous_decisions": _autonomous_decisions(state, esc),
                       "last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
@@ -3310,7 +3319,7 @@ def consult_route(state):
         said = m.group(1).strip()
         choice = match_option(said, esc.get("options") or []) or said
         # the navigator's words beside its pick stay in last_answer_text, where apply_answer reads a stated reason
-        u.update({"last_answer": choice, "last_answer_text": said})
+        u.update({"last_answer": choice, "last_answer_text": said, "autonomous_decisions": _autonomous_decisions(state, esc)})
         ledger(state, u, f"consult: {esc.get('kind')}: {choice} (navigator)")
         u["_next"] = "apply_answer"
         return u
