@@ -1943,6 +1943,8 @@ E_IR_SPENT = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, i
 R82 = os.path.join(TMP, "replay-08-2")
 write(os.path.join(R82, "CONTRIBUTING.md"), "# Contributing\n\nRun every check through the wrapper:\n\n    ./run-checks\n\n"
                                              "It sets up what the checks need.\n")
+git(R82, "init", "-q")
+git(R82, "add", "CONTRIBUTING.md")
 R82_RUN = os.path.join(TMP, "runs-replay", "r82")
 R82_WHY = "CONTRIBUTING.md:5 documents the wrapper, which runs the same checks"
 R82_CTX = dict(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, current_task=T1, run_branch="feat/PLAN-widgets", code_repo_path=R82,
@@ -1998,7 +2000,7 @@ check("replay 08/2: RED with a pending proposal for the failed command -> verifi
       u["_next"] == "escalate_gate" and E_VC.get("kind") == "verification_command" and not any(o["recommended"] for o in E_VC["options"])
       and [o["text"] for o in E_VC["options"]] == [gates.VERIFY_ADOPT, gates.VERIFY_KEEP, "Stop and report"]
       and "$ sh check.sh" in E_VC["evidence"] and "5:     ./run-checks" in E_VC["evidence"]
-      and "== CONTRIBUTING.md\ncited line 5:\n" in E_VC["evidence"] and "CONTRIBUTING.md:5:     ./run-checks" in E_VC["evidence"]
+      and "## CONTRIBUTING.md\ncited line 5:\n" in E_VC["evidence"] and "CONTRIBUTING.md:5:     ./run-checks" in E_VC["evidence"]
       and "replacement text appears verbatim in: CONTRIBUTING.md" in E_VC["evidence"] and u["verification_proposal"] == {}
       and E_VC["data"]["scope"] == "task" and E_VC["data"]["failed_command"] == "sh check.sh", E_VC)
 u = gates.integration_test(r82(verification_proposal={**R82_PROPOSAL, "command": "true"}))
@@ -2006,17 +2008,23 @@ check("replay 08/2: a proposal for another command than the failed one is ledger
       u["_next"] == "fix_round" and u["verification_proposal"] == {} and any("dropped" in d for d in u["decisions"]), u["_next"])
 u = gates.integration_test(r82(verification_proposal={**R82_PROPOSAL, "reason": "docs/missing.md:3 says so"}))
 check("replay 08/2: a cited place that does not exist is reported as not found",
-      "cited but not found: docs/missing.md:3" in (u.get("escalation") or {}).get("evidence", ""), u.get("escalation"))
+      "cited but not tracked or not found: docs/missing.md:3" in (u.get("escalation") or {}).get("evidence", ""), u.get("escalation"))
 write(os.path.join(TMP, "outside.md"), "a\nb\nc\nd\n./run-checks\n")
 u = gates.integration_test(r82(verification_proposal={**R82_PROPOSAL, "reason": "../outside.md:5 says so"}))
 check("verification_command: a citation outside the code repo is reported as not found",
-      "cited but not found: ../outside.md:5" in (u.get("escalation") or {}).get("evidence", "")
+      "cited but not tracked or not found: ../outside.md:5" in (u.get("escalation") or {}).get("evidence", "")
       and "outside.md:5:" not in (u.get("escalation") or {}).get("evidence", ""), u.get("escalation"))
 RDOC = os.path.join(TMP, "doc-check")
 write(os.path.join(RDOC, "HACKING.md"), "# Hacking\n\nInstall bin/runner first.\n")
 write(os.path.join(RDOC, "tasks.txt"), "build:\n\tbin/runner build\ncheck:\n\tbin/runner check\n")
 write(os.path.join(RDOC, "AGENTS.md"), "# Agents\n\nUse bin/runner for every gate.\n")
 write(os.path.join(RDOC, "notes.md"), "bin/runner check\n")
+write(os.path.join(RDOC, "long.md"), "bin/runner " + "x" * 400 + "\n")
+for i in range(1, 10):
+    write(os.path.join(RDOC, f"f{i}.txt"), "bin/runner\n")
+write(os.path.join(RDOC, "scratch.md"), "bin/runner untracked-only-text\n")
+git(RDOC, "init", "-q")
+git(RDOC, "add", "HACKING.md", "tasks.txt", "AGENTS.md", "notes.md", "long.md", *(f"f{i}.txt" for i in range(1, 10)))
 
 
 def doc_check(reason, repo=RDOC):
@@ -2028,23 +2036,34 @@ def doc_check(reason, repo=RDOC):
 
 ev = doc_check("HACKING.md and tasks.txt describe it")
 check("documentation check: files named by bare name are read and their matching lines reported",
-      "== HACKING.md\nHACKING.md:3: Install bin/runner first." in ev and "== tasks.txt\n" in ev and "tasks.txt:4: \tbin/runner check" in ev
+      "## HACKING.md\nHACKING.md:3: Install bin/runner first." in ev and "## tasks.txt\n" in ev and "tasks.txt:4: \tbin/runner check" in ev
       and "cited" not in ev and "notes.md" not in ev, ev)
 ev = doc_check("HACKING.md names the runner")
 check("documentation check: a line naming only the program is reported, and the verbatim line says none",
       "HACKING.md:3: Install bin/runner first." in ev and ev.endswith("replacement text appears verbatim in: none"), ev)
 ev = doc_check("HACKING.md:3 and tasks.txt:4 say so")
 check("documentation check: every path:line citation gets its excerpt",
-      "== HACKING.md\ncited line 3:\n1: # Hacking\n2: \n3: Install bin/runner first.\n" in ev
-      and "== tasks.txt\ncited line 4:\n1: build:\n" in ev and "4: \tbin/runner check\ntasks.txt:2:" in ev, ev)
+      "## HACKING.md\ncited line 3:\n1: # Hacking\n2: \n3: Install bin/runner first.\n" in ev
+      and "## tasks.txt\ncited line 4:\n1: build:\n" in ev and "4: \tbin/runner check\ntasks.txt:2:" in ev, ev)
 ev = doc_check("tasks.txt:4 runs it")
 check("documentation check: a convention file the reason never mentions is still read",
-      "== AGENTS.md\nAGENTS.md:3: Use bin/runner for every gate." in ev, ev)
+      "## AGENTS.md\nAGENTS.md:3: Use bin/runner for every gate." in ev, ev)
+ev = doc_check("scratch.md and HACKING.md say so")
+check("documentation check: a file git does not track is listed as not tracked and never read",
+      "- cited but not tracked or not found: scratch.md" in ev and "untracked-only-text" not in ev and "## scratch.md" not in ev
+      and "## HACKING.md\n" in ev, ev)
+ev = doc_check("long.md lists it")
+check("documentation check: an overlong line is cut in the evidence",
+      "long.md:1: bin/runner " + "x" * 289 + " ... [trimmed]\n" in ev and "x" * 290 not in ev, ev)
+ev = doc_check(" ".join(f"f{i}.txt" for i in range(1, 10)) + " say so")
+check("documentation check: a reason naming more files than the cap reads the first ones and says how many were left out",
+      "## f8.txt\n" in ev and "## f9.txt" not in ev and "## AGENTS.md" not in ev
+      and "- 2 more files not read (at most 8 are read)" in ev, ev)
 write(os.path.join(TMP, "outside-doc.md"), "bin/runner check outside-only\n")
 os.makedirs(os.path.join(TMP, "doc-check-empty"), exist_ok=True)
 ev = doc_check("../outside-doc.md:1 and ../outside-doc.md say so", os.path.join(TMP, "doc-check-empty"))
 check("documentation check: a citation outside the code repo is not found and never read",
-      ev.endswith("\n\nDocumentation check: no cited or convention file found in the repo\ncited but not found: ../outside-doc.md:1"), ev)
+      ev.endswith("\n\nDocumentation check: no cited or convention file found in the repo\n- cited but not tracked or not found: ../outside-doc.md:1"), ev)
 u = gates.apply_answer(r82(escalation=E_VC, last_answer=gates.VERIFY_ADOPT, verification_commands='["true", "sh check.sh", "./run-checks"]'))
 ch82 = _lib.as_list(u.get("verification_changes"))
 check("replay 08/2: adopt -> replaced in place and deduplicated, the change recorded with reason and by, only the verification re-run",

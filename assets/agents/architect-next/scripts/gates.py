@@ -3021,6 +3021,9 @@ VERIFY_REPLACED_RERUN = "Run the verification again with the replaced command"
 CITED_PLACE_RE = re.compile(r"([\w./-]+):(\d+)")
 PATH_TOKEN_RE = re.compile(r"[\w./-]+")
 DOC_MATCH_CAP = 12
+DOC_LINE_CAP = 300
+DOC_FILE_CAP = 8
+DOC_REPORT_CHARS = 4000
 
 
 def _verification_decided(state, command, replacement):
@@ -3029,14 +3032,25 @@ def _verification_decided(state, command, replacement):
 
 def _documentation_check(state, replacement, reason):
     """What the files a proposal cites or names, and the project convention files, say about its command: the lines
-    around each cited `path:line`, and every line holding the command or one of its words. Only regular files inside
-    the code repo are read."""
+    around each cited `path:line`, and every line holding the command or one of its words. Only regular files git
+    tracks in the code repo are read, at most DOC_FILE_CAP of them, each reported line cut to DOC_LINE_CAP chars."""
     code = os.path.realpath(state.get("code_repo_path") or ".")
     reason = reason or ""
+    rc, out, _ = git(code, "ls-files", "-z")
+    tracked = set(out.split("\0")) - {""} if rc == 0 else set()
 
-    def in_repo(rel):
+    def in_repo(rel, untracked=None):
         path = os.path.realpath(os.path.join(code, rel))
-        return path if path.startswith(code + os.sep) and os.path.isfile(path) else ""
+        if not path.startswith(code + os.sep) or not os.path.isfile(path):
+            return ""
+        if os.path.relpath(path, code) in tracked:
+            return path
+        if untracked is not None:
+            untracked.append(rel)
+        return ""
+
+    def clip(line):
+        return line if len(line) <= DOC_LINE_CAP else line[:DOC_LINE_CAP] + _lib.ITEM_TRIMMED
 
     cited, missing = {}, []
     for m in CITED_PLACE_RE.finditer(reason):
@@ -3047,19 +3061,20 @@ def _documentation_check(state, replacement, reason):
             cited[path].append(int(m.group(2)))
     named = [t.rstrip(".") for t in PATH_TOKEN_RE.findall(CITED_PLACE_RE.sub(" ", reason))]
     files = []
-    for path in [*cited, *map(in_repo, named), *map(in_repo, dict(_lib.CONVENTION_FILES)["code"])]:
+    for path in [*cited, *(in_repo(t, missing) for t in named), *map(in_repo, dict(_lib.CONVENTION_FILES)["code"])]:
         if path and path not in files:
             files.append(path)
+    left_out = len(files) - DOC_FILE_CAP
     words = [w for w in replacement.split() if not w.startswith("-") and len(w) >= 3]
     blocks, verbatim = [], []
-    for path in files:
+    for path in files[:DOC_FILE_CAP]:
         rel, text = os.path.relpath(path, code), read_file(path)
         lines = text.splitlines()
-        block = [f"== {rel}"]
+        block = [f"## {rel}"]
         for n in cited.get(path, []):
-            excerpt = "\n".join(f"{i}: {lines[i - 1]}" for i in range(max(1, n - 3), min(len(lines), n + 3) + 1))
+            excerpt = "\n".join(f"{i}: {clip(lines[i - 1])}" for i in range(max(1, n - 3), min(len(lines), n + 3) + 1))
             block.append(f"cited line {n}:\n{excerpt or f'(the file has {len(lines)} lines)'}")
-        hits = [f"{rel}:{i}: {line}" for i, line in enumerate(lines, 1)
+        hits = [f"{rel}:{i}: {clip(line)}" for i, line in enumerate(lines, 1)
                 if (replacement and replacement in line) or any(w in line for w in words)]
         block += hits[:DOC_MATCH_CAP] or ["no line holds the command or one of its words"]
         if len(hits) > DOC_MATCH_CAP:
@@ -3068,12 +3083,16 @@ def _documentation_check(state, replacement, reason):
             verbatim.append(rel)
         blocks.append("\n".join(block))
     if blocks:
-        report = ["Documentation check:", *blocks, f"replacement text appears verbatim in: {', '.join(verbatim) or 'none'}"]
+        report = ["Documentation check:", *blocks, f"- replacement text appears verbatim in: {', '.join(verbatim) or 'none'}"]
     else:
         report = ["Documentation check: no cited or convention file found in the repo"]
+    if left_out > 0:
+        report.append(f"- {left_out} more files not read (at most {DOC_FILE_CAP} are read)")
     if missing:
-        report.append(f"cited but not found: {', '.join(missing)}")
-    return "\n".join(report)
+        report.append(f"- cited but not tracked or not found: {', '.join(dict.fromkeys(missing))}")
+    # Each file block starts with a heading and each summary line with a bullet, so trim_items cuts inside a block and
+    # every file keeps its header.
+    return trim_items("\n".join(report), DOC_REPORT_CHARS)
 
 
 def _verification_question(state, u, scope, tid, out, failed):
