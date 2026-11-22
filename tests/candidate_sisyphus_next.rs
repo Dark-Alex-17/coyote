@@ -3290,11 +3290,12 @@ fn gauntlet_sentinels_are_column_zero_whole_lines_first_match_wins() {
     );
 }
 
-/// The engine copies the parent's variables to every agent-node child, graph
-/// agents included, so `build_lock` would reach the coder, review-gauntlet
-/// and step-runner children by inheritance alone; their `inputs:` lines are
-/// belt-and-braces. This pins that census: exactly those three nodes carry
-/// it, and no other agent node carries `inputs:` at all.
+/// The engine copies the variables `sisyphus-next` was started or spawned
+/// with to every agent-node child, so an explicitly set `build_lock` would
+/// reach the coder, review-gauntlet and step-runner children by inheritance
+/// alone; their `inputs:` lines also carry the default. This pins that
+/// census: exactly those three nodes carry it, and no other agent node
+/// carries `inputs:` at all.
 #[test]
 fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();

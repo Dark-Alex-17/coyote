@@ -3262,10 +3262,10 @@ fn agent_nodes_whose_child_declares(variable: &str) -> BTreeSet<String> {
     found
 }
 
-/// A CLI root's agent variables do not reach agent-node children, so every
-/// agent node whose child declares `build_lock` passes it through `inputs:`
-/// and no other node does. The README's `build_lock` row names those five
-/// nodes and the agent each runs.
+/// An agent-node child inherits only the variables the architect was started
+/// or spawned with, so every agent node whose child declares `build_lock`
+/// passes it through `inputs:` and no other node does. The README's
+/// `build_lock` row names those five nodes and the agent each runs.
 #[test]
 fn readme_build_lock_row_names_the_five_children_and_their_inputs() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -5116,10 +5116,10 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
     );
 }
 
-/// A CLI root's agent variables do not reach agent-node children, so the
-/// nodes whose agents declare `build_lock` thread it through `inputs:` and no
-/// other node does; apart from those inputs, the variable declaration is the
-/// one line of `graph.yaml` that names it.
+/// An agent-node child inherits only the variables the architect was started
+/// or spawned with, so the nodes whose agents declare `build_lock` thread it
+/// through `inputs:` and no other node does; apart from those inputs, the
+/// variable declaration is the one line of `graph.yaml` that names it.
 #[test]
 fn only_the_build_lock_children_thread_it_through_inputs() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -6007,7 +6007,7 @@ fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
 
 /// The `build_lock` variable row; the threading row beside it must not
 /// reword it.
-const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` and five nodes' `inputs:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. A CLI root's agent variables do not reach its agent-node children (a child graph seats only its own declared defaults), so `delegate` and `wave_delegate` (`sisyphus-next`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) each pass `build_lock: '{{build_lock}}'` through `inputs:`, as `sisyphus-next` does toward its own children; the engine seeds an input into the child's initial state ahead of its declared defaults, so the architect's value wins. Each of the three agents behind those five nodes declares `build_lock` itself |";
+const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` and five nodes' `inputs:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. The engine hands an agent-node child only the variables the architect was started or spawned with, never its declared defaults or its state, so `delegate` and `wave_delegate` (`sisyphus-next`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) each pass `build_lock: '{{build_lock}}'` through `inputs:`, as `sisyphus-next` does toward its own children; the engine seats an input for a variable the child declares as that child's variable (its `LLM_AGENT_VAR_*` env and what its own children inherit) and in its initial state ahead of its declared defaults, so the architect's value wins. Each of the three agents behind those five nodes declares `build_lock` itself |";
 
 /// Every agent the graph delegates to that declares no `build_lock` gets no
 /// `build_lock` input and consumes none: none of its own files names the
@@ -6082,7 +6082,7 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         "the graph agent librarian and the config agents",
         "pass those three through `inputs:`",
         "no `mode-degraded:` ledger line is written",
-        "do not reach its agent-node children",
+        "never its declared defaults or its state",
         "escalation_policy: '{{escalation_policy}}'",
         "reads `$LLM_AGENT_VAR_AUTO_CONFIRM` from the child agent's environment",
     ] {
@@ -6091,10 +6091,12 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
     for stale in [
         "copies the parent's agent variables",
         "by the same inheritance",
+        "do not reach its agent-node children",
+        "an input cannot carry it",
     ] {
         assert!(
             !row.contains(stale),
-            "the E9 row claims engine inheritance again with {stale:?}: {row}"
+            "the E9 row repeats a superseded inheritance claim {stale:?}: {row}"
         );
     }
     for agent in expected {
