@@ -108,6 +108,23 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   run whose criteria are met is listed under `Advisory red runs (not blocking):`, and so is a
   `tree-state` run held to exit 0 unless a criterion naming it ends neither MET nor INSPECTED (one about the
   uncommitted tree itself, say), which blocks and names those criteria and statuses.
+- With a non-empty `carried_failures` (below), each red run held to exit 0 that exited below 128
+  and whose baseline is neither `pre-existing` nor `tree-state` has its full output parsed by the
+  shared `.shared/failure_locations.py`, which resolves each failure to the repo paths git lists
+  (a directory ends in `/`). The record gains `carried`: `all`, `matched`, `new` and `unlocated`.
+  `all` is true only when the output was not trimmed, is under 4 MB, locates at least one failure,
+  has no failure line that names no repo path, and every located failure's paths exactly equal a
+  carried item's; a failing file inside a carried directory is a new failure. Matching is per
+  location (a file, or a directory when the output names only that), so a further failure at a
+  carried location is not told apart from the carried one; the owner's own gate still has to see
+  that location green. A run whose
+  `carried.all` is true is listed under `Advisory red runs (not blocking):` as every failure being
+  one the caller declared carried, grouped by owner, unless a criterion naming the command ends
+  neither MET nor INSPECTED, which blocks and names those criteria and statuses. A run only partly
+  carried blocks as a regression, and its complaint adds the failures not declared carried and the
+  count of unlocated failure lines. When the parser cannot be loaded, git cannot list the files
+  or the run's deadline is spent, the record gets a `carried_note` instead, rendered as an
+  advisory line, and blocks as if nothing were carried.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
   criterion checks judge the criteria it covers like an execution criterion no recorded run covers
   (below), naming the command and that it was skipped for time. The report's `Criteria:` line
@@ -272,6 +289,15 @@ way as `verification_commands`. Empty runs the commands bare; pipefail applies o
 (the bare arm is plain shell, Windows-compatible); the prefixed form is POSIX-only. A value that is
 not a string is an
 invalid declaration and fails closed like a malformed `verification_commands`.
+
+`carried_failures` (default `'[]'`) is a JSON array of failures the caller declares expected to
+stay red in this change and owed elsewhere: `{"paths": [...], "owner": ..., "evidence": ...}`
+items, where `paths` are repo paths (a directory ends in `/`), `owner` is a display label and
+`evidence` is optional. It sits on the same trust boundary as `verification_commands` and is
+never read from the prompt; `review-gauntlet` forwards its own the same way. Unlike
+`verification_commands`, a value that is not a JSON array is treated as none and reported under
+`Carried failures input:`, not as a `PIPELINE-FAULT`; items without a non-empty list of string
+paths are dropped and counted in that line.
 
 - `'[]'` (or omitted) gives the "none declared" marker; execution criteria are at best INSPECTED,
   naming the command to declare.

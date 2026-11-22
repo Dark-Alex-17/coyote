@@ -47,6 +47,16 @@ variables:
   - name: debris_exclude
     description: Repo-relative directories holding the run's own planning files, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none. The debris lint leaves them out of its diff, and every review lane is told they are bookkeeping, not scope drift.
     default: ''
+  - name: carried_failures
+    description: |
+      JSON array of failures the caller declares expected to stay red in this
+      change and owed elsewhere, each {"paths": [repo paths, a directory
+      ending in "/"], "owner": display label, "evidence": optional text};
+      forwarded to the adversary lane, whose red run made only of these
+      failures is advisory when every criterion naming the command is met
+      (matching is per location; a value that is not a JSON array counts as
+      none). Never inferred from the prompt.
+    default: '[]'
 
 settings:
   max_loop_iterations: 10
@@ -428,6 +438,7 @@ nodes:
       verification_commands: '{{verification_commands}}'
       build_lock: '{{build_lock}}'
       debris_exclude: '{{debris_exclude}}'
+      carried_failures: '{{carried_failures}}'
     prompt: |
       Adversarial plan-conformance review in {{project_dir}}.
 

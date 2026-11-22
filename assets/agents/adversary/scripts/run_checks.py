@@ -31,7 +31,10 @@ bounded wait (STACK_LOCK_WAIT_SECS = 1200s) gives up, the pre-run tree
 capture (below) gets SNAPSHOT_GIT_TIMEOUT_SECS = 120s of its own, and the
 deadline starts when it ends, so the capture never takes time from the
 declared commands. The run_checks node's 4600s timeout covers 1200 + 120 +
-3120 plus margin for the baseline worktree cleanup. Without the deadline, a
+3120 plus margin for the baseline worktree cleanup and for the carried-failure
+matching below, which starts a record only while the deadline has time left
+and gives each of its two git calls at least GATE_CALL_MIN_TIMEOUT_SECS.
+Without the deadline, a
 handful of hanging commands (4 x 900s) would blow the NODE timeout and the
 executor would kill this script from OUTSIDE -- the
 in-script degradation would never fire. Each command gets
@@ -130,6 +133,26 @@ prefix (the bare arm is plain shell, Windows-compatible); the prefixed form
 is POSIX-only. A present, non-string value is a
 declaration error and fails closed the same way as a malformed
 `verification_commands`: PIPELINE-FAULT, nothing executed.
+
+Carried failures: `carried_failures` is a declared variable on the same trust
+boundary, a JSON array of {"paths", "owner", "evidence"} items naming
+failures the caller declares expected to stay red in this change and owed
+elsewhere. A value that is not a JSON array is treated as none and recorded
+as `carried_error`, never a PIPELINE-FAULT; an item without a non-empty list
+of string paths is dropped and counted there. With a non-empty list, every
+red record that ran to a nonzero exit below 128, is held to exit 0 and whose
+baseline is neither pre-existing nor tree-state has its full output parsed
+by the shared `.shared/failure_locations.py` against the files git lists in
+the repository, untracked included. The record gains `carried`: {"all",
+"matched", "new", "unlocated"}. `all` is true only when the output was not
+trimmed, is under CARRIED_OUTPUT_CAP bytes, locates at least one failure,
+has no failure line naming no repo path, and every located failure's paths
+exactly equal a carried item's; a new failure inside a carried directory is
+new. Matching is per location, so a further failure at a carried location is
+not told apart; the owner's own gate still has to see it green. When the
+parser cannot be loaded or git cannot list the files, the
+record gets a `carried_note` instead and is judged as if nothing were
+carried; so does every record the deadline leaves no time to match.
 """
 
 import hashlib
@@ -166,6 +189,9 @@ GIT_CLEANUP_TIMEOUT_SECS = 20
 SNAPSHOT_GIT_TIMEOUT_SECS = 120
 GATE_CALL_MIN_TIMEOUT_SECS = 10
 BASE_RUN_FORMAT = 1
+SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+CARRIED_OUTPUT_CAP = 4 * 1024 * 1024
+CARRIED_DEADLINE_NOTE = "the run's deadline was spent"
 TREE_STATE_NOTE = (
     "candidate tree dirty: red only in the live tree; the same content on a clean checkout exits 0"
 )
@@ -266,6 +292,35 @@ def lock_prefix(declared):
             f"expected a string, got {type(declared).__name__}"
         )
     return declared.strip()
+
+
+def declared_carried(declared):
+    """(carried items, error) for the carried_failures declaration.
+
+    Missing/None or an empty string means none. A value that is not a JSON
+    array is treated as none, and an item without a non-empty list of string
+    paths is dropped; either is described in the error, never raised.
+    """
+    if declared is None or (isinstance(declared, str) and not declared.strip()):
+        return [], ""
+    if isinstance(declared, str):
+        try:
+            declared = json.loads(declared)
+        except json.JSONDecodeError as e:
+            return [], f"carried_failures treated as none: not valid JSON: {e}"
+    if not isinstance(declared, list):
+        return [], f"carried_failures treated as none: expected a JSON array, got {type(declared).__name__}"
+    items = []
+    for item in declared:
+        paths = item.get("paths") if isinstance(item, dict) else None
+        if isinstance(paths, list) and paths and all(isinstance(p, str) and p for p in paths):
+            items.append({"paths": paths, "owner": item.get("owner")})
+    dropped = len(declared) - len(items)
+    if dropped:
+        return items, (
+            f"carried_failures: {dropped} malformed item(s) dropped (an item needs a non-empty list of string paths)"
+        )
+    return items, ""
 
 
 def tail_of(text):
@@ -760,6 +815,91 @@ def compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, de
         compare(i, base, base_path)
 
 
+def carried_candidate(record):
+    """Whether a red record's failures may be matched against the carried ones: it ran to a
+    nonzero exit below the signal range, is held to exit 0, and no baseline already releases it."""
+    code = record.get("exit")
+    baseline = record.get("baseline")
+    status = baseline.get("status") if isinstance(baseline, dict) else None
+    return (
+        not record.get("skipped")
+        and type(code) is int
+        and 0 < code < 128
+        and status not in ("pre-existing", "tree-state")
+        and held_to_exit_0(record)
+    )
+
+
+def attach_carried(results, outputs, carried, proj, deadline):
+    """Give every candidate red record `carried`, its located failures matched by exact key
+    against the `carried` items, or a `carried_note` saying why they could not be matched.
+    Matching stops at the deadline; the records it did not reach get a note."""
+    candidates = [i for i, r in enumerate(results) if carried_candidate(r)]
+    if not candidates:
+        return
+
+    def unmatched(why, todo=candidates):
+        for i in todo:
+            results[i]["carried_note"] = f"not matched: {why}"
+
+    if left(deadline) <= 0:
+        unmatched(CARRIED_DEADLINE_NOTE)
+        return
+    if SHARED_DIR not in sys.path:
+        sys.path.insert(0, SHARED_DIR)
+    try:
+        import failure_locations
+    except Exception as e:  # noqa: BLE001 -- a broken locator leaves the records judged as uncarried
+        unmatched(f"the failure locator is unavailable ({e})")
+        return
+    try:
+        root = git_text(["rev-parse", "--show-toplevel"], proj, max(left(deadline), GATE_CALL_MIN_TIMEOUT_SECS))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        unmatched(f"the project's git repository could not be read: {e}")
+        return
+    index = failure_locations.repo_index(root, max(left(deadline), GATE_CALL_MIN_TIMEOUT_SECS))
+    if index is None:
+        unmatched("git could not list the repository's files")
+        return
+    by_key = {}
+    for item in carried:
+        by_key.setdefault(failure_locations.failure_key(sorted(item["paths"])), item)
+    for n, i in enumerate(candidates):
+        if left(deadline) <= 0:
+            unmatched(CARRIED_DEADLINE_NOTE, candidates[n:])
+            return
+        results[i].update(match_carried(failure_locations, root, index, outputs[i], by_key))
+
+
+def match_carried(locator, root, index, path, by_key):
+    """The `carried` field (plus a `carried_note` when nothing could be located) for the
+    output file `path`."""
+    nothing = {"all": False, "matched": [], "new": [], "unlocated": 0}
+    try:
+        if os.path.getsize(path) > CARRIED_OUTPUT_CAP:
+            return {"carried": nothing, "carried_note": f"not matched: the output exceeds {CARRIED_OUTPUT_CAP} bytes"}
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        return {"carried": nothing, "carried_note": f"not matched: the output could not be read: {e}"}
+    if locator.TRIMMED_MARK in text:
+        return {"carried": nothing, "carried_note": "not matched: the output was trimmed"}
+    located = locator.resolve_failure_tokens(root, locator.parse_failure_locations(text), index)
+    unlocated = locator.unlocated_failure_lines(root, text, index)
+    matched, new = [], []
+    for f in located:
+        item = by_key.get(locator.failure_key(sorted(f["paths"])))
+        if item is None:
+            new.append(f["paths"])
+        elif all(m["paths"] != item["paths"] for m in matched):
+            matched.append({"paths": item["paths"], "owner": item["owner"]})
+    carried = {"all": bool(located) and not new and not unlocated, "matched": matched, "new": new,
+               "unlocated": unlocated}
+    if not located:
+        return {"carried": carried, "carried_note": "not matched: no failure in the output resolves to a repo path"}
+    return {"carried": carried}
+
+
 def emit_pipeline_fault(state, msg):
     """Print the fail-closed record for a malformed declaration: nothing runs."""
     prior = state.get("pipeline_faults")
@@ -781,6 +921,7 @@ def main():
     except InvalidDeclaration as e:
         emit_pipeline_fault(state, f"PIPELINE-FAULT: build_lock declaration invalid: {e}")
         return
+    carried, carried_error = declared_carried(state.get("carried_failures"))
     if not cmds:
         print(
             json.dumps(
@@ -790,7 +931,8 @@ def main():
                         "execution criteria (build/test/lint) cannot be independently "
                         "confirmed. Declare the exact commands via the "
                         "verification_commands variable to get recorded runs."
-                    )
+                    ),
+                    **({"carried_error": carried_error} if carried_error else {}),
                 }
             )
         )
@@ -822,9 +964,20 @@ def main():
             for r in results:
                 if not r.get("skipped") and r.get("exit") != 0 and "baseline" not in r:
                     r["baseline"] = not_run(f"baseline comparison unavailable: {e}")
+        if carried:
+            try:
+                attach_carried(results, outputs, carried, proj, deadline)
+            except Exception as e:  # noqa: BLE001 -- a matching failure leaves the records judged as uncarried
+                for r in results:
+                    if carried_candidate(r):
+                        r.pop("carried", None)
+                        r["carried_note"] = f"not matched: {e}"
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    print(json.dumps({"exec_results": results}))
+    out = {"exec_results": results}
+    if carried_error:
+        out["carried_error"] = carried_error
+    print(json.dumps(out))
 
 
 try:
