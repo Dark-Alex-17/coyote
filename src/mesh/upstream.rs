@@ -234,10 +234,53 @@ impl UpstreamPoll {
         let network_changed =
             self.watch
                 .observe_addresses(addresses(), transitions, SystemTime::now());
+        if !reconnected.is_empty() {
+            // The upstream is already back in the poll that saw the move: greeting now
+            // covers both, and nothing is owed when the next poll finds it online.
+            self.watch.after_move = false;
+        }
         UpstreamChange {
             reconnected,
             network_changed,
         }
+    }
+}
+
+/// Holds a network change back one poll on a node whose relays will greet by
+/// themselves, so one move greets once: a TCP client that reconnects after the move
+/// greets its relay with its own announce, and an rnsd upstream that comes back shows up
+/// in the next poll. A node with neither greets a change at once.
+#[derive(Debug, Default)]
+pub(crate) struct MoveGreeting {
+    pending: Option<(tokio::time::Instant, Vec<String>)>,
+}
+
+impl MoveGreeting {
+    /// What of `change`, read at `now`, is greeted now. `defers` says the node has a TCP
+    /// client or an rnsd to wait for; `client_greeted_at` is when a TCP client's own
+    /// reconnect greeting last went out. A change held back is greeted at the next poll,
+    /// with whatever that poll found, unless a client greeted since, which covered it.
+    pub(crate) fn decide(
+        &mut self,
+        mut change: UpstreamChange,
+        defers: bool,
+        client_greeted_at: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> UpstreamChange {
+        if let Some((since, moved)) = self.pending.take() {
+            if client_greeted_at.is_some_and(|at| at >= since) {
+                debug!("Mesh left the network change to the relay greeting that followed it");
+                return UpstreamChange::default();
+            }
+            let mut network_changed = moved;
+            network_changed.extend(change.network_changed);
+            change.network_changed = network_changed;
+            return change;
+        }
+        if defers && !change.network_changed.is_empty() && change.reconnected.is_empty() {
+            self.pending = Some((now, std::mem::take(&mut change.network_changed)));
+        }
+        change
     }
 }
 
@@ -441,7 +484,72 @@ mod tests {
         );
     }
 
-    /// The record keeps the newest transitions only.
+    /// One move, one greeting: on a node with relays that greet by themselves the move
+    /// waits a poll; a TCP client that reconnected and greeted meanwhile covers it, and
+    /// otherwise the next poll greets it once, together with an rnsd upstream that came
+    /// back. A node with no such relay greets the move at once.
+    #[test]
+    fn one_move_is_greeted_once() {
+        let at = tokio::time::Instant::now();
+        let poll = |seconds| at + Duration::from_secs(seconds);
+        let moved = || UpstreamChange {
+            reconnected: Vec::new(),
+            network_changed: vec!["en0".to_string()],
+        };
+
+        let mut covered = MoveGreeting::default();
+        assert!(
+            covered.decide(moved(), true, None, poll(0)).is_empty(),
+            "held back"
+        );
+        assert!(
+            covered
+                .decide(UpstreamChange::default(), true, Some(poll(12)), poll(30))
+                .is_empty(),
+            "the relay reconnect's own greeting covered the move"
+        );
+
+        let mut held = MoveGreeting::default();
+        assert!(
+            held.decide(
+                moved(),
+                true,
+                Some(poll(0) - Duration::from_secs(5)),
+                poll(0)
+            )
+            .is_empty()
+        );
+        let upstream_back = UpstreamChange {
+            reconnected: vec!["TCPInterface[Team Relay]".to_string()],
+            network_changed: Vec::new(),
+        };
+        assert_eq!(
+            held.decide(
+                upstream_back,
+                true,
+                Some(poll(0) - Duration::from_secs(5)),
+                poll(30)
+            ),
+            UpstreamChange {
+                reconnected: vec!["TCPInterface[Team Relay]".to_string()],
+                network_changed: vec!["en0".to_string()],
+            },
+            "one greeting for the move and the upstream that came back"
+        );
+        assert!(
+            held.decide(UpstreamChange::default(), true, None, poll(60))
+                .is_empty()
+        );
+
+        let mut lan_only = MoveGreeting::default();
+        assert_eq!(lan_only.decide(moved(), false, None, poll(0)), moved());
+        assert!(
+            lan_only
+                .decide(UpstreamChange::default(), false, None, poll(30))
+                .is_empty()
+        );
+    }
+
     /// An IPv6 address counts by its /64 prefix: a temporary address rotating inside one
     /// network is no move, a new prefix is, and no `fe80::/10` address is counted.
     #[test]

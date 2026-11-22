@@ -81,7 +81,9 @@ use crate::mesh::trust::{
     Decision, InstancePresence, KeyChangeOutcome, Tier, TrustStore, decode_name_hash, parse_hash,
     row_derives,
 };
-use crate::mesh::upstream::{InterfaceTransitions, UpstreamChange, UpstreamPoll, host_addresses};
+use crate::mesh::upstream::{
+    InterfaceTransitions, MoveGreeting, UpstreamChange, UpstreamPoll, host_addresses,
+};
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
     mesh_cache_dir, parse_rfc3339,
@@ -4276,6 +4278,14 @@ async fn watch_interfaces(
     };
     let mut upstream = UpstreamPoll::new(host_addresses());
     let mut upstream_greetings = GreetingBudget::default();
+    // A node with relays that greet by themselves holds a network change back a poll,
+    // so one move greets once (`MoveGreeting`).
+    let defers_moves = !watches.is_empty()
+        || runtime
+            .upgrade()
+            .is_some_and(|runtime| runtime.rnsd_reader().is_some());
+    let mut move_greeting = MoveGreeting::default();
+    let mut client_greeted_at: Option<tokio::time::Instant> = None;
     loop {
         let mut transitions = Vec::new();
         tokio::select! {
@@ -4292,6 +4302,12 @@ async fn watch_interfaces(
                         runtime.interface_transitions(),
                     ) => change,
                 };
+                let change = move_greeting.decide(
+                    change,
+                    defers_moves,
+                    client_greeted_at,
+                    tokio::time::Instant::now(),
+                );
                 if change.is_empty() {
                     continue;
                 }
@@ -4360,11 +4376,12 @@ async fn watch_interfaces(
                     });
                     tokio::select! {
                         () = cancel.cancelled() => return,
-                        outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
-                            warn!(
+                        outcome = runtime.announce_on_connect() => match outcome {
+                            Ok(()) => client_greeted_at = Some(tokio::time::Instant::now()),
+                            Err(err) => warn!(
                                 "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
                                 redact_hashes(&format!("{err:#}"))
-                            );
+                            ),
                         }
                     }
                 }
@@ -4373,6 +4390,9 @@ async fn watch_interfaces(
                         () = cancel.cancelled() => return,
                         greeting = greet(&runtime, greetings, Instant::now()) => greeting,
                     };
+                    if matches!(greeting, ReconnectGreeting::Announced) {
+                        client_greeted_at = Some(tokio::time::Instant::now());
+                    }
                     let line = reconnect_line(label, &greeting);
                     match &greeting {
                         ReconnectGreeting::Failed(err) => warn!(
