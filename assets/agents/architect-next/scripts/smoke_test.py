@@ -3391,8 +3391,10 @@ for name, (first, spent, more, key, ctx) in CAP_CASES.items():
     s.update(gates.parse_answer(s))
     picked = s.get("last_answer")
     s.update(gates.apply_answer(s))
-    check(f"headless: {name} guidance picks the continue option and dispatches the round",
-          picked == more and s["_next"] in ("fix_round", "batch_fix_route"), (picked, s["_next"]))
+    # a bare one-more pick on integration_red goes to the headless judge for its reason
+    expect = ("headless_judge",) if first["kind"] == "integration_red" else ("fix_round", "batch_fix_route")
+    check(f"headless: {name} guidance picks the continue option and dispatches the round, or asks the judge for a reason",
+          picked == more and s["_next"] in expect, (picked, s["_next"]))
 cc_ = {n: AA(c[0]["kind"], c[2], esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
 fr_ = {n: _lib.as_dict(v.get("fix_request")) for n, v in cc_.items()}
 check("apply_answer: integration_conflict continue -> a rebase fix round for the task, back to integration, one cycle before it asks again",
@@ -3406,6 +3408,68 @@ check("apply_answer: integration_red continue -> a fix round for the task (not a
 check("apply_answer: integration_red continue at Phase F -> a fix round back to integration_check",
       cc_["integration_red at Phase F"]["_next"] == "fix_round" and fr_["integration_red at Phase F"].get("return_to") == "integration_check"
       and cc_["integration_red at Phase F"].get("final_integration_strikes") == STRIKE_LIMIT, (cc_["integration_red at Phase F"]["_next"], fr_["integration_red at Phase F"]))
+
+
+def ledgered(u, line):
+    return any(line in d for d in u.get("decisions", []))
+
+
+for name in ("integration_red", "integration_red at Phase F"):
+    first, _, more, key, ctx = CAP_CASES[name]
+    s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
+    s.update(gates.parse_answer(s))
+    source = s.get("answer_source")
+    v = gates.apply_answer(s)
+    check(f"headless: {name} one more with no reason stated -> the headless judge, no continue counted, strikes unchanged",
+          source == "headless" and v["_next"] == "headless_judge"
+          and _lib.as_dict(_lib.as_dict(v.get("escalation")).get("data")).get("judge_fault")
+          and "cap_continues" not in v and "task_rounds" not in v and "final_integration_strikes" not in v
+          and ledgered(v, "integration_red: one more fix round picked by the headless with no reason stated -> headless judge"),
+          (source, v["_next"], v.get("decisions")))
+    s.update(v)
+    s.update({"reply_verdict": "option", "reply_option": more, "reply_reason": R82_JUDGE})
+    s.update(gates.interpret_route(s))
+    source = s.get("answer_source")
+    s.update(gates.apply_answer(s))
+    check(f"headless judge: {name} one more with its reason -> a fix round carrying the reason, one continue counted",
+          source == "judge" and s["_next"] == "fix_round" and any(R82_JUDGE in i for i in s["fix_request"]["items"])
+          and _lib.as_dict(s.get("cap_continues")).get(key) == 1, (source, s["_next"], s.get("cap_continues")))
+    v = AA(first["kind"], more, esc=first, cap_continues={}, answer_source="", **copy.deepcopy(ctx))
+    check(f"apply_answer: {name} owner one more with no reason stated -> a plain fix round, ledgered",
+          v["_next"] == "fix_round" and _lib.as_dict(v.get("cap_continues")).get(key) == 1
+          and ledgered(v, "integration_red: one more fix round with no reason stated -> plain fix round"), (v["_next"], v.get("decisions")))
+    s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
+    spent = next(iter(_lib.as_dict(gates.apply_answer({**s, **gates.parse_answer(s)}).get("judge_rulings"))), "")
+    v = AA(first["kind"], more, esc=first, cap_continues={}, answer_source="headless", judge_rulings={spent: STRIKE_LIMIT},
+           **copy.deepcopy(ctx))
+    check(f"apply_answer: {name} headless one more with the judge's rulings spent -> a plain fix round, ledgered",
+          spent and v["_next"] == "fix_round"
+          and ledgered(v, "integration_red: one more fix round with no reason stated -> plain fix round"), (spent, v["_next"]))
+s = base_state(escalation=e5, last_answer_text=HG, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"])
+s.update(gates.parse_answer(s))
+v = gates.apply_answer(s)
+check("headless: conformance_stuck one more with no reason stated -> the headless judge, conformance rounds unchanged",
+      s.get("answer_source") == "headless" and v["_next"] == "headless_judge" and "task_rounds" not in v
+      and _lib.as_dict(_lib.as_dict(v.get("escalation")).get("data")).get("judge_fault")
+      and ledgered(v, "conformance_stuck: one more fix round picked by the headless with no reason stated -> headless judge"),
+      (v["_next"], v.get("decisions")))
+s = base_state(escalation=e5, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"],
+               consult_result="CONSULT: ANSWER One more fix round (state reason)")
+s.update(gates.consult_route(s))
+v = gates.apply_answer(s)
+check("consult: conformance_stuck one more from the navigator with no reason stated -> the headless judge",
+      s.get("answer_source") == "navigator" and v["_next"] == "headless_judge"
+      and ledgered(v, "conformance_stuck: one more fix round picked by the navigator with no reason stated -> headless judge"),
+      (s.get("answer_source"), v["_next"]))
+rounds5 = _lib.as_int(_lib.as_dict(s5["task_rounds"]).get(T1, {}).get("conformance_rounds"))
+v = AA("conformance_stuck", "One more fix round (state reason)", esc=e5, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"],
+       answer_source="")
+check("apply_answer: conformance_stuck owner one more with no reason stated -> a plain fix round, ledgered",
+      v["_next"] == "compose_delegation" and v["task_rounds"][T1]["conformance_rounds"] == rounds5 + 1
+      and ledgered(v, "conformance_stuck: one more fix round with no reason stated -> plain fix round"), (v["_next"], v.get("decisions")))
+check("ask_dispatch and an owner reply clear answer_source",
+      gates.ask_dispatch(base_state(escalation=e5, answer_source="headless")).get("answer_source") == ""
+      and gates.parse_answer(base_state(escalation=e5, last_answer_text="1", answer_source="headless")).get("answer_source") == "")
 check("apply_answer: batch_strikeout continue -> batch_fix_route with the strikes one below the cap",
       cc_["batch_strikeout"]["_next"] == "batch_fix_route" and cc_["batch_strikeout"]["batch_state"]["B1"]["strikes"] == STRIKE_LIMIT - 1)
 v = AA("batch_strikeout", "One more batch round (state reason)", esc=E_BS, last_answer_text="1 - the flaky fixture is fixed now", cap_continues={},
@@ -3463,10 +3527,6 @@ def reviews(pr_state="OPEN", decision="", head="h2", reviews_=(), comments=(), t
 
 def review_keys(u):
     return sorted(k for k in u if k.startswith("review_"))
-
-
-def ledgered(u, line):
-    return any(line in d for d in u.get("decisions", []))
 
 
 RW = dict(pr_number="99", pr_tracking="review", tasks=ts_f, plan_path=PROMOTED)

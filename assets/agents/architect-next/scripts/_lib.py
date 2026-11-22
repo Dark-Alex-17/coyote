@@ -364,6 +364,7 @@ STATE_KEYS = (
     "leak_questions", "leak_unanswerable", "leak_pending_answers", "leak_owner_reason",
     "design_rounds", "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks",
     "choice_forced", "run_branch_override", "run_branch_override_group", "base_branch_override", "code_dir_override",
+    "answer_source",
 )
 
 
@@ -497,6 +498,7 @@ def raise_escalation(state, updates, esc):
     updates["reask_rounds"] = 0
     updates["reply_interpreted"] = False
     updates["answer_reason"] = ""
+    updates["answer_source"] = ""
     updates["_next"] = "escalate_gate"
     return updates
 

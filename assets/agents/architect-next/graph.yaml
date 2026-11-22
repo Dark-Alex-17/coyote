@@ -353,6 +353,7 @@ initial_state:
   reply_interpreted: false
   reply_source: ''
   answer_reason: ''
+  answer_source: ''
   judge_rulings: {}
   discussion: {}
   discussion_run_id: ''

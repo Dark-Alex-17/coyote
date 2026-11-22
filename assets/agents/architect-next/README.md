@@ -475,6 +475,9 @@ an option or an accepted instruction with its reason. `interpret_route` applies 
 records it in the autonomous digest and carries the reason into the round it starts; a ruling
 that names no offered option or gives no reason gets one more ruling, then the run stops
 blocked with the question. Each kind and task is ruled on at most `STRIKE_LIMIT` (3) times.
+A one-more fix round on `integration_red` or `conformance_stuck` picked with no reason stated
+goes to the judge for one when the headless default, the ladder or the navigator picked it and
+the judge has rulings left for the question; any other bare pick runs as a plain fix round.
 
 Verification commands the project cannot run as declared: a RED integration run (per task
 or at Phase F) hands the fix round the failing command and its exit. If the command cannot

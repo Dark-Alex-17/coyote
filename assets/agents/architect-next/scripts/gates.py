@@ -3335,7 +3335,7 @@ def ladder_route(state):
             line = f"{esc.get('kind')}: {choice} (basis: {basis})"
             u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line],
                       "autonomous_decisions": _autonomous_decisions(state, esc),
-                      "last_answer": choice, "last_answer_text": choice})
+                      "last_answer": choice, "last_answer_text": choice, "answer_source": "ladder"})
             ledger(state, u, f"autonomous: {line}")
             u["_next"] = "apply_answer"
             return u
@@ -3356,7 +3356,8 @@ def consult_route(state):
         said = m.group(1).strip()
         choice = match_option(said, esc.get("options") or []) or said
         # the navigator's words beside its pick stay in last_answer_text, where apply_answer reads a stated reason
-        u.update({"last_answer": choice, "last_answer_text": said, "autonomous_decisions": _autonomous_decisions(state, esc)})
+        u.update({"last_answer": choice, "last_answer_text": said, "autonomous_decisions": _autonomous_decisions(state, esc),
+                  "answer_source": "navigator"})
         ledger(state, u, f"consult: {esc.get('kind')}: {choice} (navigator)")
         u["_next"] = "apply_answer"
         return u
@@ -3390,6 +3391,7 @@ def ask_dispatch(state):
     u = {}
     esc = as_dict(state.get("escalation"))
     u["parked"] = esc.get("kind", "")
+    u["answer_source"] = ""
     snapshot(state, u, "parked")
     _slack_ping(state, f"architect run paused: {esc.get('kind')} - {tail(esc.get('question', ''), 120)} (run {state.get('run_id')})")
     if OWNER_REMOTE_INPUT and truthy(state.get("top_level")) and truthy(state.get("owner_away")):
@@ -3499,10 +3501,18 @@ def parse_answer(state):
                              f"option: {tail(choice, 200)}")
         else:
             choice = text
-    u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False, "answer_reason": ""})
+    u.update({"last_answer": choice, "last_answer_text": text, "parked": "", "reply_interpreted": False, "answer_reason": "",
+              "answer_source": "headless" if headless else ""})
     ledger(state, u, f"decision: {esc.get('kind')}: {tail(choice, 300)}")
     u["_next"] = "apply_answer"
     return u
+
+
+def _judge_key(esc):
+    """The question's key in judge_rulings: kind, task and a hash of the question as first asked."""
+    asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
+    return (f"{esc.get('kind', '')}:{as_dict(esc.get('data')).get('task') or ''}:"
+            f"{hashlib.sha1(asked.encode('utf-8', 'replace')).hexdigest()[:8]}")
 
 
 def _to_headless_judge(state, u, esc):
@@ -3510,8 +3520,7 @@ def _to_headless_judge(state, u, esc):
     question, so a run whose judge keeps going on cannot loop forever."""
     kind = esc.get("kind", "")
     asked = as_dict(esc.get("data")).get("asked") or esc.get("question", "")
-    key = (f"{kind}:{as_dict(esc.get('data')).get('task') or ''}:"
-           f"{hashlib.sha1(asked.encode('utf-8', 'replace')).hexdigest()[:8]}")
+    key = _judge_key(esc)
     rulings = dict(as_dict(state.get("judge_rulings")))
     if as_int(rulings.get(key)) >= STRIKE_LIMIT:
         ledger(state, u, f"headless judge: {kind}: already decided {rulings[key]} times -> stop and report")
@@ -3702,7 +3711,7 @@ def _judge_route(state, u, esc, verdict, shape):
     line = f"{kind}: {answer} (basis: headless judge: {reason})"
     u.update({"autonomous_digest": list(as_list(state.get("autonomous_digest"))) + [line], "last_answer": answer,
               "last_answer_text": (state.get("last_answer_text") or "").strip(), "parked": "", "reply_interpreted": False,
-              "answer_reason": reason})
+              "answer_reason": reason, "answer_source": "judge"})
     ledger(state, u, f"headless judge: {kind}: {how}: {reason}")
     ledger(state, u, f"decision: {kind}: {tail(answer, 300)}")
     u["_next"] = "apply_answer"
@@ -4015,6 +4024,28 @@ def _with_reason(request, reason):
     if reason:
         request["items"] = list(request["items"]) + [f"Reason given for one more round: {trim_items(reason, 300)}"]
     return request
+
+
+ONE_MORE_NO_REASON = ("the one-more option was taken with no reason stated; pick it again with the reason it should "
+                      "land this time, or another option")
+
+
+def _one_more_to_judge(state, u, esc, answer, options):
+    """Route a one-more fix round picked with no reason to the headless judge when the headless default, the ladder
+    or the navigator picked it and the judge has rulings left for the question; True when routed. Any other bare pick
+    is ledgered and runs as a plain fix round."""
+    if _owner_reason(state, answer, options):
+        return False
+    kind, source = esc.get("kind", ""), state.get("answer_source") or ""
+    if (source in ("headless", "ladder", "navigator")
+            and as_int(as_dict(state.get("judge_rulings")).get(_judge_key(esc))) < STRIKE_LIMIT):
+        fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": ONE_MORE_NO_REASON}}
+        u["escalation"] = fixed
+        ledger(state, u, f"{kind}: one more fix round picked by the {source} with no reason stated -> headless judge")
+        _to_headless_judge(state, u, fixed)
+        return True
+    ledger(state, u, f"{kind}: one more fix round with no reason stated -> plain fix round")
+    return False
 
 
 def _integration_round(state, u, esc, answer, options, task):
@@ -4368,18 +4399,19 @@ def apply_answer(state):
             u["failure_reason"] = f"stopped: {task.get('id')} fails conformance after the re-run"
             u["_next"] = "end_blocked"
         elif choice.startswith("one more"):
-            reason = _owner_reason(state, answer, options)
-            rounds = dict(as_dict(state.get("task_rounds")))
-            tr = rounds.setdefault(task.get("id", ""), {})
-            tr["conformance_rounds"] = as_int(tr.get("conformance_rounds")) + 1
-            u["task_rounds"] = rounds
-            ledger(state, u, f"conformance: {task.get('id')}: one more fix round ({tr['conformance_rounds']} so far)"
-                             + (f": {trim_items(reason, 300)}" if reason else ""))
-            u.update({"delegation_kind": "fix", "fix_source": "review", "fix_return_to": "verify",
-                      "fix_items": as_list(data.get("findings"))
-                      or [l[2:] for l in esc.get("evidence", "").splitlines() if l.startswith("- ")],
-                      "fix_note": "One more fix round at the user's request." + (f" Their reason: {reason}" if reason else "")})
-            u["_next"] = "compose_delegation"
+            if not _one_more_to_judge(state, u, esc, answer, options):
+                reason = _owner_reason(state, answer, options)
+                rounds = dict(as_dict(state.get("task_rounds")))
+                tr = rounds.setdefault(task.get("id", ""), {})
+                tr["conformance_rounds"] = as_int(tr.get("conformance_rounds")) + 1
+                u["task_rounds"] = rounds
+                ledger(state, u, f"conformance: {task.get('id')}: one more fix round ({tr['conformance_rounds']} so far)"
+                                 + (f": {trim_items(reason, 300)}" if reason else ""))
+                u.update({"delegation_kind": "fix", "fix_source": "review", "fix_return_to": "verify",
+                          "fix_items": as_list(data.get("findings"))
+                          or [l[2:] for l in esc.get("evidence", "").splitlines() if l.startswith("- ")],
+                          "fix_note": "One more fix round at the user's request." + (f" Their reason: {reason}" if reason else "")})
+                u["_next"] = "compose_delegation"
         elif choice.startswith("accept"):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) conformance findings accepted unresolved at the user's say-so"]
             u["_next"] = "post_round"
@@ -4489,7 +4521,8 @@ def apply_answer(state):
         a = ("abort" if abort else "stop" if stop
              else _picked_key(answer, options, {"round": ["one more", "cycle", "round"], "abort": ["abort"], "stop": ["stop"]}))
         if a == "round":
-            _integration_round(state, u, esc, answer, options, task)
+            if kind == "integration_conflict" or not _one_more_to_judge(state, u, esc, answer, options):
+                _integration_round(state, u, esc, answer, options, task)
         elif a == "abort":
             task["status"] = "failed"
             save_tasks(state, u, tasks)
