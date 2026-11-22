@@ -114,14 +114,17 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   (a directory ends in `/`). The record gains `carried`: `all`, `matched`, `new` and `unlocated`.
   `all` is true only when the output was not trimmed, is under 4 MB, locates at least one failure,
   has no failure line that names no repo path, and every located failure's paths exactly equal a
-  carried item's; a failing file inside a carried directory is a new failure. A run whose
+  carried item's; a failing file inside a carried directory is a new failure. Matching is per
+  location (a file, or a directory when the output names only that), so a further failure at a
+  carried location is not told apart from the carried one; the owner's own gate still has to see
+  that location green. A run whose
   `carried.all` is true is listed under `Advisory red runs (not blocking):` as every failure being
   one the caller declared carried, grouped by owner, unless a criterion naming the command ends
   neither MET nor INSPECTED, which blocks and names those criteria and statuses. A run only partly
   carried blocks as a regression, and its complaint adds the failures not declared carried and the
-  count of unlocated failure lines. When the parser cannot be imported or git cannot list the
-  files, the record gets a `carried_note` instead, rendered as an advisory line, and blocks as if
-  nothing were carried.
+  count of unlocated failure lines. When the parser cannot be loaded, git cannot list the files
+  or the run's deadline is spent, the record gets a `carried_note` instead, rendered as an
+  advisory line, and blocks as if nothing were carried.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
   criterion checks judge the criteria it covers like an execution criterion no recorded run covers
   (below), naming the command and that it was skipped for time. The report's `Criteria:` line
@@ -292,8 +295,8 @@ stay red in this change and owed elsewhere: `{"paths": [...], "owner": ..., "evi
 items, where `paths` are repo paths (a directory ends in `/`), `owner` is a display label and
 `evidence` is optional. It sits on the same trust boundary as `verification_commands` and is
 never read from the prompt; `review-gauntlet` forwards its own the same way. Unlike
-`verification_commands`, a value that is not a JSON array is treated as none and reported as a
-`carried_error` advisory line, not a `PIPELINE-FAULT`; items without a non-empty list of string
+`verification_commands`, a value that is not a JSON array is treated as none and reported under
+`Carried failures input:`, not as a `PIPELINE-FAULT`; items without a non-empty list of string
 paths are dropped and counted in that line.
 
 - `'[]'` (or omitted) gives the "none declared" marker; execution criteria are at best INSPECTED,

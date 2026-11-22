@@ -53,7 +53,9 @@ variables:
       change and owed elsewhere, each {"paths": [repo paths, a directory
       ending in "/"], "owner": display label, "evidence": optional text};
       forwarded to the adversary lane, whose red run made only of these
-      failures is advisory. Never inferred from the prompt.
+      failures is advisory when every criterion naming the command is met
+      (matching is per location; a value that is not a JSON array counts as
+      none). Never inferred from the prompt.
     default: '[]'
 
 settings:

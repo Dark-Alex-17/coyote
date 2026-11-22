@@ -8448,6 +8448,8 @@ mod tests {
     /// the installed tree, not the source tree, is what production runs.
     /// A dot-directory the embed or the installer skipped would leave every
     /// gauntlet BLOCKED with `GAUNTLET_REVIEW_INCOMPLETE: debris`.
+    /// The adversary's run_checks imports `failure_locations.py` from the
+    /// same directory; without it, carried failures are never matched.
     #[test]
     #[serial]
     fn install_builtin_agents_ships_the_shared_debris_lint_the_review_graphs_import() {

@@ -31,7 +31,10 @@ bounded wait (STACK_LOCK_WAIT_SECS = 1200s) gives up, the pre-run tree
 capture (below) gets SNAPSHOT_GIT_TIMEOUT_SECS = 120s of its own, and the
 deadline starts when it ends, so the capture never takes time from the
 declared commands. The run_checks node's 4600s timeout covers 1200 + 120 +
-3120 plus margin for the baseline worktree cleanup. Without the deadline, a
+3120 plus margin for the baseline worktree cleanup and for the carried-failure
+matching below, which starts a record only while the deadline has time left
+and gives each of its two git calls at least GATE_CALL_MIN_TIMEOUT_SECS.
+Without the deadline, a
 handful of hanging commands (4 x 900s) would blow the NODE timeout and the
 executor would kill this script from OUTSIDE -- the
 in-script degradation would never fire. Each command gets
@@ -145,9 +148,11 @@ the repository, untracked included. The record gains `carried`: {"all",
 trimmed, is under CARRIED_OUTPUT_CAP bytes, locates at least one failure,
 has no failure line naming no repo path, and every located failure's paths
 exactly equal a carried item's; a new failure inside a carried directory is
-new. When the parser cannot be imported or git cannot list the files, the
+new. Matching is per location, so a further failure at a carried location is
+not told apart; the owner's own gate still has to see it green. When the
+parser cannot be loaded or git cannot list the files, the
 record gets a `carried_note` instead and is judged as if nothing were
-carried.
+carried; so does every record the deadline leaves no time to match.
 """
 
 import hashlib
@@ -186,6 +191,7 @@ GATE_CALL_MIN_TIMEOUT_SECS = 10
 BASE_RUN_FORMAT = 1
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 CARRIED_OUTPUT_CAP = 4 * 1024 * 1024
+CARRIED_DEADLINE_NOTE = "the run's deadline was spent"
 TREE_STATE_NOTE = (
     "candidate tree dirty: red only in the live tree; the same content on a clean checkout exits 0"
 )
@@ -824,37 +830,44 @@ def carried_candidate(record):
     )
 
 
-def attach_carried(results, outputs, carried, proj):
+def attach_carried(results, outputs, carried, proj, deadline):
     """Give every candidate red record `carried`, its located failures matched by exact key
-    against the `carried` items, or a `carried_note` saying why they could not be matched."""
+    against the `carried` items, or a `carried_note` saying why they could not be matched.
+    Matching stops at the deadline; the records it did not reach get a note."""
     candidates = [i for i, r in enumerate(results) if carried_candidate(r)]
     if not candidates:
         return
 
-    def unmatched(why):
-        for i in candidates:
+    def unmatched(why, todo=candidates):
+        for i in todo:
             results[i]["carried_note"] = f"not matched: {why}"
 
+    if left(deadline) <= 0:
+        unmatched(CARRIED_DEADLINE_NOTE)
+        return
     if SHARED_DIR not in sys.path:
         sys.path.insert(0, SHARED_DIR)
     try:
         import failure_locations
-    except ImportError as e:
+    except Exception as e:  # noqa: BLE001 -- a broken locator leaves the records judged as uncarried
         unmatched(f"the failure locator is unavailable ({e})")
         return
     try:
-        root = git_text(["rev-parse", "--show-toplevel"], proj, GIT_CLEANUP_TIMEOUT_SECS)
+        root = git_text(["rev-parse", "--show-toplevel"], proj, max(left(deadline), GATE_CALL_MIN_TIMEOUT_SECS))
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         unmatched(f"the project's git repository could not be read: {e}")
         return
-    index = failure_locations.repo_index(root)
+    index = failure_locations.repo_index(root, max(left(deadline), GATE_CALL_MIN_TIMEOUT_SECS))
     if index is None:
         unmatched("git could not list the repository's files")
         return
     by_key = {}
     for item in carried:
-        by_key.setdefault(failure_locations.failure_key(item["paths"]), item)
-    for i in candidates:
+        by_key.setdefault(failure_locations.failure_key(sorted(item["paths"])), item)
+    for n, i in enumerate(candidates):
+        if left(deadline) <= 0:
+            unmatched(CARRIED_DEADLINE_NOTE, candidates[n:])
+            return
         results[i].update(match_carried(failure_locations, root, index, outputs[i], by_key))
 
 
@@ -875,7 +888,7 @@ def match_carried(locator, root, index, path, by_key):
     unlocated = locator.unlocated_failure_lines(root, text, index)
     matched, new = [], []
     for f in located:
-        item = by_key.get(locator.failure_key(f["paths"]))
+        item = by_key.get(locator.failure_key(sorted(f["paths"])))
         if item is None:
             new.append(f["paths"])
         elif all(m["paths"] != item["paths"] for m in matched):
@@ -918,7 +931,8 @@ def main():
                         "execution criteria (build/test/lint) cannot be independently "
                         "confirmed. Declare the exact commands via the "
                         "verification_commands variable to get recorded runs."
-                    )
+                    ),
+                    **({"carried_error": carried_error} if carried_error else {}),
                 }
             )
         )
@@ -952,7 +966,7 @@ def main():
                     r["baseline"] = not_run(f"baseline comparison unavailable: {e}")
         if carried:
             try:
-                attach_carried(results, outputs, carried, proj)
+                attach_carried(results, outputs, carried, proj, deadline)
             except Exception as e:  # noqa: BLE001 -- a matching failure leaves the records judged as uncarried
                 for r in results:
                     if carried_candidate(r):

@@ -332,7 +332,9 @@ verbatim.
   `{"paths", "owner", "evidence"}` items) rides the same passthrough: failures
   the caller declares expected to stay red in this change and owed elsewhere.
   The adversary lane reports a red run whose every failure exactly matches a
-  carried item's paths as advisory; a new failure beside them still blocks.
+  carried item's paths as advisory when every criterion naming the command is
+  met; a new failure beside them still blocks. A value that is not a JSON
+  array counts as none and is reported as a note.
 - Signals failures degrade WIDER: if git can't compute the diff, the surface
   is unknown — the security lane is added (and probe, when a local-run recipe
   exists) on top of caller context + forced lanes, and the report notes it.
