@@ -39,7 +39,7 @@ const PICKER_HEADER: &str = "Threads  Enter = open  Esc = back";
 const CHECKPOINT_NOTE: &str =
     "Read-only. Tool calls show live; replies show up at the child's next checkpoint.";
 const ROOT_THREAD: &str = "root thread";
-const COMPRESSED_DIVIDER: &str = "(earlier rounds, compressed)";
+pub(super) const COMPRESSED_DIVIDER: &str = "(earlier rounds, compressed)";
 /// The largest child session file the pager reads; a bigger one is
 /// reported rather than parsed.
 const CHILD_FILE_LIMIT: u64 = 16 * 1024 * 1024;
@@ -130,12 +130,21 @@ pub(super) fn load_child(file: &Path, ctx: &RequestContext) -> Result<Vec<ChildE
         );
     }
     let session = Session::load_from_path(file, ctx.model.clone(), ctx, &ctx.app.config)?;
-    let mut shown = entries(session.compressed_messages());
+    Ok(session_entries(
+        session.compressed_messages(),
+        session.messages(),
+    ))
+}
+
+/// The entries of a session's compressed rounds, headed by their divider,
+/// then those of its live messages.
+pub(super) fn session_entries(compressed: &[Message], active: &[Message]) -> Vec<ChildEntry> {
+    let mut shown = entries(compressed);
     if !shown.is_empty() {
         shown.insert(0, ChildEntry::Compressed);
     }
-    shown.extend(entries(session.messages()));
-    Ok(shown)
+    shown.extend(entries(active));
+    shown
 }
 
 /// The lines of a text entry. A tool call is drawn from its row instead,
@@ -150,7 +159,7 @@ fn entry_lines(entry: &ChildEntry, width: u16, renderer: &mut Renderer) -> Vec<L
 }
 
 /// A saved call's row text, as a live row of the same call has it.
-fn entry_summary(name: &str, args: &str) -> String {
+pub(super) fn entry_summary(name: &str, args: &str) -> String {
     format!("{name} {args}")
 }
 

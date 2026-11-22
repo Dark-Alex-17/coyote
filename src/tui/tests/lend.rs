@@ -155,6 +155,47 @@ fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
     assert_eq!(lent.load(Ordering::SeqCst), 2);
 }
 
+/// Under the TUI a resumed session's history, which `.session` and
+/// `.agent` replay, goes to the loop as rows rather than printed into the
+/// command's capture; the transcript shows every message under the
+/// divider. With no TUI the replay hands nothing over.
+#[test]
+#[serial]
+fn a_replayed_history_under_the_tui_goes_to_the_transcript_as_rows() {
+    use crate::client::{Message, MessageContent, MessageRole};
+    let ctx = chat_ctx();
+    let text = |role, text: &str| Message::new(role, MessageContent::Text(text.to_string()));
+    let compressed = [text(MessageRole::User, "an early question e1q")];
+    let active = [
+        text(MessageRole::User, "the last question q4r"),
+        text(MessageRole::Assistant, "the last answer a9z"),
+    ];
+    assert!(!crate::tui::show_history(&compressed, &active));
+
+    let (tx, mut rx) = unbounded_channel();
+    let owner = OwnerGuard::tui(tx);
+    crate::repl::replay::render(&ctx.app.config, &compressed, &active).unwrap();
+    drop(owner);
+    let msg = rx.try_recv().expect("the history did not reach the loop");
+    assert!(
+        matches!(&msg, UiMsg::History(entries) if entries.len() == 4),
+        "{msg:?}"
+    );
+
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.handle_msg(msg);
+    let frame = harness.draw();
+    for shown in [
+        "(earlier rounds, compressed)",
+        "> an early question e1q",
+        "> the last question q4r",
+        "the last answer a9z",
+        crate::tui::transcript::HISTORY_DIVIDER,
+    ] {
+        assert!(frame.contains(shown), "{shown:?} is not shown:\n{frame}");
+    }
+}
+
 /// Under the TUI `.copy` hands the reply to the loop, which copies it
 /// over the screen's descriptor, rather than writing an OSC 52 request
 /// into the turn's capture; the app keeps it for the loop to take.

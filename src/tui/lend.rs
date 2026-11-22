@@ -1,4 +1,6 @@
+use super::pager::session_entries;
 use super::sink::{LendJob, UiMsg};
+use crate::client::Message;
 use crate::events::NoticeKind;
 use anyhow::{Result, anyhow, bail};
 use std::process::Stdio;
@@ -189,6 +191,19 @@ pub(crate) fn notice(kind: NoticeKind, text: String) -> bool {
 pub(crate) fn request_copy(text: &str) -> bool {
     match owner() {
         Owner::Tui(lender) => lender.tx.send(UiMsg::Copy(text.to_string())).is_ok(),
+        Owner::Shell => false,
+    }
+}
+
+/// Hands a resumed session's history to the loop to show in the
+/// transcript, from anywhere in the process; the rows are built here, off
+/// the loop. False when no UI is running to show it.
+pub(crate) fn show_history(compressed: &[Message], active: &[Message]) -> bool {
+    match owner() {
+        Owner::Tui(lender) => lender
+            .tx
+            .send(UiMsg::History(session_entries(compressed, active)))
+            .is_ok(),
         Owner::Shell => false,
     }
 }

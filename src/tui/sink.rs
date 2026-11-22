@@ -3,6 +3,7 @@
 //! UI loop's inbox. A question for the human goes the same way and blocks
 //! the asking thread on a std channel until the modal answers.
 
+use super::pager::ChildEntry;
 use super::run_now::CommandOutput;
 use crate::client::SseEvent;
 use crate::config::AppConfig;
@@ -128,6 +129,9 @@ pub(crate) enum UiMsg {
     /// Text `.copy` puts on the clipboard. Fd 1 is a turn's capture pipe,
     /// so the loop copies it over the screen's descriptor as Alt+C does.
     Copy(String),
+    /// A resumed session's history, which the REPL prints on `.session`
+    /// and `.agent`; the transcript shows it as rows instead.
+    History(Vec<ChildEntry>),
     /// A child agent wrote its session file.
     ChildTranscriptFlushed {
         session_id: String,

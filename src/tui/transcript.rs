@@ -8,6 +8,7 @@ use super::cells::{
     self, AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTail, TaskRow, ToolStatus,
     append_output,
 };
+use super::pager::{COMPRESSED_DIVIDER, ChildEntry, entry_summary};
 use super::render::{RenderCache, Renderer};
 use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
 use crate::config::CommandPrefix;
@@ -18,11 +19,17 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::time::Instant;
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 /// Lines one wheel notch moves the view.
 pub(super) const WHEEL_LINES: i32 = 1;
+/// The rows a cell above the view counts as until the view first reaches
+/// it and lays it out.
+const UNLAID_ROWS: usize = 1;
+/// The line under a resumed session's history, as the REPL prints it.
+pub(super) const HISTORY_DIVIDER: &str = "--- previous conversation ---";
 
 /// The screen rows one cell took in the last frame, counted from the
 /// view's top row.
@@ -41,6 +48,36 @@ struct Anchor {
     cell: usize,
     row: usize,
     gap: bool,
+}
+
+/// How many rows a cell took when it was last laid out, and for what: the
+/// cell's revision, the width and the room a greeting was given.
+#[derive(Clone, Copy)]
+struct LaidOut {
+    revision: u64,
+    width: u16,
+    room: Option<u16>,
+    rows: usize,
+}
+
+/// Where a frame's view sits: each cell's first line, the line count,
+/// the offset from the bottom and the lines it shows.
+struct Placement {
+    headers: Vec<usize>,
+    total: usize,
+    offset: usize,
+    start: usize,
+    end: usize,
+}
+
+impl Placement {
+    /// The cell holding the view's top line, or the one above the gap a
+    /// view starting on a gap shows.
+    fn first_cell(&self) -> usize {
+        self.headers
+            .partition_point(|header| *header <= self.start)
+            .saturating_sub(1)
+    }
 }
 
 pub(super) struct Transcript {
@@ -93,6 +130,10 @@ pub(super) struct Transcript {
     /// share one, so a cell laid out at some revision is known to read
     /// the same while it keeps it, wherever it has moved to.
     revisions: Vec<u64>,
+    /// What each cell took when last laid out, by index; an entry whose
+    /// revision is not its cell's is stale. Cells above the view are laid
+    /// out only once the view reaches them.
+    laid_out: Vec<Option<LaidOut>>,
     /// The bytes every call's whole output in the cells keeps.
     full_output_bytes: usize,
 }
@@ -118,6 +159,7 @@ impl Transcript {
             last_area: Rect::ZERO,
             generation: 1,
             revisions: vec![1],
+            laid_out: Vec::new(),
             full_output_bytes: 0,
         }
     }
@@ -233,6 +275,35 @@ impl Transcript {
         let revision = self.next_revision();
         self.revisions.push(revision);
         self.cells.push(cell);
+    }
+
+    /// Appends a resumed session's history, as the REPL prints it on
+    /// resuming: every line, reply and saved call, as rows like the live
+    /// ones, then a divider. Nothing is appended for an empty history.
+    pub(super) fn push_history(&mut self, entries: Vec<ChildEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        for entry in entries {
+            let cell = match entry {
+                ChildEntry::Compressed => {
+                    Cell::notice(NoticeKind::Compress, COMPRESSED_DIVIDER.to_string())
+                }
+                ChildEntry::User(text) => Cell::user(&text),
+                ChildEntry::Assistant(text) => Cell::assistant(text, true),
+                ChildEntry::Tool {
+                    call_id,
+                    name,
+                    args,
+                    output,
+                } => Cell::recorded_tool(call_id, entry_summary(&name, &args), &output),
+            };
+            self.push(cell);
+        }
+        self.push(Cell::notice(
+            NoticeKind::Checkpoint,
+            HISTORY_DIVIDER.to_string(),
+        ));
     }
 
     /// Appends the cell a reply streams into and remembers where it is.
@@ -566,56 +637,51 @@ impl Transcript {
         let previous = std::mem::replace(&mut self.last_area, area);
         let resized = area.width != previous.width;
         let centre = self.welcome_only();
-        // A blank line separates each cell from the one before; `headers`
-        // holds the line each cell starts on.
-        let mut cell_lines = Vec::with_capacity(self.cells.len());
-        let mut headers: Vec<usize> = Vec::with_capacity(self.cells.len());
-        let mut total = 0;
         let room = centre.then_some(area.height);
-        for cell in &mut self.cells {
-            if !headers.is_empty() {
-                total += 1;
+        let count = self.cells.len();
+        self.laid_out.resize(count, None);
+        // Only the cells from the view's top line down are laid out. One
+        // further up counts the rows it took when last laid out at this
+        // width, or `UNLAID_ROWS` until the view first reaches it, so a
+        // long history costs what is on screen rather than all of it. The
+        // view is placed again with every cell it reaches laid out, until
+        // it reaches no cell that is not.
+        let mut exact_from = count;
+        let mut frame_lines: Vec<(usize, Vec<Line<'static>>)> = Vec::new();
+        let placement = loop {
+            let mut rows = Vec::with_capacity(count);
+            for index in 0..count {
+                rows.push(match self.rows_laid_out(index, area.width, room) {
+                    Some(rows) => rows,
+                    None if index >= exact_from => {
+                        self.lay_out(index, area.width, room, renderer, &mut frame_lines)
+                    }
+                    None => UNLAID_ROWS,
+                });
             }
-            headers.push(total);
-            let lines = cell.cached_lines(area.width, room, renderer);
-            total += lines.len();
-            cell_lines.push(lines);
-        }
-
-        let height = usize::from(area.height);
-        // A new width re-wraps every cell, so a row inside one no longer
-        // names the same text; the offset is kept as it was instead.
-        if self.offset_from_bottom > 0 && !resized {
-            match self.anchor.and_then(|anchor| anchor.line(&headers, total)) {
-                Some(top) => {
-                    self.offset_from_bottom = anchored_offset(
-                        self.last_offset,
-                        self.offset_from_bottom,
-                        top + usize::from(previous.height),
-                        total,
-                    );
-                }
-                None => self.offset_from_bottom += total.saturating_sub(self.last_total),
+            let placement = self.place(&rows, area, previous, resized, centre);
+            let first = placement.first_cell();
+            if first >= exact_from
+                || (first..exact_from)
+                    .all(|index| self.rows_laid_out(index, area.width, room).is_some())
+            {
+                break placement;
             }
-        }
+            exact_from = first;
+        };
+        let Placement {
+            headers,
+            total,
+            offset,
+            start,
+            end,
+        } = placement;
         self.last_total = total;
-        self.offset_from_bottom = self.offset_from_bottom.min(total.saturating_sub(height));
-        if std::mem::take(&mut self.reveal_focus)
-            && let Some(header) = self.focus.map(|focus| headers[focus])
-        {
-            self.offset_from_bottom = revealed(self.offset_from_bottom, header, total, height);
-        }
+        self.offset_from_bottom = offset;
+        self.reveal_focus = false;
         if self.offset_from_bottom == 0 {
             self.unseen = 0;
         }
-        let end = total - self.offset_from_bottom;
-        // A greeting taller than the area keeps its top, where the
-        // wordmark is; the render clips its bottom.
-        let start = if centre {
-            0
-        } else {
-            end.saturating_sub(height)
-        };
         self.last_offset = self.offset_from_bottom;
         self.anchor = headers
             .partition_point(|header| *header <= start)
@@ -636,14 +702,17 @@ impl Transcript {
         let mut lines = Vec::with_capacity(end - start);
         self.last_layout.clear();
         let first = self.anchor.map_or(0, |anchor| anchor.cell);
-        for (index, cell_rows) in cell_lines.iter().enumerate().skip(first) {
-            let header = headers[index];
+        for (index, &header) in headers.iter().enumerate().skip(first) {
             if header > end {
                 break;
             }
             if index > 0 && header > start {
                 lines.push(Line::default());
             }
+            let cell_rows = match frame_lines.iter().position(|(at, _)| *at == index) {
+                Some(at) => Cow::Owned(frame_lines.swap_remove(at).1),
+                None => self.cells[index].cached_lines(area.width, room, renderer),
+            };
             let from = start.saturating_sub(header);
             let to = cell_rows.len().min(end - header);
             if from >= to {
@@ -674,6 +743,109 @@ impl Transcript {
             lines,
             centre,
             chip,
+        }
+    }
+
+    /// The rows cell `index` took when laid out for `width` and `room`,
+    /// if it has been since it last changed.
+    fn rows_laid_out(&self, index: usize, width: u16, room: Option<u16>) -> Option<usize> {
+        let laid_out = self.laid_out.get(index).copied().flatten()?;
+        (laid_out.revision == self.revisions[index]
+            && laid_out.width == width
+            && laid_out.room == room)
+            .then_some(laid_out.rows)
+    }
+
+    /// Lays cell `index` out and returns its rows. A cell whose lines are
+    /// drawn anew each frame (a streaming reply) is not remembered as laid
+    /// out; its lines for this frame are kept in `frame_lines` instead.
+    fn lay_out(
+        &mut self,
+        index: usize,
+        width: u16,
+        room: Option<u16>,
+        renderer: &mut Renderer,
+        frame_lines: &mut Vec<(usize, Vec<Line<'static>>)>,
+    ) -> usize {
+        if let Some((_, lines)) = frame_lines.iter().find(|(at, _)| *at == index) {
+            return lines.len();
+        }
+        match self.cells[index].cached_lines(width, room, renderer) {
+            Cow::Borrowed(lines) => {
+                let rows = lines.len();
+                self.laid_out[index] = Some(LaidOut {
+                    revision: self.revisions[index],
+                    width,
+                    room,
+                    rows,
+                });
+                rows
+            }
+            Cow::Owned(lines) => {
+                let rows = lines.len();
+                frame_lines.push((index, lines));
+                rows
+            }
+        }
+    }
+
+    /// Places the view over cells of `rows` each. A blank line separates
+    /// each cell from the one before. A scrolled view is held on the line
+    /// the last frame started on; a new width re-wraps every cell, so a
+    /// row inside one no longer names the same text, and the offset is
+    /// kept as it was instead.
+    fn place(
+        &self,
+        rows: &[usize],
+        area: Rect,
+        previous: Rect,
+        resized: bool,
+        centre: bool,
+    ) -> Placement {
+        let mut headers = Vec::with_capacity(rows.len());
+        let mut total = 0;
+        for &cell_rows in rows {
+            if !headers.is_empty() {
+                total += 1;
+            }
+            headers.push(total);
+            total += cell_rows;
+        }
+        let height = usize::from(area.height);
+        let mut offset = self.offset_from_bottom;
+        if offset > 0 && !resized {
+            match self.anchor.and_then(|anchor| anchor.line(&headers, total)) {
+                Some(top) => {
+                    offset = anchored_offset(
+                        self.last_offset,
+                        offset,
+                        top + usize::from(previous.height),
+                        total,
+                    );
+                }
+                None => offset += total.saturating_sub(self.last_total),
+            }
+        }
+        offset = offset.min(total.saturating_sub(height));
+        if self.reveal_focus
+            && let Some(header) = self.focus.map(|focus| headers[focus])
+        {
+            offset = revealed(offset, header, total, height);
+        }
+        let end = total - offset;
+        // A greeting taller than the area keeps its top, where the
+        // wordmark is; the render clips its bottom.
+        let start = if centre {
+            0
+        } else {
+            end.saturating_sub(height)
+        };
+        Placement {
+            headers,
+            total,
+            offset,
+            start,
+            end,
         }
     }
 
@@ -1328,6 +1500,126 @@ mod tests {
         assert_eq!(transcript.unseen, 2);
         transcript.truncate(5);
         assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Thousands of resumed messages of the shape a long session holds.
+    fn long_history(exchanges: usize) -> Vec<ChildEntry> {
+        (0..exchanges)
+            .flat_map(|n| {
+                [
+                    ChildEntry::User(format!("question {n}")),
+                    ChildEntry::Tool {
+                        call_id: format!("call-{n}"),
+                        name: "fs_read".to_string(),
+                        args: format!("{{\"path\":\"notes-{n}.md\"}}"),
+                        output: format!("line one of {n}\nline two of {n}\n"),
+                    },
+                    ChildEntry::Assistant(format!(
+                        "**Answer {n}**: a reply long enough to wrap onto a second row at forty \
+                         columns, with `code` in it.\n\n- a list item\n- another"
+                    )),
+                ]
+            })
+            .collect()
+    }
+
+    /// A long resumed history lays out only the cells the view reaches:
+    /// the first frame costs a screenful, not the whole history, and is
+    /// drawn in bounded time.
+    #[test]
+    fn a_long_history_lays_out_only_what_the_view_reaches() {
+        let (mut transcript, mut renderer) = transcript();
+        let started = Instant::now();
+        transcript.push_history(long_history(5_000));
+        let view = transcript.view(area(10), &mut renderer);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "15,000 messages took {elapsed:?} to first frame"
+        );
+        let laid_out = (0..transcript.len())
+            .filter(|&index| transcript.rows_laid_out(index, 40, None).is_some())
+            .count();
+        assert!(
+            laid_out < 20,
+            "{laid_out} cells were laid out for one screen"
+        );
+        let Cell::User { cache, .. } = &transcript.cells[0] else {
+            panic!("the history does not start with its first line");
+        };
+        assert!(
+            cache.peek(40).is_none(),
+            "the first message was wrapped for a frame that never shows it"
+        );
+        let shown = rows(&view);
+        assert!(
+            shown.iter().any(|row| row.contains(HISTORY_DIVIDER)),
+            "{shown:#?}"
+        );
+        assert!(
+            shown.iter().any(|row| row.contains("another")),
+            "{shown:#?}"
+        );
+    }
+
+    /// Paging up through a long resumed history reaches its very first
+    /// message, the view moving up every page, and stops there.
+    #[test]
+    fn paging_up_a_long_history_reaches_its_first_message() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push_history(long_history(1_000));
+        transcript.view(area(10), &mut renderer);
+        let mut pages = 0;
+        let mut last_offset = 0;
+        let top = loop {
+            transcript.scroll_page(-1);
+            let view = transcript.view(area(10), &mut renderer);
+            pages += 1;
+            if transcript.offset_from_bottom == last_offset {
+                break rows(&view);
+            }
+            last_offset = transcript.offset_from_bottom;
+            assert!(pages < 10_000, "paging never reached the top");
+        };
+        assert_eq!(
+            top.first().map(String::as_str),
+            Some("> question 0"),
+            "{top:#?}"
+        );
+        assert!(pages > 100, "a history this long cannot fit {pages} pages");
+        let laid_out = (0..transcript.len())
+            .filter(|&index| transcript.rows_laid_out(index, 40, None).is_some())
+            .count();
+        assert_eq!(
+            laid_out,
+            transcript.len(),
+            "the top reached, every cell is laid out"
+        );
+    }
+
+    /// A resumed history reads as the live rows do: the user line, the
+    /// saved call as a finished row, the reply, then the divider under
+    /// the last; compressed rounds come first under their own divider.
+    #[test]
+    fn a_resumed_history_shows_as_rows_under_a_divider() {
+        let (mut transcript, mut renderer) = transcript();
+        let mut entries = vec![ChildEntry::Compressed, ChildEntry::User("old".to_string())];
+        entries.extend(long_history(1));
+        transcript.push_history(entries);
+        let shown = rows(&transcript.view(area(30), &mut renderer));
+        let at = |needle: &str| {
+            shown
+                .iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not shown: {shown:#?}"))
+        };
+        assert!(at(COMPRESSED_DIVIDER) < at("> old"));
+        assert!(at("> old") < at("> question 0"));
+        assert!(at("> question 0") < at("fs_read"));
+        assert!(at("fs_read") < at("Answer 0"));
+        assert!(at("Answer 0") < at(HISTORY_DIVIDER));
+        transcript.push_history(Vec::new());
+        assert_eq!(transcript.len(), 6, "an empty history appends nothing");
     }
 
     /// The offset is clamped to the lines above the view, a push while

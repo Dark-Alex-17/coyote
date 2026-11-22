@@ -2,7 +2,7 @@ mod completer;
 mod highlighter;
 mod placeholder_edit;
 mod prompt;
-mod replay;
+pub(crate) mod replay;
 
 pub(crate) use self::completer::{ReplCompleter, command_candidates, macro_candidates, split_line};
 pub(crate) use self::highlighter::{CommandSpan, classify_command};

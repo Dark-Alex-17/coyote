@@ -2,6 +2,7 @@ use super::command_timing::{self, Timing};
 use super::control::{TurnOutcome, spawn_control_request, spawn_exit, spawn_run_now, spawn_turn};
 use super::events::SystemClock;
 use super::lend::{OwnerGuard, TtyHandles, remember_tty};
+use super::pager::session_entries;
 use super::queued::{carry_over, reconcile_queue, take_user_messages};
 use super::rewind::apply_rewind;
 use super::run_now::{CommandOutput, replay_deferred};
@@ -674,6 +675,12 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     // does: the palette's command set in particular, which is otherwise
     // the bare one until the first command hands the context back.
     app.sync_from_ctx(&mut ctx);
+    // A session resumed at launch shows its history, as the REPL prints it.
+    if let Some(session) = &ctx.session {
+        let (compressed, active) = crate::repl::replay::snapshot(session);
+        app.transcript
+            .push_history(session_entries(&compressed, &active));
+    }
 
     // Fd 1 is still the terminal here; a turn's capture takes it over.
     if let Some(reason) = remember_tty() {

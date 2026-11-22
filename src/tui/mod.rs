@@ -65,7 +65,9 @@ use keys::{Action, KeyContext, Layer, OverlayKind, PagerMode, PopupKind, ViMode}
 #[cfg(test)]
 pub(crate) use lend::OwnerGuard;
 use lend::{Owner, owner};
-pub(crate) use lend::{TtyHandles, ensure_terminal_lendable, lend_terminal, notice, request_copy};
+pub(crate) use lend::{
+    TtyHandles, ensure_terminal_lendable, lend_terminal, notice, request_copy, show_history,
+};
 use modal::{PendingPrompt, PromptModal};
 use pager::{Pager, PagerView};
 use queued::{QueuedLine, QueuedPreview, remove_sent};
@@ -1790,6 +1792,7 @@ impl App {
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
             UiMsg::LendTerminal(job) => self.lend_requests.push(job),
             UiMsg::Copy(text) => self.copy_requests.push(text),
+            UiMsg::History(entries) => self.transcript.push_history(entries),
             UiMsg::ChildTranscriptFlushed { session_id } => {
                 if !is_plain_session_id(&session_id) {
                     warn!("Ignored a flush of a child session with the id {session_id:?}");

@@ -1389,6 +1389,111 @@ mod transcript {
     // ---------------------------------------------------------------------
 
     /// With nothing running and no child ever started, `.threads` opens the
+    /// A session file of `exchanges` user lines and replies, numbered so
+    /// the first and the last can be told apart.
+    fn write_session(dir: &Path, name: &str, exchanges: usize) {
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let mut yaml = String::from("model: dryrun:dry-model\nmessages:\n");
+        for n in 0..exchanges {
+            yaml.push_str(&format!(
+                "- role: user\n  content: 'question {n:05}'\n\
+                 - role: assistant\n  content: 'answer {n:05}, a reply of a few words'\n"
+            ));
+        }
+        fs::write(sessions.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    /// A session resumed at launch with thousands of messages shows all of
+    /// its history, as the REPL does: the newest reply and the divider
+    /// under it come up within a bounded time, and the top of the
+    /// transcript view is the very first message.
+    #[test]
+    #[serial]
+    fn a_large_session_resumed_at_launch_shows_its_whole_history() {
+        const EXCHANGES: usize = 2_500;
+        let dir = fresh_config_dir("big-session");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        write_session(&dir, "big", EXCHANGES);
+
+        let started = std::time::Instant::now();
+        let mut pty = spawn_tui_with_args(&dir, &[], &["-s", "big"]);
+        pty.wait_for("previous conversation", PTY_DEADLINE)
+            .expect("the resumed history never showed its divider");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "first frame of a {}-message session after {elapsed:?}",
+            EXCHANGES * 2
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "a {}-message session took {elapsed:?} to show",
+            EXCHANGES * 2
+        );
+        let frame = repainted_frame_showing(
+            &mut pty,
+            "answer 02499",
+            "the newest reply is not on the first screen",
+        );
+        assert!(!frame.contains("question 00000"), "{frame}");
+
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"g").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "question 00000",
+            "the transcript view's top is not the session's first message",
+        );
+        pty.send(b"q").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        quit(pty);
+    }
+
+    /// `.session <name>` inside the TUI shows the session's history as
+    /// rows, the oldest message included, rather than as the command's
+    /// printed output.
+    #[test]
+    #[serial]
+    fn dot_session_shows_the_resumed_history_as_rows() {
+        let dir = fresh_config_dir("dot-session-history");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        write_session(&dir, "small", 3);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        pty.send(b".session small\r").unwrap();
+        let frame = repainted_frame_showing(
+            &mut pty,
+            "previous conversation",
+            "`.session` did not show the history's divider",
+        );
+        for shown in [
+            "> question 00000",
+            "answer 00000",
+            "> question 00002",
+            "answer 00002",
+        ] {
+            assert!(
+                squeezed(&frame).contains(&squeezed(shown)),
+                "{shown:?} is not shown:\n{frame}"
+            );
+        }
+        assert!(
+            !frame.contains("You:"),
+            "the REPL's printed replay leaked in:\n{frame}"
+        );
+        quit(pty);
+    }
+
+    /// With nothing running and no child ever started, `.threads` opens the
     /// thread picker straight away, and so does `t` in the tasks pop-up;
     /// leaving the picker and the transcript view opened from the pop-up
     /// brings the pop-up back.
