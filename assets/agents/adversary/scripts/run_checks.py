@@ -923,17 +923,19 @@ def main():
         return
     carried, carried_error = declared_carried(state.get("carried_failures"))
     if not cmds:
-        out = {
-            "exec_results": (
-                "none declared — the caller supplied no verification_commands; "
-                "execution criteria (build/test/lint) cannot be independently "
-                "confirmed. Declare the exact commands via the "
-                "verification_commands variable to get recorded runs."
+        print(
+            json.dumps(
+                {
+                    "exec_results": (
+                        "none declared — the caller supplied no verification_commands; "
+                        "execution criteria (build/test/lint) cannot be independently "
+                        "confirmed. Declare the exact commands via the "
+                        "verification_commands variable to get recorded runs."
+                    ),
+                    **({"carried_error": carried_error} if carried_error else {}),
+                }
             )
-        }
-        if carried_error:
-            out["carried_error"] = carried_error
-        print(json.dumps(out))
+        )
         return
 
     proj = os.path.expanduser(
