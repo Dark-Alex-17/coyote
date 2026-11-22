@@ -1461,13 +1461,15 @@ nodes:
     id: delegate
     type: agent
     agent: sisyphus-next
-    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag and project directory ride `inputs:`.
+    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag, project directory, escalation policy and build lock ride `inputs:`.
     prompt: |
       {{delegation_prompt}}
     inputs:
       review_cadence: '{{delegate_review_cadence}}'
       parallel: '{{delegate_parallel}}'
       project_dir: '{{delegate_project_dir}}'
+      escalation_policy: '{{escalation_policy}}'
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1526,12 +1528,13 @@ nodes:
     id: run_gauntlet
     type: agent
     agent: review-gauntlet
-    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary).
+    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary; the build lock rides `inputs:` too).
     prompt: |
       {{gauntlet_prompt}}
     inputs:
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1543,12 +1546,13 @@ nodes:
     id: run_adversary
     type: agent
     agent: adversary
-    description: Micro task scope - the direct conformance verdict (criteria are executable commands).
+    description: Micro task scope - the direct conformance verdict (criteria are executable commands); the build lock rides `inputs:`.
     prompt: |
       {{adversary_prompt}}
     inputs:
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
+      build_lock: '{{build_lock}}'
     timeout: 7200
     max_attempts: 1
     state_updates:
@@ -1722,13 +1726,15 @@ nodes:
     type: agent
     agent: sisyphus-next
     teammates: true
-    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree and the item's review cadence ride `inputs:`.
+    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree, the item's review cadence, the escalation policy and the build lock ride `inputs:`.
     prompt: |
       {{wtask.prompt}}
     inputs:
       parallel: '1'
       project_dir: '{{wtask.worktree}}'
       review_cadence: '{{wtask.review_cadence}}'
+      escalation_policy: '{{escalation_policy}}'
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1749,12 +1755,13 @@ nodes:
     id: wave_gauntlet
     type: agent
     agent: review-gauntlet
-    description: The member's conformance panel (independent verdict; no teammates flag).
+    description: The member's conformance panel (independent verdict; no teammates flag); the build lock rides `inputs:`.
     prompt: |
       {{gauntlet_prompt}}
     inputs:
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
