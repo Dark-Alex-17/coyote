@@ -46,6 +46,10 @@ impl TodoPanel {
     }
 
     pub(super) fn set(&mut self, goal: String, items: Vec<TodoItem>) {
+        // A new goal is a new list, read from its top.
+        if goal != self.goal {
+            self.top = 0;
+        }
         self.goal = goal;
         self.items = items;
     }
@@ -253,6 +257,19 @@ mod tests {
         let rows = draw(&mut panel);
         assert!(rows[1].contains("step 1"), "{rows:#?}");
         assert!(!rows[0].contains("above"), "{rows:#?}");
+
+        panel.page(1);
+        panel.set_items(items(12));
+        assert!(
+            draw(&mut panel)[0].contains("above"),
+            "an update moved a scrolled list"
+        );
+        panel.set("a new goal".to_string(), items(12));
+        let rows = draw(&mut panel);
+        assert!(
+            rows[1].contains("a new goal"),
+            "a new list did not open at its top: {rows:#?}"
+        );
     }
 
     /// A list that fits shows whole with no counts and does not move.

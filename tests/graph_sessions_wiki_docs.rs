@@ -2931,7 +2931,7 @@ fn wiki_documents_the_wait_tools() {
     let lead = "`job__wait` answers with a `status`";
     let statuses = flat(&paragraph("Background-Jobs.md", &tools, lead));
     for needle in [
-        "`ready`, `timeout`, `interrupted`, `pending` or `none`",
+        "`ready`, `timeout`, `interrupted`, `pending`, `user_message` or `none`",
         "an `outcome` of `success` or `failed`",
     ] {
         assert!(
@@ -2939,7 +2939,14 @@ fn wiki_documents_the_wait_tools() {
             "the Background-Jobs.md job__wait result sentence does not list {needle}"
         );
     }
-    for status in ["ready", "timeout", "interrupted", "pending", "none"] {
+    for status in [
+        "ready",
+        "timeout",
+        "interrupted",
+        "pending",
+        "user_message",
+        "none",
+    ] {
         assert!(
             handle_wait.contains(&format!("\"status\": \"{status}\"")),
             "handle_wait no longer returns status {status:?}"
@@ -3103,7 +3110,7 @@ fn wiki_documents_the_wait_tools() {
     let agent_lead = "`agent__wait` answers with a `status`";
     let agent_statuses = flat(&paragraph("Agents.md", &agents, agent_lead));
     for needle in [
-        "`ready`, `timeout`, `interrupted`, `pending` or `none`",
+        "`ready`, `timeout`, `interrupted`, `pending`, `user_message` or `none`",
         "an `outcome` of `success`, `failed`, or `finished`",
         "(Background-Jobs#the-six-tools)",
     ] {
@@ -3112,7 +3119,14 @@ fn wiki_documents_the_wait_tools() {
             "the Agents.md agent__wait result sentence does not say {needle}"
         );
     }
-    for status in ["ready", "timeout", "interrupted", "pending", "none"] {
+    for status in [
+        "ready",
+        "timeout",
+        "interrupted",
+        "pending",
+        "user_message",
+        "none",
+    ] {
         assert!(
             agent_wait.contains(&format!("\"status\": \"{status}\"")),
             "agents.rs handle_wait no longer returns status {status:?}"

@@ -99,6 +99,9 @@ pub(crate) const WELCOME_HELP_HINT: &str = r#"Type ".help" for additional help."
 /// Printed for a bare `.set` or `.reasoning`, with the dot prefix that
 /// `render_hints` swaps for the active one.
 pub(crate) const SET_USAGE: &str = "Usage: .set <key> <value>...";
+/// What `.redraw session` says under the full-screen UI, whose transcript
+/// already shows the session's history.
+pub(crate) const TUI_REDRAW_SESSION_NOTE: &str = "The transcript already shows this session's history: scroll up, or press Ctrl+T for the transcript view.";
 pub(crate) const REASONING_USAGE: &str = "Usage: .reasoning <level>";
 
 /// Brackets one user-visible turn at an outer boundary (`ask`,
@@ -1662,6 +1665,10 @@ async fn dispatch_repl_line(
                     let (compressed, active) = replay::snapshot(session);
                     if compressed.is_empty() && active.is_empty() {
                         println!("Session is empty.");
+                    } else if crate::tui::active() {
+                        // The transcript already holds the history as rows;
+                        // replaying it would add a second copy.
+                        println!("{TUI_REDRAW_SESSION_NOTE}");
                     } else {
                         let app = Arc::clone(&ctx.app.config);
                         replay::clear_viewport()?;

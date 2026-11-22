@@ -28,7 +28,8 @@ pub(super) const WHEEL_LINES: i32 = 1;
 /// The rows a cell above the view counts as until the view first reaches
 /// it and lays it out.
 const UNLAID_ROWS: usize = 1;
-/// The line under a resumed session's history, as the REPL prints it.
+/// The line under a resumed session's history: the TUI's form of the
+/// divider the REPL prints there.
 pub(super) const HISTORY_DIVIDER: &str = "--- previous conversation ---";
 
 /// The screen rows one cell took in the last frame, counted from the
@@ -280,10 +281,18 @@ impl Transcript {
     /// Appends a resumed session's history, as the REPL prints it on
     /// resuming: every line, reply and saved call, as rows like the live
     /// ones, then a divider. Nothing is appended for an empty history.
+    /// The saved calls' whole output counts against the same budget as
+    /// live output, and a view scrolled away counts the block as one new
+    /// entry below.
     pub(super) fn push_history(&mut self, entries: Vec<ChildEntry>) {
+        self.push_history_within(entries, FULL_OUTPUT_BUDGET);
+    }
+
+    fn push_history_within(&mut self, entries: Vec<ChildEntry>, budget: usize) {
         if entries.is_empty() {
             return;
         }
+        let unseen = self.unseen;
         for entry in entries {
             let cell = match entry {
                 ChildEntry::Compressed => {
@@ -304,6 +313,10 @@ impl Transcript {
             NoticeKind::Checkpoint,
             HISTORY_DIVIDER.to_string(),
         ));
+        if self.offset_from_bottom > 0 {
+            self.unseen = unseen + 1;
+        }
+        self.account_full_output(0, budget);
     }
 
     /// Appends the cell a reply streams into and remembers where it is.
@@ -1595,6 +1608,51 @@ mod tests {
             transcript.len(),
             "the top reached, every cell is laid out"
         );
+    }
+
+    /// A resumed history reads as the live rows do: the user line, the
+    /// A resumed history's saved outputs count against the whole-output
+    /// budget at once, the oldest given up first; a view scrolled away
+    /// counts the whole history as one entry below.
+    #[test]
+    fn a_resumed_history_keeps_to_the_output_budget_and_counts_once_below() {
+        let (mut transcript, mut renderer) = transcript();
+        for n in 0..30 {
+            transcript.push(Cell::user(&format!("line {n}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-3);
+        transcript.view(area(5), &mut renderer);
+        let output = "x".repeat(1_000);
+        let entries: Vec<ChildEntry> = (0..10)
+            .map(|n| ChildEntry::Tool {
+                call_id: format!("call-{n}"),
+                name: "fs_read".to_string(),
+                args: "{}".to_string(),
+                output: output.clone(),
+            })
+            .collect();
+        transcript.push_history_within(entries, 4_000);
+        assert!(
+            transcript.full_output_bytes <= 4_000,
+            "{} bytes kept over a 4000-byte budget",
+            transcript.full_output_bytes
+        );
+        let kept: Vec<usize> = transcript
+            .cells
+            .iter()
+            .map(Cell::full_output_bytes)
+            .collect();
+        assert_eq!(
+            kept.iter().filter(|bytes| **bytes > 0).count(),
+            4,
+            "{kept:?}"
+        );
+        assert!(
+            kept[30..34].iter().all(|bytes| *bytes == 0),
+            "the oldest kept theirs: {kept:?}"
+        );
+        assert_eq!(transcript.unseen, 1, "the history counted entry by entry");
     }
 
     /// A resumed history reads as the live rows do: the user line, the

@@ -2020,9 +2020,14 @@ impl App {
             }
             (true, None) => (Rect::ZERO, Some(upper)),
         };
-        if transcript.width > 0 {
-            TABLE_WIDTH.store(transcript.width, Ordering::Relaxed);
-        }
+        // With the todo panel in its place the transcript comes back at
+        // the whole width, so that is what a table is fitted to meanwhile.
+        let table_width = if transcript.width > 0 {
+            transcript.width
+        } else {
+            upper.width
+        };
+        TABLE_WIDTH.store(table_width, Ordering::Relaxed);
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
         if let Some(todo) = todo {

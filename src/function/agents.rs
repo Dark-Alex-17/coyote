@@ -17329,12 +17329,14 @@ mod tests {
 
     /// A message the user sends mid-wait ends agent__wait and
     /// agent__collect promptly with a `user_message` status; the agent
-    /// waited on is neither cancelled nor collected and keeps running.
+    /// waited on is neither cancelled nor collected, keeps running, and is
+    /// collected later once the model has read the message.
     #[test]
     fn a_user_message_mid_wait_ends_wait_and_collect_and_the_agent_keeps_running() {
         run_async(async {
             let mut ctx = ctx_with_supervisor(4, 3);
-            let abort = register_running_agent(&mut ctx, "slow", "test");
+            let abort =
+                register_agent_running_for(&mut ctx, "slow", "test", Duration::from_secs(2));
             ctx.session_abort = Some(create_abort_signal());
             let queue = Arc::clone(&ctx.notification_queue);
             tokio::spawn(async move {
@@ -17365,14 +17367,28 @@ mod tests {
                     .contains("still running")
             );
 
-            let sup = ctx.supervisor.as_ref().unwrap().read();
-            assert!(sup.has_agent("slow"), "the agent was taken");
-            assert_eq!(sup.is_finished("slow"), Some(false), "the agent stopped");
+            {
+                let sup = ctx.supervisor.as_ref().unwrap().read();
+                assert!(sup.has_agent("slow"), "the agent was taken");
+                assert_eq!(sup.is_finished("slow"), Some(false), "the agent stopped");
+            }
             assert!(!abort.aborted(), "the agent was cancelled");
             assert!(
                 ctx.notification_queue.has_user_message(),
                 "the message was consumed"
             );
+
+            ctx.notification_queue.take_where(|notification| {
+                matches!(notification, SystemNotification::UserMessage { .. })
+            });
+            let result = time::timeout(
+                Duration::from_secs(10),
+                handle_collect(&mut ctx, &json!({"id": "slow"})),
+            )
+            .await
+            .expect("the agent kept running and finishes")
+            .unwrap();
+            assert_eq!(result["status"], "completed", "{result}");
         });
     }
 

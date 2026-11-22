@@ -4444,10 +4444,10 @@ mod tests {
         });
     }
 
-    /// The bare-SIGINT arm a spawned child latches cannot be driven
-    /// hermetically, so this pins that the child's wait ends on its timeout.
+    /// A spawned child's wait answers no user, so a message on its queue
+    /// does not end it.
     #[test]
-    fn handle_wait_in_a_spawned_child_times_out_instead_of_interrupting() {
+    fn a_spawned_childs_job_wait_ignores_a_user_message() {
         run_async(async {
             let mut ctx = ctx_with_job_supervisor(4);
             ctx.self_agent_id = Some("c1".to_string());
@@ -4520,8 +4520,10 @@ mod tests {
         });
     }
 
+    /// The bare-SIGINT arm a spawned child latches cannot be driven
+    /// hermetically, so this pins that the child's wait ends on its timeout.
     #[test]
-    fn handle_wait_in_a_spawned_child_times_out_with_no_message_waiting() {
+    fn handle_wait_in_a_spawned_child_times_out_instead_of_interrupting() {
         run_async(async {
             let mut ctx = ctx_with_job_supervisor(4);
             ctx.self_agent_id = Some("c1".to_string());

@@ -2,7 +2,7 @@ use super::*;
 use crate::tui::run_loop::{
     AfterTurn, DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished,
     cancel_command, dump_route, finish_turn, flush_typeahead, join_unattended, purge_turn_queue,
-    quit_abort, restore_held_back,
+    quit_abort, restore_held_back, unqueue_held,
 };
 #[cfg(unix)]
 use crate::tui::run_loop::{Termination, edit_in_editor};
@@ -456,6 +456,61 @@ fn lines_held_back_by_esc_run_next_in_the_order_typed() {
             take_user_messages(&next.notification_queue),
             ["second e2", "third e3"]
         );
+    });
+}
+
+/// A setting taken during a turn is on the context the held line's turn
+/// Alt+Up after an Esc takes the newest held line back from the lines the
+/// Esc held back, so it is not reported as already sent, and the older
+/// line still runs next once the turn ends.
+#[test]
+#[serial]
+fn alt_up_after_esc_takes_the_line_back_and_the_older_one_still_runs_next() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-esc-unqueue");
+        let ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        let mut immediate = ImmediateCommands::default();
+        let queue = NotificationQueue::new();
+        harness.app.begin_turn("explain", false);
+        for text in ["older u1", "newer u2"] {
+            harness.type_text(text);
+            harness.press(KeyCode::Enter);
+            queued::queue_user_message(&queue, text);
+        }
+        assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+        let mut held_back = take_user_messages(&queue);
+        let unqueue = harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        let Some(Command::Unqueue {
+            held: Some(text), ..
+        }) = unqueue
+        else {
+            panic!("Alt+Up did not take the newest held line back: {unqueue:?}");
+        };
+        assert!(
+            unqueue_held(&queue, &mut held_back, &text),
+            "reported as already sent"
+        );
+        assert_eq!(held_back, ["older u1"]);
+        assert!(!unqueue_held(&queue, &mut held_back, "never held"));
+
+        restore_held_back(&queue, &mut held_back);
+        let after = finish_turn(
+            &mut harness.app,
+            &mut immediate,
+            ctx,
+            false,
+            &TurnOutcome::default(),
+            &queue,
+            false,
+        )
+        .await;
+        let AfterTurn::Next(_, line) = after else {
+            panic!("the older held line was lost");
+        };
+        assert_eq!(line, "older u1");
     });
 }
 

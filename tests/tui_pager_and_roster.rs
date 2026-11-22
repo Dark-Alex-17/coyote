@@ -1403,6 +1403,172 @@ mod transcript {
         Some(frame[start..end].to_string())
     }
 
+    /// Alt+PgUp undoes Alt+PgDn on an open todo panel: the first items are
+    /// back on screen and the top border no longer counts lines above.
+    #[test]
+    #[serial]
+    fn alt_page_up_scrolls_a_paged_todo_list_back_to_its_top() {
+        const ALT_PAGE_DOWN: &[u8] = b"\x1b[6;3~";
+        const ALT_PAGE_UP: &[u8] = b"\x1b[5;3~";
+        let dir = fresh_config_dir("todo-scroll-up");
+        let _guard = TempDirGuard(dir.clone());
+        let mut replies = vec![Reply::ToolCall {
+            name: "todo__init".to_string(),
+            arguments: "{\"goal\": \"a long list\"}".to_string(),
+        }];
+        replies.extend((1..=14).map(|n| Reply::ToolCall {
+            name: "todo__add".to_string(),
+            arguments: format!("{{\"task\": \"item {n:02} of the list\"}}"),
+        }));
+        replies.push(Reply::Text("listed u3p".to_string()));
+        let fake = FakeLlm::start(replies);
+        write_fake_llm_config_with(&dir, &fake, "auto_continue: true\nmax_auto_continues: 0\n");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(16, 100).unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        pty.send(b"make a list\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "listed u3p", 0, "the reply after the todo calls");
+        pty.read_for(HOTKEY_GAP);
+        pty.send(CTRL_X).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        pty.send(ALT_PAGE_DOWN).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let paged = ctrl_l_repaint(&mut pty);
+        assert!(
+            !paged.contains("item01") && paged.contains("above)"),
+            "Alt+PgDn did not page the panel:\n{paged}"
+        );
+
+        pty.send(ALT_PAGE_UP).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let back = ctrl_l_repaint(&mut pty);
+        assert!(
+            back.contains("item01") && !back.contains("above)") && back.contains("below)"),
+            "Alt+PgUp did not scroll the panel back to its top:\n{back}"
+        );
+        quit(pty);
+    }
+
+    /// `.threads` typed while a tool runs opens the thread picker at once:
+    /// it is not held for the turn's end, the tool keeps running, and the
+    /// model is not asked again.
+    #[test]
+    #[serial]
+    fn dot_threads_mid_turn_opens_the_picker_at_once() {
+        const PICKER: &str = "Threads  Enter = open  Esc = back";
+        let dir = fresh_config_dir("threads-mid-turn");
+        let _guard = TempDirGuard(dir.clone());
+        let tool_pid = dir.join("tool.pid");
+        let fake = FakeLlm::start(vec![
+            Reply::ToolCall {
+                name: "fixture_sleep".to_string(),
+                arguments: "{}".to_string(),
+            },
+            Reply::Text("done after the tool r6k".to_string()),
+        ]);
+        write_fake_llm_config_with(&dir, &fake, "enabled_tools:\n  - fixture_sleep\n");
+        write_tool(&dir, "fixture_sleep.sh", &sleeping_tool(&tool_pid));
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+
+        pty.send(b"run the slow tool\r").unwrap();
+        wait_for_file(&mut pty, &tool_pid, "the tool's pid file");
+        let pid: i32 = fs::read_to_string(&tool_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        pty.read_for(Duration::from_millis(500));
+
+        pty.send(b".threads\r").unwrap();
+        let frame = repainted_frame_showing(
+            &mut pty,
+            PICKER,
+            "`.threads` mid-turn did not open the picker at once",
+        );
+        assert!(
+            !squeezed(&frame).contains(&squeezed("pending: 1")),
+            "`.threads` was held as a queued line:\n{frame}"
+        );
+        assert_eq!(fake.served(), 1, "`.threads` reached the model");
+        assert!(alive(pid), "`.threads` stopped the running tool");
+
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"q").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        // SAFETY: kill takes a pid and a signal number and touches no memory.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        wait_for_squeezed_after(&mut pty, "done after the tool r6k", 0, "the turn's end");
+        quit(pty);
+    }
+
+    /// `.session <name>` on a session of thousands of messages, from inside
+    /// the TUI, shows its newest reply within a bounded time, and the top
+    /// of the transcript view is the session's very first message.
+    #[test]
+    #[serial]
+    fn dot_session_on_a_large_session_is_bounded_and_reaches_the_first_message() {
+        const EXCHANGES: usize = 2_500;
+        let dir = fresh_config_dir("big-dot-session");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        write_session(&dir, "huge", EXCHANGES);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        let at = pty.raw().len();
+        let started = std::time::Instant::now();
+        pty.send(b".session huge\r").unwrap();
+        pty.wait_for_after("previous conversation", at, PTY_DEADLINE)
+            .expect("`.session` never showed the history's divider");
+        let elapsed = started.elapsed();
+        eprintln!("`.session` on {} messages took {elapsed:?}", EXCHANGES * 2);
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "`.session` on {} messages took {elapsed:?}",
+            EXCHANGES * 2
+        );
+        repainted_frame_showing(
+            &mut pty,
+            "answer 02499",
+            "the newest reply is not on screen after `.session`",
+        );
+
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"g").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "question 00000",
+            "the transcript view's top is not the session's first message",
+        );
+        pty.send(b"q").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        // Scrolling the transcript itself (no pager) up to the top reaches it too.
+        // About four rows an exchange and twenty a page: 1,000 pages is
+        // twice what the history needs.
+        for n in 0..1_000 {
+            pty.send(PAGE_UP).unwrap();
+            if n % 100 == 99 {
+                pty.read_for(Duration::from_millis(100));
+            }
+        }
+        repainted_frame_showing(
+            &mut pty,
+            "question 00000",
+            "PageUp in the transcript never reached the first message",
+        );
+        quit(pty);
+    }
+
     // ---------------------------------------------------------------------
     // With the reasoning delta held open on the wire, the "Thinking for Ns"
     // status row is on screen well before the hold limit, and it is gone
@@ -1451,7 +1617,6 @@ mod transcript {
     // Ctrl+X shows the Todo panel and hides it again.
     // ---------------------------------------------------------------------
 
-    /// With nothing running and no child ever started, `.threads` opens the
     /// A session file of `exchanges` user lines and replies, numbered so
     /// the first and the last can be told apart.
     fn write_session(dir: &Path, name: &str, exchanges: usize) {
@@ -1501,7 +1666,20 @@ mod transcript {
         );
         assert!(!frame.contains("question 00000"), "{frame}");
 
+        // The transcript view still lays the whole root thread out when it
+        // opens; this bounds that first layout of the long history.
+        let opened_at = pty.raw().len();
+        let opening = std::time::Instant::now();
         pty.send(b"\x14").unwrap();
+        pty.wait_for_after("root thread", opened_at, PTY_DEADLINE)
+            .expect("Ctrl+T did not open the transcript view");
+        let opened = opening.elapsed();
+        eprintln!("the transcript view opened on the long history after {opened:?}");
+        assert!(
+            opened < Duration::from_secs(10),
+            "the transcript view took {opened:?} to open on a {}-message history",
+            EXCHANGES * 2
+        );
         repainted_frame_showing(
             &mut pty,
             "Thread: root thread",

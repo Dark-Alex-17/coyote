@@ -857,6 +857,21 @@ pub(super) fn purge_turn_queue(task: &Option<Task>) {
     }
 }
 
+/// Takes the newest copy of a held line back for the composer: from the
+/// lines an Esc held back first, then from the turn's queue. False when
+/// neither has it, the driver having handed it to the model already.
+pub(super) fn unqueue_held(
+    queue: &NotificationQueue,
+    held_back: &mut Vec<String>,
+    text: &str,
+) -> bool {
+    if let Some(at) = held_back.iter().rposition(|held| held == text) {
+        held_back.remove(at);
+        return true;
+    }
+    queued::unqueue_user_message(queue, text)
+}
+
 /// Puts the lines an Esc held back on the ended turn's queue, ahead of any
 /// typed since, in the order they were typed, so the end of the turn
 /// finds them unsent and runs them next.
@@ -1079,7 +1094,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Unqueue { held, draft }) => {
                         if let Some(Task::Turn { queue, .. }) = &task {
                             if let Some(text) = held
-                                && !queued::unqueue_user_message(queue, &text)
+                                && !unqueue_held(queue, &mut held_back, &text)
                             {
                                 app.handle_msg(UiMsg::Notice {
                                     kind: NoticeKind::ToolWarning,

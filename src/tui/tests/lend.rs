@@ -197,6 +197,88 @@ fn a_replayed_history_under_the_tui_goes_to_the_transcript_as_rows() {
 }
 
 /// Under the TUI `.copy` hands the reply to the loop, which copies it
+/// `.redraw session` under the TUI adds no second copy of the history:
+/// While the TUI holds the terminal, a `.list` table is fitted to the
+/// width of the transcript it last drew: a long description wraps inside
+/// its cell and every row fits. With no TUI the width is not set.
+#[test]
+#[serial]
+fn a_list_table_under_the_tui_fits_the_transcripts_width() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-list-width");
+        let agent = crate::config::paths::agent_config_file("wrapprobe");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(
+            &agent,
+            "name: wrapprobe\ndescription: a probe agent whose description is far too long \
+             to sit on one row of an eighty column transcript, so that its cell must wrap \
+             onto the rows below it\nversion: 0.1.0\ninstructions: Reply briefly.\n",
+        )
+        .unwrap();
+        let ctx = chat_ctx();
+        let mut harness = Harness::standalone(80, 24);
+        harness.draw();
+        assert_eq!(crate::tui::table_width(), None, "no TUI holds the terminal");
+
+        let (tx, _rx) = unbounded_channel();
+        let owner = OwnerGuard::tui(tx);
+        harness.draw();
+        assert_eq!(crate::tui::table_width(), Some(80));
+        let listing = crate::repl::list_output(&ctx, Some("agents"))
+            .await
+            .unwrap();
+        drop(owner);
+        let table: Vec<&str> = listing
+            .lines()
+            .filter(|line| line.contains('\u{2502}'))
+            .collect();
+        assert!(table.len() > 3, "{listing}");
+        for line in &table {
+            let plain = crate::tui::plain_text(line);
+            assert!(
+                unicode_width::UnicodeWidthStr::width(plain.as_str()) <= 80,
+                "{plain:?} is wider than the transcript:\n{listing}"
+            );
+        }
+        assert!(
+            listing.contains("below it"),
+            "the description lost its end:\n{listing}"
+        );
+    });
+}
+
+/// `.redraw session` under the TUI adds no second copy of the history:
+/// the transcript already shows it, so nothing reaches the loop.
+#[test]
+#[serial]
+fn dot_redraw_session_under_the_tui_does_not_add_the_history_again() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-redraw-session");
+        let mut ctx = chat_ctx();
+        let mut session = crate::config::Session::default();
+        let input = Input::from_str(&ctx, "question", None).unwrap();
+        session.add_message(&input, "reply").unwrap();
+        ctx.session = Some(session);
+        let (tx, mut rx) = unbounded_channel();
+        let owner = OwnerGuard::tui(tx);
+        Box::pin(crate::repl::run_repl_command(
+            &mut ctx,
+            create_abort_signal(),
+            ".redraw session",
+        ))
+        .await
+        .unwrap();
+        drop(owner);
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg, UiMsg::History(_)),
+                "the history was sent again"
+            );
+        }
+    });
+}
+
+/// Under the TUI `.copy` hands the reply to the loop, which copies it
 /// over the screen's descriptor, rather than writing an OSC 52 request
 /// into the turn's capture; the app keeps it for the loop to take.
 #[test]
