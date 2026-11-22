@@ -3605,8 +3605,7 @@ fn trimmed_output_is_not_matched_and_malformed_items_are_counted() {
     assert_eq!(results[0]["carried"]["all"], true, "{out}");
     assert_eq!(results[1]["carried"]["all"], false, "{out}");
     assert_eq!(
-        results[1]["carried_note"],
-        "not matched: the output was trimmed",
+        results[1]["carried_note"], "not matched: the output was trimmed",
         "{out}"
     );
 
@@ -3614,7 +3613,10 @@ fn trimmed_output_is_not_matched_and_malformed_items_are_counted() {
     state["exec_results"] = results.clone();
     let text = report(&dir.0, "carried-guards", &state);
     assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
-    assert!(text.contains("1. Verification run `sh trimmed.sh`"), "{text}");
+    assert!(
+        text.contains("1. Verification run `sh trimmed.sh`"),
+        "{text}"
+    );
     assert!(
         text.contains("- `sh trimmed.sh` -- carried failures not matched: the output was trimmed"),
         "{text}"
@@ -3629,7 +3631,13 @@ fn a_killed_run_blocks_whatever_its_carried_record_says() {
         return;
     }
     let dir = fixture_dir("carried-killed");
-    let mut record = red("sh suite.sh", 137, "Killed", 0, "the command passed on the diff base");
+    let mut record = red(
+        "sh suite.sh",
+        137,
+        "Killed",
+        0,
+        "the command passed on the diff base",
+    );
     record["pass_condition"] = json!({"condition": "exit 0", "criteria": []});
     record["carried"] = json!({"all": true, "matched": [{"paths": ["pkg/alpha/"], "owner": 2}],
                                "new": [], "unlocated": 0});
@@ -3638,7 +3646,8 @@ fn a_killed_run_blocks_whatever_its_carried_record_says() {
     let text = report(&dir.0, "carried-killed", &state);
     assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
     assert!(
-        text.contains("1. Verification run `sh suite.sh`") && text.contains("exit 137 (recorded FAIL"),
+        text.contains("1. Verification run `sh suite.sh`")
+            && text.contains("exit 137 (recorded FAIL"),
         "{text}"
     );
     assert!(!text.contains("declared carried"), "{text}");

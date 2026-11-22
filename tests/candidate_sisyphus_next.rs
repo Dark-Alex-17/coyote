@@ -1450,6 +1450,11 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("review-gauntlet").join("scripts"),
         &agents.join("review-gauntlet").join("scripts"),
     );
+    // the carried-failure round trip runs the adversary's own run_checks on the carry gate's list
+    copy_tree(
+        &agents_dir().join("adversary").join("scripts"),
+        &agents.join("adversary").join("scripts"),
+    );
     // the red-gate rows render the coder's own end_failure template
     fs::create_dir_all(agents.join("coder")).unwrap();
     fs::copy(
