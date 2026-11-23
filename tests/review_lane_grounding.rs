@@ -834,6 +834,59 @@ fn rendered_project_dir(node: &serde_yaml::Value, state: &Value) -> Option<Strin
     state[key].as_str().map(str::to_string)
 }
 
+/// The project_dir an llm node tells the model to hand to agent__spawn: the
+/// `"project_dir": "{{key}}"` snippet in its instructions, which the engine
+/// interpolates, resolved against `state`. None when the instructions name
+/// no such spawn variable.
+fn spawned_project_dir(node: &serde_yaml::Value, state: &Value) -> Option<String> {
+    let instructions = node["instructions"].as_str()?;
+    let (_, rest) = instructions.split_once(r#""project_dir": "{{"#)?;
+    let (key, _) = rest.split_once(r#"}}""#)?;
+    state[key.trim()].as_str().map(str::to_string)
+}
+
+/// Each review graph with the state its facts/signals script resolves when
+/// the root run sits in the main clone and the caller names the worktree.
+fn resolved_review_states(w: &Worktree) -> Vec<(&'static str, Value)> {
+    [
+        (
+            "review-gauntlet/graph.yaml",
+            "review-gauntlet/scripts/signals.py",
+        ),
+        ("code-reviewer/graph.yaml", "code-reviewer/scripts/facts.py"),
+    ]
+    .into_iter()
+    .map(|(graph, script)| {
+        let mut state = json!({
+            "project_dir": s(&w.main),
+            "project_dir_in": s(&w.worktree),
+            "diff_spec": "worktree",
+        });
+        let resolved = run_script(script, &state);
+        state["project_dir"] = resolved["project_dir"].clone();
+        (graph, state)
+    })
+    .collect()
+}
+
+/// A lane seated in `seated` reads `src/lib.rs` from the main clone's cwd;
+/// only a seat in the worktree under review returns the task's file.
+fn assert_seated_in_worktree(w: &Worktree, seated: &str, label: &str) {
+    let run = review_run(Path::new(seated));
+    let out = run_tool(
+        "fs_cat.sh",
+        &w.main,
+        &[("path", "src/lib.rs")],
+        &run,
+        &w.main.join("../cache"),
+    );
+    assert_eq!(
+        out.trim(),
+        "// TASK",
+        "{label}: the lane is seated in {seated}, not the worktree under review: {out}"
+    );
+}
+
 /// The root run was started in the main clone, so every child inherits it
 /// as `project_dir`; the caller names a task worktree as the checkout under
 /// review. Each lane child must be seated in the worktree, so its grounded
@@ -844,22 +897,8 @@ fn review_lanes_are_seated_in_the_worktree_under_review() {
         return;
     }
     let w = worktree();
-    let cache = w.main.join("../cache");
     let inherited = s(&w.main);
-    for (graph, script) in [
-        (
-            "review-gauntlet/graph.yaml",
-            "review-gauntlet/scripts/signals.py",
-        ),
-        ("code-reviewer/graph.yaml", "code-reviewer/scripts/facts.py"),
-    ] {
-        let mut state = json!({
-            "project_dir": inherited,
-            "project_dir_in": s(&w.worktree),
-            "diff_spec": "worktree",
-        });
-        let resolved = run_script(script, &state);
-        state["project_dir"] = resolved["project_dir"].clone();
+    for (graph, state) in resolved_review_states(&w) {
         let doc = agent_doc(graph);
         let lanes: Vec<(String, serde_yaml::Value)> = doc["nodes"]
             .as_mapping()
@@ -875,21 +914,43 @@ fn review_lanes_are_seated_in_the_worktree_under_review() {
                 "{graph} {id}: the child agent declares no project_dir to seat"
             );
             let seated = rendered_project_dir(&node, &state).unwrap_or_else(|| inherited.clone());
-            let run = review_run(Path::new(&seated));
-            let out = run_tool(
-                "fs_cat.sh",
-                &w.main,
-                &[("path", "src/lib.rs")],
-                &run,
-                &cache,
-            );
-            assert_eq!(
-                out.trim(),
-                "// TASK",
-                "{graph} {id}: the lane is seated in {seated}, not the worktree under review: {out}"
-            );
+            assert_seated_in_worktree(&w, &seated, &format!("{graph} {id}"));
         }
     }
+}
+
+/// Lanes an llm node starts with agent__spawn get no `inputs:`; the model
+/// seats them only by passing project_dir as a spawn variable, so the
+/// node's instructions must name it from the state key the script resolved.
+#[test]
+fn spawned_review_lanes_are_seated_in_the_worktree_under_review() {
+    if !tools_available() || !python_available() {
+        return;
+    }
+    let w = worktree();
+    let mut spawners = 0;
+    for (graph, state) in resolved_review_states(&w) {
+        let doc = agent_doc(graph);
+        for (id, node) in doc["nodes"].as_mapping().unwrap() {
+            let spawns = node["type"].as_str() == Some("llm")
+                && node["instructions"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("agent__spawn"));
+            if !spawns {
+                continue;
+            }
+            spawners += 1;
+            let label = format!("{graph} {}", id.as_str().unwrap());
+            let seated = spawned_project_dir(node, &state).unwrap_or_else(|| {
+                panic!(
+                    "{label}: the instructions never tell the model to pass \
+                     \"project_dir\": \"{{{{<state key>}}}}\" as a spawn variable"
+                )
+            });
+            assert_seated_in_worktree(&w, &seated, &label);
+        }
+    }
+    assert!(spawners > 0, "no llm node spawns lane agents");
 }
 
 /// Runs a shipped graph script with `state` delivered via GRAPH_STATE_FILE.
