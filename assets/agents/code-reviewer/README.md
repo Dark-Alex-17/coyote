@@ -96,6 +96,9 @@ sweep) and untracked local files of another clone are unaffected. The guard live
 `functions/utils/review-paths.sh`. The `probe` lane is not grounded: it boots the system, writes
 files and runs commands in the checkout it is given, so a read-path guard on its fs tools would
 cover none of what it does.
+The `review_domain` and `verify` nodes pass the checkout `facts` resolved as `project_dir` through
+`inputs:`, so the domain leaders, their file reviewers and the verifier are grounded in that
+checkout even when the run that spawned the review was started in another one.
 
 A CodeRabbit-style code review orchestrator that coordinates per-file reviews and synthesizes findings into a unified 
 report.
