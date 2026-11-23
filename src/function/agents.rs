@@ -1338,8 +1338,6 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
     Ok(())
 }
 
-/// The `agent.*` extras every event about a spawned child carries. Only a
-/// seated child has a session to name, so the key is absent otherwise.
 /// Records a seated child's terminal status on its sidecar. The sidecar is
 /// bookkeeping about the child, not part of its result, so a sidecar that
 /// cannot be read or written is logged and the caller carries on with the

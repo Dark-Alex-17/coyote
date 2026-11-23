@@ -132,6 +132,9 @@ pub(crate) enum UiMsg {
     /// Text `.copy` puts on the clipboard. Fd 1 is a turn's capture pipe,
     /// so the loop copies it over the screen's descriptor as Alt+C does.
     Copy(String),
+    /// What the paste key read off the clipboard, read and saved on a
+    /// worker thread; its images are numbered when it lands.
+    ClipboardPasted(crate::repl::PreparedPaste),
     /// A resumed session's history, which the REPL prints on `.session`
     /// and `.agent`; the transcript shows it as rows instead.
     History(Vec<ChildEntry>),
@@ -285,9 +288,11 @@ impl UiSink for TuiSink {
 }
 
 /// A string from an engine event, made safe to draw: it lands on the status
-/// row or a transcript row, and a tool's text is its own.
+/// row or a transcript row, and a tool's text is its own. It is cut to the
+/// length a hook's environment value gets, so a long error stays a bounded
+/// row.
 fn plain(text: &str) -> String {
-    super::render::plain_text(text)
+    super::render::plain_text(crate::hooks::truncate_env_value(text))
 }
 
 fn plain_opt(text: &Option<String>) -> Option<String> {
