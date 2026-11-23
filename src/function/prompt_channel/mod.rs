@@ -80,8 +80,8 @@ impl ToolPrompter {
             return Ok(answer);
         }
         // A run with no human cannot answer a tool, so the tool fails closed;
-        // the headless prompter's `needs_human` JSON is only useful to
-        // built-in tools, which hand it back to the model. The cancel is
+        // the headless prompter's needs-human answer is only useful to
+        // built-in tools, which hand it back to the model as JSON. The cancel is
         // substituted here, before any widget is built, because a tool
         // must see a clean cancel on its protocol and never a crash; the
         // prompter is not consulted (`headless_run_answers_tool_prompts_with_cancel`).
