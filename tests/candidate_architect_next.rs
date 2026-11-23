@@ -2188,7 +2188,21 @@ fn copy_tree(src: &Path, dst: &Path) {
 /// Returns the candidate copy.
 fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
     let agents = scratch.0.join("tree").join("agents");
-    for name in [".shared", "architect", "sisyphus-next"] {
+    // The smoke battery reads each child agent's declared variables and runs
+    // review-gauntlet's signals script.
+    for name in [
+        ".shared",
+        "architect",
+        "sisyphus-next",
+        "review-gauntlet",
+        "adversary",
+        "explore",
+        "librarian",
+        "gatekeeper",
+        "oracle",
+        "engineer",
+        "whetstone",
+    ] {
         copy_tree(&agents_dir().join(name), &agents.join(name));
     }
     let copy = agents.join(CANDIDATE);
@@ -3093,10 +3107,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4976, 4985],
+        vec![51, 4980, 4989],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4976, 4985] {
+    for line in [4980, 4989] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"

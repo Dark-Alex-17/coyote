@@ -291,6 +291,7 @@ initial_state:
   verify_lane: ''
   gauntlet_prompt: ''
   adversary_prompt: ''
+  review_project_dir: ''
   gauntlet_result: ''
   adversary_result: ''
   gauntlet_blockers: []
@@ -760,6 +761,8 @@ nodes:
     type: agent
     agent: explore
     teammates: true
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       Grounding slice for a design decomposition. Code repo: {{code_repo_path}}
       (read-only reference siblings may live under {{reference_root_path}}).
@@ -794,6 +797,8 @@ nodes:
     id: explore_slice_solo
     type: agent
     agent: explore
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       Grounding slice for a design decomposition. Code repo: {{code_repo_path}}
       (read-only reference siblings may live under {{reference_root_path}}).
@@ -834,6 +839,8 @@ nodes:
     id: archivist_question
     type: agent
     agent: explore
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       {{question}}
 
@@ -868,6 +875,8 @@ nodes:
     id: librarian_question
     type: agent
     agent: librarian
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       {{question}}
 
@@ -1116,6 +1125,7 @@ nodes:
       authoritative sources preferred; return a distilled, deduplicated checklist
       (one item per line, numbered).
     inputs:
+      project_dir: '{{code_repo_path}}'
       research_depth: deep
     timeout: 3600
     max_attempts: 2
@@ -1205,6 +1215,8 @@ nodes:
     type: agent
     agent: gatekeeper
     description: Gate 1 - self-containedness (SEALED/LEAKY), blocking by construction.
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       {{gate1_prompt}}
     timeout: 3600
@@ -1322,6 +1334,8 @@ nodes:
     type: agent
     agent: oracle
     description: Gate 2 - executability (PLAN_REVIEW OKAY/REJECT) over the sealed plan.
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       {{gate2_prompt}}
     timeout: 3600
@@ -1491,6 +1505,8 @@ nodes:
     type: agent
     agent: oracle
     description: Consult the oracle for diagnosis before deciding to retry, re-scope or escalate a failed task.
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       A delegated implementation task failed after the implementer's own recovery.
       Diagnose the failure from the evidence and propose ONE of: a concrete
@@ -1530,10 +1546,11 @@ nodes:
     id: run_gauntlet
     type: agent
     agent: review-gauntlet
-    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary; the build lock rides `inputs:` too).
+    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary; the checkout under review and the build lock ride `inputs:` too).
     prompt: |
       {{gauntlet_prompt}}
     inputs:
+      project_dir: '{{review_project_dir}}'
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
@@ -1548,10 +1565,11 @@ nodes:
     id: run_adversary
     type: agent
     agent: adversary
-    description: Micro task scope - the direct conformance verdict (criteria are executable commands); the build lock rides `inputs:`.
+    description: Micro task scope - the direct conformance verdict (criteria are executable commands); the checkout under review and the build lock ride `inputs:`.
     prompt: |
       {{adversary_prompt}}
     inputs:
+      project_dir: '{{review_project_dir}}'
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
@@ -1757,10 +1775,11 @@ nodes:
     id: wave_gauntlet
     type: agent
     agent: review-gauntlet
-    description: The member's conformance panel (independent verdict; no teammates flag); the build lock rides `inputs:`.
+    description: The member's conformance panel (independent verdict; no teammates flag); the member's worktree and the build lock ride `inputs:`.
     prompt: |
       {{gauntlet_prompt}}
     inputs:
+      project_dir: '{{review_project_dir}}'
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
@@ -1974,6 +1993,8 @@ nodes:
     description: >-
       Tier 3 - one bounded request/response edge to the navigator (A5: retries 0,
       timeout -> tier 4). Rehydrates from artifacts, never a transcript.
+    inputs:
+      project_dir: '{{code_repo_path}}'
     prompt: |
       Consult request from a running architect orchestration (you are the
       navigator the run defers preference-laden or novel decisions to; answer

@@ -1863,8 +1863,10 @@ def verify_gate(state):
     tasks = as_list(state.get("tasks"))
     scope = state.get("verify_scope") or "task"
     code = state.get("code_repo_path", "")
+    # A batch is reviewed on the run branch; the last delegation's worktree may already be removed.
+    rdir = code if scope == "batch" else (state.get("delegate_project_dir") or code)
     task = task_by_id(tasks, state.get("current_task")) or {}
-    head = git_out(code, "rev-parse", "HEAD", default=task.get("head_sha", ""))
+    head = git_out(rdir, "rev-parse", "HEAD", default=task.get("head_sha", ""))
     unit = state.get("current_batch") if scope == "batch" else task.get("id", "run")
     rounds_log = dict(as_dict(state.get("round_log")))
     rl = rounds_log.setdefault(unit, [])
@@ -1880,8 +1882,8 @@ def verify_gate(state):
         base = task.get("base_sha", "") if scope != "batch" else state.get("batch_base_sha", "")
         diff = f"{base}..HEAD" if base else "worktree"
     else:
-        diff = f"get_diff --base {task.get('pr_base') or state.get('base_branch_name')} in {code}"
-    lines = ["Post-implementation review gate.", f"Project: {state.get('delegate_project_dir') or code}", f"Diff: {diff}"]
+        diff = f"get_diff --base {task.get('pr_base') or state.get('base_branch_name')} in {rdir}"
+    lines = ["Post-implementation review gate.", f"Project: {rdir}", f"Diff: {diff}"]
     forced = ["adversary"]
     if scope == "batch":
         forced = ["code-review", "adversary", "security"]
@@ -1904,7 +1906,7 @@ def verify_gate(state):
             lines += ["Rebuttals from the fix round (claims to verify against the diff, not settled decisions):"]
             lines += [f"- {r}" for r in rebuttals]
         last = rl[-1]
-        if last.get("head") and last["head"] != head and not _code_tree_dirty(state, code):
+        if last.get("head") and last["head"] != head and not _code_tree_dirty(state, rdir):
             lines += [f"Re-review delta: {last['head']}..HEAD"]
             # Only the immediately-prior round settles a lane, as the review
             # gauntlet's own contract reads it: a lane GREEN two rounds ago but
@@ -1920,8 +1922,9 @@ def verify_gate(state):
         lines += ["Local-run recipe / usage suites:", note]
     u["gauntlet_prompt"] = "\n".join(lines)
     u["adversary_prompt"] = (f"Adversarially review the changes for {task.get('id', unit)} against its plan. Return CONFORMS/DIVERGES.\n\n"
-                             f"DIFF: {'run ' + diff if diff.startswith('get_diff') else 'run get_diff --base ' + diff.split('..')[0] + ' in ' + code}\n\n"
+                             f"DIFF: {'run ' + diff if diff.startswith('get_diff') else 'run get_diff --base ' + diff.split('..')[0] + ' in ' + rdir}\n\n"
                              f"PLAN - acceptance criteria to check against:\n{crit}\n\n{_quality_bar_text(plan_text)}")
+    u["review_project_dir"] = rdir
     cmds = _verification_commands(state)
     if scope == "hygiene" and state.get("hygiene_lint_cmd"):
         arr = json.loads(cmds)
@@ -1935,7 +1938,7 @@ def verify_gate(state):
         if isinstance(arr, list):
             declared = [c.strip() for c in arr if isinstance(c, str)]
             source = crit if scope == "batch" else plan_section(body, r"Acceptance criteria")
-            kept, dropped = criterion_commands(source, state.get("delegate_project_dir") or code, declared)
+            kept, dropped = criterion_commands(source, rdir, declared)
             extra = [c for c in kept if c not in declared]
             if extra:
                 cmds = json.dumps(arr + extra)
@@ -2758,7 +2761,8 @@ def wave_verify_build(state):
     sub.update({"current_task": task["id"], "verify_scope": "task", "delegate_project_dir": w.get("worktree", ""),
                 "round_log": {}, "tasks": tasks})
     inner = verify_gate(sub)
-    u.update({k: inner[k] for k in ("gauntlet_prompt", "adversary_prompt", "verification_commands_json", "debris_exclude") if k in inner})
+    u.update({k: inner[k] for k in ("gauntlet_prompt", "adversary_prompt", "verification_commands_json", "debris_exclude",
+                                    "review_project_dir") if k in inner})
     u["wave_report"] = state.get("wave_delegate_result") or ""
     return u
 

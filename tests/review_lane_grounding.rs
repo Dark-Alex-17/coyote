@@ -807,6 +807,91 @@ fn python_available() -> bool {
     ok
 }
 
+fn agent_doc(rel: &str) -> serde_yaml::Value {
+    let path = manifest().join("assets/agents").join(rel);
+    serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap()
+}
+
+fn declares_project_dir(agent: &str) -> bool {
+    ["graph.yaml", "config.yaml"]
+        .iter()
+        .map(|file| format!("{agent}/{file}"))
+        .find(|rel| manifest().join("assets/agents").join(rel).is_file())
+        .map(|rel| agent_doc(&rel))
+        .and_then(|doc| doc["variables"].as_sequence().cloned())
+        .is_some_and(|vars| {
+            vars.iter()
+                .any(|v| v["name"].as_str() == Some("project_dir"))
+        })
+}
+
+/// An agent node's `inputs.project_dir` as the engine resolves it: a lone
+/// `{{key}}` yields that state value; None when the node passes none, so
+/// the child keeps the value inherited from the root run.
+fn rendered_project_dir(node: &serde_yaml::Value, state: &Value) -> Option<String> {
+    let template = node["inputs"]["project_dir"].as_str()?.trim();
+    let key = template.strip_prefix("{{")?.strip_suffix("}}")?;
+    state[key].as_str().map(str::to_string)
+}
+
+/// The root run was started in the main clone, so every child inherits it
+/// as `project_dir`; the caller names a task worktree as the checkout under
+/// review. Each lane child must be seated in the worktree, so its grounded
+/// read of `src/lib.rs` from the main clone's cwd returns the task's file.
+#[test]
+fn review_lanes_are_seated_in_the_worktree_under_review() {
+    if !tools_available() || !python_available() {
+        return;
+    }
+    let w = worktree();
+    let cache = w.main.join("../cache");
+    let inherited = s(&w.main);
+    for (graph, script) in [
+        (
+            "review-gauntlet/graph.yaml",
+            "review-gauntlet/scripts/signals.py",
+        ),
+        ("code-reviewer/graph.yaml", "code-reviewer/scripts/facts.py"),
+    ] {
+        let mut state = json!({
+            "project_dir": inherited,
+            "project_dir_in": s(&w.worktree),
+            "diff_spec": "worktree",
+        });
+        let resolved = run_script(script, &state);
+        state["project_dir"] = resolved["project_dir"].clone();
+        let doc = agent_doc(graph);
+        let lanes: Vec<(String, serde_yaml::Value)> = doc["nodes"]
+            .as_mapping()
+            .unwrap()
+            .iter()
+            .filter(|(_, node)| node["type"].as_str() == Some("agent"))
+            .map(|(id, node)| (id.as_str().unwrap().to_string(), node.clone()))
+            .collect();
+        assert!(!lanes.is_empty(), "{graph}: no agent nodes");
+        for (id, node) in lanes {
+            assert!(
+                declares_project_dir(node["agent"].as_str().unwrap()),
+                "{graph} {id}: the child agent declares no project_dir to seat"
+            );
+            let seated = rendered_project_dir(&node, &state).unwrap_or_else(|| inherited.clone());
+            let run = review_run(Path::new(&seated));
+            let out = run_tool(
+                "fs_cat.sh",
+                &w.main,
+                &[("path", "src/lib.rs")],
+                &run,
+                &cache,
+            );
+            assert_eq!(
+                out.trim(),
+                "// TASK",
+                "{graph} {id}: the lane is seated in {seated}, not the worktree under review: {out}"
+            );
+        }
+    }
+}
+
 /// Runs a shipped graph script with `state` delivered via GRAPH_STATE_FILE.
 /// Python's stdio is set to Windows' cp1252 and UTF-8 mode is off, as on a
 /// windows-latest runner where the engine sets neither, so a script that

@@ -4112,6 +4112,60 @@ check("graph: delegate and wave_delegate hand the architect's escalation_policy 
       all(v.get("escalation_policy") == p and v.get("build_lock") == LOCK for (_, p), v in policy_in.items()), policy_in)
 lock_in = {n: render_inputs(n, {**base_state(build_lock=LOCK), "wtask": WAVE[0]}).get("build_lock") for n in ("run_gauntlet", "wave_gauntlet", "run_adversary")}
 check("graph: run_gauntlet, wave_gauntlet and run_adversary hand the architect's build_lock to their child", all(v == LOCK for v in lock_in.values()), lock_in)
+AGENTS_ROOT = os.path.join(HERE, "..", "..")
+
+
+def child_declares_project_dir(agent):
+    for name in ("graph.yaml", "config.yaml"):
+        doc, _ = read_graph(os.path.join(AGENTS_ROOT, agent, name))
+        if doc is not None:
+            return any(v.get("name") == "project_dir" for v in doc.get("variables") or [])
+    return None
+
+
+# A child that declares project_dir and gets no input keeps the root run's checkout.
+declares = {n: child_declares_project_dir(v.get("agent", "")) for n, v in NODES.items() if v.get("type") == "agent"}
+unseated = sorted(n for n, d in declares.items() if d and not (NODES[n].get("inputs") or {}).get("project_dir"))
+unread = sorted(n for n, d in declares.items() if d is None)
+check("graph: every agent node whose child declares project_dir passes it through inputs", not unseated and not unread,
+      {"unseated": unseated, "child agent unreadable": unread})
+TOP_LEVEL = ("explore_slice_team", "explore_slice_solo", "archivist_question", "librarian_question", "checklist_librarian",
+             "gate1", "gate2", "oracle_diagnose", "consult_navigator")
+top_dirs = {n: render_inputs(n, base_state()).get("project_dir") for n in TOP_LEVEL}
+check("graph: planning, gate, diagnosis and navigator children are seated in the code repo", all(d == CODE for d in top_dirs.values()), top_dirs)
+REVIEW_NODES = ("run_gauntlet", "run_adversary")
+seq_v = gates.verify_gate({**base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task"), **U_SEQ})
+seq_dirs = {n: render_inputs(n, {**base_state(), **U_SEQ, **seq_v}).get("project_dir") for n in REVIEW_NODES}
+check("graph: a sequential task's reviewers are seated in the code repo", all(d == CODE for d in seq_dirs.values()), seq_dirs)
+WT = WAVE[0]["worktree"]
+retry_v = gates.verify_gate({**RETRY, **U_RETRY, "verify_scope": "task"})
+retry_dirs = {n: render_inputs(n, {**RETRY, **U_RETRY, **retry_v}).get("project_dir") for n in REVIEW_NODES}
+check("graph: a task retried in its wave worktree is reviewed there - run_gauntlet and run_adversary seat the worktree, the adversary "
+      "diff names it, and the round head is the worktree's",
+      all(d == WT for d in retry_dirs.values()) and f" in {WT}" in retry_v["adversary_prompt"]
+      and f" in {CODE}\n" not in retry_v["adversary_prompt"]
+      and retry_v["round_log"][T1][-1]["head"] == gates.git_out(WT, "rev-parse", "HEAD"),
+      (retry_dirs, retry_v["adversary_prompt"][:300]))
+wave_v = gates.wave_verify_build(base_state(plan_path=PROMOTED, tasks=TS_W, wtask=WAVE[0], wave_delegate_result=REPORT_OK))
+wave_dir = render_inputs("wave_gauntlet", {**base_state(), "wtask": WAVE[0], **wave_v}).get("project_dir")
+check("graph: a wave member's review panel is seated in the member's worktree", wave_dir == WT, wave_dir)
+batch_v = gates.verify_gate({**RETRY, **U_RETRY, "verify_scope": "batch", "current_batch": "B1"})
+check("graph: a batch review is seated in the code repo even when the last delegation went to a worktree",
+      render_inputs("run_gauntlet", {**RETRY, **U_RETRY, **batch_v}).get("project_dir") == CODE and f"Project: {CODE}\n" in batch_v["gauntlet_prompt"],
+      batch_v.get("review_project_dir"))
+RG_GRAPH, rg_graph_error = read_graph(os.path.join(AGENTS_ROOT, "review-gauntlet", "graph.yaml"))
+RG_NODES = (RG_GRAPH or {}).get("nodes") or {}
+# The panel's parse stage may extract no directory; the seated variable alone must carry the worktree to every lane.
+rg_state = {"project_dir": render_inputs("run_gauntlet", {**RETRY, **U_RETRY, **retry_v}).get("project_dir"), "project_dir_in": "",
+            "diff_spec": "worktree"}
+p = subprocess.run([sys.executable, "-B", os.path.join(AGENTS_ROOT, "review-gauntlet", "scripts", "signals.py")],
+                   env={**{k: v for k, v in os.environ.items() if k != "GRAPH_STATE_FILE"}, "GRAPH_STATE": json.dumps(rg_state)},
+                   capture_output=True, text=True, cwd=CODE)
+rg_state.update(json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else {})
+lane_dirs = {n: render_inputs(n, rg_state, RG_NODES).get("project_dir") for n, v in RG_NODES.items() if v.get("type") == "agent"}
+check("graph: a task worktree flows architect run_gauntlet inputs -> review-gauntlet signals -> every review lane's inputs",
+      RG_GRAPH is not None and lane_dirs and all(d and os.path.realpath(d) == os.path.realpath(WT) for d in lane_dirs.values()),
+      f"{rg_graph_error} rc={p.returncode} {p.stderr[-300:]} {lane_dirs}")
 # The child's own escalate_gate over the delegate inputs: the battery drops LLM_AGENT_VAR_*, so only an input can carry the policy.
 SN_ESC_HARD = {**SN_ESC, "hard_trigger": True}
 for node in ("delegate", "wave_delegate"):
