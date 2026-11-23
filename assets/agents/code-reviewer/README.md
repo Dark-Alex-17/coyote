@@ -99,7 +99,8 @@ cover none of what it does.
 
 The `review_domain` and `verify` nodes pass the checkout `facts` resolved as `project_dir` through
 `inputs:`, so the domain leaders, their file reviewers and the verifier are grounded in that
-checkout even when the run that spawned the review was started in another one.
+checkout even when the run that spawned the review was started in another one; `aux_lanes` passes
+it as the `project_dir` spawn variable to each lane agent that declares one.
 
 A CodeRabbit-style code review orchestrator that coordinates per-file reviews and synthesizes findings into a unified 
 report.
