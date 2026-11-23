@@ -1,7 +1,7 @@
 use crate::cli::{Cli, McpScopeArg, McpTransportArg};
-use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::config::{ensure_parent_exists, paths};
 use crate::mcp::{JsonField, McpOAuthConfig, McpServer, McpServersConfig, McpTransportType};
+use crate::prompt::{InquirePrompter, Prompter, require_human};
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::{IndexMap, IndexSet};
@@ -172,10 +172,8 @@ fn confirm_on_the_terminal(
     question: String,
     remedy: &str,
 ) -> Result<bool> {
-    if !menu_can_use_terminal() {
-        return Err(refuse_non_interactive(action, remedy));
-    }
-    let prompter = crate::prompt::InquirePrompter::default();
+    let prompter = InquirePrompter::default();
+    require_human(&prompter, action, remedy)?;
     crate::prompt::confirm(&prompter, question, false)
 }
 
@@ -365,8 +363,8 @@ fn provision_secrets(cli: &Cli, server: &str, vault: &Vault) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    refuse_missing_secrets_without_a_terminal(server, &missing)?;
-    let prompter = crate::prompt::InquirePrompter::default();
+    let prompter = InquirePrompter::default();
+    refuse_missing_secrets_without_a_terminal(&prompter, server, &missing)?;
     for name in missing {
         eprintln!("Value references vault secret {{{{ {name} }}}} which is not stored yet.");
         let ok =
@@ -386,21 +384,23 @@ fn provision_secrets(cli: &Cli, server: &str, vault: &Vault) -> Result<()> {
 /// Each missing secret is asked for and then entered on the terminal, so
 /// a run with nowhere to ask is refused before the first question rather
 /// than part way through the list.
-fn refuse_missing_secrets_without_a_terminal(server: &str, missing: &[&str]) -> Result<()> {
-    if menu_can_use_terminal() {
-        return Ok(());
-    }
+fn refuse_missing_secrets_without_a_terminal(
+    prompter: &dyn Prompter,
+    server: &str,
+    missing: &[&str],
+) -> Result<()> {
     let commands: Vec<String> = missing
         .iter()
         .map(|name| format!("`coyote --add-secret {name}`"))
         .collect();
-    Err(refuse_non_interactive(
+    require_human(
+        prompter,
         format_args!("provision the MCP secrets for '{server}'"),
         format_args!(
             " or add them to the vault first with {}.",
             commands.join(", ")
         ),
-    ))
+    )
 }
 
 fn load_for_scope_or_search(
@@ -492,6 +492,7 @@ fn save_config(path: &Path, config: &McpServersConfig) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::conflict::prompt_script;
+    use crate::prompt::ScriptedPrompter;
     use crate::testing::TestConfigDirGuard;
     use clap::Parser;
     use serial_test::serial;
@@ -502,8 +503,12 @@ mod tests {
         let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install_non_interactive();
 
-        let err = refuse_missing_secrets_without_a_terminal("github", &["GH_TOKEN", "GH_USER"])
-            .unwrap_err();
+        let err = refuse_missing_secrets_without_a_terminal(
+            &ScriptedPrompter::refusing(),
+            "github",
+            &["GH_TOKEN", "GH_USER"],
+        )
+        .unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -519,7 +524,12 @@ mod tests {
         let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _script = prompt_script::install(&[]);
 
-        refuse_missing_secrets_without_a_terminal("github", &["GH_TOKEN"]).unwrap();
+        refuse_missing_secrets_without_a_terminal(
+            &ScriptedPrompter::refusing(),
+            "github",
+            &["GH_TOKEN"],
+        )
+        .unwrap();
     }
 
     /// A config dir holding a user mcp.json with one server, plus the

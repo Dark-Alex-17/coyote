@@ -132,15 +132,14 @@ pub fn create_vault_password_file(
     }
     // Every path from here asks at least twice (create, then the password
     // itself), so a run with nowhere to ask is refused before the first.
-    if !crate::config::conflict::menu_can_use_terminal() {
-        return Err(crate::config::conflict::refuse_non_interactive(
-            format_args!(
-                "create the vault password file at '{}'",
-                vault_password_file.display()
-            ),
-            ".",
-        ));
-    }
+    crate::prompt::require_human(
+        prompter,
+        format_args!(
+            "create the vault password file at '{}'",
+            vault_password_file.display()
+        ),
+        ".",
+    )?;
 
     if exists {
         let ans = confirm(

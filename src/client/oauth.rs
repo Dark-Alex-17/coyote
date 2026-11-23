@@ -4,11 +4,11 @@ use super::gemini_oauth::GeminiOAuthProvider;
 use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
-use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::config::paths;
 use crate::events::Origin;
 use crate::prompt::{
-    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present,
+    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, Reach, ask,
+    require_human,
 };
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -325,7 +325,7 @@ async fn run_pkce_flow(
     // printed or a browser opened for a sign-in nobody could finish.
     let capture = code_capture(use_callback_listener);
     if capture != CodeCapture::Listener {
-        ensure_paste_can_be_asked(client_name)?;
+        ensure_paste_can_be_asked(prompter, client_name)?;
     }
 
     let authorize_url = build_authorize_url(provider, &redirect_uri, &code_challenge, &state);
@@ -991,7 +991,7 @@ fn ask_paste_input(
     client_name: &str,
     question: &str,
 ) -> Result<(String, Option<String>)> {
-    ensure_paste_can_be_asked(client_name)?;
+    ensure_paste_can_be_asked(prompter, client_name)?;
     let req = PromptRequest {
         sensitive: true,
         ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
@@ -1000,21 +1000,20 @@ fn ask_paste_input(
     parse_paste_input(input.trim())
 }
 
-fn ensure_paste_can_be_asked(client_name: &str) -> Result<()> {
+fn ensure_paste_can_be_asked(prompter: &dyn Prompter, client_name: &str) -> Result<()> {
     // Refused before any widget exists, with the flow's own message rather
     // than the prompter's typed refusal, so a headless run reads the same
     // error whichever step it stops at; `ask_paste_input_bails_without_a_human_before_asking`
     // pins that no request reaches the prompter. A run with a human but no
     // terminal to paste into gets the shared non-interactive refusal.
-    if !human_present() {
+    if prompter.reach() == Reach::Headless {
         bail!("{NO_HUMAN_FOR_OAUTH}");
     }
-    if !menu_can_use_terminal() {
-        return Err(refuse_non_interactive(
-            format_args!("sign in to '{client_name}' with OAuth"),
-            ".",
-        ));
-    }
+    require_human(
+        prompter,
+        format_args!("sign in to '{client_name}' with OAuth"),
+        ".",
+    )?;
     Ok(())
 }
 
@@ -2205,7 +2204,7 @@ echo_pkce_in_token_exchange: true
         let _tui_off = crate::tui::OwnerGuard::shell_for_test();
         let _no_tty = prompt_script::install_non_interactive();
 
-        let err = ensure_paste_can_be_asked("client-x").unwrap_err();
+        let err = ensure_paste_can_be_asked(&ScriptedPrompter::refusing(), "client-x").unwrap_err();
 
         assert_eq!(
             err.to_string(),

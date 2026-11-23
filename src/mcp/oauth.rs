@@ -2,11 +2,11 @@ use crate::client::oauth::{
     OAuthProvider, OAuthTokens, TokenRequestFormat, load_oauth_tokens, refresh_oauth_token,
     run_oauth_flow, token_response_keys,
 };
-use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::config::paths;
 use crate::events::Origin;
 use crate::prompt::{
-    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present,
+    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, Reach, ask,
+    require_human,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -131,15 +131,14 @@ pub async fn run_mcp_oauth_flow(
     // `run_mcp_oauth_flow_bails_without_a_human_before_discovery_or_the_prompter`).
     // A run with a human but no terminal for the client-id question gets
     // the shared non-interactive refusal, also before any network.
-    if !human_present() {
+    if prompter.reach() == Reach::Headless {
         bail!("{NO_HUMAN_FOR_OAUTH}");
     }
-    if !menu_can_use_terminal() {
-        return Err(refuse_non_interactive(
-            format_args!("sign in to '{server_name}' with OAuth"),
-            ".",
-        ));
-    }
+    require_human(
+        prompter,
+        format_args!("sign in to '{server_name}' with OAuth"),
+        ".",
+    )?;
     let discovered = discover_oauth_metadata(server_url).await?;
     let metadata = discovered.metadata;
     let resource = resolve_resource(discovered.resource, server_url)?;
@@ -227,15 +226,14 @@ fn ask_client_id(prompter: &dyn Prompter, server_name: &str) -> Result<String> {
     // error whichever step it stops at; `ask_client_id_bails_without_a_human_before_asking`
     // pins that no request reaches the prompter. A run with a human but no
     // terminal to answer on gets the shared non-interactive refusal.
-    if !human_present() {
+    if prompter.reach() == Reach::Headless {
         bail!("{NO_HUMAN_FOR_OAUTH}");
     }
-    if !menu_can_use_terminal() {
-        return Err(refuse_non_interactive(
-            format_args!("sign in to '{server_name}' with OAuth"),
-            ".",
-        ));
-    }
+    require_human(
+        prompter,
+        format_args!("sign in to '{server_name}' with OAuth"),
+        ".",
+    )?;
     let req = PromptRequest {
         sensitive: true,
         ..PromptRequest::new(

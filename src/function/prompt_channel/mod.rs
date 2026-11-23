@@ -186,7 +186,8 @@ pub(crate) fn answer_value(answer: &Result<PromptAnswer>) -> Value {
         Ok(PromptAnswer::Confirmed(yes)) => json!(yes),
         Ok(PromptAnswer::Selected(choice)) | Ok(PromptAnswer::Text(choice)) => json!(choice),
         Ok(PromptAnswer::Checked(choices)) => json!(choices),
-        Ok(PromptAnswer::Cancelled | PromptAnswer::Interrupted) | Err(_) => Value::Null,
+        Ok(PromptAnswer::Cancelled | PromptAnswer::Interrupted | PromptAnswer::NeedsHuman)
+        | Err(_) => Value::Null,
     }
 }
 

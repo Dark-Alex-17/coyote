@@ -5,10 +5,9 @@
 //! keep-all/replace-all semantics are identical everywhere, including when
 //! one sticky scope spans several install locations in a single run.
 
-use crate::prompt::{Prompter, select_closed};
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::prompt::{Prompter, can_ask, require_human, select_closed};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;
 
@@ -40,7 +39,7 @@ pub(crate) enum ConflictAction {
 pub(crate) enum NonInteractive {
     /// Refused in the shared shape; `remedy` follows "Re-run in a
     /// terminal" and names the flags of the surface that started the
-    /// run (see [`refuse_non_interactive`]).
+    /// run (see [`require_human`]).
     Bail {
         remedy: &'static str,
     },
@@ -83,16 +82,14 @@ pub(crate) fn resolve_conflict(
         StickyMode::None => {}
     }
 
-    if !menu_can_use_terminal() {
-        match non_interactive {
-            NonInteractive::Keep => return Ok(ConflictAction::Keep),
-            NonInteractive::Bail { remedy } => {
-                return Err(refuse_non_interactive(
-                    format_args!("overwrite local file {}", dst.display()),
-                    remedy,
-                ));
-            }
-        }
+    match non_interactive {
+        NonInteractive::Keep if !can_ask(prompter) => return Ok(ConflictAction::Keep),
+        NonInteractive::Keep => {}
+        NonInteractive::Bail { remedy } => require_human(
+            prompter,
+            format_args!("overwrite local file {}", dst.display()),
+            remedy,
+        )?,
     }
 
     let prompt = format!("Conflict at {} (category: {category})", dst.display());
@@ -112,29 +109,6 @@ pub(crate) fn resolve_conflict(
         "abort" => bail!("Install aborted by user at conflict resolution."),
         _ => unreachable!("select_closed only hands back an offered option"),
     }
-}
-
-/// Whether a question has somewhere to be shown: the full-screen UI's
-/// modal, or a terminal on stdout for an inquire widget. Stdin does not
-/// matter: when it is not a terminal the widget reads its keys from
-/// `/dev/tty` instead.
-pub(crate) fn menu_can_use_terminal() -> bool {
-    #[cfg(test)]
-    let on_tty = prompt_script::forced_stdout_tty().unwrap_or(*IS_STDOUT_TERMINAL);
-    #[cfg(not(test))]
-    let on_tty = *IS_STDOUT_TERMINAL;
-    crate::tui::active() || on_tty
-}
-
-/// The refusal for a question nothing can show; every site builds it
-/// here so the message has one shape. `remedy` follows "Re-run in a
-/// terminal" directly, so it begins with its own separator (" or pass
-/// --force.", ", with --yes (updates).") or is just a period.
-pub(crate) fn refuse_non_interactive(
-    action: impl std::fmt::Display,
-    remedy: impl std::fmt::Display,
-) -> anyhow::Error {
-    anyhow!("Refusing to {action} non-interactively. Re-run in a terminal{remedy}")
 }
 
 fn select_choice(prompt: &str, prompter: &dyn Prompter) -> Result<String> {
@@ -217,7 +191,7 @@ pub(crate) mod prompt_script {
 
     /// The stdout terminal the script stands in for. Stdin is left real, so
     /// a test pipes fd 0 itself when it needs a non-terminal stdin.
-    pub(super) fn forced_stdout_tty() -> Option<bool> {
+    pub(crate) fn forced_stdout_tty() -> Option<bool> {
         match STATE.load(Ordering::SeqCst) {
             TTY => Some(true),
             NON_TTY => Some(false),
@@ -361,63 +335,6 @@ mod tests {
             "got: {err:#}"
         );
         assert_eq!(sticky, StickyMode::None);
-    }
-
-    #[test]
-    #[serial]
-    fn menu_can_use_terminal_is_true_under_the_tui_whatever_the_tty() {
-        let _script = prompt_script::install_non_interactive();
-        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
-        assert!(menu_can_use_terminal());
-
-        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
-        assert!(!menu_can_use_terminal());
-    }
-
-    /// Outside the UI the gate follows stdout alone; a piped stdin does not
-    /// close it, since inquire then reads its keys from `/dev/tty`.
-    #[test]
-    #[serial]
-    fn menu_can_use_terminal_needs_only_a_stdout_tty_outside_the_tui() {
-        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
-        assert_eq!(menu_can_use_terminal(), *IS_STDOUT_TERMINAL);
-
-        let forced_on = prompt_script::install(&[]);
-        assert!(menu_can_use_terminal());
-        drop(forced_on);
-
-        let _forced_off = prompt_script::install_non_interactive();
-        assert!(!menu_can_use_terminal());
-
-        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
-        assert!(menu_can_use_terminal());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn menu_can_use_terminal_stays_open_with_a_stdout_tty_and_piped_stdin() {
-        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
-        let _stdout_tty = prompt_script::install(&[]);
-        let _stdin = crate::testing::pipe_stdin();
-
-        assert!(menu_can_use_terminal());
-    }
-
-    /// The refusal has one shape; only the action and the remedy vary.
-    #[test]
-    fn the_refusal_names_the_action_and_where_to_re_run() {
-        let err = refuse_non_interactive("overwrite local file", " or pass --force.");
-        assert_eq!(
-            err.to_string(),
-            "Refusing to overwrite local file non-interactively. Re-run in a terminal or pass --force."
-        );
-
-        let err = refuse_non_interactive("pick a bundle", ".");
-        assert_eq!(
-            err.to_string(),
-            "Refusing to pick a bundle non-interactively. Re-run in a terminal."
-        );
     }
 
     #[test]

@@ -1,5 +1,4 @@
-use crate::config::conflict::menu_can_use_terminal;
-use crate::prompt::Prompter;
+use crate::prompt::{Prompter, require_human};
 use crate::utils::warning_text;
 use anyhow::{Context, Result, bail};
 use dunce::canonicalize;
@@ -136,18 +135,18 @@ fn update_binary_at(
 
         if force {
             println!("--force specified; updating anyway.");
-        } else if menu_can_use_terminal() {
+        } else {
+            require_human(
+                prompter,
+                format_args!("update a {} install", source.label()),
+                remedy,
+            )?;
             let proceed =
                 crate::prompt::confirm_with_help(prompter, "Update anyway?", false, &body)?;
             if !proceed {
                 println!("Update cancelled.");
                 return Ok(());
             }
-        } else {
-            return Err(crate::config::conflict::refuse_non_interactive(
-                format_args!("update a {} install", source.label()),
-                remedy,
-            ));
         }
     }
 

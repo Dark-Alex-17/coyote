@@ -289,13 +289,13 @@ fn headless_request(ctx: &RequestContext, action: UserAction, args: &Value) -> P
 }
 
 /// The structured reply a run with no human hands the model. The prompter
-/// carries it as text for a confirm and refuses every other kind; the
-/// refusal becomes the same reply here, since the model is the one party
-/// that can act on it.
+/// answers a confirm with [`PromptAnswer::NeedsHuman`] and refuses every
+/// other kind; both become the same reply here, since the model is the
+/// one party that can act on it.
 fn headless_value(ctx: &RequestContext, req: PromptRequest) -> Result<Value> {
     let reply = headless_reply(&req);
     match ctx.prompt(req) {
-        Ok(PromptAnswer::Text(json)) => Ok(serde_json::from_str(&json)?),
+        Ok(PromptAnswer::NeedsHuman) => Ok(reply),
         Ok(other) => bail!("Unexpected answer to a headless prompt: {other:?}"),
         Err(err) if NeedsHuman::caused(&err) => Ok(reply),
         Err(err) => Err(err),
@@ -573,6 +573,37 @@ mod tests {
             panic!("{requested:?}");
         };
         assert_eq!(*action, PromptAction::Select);
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: NEEDS_HUMAN_MARKER.to_string(),
+                auto: false,
+            }]
+        );
+    }
+
+    /// A headless confirm is answered rather than refused, and both the
+    /// reply the model reads and the published answer match the select's.
+    #[test]
+    #[serial]
+    fn a_headless_confirm_hands_back_the_json_and_publishes_needs_human() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let sink = RecordingSink::install();
+        let mut ctx = cmd_ctx();
+        let v = run_user_tool(
+            &mut ctx,
+            "user__confirm",
+            json!({"question": "q-hl-cfm-8w", "options": ["a", "b"]}),
+        );
+
+        let expected = headless_json("confirm", "q-hl-cfm-8w", json!(["a", "b"]));
+        assert_eq!(v.to_string(), expected.to_string());
+        let (requested, answered) = prompt_events(sink.drain(), "q-hl-cfm-8w");
+        let [Event::PromptRequested { id, action, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(*action, PromptAction::Confirm);
         assert_eq!(
             answered,
             vec![Event::PromptAnswered {

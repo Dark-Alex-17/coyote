@@ -3,14 +3,15 @@ use super::bundles::{
     hash_file,
 };
 use crate::config::builtin_manifest::is_builtin_manifest_name;
-use crate::config::conflict::{self, ConflictAction, NonInteractive, StickyMode, resolve_conflict};
+use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
 use crate::config::{
     AssetCategory, BUNDLE_MANIFEST_FILE, CommandPrefix, InstallFilter, paths,
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::prompt::{
-    NeedsHuman, PromptCancelled, Prompter, select_closed, select_closed_or_cancel,
+    NeedsHuman, PromptCancelled, Prompter, can_ask, require_human, select_closed,
+    select_closed_or_cancel,
 };
 use crate::utils;
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
@@ -627,7 +628,7 @@ fn resolve_obsolete(
     // apply_plan has already written the update, so refusing here would
     // leave it half done. A Ctrl-C still stops the update at this point,
     // because the user asked for that.
-    if !conflict::menu_can_use_terminal() {
+    if !can_ask(prompter) {
         return Ok(ObsoleteAction::Keep);
     }
 
@@ -803,12 +804,11 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
     let record = store.get(&name).expect("resolved above").clone();
 
     if !assume_yes {
-        if !conflict::menu_can_use_terminal() {
-            return Err(conflict::refuse_non_interactive(
-                format_args!("uninstall bundle '{name}'"),
-                " or pass --yes.",
-            ));
-        }
+        require_human(
+            prompter,
+            format_args!("uninstall bundle '{name}'"),
+            " or pass --yes.",
+        )?;
         let ownership = format!(
             "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
             record.files.len(),
@@ -935,15 +935,14 @@ fn select_uninstall_candidate(
                 .map(|(name, source)| format!("{name} ({source})"))
                 .collect();
 
-            if !conflict::menu_can_use_terminal() {
-                return Err(conflict::refuse_non_interactive(
-                    format_args!(
-                        "pick between the bundles matching '{spec}' ({})",
-                        described.join(", ")
-                    ),
-                    " or pass the exact bundle name or source URL.",
-                ));
-            }
+            require_human(
+                prompter,
+                format_args!(
+                    "pick between the bundles matching '{spec}' ({})",
+                    described.join(", ")
+                ),
+                " or pass the exact bundle name or source URL.",
+            )?;
 
             let picked = select_closed(
                 prompter,
@@ -1143,7 +1142,7 @@ fn resolve_uninstall_action(
     prompter: &dyn Prompter,
     note: &mut dyn FnMut(&str),
 ) -> Result<ObsoleteAction> {
-    if assume_yes || !conflict::menu_can_use_terminal() {
+    if assume_yes || !can_ask(prompter) {
         return Ok(ObsoleteAction::Keep);
     }
 
@@ -2396,12 +2395,11 @@ fn resolve_mcp_conflict(
     if assume_yes || *unanswered {
         return Ok(McpConflictAction::KeepLocal);
     }
-    if !conflict::menu_can_use_terminal() {
-        return Err(conflict::refuse_non_interactive(
-            format_args!("merge the already-installed MCP server '{name}'"),
-            io.remedy,
-        ));
-    }
+    require_human(
+        io.prompter,
+        format_args!("merge the already-installed MCP server '{name}'"),
+        io.remedy,
+    )?;
     let rename_label = format!("rename remote as \"{name}-remote\"");
     let prompt = format!("Conflict on MCP server '{name}'");
     let choice = match select_closed_or_cancel(
@@ -2526,7 +2524,7 @@ fn partition_missing_secrets(
     missing: &[String],
     prompter: &dyn Prompter,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    if conflict::menu_can_use_terminal() {
+    if can_ask(prompter) {
         println!(
             "\nThe merged mcp.json references {} secret(s) not yet in the vault.",
             missing.len()
@@ -2651,6 +2649,7 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+    use crate::config::conflict;
     use crate::prompt::{
         HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
     };

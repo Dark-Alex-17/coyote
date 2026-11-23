@@ -4,7 +4,7 @@
 //! event bus as it is asked and as it is answered.
 
 use crate::events::{Event, Origin, bus};
-use crate::utils::{ACP_SERVER, HEADLESS};
+use crate::utils::{ACP_SERVER, HEADLESS, IS_STDOUT_TERMINAL};
 use anyhow::{Result, anyhow, bail};
 use inquire::{Confirm, InquireError, MultiSelect, Password, PasswordDisplayMode, Select, Text};
 use serde_json::{Value, json};
@@ -26,6 +26,71 @@ const REDACTED_MARKER: &str = "<redacted>";
 /// ACP server have none; every other run has a terminal.
 pub(crate) fn human_present() -> bool {
     !(HEADLESS.load(Ordering::SeqCst) || ACP_SERVER.load(Ordering::SeqCst))
+}
+
+/// Whether a question has somewhere to be shown: the full-screen UI's
+/// modal, or a terminal on stdout for an inquire widget. Stdin does not
+/// matter: when it is not a terminal the widget reads its keys from
+/// `/dev/tty` instead.
+fn terminal_reachable() -> bool {
+    #[cfg(test)]
+    let on_tty =
+        crate::config::conflict::prompt_script::forced_stdout_tty().unwrap_or(*IS_STDOUT_TERMINAL);
+    #[cfg(not(test))]
+    let on_tty = *IS_STDOUT_TERMINAL;
+    crate::tui::active() || on_tty
+}
+
+/// Who a prompter's questions can reach. A run with no human is
+/// `Headless` whether or not it has a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    Human,
+    /// A human, but nowhere to show the question.
+    NoTerminal,
+    /// A headless run or the ACP server.
+    Headless,
+}
+
+/// The run's reach, read from its flags and terminal rather than from the
+/// prompter's type: a command may build its own inquire prompter while
+/// the full-screen UI owns the screen.
+fn ambient_reach() -> Reach {
+    if !human_present() {
+        Reach::Headless
+    } else if !terminal_reachable() {
+        Reach::NoTerminal
+    } else {
+        Reach::Human
+    }
+}
+
+/// Whether a question may be put to `prompter`. A run with no human still
+/// asks when there is a terminal, so the refusal it gets is the
+/// prompter's typed [`NeedsHuman`].
+pub(crate) fn can_ask(prompter: &dyn Prompter) -> bool {
+    match prompter.reach() {
+        Reach::Human => true,
+        Reach::NoTerminal => false,
+        Reach::Headless => terminal_reachable(),
+    }
+}
+
+/// Refuses `action` when [`can_ask`] says no question can be shown; every
+/// site refuses here so the message has one shape. `remedy` follows
+/// "Re-run in a terminal" directly, so it begins with its own separator
+/// (" or pass --force.", ", with --yes (updates).") or is just a period.
+pub(crate) fn require_human(
+    prompter: &dyn Prompter,
+    action: impl fmt::Display,
+    remedy: impl fmt::Display,
+) -> Result<()> {
+    if can_ask(prompter) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Refusing to {action} non-interactively. Re-run in a terminal{remedy}"
+    ))
 }
 
 pub(crate) const NO_HUMAN_FOR_OAUTH: &str =
@@ -153,6 +218,9 @@ pub enum PromptAnswer {
     /// command stopped. Reads as [`PromptAnswer::Cancelled`] except where
     /// a cancel would carry on without the answer.
     Interrupted,
+    /// A run with no human declined to answer; the caller decides what
+    /// the refusal becomes.
+    NeedsHuman,
 }
 
 impl PromptAnswer {
@@ -166,13 +234,9 @@ impl PromptAnswer {
             PromptAnswer::Text(_) if action == PromptAction::Password => {
                 REDACTED_MARKER.to_string()
             }
-            // Only the headless prompter answers a confirm with text: its
-            // `needs_human` JSON, which the bus reports like a refusal.
-            PromptAnswer::Text(_) if action == PromptAction::Confirm => {
-                NEEDS_HUMAN_MARKER.to_string()
-            }
             PromptAnswer::Text(text) => text.clone(),
             PromptAnswer::Cancelled | PromptAnswer::Interrupted => "<cancelled>".to_string(),
+            PromptAnswer::NeedsHuman => NEEDS_HUMAN_MARKER.to_string(),
         }
     }
 
@@ -208,11 +272,7 @@ impl PromptAnswer {
         match self {
             PromptAnswer::Cancelled => PromptCancelled { interrupted: false }.into(),
             PromptAnswer::Interrupted => PromptCancelled { interrupted: true }.into(),
-            // Only the headless prompter answers a confirm with text (its
-            // `needs_human` JSON), so the refusal is what the caller sees.
-            PromptAnswer::Text(_) if expected == PromptAction::Confirm => {
-                NeedsHuman::Prompt(expected).into()
-            }
+            PromptAnswer::NeedsHuman => NeedsHuman::Prompt(expected).into(),
             _ => anyhow!("Unexpected answer to the {} prompt", expected.name()),
         }
     }
@@ -257,6 +317,10 @@ impl std::error::Error for PromptCancelled {}
 /// has no human to ask answers at once.
 pub trait Prompter: Send + Sync + fmt::Debug {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer>;
+
+    fn reach(&self) -> Reach {
+        ambient_reach()
+    }
 
     /// Lets a test look at the seated prompter behind the trait object.
     #[cfg(test)]
@@ -689,13 +753,14 @@ impl Prompter for InquirePrompter {
     }
 }
 
-/// Answers for a run with no human. A confirm is answered with the
-/// structured `needs_human` JSON the model is expected to act on, carried
-/// as text; only `handle_user_tool` knows how to read it, and every other
-/// confirm consumer rejects it as the wrong shape. Every other kind is
-/// refused with [`NeedsHuman`], because a text-shaped answer would be
-/// taken as the human's: a role would be saved under the JSON, or an MCP
-/// server would receive it as an argument.
+/// Answers for a run with no human. A confirm is answered with
+/// [`PromptAnswer::NeedsHuman`], which `handle_user_tool` turns into the
+/// structured `needs_human` JSON the model is expected to act on, and
+/// every other confirm consumer reads as the [`NeedsHuman`] refusal.
+/// Every other kind is refused with [`NeedsHuman`], because a
+/// text-shaped answer would be taken as the human's: a role would be
+/// saved under the JSON, or an MCP server would receive it as an
+/// argument.
 #[derive(Debug, Default)]
 pub struct HeadlessPrompter;
 
@@ -762,9 +827,13 @@ pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
 impl Prompter for HeadlessPrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
         match req.action {
-            PromptAction::Confirm => Ok(PromptAnswer::Text(headless_reply(&req).to_string())),
+            PromptAction::Confirm => Ok(PromptAnswer::NeedsHuman),
             action => Err(NeedsHuman::Prompt(action).into()),
         }
+    }
+
+    fn reach(&self) -> Reach {
+        Reach::Headless
     }
 
     #[cfg(test)]
@@ -866,6 +935,7 @@ pub(crate) fn prompt_events(events: Vec<Event>, question: &str) -> (Vec<Event>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::conflict::prompt_script;
     use crate::events::RecordingSink;
     use crate::testing::AtomicFlagGuard;
     use serial_test::serial;
@@ -1069,6 +1139,146 @@ mod tests {
 
         let _acp_on = AtomicFlagGuard::set(&ACP_SERVER, true);
         assert!(!human_present());
+    }
+
+    /// The flags of a run with a human, so a test controls the terminal
+    /// alone.
+    fn with_a_human() -> (AtomicFlagGuard, AtomicFlagGuard) {
+        (
+            AtomicFlagGuard::set(&HEADLESS, false),
+            AtomicFlagGuard::set(&ACP_SERVER, false),
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn reach_is_human_under_the_tui_whatever_the_tty() {
+        let _human = with_a_human();
+        let _script = prompt_script::install_non_interactive();
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let prompter = ScriptedPrompter::refusing();
+        assert_eq!(prompter.reach(), Reach::Human);
+
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        assert_eq!(prompter.reach(), Reach::NoTerminal);
+    }
+
+    /// Outside the UI the terminal follows stdout alone; a piped stdin
+    /// does not close it, since inquire then reads its keys from
+    /// `/dev/tty`.
+    #[test]
+    #[serial]
+    fn reach_needs_only_a_stdout_tty_outside_the_tui() {
+        let _human = with_a_human();
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let prompter = ScriptedPrompter::refusing();
+        assert_eq!(prompter.reach() == Reach::Human, *IS_STDOUT_TERMINAL);
+
+        let forced_on = prompt_script::install(&[]);
+        assert_eq!(prompter.reach(), Reach::Human);
+        drop(forced_on);
+
+        let _forced_off = prompt_script::install_non_interactive();
+        assert_eq!(prompter.reach(), Reach::NoTerminal);
+
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        assert_eq!(prompter.reach(), Reach::Human);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn reach_stays_human_with_a_stdout_tty_and_piped_stdin() {
+        let _human = with_a_human();
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _stdout_tty = prompt_script::install(&[]);
+        let _stdin = crate::testing::pipe_stdin();
+
+        assert_eq!(ScriptedPrompter::refusing().reach(), Reach::Human);
+    }
+
+    /// A missing human outranks a missing terminal; the headless
+    /// prompter is headless even where a human is present.
+    #[test]
+    #[serial]
+    fn reach_is_headless_without_a_human_whatever_the_terminal() {
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let scripted = ScriptedPrompter::refusing();
+        for forced_tty in [true, false] {
+            let _script = if forced_tty {
+                prompt_script::install(&[])
+            } else {
+                prompt_script::install_non_interactive()
+            };
+            for (headless, acp) in [(true, false), (false, true)] {
+                let _headless = AtomicFlagGuard::set(&HEADLESS, headless);
+                let _acp = AtomicFlagGuard::set(&ACP_SERVER, acp);
+                assert_eq!(scripted.reach(), Reach::Headless);
+                assert_eq!(HeadlessPrompter.reach(), Reach::Headless);
+            }
+            let _human = with_a_human();
+            assert_eq!(HeadlessPrompter.reach(), Reach::Headless);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn require_human_lets_a_human_with_a_terminal_be_asked() {
+        let _human = with_a_human();
+        let _script = prompt_script::install(&[]);
+        let prompter = ScriptedPrompter::refusing();
+        assert_eq!(prompter.reach(), Reach::Human);
+        assert!(can_ask(&prompter));
+        require_human(&prompter, "pick a bundle", ".").unwrap();
+    }
+
+    /// The refusal has one shape; only the action and the remedy vary.
+    #[test]
+    #[serial]
+    fn the_refusal_names_the_action_and_where_to_re_run() {
+        let _human = with_a_human();
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _script = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+        assert_eq!(prompter.reach(), Reach::NoTerminal);
+        assert!(!can_ask(&prompter));
+
+        let err =
+            require_human(&prompter, "overwrite local file", " or pass --force.").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to overwrite local file non-interactively. Re-run in a terminal or pass --force."
+        );
+
+        let err = require_human(&prompter, "pick a bundle", ".").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to pick a bundle non-interactively. Re-run in a terminal."
+        );
+    }
+
+    /// With no human, a terminal still lets the question through so the
+    /// headless prompter gives its typed refusal; without one the run is
+    /// refused like any other.
+    #[test]
+    #[serial]
+    fn require_human_without_a_human_refuses_only_without_a_terminal() {
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+
+        let forced_on = prompt_script::install(&[]);
+        assert!(can_ask(&HeadlessPrompter));
+        require_human(&HeadlessPrompter, "pick a bundle", ".").unwrap();
+        drop(forced_on);
+
+        let _forced_off = prompt_script::install_non_interactive();
+        assert!(!can_ask(&HeadlessPrompter));
+        let err = require_human(&HeadlessPrompter, "pick a bundle", ".").unwrap_err();
+        assert!(!NeedsHuman::caused(&err), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "Refusing to pick a bundle non-interactively. Re-run in a terminal."
+        );
     }
 
     #[test]
@@ -1313,11 +1523,11 @@ mod tests {
     }
 
     #[test]
-    fn headless_prompter_carries_the_confirm_reply_as_text() {
-        let req = request(PromptAction::Confirm, None);
-        let expected = headless_reply(&req).to_string();
-        let answer = HeadlessPrompter.prompt(req).unwrap();
-        assert_eq!(answer, PromptAnswer::Text(expected));
+    fn headless_prompter_answers_a_confirm_with_needs_human() {
+        let answer = HeadlessPrompter
+            .prompt(request(PromptAction::Confirm, None))
+            .unwrap();
+        assert_eq!(answer, PromptAnswer::NeedsHuman);
     }
 
     #[test]
@@ -1393,7 +1603,10 @@ mod tests {
         let text = PromptAnswer::Text("hunter2".to_string());
         assert_eq!(text.summary(PromptAction::Password), "<redacted>");
         assert_eq!(text.summary(PromptAction::Input), "hunter2");
-        assert_eq!(text.summary(PromptAction::Confirm), "<needs_human>");
+        assert_eq!(
+            PromptAnswer::NeedsHuman.summary(PromptAction::Confirm),
+            "<needs_human>"
+        );
         assert_eq!(
             PromptAnswer::Confirmed(true).summary(PromptAction::Confirm),
             "yes"
@@ -1448,10 +1661,14 @@ mod tests {
             .into_confirmed()
             .unwrap_err();
         assert_eq!(err.to_string(), "Unexpected answer to the confirm prompt");
-        let err = PromptAnswer::Text("t".to_string())
-            .into_confirmed()
-            .unwrap_err();
-        assert!(err.is::<NeedsHuman>(), "{err}");
+        let err = PromptAnswer::NeedsHuman.into_confirmed().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Confirm))
+            ),
+            "{err}"
+        );
         let err = PromptAnswer::Confirmed(true).into_selected().unwrap_err();
         assert_eq!(err.to_string(), "Unexpected answer to the select prompt");
         let err = PromptAnswer::Confirmed(true).into_checked().unwrap_err();

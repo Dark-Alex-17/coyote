@@ -605,12 +605,7 @@ fn confirm_asset_overwrite(
     prompter: &dyn Prompter,
     remedy: &str,
 ) -> Result<bool> {
-    if !conflict::menu_can_use_terminal() {
-        return Err(conflict::refuse_non_interactive(
-            format_args!("reinstall bundled {label}"),
-            remedy,
-        ));
-    }
+    crate::prompt::require_human(prompter, format_args!("reinstall bundled {label}"), remedy)?;
     let body = match category {
         AssetCategory::McpConfig => format!(
             "This merges the bundled MCP server template into your configuration \
@@ -1071,12 +1066,12 @@ impl AssertState {
 }
 
 pub async fn create_config_file(config_path: &Path) -> Result<()> {
-    if !conflict::menu_can_use_terminal() {
-        return Err(conflict::refuse_non_interactive(
-            format_args!("create the config file at '{}'", config_path.display()),
-            ".",
-        ));
-    }
+    let prompter = crate::prompt::InquirePrompter::default();
+    crate::prompt::require_human(
+        &prompter,
+        format_args!("create the config file at '{}'", config_path.display()),
+        ".",
+    )?;
     debug_assert!(
         !crate::tui::active(),
         "the first-run wizard draws inquire widgets straight on the terminal and never runs under the UI"
@@ -1092,7 +1087,6 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         return create_config_file_sandbox(config_path).await;
     }
 
-    let prompter = crate::prompt::InquirePrompter::default();
     let provider_choice = prompt_provider_choice(&prompter)?;
     let mut vault = match &provider_choice {
         None => Vault::default_local(),

@@ -13,7 +13,7 @@ pub use utils::prompt_provider_choice;
 use crate::cli::Cli;
 use crate::config::AppConfig;
 use crate::events::Origin;
-use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask};
+use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask, require_human};
 use crate::vault::utils::ensure_password_file_initialized;
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
@@ -176,12 +176,7 @@ impl Vault {
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
-        if !crate::config::conflict::menu_can_use_terminal() {
-            return Err(crate::config::conflict::refuse_non_interactive(
-                format_args!("add secret '{secret_name}'"),
-                ".",
-            ));
-        }
+        require_human(prompter, format_args!("add secret '{secret_name}'"), ".")?;
         let secret_value = Self::ask_secret_value(prompter)?;
 
         let h = Handle::current();
@@ -217,12 +212,7 @@ impl Vault {
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
-        if !crate::config::conflict::menu_can_use_terminal() {
-            return Err(crate::config::conflict::refuse_non_interactive(
-                format_args!("update secret '{secret_name}'"),
-                ".",
-            ));
-        }
+        require_human(prompter, format_args!("update secret '{secret_name}'"), ".")?;
         let secret_value = Self::ask_secret_value(prompter)?;
         let h = Handle::current();
         tokio::task::block_in_place(|| {

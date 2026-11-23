@@ -14,10 +14,10 @@ mod splitter;
 use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
-use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::hooks::RagSyncHooks;
 use crate::prompt::{
-    Prompter, confirm, confirm_with_help, input, reask, required_input, select_closed,
+    Prompter, can_ask, confirm, confirm_with_help, input, reask, require_human, required_input,
+    select_closed,
 };
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
@@ -151,9 +151,13 @@ impl Rag {
         init_client(&self.app_config, model)
     }
 
-    /// The refusal for a knowledge base nothing can ask about.
-    pub(crate) fn refuse_init(name: &str) -> anyhow::Error {
-        refuse_non_interactive(format_args!("initialize RAG knowledge base '{name}'"), ".")
+    /// Refuses a knowledge base nothing can ask about.
+    pub(crate) fn require_human_for_init(prompter: &dyn Prompter, name: &str) -> Result<()> {
+        require_human(
+            prompter,
+            format_args!("initialize RAG knowledge base '{name}'"),
+            ".",
+        )
     }
 
     pub async fn init_with_config(
@@ -219,12 +223,11 @@ impl Rag {
                 value
             }
             None => {
-                if !menu_can_use_terminal() {
-                    return Err(refuse_non_interactive(
-                        format_args!("choose an embedding model for RAG knowledge base '{name}'"),
-                        ". Set `embedding_model` on the rag node, or run the agent interactively once.",
-                    ));
-                }
+                require_human(
+                    prompter,
+                    format_args!("choose an embedding model for RAG knowledge base '{name}'"),
+                    ". Set `embedding_model` on the rag node, or run the agent interactively once.",
+                )?;
                 let models = list_models(app, ModelType::Embedding);
                 if models.is_empty() {
                     bail!("No available embedding model");
@@ -241,12 +244,11 @@ impl Rag {
                 value
             }
             None => {
-                if !menu_can_use_terminal() {
-                    return Err(refuse_non_interactive(
-                        format_args!("choose a chunk_size for RAG knowledge base '{name}'"),
-                        ". Set `chunk_size` on the rag node, or run the agent interactively once.",
-                    ));
-                }
+                require_human(
+                    prompter,
+                    format_args!("choose a chunk_size for RAG knowledge base '{name}'"),
+                    ". Set `chunk_size` on the rag node, or run the agent interactively once.",
+                )?;
                 set_chunk_size(&embedding_model, prompter)?
             }
         };
@@ -256,12 +258,11 @@ impl Rag {
                 value
             }
             None => {
-                if !menu_can_use_terminal() {
-                    return Err(refuse_non_interactive(
-                        format_args!("choose a chunk_overlap for RAG knowledge base '{name}'"),
-                        ". Set `chunk_overlap` on the rag node, or run the agent interactively once.",
-                    ));
-                }
+                require_human(
+                    prompter,
+                    format_args!("choose a chunk_overlap for RAG knowledge base '{name}'"),
+                    ". Set `chunk_overlap` on the rag node, or run the agent interactively once.",
+                )?;
                 set_chunk_overlay(chunk_size / 20, prompter)?
             }
         };
@@ -309,9 +310,7 @@ impl Rag {
             sync_hooks,
             prompter,
         } = run;
-        if !menu_can_use_terminal() {
-            return Err(Self::refuse_init(name));
-        }
+        Self::require_human_for_init(prompter, name)?;
         println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app, prompter)?;
         let driver = if prompt_for_driver {
@@ -443,12 +442,11 @@ impl Rag {
         save_path: &Path,
         prompter: &dyn Prompter,
     ) -> Result<Self> {
-        if !menu_can_use_terminal() {
-            return Err(refuse_non_interactive(
-                format_args!("run the attach wizard for RAG '{name}'"),
-                ".",
-            ));
-        }
+        require_human(
+            prompter,
+            format_args!("run the attach wizard for RAG '{name}'"),
+            ".",
+        )?;
         // Checked before any prompt or secret is created, so a name that
         // collides with another RAG's kit is refused at once.
         check_rag_kit_slot(save_path, name)?;
@@ -1096,7 +1094,7 @@ impl Rag {
 
         if has_error {
             let mut aborted = true;
-            if menu_can_use_terminal() {
+            if can_ask(prompter) {
                 let ans = confirm(prompter, "Some documents failed to load. Continue?", false)?;
                 aborted = !ans;
             }

@@ -14,7 +14,7 @@ use crate::{
 
 use super::rag_cache::RagKey;
 use crate::config::builtin_manifest;
-use crate::config::conflict::{self, InstallMode, StickyMode, menu_can_use_terminal};
+use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
@@ -26,7 +26,9 @@ use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
-use crate::prompt::{NeedsHuman, Prompter, confirm, human_present, required_sensitive_input};
+use crate::prompt::{
+    NeedsHuman, Prompter, Reach, can_ask, confirm, require_human, required_sensitive_input,
+};
 use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
@@ -405,7 +407,7 @@ impl Agent {
             Some(rag)
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
-            if menu_can_use_terminal() {
+            if can_ask(prompter.as_ref()) {
                 // The knowledge base is optional, so a run with no human
                 // to ask declines it instead of failing. Closing the
                 // question still cancels the agent init.
@@ -571,7 +573,7 @@ impl Agent {
             if no_interaction {
                 continue;
             }
-            if may_ask_human(interactive, menu_can_use_terminal()) {
+            if may_ask_human(interactive, prompter) {
                 if !printed {
                     println!("⚙ Init agent variables...");
                     printed = true;
@@ -1518,14 +1520,13 @@ async fn init_graph_rags(
                 && config.chunk_size.is_some()
                 && config.chunk_overlap.is_some();
             if !fully_specified {
-                if !menu_can_use_terminal() {
-                    return Err(conflict::refuse_non_interactive(
-                        format_args!(
-                            "build the knowledge base for rag node '{node_id}' of agent '{agent_name}'"
-                        ),
-                        ", or set `embedding_model`, `chunk_size`, and `chunk_overlap` on the node.",
-                    ));
-                }
+                require_human(
+                    prompter.as_ref(),
+                    format_args!(
+                        "build the knowledge base for rag node '{node_id}' of agent '{agent_name}'"
+                    ),
+                    ", or set `embedding_model`, `chunk_size`, and `chunk_overlap` on the node.",
+                )?;
 
                 let ans = confirm(
                     prompter.as_ref(),
@@ -1704,8 +1705,8 @@ fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str)
 /// own without a human, but failing on the first refusal would name one
 /// variable; gating here lets the loop collect every unset variable and
 /// report them all in one bail.
-fn may_ask_human(interactive: bool, tty: bool) -> bool {
-    interactive && tty && human_present()
+fn may_ask_human(interactive: bool, prompter: &dyn Prompter) -> bool {
+    interactive && prompter.reach() == Reach::Human
 }
 
 #[cfg(test)]
@@ -1872,16 +1873,23 @@ mod tests {
 
     #[test]
     #[serial]
-    fn may_ask_human_needs_an_interactive_tty_and_a_human() {
+    fn may_ask_human_needs_an_interactive_run_and_a_human_at_a_terminal() {
         let _acp = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let prompter = ScriptedPrompter::refusing();
+        let tty = crate::config::conflict::prompt_script::install(&[]);
         let headless = AtomicFlagGuard::set(&HEADLESS, true);
-        assert!(!may_ask_human(true, true));
+        assert!(!may_ask_human(true, &prompter));
         drop(headless);
 
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
-        assert!(may_ask_human(true, true));
-        assert!(!may_ask_human(false, true));
-        assert!(!may_ask_human(true, false));
+        assert!(may_ask_human(true, &prompter));
+        assert!(!may_ask_human(false, &prompter));
+        assert!(!may_ask_human(true, &HeadlessPrompter));
+        drop(tty);
+
+        let _no_tty = crate::config::conflict::prompt_script::install_non_interactive();
+        assert!(!may_ask_human(true, &prompter));
     }
 
     #[test]

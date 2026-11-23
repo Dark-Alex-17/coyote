@@ -7609,9 +7609,7 @@ impl RequestContext {
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
-                if !crate::config::conflict::menu_can_use_terminal() {
-                    return Err(Rag::refuse_init(super::TEMP_RAG_NAME));
-                }
+                Rag::require_human_for_init(prompter.as_ref(), super::TEMP_RAG_NAME)?;
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
                 // A temp rag is never saved, so the wizard can run with
                 // the previous one still on disk; it is removed only once
@@ -13372,13 +13370,8 @@ mod tests {
         let seat = format!("{:?}", ctx.prompter);
         assert!(seat.starts_with("HeadlessPrompter"), "{seat}");
         let req = ctx.prompt_request(PromptAction::Confirm, "go? hl-ctx-5r", Vec::new(), None);
-        let answer = ctx.prompt(req).unwrap();
-        let PromptAnswer::Text(json) = answer else {
-            panic!("{answer:?}");
-        };
-        let reply: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(reply["needs_human"], true);
-        assert_eq!(reply["question"], "go? hl-ctx-5r");
+        assert_eq!(ctx.prompt(req).unwrap(), PromptAnswer::NeedsHuman);
+        assert_eq!(ctx.prompter.reach(), crate::prompt::Reach::Headless);
     }
 
     /// The seat is inspected rather than exercised: drawing an inquire

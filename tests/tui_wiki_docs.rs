@@ -1506,15 +1506,15 @@ fn session_yes_is_documented_as_covering_one_operation_or_path() {
     }
 }
 
-/// Every `refuse_non_interactive(` call in `source`: its action format and
-/// its remedy, when the remedy is a literal.
+/// Every `require_human(` call in `source`: its action format and its
+/// remedy, when the remedy is a literal.
 fn refusal_calls(source: &str) -> Vec<(String, Option<String>)> {
     source
-        .match_indices("refuse_non_interactive(")
+        .match_indices("require_human(")
         .filter(|(at, _)| !source[..*at].ends_with("fn "))
         .map(|(at, call)| {
             let rest = &source[at + call.len()..];
-            let mut literals = string_literals(&rest[..rest.find("));").unwrap()]).into_iter();
+            let mut literals = string_literals(&rest[..rest.find(")?;").unwrap()]).into_iter();
             (literals.next().unwrap(), literals.next())
         })
         .collect()
@@ -1564,15 +1564,9 @@ fn unattended_page_quotes_the_refusals() {
     let creating = literal_with(prompt, "needs a human to answer the prompt")
         .replace("{NO_HUMAN_ATTACHED}", &attached);
     let headless = fn_body(prompt, "impl Prompter for HeadlessPrompter");
-    assert!(
-        headless.contains("PromptAction::Confirm => Ok(PromptAnswer::Text(headless_reply(&req)")
-    );
+    assert!(headless.contains("PromptAction::Confirm => Ok(PromptAnswer::NeedsHuman)"));
     assert!(headless.contains("action => Err(NeedsHuman::Prompt(action).into())"));
-    let shape = string_literals(&fn_body(
-        &src(&["config", "conflict.rs"]),
-        "pub(crate) fn refuse_non_interactive(",
-    ))
-    .remove(0);
+    let shape = string_literals(&fn_body(prompt, "pub(crate) fn require_human(")).remove(0);
     let (lead, tail) = shape.split_once("{action}").unwrap();
     let (middle, _) = tail.split_once("{remedy}").unwrap();
     let mut calls = Vec::new();

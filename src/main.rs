@@ -1075,15 +1075,14 @@ fn resolve_oauth_client(
             0 => bail!("No OAuth-capable clients configured."),
             1 => find_by_name(&candidates[0]).unwrap(),
             _ => {
-                if !crate::config::conflict::menu_can_use_terminal() {
-                    return Err(crate::config::conflict::refuse_non_interactive(
-                        format_args!(
-                            "pick between the OAuth-capable clients ({})",
-                            candidates.join(", ")
-                        ),
-                        " or pass --authenticate <CLIENT_NAME>.",
-                    ));
-                }
+                crate::prompt::require_human(
+                    prompter,
+                    format_args!(
+                        "pick between the OAuth-capable clients ({})",
+                        candidates.join(", ")
+                    ),
+                    " or pass --authenticate <CLIENT_NAME>.",
+                )?;
                 let choice = crate::prompt::select_closed(
                     prompter,
                     "Select a client to authenticate:",

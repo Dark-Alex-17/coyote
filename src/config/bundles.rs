@@ -3,9 +3,8 @@ use super::install_remote::{
 };
 use super::{paths, request_context};
 use crate::config::AssetCategory;
-use crate::config::conflict::menu_can_use_terminal;
 use crate::function::write_file_atomic;
-use crate::prompt::Prompter;
+use crate::prompt::{Prompter, can_ask};
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
@@ -280,7 +279,7 @@ impl BundleStore {
 
             if let Some(other_source) = &collision
                 && manifest_name.is_some()
-                && menu_can_use_terminal()
+                && can_ask(prompter)
             {
                 let proceed = crate::prompt::confirm(
                     prompter,
