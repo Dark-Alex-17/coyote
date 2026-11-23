@@ -263,6 +263,24 @@ fn a_line_held_for_its_images_is_sent_by_enter_once_the_turn_ends() {
 }
 
 #[test]
+fn taking_a_held_line_back_forgets_the_pasted_images() {
+    let mut harness = Harness::new(120, 24, plain_config(), FooterInfo::default());
+    harness.app.begin_turn("explain", false);
+    harness.type_text("held");
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Queue("held".to_string()))
+    );
+    paste_image(&mut harness, "shot.png");
+    harness.press(KeyCode::Backspace);
+    assert_eq!(harness.app.composer_text(), "");
+    assert!(!harness.app.pasted_images.is_empty());
+    harness.app.handle_key(alt(KeyCode::Up));
+    assert_eq!(harness.app.composer_text(), "held");
+    assert!(harness.app.pasted_images.is_empty());
+}
+
+#[test]
 fn ctrl_v_and_alt_v_paste_during_a_turn_too() {
     let mut harness = Harness::new(120, 24, plain_config(), FooterInfo::default());
     harness.app.begin_turn("explain", false);

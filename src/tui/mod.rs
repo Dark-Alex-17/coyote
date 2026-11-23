@@ -1077,6 +1077,7 @@ impl App {
         let line = self.queued.pop()?;
         let draft = self.hold_composer_line();
         self.set_composer_text(&line.text);
+        self.forget_pasted_images();
         let held = (!line.command).then_some(line.text);
         if held.is_none() && draft.is_none() {
             return None;
