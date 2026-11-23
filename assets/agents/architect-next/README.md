@@ -495,6 +495,17 @@ else `kind#index` for a multiple-choice question, else the kind; the phase is `r
 the run close-out and `task` otherwise) in the `autonomous_decisions` seed; the
 `answer_source` seed names who picked the answer (headless default, ladder, navigator or
 judge) and `apply_reasks` counts `apply_answer`'s re-asks, reset by every new escalation.
+A kind that asks more than one distinct question sets `data.decision` at each raise site
+(`promote_failed`, `git_setup_failed`, `gate_fault`, `ci_exhausted`, `review_owner_judgment`,
+`watch_visit_cap`, `review_read_truncated`), so two of its questions in one task keep
+separate keys. `apply_answer` records the key in the `answered_decisions` seed whenever it
+acts on an answer, never when it sends the reply to be read, asks the question again or
+hands it to the judge. A decision the run already answered that comes back is a repeat:
+`escalate_gate` counts it as failed once, so the autonomous ladder sends it to the owner;
+with no human, the engine's no-human reply sends it to the headless judge instead of the
+recommended option, unless it is a hard trigger or its kind has an approval node of its own
+(`OWN_PROMPT_KINDS`); and a repeated multiple-choice question, whose picker answers itself
+with no human, is asked at the typed prompt under the same `kind#index` key.
 
 Verification commands the project cannot run as declared: a RED integration run (per task
 or at Phase F) hands the fix round the failing command and its exit. If the command cannot

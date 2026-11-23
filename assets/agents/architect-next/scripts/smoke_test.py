@@ -1027,6 +1027,7 @@ check("promote_verify: the promoted PLAN still missing after the retry -> escala
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed" and "promoted PLAN not found" in u["escalation"]["evidence"]
       and "promotion left no task dirs for the plan; the breakdown table lists 3 tasks" in u["escalation"]["evidence"]
       and not any("proceeding (advisory)" in d for d in u.get("decisions", [])), u.get("escalation"))
+E_RAISED_DEFECTS = u["escalation"]
 # Simulate promote_tasks: PLAN + three tasks through bin/new-task.
 PROMOTED = FIXTURE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
 ids = []
@@ -1824,6 +1825,18 @@ check("task_done_verify: completed entry appended by the script when missing; le
       and "completed" in read_file(os.path.join(t1d["dir"], "log.md")) and "WidgetStore" in read_file(os.path.join(t1d["dir"], "log.md"))
       and any("week plan" in a for a in u["anomalies_log"]) and CLOSE_COMMIT_MARKER in FIXTURE.last_commit())
 TS_DONE1 = u["tasks"]
+_layout, _core_tool = gates.TASKSTORE, gates.core_tool
+gates.TASKSTORE = _lib.TASKSTORE = "dirstate"
+gates.core_tool = lambda *a, **k: (False, "push rejected")
+try:
+    u = gates.task_done_verify(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_DONE1), current_task=T1, report_parsed=pr_))
+finally:
+    gates.TASKSTORE = _lib.TASKSTORE = _layout
+    gates.core_tool = _core_tool
+check("repeat decisions: the promotion defects and the task close are two promote_failed decisions in one task",
+      u["escalation"]["kind"] == "promote_failed"
+      and gates._decision_key(base_state(current_task=T1), u["escalation"])
+      != gates._decision_key(base_state(current_task=T1), E_RAISED_DEFECTS), (u.get("escalation"), E_RAISED_DEFECTS))
 u = gates.stack_gate(base_state(plan_path=PROMOTED, tasks=TS_DONE1))
 check("stack_gate: single -> task_done_route", u["_next"] == "task_done_route")
 ts_chain = copy.deepcopy(TS_DONE1)
@@ -3224,6 +3237,36 @@ check("apply_answer: promote_failed free text never aborts -> interpret_reply, t
       _promote_free.get("_next") == "interpret_reply" and _promote_read.get("_next") == "ask_dispatch"
       and "failure_reason" not in _promote_free and "failure_reason" not in _promote_read,
       (_promote_free.get("_next"), _promote_read.get("_next")))
+HG = _lib.HEADLESS_GUIDANCE
+REPEAT_KEY = gates._decision_key(base_state(), E)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text=HG, answered_decisions=[REPEAT_KEY]))
+check("repeat decisions: the engine's no-human reply to a decision the run already answered goes to the headless judge, "
+      "never the recommended default",
+      u["_next"] == "headless_judge" and sum(u.get("judge_rulings", {}).values()) == 1
+      and any("headless: conformance_stuck: asked again after an answer -> headless judge" in d for d in u["decisions"]), u)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text=HG, answered_decisions=["other|x|task"]))
+check("repeat decisions: the first no-human reply to a decision still takes its recommended option",
+      u["_next"] == "apply_answer" and u["last_answer"] == "Stop and report", u)
+u = gates.parse_answer(base_state(escalation=dict(E, hard_trigger=True), last_answer_text=HG, answered_decisions=[REPEAT_KEY]))
+check("repeat decisions: a repeated hard trigger keeps its recommended option, never judged",
+      u["_next"] == "apply_answer" and u["last_answer"] == "Stop and report" and "judge_rulings" not in u, u)
+PICKER = dict(E, data={"multiple_choice": True, "index": 1})
+PICKER_KEY = gates._decision_key(base_state(), PICKER)
+PICKER_FIRST = gates.ask_dispatch(base_state(escalation=PICKER))
+u = gates.ask_dispatch(base_state(escalation=PICKER, answered_decisions=[PICKER_KEY]))
+check("repeat decisions: a repeated multiple-choice decision is asked at the typed prompt under the same decision key",
+      PICKER_FIRST["_next"] == "ask_choice_2" and u["_next"] == "ask_user" and "multiple_choice" not in u["escalation"]["data"]
+      and gates._decision_key(base_state(), u["escalation"]) == PICKER_KEY and "One more round" in u["ask_question"]
+      and any(f"repeat decision {PICKER_KEY} -> typed prompt" in d for d in u["decisions"]), u)
+PROMOTE_KEY = gates._decision_key(base_state(), E_PROMOTE_DEFECTS)
+acted = gates.apply_answer(base_state(escalation=E_PROMOTE_DEFECTS, last_answer="Continue with the tasks as promoted"))
+check("repeat decisions: apply_answer records a decision it acted on, never one it sent to be read or asked again",
+      acted["_next"] == "branch_setup" and acted.get("answered_decisions") == [PROMOTE_KEY]
+      and _promote_free["_next"] == "interpret_reply" and "answered_decisions" not in _promote_free
+      and _promote_read["_next"] == "ask_dispatch" and "answered_decisions" not in _promote_read, (acted, _promote_free, _promote_read))
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", answered_decisions=[REPEAT_KEY]))
+check("repeat decisions: an autonomous run asks the owner for a decision it already answered, even one the ladder never saw",
+      u["_next"] == "ask_dispatch" and any(f"ladder: {REPEAT_KEY} already answered once -> owner" in d for d in u["decisions"]), u)
 for reply in ("yes, adopt it", "adopt it, yes please", "Adopt"):
     u = gates.apply_answer(base_state(escalation=AA_ESC["design_ask"], last_answer=reply, current_task=T1, tasks=tasks_with(), task_rounds={}))
     check(f"apply_answer: design_ask free {reply!r} -> recorded as the decision, never adopted",
@@ -3673,6 +3716,11 @@ check("ci_apply: budgets are per check-name per PR (lint on #99 fresh although t
 u = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f))
 check("ci_apply: B18 fix strikes exhausted per check per PR -> ci_exhausted", u["escalation"]["kind"] == "ci_exhausted")
 E_CE = u["escalation"]
+E_CI_WATCH = gates.ci_route(base_state(ci_status="timeout", current_task=T1))["escalation"]
+check("repeat decisions: the CI watch timeout and the fix cap are two ci_exhausted decisions in one task",
+      E_CI_WATCH["kind"] == "ci_exhausted"
+      and gates._decision_key(base_state(current_task=T1), E_CI_WATCH) != gates._decision_key(base_state(current_task=T1), E_CE),
+      (E_CI_WATCH, E_CE))
 E_CE_SPENT = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")],
                                        ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f,
                                        cap_continues={"ci_exhausted:99:test": STRIKE_LIMIT})).get("escalation")
@@ -4091,6 +4139,8 @@ check("watch: ci_poll / review_poll node timeouts cover the sleep plus one gh re
 check("watch: review_route has a timeout above the slack_ping subprocess bound (60s)", NODES.get("review_route", {}).get("timeout", 0) > 60,
       NODES.get("review_route", {}).get("timeout"))
 check("watch: ci_polls_run and review_polls_run seeded at 0", SEEDS.get("ci_polls_run") == 0 and SEEDS.get("review_polls_run") == 0)
+check("repeat decisions: answered_decisions is seeded empty and persisted like autonomous_decisions",
+      SEEDS.get("answered_decisions") == [] and "answered_decisions" in _lib.STATE_KEYS, SEEDS.get("answered_decisions"))
 check("graph: confirm_seed offers exactly the seed_confirm options intake raises",
       NODES.get("confirm_seed", {}).get("options") == [o["text"] for o in E_SEED["options"]], NODES.get("confirm_seed", {}).get("options"))
 check("graph: confirm_draft offers exactly the draft_confirm options draft_route raises",
@@ -4700,7 +4750,8 @@ try:
     check("review trust: review_route with untrusted items -> review_owner_judgment hard trigger, two options, ids only, ledgered",
           RU.get("_next") == "escalate_gate" and ESC.get("kind") == "review_owner_judgment" and ESC.get("hard_trigger") is True
           and [(o["text"], o["recommended"]) for o in ESC.get("options", [])] == [("Skip it and keep watching", False), ("Stop watching and report", True)]
-          and ESC.get("data") == {"items": UIDS, "untrusted": True} and RU.get("review_status") == "owner_judgment"
+          and ESC.get("data") == {"items": UIDS, "untrusted": True, "decision": "untrusted_authors"}
+          and RU.get("review_status") == "owner_judgment"
           and "not an owner, or a member or collaborator without write access" in ESC.get("question", "") and "read it on the PR" in ESC.get("question", "")
           and ledgered(RU, "review-watch: PR #99 untrusted threadcomment:C8 by eve (NONE), review:R7 by eve (CONTRIBUTOR), comment:I7 by eve (NONE) -> owner judgment"), RU)
     check("review trust: review_route keeps the trusted items for a later triage and marks nothing seen",

@@ -919,7 +919,7 @@ def gate1_route(state):
         return raise_escalation(state, u, escalation(
             "gate_fault", "The gatekeeper produced no verdict (agent fault). Retry the gate, or abort?",
             [option("Retry the gatekeeper", recommended=_retry_gate_recommended(state)), option("Abort the run")],
-            evidence=trim_items(text, 1000), data={"gate": "gate1"}))
+            evidence=trim_items(text, 1000), data={"gate": "gate1", "decision": "gate1"}))
     u["gate1_verdict"] = verdict
     if verdict == "SEALED" or verdict == "FRICTION":
         if verdict == "FRICTION":
@@ -1063,7 +1063,7 @@ def gate2_route(state):
         return raise_escalation(state, u, escalation(
             "gate_fault", "The oracle produced no PLAN_REVIEW verdict (agent fault). Retry, or abort?",
             [option("Retry the oracle review", recommended=_retry_gate_recommended(state)), option("Abort the run")],
-            evidence=trim_items(text, 1000), data={"gate": "gate2"}))
+            evidence=trim_items(text, 1000), data={"gate": "gate2", "decision": "gate2"}))
     u["gate2_verdict"] = verdict
     if verdict == "OKAY":
         ledger(state, u, "gate2: OKAY")
@@ -1207,7 +1207,8 @@ def promote_verify(state):
         return raise_escalation(state, u, escalation(
             "promote_failed", "Promotion left mechanical defects after a retry. Abort, or continue with the tasks as they are?",
             [option("Abort the run", recommended=True), option("Continue with the tasks as promoted")],
-            evidence="\n".join(defects + ([advisory] if advisory else [])), hard_trigger=True))
+            evidence="\n".join(defects + ([advisory] if advisory else [])), hard_trigger=True,
+            data={"decision": "promotion_defects"}))
     if advisory:
         line = f"promote: breakdown lists {len(rows)} rows, {len(tasks)} task dirs after the retry; proceeding (advisory)"
         ledger(state, u, line)
@@ -1219,7 +1220,8 @@ def promote_verify(state):
         if TASKSTORE == "dirstate":
             return raise_escalation(state, u, escalation(
                 "promote_failed", f"The {STORE_LABEL} commit/push after promotion failed (validate RED or push rejected). Fix and retry, or abort?",
-                [option("Retry the planning commit", recommended=True), option("Abort the run")], evidence=tail(out, 2000)))
+                [option("Retry the planning commit", recommended=True), option("Abort the run")], evidence=tail(out, 2000),
+                data={"decision": "promotion_commit_push"}))
     for t in tasks:
         t.setdefault("unit", _pr_unit(state, t, tasks))
     save_tasks(state, u, tasks)
@@ -1294,12 +1296,12 @@ def _git_setup_escalation(state, u, branch, base, code, step, detail):
             "git_setup_failed", f"The run branch {branch} is already checked out in the worktree at {where}, so it cannot be "
                                 f"checked out in {code}. Use that worktree, pick a different branch name, or abort?",
             [option(USE_WORKTREE, recommended=True, evidence=where), option(PICK_BRANCH), option(ABORT_RUN)],
-            evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base},
+            evidence=tail(detail, 1500), data={"worktree": where, "branch": branch, "base": base, "decision": "worktree_held"},
             quoted=(branch, where, code)))
     return raise_escalation(state, u, escalation(
         "git_setup_failed", f"Could not set up the branch {branch} from {base} in {code}: git {' '.join(step)} failed. Retry, or abort?",
         [option(RETRY_BRANCH, recommended=True), option(ABORT_RUN)], evidence=tail(detail, 1500),
-        data={"branch": branch, "base": base}, quoted=(branch, base, code, " ".join(step))))
+        data={"branch": branch, "base": base, "decision": "git_step_failed"}, quoted=(branch, base, code, " ".join(step))))
 
 
 def _git_common_dir(path):
@@ -2587,7 +2589,8 @@ def task_done_verify(state):
             ledger(state, u, f"task-done: store close tool failed for {task.get('id')}: {tail(out, 300)}")
             return raise_escalation(state, u, escalation(
                 "promote_failed", f"The store close for {task.get('id')} failed (validate RED or push rejected). Fix and retry, or abort?",
-                [option("Retry the close", recommended=True), option("Abort the run")], evidence=tail(out, 2000), hard_trigger=True))
+                [option("Retry the close", recommended=True), option("Abort the run")], evidence=tail(out, 2000), hard_trigger=True,
+                data={"decision": "task_close"}))
         task["dir"] = os.path.join(state.get("tasks_root", ""), "completed", os.path.basename(tdir)) if tdir else task.get("dir", "")
     else:
         set_task_status(state, task, "complete")
@@ -3381,7 +3384,9 @@ def escalate_gate(state):
         return u
     policy = str(var(state, "escalation_policy", "interactive")).strip().lower()
     key = _decision_key(state, esc)
-    failed_once = key in as_list(state.get("autonomous_decisions"))
+    resolved = key in as_list(state.get("autonomous_decisions"))
+    answered = key in as_list(state.get("answered_decisions"))
+    failed_once = resolved or answered
     if policy == "autonomous" and not esc.get("hard_trigger") and not failed_once:
         rulings = ""
         path = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "standing-rulings.md")
@@ -3392,7 +3397,8 @@ def escalate_gate(state):
         u["_next"] = "ladder_judge"
     else:
         if failed_once:
-            ledger(state, u, f"ladder: {key} already resolved autonomously once -> owner")
+            how = "resolved autonomously" if resolved else "answered"
+            ledger(state, u, f"ladder: {key} already {how} once -> owner")
         u["_next"] = "ask_dispatch"
     return u
 
@@ -3448,6 +3454,8 @@ def consult_route(state):
 
 _TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft",
                      "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
+# escalation kinds answered at an approval node of their own: the ones above, and the two plan gates routed to theirs
+OWN_PROMPT_KINDS = ("review_incomplete", "seed_confirm", "draft_confirm", "approve_breakdown", "approve_next")
 
 
 def _terminal_prompt(esc):
@@ -3469,6 +3477,16 @@ def _slack_ping(state, text):
 def ask_dispatch(state):
     u = {}
     esc = as_dict(state.get("escalation"))
+    key = _decision_key(state, esc)
+    if key in as_list(state.get("answered_decisions")) and truthy(as_dict(esc.get("data")).get("multiple_choice")) \
+            and esc.get("kind") not in OWN_PROMPT_KINDS:
+        # the picker answers itself with no human, so a repeat goes to the typed prompt under the key it was answered by
+        data = {k: v for k, v in as_dict(esc.get("data")).items() if k != "multiple_choice"}
+        data["decision"] = data.get("decision") or f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
+        esc = {**esc, "data": data}
+        u["escalation"] = esc
+        u["ask_question"] = render_question(esc)
+        ledger(state, u, f"repeat decision {key} -> typed prompt")
     u["parked"] = esc.get("kind", "")
     u["answer_source"] = ""
     snapshot(state, u, "parked")
@@ -3532,7 +3550,12 @@ def parse_answer(state):
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
-    if headless := headless_recommended(text, options):
+    kind = esc.get("kind")
+    repeat = _decision_key(state, esc) in as_list(state.get("answered_decisions")) and not esc.get("hard_trigger")
+    if text == _lib.HEADLESS_GUIDANCE and options and kind not in OWN_PROMPT_KINDS and repeat:
+        ledger(state, u, f"headless: {kind}: asked again after an answer -> headless judge")
+        return _to_headless_judge(state, u, esc)
+    elif headless := headless_recommended(text, options):
         # the engine's no-human answer takes the recommended option; never interpreted, never matched on its words
         choice = headless
         ledger(state, u, f"headless: {esc.get('kind')}: no human available -> the recommended option: {tail(choice, 200)}")
@@ -4904,6 +4927,12 @@ def apply_answer(state):
         u["_next"] = "end_failure"
     if u.get("_next") in ("end_blocked", "end_aborted") and u.get("failure_reason") and state.get("answer_reason"):
         u["failure_reason"] += f" (headless judge: {trim_items(state['answer_reason'], 500)})"
+    key = _decision_key(state, esc)
+    answered = as_list(state.get("answered_decisions"))
+    # _ask_again raises the same decision again through escalate_gate, which acts on nothing
+    asked_again = u.get("_next") == "escalate_gate" and _decision_key({**state, **u}, as_dict(u.get("escalation"))) == key
+    if u.get("_next") not in ("ask_dispatch", "interpret_reply", "headless_judge") and not asked_again and key not in answered:
+        u["answered_decisions"] = list(answered) + [key]
     snapshot(state, u, f"answered {kind}")
     return u
 
@@ -5358,7 +5387,7 @@ def ci_route(state):
             ledger(state, u, f"review-watch: PR #{pr} stop: watch_visit_cap")
         return raise_escalation(state, u, escalation(
             "watch_visit_cap", f"The CI watch on PR #{pr} used its run-wide budget of {POLL_VISIT_BUDGET} polls. Stop watching and report.",
-            [option("Stop watching and report", recommended=True)], quoted=(pr,)))
+            [option("Stop watching and report", recommended=True)], data={"decision": "ci_watch_budget"}, quoted=(pr,)))
     elif watching:
         ledger(state, u, f"review-watch: PR #{pr} stop: ci_exhausted")
         return raise_escalation(state, u, escalation(
@@ -5366,14 +5395,16 @@ def ci_route(state):
                             f"wall {CI_WALL_SECS}s). Keep waiting, or stop watching and report?",
             [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True,
                                                                  evidence="the PR stays open and ready; the report names the stop reason")],
-            evidence=tail(state.get("ci_evidence", ""), 1500), quoted=(pr, status, state.get("ci_rounds"))))
+            evidence=tail(state.get("ci_evidence", ""), 1500), data={"decision": "review_watch_ci"},
+            quoted=(pr, status, state.get("ci_rounds"))))
     else:
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"The CI watch on PR #{pr} ended without a verdict ({status}: rounds {state.get('ci_rounds')}, "
                             f"wall {CI_WALL_SECS}s). Keep waiting, or leave the PR in draft and report?",
             [option("Keep waiting (re-run the watch)"), option("Leave the PR in draft and report", recommended=True,
                                                                  evidence="a draft with a named blocker beats a ready PR on red/pending")],
-            evidence=tail(state.get("ci_evidence", ""), 1500), quoted=(pr, status, state.get("ci_rounds"))))
+            evidence=tail(state.get("ci_evidence", ""), 1500), data={"decision": "ci_watch"},
+            quoted=(pr, status, state.get("ci_rounds"))))
     return u
 
 
@@ -5505,7 +5536,8 @@ def ci_apply(state):
                 "ci_exhausted", f"CI still red on {over}{during} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?"
                                 + ("" if more else CAP_SPENT_NOTE),
                 [option(CI_FIX_MORE, recommended=more), option(leave)],
-                evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True, data={"over": over, "failing": checks}))
+                evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True,
+                data={"over": over, "failing": checks, "decision": "fix_cap"}))
         u["fix_request"] = _ci_fix_request(state, owner, pr, checks)
         ledger(state, u, f"ci: real failure -> fix round to {owner} (strikes {pr_strikes})")
         u["_next"] = "fix_round"
@@ -5915,7 +5947,7 @@ def review_route(state):
                                      f"or a member or collaborator without write access:\n{listed}\n"
                                      "The watch did not read the body: read it on the PR. Skip it and keep watching, or stop watching?",
             [option("Skip it and keep watching"), option("Stop watching and report", recommended=True)],
-            hard_trigger=True, data={"items": [i["id"] for i in untrusted], "untrusted": True}))
+            hard_trigger=True, data={"items": [i["id"] for i in untrusted], "untrusted": True, "decision": "untrusted_authors"}))
     if status == "truncated":
         _review_event(state, u, "stop: read_truncated")
         lists = [as_dict(x) for x in as_list(state.get("review_truncated"))]
@@ -5926,16 +5958,16 @@ def review_route(state):
             return raise_escalation(state, u, escalation(
                 "review_read_truncated", f"The review read on PR #{pr} holds more than the {REVIEW_PAGE} items it fetches per list ({listed}), "
                                          "so the watch cannot see every new comment. Stop watching and report.", [stop],
-                quoted=(pr, listed)))
+                data={"decision": "comments_truncated"}, quoted=(pr, listed)))
         return raise_escalation(state, u, escalation(
             "review_read_truncated", f"The review read on PR #{pr} holds more than the {REVIEW_PAGE} items it fetches per list ({listed}), "
                                      "so the watch cannot see every review item. Keep watching, or stop watching and report?",
-            [option("Keep watching (re-arm the review watch)"), stop], quoted=(pr, listed)))
+            [option("Keep watching (re-arm the review watch)"), stop], data={"decision": "review_truncated"}, quoted=(pr, listed)))
     _review_event(state, u, f"stop: {status}")
     if status == "visit_cap":
         return raise_escalation(state, u, escalation(
             "watch_visit_cap", f"The review watch on PR #{pr} used its run-wide budget of {POLL_VISIT_BUDGET} polls. Stop watching and report.",
-            [option("Stop watching and report", recommended=True)], quoted=(pr,)))
+            [option("Stop watching and report", recommended=True)], data={"decision": "review_watch_budget"}, quoted=(pr,)))
     return raise_escalation(state, u, escalation(
         "review_exhausted", f"The review watch on PR #{pr} ended without an approval ({status}: polls {state.get('review_rounds')}, "
                             f"wall {REVIEW_WALL_SECS}s). Keep watching, or stop watching and report?",
@@ -6004,7 +6036,7 @@ def review_apply(state):
             "review_owner_judgment", f"Review comment(s) on PR #{pr} need an owner decision:\n{quoted}\n"
                                      "Address them as a fix round, skip them and keep watching, or stop watching?",
             [option("Address it as a fix round"), option("Skip it and keep watching"), option("Stop watching and report")],
-            hard_trigger=True, data={"items": [i["id"] for i in owner]}))
+            hard_trigger=True, data={"items": [i["id"] for i in owner], "decision": "owner_comments"}))
     if not fixes:
         u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items]
         u.update({"review_items": [], "review_triage_items": [], "review_status": "pending"})
