@@ -81,8 +81,8 @@ pub enum Event {
         payload: Option<String>,
         origin: Origin,
     },
-    /// The plain narration line of a tool call, with the tool name and the
-    /// argument words it is built from.
+    /// Lets a consumer show a tool call without re-parsing the coloured
+    /// log line; `line` is the uncoloured rendering of `name` and `args`.
     ToolNarration {
         call_id: String,
         name: String,
