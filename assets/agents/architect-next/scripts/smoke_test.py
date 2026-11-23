@@ -15,7 +15,6 @@ Usage: smoke_test.py   (exit 1 on any failure; prints one line per check)
 
 import ast
 import datetime
-import hashlib
 import json
 import os
 import re
@@ -2873,7 +2872,7 @@ check("apply_answer: the forced reply recorded (via other) and the force lifted 
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True, reply_interpreted=True))
 check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
 E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
-E_DQ_KEY = f"design_round#0~{hashlib.sha1(E_DQ['data']['question'].encode()).hexdigest()[:8]}||task"
+E_DQ_KEY = f"design_round#0~{gates.hashlib.sha1(E_DQ['data']['question'].encode()).hexdigest()[:8]}||task"
 check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index and question",
       gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_decisions=[E_DQ_KEY]))["_next"] == "ladder_judge"
       and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_decisions=[E_DQ_KEY]))["_next"] == "ask_dispatch")
