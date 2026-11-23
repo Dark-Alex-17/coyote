@@ -1309,6 +1309,13 @@ mod key_help_and_chords {
     const LAST_HELP_ROW: &str = "Close the help";
     /// The roster's legend.
     const ROSTER_MARK: &str = "Esc = close";
+    /// A pseudo-terminal never answers a cursor-position query, and the plain
+    /// REPL sends three before each prompt reads a key (its own row resync,
+    /// then reedline's anchor and drift checks), each waiting out crossterm's
+    /// 2 s. The first prompt also pays the background-colour probe, so it
+    /// lands about 12 s after spawn on a loaded host, and the line sent after
+    /// `.keys` sits 6 s behind the next prompt's queries.
+    const REPL_PROMPT_DEADLINE: Duration = Duration::from_secs(45);
 
     /// xterm's encodings of F1-F12.
     const FUNCTION_KEYS: [&[u8]; 12] = [
@@ -1607,11 +1614,11 @@ mod key_help_and_chords {
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+        pty.wait_for("dry-model)>", REPL_PROMPT_DEADLINE).unwrap();
         pty.read_for(Duration::from_millis(300));
         let at = pty.raw().len();
         pty.send(b".keys\r").unwrap();
-        pty.wait_for_after("Unknown command", at, PTY_DEADLINE)
+        pty.wait_for_after("Unknown command", at, REPL_PROMPT_DEADLINE)
             .expect("the REPL did not refuse .keys as an unknown command");
         let out = strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..]));
         assert!(
@@ -1623,7 +1630,9 @@ mod key_help_and_chords {
             "the REPL entered the alternate screen"
         );
         pty.send(b".exit\r").unwrap();
-        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        let transcript = pty
+            .wait_for("tty-probe-done", REPL_PROMPT_DEADLINE)
+            .unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
     }
 
