@@ -270,6 +270,8 @@ nodes:
     agent: domain-reviewer
     teammates: true
     timeout: 7200
+    inputs:
+      project_dir: '{{project_dir}}'
     prompt: |
       ## TASK
       Review the changes in your assigned domain slice as ONE coherent unit and
@@ -553,6 +555,8 @@ nodes:
     description: Independent fresh-context verification of every 🔴/🟡 finding — structurally on the path to the report; cannot be skipped.
     agent: finding-verifier
     timeout: 3600
+    inputs:
+      project_dir: '{{project_dir}}'
     prompt: |
       Verify these code-review findings against the working tree.
 

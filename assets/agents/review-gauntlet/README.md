@@ -329,6 +329,12 @@ verbatim.
   under that prefix (e.g. `flock -w 240 /path/to/lock`), the same way the coder and
   step-runner gates do, so a parallel batch sharing one target directory
   serialises its verification runs too.
+- Every lane node passes the resolved `project_dir` (the checkout `signals`
+  settled on: the caller's named directory, else the variable) through
+  `inputs:`. A child that declares the variable takes an `inputs:` value as
+  its own `project_dir`, so the lane's read guard and tools, and the lane's
+  own children, work in the reviewed checkout rather than the one the root
+  run was started in.
 - The `carried_failures` variable (default `'[]'`, a JSON array of
   `{"paths", "owner", "evidence"}` items) rides the same passthrough: failures
   the caller declares expected to stay red in this change and owed elsewhere.
