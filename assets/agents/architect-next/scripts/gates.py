@@ -3173,10 +3173,10 @@ def _ask_typed_verification(state, u, esc):
     typed = f"`{p.get('replacement') or ''}` -- {p.get('reason') or ''}"
     if as_int(p.get("typed_rounds")) > RERUN_ONCE:
         u["verification_proposal"] = {}
-        ledger(state, u, f"verification: `{p.get('replacement')}` is typed past {RERUN_ONCE} re-typed replacements; not "
+        ledger(state, u, f"verification: `{p.get('replacement')}` is typed past the re-typed replacement bound; not "
                          f"asked about and not adopted")
-        _reask_unmatched(state, u, esc, typed, why=f"{RERUN_ONCE} typed replacements were already asked about. Pick an "
-                                                   f"option by its number or its text.")
+        _reask_unmatched(state, u, esc, typed, why="typed replacements for this command were already asked about. Pick "
+                                                   "an option by its number or its text.")
         return
     scope = data.get("scope") or ("task" if data.get("task") else "run")
     tid = data.get("task") or (_final_red_owner(state) if scope == "run" else "")
