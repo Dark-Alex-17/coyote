@@ -2881,6 +2881,65 @@ nodes:
         assert_eq!(hooks_of(HookEvent::AgentFailed), expected);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn node_start_notice_names_its_node_in_the_origin() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("step.sh", "#!/bin/bash\necho '{}'\n");
+        let yaml = r#"
+name: node_start_origin_test
+settings:
+  validate_before_run: false
+start: step_s4n
+nodes:
+  step_s4n:
+    type: script
+    script: step.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "ok"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        ctx.self_agent_id = Some("graph-agent-s4n".to_string());
+        let bus = crate::events::RecordingSink::install();
+        GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let starts: Vec<Origin> = bus
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::events::Event::Notice {
+                    kind: crate::events::NoticeKind::GraphNode,
+                    text,
+                    origin,
+                } if text.contains("(script) start")
+                    && origin.agent_id.as_deref() == Some("graph-agent-s4n") =>
+                {
+                    Some(origin)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![Origin {
+                agent_id: Some("graph-agent-s4n".to_string()),
+                depth: 0,
+                node: Some("step_s4n".to_string()),
+            }]
+        );
+    }
+
     /// Declared variables are seeded into state at run start, so the agent
     /// node's strict prompt interpolation of `{{foo}}` succeeds instead of
     /// bailing with "not found in state". `ctx.agent` is None here, so each

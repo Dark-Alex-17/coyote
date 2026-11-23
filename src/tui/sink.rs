@@ -877,6 +877,30 @@ mod tests {
         assert_eq!(msgs.len(), 4);
     }
 
+    #[test]
+    fn a_long_tool_or_job_error_reaches_the_transcript_cut_to_the_hook_value_length() {
+        let (sink, mut rx) = sink();
+        let long = "e".repeat(3000);
+        let cut = crate::hooks::truncate_env_value(&long);
+        assert!(cut.len() < long.len());
+
+        sink.on_event(&tool_finished(
+            "call-long",
+            None,
+            Some(&long),
+            Origin::detached(),
+        ));
+        sink.on_event(&job_finished("job_long", Some(&long), Origin::detached()));
+        let errors: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                UiMsg::ToolFinished { error, .. } | UiMsg::JobFinished { error, .. } => error,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, vec![cut.to_string(), cut.to_string()]);
+    }
+
     /// `agent.started` fires with the child's context, so the root's
     /// direct children arrive at depth one and deeper ones are dropped;
     /// an agent's end is matched by id whatever its depth.

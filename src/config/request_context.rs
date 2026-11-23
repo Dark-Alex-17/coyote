@@ -8928,19 +8928,24 @@ mod tests {
         );
         ctx.record_token_usage(None, &priced_model());
 
-        let prompts: Vec<String> = recording
+        let published: Vec<(String, Origin)> = recording
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::UsageUpdated { right_prompt, .. }
-                    if right_prompt.contains("usage-probe-x7x") =>
-                {
-                    Some(right_prompt)
-                }
+                Event::UsageUpdated {
+                    right_prompt,
+                    origin,
+                } if right_prompt.contains("usage-probe-x7x") => Some((right_prompt, origin)),
                 _ => None,
             })
             .collect();
-        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert_eq!(published.len(), 2, "{published:?}");
+        assert!(
+            published
+                .iter()
+                .all(|(_, origin)| *origin == Origin::from(&ctx)),
+            "{published:?}"
+        );
     }
 
     #[test]

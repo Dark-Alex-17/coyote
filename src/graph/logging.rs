@@ -411,6 +411,50 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn node_complete_narration_ends_with_the_fallback_route_tail() {
+        let node = end_node("probe-node-route-x7x");
+        let origin = Origin {
+            agent_id: Some("child".to_string()),
+            depth: 1,
+            node: Some("probe-node-route-x7x".to_string()),
+        };
+        let route = route_suffix(Some("recover"), true);
+        let sink = RecordingSink::install();
+
+        narrate_node_complete(
+            &crate::turn::SilentSink,
+            false,
+            &node,
+            Duration::from_millis(5),
+            &route,
+            false,
+            &origin,
+        );
+
+        let recorded: Vec<(String, Origin)> = sink
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Notice {
+                    kind: NoticeKind::GraphNode,
+                    text,
+                    origin,
+                } if text.contains("probe-node-route-x7x") => Some((text, origin)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let (text, published) = &recorded[0];
+        // dimmed_text closes the line with an SGR reset unless NO_COLOR is set.
+        assert!(
+            text.trim_end_matches("\u{1b}[0m").ends_with(&route),
+            "{text:?}"
+        );
+        assert_eq!(*published, origin);
+    }
+
+    #[test]
     fn records_and_aggregates_node_timings() {
         let mut logger = GraphLogger::with_visibility(
             "g",
