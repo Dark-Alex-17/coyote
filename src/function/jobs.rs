@@ -1358,6 +1358,9 @@ async fn pump_into_ring(
                         Routed::Served(request) => {
                             let id = request.id().to_string();
                             let served = tokio::task::spawn_blocking(move || request.serve()).await;
+                            // `serve` catches a prompter panic itself, so this
+                            // runs only when the task is cancelled or the
+                            // runtime is shutting down.
                             if let Err(err) = served {
                                 router.not_answered(&id, err);
                             }
