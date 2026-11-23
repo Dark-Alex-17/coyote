@@ -22,6 +22,7 @@ use crate::config::{
     resolve_prompt_args, sanitize_display_text, vision_unsupported_message,
 };
 use crate::config::{AssetCategory, paths};
+use crate::events::Origin;
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
@@ -899,7 +900,13 @@ async fn dispatch_repl_line(
                 let clients = ctx.app.config.clients.clone();
                 let (client_name, provider) =
                     resolve_oauth_client(Some(client.name()), &clients, ctx.prompter.as_ref())?;
-                oauth::run_oauth_flow(&*provider, &client_name, ctx.prompter.as_ref()).await?;
+                oauth::run_oauth_flow(
+                    &*provider,
+                    &client_name,
+                    ctx.prompter.as_ref(),
+                    &Origin::from(&*ctx),
+                )
+                .await?;
             }
             ".mcp" => match args {
                 Some(args) => {
@@ -949,6 +956,7 @@ async fn dispatch_repl_line(
                                             callback_port,
                                             redirect_host,
                                             ctx.prompter.as_ref(),
+                                            &Origin::from(&*ctx),
                                         )
                                         .await?;
                                         println!("Authentication saved.");

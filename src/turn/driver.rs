@@ -1,6 +1,6 @@
 use super::{emit_assistant_text, emit_notice};
 use crate::config::{AppConfig, Input, RequestContext, Session, TURN_INTERRUPTED_TEXT};
-use crate::events::NoticeKind;
+use crate::events::{NoticeKind, Origin};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pending_tasks};
 use crate::graph;
 use crate::graph::dispatch::{GraphTurn, run_graph_turn};
@@ -142,7 +142,12 @@ impl TurnDriver<'_> {
                 };
                 match turn {
                     GraphTurn::Run { output, last_run } => {
-                        emit_assistant_text(ui.as_ref(), app.as_ref(), &output)?;
+                        emit_assistant_text(
+                            ui.as_ref(),
+                            app.as_ref(),
+                            &output,
+                            Origin::from(&*ctx),
+                        )?;
                         input.clear_continue_output();
                         // `None` (a run the graph does not record: no session
                         // block and nothing to carry) clears any stale record
@@ -232,6 +237,7 @@ impl TurnDriver<'_> {
                                     checkpoint.committed_results, checkpoint.committed_tokens
                                 ))
                             ),
+                            Origin::from(&*ctx),
                         );
                         retried_after_compress = false;
                     }
@@ -288,6 +294,7 @@ impl TurnDriver<'_> {
                                 "Auto-continuing ({count}/{max}): {remaining} incomplete todo(s) remain"
                             ))
                         ),
+                        Origin::from(&*ctx),
                     );
 
                     format!("{prompt}\n\n{todo_state}")
@@ -330,6 +337,7 @@ impl TurnDriver<'_> {
                                 "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
                             ))
                         ),
+                        Origin::from(&*ctx),
                     );
 
                     format!("{prompt}\n\n{todo_state}")
@@ -357,7 +365,12 @@ impl TurnDriver<'_> {
             ctx.before_chat_completion(&input)?;
             let graph::dispatch::ChildGraphRun { result, last_run } =
                 graph::run_active_agent_graph(ctx, &input, abort_signal.clone()).await?;
-            emit_assistant_text(ui.as_ref(), app.as_ref(), &result.output)?;
+            emit_assistant_text(
+                ui.as_ref(),
+                app.as_ref(),
+                &result.output,
+                Origin::from(&*ctx),
+            )?;
             ctx.record_graph_run(app.as_ref(), &input, &result.output, last_run)?;
             return Ok(TurnOutcome::Completed);
         }
@@ -429,6 +442,7 @@ pub(crate) async fn autoname_with_notice(ctx: &mut RequestContext, app: &AppConf
                 .italic()
                 .paint("Autonaming the session."),
         ),
+        Origin::from(&*ctx),
     );
     if let Err(err) = ctx.autoname_session(app).await {
         warn!("Failed to autoname the session: {err:#}");
@@ -482,6 +496,7 @@ pub(crate) async fn run_auto_compress(ctx: &mut RequestContext, app: &AppConfig)
                 .italic()
                 .paint("Compressing the session."),
         ),
+        Origin::from(&*ctx),
     );
 
     let compressed = auto_compress_session(ctx, app).await;
@@ -535,6 +550,7 @@ pub(crate) async fn auto_compress_session(ctx: &mut RequestContext, app: &AppCon
                 ctx.ui.as_ref(),
                 NoticeKind::Compress,
                 format!("\n{}", compression_failure_notice(app, &err)),
+                Origin::from(&*ctx),
             );
             false
         }
@@ -594,6 +610,7 @@ pub(crate) fn emit_pause_banner(ctx: &RequestContext) {
                 "\n⏸ {}",
                 dim_notice_color(&ctx.app.config).italic().paint(text)
             ),
+            Origin::from(ctx),
         );
     }
 }
@@ -743,6 +760,7 @@ fn emit_turn_notice(ctx: &RequestContext, notice: Option<String>) {
                 "\n⏸ {}",
                 dim_notice_color(&ctx.app.config).italic().paint(text)
             ),
+            Origin::from(ctx),
         );
     }
 }
@@ -788,6 +806,21 @@ mod tests {
         ctx
     }
 
+    fn silent_child_ctx(agent_id: &str) -> RequestContext {
+        let mut ctx = silent_ctx();
+        ctx.self_agent_id = Some(agent_id.to_string());
+        ctx.current_depth = 1;
+        ctx
+    }
+
+    fn child_origin(agent_id: &str) -> Origin {
+        Origin {
+            agent_id: Some(agent_id.to_string()),
+            depth: 1,
+            node: None,
+        }
+    }
+
     async fn drive(
         ctx: &mut RequestContext,
         mode: TurnMode,
@@ -824,9 +857,33 @@ mod tests {
             &recorded[0],
             Event::Notice {
                 kind: NoticeKind::AutoContinue,
-                text
+                text,
+                ..
             } if text.starts_with("\n⏸ ")
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_context_notice_carries_its_agent_id_and_depth() {
+        let mut ctx = silent_child_ctx("child-notice-x7x");
+        ctx.add_todo("pending work");
+        ctx.pause_auto_continue("probe-child-pause-x7x");
+        let sink = RecordingSink::install();
+
+        emit_pause_banner(&ctx);
+
+        let origins: Vec<Origin> = sink
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Notice { text, origin, .. } if text.contains("probe-child-pause-x7x") => {
+                    Some(origin)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(origins, vec![child_origin("child-notice-x7x")]);
     }
 
     #[tokio::test]
@@ -888,6 +945,40 @@ mod tests {
             vec![Event::AssistantText {
                 text: reply.to_string(),
                 markdown: true,
+                origin: Origin::detached(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_child_context_assistant_text_carries_its_agent_id_and_depth() {
+        let mut ctx = silent_child_ctx("child-text-x7x");
+        let reply = "probe-driver-child-reply-x7x";
+        let client = Arc::new(FixedReplyClient::new(reply));
+        let mut runner = completion_runner(move |input, ctx, abort| {
+            let client = Arc::clone(&client);
+            boxed_completion(async move {
+                ctx.before_chat_completion(input)?;
+                call_chat_completions(input, true, false, client.as_ref(), ctx, abort).await
+            })
+        });
+        let sink = RecordingSink::install();
+
+        let outcome = drive(&mut ctx, TurnMode::Headless, "hi", &mut runner).await;
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let recorded: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::AssistantText { text, .. } if text == reply))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![Event::AssistantText {
+                text: reply.to_string(),
+                markdown: true,
+                origin: child_origin("child-text-x7x"),
             }]
         );
     }
@@ -913,9 +1004,47 @@ mod tests {
         let deltas: Vec<Event> = sink
             .drain()
             .into_iter()
-            .filter(|event| matches!(event, Event::TextDelta(text) if text == reply))
+            .filter(|event| matches!(event, Event::TextDelta { text, .. } if text == reply))
             .collect();
-        assert_eq!(deltas, vec![Event::TextDelta(reply.to_string())]);
+        assert_eq!(
+            deltas,
+            vec![Event::TextDelta {
+                text: reply.to_string(),
+                origin: Origin::detached(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_child_context_text_delta_carries_its_agent_id_and_depth() {
+        let mut ctx = silent_child_ctx("child-delta-x7x");
+        let reply = "probe-driver-child-delta-x7x";
+        let client = Arc::new(FixedReplyClient::new(reply));
+        let mut runner = completion_runner(move |input, ctx, abort| {
+            let client = Arc::clone(&client);
+            boxed_completion(async move {
+                ctx.before_chat_completion(input)?;
+                call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
+            })
+        });
+        let sink = RecordingSink::install();
+
+        let outcome = drive(&mut ctx, TurnMode::Headless, "hi", &mut runner).await;
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let deltas: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::TextDelta { text, .. } if text == reply))
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![Event::TextDelta {
+                text: reply.to_string(),
+                origin: child_origin("child-delta-x7x"),
+            }]
+        );
     }
 
     /// A line the user queued mid-turn rides on the last tool result of

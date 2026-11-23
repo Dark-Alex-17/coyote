@@ -8,6 +8,7 @@ use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
     Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
 };
+use crate::events::Origin;
 use crate::function::ToolResult;
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
@@ -222,7 +223,11 @@ async fn run(
     parent_ctx.role = saved_role;
     let node_jobs =
         std::mem::replace(&mut parent_ctx.node_job_scope, saved_job_scope).unwrap_or_default();
-    reap_jobs(parent_ctx.supervisor.as_ref(), &node_jobs).await;
+    let origin = Origin {
+        node: Some(node_id.to_string()),
+        ..Origin::from(&*parent_ctx)
+    };
+    reap_jobs(parent_ctx.supervisor.as_ref(), &node_jobs, &origin).await;
     parent_ctx.active_node_mcp_tools = saved_node_mcp_tools;
     parent_ctx.refresh_mcp_tool_filters();
     restore_agent_skill_policy(parent_ctx, saved_agent_skill_state);

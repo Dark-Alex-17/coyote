@@ -1443,6 +1443,7 @@ struct SpawnResultHooks {
     session_id: Option<String>,
     agent_id: String,
     agent_name: String,
+    origin: Origin,
 }
 
 impl SpawnResultHooks {
@@ -1463,6 +1464,7 @@ impl SpawnResultHooks {
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.to_string(),
             agent_name: agent_name.to_string(),
+            origin: Origin::from(child_ctx),
         }
     }
 
@@ -1477,7 +1479,7 @@ impl SpawnResultHooks {
         };
         hooks::emit_resolved(
             Event::AgentFinished {
-                origin: Origin::detached(),
+                origin: self.origin,
                 agent_id: self.agent_id,
                 name: Some(self.agent_name.clone()),
                 session_id: self.session_id,
@@ -4498,8 +4500,10 @@ mod tests {
     #[test]
     #[serial]
     fn fire_publishes_bus_twin_without_resolved_hooks() {
-        let ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
         let agent_id = "agent-bus-probe-x7x";
+        ctx.self_agent_id = Some(agent_id.to_string());
+        ctx.current_depth = 1;
         let _sink = hooks::test_sink::install();
         let bus = crate::events::RecordingSink::install();
 
@@ -4517,7 +4521,7 @@ mod tests {
             panic!("expected Event::Hook, got {:?}", published[0]);
         };
         assert_eq!(*event, HookEvent::AgentCompleted);
-        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*origin, Origin::from(&ctx));
         assert_eq!(*payload, None);
         assert!(envs.contains(&("COYOTE_AGENT_NAME".to_string(), "explore".to_string())));
         assert!(envs.contains(&("COYOTE_EVENT".to_string(), "agent.completed".to_string())));

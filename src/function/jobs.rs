@@ -66,6 +66,7 @@ struct JobHookSnapshot {
     agent_name: Option<String>,
     job_id: String,
     tool: String,
+    origin: Origin,
 }
 
 impl JobHookSnapshot {
@@ -80,6 +81,7 @@ impl JobHookSnapshot {
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
             job_id: job_id.to_string(),
             tool: tool.to_string(),
+            origin: Origin::from(ctx),
         }
     }
 
@@ -90,7 +92,7 @@ impl JobHookSnapshot {
         let resolved = if success { self.completed } else { self.failed };
         hooks::emit_resolved(
             Event::JobFinished {
-                origin: Origin::detached(),
+                origin: self.origin,
                 job_id: self.job_id,
                 tool: self.tool,
                 ok: success,
@@ -1121,6 +1123,7 @@ async fn handle_cancel(ctx: &RequestContext, args: &Value) -> Result<Value> {
     kill_job_with_grace(&mut handle).await;
     events::bus().publish(Event::JobCancelled {
         job_id: id.to_string(),
+        origin: Origin::from(ctx),
     });
 
     let tool = handle.tool.clone();
@@ -1173,6 +1176,7 @@ async fn kill_job_with_grace(handle: &mut JobHandle) {
 pub async fn reap_jobs(
     supervisor: Option<&Arc<RwLock<Supervisor>>>,
     ids: &[String],
+    origin: &Origin,
 ) -> Vec<String> {
     let Some(supervisor) = supervisor else {
         return Vec::new();
@@ -1186,7 +1190,10 @@ pub async fn reap_jobs(
         if let Some(mut handle) = handle {
             handle.abort_signal.set_ctrlc();
             kill_job_with_grace(&mut handle).await;
-            events::bus().publish(Event::JobCancelled { job_id: id.clone() });
+            events::bus().publish(Event::JobCancelled {
+                job_id: id.clone(),
+                origin: origin.clone(),
+            });
             warn!(
                 "Reaped background job '{id}' ({}): left unreclaimed at graph node exit",
                 handle.tool
@@ -2161,6 +2168,7 @@ mod tests {
             let reaped = reap_jobs(
                 ctx.supervisor.as_ref(),
                 &["j1".to_string(), "missing".to_string()],
+                &Origin::detached(),
             )
             .await;
 
@@ -2169,12 +2177,17 @@ mod tests {
         });
     }
 
-    fn cancelled_job_ids(recording: &crate::events::RecordingSink, marker: &str) -> Vec<String> {
+    fn cancelled_jobs(
+        recording: &crate::events::RecordingSink,
+        marker: &str,
+    ) -> Vec<(String, Origin)> {
         recording
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::JobCancelled { job_id } if job_id.contains(marker) => Some(job_id),
+                Event::JobCancelled { job_id, origin } if job_id.contains(marker) => {
+                    Some((job_id, origin))
+                }
                 _ => None,
             })
             .collect()
@@ -2182,9 +2195,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn handle_cancel_publishes_job_cancelled() {
+    fn handle_cancel_publishes_job_cancelled_with_the_context_origin() {
         run_async(async {
-            let ctx = ctx_with_job_supervisor(4);
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.self_agent_id = Some("cancel-origin-x7x".into());
+            ctx.current_depth = 1;
             ctx.supervisor
                 .as_ref()
                 .unwrap()
@@ -2199,8 +2214,8 @@ mod tests {
 
             assert_eq!(result["status"], "cancelled");
             assert_eq!(
-                cancelled_job_ids(&recording, "x7x"),
-                vec!["job-cancel-x7x".to_string()]
+                cancelled_jobs(&recording, "job-cancel-x7x"),
+                vec![("job-cancel-x7x".to_string(), Origin::from(&ctx))]
             );
         });
     }
@@ -2217,16 +2232,22 @@ mod tests {
                 .register(make_running_job("job-reap-x7x"))
                 .unwrap();
             let recording = crate::events::RecordingSink::install();
+            let origin = Origin {
+                agent_id: Some("reap-origin-x7x".to_string()),
+                depth: 1,
+                node: Some("plan".to_string()),
+            };
 
             reap_jobs(
                 ctx.supervisor.as_ref(),
                 &["job-reap-x7x".to_string(), "missing-x7x".to_string()],
+                &origin,
             )
             .await;
 
             assert_eq!(
-                cancelled_job_ids(&recording, "x7x"),
-                vec!["job-reap-x7x".to_string()]
+                cancelled_jobs(&recording, "x7x"),
+                vec![("job-reap-x7x".to_string(), origin)]
             );
         });
     }
@@ -3974,7 +3995,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fire_terminal_publishes_bus_twin_without_resolved_hooks() {
-        let ctx = plain_ctx();
+        let mut ctx = plain_ctx();
+        ctx.self_agent_id = Some("job-snapshot-x7x".into());
+        ctx.current_depth = 2;
         let job_id = "job-bus-probe-x7x";
         let _guard = hooks::test_sink::install();
         let sink = crate::events::RecordingSink::install();
@@ -3999,7 +4022,7 @@ mod tests {
                 panic!("expected Event::Hook, got {published:?}");
             };
             assert_eq!(*event, expected_event);
-            assert_eq!(*origin, Origin::detached());
+            assert_eq!(*origin, Origin::from(&ctx));
             assert_eq!(*payload, None);
             assert!(envs.contains(&("COYOTE_TOOL_NAME".to_string(), "echo".to_string())));
             let error = envs

@@ -38,6 +38,7 @@ use crate::config::{
     maybe_spawn_models_refresh, sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
+use crate::events::Origin;
 use crate::graph::llm::CompletionFuture;
 use crate::mcp::McpServersConfig;
 use crate::prompt::{InquirePrompter, Prompter};
@@ -342,7 +343,7 @@ async fn run_cli_flag(
         let prompter = InquirePrompter::default();
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
-        oauth::run_oauth_flow(&*provider, &client_name, &prompter).await?;
+        oauth::run_oauth_flow(&*provider, &client_name, &prompter, &Origin::detached()).await?;
         return Ok(true);
     }
 
@@ -391,6 +392,7 @@ async fn run_cli_flag(
             spec.oauth.as_ref().and_then(|o| o.callback_port),
             spec.oauth.as_ref().and_then(|o| o.redirect_host.as_deref()),
             &prompter,
+            &Origin::detached(),
         )
         .await?;
         println!("Authentication saved. '{server_name}' is now available for use.");

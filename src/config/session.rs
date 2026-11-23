@@ -1422,6 +1422,7 @@ impl Session {
         session_dir: &Path,
         is_repl: bool,
         prompter: &dyn Prompter,
+        origin: Origin,
     ) -> Result<()> {
         let save_session = self.effective_save_session();
         if self.dirty && save_session != Some(false) {
@@ -1433,14 +1434,14 @@ impl Session {
                 }
                 let save = PromptRequest {
                     default: Some(json!(false)),
-                    ..PromptRequest::new(PromptAction::Confirm, "Save session?", Origin::detached())
+                    ..PromptRequest::new(PromptAction::Confirm, "Save session?", origin.clone())
                 };
                 let ans = ask(prompter, save)?.into_confirmed()?;
                 if !ans {
                     return Ok(());
                 }
                 if session_name == TEMP_SESSION_NAME {
-                    session_name = ask_session_name(prompter)?;
+                    session_name = ask_session_name(prompter, &origin)?;
                 }
             } else if save_session == Some(true) && session_name == TEMP_SESSION_NAME {
                 session_dir = session_dir.join(AUTONAME_PLACEHOLDER);
@@ -1835,9 +1836,9 @@ fn print_saved_to(session_path: &Path) {
 }
 
 /// Asks until the name is neither blank nor the temp session's.
-fn ask_session_name(prompter: &dyn Prompter) -> Result<String> {
+fn ask_session_name(prompter: &dyn Prompter, origin: &Origin) -> Result<String> {
     loop {
-        let req = PromptRequest::new(PromptAction::Input, "Session name:", Origin::detached());
+        let req = PromptRequest::new(PromptAction::Input, "Session name:", origin.clone());
         let name = ask(prompter, req)?.into_text()?;
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -3140,7 +3141,12 @@ last_run:
         let modified_before = destination.metadata().unwrap().modified().unwrap();
 
         session
-            .exit(&sessions_dir, true, &ScriptedPrompter::refusing())
+            .exit(
+                &sessions_dir,
+                true,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
             .unwrap();
 
         assert_eq!(read_to_string(&destination).unwrap(), before);
@@ -3186,7 +3192,12 @@ last_run:
         let mut session = dirty_unsaved_session();
 
         session
-            .exit(&sessions_dir, false, &ScriptedPrompter::refusing())
+            .exit(
+                &sessions_dir,
+                false,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
             .unwrap();
 
         assert!(std::fs::read_dir(&sessions_dir).unwrap().next().is_none());
@@ -3200,7 +3211,9 @@ last_run:
         let mut session = dirty_unsaved_session();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
 
-        session.exit(&sessions_dir, true, &prompter).unwrap();
+        session
+            .exit(&sessions_dir, true, &prompter, Origin::detached())
+            .unwrap();
 
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1);
@@ -3224,13 +3237,18 @@ last_run:
             PromptAnswer::Text("my-sess-9z".to_string()),
         ]);
 
-        session.exit(&sessions_dir, true, &prompter).unwrap();
+        let origin = Origin {
+            agent_id: Some("exit-name-x7x".to_string()),
+            depth: 1,
+            node: None,
+        };
+        session
+            .exit(&sessions_dir, true, &prompter, origin.clone())
+            .unwrap();
 
-        let questions: Vec<String> = prompter
-            .requests()
-            .into_iter()
-            .map(|req| req.question)
-            .collect();
+        let requests = prompter.requests();
+        assert!(requests.iter().all(|req| req.origin == origin));
+        let questions: Vec<String> = requests.into_iter().map(|req| req.question).collect();
         assert_eq!(
             questions,
             vec![
@@ -3253,7 +3271,9 @@ last_run:
         let prompter =
             ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), PromptAnswer::Cancelled]);
 
-        let err = session.exit(&sessions_dir, true, &prompter).unwrap_err();
+        let err = session
+            .exit(&sessions_dir, true, &prompter, Origin::detached())
+            .unwrap_err();
 
         assert_eq!(err.to_string(), "Operation was canceled by the user");
         assert!(std::fs::read_dir(&sessions_dir).unwrap().next().is_none());

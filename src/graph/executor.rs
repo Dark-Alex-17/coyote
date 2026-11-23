@@ -1,6 +1,8 @@
 use super::agent::{AgentExecutionOutcome, AgentNodeExecutor};
 use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
-use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed, node_type_label};
+use super::logging::{
+    GraphLogger, narrate_node_complete, narrate_node_failed, node_type_label, route_suffix,
+};
 use super::map::MapNodeExecutor;
 use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
@@ -92,6 +94,7 @@ impl GraphExecutor {
             self.graph.settings.log_state_snapshots,
             is_nested,
             Arc::clone(&ctx.ui),
+            Origin::from(&*ctx),
         );
         let result = self.run(&mut logger, ctx, abort_signal).await;
         if let Err(e) = &result {
@@ -321,6 +324,7 @@ impl GraphExecutor {
                             Duration::default(),
                             "aborted",
                             in_super_step,
+                            &node_hooks.origin,
                         );
                         node_hooks.failed(Duration::default(), "aborted");
                         return (
@@ -356,9 +360,9 @@ impl GraphExecutor {
                                 silent,
                                 &node,
                                 elapsed,
-                                route.as_deref(),
-                                false,
+                                &route_suffix(route.as_deref(), false),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.completed(elapsed, route.as_deref());
                         }
@@ -368,9 +372,9 @@ impl GraphExecutor {
                                 silent,
                                 &node,
                                 elapsed,
-                                Some(target),
-                                true,
+                                &route_suffix(Some(target), true),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.completed(elapsed, Some(target));
                         }
@@ -380,9 +384,9 @@ impl GraphExecutor {
                                 silent,
                                 &node,
                                 elapsed,
-                                Some("END"),
-                                false,
+                                &route_suffix(Some("END"), false),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.completed(elapsed, Some("END"));
                         }
@@ -394,6 +398,7 @@ impl GraphExecutor {
                                 elapsed,
                                 &e.to_string(),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.failed(elapsed, &e.to_string());
                         }

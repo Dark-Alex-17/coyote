@@ -17,7 +17,8 @@ pub struct Origin {
 }
 
 impl Origin {
-    /// An origin for publishers that have no request context (snapshot emitters).
+    /// An origin for publishers that run with no request context at all,
+    /// such as the command-line login flows.
     pub fn detached() -> Self {
         Self {
             agent_id: None,
@@ -149,7 +150,10 @@ pub enum Event {
         route: Option<String>,
         error: Option<String>,
     },
-    TextDelta(String),
+    TextDelta {
+        text: String,
+        origin: Origin,
+    },
     /// The model's thinking phase began / ended. Each carries the
     /// publishing turn's origin; the UI keeps only the root's.
     ThinkingStarted {
@@ -162,10 +166,12 @@ pub enum Event {
     AssistantText {
         text: String,
         markdown: bool,
+        origin: Origin,
     },
     Notice {
         kind: NoticeKind,
         text: String,
+        origin: Origin,
     },
     ToolOutputChunk {
         call_id: String,
@@ -175,6 +181,7 @@ pub enum Event {
     },
     UsageUpdated {
         right_prompt: String,
+        origin: Origin,
     },
     ChildTranscriptFlushed {
         session_id: String,
@@ -189,6 +196,7 @@ pub enum Event {
     },
     JobCancelled {
         job_id: String,
+        origin: Origin,
     },
     TodoUpdated {
         items: Vec<TodoItem>,

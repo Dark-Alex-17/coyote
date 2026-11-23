@@ -705,7 +705,7 @@ pub async fn call_chat_completions(
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
                 }
                 if print {
-                    emit_assistant_text(ui.as_ref(), &ctx.app.config, &text)?;
+                    emit_assistant_text(ui.as_ref(), &ctx.app.config, &text, Origin::from(&*ctx))?;
                 }
             }
             ctx.record_token_usage(usage, client.model());
@@ -742,10 +742,17 @@ pub enum StreamTarget {
 /// Republishes each text delta on the event bus and hands the event on to
 /// `out`. Stops on `Done`, when the handler drops its sender, or when the
 /// consumer behind `out` has gone away (a sink that aborted is not an error).
-async fn forward_deltas(mut rx: UnboundedReceiver<SseEvent>, out: UnboundedSender<SseEvent>) {
+async fn forward_deltas(
+    mut rx: UnboundedReceiver<SseEvent>,
+    out: UnboundedSender<SseEvent>,
+    origin: Origin,
+) {
     while let Some(ev) = rx.recv().await {
         if let SseEvent::Text(t) = &ev {
-            bus().publish(Event::TextDelta(t.clone()));
+            bus().publish(Event::TextDelta {
+                text: t.clone(),
+                origin: origin.clone(),
+            });
         }
         let done = matches!(ev, SseEvent::Done);
         if out.send(ev).is_err() || done {
@@ -763,7 +770,8 @@ pub async fn call_chat_completions_streaming_to(
 ) -> Result<(String, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
-    handler.set_origin(Origin::from(&*ctx));
+    let origin = Origin::from(&*ctx);
+    handler.set_origin(origin.clone());
     let silent = ctx.render_mode == RenderMode::Silent;
     if silent {
         handler.set_silent(true);
@@ -789,7 +797,7 @@ pub async fn call_chat_completions_streaming_to(
             let (sink_tx, sink_rx) = unbounded_channel();
             let (send_ret, (), render_ret) = tokio::join!(
                 client.chat_completions_streaming(input, &mut handler),
-                forward_deltas(rx, sink_tx),
+                forward_deltas(rx, sink_tx, origin.clone()),
                 ui.stream(client.app_config(), sink_rx, abort_signal.clone()),
             );
             (send_ret, render_ret)
@@ -843,6 +851,7 @@ pub async fn call_chat_completions_streaming_to(
                     ui.as_ref(),
                     NoticeKind::Interrupted,
                     error_text("Response interrupted"),
+                    origin,
                 );
             }
 
@@ -855,6 +864,7 @@ pub async fn call_chat_completions_streaming_to(
                 ui.as_ref(),
                 NoticeKind::Interrupted,
                 error_text("Response interrupted"),
+                origin,
             );
         }
 
@@ -2044,7 +2054,7 @@ mod tests {
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::TextDelta(text) if text.starts_with("chunk") => Some(text),
+                Event::TextDelta { text, .. } if text.starts_with("chunk") => Some(text),
                 _ => None,
             })
             .collect();
@@ -2259,7 +2269,7 @@ mod tests {
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::TextDelta(text) if text.starts_with("chunk") => Some(text),
+                Event::TextDelta { text, .. } if text.starts_with("chunk") => Some(text),
                 _ => None,
             })
             .collect();
@@ -2419,6 +2429,7 @@ mod tests {
         expected.push(Event::AssistantText {
             text: "<think>\nhmm\n</think>\n\nanswer!".to_string(),
             markdown: true,
+            origin: Origin::from(&ctx),
         });
         assert_eq!(recorded, expected);
     }
@@ -2478,6 +2489,7 @@ mod tests {
             vec![Event::AssistantText {
                 text: paced_text(),
                 markdown: true,
+                origin: Origin::from(&ctx),
             }]
         );
     }

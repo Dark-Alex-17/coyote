@@ -12,7 +12,7 @@ pub use stdout::StdoutSink;
 
 use crate::client::SseEvent;
 use crate::config::AppConfig;
-use crate::events::{Event, NoticeKind, OutputStream};
+use crate::events::{Event, NoticeKind, Origin, OutputStream};
 use crate::utils::AbortSignal;
 use anyhow::Result;
 use serde_json::Value;
@@ -64,17 +64,23 @@ impl Drop for BusyGuard<'_> {
 
 /// Renders a notice on the sink and publishes it, so a sink stays a renderer
 /// and the bus stays the observer.
-pub(crate) fn emit_notice(ui: &dyn UiSink, kind: NoticeKind, text: String) {
+pub(crate) fn emit_notice(ui: &dyn UiSink, kind: NoticeKind, text: String, origin: Origin) {
     ui.notice(kind, &text);
-    crate::events::bus().publish(Event::Notice { kind, text });
+    crate::events::bus().publish(Event::Notice { kind, text, origin });
 }
 
 /// Renders a round's final text on the sink and publishes it as markdown.
-pub(crate) fn emit_assistant_text(ui: &dyn UiSink, app: &AppConfig, text: &str) -> Result<()> {
+pub(crate) fn emit_assistant_text(
+    ui: &dyn UiSink,
+    app: &AppConfig,
+    text: &str,
+    origin: Origin,
+) -> Result<()> {
     ui.assistant_text(app, text)?;
     crate::events::bus().publish(Event::AssistantText {
         text: text.to_string(),
         markdown: true,
+        origin,
     });
     Ok(())
 }

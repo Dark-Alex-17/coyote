@@ -1,6 +1,6 @@
 use super::state::StateManager;
 use super::types::{Node, NodeType};
-use crate::events::NoticeKind;
+use crate::events::{NoticeKind, Origin};
 use crate::turn::{UiSink, emit_notice};
 use crate::utils::dimmed_text;
 use chrono::Local;
@@ -44,6 +44,7 @@ pub struct GraphLogger {
     log_state_snapshots: bool,
     silent: bool,
     ui: Arc<dyn UiSink>,
+    origin: Origin,
     timings: IndexMap<String, NodeTiming>,
 }
 
@@ -53,12 +54,14 @@ impl GraphLogger {
         log_state_snapshots: bool,
         silent: bool,
         ui: Arc<dyn UiSink>,
+        origin: Origin,
     ) -> Self {
         Self {
             graph_name: graph_name.to_string(),
             log_state_snapshots,
             silent,
             ui,
+            origin,
             timings: IndexMap::new(),
         }
     }
@@ -76,6 +79,7 @@ impl GraphLogger {
                     "▸ graph: {} (start: {start_node})",
                     self.graph_name
                 )),
+                self.origin.clone(),
             );
         }
     }
@@ -90,6 +94,7 @@ impl GraphLogger {
                 self.ui.as_ref(),
                 NoticeKind::GraphNode,
                 dimmed_text(&format!("▸ graph done in {:.2}s", elapsed.as_secs_f64())),
+                self.origin.clone(),
             );
         }
         self.log_performance_summary();
@@ -111,7 +116,13 @@ impl GraphLogger {
     }
 
     pub fn node_start(&self, node: &Node, in_super_step: bool) {
-        narrate_node_start(self.ui.as_ref(), self.silent, node, in_super_step);
+        narrate_node_start(
+            self.ui.as_ref(),
+            self.silent,
+            node,
+            in_super_step,
+            &self.origin,
+        );
     }
 
     pub fn super_step_start(&self, branches: &[String]) {
@@ -126,6 +137,7 @@ impl GraphLogger {
                 ts(),
                 branches.join(", ")
             )),
+            self.origin.clone(),
         );
     }
 
@@ -142,6 +154,7 @@ impl GraphLogger {
             self.ui.as_ref(),
             NoticeKind::GraphNode,
             dimmed_text(&format!("▸ {} super-step end{route}", ts())),
+            self.origin.clone(),
         );
     }
 
@@ -209,7 +222,13 @@ impl GraphLogger {
     }
 }
 
-pub fn narrate_node_start(ui: &dyn UiSink, silent: bool, node: &Node, in_super_step: bool) {
+pub fn narrate_node_start(
+    ui: &dyn UiSink,
+    silent: bool,
+    node: &Node,
+    in_super_step: bool,
+    origin: &Origin,
+) {
     if silent {
         return;
     }
@@ -219,6 +238,7 @@ pub fn narrate_node_start(ui: &dyn UiSink, silent: bool, node: &Node, in_super_s
         ui,
         NoticeKind::GraphNode,
         dimmed_text(&format!("▸ {} {indent}{} ({label}) start", ts(), node.id)),
+        origin.clone(),
     );
 }
 
@@ -236,14 +256,15 @@ pub(super) fn route_suffix(next_target: Option<&str>, fell_back: bool) -> String
     }
 }
 
+/// `route` is the completion line's tail as built by `route_suffix`.
 pub fn narrate_node_complete(
     ui: &dyn UiSink,
     silent: bool,
     node: &Node,
     elapsed: Duration,
-    next_target: Option<&str>,
-    fell_back: bool,
+    route: &str,
     in_super_step: bool,
+    origin: &Origin,
 ) {
     if silent {
         return;
@@ -251,7 +272,6 @@ pub fn narrate_node_complete(
     let indent = if in_super_step { "  " } else { "" };
     let label = node_type_label(node);
     let dur = fmt_secs(elapsed);
-    let route = route_suffix(next_target, fell_back);
     emit_notice(
         ui,
         NoticeKind::GraphNode,
@@ -260,6 +280,7 @@ pub fn narrate_node_complete(
             ts(),
             node.id
         )),
+        origin.clone(),
     );
 }
 
@@ -270,6 +291,7 @@ pub fn narrate_node_failed(
     elapsed: Duration,
     err: &str,
     in_super_step: bool,
+    origin: &Origin,
 ) {
     if silent {
         return;
@@ -286,6 +308,7 @@ pub fn narrate_node_failed(
             ts(),
             node.id
         )),
+        origin.clone(),
     );
 }
 
@@ -331,9 +354,9 @@ mod tests {
             false,
             &node,
             Duration::from_millis(5),
-            None,
+            "",
             false,
-            false,
+            &Origin::detached(),
         );
         let notices = probe.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -347,17 +370,22 @@ mod tests {
             true,
             &node,
             Duration::from_millis(5),
-            None,
+            "",
             false,
-            false,
+            &Origin::detached(),
         );
         assert!(silent.notices().is_empty());
     }
 
     #[test]
     #[serial]
-    fn node_complete_narration_is_published_as_a_graph_node_notice() {
+    fn node_complete_narration_is_published_as_a_graph_node_notice_with_its_origin() {
         let node = end_node("probe-node-bus-x7x");
+        let origin = Origin {
+            agent_id: Some("child".to_string()),
+            depth: 1,
+            node: Some("probe-node-bus-x7x".to_string()),
+        };
         let sink = RecordingSink::install();
 
         narrate_node_complete(
@@ -365,9 +393,9 @@ mod tests {
             false,
             &node,
             Duration::from_millis(5),
-            None,
+            "",
             false,
-            false,
+            &origin,
         );
 
         let recorded: Vec<Event> = sink
@@ -382,15 +410,21 @@ mod tests {
             &recorded[0],
             Event::Notice {
                 kind: NoticeKind::GraphNode,
+                origin: published,
                 ..
-            }
+            } if *published == origin
         ));
     }
 
     #[test]
     fn records_and_aggregates_node_timings() {
-        let mut logger =
-            GraphLogger::with_visibility("g", false, false, Arc::new(crate::turn::SilentSink));
+        let mut logger = GraphLogger::with_visibility(
+            "g",
+            false,
+            false,
+            Arc::new(crate::turn::SilentSink),
+            Origin::detached(),
+        );
         logger.record_timing("a", Duration::from_millis(100));
         logger.record_timing("a", Duration::from_millis(300));
         logger.record_timing("b", Duration::from_millis(50));
@@ -420,8 +454,13 @@ mod tests {
 
     #[test]
     fn new_logger_has_no_timings() {
-        let logger =
-            GraphLogger::with_visibility("g", true, false, Arc::new(crate::turn::SilentSink));
+        let logger = GraphLogger::with_visibility(
+            "g",
+            true,
+            false,
+            Arc::new(crate::turn::SilentSink),
+            Origin::detached(),
+        );
 
         assert!(logger.timings.is_empty());
         assert!(logger.log_state_snapshots);

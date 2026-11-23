@@ -6,7 +6,7 @@ use super::{
 };
 use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
-use crate::events::NoticeKind;
+use crate::events::{NoticeKind, Origin};
 use crate::turn::emit_notice;
 use crate::utils::{AbortSignal, render_image_slots, strip_image_slots};
 use anyhow::{Context, Result, anyhow, bail};
@@ -243,6 +243,7 @@ pub async fn run_graph_turn(
         ctx.ui.as_ref(),
         NoticeKind::Routing,
         route::routing_line(branch),
+        Origin::from(&*ctx),
     );
     match branch {
         Branch::Run => {

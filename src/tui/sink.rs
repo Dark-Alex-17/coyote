@@ -315,7 +315,7 @@ impl EventSink for TuiSink {
             Event::ThinkingStopped { origin } if is_root(origin) => {
                 self.send(UiMsg::ThinkingStopped)
             }
-            Event::UsageUpdated { right_prompt } => {
+            Event::UsageUpdated { right_prompt, .. } => {
                 self.send(UiMsg::UsageUpdated(right_prompt.clone()))
             }
             Event::ToolStarted {
@@ -450,8 +450,8 @@ impl EventSink for TuiSink {
                 job_id: plain(job_id),
                 tool: plain(tool),
             }),
-            // A job's end is published from its own task with a detached
-            // origin; the id says which row it belongs to.
+            // A job's end and cancel are matched by id from any origin: a
+            // job a child started can still end on a row the root shows.
             Event::JobFinished {
                 job_id, ok, error, ..
             } => self.send(UiMsg::JobFinished {
@@ -459,7 +459,7 @@ impl EventSink for TuiSink {
                 ok: *ok,
                 error: plain_opt(error),
             }),
-            Event::JobCancelled { job_id } => self.send(UiMsg::JobCancelled {
+            Event::JobCancelled { job_id, .. } => self.send(UiMsg::JobCancelled {
                 job_id: job_id.clone(),
             }),
             // `agent.started` is fired with the child's own context, so a
@@ -606,9 +606,9 @@ mod tests {
         }
     }
 
-    fn job_finished(job_id: &str, error: Option<&str>) -> Event {
+    fn job_finished(job_id: &str, error: Option<&str>, origin: Origin) -> Event {
         Event::JobFinished {
-            origin: Origin::detached(),
+            origin,
             job_id: job_id.to_string(),
             tool: String::new(),
             ok: error.is_none(),
@@ -616,9 +616,9 @@ mod tests {
         }
     }
 
-    fn agent_finished(agent_id: &str, outcome: AgentOutcome) -> Event {
+    fn agent_finished(agent_id: &str, outcome: AgentOutcome, origin: Origin) -> Event {
         Event::AgentFinished {
-            origin: Origin::detached(),
+            origin,
             agent_id: agent_id.to_string(),
             name: None,
             session_id: None,
@@ -824,29 +824,35 @@ mod tests {
         ));
     }
 
-    /// A job starts under the root but ends from its own task with a
-    /// detached origin; both reach the transcript, and so does a cancel.
+    /// A job's start reaches the transcript only from the root; its end
+    /// and a cancel reach it whatever their origin.
     #[test]
     fn job_hooks_and_cancellation_reach_the_transcript() {
         let (sink, mut rx) = sink();
+        let child = Origin {
+            agent_id: Some("agent_1".to_string()),
+            depth: 1,
+            node: None,
+        };
         sink.on_event(&Event::JobStarted {
             origin: Origin::detached(),
             job_id: "job_1a2b".to_string(),
             tool: "execute_command".to_string(),
         });
         sink.on_event(&Event::JobStarted {
-            origin: Origin {
-                agent_id: Some("agent_1".to_string()),
-                depth: 1,
-                node: None,
-            },
+            origin: child.clone(),
             job_id: "job_child".to_string(),
             tool: String::new(),
         });
-        sink.on_event(&job_finished("job_1a2b", Some("exit 1")));
-        sink.on_event(&job_finished("job_3c4d", None));
+        sink.on_event(&job_finished(
+            "job_1a2b",
+            Some("exit 1"),
+            Origin::detached(),
+        ));
+        sink.on_event(&job_finished("job_3c4d", None, child.clone()));
         sink.on_event(&Event::JobCancelled {
             job_id: "job_5e6f".to_string(),
+            origin: child,
         });
         let msgs = drain(&mut rx);
         assert!(matches!(
@@ -868,7 +874,7 @@ mod tests {
 
     /// `agent.started` fires with the child's context, so the root's
     /// direct children arrive at depth one and deeper ones are dropped;
-    /// an agent's end comes detached and is matched by id.
+    /// an agent's end is matched by id whatever its depth.
     #[test]
     fn agent_hooks_reach_the_transcript_for_direct_children() {
         let (sink, mut rx) = sink();
@@ -890,9 +896,18 @@ mod tests {
         sink.on_event(&agent_finished(
             "agent_coder_1a2b",
             AgentOutcome::Failed("boom".to_string()),
+            child(1),
         ));
-        sink.on_event(&agent_finished("agent_b", AgentOutcome::Interrupted));
-        sink.on_event(&agent_finished("agent_c", AgentOutcome::Completed));
+        sink.on_event(&agent_finished(
+            "agent_b",
+            AgentOutcome::Interrupted,
+            child(2),
+        ));
+        sink.on_event(&agent_finished(
+            "agent_c",
+            AgentOutcome::Completed,
+            Origin::detached(),
+        ));
         let msgs = drain(&mut rx);
         assert!(matches!(
             &msgs[0],

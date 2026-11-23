@@ -234,13 +234,14 @@ pub struct ResolvedHook {
     pub cwd: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RagSyncHooks {
     started: Vec<ResolvedHook>,
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_name: Option<String>,
+    origin: Origin,
 }
 
 impl RagSyncHooks {
@@ -254,9 +255,12 @@ impl RagSyncHooks {
                 .as_ref()
                 .map(|session| session.name().to_string()),
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+            origin: Origin::from(ctx),
         }
     }
 
+    /// Resolved while an agent loads, before any context holds it, so its
+    /// events carry no origin.
     pub fn resolve_for_agent(
         global_hooks: &HooksMap,
         gate: &[String],
@@ -278,6 +282,7 @@ impl RagSyncHooks {
             failed: resolve(HookEvent::RagSyncFailed),
             session_name: None,
             agent_name: Some(agent_name.to_string()),
+            origin: Origin::detached(),
         }
     }
 
@@ -329,7 +334,7 @@ impl RagSyncHooks {
             ("COYOTE_RAG_PATH", rag_path.to_string()),
         ];
         envs.extend(extras.iter().map(|(key, value)| (*key, value.clone())));
-        publish_hook_event(event, &base_envs, &envs, None, Origin::detached());
+        publish_hook_event(event, &base_envs, &envs, None, self.origin.clone());
         if resolved.is_empty() {
             return;
         }
@@ -337,12 +342,13 @@ impl RagSyncHooks {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct McpServerHooks {
     connected: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_name: Option<String>,
+    origin: Origin,
 }
 
 impl McpServerHooks {
@@ -355,6 +361,7 @@ impl McpServerHooks {
                 .as_ref()
                 .map(|session| session.name().to_string()),
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+            origin: Origin::from(ctx),
         }
     }
 
@@ -387,7 +394,7 @@ impl McpServerHooks {
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
-        publish_hook_event(event, &base_envs, extras, None, Origin::detached());
+        publish_hook_event(event, &base_envs, extras, None, self.origin.clone());
         if resolved.is_empty() {
             return;
         }
@@ -3006,7 +3013,9 @@ mod tests {
     fn rag_sync_fire_completed_publishes_bus_twin_without_resolved_hooks() {
         let _guard = test_sink::install();
         let sink = crate::events::RecordingSink::install();
-        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let mut ctx = ctx_with_global_hooks(IndexMap::new());
+        ctx.self_agent_id = Some("rag-origin-x7x".into());
+        ctx.current_depth = 1;
         let rag_name = "rag-bus-probe-x7x";
 
         RagSyncHooks::resolve(&ctx).fire_completed(rag_name, "/tmp/rag", 3);
@@ -3023,7 +3032,7 @@ mod tests {
             panic!("expected Event::Hook, got {:?}", published[0]);
         };
         assert_eq!(*event, HookEvent::RagSyncCompleted);
-        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*origin, Origin::from(&ctx));
         assert_eq!(*payload, None);
         assert!(envs.contains(&("COYOTE_RAG_PATH".to_string(), "/tmp/rag".to_string())));
         assert!(envs.contains(&("COYOTE_RAG_DOC_COUNT".to_string(), "3".to_string())));
@@ -3040,7 +3049,9 @@ mod tests {
     fn mcp_server_fire_connected_publishes_bus_twin_without_resolved_hooks() {
         let _guard = test_sink::install();
         let sink = crate::events::RecordingSink::install();
-        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let mut ctx = ctx_with_global_hooks(IndexMap::new());
+        ctx.self_agent_id = Some("mcp-origin-x7x".into());
+        ctx.current_depth = 1;
         let server = "mcp-bus-probe-x7x";
 
         McpServerHooks::resolve(&ctx).fire_connected(server, "stdio", true);
@@ -3057,7 +3068,7 @@ mod tests {
             panic!("expected Event::Hook, got {:?}", published[0]);
         };
         assert_eq!(*event, HookEvent::McpServerConnected);
-        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*origin, Origin::from(&ctx));
         assert_eq!(*payload, None);
         assert!(envs.contains(&("COYOTE_MCP_TRANSPORT".to_string(), "stdio".to_string())));
         assert!(envs.contains(&("COYOTE_MCP_RECONNECT".to_string(), "true".to_string())));

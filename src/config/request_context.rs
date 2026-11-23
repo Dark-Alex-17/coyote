@@ -1777,6 +1777,7 @@ impl RequestContext {
                 &sessions_dir,
                 self.working_mode.is_repl(),
                 self.prompter.as_ref(),
+                Origin::from(&*self),
             )
         });
         if taken.is_some() {
@@ -3643,7 +3644,10 @@ impl RequestContext {
         // it back) would otherwise overwrite the user's totals with its own.
         if self.self_agent_id.is_none() && self.persists_session {
             let right_prompt = self.render_prompt_right(&self.app.config);
-            events::bus().publish(Event::UsageUpdated { right_prompt });
+            events::bus().publish(Event::UsageUpdated {
+                right_prompt,
+                origin: Origin::from(&*self),
+            });
         }
     }
 
@@ -8928,7 +8932,7 @@ mod tests {
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::UsageUpdated { right_prompt }
+                Event::UsageUpdated { right_prompt, .. }
                     if right_prompt.contains("usage-probe-x7x") =>
                 {
                     Some(right_prompt)
@@ -8959,7 +8963,7 @@ mod tests {
         let published = recording.drain().into_iter().any(|event| {
             matches!(
                 event,
-                Event::UsageUpdated { right_prompt } if right_prompt.contains("usage-probe-x7x")
+                Event::UsageUpdated { right_prompt, .. } if right_prompt.contains("usage-probe-x7x")
             )
         });
         assert!(!published);
@@ -8986,7 +8990,7 @@ mod tests {
         let published = recording.drain().into_iter().any(|event| {
             matches!(
                 event,
-                Event::UsageUpdated { right_prompt } if right_prompt.contains("usage-probe-x7x")
+                Event::UsageUpdated { right_prompt, .. } if right_prompt.contains("usage-probe-x7x")
             )
         });
         assert!(!published);
@@ -12009,6 +12013,34 @@ mod tests {
         assert!(ctx.session.is_some());
         ctx.exit_session().unwrap();
         assert!(ctx.session.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_asks_to_save_with_the_context_origin() {
+        let mut ctx = create_test_ctx();
+        ctx.working_mode = WorkingMode::Repl;
+        ctx.self_agent_id = Some("exit-origin-x7x".into());
+        ctx.current_depth = 1;
+        let mut session = Session::default();
+        session.set_save_session(None);
+        session.mark_dirty();
+        ctx.session = Some(session);
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        let recording = crate::events::RecordingSink::install();
+
+        ctx.exit_session().unwrap();
+
+        let (requested, _) = prompt_events(recording.drain(), "Save session?");
+        let origins: Vec<Origin> = requested
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PromptRequested { origin, .. } => Some(origin),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(origins, vec![Origin::from(&ctx)]);
+        assert_eq!(origins[0].agent_id.as_deref(), Some("exit-origin-x7x"));
     }
 
     #[test]

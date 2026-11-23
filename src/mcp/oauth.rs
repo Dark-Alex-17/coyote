@@ -122,6 +122,7 @@ pub async fn run_mcp_oauth_flow(
     callback_port: Option<u16>,
     redirect_host: Option<&str>,
     prompter: &dyn Prompter,
+    origin: &Origin,
 ) -> Result<()> {
     // Checked before discovery so a headless run never reaches the point
     // where a prompter's placeholder answer could be persisted as a client_id.
@@ -187,11 +188,11 @@ pub async fn run_mcp_oauth_flow(
                 Ok(id) => id,
                 Err(e) => {
                     warn!("Dynamic client registration failed: {e}. Falling back to manual entry.");
-                    ask_client_id(prompter, server_name)?
+                    ask_client_id(prompter, server_name, origin)?
                 }
             }
         } else {
-            ask_client_id(prompter, server_name)?
+            ask_client_id(prompter, server_name, origin)?
         };
         // Persist regardless of how the client_id was obtained (DCR, config,
         // or manual entry) so refresh_mcp_token can run the refresh_token
@@ -217,10 +218,10 @@ pub async fn run_mcp_oauth_flow(
         resource,
     };
 
-    run_oauth_flow(&provider, &mcp_token_key(server_name), prompter).await
+    run_oauth_flow(&provider, &mcp_token_key(server_name), prompter, origin).await
 }
 
-fn ask_client_id(prompter: &dyn Prompter, server_name: &str) -> Result<String> {
+fn ask_client_id(prompter: &dyn Prompter, server_name: &str, origin: &Origin) -> Result<String> {
     // Refused before any widget exists, with the flow's own message rather
     // than the prompter's typed refusal, so a headless run reads the same
     // error whichever step it stops at; `ask_client_id_bails_without_a_human_before_asking`
@@ -239,7 +240,7 @@ fn ask_client_id(prompter: &dyn Prompter, server_name: &str) -> Result<String> {
         ..PromptRequest::new(
             PromptAction::Input,
             "Enter the OAuth client ID for this MCP server:",
-            Origin::detached(),
+            origin.clone(),
         )
     };
     ask(prompter, req)
@@ -737,13 +738,19 @@ mod tests {
     fn ask_client_id_round_trips_an_input_prompt() {
         let _tty = prompt_script::install(&[]);
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("cid-7q".to_string())]);
+        let origin = Origin {
+            agent_id: Some("client-id-origin-x7x".to_string()),
+            depth: 1,
+            node: None,
+        };
 
-        let client_id = ask_client_id(&prompter, "srv-7q").unwrap();
+        let client_id = ask_client_id(&prompter, "srv-7q", &origin).unwrap();
 
         assert_eq!(client_id, "cid-7q");
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].action, PromptAction::Input);
+        assert_eq!(requests[0].origin, origin);
         assert_eq!(
             requests[0].question,
             "Enter the OAuth client ID for this MCP server:"
@@ -757,7 +764,7 @@ mod tests {
         let sink = RecordingSink::install();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("cid-6w3z".to_string())]);
 
-        let client_id = ask_client_id(&prompter, "srv-6w3z").unwrap();
+        let client_id = ask_client_id(&prompter, "srv-6w3z", &Origin::detached()).unwrap();
 
         assert_eq!(client_id, "cid-6w3z");
         let events = sink.drain();
@@ -780,7 +787,7 @@ mod tests {
         let _tty = prompt_script::install(&[]);
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
 
-        let err = ask_client_id(&prompter, "srv-7q").unwrap_err();
+        let err = ask_client_id(&prompter, "srv-7q", &Origin::detached()).unwrap_err();
 
         assert_eq!(err.to_string(), "Failed to read client ID");
         assert_eq!(
@@ -795,7 +802,7 @@ mod tests {
         let _headless = AtomicFlagGuard::set(&HEADLESS, true);
         let prompter = ScriptedPrompter::refusing();
 
-        let err = ask_client_id(&prompter, "srv-7q").unwrap_err();
+        let err = ask_client_id(&prompter, "srv-7q", &Origin::detached()).unwrap_err();
 
         assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
         assert!(prompter.requests().is_empty());
@@ -809,7 +816,7 @@ mod tests {
         let _no_tty = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
 
-        let err = ask_client_id(&prompter, "srv-7q").unwrap_err();
+        let err = ask_client_id(&prompter, "srv-7q", &Origin::detached()).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -833,6 +840,7 @@ mod tests {
             None,
             None,
             &prompter,
+            &Origin::detached(),
         )
         .await
         .unwrap_err();
@@ -858,6 +866,7 @@ mod tests {
             None,
             None,
             &prompter,
+            &Origin::detached(),
         )
         .await
         .unwrap_err();
