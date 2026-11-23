@@ -1863,7 +1863,8 @@ def verify_gate(state):
     tasks = as_list(state.get("tasks"))
     scope = state.get("verify_scope") or "task"
     code = state.get("code_repo_path", "")
-    rdir = state.get("delegate_project_dir") or code
+    # A batch is reviewed on the run branch; the last delegation's worktree may already be removed.
+    rdir = code if scope == "batch" else (state.get("delegate_project_dir") or code)
     task = task_by_id(tasks, state.get("current_task")) or {}
     head = git_out(rdir, "rev-parse", "HEAD", default=task.get("head_sha", ""))
     unit = state.get("current_batch") if scope == "batch" else task.get("id", "run")

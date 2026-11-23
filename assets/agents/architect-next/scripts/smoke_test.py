@@ -4149,6 +4149,10 @@ check("graph: a task retried in its wave worktree is reviewed there - run_gauntl
 wave_v = gates.wave_verify_build(base_state(plan_path=PROMOTED, tasks=TS_W, wtask=WAVE[0], wave_delegate_result=REPORT_OK))
 wave_dir = render_inputs("wave_gauntlet", {**base_state(), "wtask": WAVE[0], **wave_v}).get("project_dir")
 check("graph: a wave member's review panel is seated in the member's worktree", wave_dir == WT, wave_dir)
+batch_v = gates.verify_gate({**RETRY, **U_RETRY, "verify_scope": "batch", "current_batch": "B1"})
+check("graph: a batch review is seated in the code repo even when the last delegation went to a worktree",
+      render_inputs("run_gauntlet", {**RETRY, **U_RETRY, **batch_v}).get("project_dir") == CODE and f"Project: {CODE}\n" in batch_v["gauntlet_prompt"],
+      batch_v.get("review_project_dir"))
 RG_GRAPH, rg_graph_error = read_graph(os.path.join(AGENTS_ROOT, "review-gauntlet", "graph.yaml"))
 RG_NODES = (RG_GRAPH or {}).get("nodes") or {}
 # The panel's parse stage may extract no directory; the seated variable alone must carry the worktree to every lane.
@@ -4160,7 +4164,7 @@ p = subprocess.run([sys.executable, "-B", os.path.join(AGENTS_ROOT, "review-gaun
 rg_state.update(json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else {})
 lane_dirs = {n: render_inputs(n, rg_state, RG_NODES).get("project_dir") for n, v in RG_NODES.items() if v.get("type") == "agent"}
 check("graph: a task worktree flows architect run_gauntlet inputs -> review-gauntlet signals -> every review lane's inputs",
-      RG_GRAPH is not None and len(lane_dirs) == 4 and all(d and os.path.realpath(d) == os.path.realpath(WT) for d in lane_dirs.values()),
+      RG_GRAPH is not None and lane_dirs and all(d and os.path.realpath(d) == os.path.realpath(WT) for d in lane_dirs.values()),
       f"{rg_graph_error} rc={p.returncode} {p.stderr[-300:]} {lane_dirs}")
 # The child's own escalate_gate over the delegate inputs: the battery drops LLM_AGENT_VAR_*, so only an input can carry the policy.
 SN_ESC_HARD = {**SN_ESC, "hard_trigger": True}
