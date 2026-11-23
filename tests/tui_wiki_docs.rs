@@ -1005,25 +1005,37 @@ fn prompt_helpers_are_described_as_they_ship() {
 fn hooks_page_lists_the_call_id_on_every_tool_event() {
     let events = tool_events();
     assert_eq!(events.len(), 3, "{events:?}");
+    let typed_tool_events = ["Event::ToolStarted {", "Event::ToolFinished {"];
     let function = src(&["function", "mod.rs"]);
     let function = production(&function);
-    for (variant, name) in &events {
-        let fire = format!("HookEvent::{variant},\n");
-        let sites: Vec<usize> = function.match_indices(&fire).map(|(at, _)| at).collect();
-        assert!(!sites.is_empty(), "function/mod.rs fires {name}");
-        for at in sites {
-            let args = &function[at..at + function[at..].find("],").unwrap()];
-            assert!(
-                args.contains("(\"COYOTE_TOOL_CALL_ID\","),
-                "{name} carries COYOTE_TOOL_CALL_ID: {args}"
-            );
-        }
+    for typed in typed_tool_events {
+        assert!(function.contains(typed), "function/mod.rs emits {typed}");
     }
     let hooks = src(&["hooks.rs"]);
-    let fire = fn_body(&hooks, "pub fn fire(");
+    let spec = fn_body(&hooks, "fn hook_spec(");
+    for (variant, name) in &events {
+        assert!(
+            spec.contains(&format!("HookEvent::{variant}")),
+            "hook_spec maps a typed event to {name}"
+        );
+    }
+    for typed in typed_tool_events {
+        assert!(spec.contains(typed), "hook_spec maps {typed}");
+    }
+    assert_eq!(
+        spec.matches("tool_extras(").count(),
+        typed_tool_events.len(),
+        "every tool arm of hook_spec takes its env from tool_extras"
+    );
+    let tool_extras = fn_body(&hooks, "fn tool_extras(");
     assert!(
-        fire.find("publish_hook_event(").unwrap() < fire.find("if resolved.is_empty()").unwrap(),
-        "fire publishes before it looks for shell hooks"
+        tool_extras.contains("(\"COYOTE_TOOL_CALL_ID\","),
+        "{tool_extras}"
+    );
+    let dispatch = fn_body(&hooks, "fn dispatch(");
+    assert!(
+        dispatch.find("publish_hook_event(").unwrap() < dispatch.find("fire_resolved(").unwrap(),
+        "a typed event is published before its shell hooks run"
     );
 
     let Some(wiki) = wiki_dir() else { return };
