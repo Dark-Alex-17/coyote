@@ -487,8 +487,8 @@ records it in the autonomous digest and carries the reason into the round it sta
 that names no offered option or gives no reason gets one more ruling, then the run stops
 blocked with the question. Each kind and task is ruled on at most `STRIKE_LIMIT` (3) times.
 A one-more round on `integration_red`, `conformance_stuck`, `integration_conflict`,
-`batch_strikeout`, `ci_exhausted` (past the fix cap) or `gate2_stuck` picked with no reason
-stated goes to the judge for one when the headless default, the ladder or the navigator picked
+`batch_strikeout`, `ci_exhausted` (past the fix cap), `gate2_stuck` or `gate1_stuck` picked
+with no reason stated goes to the judge for one when the headless default, the ladder or the navigator picked
 it and the judge has rulings left for the question; any other bare pick runs as a plain round.
 Under `escalation_policy=autonomous` a decision goes to the ladder once and to the owner after
 that, keyed `<decision>|<task>|<phase>` (`_decision_key`: the decision is `data.decision`,

@@ -3753,8 +3753,10 @@ CAP_CASES = {
                      dict(pr_number="99", tasks=ts_f, ci_owning_task=T1, ci_fix_strikes={"99": {"test": STRIKE_LIMIT + 1}})),
     "gate2_stuck": (E_G2, g2_spent.get("escalation"), "Another fix round (state reason)", "gate2_stuck",
                     dict(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT + 1)),
+    "gate1_stuck": (E_G1_STUCK, g1_spent.get("escalation"), gates.GATE1_ANOTHER_ROUND, "gate1_stuck",
+                    dict(gate1_result=G1_STUCK, leak_fingerprints=[G1_FP, G1_FP])),
 }
-CAP_ROUND_NEXT = ("fix_round", "batch_fix_route", "amend_plan")
+CAP_ROUND_NEXT = ("fix_round", "batch_fix_route", "amend_plan", "answer_leaks")
 for name, (first, spent, more, key, ctx) in CAP_CASES.items():
     check(f"{name}: the continue option is first and recommended at the cap; after {STRIKE_LIMIT} continues none is, with the cap-spent note",
           _cap_offer(first) == (more, [more]) and _cap_offer(spent) == (more, [])
@@ -3790,9 +3792,10 @@ def ledgered(u, line):
 
 
 ONE_MORE_WHAT = {"integration_conflict": "rebase cycle", "integration_red": "fix round", "integration_red at Phase F": "fix round",
-                 "batch_strikeout": "batch round on B1", "ci_exhausted": "CI fix round", "gate2_stuck": "Gate 2 fix round"}
+                 "batch_strikeout": "batch round on B1", "ci_exhausted": "CI fix round", "gate2_stuck": "Gate 2 fix round",
+                 "gate1_stuck": "revise-and-re-seal round"}
 ONE_MORE_UNTOUCHED = ("cap_continues", "task_rounds", "final_integration_strikes", "batch_state", "ci_fix_strikes", "oracle_rejects",
-                      "amend_counts", "amend_cycles", "pending_amendments", "fix_request")
+                      "amend_counts", "amend_cycles", "pending_amendments", "fix_request", "leak_owner_reason")
 for name, what in ONE_MORE_WHAT.items():
     first, _, more, key, ctx = CAP_CASES[name]
     kind = first["kind"]
@@ -3811,7 +3814,7 @@ for name, what in ONE_MORE_WHAT.items():
     s.update(gates.interpret_route(s))
     source = s.get("answer_source")
     s.update(gates.apply_answer(s))
-    carried = repr((s.get("fix_request"), s.get("batch_state"), s.get("pending_amendments")))
+    carried = repr((s.get("fix_request"), s.get("batch_state"), s.get("pending_amendments"), s.get("leak_owner_reason")))
     check(f"headless judge: {name} one more with its reason -> the round runs carrying the reason, one continue counted",
           source == "judge" and s["_next"] in CAP_ROUND_NEXT and R82_JUDGE in carried
           and _lib.as_dict(s.get("cap_continues")).get(key) == 1, (source, s["_next"], s.get("cap_continues")))
@@ -3873,9 +3876,10 @@ check("apply_answer: ci_exhausted continue -> a coder fix round for the owning t
       cc_["ci_exhausted"]["_next"] == "fix_round" and fr_["ci_exhausted"].get("task") == T1 and fr_["ci_exhausted"].get("return_to") == "ci"
       and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
       (cc_["ci_exhausted"]["_next"], fr_["ci_exhausted"], cc_["ci_exhausted"].get("ci_fix_strikes")))
-# gate2_stuck asks again on such a reply; its own check sits with the other gate2_stuck rows
+# gate2_stuck asks again on such a reply and gate1_stuck takes it as the owner's answers; their own checks sit with
+# their other rows
 ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()
-        if n != "gate2_stuck"}
+        if n not in ("gate2_stuck", "gate1_stuck")}
 check("apply_answer: a reply that picks none of a cap's options goes to interpret_reply, never stopped",
       all(v["_next"] == "interpret_reply" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
       {n: v["_next"] for n, v in ask_.items()})

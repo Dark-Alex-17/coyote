@@ -4448,16 +4448,17 @@ def apply_answer(state):
             u["failure_reason"] = "stopped: Gate 1 LEAKY on the same questions after the A1 retry"
             u["_next"] = "end_blocked"
         elif _named_option(answer, gate1_options) == GATE1_ANOTHER_ROUND:
-            reason = _owner_reason(state, answer, gate1_options)
-            ledger(state, u, "gate1: another revise-and-re-seal round on the same questions"
-                             + (f": {trim_items(reason, 300)}" if reason else ""))
-            counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
-            counts["gate1"] = min(counts.get("gate1", 0), AMEND_GATE1_MAX - 1)
-            u["amend_counts"] = counts
-            u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
-            _count_continue(state, u, "gate1_stuck")
-            u["leak_owner_reason"] = reason
-            u["_next"] = "answer_leaks"
+            if not _one_more_to_judge(state, u, esc, answer, gate1_options, "revise-and-re-seal round"):
+                reason = _owner_reason(state, answer, gate1_options)
+                ledger(state, u, "gate1: another revise-and-re-seal round on the same questions"
+                                 + (f": {trim_items(reason, 300)}" if reason else ""))
+                counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
+                counts["gate1"] = min(counts.get("gate1", 0), AMEND_GATE1_MAX - 1)
+                u["amend_counts"] = counts
+                u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
+                _count_continue(state, u, "gate1_stuck")
+                u["leak_owner_reason"] = reason
+                u["_next"] = "answer_leaks"
         else:
             queue_amendments(u, "gate1", [f"Owner's answers to the gatekeeper's open questions:\n{answer}"])
             u["leak_fingerprints"] = []
