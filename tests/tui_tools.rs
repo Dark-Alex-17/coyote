@@ -3898,6 +3898,7 @@ mod binary {
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
+        pty.leave_keyboard_probe_unanswered();
 
         let probe = pty
             .wait_for_raw(b"\x1b[?u", 0, PTY_DEADLINE)

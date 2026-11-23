@@ -2,6 +2,7 @@ mod child_live;
 mod command_timing;
 mod control;
 mod image_paste;
+mod key_help;
 mod lend;
 mod modal;
 mod mouse_and_copy;
@@ -214,6 +215,14 @@ fn duplicated_adjacent_rows(rendered: &str) -> usize {
         .filter(|row| !row.trim_matches(['"', ' ']).is_empty())
         .collect();
     rows.windows(2).filter(|pair| pair[0] == pair[1]).count()
+}
+
+/// The buffer dump with its row quotes and all whitespace removed, so
+/// text wrapped over several rows can be matched as one run.
+fn squeezed(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && *c != '"')
+        .collect()
 }
 
 /// Snapshots a frame that shows the welcome block. The version on the

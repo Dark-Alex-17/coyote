@@ -36,6 +36,11 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
     - name: Cache DuckDB Extensions
       id: duckdb-extensions
       uses: actions/cache@v4
@@ -48,7 +53,7 @@ jobs:
       run: cargo test --all duckdb
 
     - name: Test
-      run: cargo test --all
+      run: cargo nextest run --all --profile ci
 
     - name: Clippy
       run: cargo clippy --all --all-targets -- -D warnings

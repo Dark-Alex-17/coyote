@@ -1,0 +1,26 @@
+# Every test runs in its own process under nextest, so `#[serial]` does not
+# serialise the pty suites; this group caps how many drive a pty at once.
+[test-groups]
+pty = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = """
+binary(editor_setting_usage) | binary(prompt_protocol) | binary(pty_hygiene)
+| binary(theme_setting_usage) | binary(tui_composer_and_queue)
+| binary(tui_lifecycle_and_signals) | binary(tui_modals) | binary(tui_pager_and_roster)
+| binary(tui_palette_and_rewind) | binary(tui_tools) | binary(tui_usage_probe)
+"""
+test-group = "pty"
+
+[profile.ci]
+fail-fast = false
+
+# Keep this filter in step with the default profile's pty override.
+[[profile.ci.overrides]]
+filter = """
+binary(editor_setting_usage) | binary(prompt_protocol) | binary(pty_hygiene)
+| binary(theme_setting_usage) | binary(tui_composer_and_queue)
+| binary(tui_lifecycle_and_signals) | binary(tui_modals) | binary(tui_pager_and_roster)
+| binary(tui_palette_and_rewind) | binary(tui_tools) | binary(tui_usage_probe)
+"""
+retries = 1

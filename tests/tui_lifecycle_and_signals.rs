@@ -280,9 +280,10 @@ mod binary_lifecycle {
          leave={leave_alt})"
         );
 
-        // The keyboard-enhancement probe is answered by nothing on a pty, so
-        // the flags may legitimately never be pushed; if they are, the push
-        // follows alt-screen entry and the pop precedes leaving it.
+        // The harness answers the keyboard-enhancement probe as a terminal
+        // without the protocol, so the flags are not expected here; if they
+        // are pushed, the push follows alt-screen entry and the pop precedes
+        // leaving it.
         assert!(
             find(raw, b"\x1b[?u", 0).is_some(),
             "the keyboard-enhancement support probe (CSI ? u) was never sent"
@@ -316,14 +317,15 @@ mod binary_lifecycle {
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
+        pty.leave_keyboard_probe_unanswered();
 
         let transcript = pty.wait_for("cpid=", PTY_DEADLINE).unwrap();
         let pid = child_pid(&transcript);
         // The probe opens with its query and then waits two seconds for a
-        // reply nobody here sends; the hang-up goes out as soon as the query
-        // is seen, before a loaded host can let the wait run out. The wait is
-        // crossterm's own fixed timeout inside the process, so no terminal on
-        // this side can hold it open for longer.
+        // reply this test never sends; the hang-up goes out as soon as the
+        // query is seen, before a loaded host can let the wait run out. The
+        // wait is crossterm's own fixed timeout inside the process, so no
+        // terminal on this side can hold it open for longer.
         pty.wait_for_raw(b"\x1b[?u\x1b[c", 0, PTY_DEADLINE).unwrap();
         // SAFETY: kill takes a pid and a signal number and touches no memory.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
@@ -2367,6 +2369,7 @@ mod suspend_and_signals {
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config_with(&dir, "");
         let mut pty = spawn_tui(&dir, &[]);
+        pty.leave_keyboard_probe_unanswered();
 
         let probe = pty
             .wait_for_raw(b"\x1b[?u", 0, PTY_DEADLINE)
@@ -2818,8 +2821,9 @@ mod cold_start {
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config_with(&dir, "");
         let mut pty = spawn_tui_bare(&dir);
-        // Shrink before the first frame: startup probes the keyboard for two
-        // seconds, so the resize lands well before anything is drawn.
+        // Shrink before the first frame: startup waits on the keyboard
+        // probe, which the harness answers only once the test reads, so the
+        // resize lands before anything is drawn.
         pty.resize(4, 20).unwrap();
 
         pty.wait_for_raw(ENTER_ALT, 0, PTY_DEADLINE)

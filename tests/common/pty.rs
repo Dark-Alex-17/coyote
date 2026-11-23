@@ -26,13 +26,27 @@ pub fn detached(cmd: &mut Command) -> &mut Command {
 }
 
 /// A child running with a pseudo-terminal as its controlling tty and as
-/// all three standard streams; the test holds the master side.
+/// all three standard streams; the test holds the master side. Like a
+/// terminal without the kitty keyboard protocol, it answers crossterm's
+/// keyboard-enhancement probe with device attributes alone, unless the
+/// test opts out.
 #[cfg(unix)]
 pub struct Pty {
     master: std::fs::File,
     child: std::process::Child,
     raw: Vec<u8>,
+    answers_keyboard_probe: bool,
+    keyboard_probe_answered: usize,
 }
+
+/// crossterm's keyboard-enhancement probe: the flags query, then a
+/// primary device-attributes query as the sentinel.
+#[cfg(unix)]
+const KEYBOARD_PROBE: &[u8] = b"\x1b[?u\x1b[c";
+/// A VT220-class terminal's device attributes, with no flags reply ahead
+/// of it: crossterm reads that as no keyboard-enhancement support.
+#[cfg(unix)]
+const KEYBOARD_PROBE_REPLY: &[u8] = b"\x1b[?62;22c";
 
 #[cfg(unix)]
 impl Pty {
@@ -108,7 +122,16 @@ impl Pty {
             master: std::fs::File::from(master),
             child,
             raw: Vec::new(),
+            answers_keyboard_probe: true,
+            keyboard_probe_answered: 0,
         })
+    }
+
+    /// Stops the automatic reply to the keyboard-enhancement probe, for a
+    /// test that answers it itself or needs it still waiting. Call it
+    /// before the first wait.
+    pub fn leave_keyboard_probe_unanswered(&mut self) {
+        self.answers_keyboard_probe = false;
     }
 
     /// Reads the master until the stripped transcript contains `needle` and
@@ -202,9 +225,10 @@ impl Pty {
         self.master.as_raw_fd()
     }
 
-    /// One poll-and-read step; errors with the stripped transcript when
-    /// the deadline passes or the slave side hangs up. `needle` only names
-    /// what the caller was waiting for in that message.
+    /// One poll-and-read step, answering any keyboard-enhancement probe it
+    /// read; errors with the stripped transcript when the deadline passes
+    /// or the slave side hangs up. `needle` only names what the caller was
+    /// waiting for in that message.
     fn pump(
         &mut self,
         deadline: std::time::Instant,
@@ -245,13 +269,24 @@ impl Pty {
             Ok(0) => Err(closed_early(needle, text)),
             Ok(n) => {
                 self.raw.extend_from_slice(&buf[..n]);
-                Ok(())
+                self.answer_keyboard_probe()
             }
             // Linux reports a hung-up slave as EIO rather than EOF.
             Err(err) if err.raw_os_error() == Some(libc::EIO) => Err(closed_early(needle, text)),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn answer_keyboard_probe(&mut self) -> std::io::Result<()> {
+        if !self.answers_keyboard_probe {
+            return Ok(());
+        }
+        while let Some(at) = find_bytes(&self.raw[self.keyboard_probe_answered..], KEYBOARD_PROBE) {
+            self.keyboard_probe_answered += at + KEYBOARD_PROBE.len();
+            self.send(KEYBOARD_PROBE_REPLY)?;
+        }
+        Ok(())
     }
 
     pub fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {

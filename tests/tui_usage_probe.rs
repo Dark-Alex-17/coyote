@@ -491,11 +491,15 @@ mod welcome_sweep {
     const DA1_QUERY: &[u8] = b"\x1b[c";
     /// A VT220-class terminal's answer to it.
     const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
+    /// What precedes the query when it closes the keyboard-enhancement
+    /// probe, which the harness answers itself.
+    const KEYBOARD_FLAGS_QUERY: &[u8] = b"\x1b[?u";
 
     /// Reads in short slices for `window`, answering each device-attributes
-    /// query as a real terminal would, and returns per slice when it ended
-    /// (since `start`) and the raw range it added. `answered` is how far
-    /// the queries have been answered, so none is answered twice.
+    /// query outside the keyboard probe as a real terminal would, and
+    /// returns per slice when it ended (since `start`) and the raw range it
+    /// added. `answered` is how far the queries have been answered, so none
+    /// is answered twice.
     fn slices(
         pty: &mut Pty,
         start: Instant,
@@ -509,7 +513,9 @@ mod welcome_sweep {
             pty.read_for(Duration::from_millis(20));
             while let Some(at) = find(pty.raw(), DA1_QUERY, *answered) {
                 *answered = at + DA1_QUERY.len();
-                pty.send(DA1_REPLY).unwrap();
+                if !pty.raw()[..at].ends_with(KEYBOARD_FLAGS_QUERY) {
+                    pty.send(DA1_REPLY).unwrap();
+                }
             }
             out.push((start.elapsed(), from, pty.raw().len()));
         }

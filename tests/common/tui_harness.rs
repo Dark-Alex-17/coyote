@@ -13,8 +13,8 @@ use std::{env, fs, iter, process};
 use super::fake_llm::{FakeLlm, Reply};
 use super::pty::{Pty, detached, strip_ansi};
 
-/// Covers the keyboard-enhancement probe, which waits two seconds for an
-/// answer a pseudo-terminal never gives.
+/// Covers the keyboard-enhancement probe's two-second wait in a test that
+/// leaves it unanswered (see `Pty::leave_keyboard_probe_unanswered`).
 pub const PTY_DEADLINE: Duration = Duration::from_secs(20);
 /// Hotkeys on a modal count only once both the last keystroke and the
 /// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles

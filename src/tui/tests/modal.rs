@@ -991,14 +991,6 @@ fn narration_and_the_confirm_question_wrap_instead_of_clipping() {
     harness.app.answer_front(PromptAnswer::Cancelled);
 }
 
-/// The buffer dump with its row quotes and all whitespace removed, so
-/// text wrapped over several rows can be matched as one run.
-fn squeezed(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_whitespace() && *c != '"')
-        .collect()
-}
-
 /// A question taller than the rows a 20-line frame can spare is cut
 /// with a marker counting the hidden lines, and no hotkey approves it
 /// until the terminal has grown enough to show the whole thing.

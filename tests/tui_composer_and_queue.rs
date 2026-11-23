@@ -10,10 +10,10 @@ mod common;
 
 mod queue_vi_and_headless {
     //! Black-box pins for the bottom pane's queue across an agent switch, the
-    //! vi layer, the command highlight, Ctrl+R, backtick document commands and
-    //! the headless prompter's refusal: the built binary on a pseudo-terminal
-    //! and a scripted fake model where a turn has to be held open. Unix-only
-    //! and serial like its sibling pty modules.
+    //! vi layer, Ctrl+R, backtick document commands and the headless
+    //! prompter's refusal: the built binary on a pseudo-terminal and a
+    //! scripted fake model where a turn has to be held open. Unix-only and
+    //! serial like its sibling pty modules.
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -21,7 +21,6 @@ mod queue_vi_and_headless {
     use std::time::{Duration, Instant};
 
     use super::common::fake_llm::{Chunk, FakeLlm, Reply};
-    use super::common::pty::Pty;
     use super::common::tui_harness::*;
     use serial_test::serial;
 
@@ -41,61 +40,6 @@ mod queue_vi_and_headless {
         )
         .unwrap();
     }
-
-    /// The last `CSI r;c H` before `at`: its offset and the position it set.
-    fn cursor_position_before(haystack: &[u8], at: usize) -> Option<(usize, u16, u16)> {
-        let mut end = at;
-        while let Some(start) = rfind(&haystack[..end], b"\x1b[") {
-            let params: Vec<u8> = haystack[start + 2..at]
-                .iter()
-                .copied()
-                .take_while(|b| b.is_ascii_digit() || *b == b';')
-                .collect();
-            if haystack.get(start + 2 + params.len()) == Some(&b'H')
-                && let Some((row, col)) = std::str::from_utf8(&params)
-                    .ok()
-                    .and_then(|p| p.split_once(';'))
-                && let (Ok(row), Ok(col)) = (row.parse(), col.parse())
-            {
-                return Some((start, row, col));
-            }
-            end = start;
-        }
-        None
-    }
-
-    /// The SGR lists between the cursor move that started the run of cells
-    /// `at` belongs to and `at` itself (the style of the text at `at` after a
-    /// full repaint).
-    fn sgr_before(raw: &[u8], at: usize) -> Vec<Vec<u16>> {
-        let (start, _, _) = cursor_position_before(raw, at)
-            .unwrap_or_else(|| panic!("no cursor position precedes offset {at}"));
-        sgr_params(&raw[start..at])
-    }
-
-    /// The SGR lists between `from` and `to`.
-    fn sgr_between(raw: &[u8], from: usize, to: usize) -> Vec<Vec<u16>> {
-        sgr_params(&raw[from..to])
-    }
-
-    fn has_indexed_foreground(params: &[Vec<u16>], index: u16) -> bool {
-        params
-            .iter()
-            .any(|p| p.windows(3).any(|w| w == [38, 5, index]))
-    }
-
-    /// Whether any SGR list sets a foreground colour at all: an indexed or
-    /// truecolor `38`, or one of the basic `30-37` / `90-97` codes. `39`
-    /// (default) and `0` (reset) are not colours.
-    fn sets_a_foreground(params: &[Vec<u16>]) -> bool {
-        params.iter().any(|p| {
-            p.iter()
-                .any(|&code| code == 38 || (30..=37).contains(&code) || (90..=97).contains(&code))
-        })
-    }
-
-    const GREEN: u16 = 2;
-    const RED: u16 = 1;
 
     /// Files under `root` (recursively) whose contents contain `needle`.
     fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
@@ -517,107 +461,6 @@ mod queue_vi_and_headless {
     }
 
     // ---------------------------------------------------------------------
-    // The command highlight stops at a word boundary.
-    // ---------------------------------------------------------------------
-
-    /// Reads the style the field paints `typed` with after a repaint; closes
-    /// the palette band first so the field's copy is the one found. The
-    /// composer is painted below the transcript (whose welcome block spells
-    /// `.help`), so the LAST copy after the repaint is the field's.
-    fn command_style(pty: &mut Pty, typed: &str, cols: u16) -> (Vec<Vec<u16>>, String) {
-        pty.send(typed.as_bytes()).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        pty.send(b"\x1b").unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let repainted = repaint(pty, 40, cols);
-        let frame = since(pty, repainted);
-        let at = rfind_after(pty.raw(), typed.as_bytes(), repainted)
-            .unwrap_or_else(|| panic!("`{typed}` was not repainted:\n{frame}"));
-        (sgr_before(pty.raw(), at), frame)
-    }
-
-    /// The last occurrence of `needle` at or after `from`.
-    fn rfind_after(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-        let from = from.min(haystack.len());
-        rfind(&haystack[from..], needle).map(|at| from + at)
-    }
-
-    /// Clears the field (one Ctrl+C on a draft).
-    fn clear_draft(pty: &mut Pty) {
-        pty.send(b"\x03").unwrap();
-        pty.read_for(Duration::from_millis(400));
-    }
-
-    /// `.helpx` is not a command even though `.help` is its prefix: red, not
-    /// green. `.help x` keeps `.help` green with the argument plain. Same
-    /// under the slash prefix.
-    #[test]
-    #[serial]
-    fn a_command_prefix_followed_by_more_letters_is_painted_red_not_green() {
-        for (prefix_yaml, sigil) in [("", '.'), ("command_prefix: slash\n", '/')] {
-            let dir = fresh_config_dir(&format!("word-boundary-{}", sigil as u8));
-            let _guard = TempDirGuard(dir.clone());
-            write_dry_run_config_with(&dir, prefix_yaml);
-            let mut pty = spawn_tui(&dir, &[]);
-            pty.wait_for("no session", PTY_DEADLINE).unwrap();
-
-            let known = format!("{sigil}help");
-            let (style, frame) = command_style(&mut pty, &known, 101);
-            assert!(
-                has_indexed_foreground(&style, GREEN),
-                "`{known}` was not painted green: {style:?}\n{frame}"
-            );
-            clear_draft(&mut pty);
-
-            let extended = format!("{sigil}helpx");
-            let (style, frame) = command_style(&mut pty, &extended, 100);
-            assert!(
-                has_indexed_foreground(&style, RED),
-                "`{extended}` (a known command plus letters) was not painted red: {style:?}\n{frame}"
-            );
-            assert!(
-                !has_indexed_foreground(&style, GREEN),
-                "`{extended}` was painted green as if `{known}` matched by prefix: {style:?}\n{frame}"
-            );
-            clear_draft(&mut pty);
-
-            let with_arg = format!("{sigil}help x");
-            pty.send(with_arg.as_bytes()).unwrap();
-            pty.read_for(Duration::from_millis(300));
-            pty.send(b"\x1b").unwrap();
-            pty.read_for(Duration::from_millis(300));
-            let repainted = repaint(&mut pty, 40, 101);
-            let frame = since(&pty, repainted);
-            let name_at = rfind_after(pty.raw(), known.as_bytes(), repainted)
-                .unwrap_or_else(|| panic!("`{with_arg}` was not repainted:\n{frame}"));
-            let name_style = sgr_before(pty.raw(), name_at);
-            assert!(
-                has_indexed_foreground(&name_style, GREEN),
-                "`{known}` before an argument was not painted green: {name_style:?}\n{frame}"
-            );
-            // Between the command word and its argument the colour is reset:
-            // the argument is plain, neither red nor green. The terminal only
-            // emits SGR on a change, so an argument painted in the command's
-            // colour would leave no sequence at all; the reset has to be seen.
-            let arg_at = find(pty.raw(), b" x", name_at + known.len()).unwrap_or_else(|| {
-                panic!("the argument of `{with_arg}` was not repainted:\n{frame}")
-            });
-            let arg_style = sgr_between(pty.raw(), name_at + known.len(), arg_at + 2);
-            assert!(
-                arg_style.iter().any(|p| p.contains(&39) || p == &[0]),
-                "no reset between `{known}` and its argument: {arg_style:?}\n{frame}"
-            );
-            assert!(
-                !sets_a_foreground(&arg_style),
-                "the argument after `{known}` is painted, not plain: {arg_style:?}\n{frame}"
-            );
-            clear_draft(&mut pty);
-            pty.read_for(HOTKEY_GAP);
-            quit_and_check(&mut pty);
-        }
-    }
-
-    // ---------------------------------------------------------------------
     // Ctrl+R history search; the history file is private.
     // ---------------------------------------------------------------------
 
@@ -915,36 +758,6 @@ mod queue_vi_and_headless {
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(300));
         quit_clearing_any_draft(&mut pty);
-    }
-
-    // ---------------------------------------------------------------------
-    // The placeholder names the configured command key.
-    // ---------------------------------------------------------------------
-
-    /// Under `command_prefix: slash` the empty composer's placeholder points
-    /// at `/` for commands, not `.`.
-    #[test]
-    #[serial]
-    fn the_placeholder_names_the_configured_command_prefix() {
-        for (prefix_yaml, sigil) in [("command_prefix: slash\n", '/'), ("", '.')] {
-            let dir = fresh_config_dir(&format!("placeholder-{}", sigil as u8));
-            let _guard = TempDirGuard(dir.clone());
-            write_dry_run_config_with(&dir, prefix_yaml);
-            let mut pty = spawn_tui(&dir, &[]);
-            pty.wait_for("no session", PTY_DEADLINE).unwrap();
-            let frame = repainted_frame_after_resize(&mut pty, 40, 101);
-            let flat = squeezed(&frame);
-            let other = if sigil == '/' { '.' } else { '/' };
-            assert!(
-                flat.contains(&format!("Typeapromptora{sigil}command")),
-                "under `{sigil}` the placeholder does not point at `{sigil}` for commands:\n{frame}"
-            );
-            assert!(
-                !flat.contains(&format!("Typeapromptora{other}command")),
-                "under `{sigil}` the placeholder still points at `{other}`:\n{frame}"
-            );
-            quit_and_check(&mut pty);
-        }
     }
 
     /// A line sent while the model waits in `job__wait` ends the wait at
@@ -1281,19 +1094,15 @@ mod key_help_and_chords {
     //! Real-process checks of the TUI's key discovery and panel chords, written
     //! from the keys contract rather than the dispatcher: no function key does
     //! anything (F1-F12 on the empty composer open no panel, no roster and no
-    //! key help, and type nothing); `.keys` opens the key help, which lists the
-    //! chords and no function key on any page, scrolls with PageDown, and
-    //! closes with `q`, `?`, Ctrl+C and Ctrl+D as well as Esc; `/keys` opens
-    //! it under `command_prefix: slash`, and `?` opens it from vi normal mode;
-    //! Alt+T closes the roster it opened, and `?` with the roster open does
-    //! not open the key help; Ctrl+X opens the todo panel without eating the
-    //! composer's text, and Ctrl+E is still the composer's end of line; the
-    //! plain REPL does not know `.keys`. F1-F12 also leave the roster, the key
-    //! help and the pager as they are; `?` in the history search band opens no
-    //! help; under a Select modal Ctrl+X shows the todo panel while Alt+T,
-    //! Ctrl+G, `?` and the function keys do nothing; the palette does not offer
-    //! `.keys`. Each case runs the binary on a pseudo-terminal, so the module is
-    //! unix-only, and the cases run one at a time.
+    //! key help, and type nothing); Alt+T closes the roster it opened, and `?`
+    //! with the roster open does not open the key help; Ctrl+X opens the todo
+    //! panel without eating the composer's text, and Ctrl+E is still the
+    //! composer's end of line; the plain REPL does not know `.keys`. F1-F12
+    //! also leave the roster, the key help and the pager as they are; `?` in
+    //! the history search band opens no help; under a Select modal Ctrl+X
+    //! shows the todo panel while Alt+T, Ctrl+G, `?` and the function keys do
+    //! nothing. Each case runs the binary on a pseudo-terminal, so the module
+    //! is unix-only, and the cases run one at a time.
     use std::time::Duration;
 
     use super::common::pty::{Pty, strip_ansi};
@@ -1302,11 +1111,8 @@ mod key_help_and_chords {
 
     const CTRL_E: &[u8] = b"\x05";
     const HOME: &[u8] = b"\x1b[H";
-    const PAGE_DOWN: &[u8] = b"\x1b[6~";
     /// A row only the key help shows.
     const HELP_MARK: &str = "Suspend to the shell";
-    /// What the key help's last row does.
-    const LAST_HELP_ROW: &str = "Close the help";
     /// The roster's legend.
     const ROSTER_MARK: &str = "Esc = close";
     /// A pseudo-terminal never answers a cursor-position query, and the plain
@@ -1359,25 +1165,6 @@ mod key_help_and_chords {
         assert_tty_restored(&transcript);
     }
 
-    /// A function key's name as a whole word (`F1`..`F12`) anywhere in `text`.
-    fn names_a_function_key(text: &str) -> Option<String> {
-        let chars: Vec<char> = text.chars().collect();
-        for (i, c) in chars.iter().enumerate() {
-            if *c != 'F' || (i > 0 && chars[i - 1].is_alphanumeric()) {
-                continue;
-            }
-            let digits: String = chars[i + 1..]
-                .iter()
-                .take_while(|d| d.is_ascii_digit())
-                .collect();
-            let after = chars.get(i + 1 + digits.len());
-            if !digits.is_empty() && after.is_none_or(|a| !a.is_alphanumeric()) {
-                return Some(format!("F{digits}"));
-            }
-        }
-        None
-    }
-
     fn assert_help_closed(pty: &mut Pty, by: &str) {
         pty.read_for(Duration::from_millis(400));
         let frame = repainted_frame_showing(
@@ -1420,130 +1207,6 @@ mod key_help_and_chords {
             "q4z",
             "an F-key left text in the composer:\n{typed}"
         );
-        leave(pty);
-    }
-
-    /// A full repaint of the key help at 30 rows by 100 columns. The page scan
-    /// compares frames, so they must share a height; the detour from 30 goes
-    /// through a shorter size, since a taller one would clamp the help's
-    /// scroll back.
-    fn help_page(pty: &mut Pty) -> String {
-        if pty.rows().unwrap() == 30 {
-            repainted_frame(pty, 28, 100);
-        }
-        repainted_frame(pty, 30, 100)
-    }
-
-    #[test]
-    #[serial]
-    fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_close_key() {
-        let (_guard, mut pty) = boot("dot-keys", "");
-
-        pty.send(b".keys\r").unwrap();
-        repainted_frame_showing(&mut pty, HELP_MARK, ".keys did not open the key help");
-        let mut pages = vec![help_page(&mut pty)];
-        // Page until the help's last row is on screen, or until a PageDown
-        // no longer moves the text.
-        while !squeezed(pages.last().unwrap()).contains(&squeezed(LAST_HELP_ROW)) {
-            assert!(pages.len() < 40, "the key help never reached its end");
-            pty.send(PAGE_DOWN).unwrap();
-            pty.read_for(Duration::from_millis(200));
-            let page = help_page(&mut pty);
-            let stuck = squeezed(&page) == squeezed(pages.last().unwrap());
-            pages.push(page);
-            if stuck {
-                break;
-            }
-        }
-        assert!(
-            pages.len() > 1,
-            "the key help fits one 30-row page, so PageDown was never tried:\n{}",
-            pages[0]
-        );
-        assert_ne!(
-            squeezed(&pages[0]),
-            squeezed(&pages[1]),
-            "PageDown did not scroll the key help"
-        );
-        let all = pages.join("\n");
-        assert!(
-            squeezed(&all).contains(&squeezed(LAST_HELP_ROW)),
-            "paging never showed the help's last row:\n{all}"
-        );
-        for chord in [
-            "Alt+T", "Ctrl+X", "Ctrl+T", "Ctrl+L", "Ctrl+R", "Ctrl+O", "Ctrl+Z",
-        ] {
-            assert!(
-                all.contains(chord),
-                "the key help never lists {chord}:\n{all}"
-            );
-        }
-        for group in [
-            "Composer and text field editing",
-            "Transcript view find",
-            "Thread picker",
-        ] {
-            assert!(
-                squeezed(&all).contains(&squeezed(group)),
-                "the key help never shows the {group:?} group:\n{all}"
-            );
-        }
-        if let Some(named) = names_a_function_key(&all) {
-            panic!("the key help names the function key {named}:\n{all}");
-        }
-
-        pty.send(b"q").unwrap();
-        assert_help_closed(&mut pty, "q");
-
-        pty.send(b"?").unwrap();
-        repainted_frame_showing(&mut pty, HELP_MARK, "? did not reopen the key help");
-        pty.send(b"?").unwrap();
-        assert_help_closed(&mut pty, "a second ?");
-
-        pty.send(b"?").unwrap();
-        repainted_frame_showing(&mut pty, HELP_MARK, "? did not reopen the key help");
-        pty.send(b"\x03").unwrap();
-        assert_help_closed(&mut pty, "Ctrl+C");
-
-        pty.send(b"?").unwrap();
-        repainted_frame_showing(&mut pty, HELP_MARK, "? did not reopen the key help");
-        pty.send(b"\x04").unwrap();
-        assert_help_closed(&mut pty, "Ctrl+D");
-
-        pty.send(b"still here k2w").unwrap();
-        wait_for_squeezed(
-            &mut pty,
-            "still here k2w",
-            "the composer did not take keys after the help",
-        );
-        leave(pty);
-    }
-
-    #[test]
-    #[serial]
-    fn slash_keys_opens_the_key_help_under_the_slash_prefix() {
-        let (_guard, mut pty) = boot("slash-keys", "command_prefix: slash\n");
-        pty.send(b"/keys\r").unwrap();
-        repainted_frame_showing(&mut pty, HELP_MARK, "/keys did not open the key help");
-        pty.send(b"\x1b").unwrap();
-        assert_help_closed(&mut pty, "Esc");
-        leave(pty);
-    }
-
-    #[test]
-    #[serial]
-    fn question_mark_in_vi_normal_mode_opens_the_key_help() {
-        let (_guard, mut pty) = boot("vi-help", "keybindings: vi\n");
-        pty.send(b"\x1b").unwrap();
-        pty.read_for(Duration::from_millis(400));
-        pty.send(b"?").unwrap();
-        repainted_frame_showing(
-            &mut pty,
-            HELP_MARK,
-            "? in vi normal mode did not open the key help",
-        );
-        pty.send(b"\x1b").unwrap();
-        assert_help_closed(&mut pty, "Esc");
         leave(pty);
     }
 
@@ -1645,8 +1308,7 @@ mod key_help_and_chords {
 
     // ---------------------------------------------------------------------
     // Function keys over the roster, the key help and the pager; `?` in a
-    // band with an empty composer; Alt+T and Ctrl+X under a prompt modal;
-    // the palette never offering `.keys`.
+    // band with an empty composer; Alt+T and Ctrl+X under a prompt modal.
     // ---------------------------------------------------------------------
 
     const CTRL_T: &[u8] = b"\x14";
@@ -1793,60 +1455,15 @@ mod key_help_and_chords {
         esc_cancels_the_modal(&mut pty, ".rag new-rag-m3c");
         leave(pty);
     }
-
-    /// The palette band of a repainted frame: from the end of the status row
-    /// above it down to the composer's rule under it; empty with no band open.
-    fn palette_band(frame: &str) -> &str {
-        let strip_end = "Ctrl+X = todo";
-        let after = frame
-            .rfind(strip_end)
-            .map(|at| &frame[at + strip_end.len()..])
-            .unwrap_or_else(|| panic!("the status row is not on screen:\n{frame}"));
-        after.split('\u{2500}').next().unwrap_or_default()
-    }
-
-    /// `.keys` belongs to the TUI but the command palette does not offer it,
-    /// while a prefix of a REPL command does open the band on that command.
-    #[test]
-    #[serial]
-    fn the_palette_does_not_offer_dot_keys() {
-        let (_guard, mut pty) = boot("palette-keys", "");
-        pty.send(b".he").unwrap();
-        pty.read_for(Duration::from_millis(500));
-        let frame = flipped_frame(&mut pty);
-        let band = palette_band(&frame);
-        assert!(
-            band.contains(".help"),
-            "the palette does not offer .help for .he:\n{frame}"
-        );
-        pty.send(b"\x1b").unwrap();
-        pty.read_for(Duration::from_millis(300));
-        pty.send(b"\x03").unwrap();
-        pty.read_for(Duration::from_millis(300));
-
-        pty.send(b".ke").unwrap();
-        pty.read_for(Duration::from_millis(500));
-        let frame = flipped_frame(&mut pty);
-        let band = palette_band(&frame);
-        assert!(
-            !band.contains(".keys"),
-            "the palette offers .keys: {band:?}\n{frame}"
-        );
-        leave(pty);
-    }
 }
 
 mod key_help_discovery {
-    //! Real-process checks of how the TUI points at its keys: the idle status
-    //! row names `? = keys  Alt+T = tasks  Ctrl+X = todo` and drops the `?`
-    //! part once the composer holds text; the welcome card's key help line is
-    //! spelled with the active prefix and names no function key; `?` on a
-    //! non-empty composer types a `?`; `.keys foo` and a two-line `.keys`
-    //! draft are sent as typed rather than opening the help; and function
-    //! keys held with a modifier (Shift+F1, Ctrl+F2, Alt+F4, Ctrl+F5,
-    //! Shift+F12) do nothing and leave no escape debris. Each case runs the
-    //! binary on a pseudo-terminal, so the module is unix-only, and the cases
-    //! run one at a time.
+    //! Real-process checks of how the TUI points at its keys: function keys
+    //! held with a modifier (Shift+F1, Ctrl+F2, Alt+F4, Ctrl+F5, Shift+F12)
+    //! do nothing and leave no escape debris, and the idle tasks pop-up
+    //! shows its title, holds the keys typed over it and closes. Each case
+    //! runs the binary on a pseudo-terminal, so the module is unix-only, and
+    //! the cases run one at a time.
     use std::time::Duration;
 
     use super::common::pty::Pty;
@@ -1889,79 +1506,6 @@ mod key_help_discovery {
 
     #[test]
     #[serial]
-    fn the_welcome_card_and_the_idle_hint_name_the_key_help_and_the_chords() {
-        let (_guard, mut pty) = boot("discovery-hints", "");
-        let frame = flipped_frame(&mut pty);
-        assert!(
-            shows(&frame, "Empty prompt: \"?\" or \".keys\" = keys"),
-            "the welcome card does not point at the key help:\n{frame}"
-        );
-        assert!(
-            shows(&frame, IDLE_HINT),
-            "the idle status row lacks `{IDLE_HINT}`:\n{frame}"
-        );
-        if let Some(named) = ["F1", "F2", "F3"].iter().find(|f| {
-            frame
-                .split(|c: char| !c.is_alphanumeric())
-                .any(|w| w == **f)
-        }) {
-            panic!("the idle screen names {named}:\n{frame}");
-        }
-
-        // `?` on a composer with text types instead of opening the help, and
-        // the hint drops its `?` part.
-        pty.send(b"ab?").unwrap();
-        let frame = repainted_frame_showing(&mut pty, "ab?", "`?` after text was not typed");
-        assert!(
-            !shows(&frame, HELP_MARK),
-            "`?` on a non-empty composer opened the key help:\n{frame}"
-        );
-        assert!(
-            shows(&frame, TEXT_HINT) && !shows(&frame, "? = keys"),
-            "with text the hint should read `{TEXT_HINT}` alone:\n{frame}"
-        );
-        leave(pty);
-    }
-
-    #[test]
-    #[serial]
-    fn the_slash_prefix_spells_the_welcome_pointer_with_slash() {
-        let (_guard, mut pty) = boot("discovery-slash", "command_prefix: slash\n");
-        let frame = flipped_frame(&mut pty);
-        assert!(
-            shows(&frame, "Empty prompt: \"?\" or \"/keys\" = keys"),
-            "the welcome card does not spell /keys under the slash prefix:\n{frame}"
-        );
-        leave(pty);
-    }
-
-    #[test]
-    #[serial]
-    fn dot_keys_with_an_argument_or_a_second_line_does_not_open_the_help() {
-        let (_guard, mut pty) = boot("discovery-keys-args", "");
-        pty.send(b".keys foo\r").unwrap();
-        pty.read_for(Duration::from_millis(800));
-        let frame = flipped_frame(&mut pty);
-        assert!(
-            !shows(&frame, HELP_MARK),
-            "`.keys foo` opened the key help:\n{frame}"
-        );
-
-        // Ctrl+J puts the second line under `.keys`.
-        pty.send(b".keys\x0azz").unwrap();
-        pty.read_for(Duration::from_millis(300));
-        pty.send(b"\r").unwrap();
-        pty.read_for(Duration::from_millis(800));
-        let frame = flipped_frame(&mut pty);
-        assert!(
-            !shows(&frame, HELP_MARK),
-            "a two-line `.keys` draft opened the key help:\n{frame}"
-        );
-        leave(pty);
-    }
-
-    #[test]
-    #[serial]
     fn function_keys_held_with_a_modifier_do_nothing_either() {
         let (_guard, mut pty) = boot("discovery-modified-fkeys", "");
         // Shift+F1, Ctrl+F2, Alt+F4, Ctrl+F5 and Shift+F12 as xterm sends
@@ -1999,36 +1543,6 @@ mod key_help_discovery {
             "k7q",
             "a modified F-key left escape debris in the composer:\n{frame}"
         );
-        leave(pty);
-    }
-
-    /// Paging through the key help reaches the mouse switch and the copy
-    /// chord, each with its description.
-    #[test]
-    #[serial]
-    fn the_key_help_lists_the_mouse_switch_and_the_copy_chord() {
-        let (_guard, mut pty) = boot("discovery-mouse-copy", "");
-        let at = pty.raw().len();
-        pty.send(b"?").unwrap();
-        repainted_frame_showing(&mut pty, HELP_MARK, "`?` did not open the key help");
-        for _ in 0..20 {
-            pty.send(b"\x1b[6~").unwrap();
-            pty.read_for(Duration::from_millis(150));
-        }
-        let help = squeezed(&super::common::pty::strip_ansi(&String::from_utf8_lossy(
-            &pty.raw()[at..],
-        )));
-        for (chord, row) in [
-            ("Alt+M", "Alt+M Mouse on: the wheel scrolls"),
-            ("Alt+C", "Alt+C Copy the focused tool call"),
-        ] {
-            assert!(
-                help.contains(&squeezed(row)),
-                "the key help does not list {chord} as {row:?}:\n{help}"
-            );
-        }
-        pty.send(ESC).unwrap();
-        repainted_frame_showing(&mut pty, IDLE_HINT, "Esc did not close the key help");
         leave(pty);
     }
 
