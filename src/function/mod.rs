@@ -2958,17 +2958,8 @@ pub fn run_llm_function(
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());
 
-    let mut reply = match io.prompter.as_ref().map(|_| prompt_channel::Server::open()) {
-        Some(Ok(server)) => {
-            envs.insert(prompt_channel::REPLY_ENV.into(), server.env_value());
-            Some(server)
-        }
-        Some(Err(err)) => {
-            debug!("Prompt reply channel unavailable for '{command_name}': {err}");
-            None
-        }
-        None => None,
-    };
+    let mut attachment =
+        prompt_channel::Attachment::open(io.prompter.clone(), &command_name, &mut envs);
 
     let mut command = Command::new(&cmd_name);
     command
@@ -2977,20 +2968,9 @@ pub fn run_llm_function(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // The bash helper exports the fd it saved stdout on; a nested coyote's
-    // tools must not inherit that marker or they would write requests to
-    // the outer pump.
-    command.env_remove(prompt_channel::OUT_FD_ENV);
-    match reply.as_ref() {
-        Some(server) => server.configure(&mut command),
-        None => {
-            command.env_remove(prompt_channel::REPLY_ENV);
-        }
-    }
+    attachment.configure(&mut command);
     let spawned_child = command.spawn();
-    if let Some(server) = reply.as_mut() {
-        server.spawned();
-    }
+    attachment.spawned();
     let mut child = spawned_child.map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
     debug!("Spawned tool process '{command_name}' pid {}", child.id());
     let spawned = Instant::now();
@@ -3000,7 +2980,6 @@ pub fn run_llm_function(
 
     let stdout_io = io.clone();
     let stderr_io = io.clone();
-    let stdout_tool = command_name.clone();
     let stdout_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let stderr_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let (stdout_done, stdout_done_rx) = std::sync::mpsc::channel();
@@ -3011,7 +2990,12 @@ pub fn run_llm_function(
     // from a surviving descendant; those are answered null rather than
     // raised to the user as prompts for a tool already reported finished.
     let tool_exited = Arc::new(AtomicBool::new(false));
-    let stdout_tool_exited = Arc::clone(&tool_exited);
+    let router = attachment.router(
+        &command_name,
+        io.call_id.clone(),
+        None,
+        Arc::clone(&tool_exited),
+    );
     // Once the drain grace runs out the pump is detached and anything a
     // surviving descendant writes is dropped rather than attributed to a
     // tool already reported finished.
@@ -3022,7 +3006,6 @@ pub fn run_llm_function(
         let mut buffer = [0; 1024];
         let mut reader = stdout;
         let mut lines = prompt_channel::LineAssembler::default();
-        let served = stdout_io.prompter.as_ref().zip(reply.as_ref());
         let emit = |chunk: &[u8]| {
             if stdout_detached.load(Ordering::Acquire) {
                 return;
@@ -3046,31 +3029,16 @@ pub fn run_llm_function(
                 break;
             }
             for classified in lines.feed(&buffer[0..n]) {
-                match classified {
-                    prompt_channel::Classified::Output(bytes) => emit(&bytes),
-                    prompt_channel::Classified::Prompt(line) => {
-                        let live = if stdout_tool_exited.load(Ordering::Acquire) {
-                            None
-                        } else {
-                            served
-                        };
-                        let request = live.and_then(|(prompter, server)| {
-                            prompter
-                                .parse_line(&line, &stdout_tool, stdout_io.call_id.clone(), None)
-                                .map(|parsed| (prompter, server, parsed))
-                        });
-                        match request {
-                            Some((prompter, server, parsed)) => {
-                                prompt_channel::handle_prompt_line(prompter, server, parsed);
-                            }
-                            None => {
-                                emit(&line);
-                                if let Some((_, server)) = served {
-                                    prompt_channel::reject_line(server, &stdout_tool, &line);
-                                }
-                            }
-                        }
-                    }
+                match &router {
+                    Some(router) => match router.route(classified) {
+                        prompt_channel::Routed::Output(bytes)
+                        | prompt_channel::Routed::Rejected(bytes) => emit(&bytes),
+                        prompt_channel::Routed::Served(request) => request.serve(),
+                    },
+                    None => match classified {
+                        prompt_channel::Classified::Output(bytes)
+                        | prompt_channel::Classified::Prompt(bytes) => emit(&bytes),
+                    },
                 }
             }
         }

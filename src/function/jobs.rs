@@ -1,6 +1,6 @@
 use super::agents::{self, AGENT_FUNCTION_PREFIX};
 use super::memory::MEMORY_FUNCTION_PREFIX;
-use super::prompt_channel::{self, Classified, LineAssembler, Server, ToolPrompter};
+use super::prompt_channel::{Attachment, LineAssembler, Routed, Router, ToolPrompter};
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
@@ -200,21 +200,8 @@ pub struct JobEnvSnapshot {
     envs: HashMap<String, String>,
     output_file: PathBuf,
     timeout_secs: u64,
-    prompter: Option<ToolPrompter>,
-    prompt_reply: Option<Server>,
+    prompt: Attachment,
     job_id: String,
-}
-
-/// What the stdout pump of a process job needs to answer a request line.
-struct JobPrompt {
-    job_id: String,
-    tool: String,
-    prompter: ToolPrompter,
-    /// Shared with the blocking task that writes the reply.
-    reply: Arc<Server>,
-    /// Set once the job process is reaped; request lines read after that
-    /// come from a surviving descendant and are answered null.
-    exited: Arc<AtomicBool>,
 }
 
 /// The complete context an MCP job task owns. The runtime holds ONLY the
@@ -1306,16 +1293,15 @@ fn build_env_snapshot(
         .or_insert_with(|| ctx.current_model().id());
     envs.entry(UiKind::ENV.to_string())
         .or_insert_with(|| ctx.ui_kind().as_str().to_string());
-    let prompt_reply = match Server::open() {
-        Ok(server) => {
-            envs.insert(prompt_channel::REPLY_ENV.into(), server.env_value());
-            Some(server)
-        }
-        Err(err) => {
-            warn!("Prompt reply channel unavailable for '{tool}': {err}");
-            None
-        }
-    };
+    let prompt = Attachment::open(
+        Some(ToolPrompter::new(
+            Arc::clone(&ctx.prompter),
+            Arc::clone(&ctx.prompt_memory),
+            Origin::from(ctx),
+        )),
+        tool,
+        &mut envs,
+    );
 
     cmd_args.push(arguments.to_string());
 
@@ -1345,25 +1331,20 @@ fn build_env_snapshot(
         envs,
         output_file,
         timeout_secs,
-        prompter: Some(ToolPrompter::new(
-            Arc::clone(&ctx.prompter),
-            Arc::clone(&ctx.prompt_memory),
-            Origin::from(ctx),
-        )),
-        prompt_reply,
+        prompt,
         job_id: job_id.to_string(),
     })
 }
 
-/// With `prompt`, request lines are answered instead of buffered; the
+/// With a router, request lines are answered instead of buffered; the
 /// prompter may block on a human, so it runs off the async worker.
 async fn pump_into_ring(
     mut reader: impl AsyncReadExt + Unpin,
     output_buf: Arc<Mutex<RingBuf>>,
-    prompt: Option<JobPrompt>,
+    router: Option<Router>,
 ) {
     let mut chunk = [0u8; 1024];
-    let Some(prompt) = prompt else {
+    let Some(router) = router else {
         loop {
             match reader.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
@@ -1378,37 +1359,15 @@ async fn pump_into_ring(
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 for classified in lines.feed(&chunk[..n]) {
-                    match classified {
-                        Classified::Output(bytes) => output_buf.lock().push(&bytes),
-                        Classified::Prompt(line) => {
-                            if prompt.exited.load(Ordering::Acquire) {
-                                output_buf.lock().push(&line);
-                                prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
-                                continue;
-                            }
-                            let Some(parsed) = prompt.prompter.parse_line(
-                                &line,
-                                &prompt.tool,
-                                None,
-                                Some(prompt.job_id.clone()),
-                            ) else {
-                                output_buf.lock().push(&line);
-                                prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
-                                continue;
-                            };
-                            let id = parsed.req.id.clone();
-                            let prompter = prompt.prompter.clone();
-                            let reply = Arc::clone(&prompt.reply);
-                            let served = tokio::task::spawn_blocking(move || {
-                                prompt_channel::handle_prompt_line(&prompter, &reply, parsed)
-                            })
-                            .await;
+                    match router.route(classified) {
+                        Routed::Output(bytes) | Routed::Rejected(bytes) => {
+                            output_buf.lock().push(&bytes)
+                        }
+                        Routed::Served(request) => {
+                            let id = request.id().to_string();
+                            let served = tokio::task::spawn_blocking(move || request.serve()).await;
                             if let Err(err) = served {
-                                warn!(
-                                    "Prompt from job '{}' was not answered: {err}",
-                                    prompt.job_id
-                                );
-                                prompt.reply.reply(&id, &Value::Null);
+                                router.not_answered(&id, err);
                             }
                         }
                     }
@@ -1507,18 +1466,10 @@ async fn run_process_job(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    command.env_remove(prompt_channel::OUT_FD_ENV);
-    let mut prompt_reply = snapshot.prompt_reply.take();
-    match prompt_reply.as_ref() {
-        Some(server) => server.configure(command.as_std_mut()),
-        None => {
-            command.env_remove(prompt_channel::REPLY_ENV);
-        }
-    }
+    let mut attachment = std::mem::take(&mut snapshot.prompt);
+    attachment.configure(command.as_std_mut());
     let spawned_child = command.spawn();
-    if let Some(server) = prompt_reply.as_mut() {
-        server.spawned();
-    }
+    attachment.spawned();
     let mut child =
         spawned_child.map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
     debug!(
@@ -1543,21 +1494,16 @@ async fn run_process_job(
         .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
     let job_exited = Arc::new(AtomicBool::new(false));
     let _exited_guard = ExitedOnDrop(Arc::clone(&job_exited));
-    let job_prompt = snapshot
-        .prompter
-        .clone()
-        .zip(prompt_reply)
-        .map(|(prompter, reply)| JobPrompt {
-            job_id: snapshot.job_id.clone(),
-            tool: snapshot.display_name.clone(),
-            prompter,
-            reply: Arc::new(reply),
-            exited: Arc::clone(&job_exited),
-        });
+    let router = attachment.router(
+        &snapshot.display_name,
+        None,
+        Some(snapshot.job_id.clone()),
+        Arc::clone(&job_exited),
+    );
     let stdout_pump = AbortOnDrop::new(tokio::spawn(pump_into_ring(
         stdout,
         Arc::clone(&output_buf),
-        job_prompt,
+        router,
     )));
     let stderr_pump = AbortOnDrop::new(tokio::spawn(pump_into_ring(
         stderr,
@@ -1863,8 +1809,7 @@ mod tests {
             envs,
             output_file,
             timeout_secs,
-            prompter: None,
-            prompt_reply: None,
+            prompt: Attachment::default(),
             job_id: String::new(),
         }
     }

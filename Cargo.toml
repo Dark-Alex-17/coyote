@@ -157,7 +157,7 @@ arboard = { version = "3.6", default-features = false, features = ["image-data"]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# The prompt reply pipe (src/function/prompt_channel.rs), the console
+# The prompt reply pipe (src/function/prompt_channel/server.rs), the console
 # writer and escape processing (src/tui/terminal.rs) and the std-handle
 # redirect (src/tui/redirect.rs).
 windows-sys = { version = "0.61", features = [

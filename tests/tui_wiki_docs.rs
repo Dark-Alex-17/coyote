@@ -359,7 +359,7 @@ fn prompt_action_names() -> Vec<String> {
 /// carry it: an `Option` field or one marked `#[serde(default)]` may be left
 /// out.
 fn wire_request_fields() -> Vec<(String, bool)> {
-    let source = src(&["function", "prompt_channel.rs"]);
+    let source = src(&["function", "prompt_channel", "mod.rs"]);
     let body = fn_body(&source, "struct WireRequest {");
     let mut fields = Vec::new();
     let mut defaulted = false;
@@ -378,13 +378,13 @@ fn wire_request_fields() -> Vec<(String, bool)> {
     fields
 }
 
-/// The bytes a request line starts with: `MARKER` in prompt_channel.rs.
+/// The bytes a request line starts with: `MARKER` in prompt_channel/mod.rs.
 fn request_marker() -> String {
-    let source = src(&["function", "prompt_channel.rs"]);
+    let source = src(&["function", "prompt_channel", "mod.rs"]);
     let head = "const MARKER: &[u8] = b";
     let at = source
         .find(head)
-        .expect("prompt_channel.rs declares MARKER");
+        .expect("prompt_channel/mod.rs declares MARKER");
     let rest = &source[at + head.len()..];
     let mut literals = string_literals(&rest[..rest.find(';').unwrap()]);
     assert_eq!(literals.len(), 1, "MARKER is one byte string");
@@ -394,7 +394,7 @@ fn request_marker() -> String {
 /// The keys of the reply line `Server::reply` writes, checked on both the
 /// unix and the windows half.
 fn reply_keys() -> Vec<String> {
-    let source = src(&["function", "prompt_channel.rs"]);
+    let source = src(&["function", "prompt_channel", "server.rs"]);
     let shape = "json!({\"id\": id, \"answer\": answer})";
     let head = "pub(crate) fn reply(&self, id: &str, answer: &Value)";
     let halves: Vec<String> = source
@@ -1045,7 +1045,7 @@ fn hooks_page_lists_the_call_id_on_every_tool_event() {
 #[test]
 fn environment_page_documents_the_ui_and_reply_variables() {
     let ui_env = const_str(&src(&["config", "ui_kind.rs"]), "ENV");
-    let reply_env = const_str(&src(&["function", "prompt_channel.rs"]), "REPLY_ENV");
+    let reply_env = const_str(&src(&["function", "prompt_channel", "mod.rs"]), "REPLY_ENV");
     assert_eq!(
         (ui_env.as_str(), reply_env.as_str()),
         ("COYOTE_UI", "COYOTE_PROMPT_REPLY")
@@ -1229,7 +1229,7 @@ fn tui_page_quotes_the_code() {
         &read(wiki.join("Custom-Tools.md")),
         PROTOCOL_HEADING,
     ));
-    let source = src(&["function", "prompt_channel.rs"]);
+    let source = src(&["function", "prompt_channel", "server.rs"]);
     assert!(source.contains(r#"r"\\.\pipe\coyote-prompt-{}-{}""#));
     assert!(source.contains("format!(\"/dev/fd/{}\", self.child_fd)"));
     for needle in [r"`\\.\pipe\coyote-prompt-...`", "`/dev/fd/<n>`"] {
