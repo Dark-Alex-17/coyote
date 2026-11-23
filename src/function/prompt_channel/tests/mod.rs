@@ -842,7 +842,7 @@ fn unparseable_request_with_an_id_is_answered_null_and_echoed() {
 }
 
 /// A scripted prompter with no answers panics when asked; the tool still
-/// gets its reply.
+/// gets its reply, and the bus sees the request answered as errored.
 #[test]
 #[serial]
 fn panicking_prompter_answers_the_tool_null() {
@@ -852,9 +852,10 @@ fn panicking_prompter_answers_the_tool_null() {
     let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
     install_tool(
         "panic-x7x",
-        "echo '{\"coyote_prompt\":{\"id\":\"p-panic-x7x\",\"action\":\"confirm\",\"question\":\"q\"}}' >&9\nIFS= read -r r <\"$COYOTE_PROMPT_REPLY\"; echo \"$r\" >> \"$LLM_OUTPUT\"",
+        "echo '{\"coyote_prompt\":{\"id\":\"p-panic-x7x\",\"action\":\"confirm\",\"question\":\"q-panic-x7x\"}}' >&9\nIFS= read -r r <\"$COYOTE_PROMPT_REPLY\"; echo \"$r\" >> \"$LLM_OUTPUT\"",
     );
     let prompter = Arc::new(ScriptedPrompter::refusing());
+    let sink = RecordingSink::install();
 
     let output = run_tool(
         "panic-x7x",
@@ -865,6 +866,18 @@ fn panicking_prompter_answers_the_tool_null() {
     assert_eq!(
         output["output"],
         format!("{}\n", json!({"id": "p-panic-x7x", "answer": null}))
+    );
+    let (requested, answered) = prompt_events(sink.drain(), "q-panic-x7x");
+    let [Event::PromptRequested { id, .. }] = requested.as_slice() else {
+        panic!("{requested:?}");
+    };
+    assert_eq!(
+        answered,
+        vec![Event::PromptAnswered {
+            id: id.clone(),
+            answer: crate::prompt::ERROR_MARKER.to_string(),
+            auto: false,
+        }]
     );
 }
 

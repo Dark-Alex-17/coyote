@@ -237,7 +237,8 @@ impl Request {
 
     /// Asks and writes the reply; blocks while the prompter waits on a
     /// human. A panicking prompter answers null, so the tool fails closed
-    /// instead of waiting on a reply that never comes.
+    /// instead of waiting on a reply that never comes, and the bus sees the
+    /// request closed as errored.
     pub(crate) fn serve(self) {
         let Self {
             prompter,
@@ -250,6 +251,11 @@ impl Request {
             handle_prompt_line(&prompter, &reply, *parsed)
         }));
         if let Err(panic) = served {
+            crate::events::bus().publish(crate::events::Event::PromptAnswered {
+                id: id.clone(),
+                answer: crate::prompt::ERROR_MARKER.to_string(),
+                auto: false,
+            });
             not_answered(
                 &reply,
                 &who,

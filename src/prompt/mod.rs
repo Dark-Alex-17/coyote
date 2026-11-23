@@ -20,6 +20,8 @@ const YES_FOR_SESSION: &str = "Yes for this session";
 const TOOL_CONFIRM_ROWS: [&str; 3] = ["Yes", "No", YES_FOR_SESSION];
 /// The published answer of a prompt a run with no human refused.
 pub(crate) const NEEDS_HUMAN_MARKER: &str = "<needs_human>";
+/// The published answer of a prompt whose prompter failed.
+pub(crate) const ERROR_MARKER: &str = "<error>";
 const REDACTED_MARKER: &str = "<redacted>";
 
 /// Whether a human can answer a prompt in this run. A headless run and the
@@ -405,7 +407,7 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
             let answer = if NeedsHuman::caused(&err) {
                 NEEDS_HUMAN_MARKER
             } else {
-                "<error>"
+                ERROR_MARKER
             };
             bus().publish(Event::PromptAnswered {
                 id: req.id,
