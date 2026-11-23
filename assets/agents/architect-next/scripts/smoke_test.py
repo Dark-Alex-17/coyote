@@ -1027,6 +1027,7 @@ check("promote_verify: the promoted PLAN still missing after the retry -> escala
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed" and "promoted PLAN not found" in u["escalation"]["evidence"]
       and "promotion left no task dirs for the plan; the breakdown table lists 3 tasks" in u["escalation"]["evidence"]
       and not any("proceeding (advisory)" in d for d in u.get("decisions", [])), u.get("escalation"))
+E_RAISED_DEFECTS = u["escalation"]
 # Simulate promote_tasks: PLAN + three tasks through bin/new-task.
 PROMOTED = FIXTURE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
 ids = []
@@ -1824,6 +1825,18 @@ check("task_done_verify: completed entry appended by the script when missing; le
       and "completed" in read_file(os.path.join(t1d["dir"], "log.md")) and "WidgetStore" in read_file(os.path.join(t1d["dir"], "log.md"))
       and any("week plan" in a for a in u["anomalies_log"]) and CLOSE_COMMIT_MARKER in FIXTURE.last_commit())
 TS_DONE1 = u["tasks"]
+_layout, _core_tool = gates.TASKSTORE, gates.core_tool
+gates.TASKSTORE = _lib.TASKSTORE = "dirstate"
+gates.core_tool = lambda *a, **k: (False, "push rejected")
+try:
+    u = gates.task_done_verify(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_DONE1), current_task=T1, report_parsed=pr_))
+finally:
+    gates.TASKSTORE = _lib.TASKSTORE = _layout
+    gates.core_tool = _core_tool
+check("repeat decisions: the promotion defects and the task close are two promote_failed decisions in one task",
+      u["escalation"]["kind"] == "promote_failed"
+      and gates._decision_key(base_state(current_task=T1), u["escalation"])
+      != gates._decision_key(base_state(current_task=T1), E_RAISED_DEFECTS), (u.get("escalation"), E_RAISED_DEFECTS))
 u = gates.stack_gate(base_state(plan_path=PROMOTED, tasks=TS_DONE1))
 check("stack_gate: single -> task_done_route", u["_next"] == "task_done_route")
 ts_chain = copy.deepcopy(TS_DONE1)
@@ -2100,27 +2113,66 @@ E_IR82_RPT = gates.integration_test(r82(task_rounds={T1: {"merged": True, "integ
 check("replay 08/2: integration_red carries the failed command and the latest fix-round report",
       E_IR82["data"].get("failed_command") == "sh check.sh" and gates.CAP_SPENT_NOTE in E_IR82["question"]
       and "REPORT-SUMMARY: the declared command needs the wrapper." in E_IR82_RPT["evidence"], E_IR82["data"])
-s = r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE, reply_source="judge", reply_verdict="instruction",
-        reply_instruction="verification_command", reply_value=f"./run-checks -- {R82_WHY}", reply_reason="The project documents the wrapper.")
-s.update(gates.interpret_route(s))
-s.update(gates.apply_answer(s))
-check("replay 08/2: an integration_red verification_command instruction is applied through the one helper and re-runs the verification",
-      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks"]'
-      and s["verification_changes"][-1]["by"] == "headless judge" and s["verification_changes"][-1]["reason"] == R82_WHY, s.get("decisions"))
-s = r82(escalation=E_IR82, last_answer_text="run the wrapper instead", reply_verdict="instruction", reply_instruction="verification_command",
-        reply_value=f"`./run-checks -- --all` -- {R82_WHY}", reply_reason="The owner names the wrapper.")
-s.update(gates.interpret_route(s))
-s.update(gates.apply_answer(s))
-check("verification_command: an owner-typed instruction through interpret_reply is recorded by the owner and re-runs the verification",
-      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks -- --all"]'
-      and s["verification_changes"][-1]["by"] == "owner" and s["verification_changes"][-1]["reason"] == R82_WHY, s.get("decisions"))
-s = r82(escalation=E_VC, last_answer_text="use the other form", reply_verdict="instruction", reply_instruction="verification_command",
-        reply_value=f"`./run-checks --all` -- {R82_WHY}", reply_reason="The owner corrects the command.")
-s.update(gates.interpret_route(s))
-s.update(gates.apply_answer(s))
-check("verification_command: the question accepts a typed corrected command and re-runs only the verification",
-      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks --all"]' and "fix_request" not in s,
-      s.get("decisions"))
+
+
+def typed82(esc, value, judge=False, **over):
+    """A typed verification_command instruction on `esc`, routed by interpret_route and then apply_answer."""
+    who = (dict(last_answer_text=_lib.HEADLESS_GUIDANCE, reply_source="judge") if judge
+           else dict(last_answer_text="use this command instead"))
+    s = r82(escalation=esc, reply_verdict="instruction", reply_instruction="verification_command", reply_value=value,
+            reply_reason="The typed command runs the same checks.", **who, **over)
+    s.update(gates.interpret_route(s))
+    s.update(gates.apply_answer(s))
+    return s
+
+
+def asked_typed(s, by, new, scope):
+    esc = s.get("escalation") or {}
+    return (s["_next"] == "escalate_gate" and esc.get("kind") == "verification_command"
+            and esc["question"].startswith(f"The {by} reports ") and esc["data"]["by"] == by
+            and esc["data"]["replacement"] == new and esc["data"]["scope"] == scope
+            and [o["text"] for o in esc["options"]] == [gates.VERIFY_ADOPT, gates.VERIFY_KEEP, "Stop and report"]
+            and not any(o["recommended"] for o in esc["options"]) and esc.get("hard_trigger")
+            and "\n\nDocumentation check:\n## CONTRIBUTING.md\ncited line 5:\n" in esc["evidence"]
+            and s["verification_commands"] == '["true", "sh check.sh"]' and not s.get("verification_changes"))
+
+
+s = typed82(E_IR82, f"./run-checks -- {R82_WHY}", judge=True)
+check("verification_command: a judge-typed replacement on integration_red is asked with its documentation check, not adopted",
+      asked_typed(s, "headless judge", "./run-checks", "task") and s["escalation"]["data"]["task"] == T1, s.get("escalation"))
+E_TYPED82 = s["escalation"]
+u = gates.apply_answer(r82(escalation=E_TYPED82, last_answer=gates.VERIFY_ADOPT, answer_reason="The cited file documents it."))
+check("verification_command: adopting the judge-typed question replaces the command and re-runs only the verification",
+      u["_next"] == "integration_test" and u["verification_commands"] == '["true", "./run-checks"]'
+      and u["verification_changes"][-1]["by"] == "headless judge" and u["verification_changes"][-1]["reason"] == R82_WHY, u)
+E_IR82F = gates.integration_check(r82(final_integration_strikes=STRIKE_LIMIT, cap_continues={"integration_red:run": STRIKE_LIMIT}))["escalation"]
+s = typed82(E_IR82F, f"./run-checks -- {R82_WHY}", judge=True)
+check("verification_command: a judge-typed replacement on the Phase F integration_red is asked at run scope with its documentation check",
+      E_IR82F["kind"] == "integration_red" and asked_typed(s, "headless judge", "./run-checks", "run"), s.get("escalation"))
+u = gates.apply_answer({**s, "last_answer": gates.VERIFY_ADOPT, "answer_reason": "The cited file documents it."})
+check("verification_command: adopting the Phase F typed question re-runs only integration_check",
+      u["_next"] == "integration_check" and u["verification_commands"] == '["true", "./run-checks"]', u)
+s = typed82(E_IR82, f"`./run-checks -- --all` -- {R82_WHY}")
+check("verification_command: an owner-typed replacement through interpret_reply is asked with its documentation check, not adopted",
+      asked_typed(s, "owner", "./run-checks -- --all", "task"), s.get("escalation"))
+s = typed82(E_VC, f"`./run-checks` -- {R82_WHY}")
+check("verification_command: typing the question's own replacement adopts it as the adopt option does and re-runs the verification",
+      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks"]' and "fix_request" not in s
+      and s["verification_changes"][-1]["by"] == "owner", s.get("decisions"))
+s = typed82(E_VC, f"`./run-checks --all` -- {R82_WHY}")
+check("verification_command: a different typed replacement on the question raises a fresh question with that command's check",
+      asked_typed(s, "owner", "./run-checks --all", "task") and s["escalation"]["data"]["typed_rounds"] == 1, s.get("escalation"))
+E_RETYPED82 = s["escalation"]
+s = typed82(E_RETYPED82, f"`./run-checks --fast` -- {R82_WHY}")
+check("verification_command: a replacement re-typed past the bound is not adopted and the open question is asked again for an option",
+      s["_next"] == "ask_dispatch" and s["escalation"]["data"]["replacement"] == "./run-checks --all"
+      and s["escalation"]["question"].startswith("Could not act on the reply ")
+      and s["verification_commands"] == '["true", "sh check.sh"]' and not s.get("verification_changes"), s.get("escalation"))
+s = typed82(E_IR82, f"./run-checks -- {R82_WHY}", judge=True, verification_changes=[
+    {"from": "sh check.sh", "to": "./run-checks", "reason": R82_WHY, "by": "owner", "task": T1, "at": "t", "kept": True}])
+check("verification_command: a typed replacement already decided is not asked again and not adopted; the open question is re-asked",
+      s["_next"] == "ask_dispatch" and s["escalation"]["kind"] == "integration_red" and s["verification_commands"] == '["true", "sh check.sh"]'
+      and any("was already decided; not asked again" in d for d in s["decisions"]), s.get("decisions"))
 CHANGED82 = [{"from": "sh check.sh", "to": "./run-checks", "reason": R82_WHY, "by": "owner", "task": T1, "at": "t"},
              {"from": "true", "to": "./other", "reason": "r", "by": "headless judge", "task": T1, "at": "t", "kept": True}]
 rep82 = gates.final_report(base_state(plan_path=PROMOTED, tasks=TS_W, run_dir=R82_RUN, verification_changes=CHANGED82))["report"]
@@ -2820,12 +2872,13 @@ check("apply_answer: the forced reply recorded (via other) and the force lifted 
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True, reply_interpreted=True))
 check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
 E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
-check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
-      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_decisions=["design_round#0||task"]))["_next"] == "ladder_judge"
-      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_decisions=["design_round#0||task"]))["_next"] == "ask_dispatch")
+E_DQ_KEY = f"design_round#0~{gates.hashlib.sha1(E_DQ['data']['question'].encode()).hexdigest()[:8]}||task"
+check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index and question",
+      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_decisions=[E_DQ_KEY]))["_next"] == "ladder_judge"
+      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_decisions=[E_DQ_KEY]))["_next"] == "ask_dispatch")
 u2 = gates.ladder_route(base_state(escalation=E_DQ, ladder_resolution="recommended", ladder_choice=""))
-check("ladder_route: a multiple-choice question records its kind and index, task and phase as ruled autonomously",
-      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2.get("autonomous_decisions") == ["design_round#0||task"], u2)
+check("ladder_route: a multiple-choice question records its kind, index and question digest, task and phase as ruled autonomously",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2.get("autonomous_decisions") == [E_DQ_KEY], u2)
 
 # ---------------------------------------------------------------- apply_answer (every kind)
 # The options each kind is raised with, since apply_answer reads a reply only by the option it names.
@@ -3185,6 +3238,48 @@ check("apply_answer: promote_failed free text never aborts -> interpret_reply, t
       _promote_free.get("_next") == "interpret_reply" and _promote_read.get("_next") == "ask_dispatch"
       and "failure_reason" not in _promote_free and "failure_reason" not in _promote_read,
       (_promote_free.get("_next"), _promote_read.get("_next")))
+HG = _lib.HEADLESS_GUIDANCE
+REPEAT_KEY = gates._decision_key(base_state(), E)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text=HG, answered_decisions=[REPEAT_KEY]))
+check("repeat decisions: the engine's no-human reply to a decision the run already answered goes to the headless judge, "
+      "never the recommended default",
+      u["_next"] == "headless_judge" and sum(u.get("judge_rulings", {}).values()) == 1
+      and any("headless: conformance_stuck: asked again after an answer -> headless judge" in d for d in u["decisions"]), u)
+u = gates.parse_answer(base_state(escalation=E, last_answer_text=HG, answered_decisions=["other|x|task"]))
+check("repeat decisions: the first no-human reply to a decision still takes its recommended option",
+      u["_next"] == "apply_answer" and u["last_answer"] == "Stop and report", u)
+u = gates.parse_answer(base_state(escalation=dict(E, hard_trigger=True), last_answer_text=HG, answered_decisions=[REPEAT_KEY]))
+check("repeat decisions: a repeated hard trigger keeps its recommended option, never judged",
+      u["_next"] == "apply_answer" and u["last_answer"] == "Stop and report" and "judge_rulings" not in u, u)
+PICKER = dict(E, data={"multiple_choice": True, "index": 1})
+PICKER_KEY = gates._decision_key(base_state(), PICKER)
+PICKER_FIRST = gates.ask_dispatch(base_state(escalation=PICKER))
+u = gates.ask_dispatch(base_state(escalation=PICKER, answered_decisions=[PICKER_KEY]))
+check("repeat decisions: a repeated multiple-choice decision is asked at the typed prompt under the same decision key",
+      PICKER_FIRST["_next"] == "ask_choice_2" and u["_next"] == "ask_user" and "multiple_choice" not in u["escalation"]["data"]
+      and gates._decision_key(base_state(), u["escalation"]) == PICKER_KEY and "One more round" in u["ask_question"]
+      and any(f"repeat decision {PICKER_KEY} -> typed prompt" in d for d in u["decisions"]), u)
+LEAK_OPTS = [option("Use the default", True), option("Ask the owner")]
+LEAK_A = escalation("leak_question", "q", LEAK_OPTS, data={"multiple_choice": True, "question": "Which port?", "index": 0})
+LEAK_B = escalation("leak_question", "q", LEAK_OPTS, data={"multiple_choice": True, "question": "Which host?", "index": 0})
+LEAK_A_AGAIN = escalation("leak_question", "q again", LEAK_OPTS, data={"multiple_choice": True, "question": "Which port?", "index": 0})
+check("repeat decisions: two leak_question queues that each start at question 1 with different questions get distinct keys",
+      gates._decision_key(base_state(), LEAK_A) != gates._decision_key(base_state(), LEAK_B)
+      and gates.ask_dispatch(base_state(escalation=LEAK_B, answered_decisions=[gates._decision_key(base_state(), LEAK_A)]))["_next"]
+      == "ask_choice_2")
+check("repeat decisions: the same multiple-choice question asked again keeps its key, so it is still a repeat",
+      gates._decision_key(base_state(), LEAK_A) == gates._decision_key(base_state(), LEAK_A_AGAIN)
+      and gates.ask_dispatch(base_state(escalation=LEAK_A_AGAIN, answered_decisions=[gates._decision_key(base_state(), LEAK_A)]))["_next"]
+      == "ask_user")
+PROMOTE_KEY = gates._decision_key(base_state(), E_PROMOTE_DEFECTS)
+acted = gates.apply_answer(base_state(escalation=E_PROMOTE_DEFECTS, last_answer="Continue with the tasks as promoted"))
+check("repeat decisions: apply_answer records a decision it acted on, never one it sent to be read or asked again",
+      acted["_next"] == "branch_setup" and acted.get("answered_decisions") == [PROMOTE_KEY]
+      and _promote_free["_next"] == "interpret_reply" and "answered_decisions" not in _promote_free
+      and _promote_read["_next"] == "ask_dispatch" and "answered_decisions" not in _promote_read, (acted, _promote_free, _promote_read))
+u = gates.escalate_gate(base_state(escalation=E, escalation_policy="autonomous", answered_decisions=[REPEAT_KEY]))
+check("repeat decisions: an autonomous run asks the owner for a decision it already answered, even one the ladder never saw",
+      u["_next"] == "ask_dispatch" and any(f"ladder: {REPEAT_KEY} already answered once -> owner" in d for d in u["decisions"]), u)
 for reply in ("yes, adopt it", "adopt it, yes please", "Adopt"):
     u = gates.apply_answer(base_state(escalation=AA_ESC["design_ask"], last_answer=reply, current_task=T1, tasks=tasks_with(), task_rounds={}))
     check(f"apply_answer: design_ask free {reply!r} -> recorded as the decision, never adopted",
@@ -3634,6 +3729,11 @@ check("ci_apply: budgets are per check-name per PR (lint on #99 fresh although t
 u = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f))
 check("ci_apply: B18 fix strikes exhausted per check per PR -> ci_exhausted", u["escalation"]["kind"] == "ci_exhausted")
 E_CE = u["escalation"]
+E_CI_WATCH = gates.ci_route(base_state(ci_status="timeout", current_task=T1))["escalation"]
+check("repeat decisions: the CI watch timeout and the fix cap are two ci_exhausted decisions in one task",
+      E_CI_WATCH["kind"] == "ci_exhausted"
+      and gates._decision_key(base_state(current_task=T1), E_CI_WATCH) != gates._decision_key(base_state(current_task=T1), E_CE),
+      (E_CI_WATCH, E_CE))
 E_CE_SPENT = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")],
                                        ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f,
                                        cap_continues={"ci_exhausted:99:test": STRIKE_LIMIT})).get("escalation")
@@ -3650,7 +3750,12 @@ CAP_CASES = {
                         dict(current_batch="B1", tasks=copy.deepcopy(ts_b), batch_state={"B1": {"strikes": STRIKE_LIMIT + 1}})),
     "ci_exhausted": (E_CE, E_CE_SPENT, "Resume with one more coder fix round (state reason)", "ci_exhausted:99:test",
                      dict(pr_number="99", tasks=ts_f, ci_owning_task=T1, ci_fix_strikes={"99": {"test": STRIKE_LIMIT + 1}})),
+    "gate2_stuck": (E_G2, g2_spent.get("escalation"), "Another fix round (state reason)", "gate2_stuck",
+                    dict(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT + 1)),
+    "gate1_stuck": (E_G1_STUCK, g1_spent.get("escalation"), gates.GATE1_ANOTHER_ROUND, "gate1_stuck",
+                    dict(gate1_result=G1_STUCK, leak_fingerprints=[G1_FP, G1_FP])),
 }
+CAP_ROUND_NEXT = ("fix_round", "batch_fix_route", "amend_plan", "answer_leaks")
 for name, (first, spent, more, key, ctx) in CAP_CASES.items():
     check(f"{name}: the continue option is first and recommended at the cap; after {STRIKE_LIMIT} continues none is, with the cap-spent note",
           _cap_offer(first) == (more, [more]) and _cap_offer(spent) == (more, [])
@@ -3658,16 +3763,14 @@ for name, (first, spent, more, key, ctx) in CAP_CASES.items():
           (_cap_offer(first), _cap_offer(spent)))
     v = AA(first["kind"], more, esc=first, last_answer_text="1 - the last round found a new cause", cap_continues={}, **copy.deepcopy(ctx))
     check(f"apply_answer: {name} continue with a reason -> a real round dispatched, the reason ledgered, one continue counted",
-          v["_next"] in ("fix_round", "batch_fix_route") and any("the last round found a new cause" in d for d in v.get("decisions", []))
+          v["_next"] in CAP_ROUND_NEXT and any("the last round found a new cause" in d for d in v.get("decisions", []))
           and _lib.as_dict(v.get("cap_continues")).get(key) == 1, (v["_next"], v.get("cap_continues"), v.get("decisions")))
     s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
     s.update(gates.parse_answer(s))
     picked = s.get("last_answer")
     s.update(gates.apply_answer(s))
-    # a bare one-more pick on integration_red goes to the headless judge for its reason
-    expect = ("headless_judge",) if first["kind"] == "integration_red" else ("fix_round", "batch_fix_route")
-    check(f"headless: {name} guidance picks the continue option and dispatches the round, or asks the judge for a reason",
-          picked == more and s["_next"] in expect, (picked, s["_next"]))
+    check(f"headless: {name} guidance picks the continue option, which asks the judge for a reason",
+          picked == more and s["_next"] == "headless_judge", (picked, s["_next"]))
 cc_ = {n: AA(c[0]["kind"], c[2], esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
 fr_ = {n: _lib.as_dict(v.get("fix_request")) for n, v in cc_.items()}
 check("apply_answer: integration_conflict continue -> a rebase fix round for the task, back to integration, one cycle before it asks again",
@@ -3687,37 +3790,44 @@ def ledgered(u, line):
     return any(line in d for d in u.get("decisions", []))
 
 
-for name in ("integration_red", "integration_red at Phase F"):
+ONE_MORE_WHAT = {"integration_conflict": "rebase cycle", "integration_red": "fix round", "integration_red at Phase F": "fix round",
+                 "batch_strikeout": "batch round on B1", "ci_exhausted": "CI fix round", "gate2_stuck": "Gate 2 fix round",
+                 "gate1_stuck": "revise-and-re-seal round"}
+ONE_MORE_UNTOUCHED = ("cap_continues", "task_rounds", "final_integration_strikes", "batch_state", "ci_fix_strikes", "oracle_rejects",
+                      "amend_counts", "amend_cycles", "pending_amendments", "fix_request", "leak_owner_reason")
+for name, what in ONE_MORE_WHAT.items():
     first, _, more, key, ctx = CAP_CASES[name]
+    kind = first["kind"]
     s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
     s.update(gates.parse_answer(s))
     source = s.get("answer_source")
     v = gates.apply_answer(s)
-    check(f"headless: {name} one more with no reason stated -> the headless judge, no continue counted, strikes unchanged",
+    check(f"headless: {name} one more with no reason stated -> the headless judge, no continue counted, state unchanged",
           source == "headless" and v["_next"] == "headless_judge"
           and _lib.as_dict(_lib.as_dict(v.get("escalation")).get("data")).get("judge_fault")
-          and "cap_continues" not in v and "task_rounds" not in v and "final_integration_strikes" not in v
-          and ledgered(v, "integration_red: one more fix round picked by the headless with no reason stated -> headless judge"),
+          and not set(ONE_MORE_UNTOUCHED) & set(v)
+          and ledgered(v, f"{kind}: one more {what} picked by the headless with no reason stated -> headless judge"),
           (source, v["_next"], v.get("decisions")))
     s.update(v)
     s.update({"reply_verdict": "option", "reply_option": more, "reply_reason": R82_JUDGE})
     s.update(gates.interpret_route(s))
     source = s.get("answer_source")
     s.update(gates.apply_answer(s))
-    check(f"headless judge: {name} one more with its reason -> a fix round carrying the reason, one continue counted",
-          source == "judge" and s["_next"] == "fix_round" and any(R82_JUDGE in i for i in s["fix_request"]["items"])
+    carried = repr((s.get("fix_request"), s.get("batch_state"), s.get("pending_amendments"), s.get("leak_owner_reason")))
+    check(f"headless judge: {name} one more with its reason -> the round runs carrying the reason, one continue counted",
+          source == "judge" and s["_next"] in CAP_ROUND_NEXT and R82_JUDGE in carried
           and _lib.as_dict(s.get("cap_continues")).get(key) == 1, (source, s["_next"], s.get("cap_continues")))
     v = AA(first["kind"], more, esc=first, cap_continues={}, answer_source="", **copy.deepcopy(ctx))
-    check(f"apply_answer: {name} owner one more with no reason stated -> a plain fix round, ledgered",
-          v["_next"] == "fix_round" and _lib.as_dict(v.get("cap_continues")).get(key) == 1
-          and ledgered(v, "integration_red: one more fix round with no reason stated -> plain fix round"), (v["_next"], v.get("decisions")))
+    check(f"apply_answer: {name} owner one more with no reason stated -> a plain round, ledgered",
+          v["_next"] in CAP_ROUND_NEXT and _lib.as_dict(v.get("cap_continues")).get(key) == 1
+          and ledgered(v, f"{kind}: one more {what} with no reason stated -> plain {what}"), (v["_next"], v.get("decisions")))
     s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
     spent = next(iter(_lib.as_dict(gates.apply_answer({**s, **gates.parse_answer(s)}).get("judge_rulings"))), "")
     v = AA(first["kind"], more, esc=first, cap_continues={}, answer_source="headless", judge_rulings={spent: STRIKE_LIMIT},
            **copy.deepcopy(ctx))
-    check(f"apply_answer: {name} headless one more with the judge's rulings spent -> a plain fix round, ledgered",
-          spent and v["_next"] == "fix_round"
-          and ledgered(v, "integration_red: one more fix round with no reason stated -> plain fix round"), (spent, v["_next"]))
+    check(f"apply_answer: {name} headless one more with the judge's rulings spent -> a plain round, ledgered",
+          spent and v["_next"] in CAP_ROUND_NEXT and _lib.as_dict(v.get("cap_continues")).get(key) == 1
+          and ledgered(v, f"{kind}: one more {what} with no reason stated -> plain {what}"), (spent, v["_next"]))
 s = base_state(escalation=e5, last_answer_text=HG, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"])
 s.update(gates.parse_answer(s))
 v = gates.apply_answer(s)
@@ -3765,7 +3875,10 @@ check("apply_answer: ci_exhausted continue -> a coder fix round for the owning t
       cc_["ci_exhausted"]["_next"] == "fix_round" and fr_["ci_exhausted"].get("task") == T1 and fr_["ci_exhausted"].get("return_to") == "ci"
       and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
       (cc_["ci_exhausted"]["_next"], fr_["ci_exhausted"], cc_["ci_exhausted"].get("ci_fix_strikes")))
-ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
+# gate2_stuck asks again on such a reply and gate1_stuck takes it as the owner's answers; their own checks sit with
+# their other rows
+ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()
+        if n not in ("gate2_stuck", "gate1_stuck")}
 check("apply_answer: a reply that picks none of a cap's options goes to interpret_reply, never stopped",
       all(v["_next"] == "interpret_reply" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
       {n: v["_next"] for n, v in ask_.items()})
@@ -4052,6 +4165,8 @@ check("watch: ci_poll / review_poll node timeouts cover the sleep plus one gh re
 check("watch: review_route has a timeout above the slack_ping subprocess bound (60s)", NODES.get("review_route", {}).get("timeout", 0) > 60,
       NODES.get("review_route", {}).get("timeout"))
 check("watch: ci_polls_run and review_polls_run seeded at 0", SEEDS.get("ci_polls_run") == 0 and SEEDS.get("review_polls_run") == 0)
+check("repeat decisions: answered_decisions is seeded empty and persisted like autonomous_decisions",
+      SEEDS.get("answered_decisions") == [] and "answered_decisions" in _lib.STATE_KEYS, SEEDS.get("answered_decisions"))
 check("graph: confirm_seed offers exactly the seed_confirm options intake raises",
       NODES.get("confirm_seed", {}).get("options") == [o["text"] for o in E_SEED["options"]], NODES.get("confirm_seed", {}).get("options"))
 check("graph: confirm_draft offers exactly the draft_confirm options draft_route raises",
@@ -4318,6 +4433,21 @@ def _long_checklist_review_each():
 
 guarded("checklist batch: review each -> the per-item queue over the same 40 items, item 1 asked, no new fan-out",
         _long_checklist_review_each)
+
+
+def _long_checklist_review_each_not_repeat():
+    s = checklist_batch_answer("Option 2")
+    batch_keys = list(s.get("answered_decisions") or [])
+    s.update(gates.ask_dispatch(s))
+    asked = s["_next"]
+    u = gates.parse_answer({**s, "last_answer_text": _lib.HEADLESS_GUIDANCE})
+    return (len(batch_keys) == 1 and asked == "ask_choice_2" and s["escalation"]["data"].get("multiple_choice") is True
+            and u["_next"] == "apply_answer" and u.get("last_answer") == gates.CHECKLIST_ACCEPT
+            and "judge_rulings" not in u), (batch_keys, asked, u["_next"], u.get("last_answer"), u.get("decisions", [])[-3:])
+
+
+guarded("checklist batch: after review each, item 1 is a new question at ask_choice_2, never a repeat of the batch "
+        "question, and headless takes its recommended option", _long_checklist_review_each_not_repeat)
 
 
 def _long_checklist_other():
@@ -4661,7 +4791,8 @@ try:
     check("review trust: review_route with untrusted items -> review_owner_judgment hard trigger, two options, ids only, ledgered",
           RU.get("_next") == "escalate_gate" and ESC.get("kind") == "review_owner_judgment" and ESC.get("hard_trigger") is True
           and [(o["text"], o["recommended"]) for o in ESC.get("options", [])] == [("Skip it and keep watching", False), ("Stop watching and report", True)]
-          and ESC.get("data") == {"items": UIDS, "untrusted": True} and RU.get("review_status") == "owner_judgment"
+          and ESC.get("data") == {"items": UIDS, "untrusted": True, "decision": "untrusted_authors"}
+          and RU.get("review_status") == "owner_judgment"
           and "not an owner, or a member or collaborator without write access" in ESC.get("question", "") and "read it on the PR" in ESC.get("question", "")
           and ledgered(RU, "review-watch: PR #99 untrusted threadcomment:C8 by eve (NONE), review:R7 by eve (CONTRIBUTOR), comment:I7 by eve (NONE) -> owner judgment"), RU)
     check("review trust: review_route keeps the trusted items for a later triage and marks nothing seen",

@@ -367,6 +367,7 @@ initial_state:
   code_dir_override: ''
   autonomous_digest: []
   autonomous_decisions: []
+  answered_decisions: []
   # --- phase F ---
   integration_checked: false
   final_integration_strikes: 0
@@ -1921,7 +1922,10 @@ nodes:
   escalate_gate:
     id: escalate_gate
     type: script
-    description: Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder.
+    description: >-
+      Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder,
+      unless the decision was already resolved autonomously (autonomous_decisions) or answered
+      (answered_decisions) in this task and phase -> tier 4.
     script: scripts/escalate_gate.py
     fallback: end_failure
 
@@ -2035,7 +2039,8 @@ nodes:
     description: >-
       Tier 4. Parks the run (A14), pings the owner ONCE (where the fork has a channel;
       top-level) and picks the terminal prompt; away top-level runs go through the
-      owner-remote-input tool first.
+      owner-remote-input tool first. A multiple-choice decision the run already answered
+      (answered_decisions) is asked at the typed prompt under the same decision key.
     script: scripts/ask_dispatch.py
     fallback: end_failure
 
@@ -2346,7 +2351,9 @@ nodes:
       interpret_reply; after that, unparseable re-asks (B22) then the free text
       stands; clears the parked marker; ledgers the decision. The headless reply
       takes the recommended option, or with none recommended goes to
-      headless_judge (at most STRIKE_LIMIT rulings per kind and task).
+      headless_judge (at most STRIKE_LIMIT rulings per kind and task); a decision
+      the run already answered (answered_decisions, not a hard trigger) goes to
+      headless_judge whatever its options recommend.
     script: scripts/parse_answer.py
     fallback: end_failure
 

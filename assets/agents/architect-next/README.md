@@ -124,23 +124,23 @@ environment assignment, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:791:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
+scripts/_lib.py:792:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
 scripts/gates.py:51:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:4980:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:4989:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:5050:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:5059:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1489:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:2219:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
-scripts/smoke_test.py:3001:u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", ...)
+scripts/smoke_test.py:1490:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:2271:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
+scripts/smoke_test.py:3054:u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:791` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:792` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:51` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:4980` and `:4989` are an English verb in prompt prose, and
+lockfile names), `gates.py:5050` and `:5059` are an English verb in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -486,26 +486,45 @@ an option or an accepted instruction with its reason. `interpret_route` applies 
 records it in the autonomous digest and carries the reason into the round it starts; a ruling
 that names no offered option or gives no reason gets one more ruling, then the run stops
 blocked with the question. Each kind and task is ruled on at most `STRIKE_LIMIT` (3) times.
-A one-more fix round on `integration_red` or `conformance_stuck` picked with no reason stated
-goes to the judge for one when the headless default, the ladder or the navigator picked it and
-the judge has rulings left for the question; any other bare pick runs as a plain fix round.
+A one-more round on `integration_red`, `conformance_stuck`, `integration_conflict`,
+`batch_strikeout`, `ci_exhausted` (past the fix cap), `gate2_stuck` or `gate1_stuck` picked
+with no reason stated goes to the judge for one when the headless default, the ladder or the navigator picked
+it and the judge has rulings left for the question; any other bare pick runs as a plain round.
 Under `escalation_policy=autonomous` a decision goes to the ladder once and to the owner after
 that, keyed `<decision>|<task>|<phase>` (`_decision_key`: the decision is `data.decision`,
-else `kind#index` for a multiple-choice question, else the kind; the phase is `run` during
+else `kind#index~digest` for a multiple-choice question, the digest a short hash of the
+question so a new queue that starts again at index 0 is a new decision while the same
+question asked again is not, else the kind; the phase is `run` during
 the run close-out and `task` otherwise) in the `autonomous_decisions` seed; the
 `answer_source` seed names who picked the answer (headless default, ladder, navigator or
 judge) and `apply_reasks` counts `apply_answer`'s re-asks, reset by every new escalation.
+A kind that asks more than one distinct question sets `data.decision` at each raise site
+(`promote_failed`, `git_setup_failed`, `gate_fault`, `ci_exhausted`, `review_owner_judgment`,
+`watch_visit_cap`, `review_read_truncated`), so two of its questions in one task keep
+separate keys. `apply_answer` records the key in the `answered_decisions` seed whenever it
+acts on an answer, never when it sends the reply to be read, asks the question again or
+hands it to the judge. A decision the run already answered that comes back is a repeat:
+`escalate_gate` counts it as failed once, so the autonomous ladder sends it to the owner;
+with no human, the engine's no-human reply sends it to the headless judge instead of the
+recommended option, unless it is a hard trigger or its kind has an approval node of its own
+(`OWN_PROMPT_KINDS`); and a repeated multiple-choice question, whose picker answers itself
+with no human, is asked at the typed prompt under the same `kind#index~digest` key.
 
 Verification commands the project cannot run as declared: a RED integration run (per task
 or at Phase F) hands the fix round the failing command and its exit. If the command cannot
 run here and the project documents another way to run the same check, the fix round reports
 `verification-command: <command> -- <path:line and why>`. At the next RED of that command the
 `verification_command` question asks whether to run the proposed command in its place, keep
-the declared one, or stop; no option is recommended, since the proposer is the fix round. The
+the declared one, or stop; no option is recommended, since the proposer does not settle it. The
 evidence reads the files the reason cites or names plus the convention files, only those git
 tracks and at most eight, showing the cited lines and each line holding the command or one of
-its words, each line cut to 300 characters. `integration_red`
-also accepts a `verification_command` instruction. An adopted replacement is recorded in
+its words, each line cut to 300 characters. `integration_red` and `verification_command` also
+accept a `verification_command` instruction from the owner or the headless judge. A typed
+replacement is never adopted unchecked: it raises a `verification_command` question naming who
+typed it, with its own documentation check in the evidence. Typing the open question's own
+replacement adopts it as the adopt option does. A different replacement typed on that question
+raises a fresh question once; past that, or for a replacement already decided, nothing is
+adopted and the open question is asked again for an option. An adopted replacement is recorded in
 `verification_changes` and listed in the final report and the PR summary, and every later gate
 runs it.
 
