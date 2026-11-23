@@ -132,6 +132,7 @@ pub(super) fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: Rewi
     {
         app.transcript.truncate(row.opener);
         app.set_composer_text(&row.title);
+        app.pasted_images.clear();
     }
     app.refresh_palette(Some(ctx));
     // The notice is a transcript cell, so it goes in after the cut or

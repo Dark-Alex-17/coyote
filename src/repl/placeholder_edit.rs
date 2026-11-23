@@ -71,7 +71,7 @@ impl PlaceholderDelete {
 
 /// The `[Image #N]` placeholders whose number names one of the `pasted`
 /// images, each with the index of its image.
-pub(super) fn recorded_placeholder_indices(
+pub(crate) fn recorded_placeholder_indices(
     line: &str,
     pasted: usize,
 ) -> impl Iterator<Item = (Range<usize>, usize)> + '_ {
@@ -94,7 +94,7 @@ pub(super) fn recorded_placeholders(
     recorded_placeholder_indices(line, pasted).map(|(span, _)| span)
 }
 
-pub(super) fn placeholder_ending_at(
+pub(crate) fn placeholder_ending_at(
     line: &str,
     cursor: usize,
     pasted: usize,
@@ -102,7 +102,7 @@ pub(super) fn placeholder_ending_at(
     recorded_placeholders(line, pasted).find(|span| span.end == cursor)
 }
 
-pub(super) fn placeholder_starting_at(
+pub(crate) fn placeholder_starting_at(
     line: &str,
     cursor: usize,
     pasted: usize,

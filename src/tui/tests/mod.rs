@@ -1,6 +1,7 @@
 mod child_live;
 mod command_timing;
 mod control;
+mod image_paste;
 mod lend;
 mod modal;
 mod mouse_and_copy;
@@ -1658,7 +1659,7 @@ fn a_pending_prefill_lands_in_the_composer_on_idle_return() {
     assert_eq!(ctx.pending_prefill, None);
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit("edited line".to_string()))
+        Some(Command::Submit("edited line".to_string(), Vec::new()))
     );
     assert_eq!(harness.app.composer_text(), "");
 }
@@ -3549,7 +3550,7 @@ fn enter_with_no_highlight_submits_the_line() {
     assert!(palette(&harness).is_some());
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit(".in".to_string()))
+        Some(Command::Submit(".in".to_string(), Vec::new()))
     );
     assert!(palette(&harness).is_none());
     assert!(harness.app.composer.is_empty());
@@ -3820,7 +3821,7 @@ fn submit(harness: &mut Harness, line: &str) {
     harness.type_text(line);
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit(line.to_string()))
+        Some(Command::Submit(line.to_string(), Vec::new()))
     );
 }
 
@@ -3845,7 +3846,7 @@ fn up_and_down_on_a_single_line_walk_the_history_around_the_draft() {
     assert_eq!(harness.app.composer_text(), "draft");
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit("draft".to_string()))
+        Some(Command::Submit("draft".to_string(), Vec::new()))
     );
     harness.press(KeyCode::Up);
     assert_eq!(harness.app.composer_text(), "draft");
@@ -4098,7 +4099,7 @@ fn vi_esc_enters_normal_mode_where_the_letters_move_delete_and_return_to_insert(
     harness.press(KeyCode::Esc);
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit("aXbcd".to_string()))
+        Some(Command::Submit("aXbcd".to_string(), Vec::new()))
     );
     assert_eq!(
         harness.app.vi_mode,
@@ -4489,7 +4490,7 @@ fn a_submitted_line_drops_the_focus_so_esc_interrupts_its_turn() {
     harness.type_text("next question");
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit("next question".to_string()))
+        Some(Command::Submit("next question".to_string(), Vec::new()))
     );
     assert!(!harness.app.transcript.focused());
 
@@ -4511,7 +4512,7 @@ fn enter_with_a_focused_row_and_a_draft_still_submits() {
     harness.type_text("next question");
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit("next question".to_string()))
+        Some(Command::Submit("next question".to_string(), Vec::new()))
     );
     assert!(matches!(
         &harness.app.transcript.cells()[1],
@@ -5899,7 +5900,7 @@ fn a_keys_macro_takes_the_keys_command_from_the_help() {
     harness.type_text(".keys");
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit(".keys".to_string()))
+        Some(Command::Submit(".keys".to_string(), Vec::new()))
     );
     assert!(harness.app.help_mut().is_none());
 
@@ -5972,7 +5973,7 @@ fn a_threads_macro_takes_the_threads_command() {
     harness.type_text(".threads");
     assert_eq!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit(".threads".to_string()))
+        Some(Command::Submit(".threads".to_string(), Vec::new()))
     );
     assert!(harness.app.overlay.is_none());
 }
@@ -5997,7 +5998,7 @@ fn the_keys_command_is_the_whole_line_or_nothing() {
         harness.app.set_composer_text(line);
         assert_eq!(
             harness.press(KeyCode::Enter),
-            Some(Command::Submit(line.to_string())),
+            Some(Command::Submit(line.to_string(), Vec::new())),
             "{line:?}"
         );
         assert!(harness.app.help_mut().is_none(), "{line:?}");

@@ -46,7 +46,7 @@ use crate::events::NoticeKind;
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
 use crate::function::jobs::JOB_KILL_GRACE;
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory};
-use crate::repl::is_command;
+use crate::repl::{is_command, recorded_placeholder_indices};
 use anyhow::Result;
 use bottom_pane::{
     PaletteSnapshot, PaletteState, PaletteView, RewindTarget, RewindView, SearchState, SearchView,
@@ -310,7 +310,9 @@ struct TurnStatus {
 /// Something the loop, not the app, has to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-    Submit(String),
+    /// A line to run, with the images pasted into it by path; its
+    /// `[Image #N]` names the Nth.
+    Submit(String, Vec<String>),
     /// A prompt typed during a turn; the loop offers it to the running
     /// turn's model.
     Queue(String),
@@ -345,6 +347,9 @@ pub(crate) enum Command {
         from: String,
         dropped: usize,
     },
+    /// Read the clipboard into the composer: its text, or a placeholder
+    /// for each image on it.
+    PasteImage,
     /// Take the chosen exchanges out of the session and the transcript
     /// and give the oldest one's prompt back to the composer.
     Rewind(RewindTarget),
@@ -392,6 +397,9 @@ pub(crate) struct App {
     transcript: Transcript,
     todo: TodoPanel,
     composer: Composer,
+    /// The images pasted into the draft, by path; its `[Image #N]` names
+    /// the Nth. Emptied whenever the draft is sent or replaced.
+    pasted_images: Vec<String>,
     /// Lines entered while a turn ran, oldest first; the loop submits
     /// what the model did not get, one per turn, once it ends.
     queued: Vec<QueuedLine>,
@@ -534,6 +542,7 @@ impl App {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
             composer: Composer::new(background, config.command_prefix),
+            pasted_images: Vec::new(),
             queued: Vec::new(),
             prompts: VecDeque::new(),
             lend_requests: Vec::new(),
@@ -877,6 +886,7 @@ impl App {
     /// walking, and it reopens with the first real edit.
     fn recall_history_entry(&mut self, text: &str) {
         self.composer.set_text(text);
+        self.pasted_images.clear();
         self.close_view();
         self.schedule_frame();
     }
@@ -906,6 +916,7 @@ impl App {
             return None;
         }
         self.composer.clear();
+        self.pasted_images.clear();
         self.palette_dirty = true;
         self.transcript.clear_focus();
         // The next line is typed, so the vi layer starts it in insert.
@@ -917,7 +928,9 @@ impl App {
         if self.take_ui_command() {
             return None;
         }
-        self.take_composer_line().map(Command::Submit)
+        let images = std::mem::take(&mut self.pasted_images);
+        self.take_composer_line()
+            .map(|line| Command::Submit(line, images))
     }
 
     fn queue_composer(&mut self) -> Option<Command> {
@@ -925,6 +938,9 @@ impl App {
             return None;
         }
         if self.take_ui_command() {
+            return None;
+        }
+        if self.keep_draft_with_images() {
             return None;
         }
         // `.keys` or `.threads` gets this far only when a macro of that
@@ -938,6 +954,25 @@ impl App {
             return self.take_composer_line().map(Command::RunNow);
         }
         self.hold_composer_line().map(Command::Queue)
+    }
+
+    /// A held line reaches the model as text only, so a draft naming a
+    /// pasted image stays in the composer, with a notice, until the turn
+    /// ends.
+    fn keep_draft_with_images(&mut self) -> bool {
+        let text = self.composer_text();
+        if recorded_placeholder_indices(&text, self.pasted_images.len())
+            .next()
+            .is_none()
+        {
+            return false;
+        }
+        self.transcript.push_notice(
+            self.notice_merge_from(),
+            NoticeKind::ToolWarning,
+            "A line with images waits for the turn to end; press Enter then".to_string(),
+        );
+        true
     }
 
     /// Takes a draft that is the `.keys` or `.threads` command and nothing
@@ -994,6 +1029,9 @@ impl App {
     /// it is not lost: it joins the end of the queue, so the two trade
     /// places.
     fn edit_queued(&mut self) -> Option<Command> {
+        if self.queued.is_empty() || self.keep_draft_with_images() {
+            return None;
+        }
         let line = self.queued.pop()?;
         let draft = self.hold_composer_line();
         self.set_composer_text(&line.text);
@@ -1220,6 +1258,7 @@ impl App {
             }
             Action::ClearComposer => {
                 self.set_composer_text("");
+                self.pasted_images.clear();
                 None
             }
             Action::DeleteToLineHead => {
@@ -1268,6 +1307,7 @@ impl App {
                 Some(Command::SetMouseCapture(self.mouse_capture))
             }
             Action::CopyToolOutput => self.copy_tool_output(),
+            Action::PasteImage => Some(Command::PasteImage),
             Action::Answer(answer) => {
                 self.answer_front(answer);
                 None
@@ -1337,9 +1377,12 @@ impl App {
                 None
             }
             Action::ComposerInput(key) => {
+                let deleted = self
+                    .composer
+                    .delete_placeholder(key, self.pasted_images.len());
                 // Tab on a command line asks for the palette rather than
                 // indenting the command.
-                if key.code != KeyCode::Tab || self.command_line().is_none() {
+                if !deleted && (key.code != KeyCode::Tab || self.command_line().is_none()) {
                     self.composer.input(key);
                 }
                 self.palette_dirty = true;

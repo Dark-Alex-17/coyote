@@ -7,13 +7,14 @@ pub(crate) mod replay;
 pub(crate) use self::completer::{ReplCompleter, command_candidates, macro_candidates, split_line};
 pub(crate) use self::highlighter::{CommandSpan, classify_command};
 use self::highlighter::{MacroNames, ReplHighlighter};
-use self::placeholder_edit::{
-    PlaceholderAwareEditMode, PlaceholderDelete, SharedLineSnapshot, recorded_placeholder_indices,
+use self::placeholder_edit::{PlaceholderAwareEditMode, PlaceholderDelete, SharedLineSnapshot};
+pub(crate) use self::placeholder_edit::{
+    placeholder_ending_at, placeholder_starting_at, recorded_placeholder_indices,
 };
 use self::prompt::ReplPrompt;
 
 use crate::client::{
-    Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
+    Message, MessageRole, Model, call_chat_completions, call_chat_completions_streaming,
     call_chat_completions_streaming_quiet, init_client, oauth,
 };
 use crate::config::{
@@ -2880,25 +2881,41 @@ fn clear_pending_images(ctx: &mut RequestContext) -> String {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum PasteOutcome {
+pub(crate) enum PasteOutcome {
     InsertText(String),
     Error(String),
     Nothing,
 }
 
+fn handle_clipboard_paste(ctx: &mut RequestContext, content: ClipboardContent) -> PasteOutcome {
+    let model = ctx.current_model().clone();
+    paste_clipboard_content(content, Some(&model), &mut ctx.pasted_images)
+}
+
 /// An image paste puts an `[Image #N]` placeholder at the cursor; the image
 /// is sent where the placeholder stands, and deleting the placeholder drops
-/// it.
-fn handle_clipboard_paste(ctx: &mut RequestContext, content: ClipboardContent) -> PasteOutcome {
-    let model = ctx.current_model();
+/// it. Each image's path is pushed onto `pasted`, so placeholder N names
+/// entry N-1. With no `model` to check, an image is taken whatever model
+/// is in use; the send refuses it later if that model cannot read images.
+pub(crate) fn paste_clipboard_content(
+    content: ClipboardContent,
+    model: Option<&Model>,
+    pasted: &mut Vec<String>,
+) -> PasteOutcome {
+    if let Some(model) = model
+        && !model.supports_vision()
+        && matches!(
+            content,
+            ClipboardContent::ImageFiles(_) | ClipboardContent::ImagePng(_)
+        )
+    {
+        return PasteOutcome::Error(vision_unsupported_message(model));
+    }
     let paths = match content {
         ClipboardContent::Text(text) => return PasteOutcome::InsertText(text),
         ClipboardContent::Empty => return PasteOutcome::Nothing,
         ClipboardContent::NonImageFiles(_) => {
             return PasteOutcome::Error("Copied files are not images.".into());
-        }
-        _ if !model.supports_vision() => {
-            return PasteOutcome::Error(vision_unsupported_message(model));
         }
         ClipboardContent::ImageFiles(paths) => {
             let cwd = env::current_dir().unwrap_or_default();
@@ -2917,8 +2934,8 @@ fn handle_clipboard_paste(ctx: &mut RequestContext, content: ClipboardContent) -
     let placeholders: Vec<String> = paths
         .into_iter()
         .map(|path| {
-            ctx.pasted_images.push(path);
-            image_marker(ctx.pasted_images.len())
+            pasted.push(path);
+            image_marker(pasted.len())
         })
         .collect();
     if placeholders.is_empty() {

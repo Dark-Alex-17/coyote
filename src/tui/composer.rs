@@ -6,8 +6,8 @@
 use super::keys::ViMotion;
 use super::theme::{DIM, Theme};
 use crate::config::CommandPrefix;
-use crate::repl::{CommandSpan, classify_command};
-use crossterm::event::KeyEvent;
+use crate::repl::{CommandSpan, classify_command, placeholder_ending_at, placeholder_starting_at};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -89,6 +89,39 @@ impl Composer {
 
     pub(super) fn input(&mut self, key: KeyEvent) {
         self.textarea.input(key);
+    }
+
+    /// Removes a whole `[Image #N]` naming one of the `pasted` images, as
+    /// the REPL does: Backspace the one ending at the cursor, Delete the
+    /// one starting there. False, with nothing changed, for any other key,
+    /// with no such placeholder there, or while text is selected, since a
+    /// selection is what the key then deletes.
+    pub(super) fn delete_placeholder(&mut self, key: KeyEvent, pasted: usize) -> bool {
+        if !key.modifiers.is_empty() || self.textarea.is_selecting() {
+            return false;
+        }
+        let cursor = self.textarea.cursor();
+        let line = &self.textarea.lines()[cursor.0];
+        let at = line
+            .char_indices()
+            .nth(cursor.1)
+            .map_or(line.len(), |(at, _)| at);
+        let span = match key.code {
+            KeyCode::Backspace => placeholder_ending_at(line, at, pasted),
+            KeyCode::Delete => placeholder_starting_at(line, at, pasted),
+            _ => None,
+        };
+        let Some(span) = span else {
+            return false;
+        };
+        let chars = line[span].chars().count();
+        if key.code == KeyCode::Backspace {
+            for _ in 0..chars {
+                self.textarea.move_cursor(CursorMove::Back);
+            }
+        }
+        self.textarea.delete_str(chars);
+        true
     }
 
     pub(super) fn insert_str(&mut self, text: &str) {

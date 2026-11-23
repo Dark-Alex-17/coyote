@@ -201,6 +201,9 @@ pub(crate) enum Action {
     ToggleMouse,
     /// Put the focused tool row's whole output on the clipboard.
     CopyToolOutput,
+    /// Read the clipboard into the composer: its text, or a placeholder
+    /// for each image on it.
+    PasteImage,
     Answer(PromptAnswer),
     /// Answer yes and remember it for the tool's later identical prompts.
     AnswerYesForSession,
@@ -432,6 +435,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Ctrl+O",
             "Edit the line in $VISUAL or $EDITOR, between turns",
         ),
+        row(
+            Composer,
+            "Ctrl+V / Alt+V",
+            "Attach the image on the clipboard",
+        ),
         row(Composer, "Ctrl+T", "Open the transcript view"),
         row(Composer, "Alt+T", "Show or hide the tasks pop-up"),
         row(Composer, "?", "Show this help, on an empty composer"),
@@ -490,7 +498,6 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Alt+< / Alt+>",
             "Start or end of the draft",
         ),
-        row(ComposerEditing, "Alt+V / Ctrl+V", "Move the cursor a page"),
         row(
             ComposerEditing,
             "Tab",
@@ -800,6 +807,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
             KeyCode::Char('r') if ctrl => Action::OpenHistorySearch,
+            KeyCode::Char('v') if ctrl => Action::PasteImage,
+            KeyCode::Char('v') if alt && !ctrl => Action::PasteImage,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
             KeyCode::Char('u') if ctrl => Action::DeleteToLineHead,
             // A legacy terminal sends Ctrl+_, Ctrl+/ and Ctrl+7 as one
@@ -962,11 +971,7 @@ mod tests {
     use super::*;
     use crate::config::CommandPrefix;
     use crate::tui::composer::Composer;
-    use crate::tui::theme::Theme;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
     use ratatui::style::Color;
-    use ratatui::widgets::Widget;
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -2615,6 +2620,14 @@ mod tests {
             ),
             (
                 H::Composer,
+                "Ctrl+V / Alt+V",
+                vec![
+                    (ctrl('v'), IDLE, Action::PasteImage),
+                    (alt(KeyCode::Char('v')), IDLE, Action::PasteImage),
+                ],
+            ),
+            (
+                H::Composer,
                 "Ctrl+T",
                 vec![(ctrl('t'), IDLE, Action::OpenPager)],
             ),
@@ -2728,14 +2741,6 @@ mod tests {
                 vec![
                     typed(alt(KeyCode::Char('<')), MULTI_LINE),
                     typed(alt(KeyCode::Char('>')), MULTI_LINE),
-                ],
-            ),
-            (
-                H::ComposerEditing,
-                "Alt+V / Ctrl+V",
-                vec![
-                    typed(alt(KeyCode::Char('v')), MULTI_LINE),
-                    typed(ctrl('v'), MULTI_LINE),
                 ],
             ),
             (
@@ -3418,8 +3423,7 @@ mod tests {
     }
 
     /// A draft primed with something to undo and to paste, its cursor
-    /// inside a word mid-way down, laid out two rows high so a page
-    /// step has somewhere to go.
+    /// inside a word mid-way down.
     fn primed_composer() -> Composer {
         let mut composer = Composer::new(Color::Reset, CommandPrefix::Dot);
         composer.set_text("one two three\n\nfour five six\nseven eight nine\n\nten eleven");
@@ -3429,10 +3433,6 @@ mod tests {
         composer.move_cursor(ViMotion::WordForward);
         composer.input(ctrl('k'));
         composer.move_cursor(ViMotion::Back);
-        let area = Rect::new(0, 0, 20, 3);
-        composer
-            .view(CommandPrefix::Dot, &[], &Theme::fallback(true), false)
-            .render(area, &mut Buffer::empty(area));
         composer
     }
 
@@ -3712,6 +3712,8 @@ mod tests {
             &always[..],
             &[
                 "Ctrl+R",
+                "Ctrl+V",
+                "Alt+V",
                 "Ctrl+Up",
                 "Ctrl+Down",
                 "Ctrl+Alt+Up",

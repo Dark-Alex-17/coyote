@@ -11,9 +11,11 @@ use super::terminal::Screen;
 use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, redirect, render};
 use crate::config::{CommandPrefix, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
-use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command};
+use crate::repl::{
+    EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, PasteOutcome, is_command, paste_clipboard_content,
+};
 use crate::supervisor::notification::{NotificationQueue, SystemNotification};
-use crate::utils::{AbortSignal, create_abort_signal};
+use crate::utils::{AbortSignal, ClipboardContent, create_abort_signal};
 use anyhow::{Result, bail};
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
@@ -245,16 +247,20 @@ fn is_setting(line: &str, prefix: CommandPrefix) -> bool {
 }
 
 /// Sends `line` off with the context as a turn, keeping a fork of the
-/// context for the commands that run beside it.
+/// context for the commands that run beside it. `images` are the paths
+/// pasted into the line, which the REPL dispatch resolves its
+/// `[Image #N]` placeholders against.
 fn start_turn(
     app: &mut App,
-    ctx: RequestContext,
+    mut ctx: RequestContext,
     immediate: &mut ImmediateCommands,
     abort: &AbortSignal,
     tx: &UnboundedSender<UiMsg>,
     line: String,
+    images: Vec<String>,
 ) -> Task {
     abort.reset();
+    ctx.pasted_images = images;
     let command = is_command(&line, ctx.app.config.command_prefix);
     app.begin_turn(&line, command);
     immediate.turn_started(&ctx);
@@ -966,6 +972,35 @@ pub(super) fn copy_notice(
     (NoticeKind::Checkpoint, notice)
 }
 
+/// Reads the clipboard through `read` into the composer as the REPL's
+/// paste key does: text as a paste, an image as a placeholder. The model
+/// is checked only while the context is in hand; during a turn the send
+/// checks it instead.
+pub(super) fn paste_clipboard_with(
+    app: &mut App,
+    ctx: Option<&RequestContext>,
+    read: impl FnOnce() -> Result<ClipboardContent>,
+) {
+    let outcome = match read() {
+        Ok(content) => paste_clipboard_content(
+            content,
+            ctx.map(RequestContext::current_model),
+            &mut app.pasted_images,
+        ),
+        Err(err) => PasteOutcome::Error(format!("Clipboard unavailable: {err:#}")),
+    };
+    match outcome {
+        PasteOutcome::InsertText(text) => {
+            app.handle_input(events::TermInput::Paste(text));
+        }
+        PasteOutcome::Nothing => {}
+        PasteOutcome::Error(text) => app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::ToolWarning,
+            text,
+        }),
+    }
+}
+
 /// Replaces the event stream, dropping the old one first. Constructing a
 /// crossterm stream takes the shared reader lock, and the old stream's
 /// pending poll holds that lock until the stream is dropped (dropping it
@@ -1077,9 +1112,17 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             Step::Input(Some(Ok(event))) => {
                 let command = app.handle_input(events::classify(event));
                 match command {
-                    Some(Command::Submit(line)) => {
+                    Some(Command::Submit(line, images)) => {
                         if let Some(ctx) = ctx.take() {
-                            task = Some(start_turn(app, ctx, &mut immediate, abort, tx, line));
+                            task = Some(start_turn(
+                                app,
+                                ctx,
+                                &mut immediate,
+                                abort,
+                                tx,
+                                line,
+                                images,
+                            ));
                         } else {
                             // Submit is not mapped while a task holds the
                             // context; should that ever change, the draft
@@ -1197,6 +1240,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         from,
                         dropped,
                     }) => copy_and_report(app, screen, &text, &from, dropped),
+                    Some(Command::PasteImage) => {
+                        paste_clipboard_with(app, ctx.as_ref(), crate::utils::read_for_paste);
+                    }
                     Some(Command::Rewind(target)) => {
                         if let Some(ctx) = ctx.as_mut() {
                             apply_rewind(app, ctx, target);
@@ -1265,6 +1311,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                                         abort,
                                         tx,
                                         line,
+                                        Vec::new(),
                                     ));
                                 }
                             }
@@ -1325,7 +1372,15 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             && let Some(line) = immediate.take_idle_line()
             && let Some(idle) = ctx.take()
         {
-            task = Some(start_turn(app, idle, &mut immediate, abort, tx, line));
+            task = Some(start_turn(
+                app,
+                idle,
+                &mut immediate,
+                abort,
+                tx,
+                line,
+                Vec::new(),
+            ));
         }
         if quit_requested
             && task.is_none()

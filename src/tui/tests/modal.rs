@@ -289,7 +289,7 @@ fn enter_right_after_submitting_does_not_answer_a_fresh_confirm() {
     harness.clock.advance(HOTKEY_IDLE);
     assert!(matches!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit(_))
+        Some(Command::Submit(..))
     ));
     let asker = ask_on_a_thread(&mut harness, confirm_request(None));
     assert_eq!(harness.press(KeyCode::Enter), None);
@@ -331,7 +331,7 @@ fn enter_ignored_during_a_turn_still_arms_the_idle_gate_for_a_fresh_confirm() {
     harness.clock.advance(HOTKEY_IDLE);
     assert!(matches!(
         harness.press(KeyCode::Enter),
-        Some(Command::Submit(_))
+        Some(Command::Submit(..))
     ));
     harness.app.begin_turn("call the tool", false);
     harness.clock.advance(HOTKEY_IDLE);
