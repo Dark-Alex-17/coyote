@@ -19296,6 +19296,80 @@ mod tests {
         second.stop().await;
     }
 
+    /// The one relay flaps: it goes away and comes back on the same port, forgetting every
+    /// path it held. A's client reconnects and the path it held to B rests on an
+    /// interface that came back since, so it is marked suspect. The next request from A
+    /// asks the network first and its link comes up, with nothing typed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_the_relay_flaps_the_next_request_lands_with_nothing_typed() {
+        use crate::mesh::card::StatusError;
+        use crate::mesh::test_support::wait_for_peer;
+
+        install_log_collector();
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let port = relay.port;
+        let a =
+            RelayNode::start_watched("node-flap-a", private_config(port), short_connect(), true)
+                .await;
+        let b =
+            RelayNode::start_watched("node-flap-b", private_config(port), short_connect(), true)
+                .await;
+        wait_for_peer(&a.runtime, &b.hash).await;
+        let transport = a.runtime.transport_handle().await.unwrap();
+        let b_hash = AddressHash::new_from_hex_string(&b.hash).unwrap();
+        assert!(transport.path_interface(&b_hash).await.is_some());
+        a.expire_announce_floor().await;
+        b.expire_announce_floor().await;
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on_with_retries(port, 0).await;
+        wait_for_mesh_line(
+            &a.notifier,
+            &format!("{} reconnected; announced", private_label(port)),
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !a.runtime.route_book().is_marked(&b.hash) {
+            assert!(
+                Instant::now() < deadline,
+                "the path over the returned relay was never marked suspect"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        wait_for_mesh_line(
+            &b.notifier,
+            &format!("{} reconnected; announced", private_label(port)),
+        )
+        .await;
+        assert!(
+            a.runtime.route_book().is_marked(&b.hash),
+            "still marked before the request"
+        );
+
+        let desc = a.runtime.resolve_destination(&b.hash).await.unwrap();
+        let answered = a.runtime.request_status(Route::unasked(desc)).await;
+        assert!(
+            !matches!(
+                answered,
+                Err(StatusError::Transport(
+                    RequestError::LinkActivationTimeout { .. }
+                        | RequestError::LinkNotOpened(_)
+                        | RequestError::LinkFailed(_)
+                ))
+            ),
+            "the request after the relay flapped failed: {answered:?}"
+        );
+        assert!(
+            !a.runtime.route_book().is_marked(&b.hash),
+            "the mark was taken"
+        );
+
+        assert!(a.slot.stop().await.unwrap());
+        b.runtime.shutdown().await.unwrap();
+        relay.stop().await;
+    }
+
     /// Two nodes on a fresh relay, both heard by it, connected long enough that the
     /// transport counts the relay's stop as a drop and not as a failed connect.
     #[cfg(unix)]
