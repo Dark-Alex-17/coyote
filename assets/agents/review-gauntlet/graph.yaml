@@ -404,6 +404,8 @@ nodes:
     # timeouts) is not derived here — deliberately out of scope for this
     # change; tracked as a follow-up.
     timeout: 11400
+    inputs:
+      project_dir: '{{project_dir}}'
     prompt: |
       Review the code changes in {{project_dir}} (diff: {{diff_spec}}) as an
       independent post-implementation review.
@@ -435,6 +437,7 @@ nodes:
     # change; tracked as a follow-up.
     timeout: 10600
     inputs:
+      project_dir: '{{project_dir}}'
       verification_commands: '{{verification_commands}}'
       build_lock: '{{build_lock}}'
       debris_exclude: '{{debris_exclude}}'
@@ -465,6 +468,8 @@ nodes:
     description: Security review lane.
     agent: security-reviewer
     timeout: 7200
+    inputs:
+      project_dir: '{{project_dir}}'
     prompt: |
       Security review of the code changes in {{project_dir}} (diff: {{diff_spec}}).
 
@@ -486,6 +491,8 @@ nodes:
     description: Black-box usage-pattern verification lane.
     agent: probe
     timeout: 7200
+    inputs:
+      project_dir: '{{project_dir}}'
     prompt: |
       Usage-pattern verification (black-box probe) of the changes in
       {{project_dir}} (diff: {{diff_spec}}).

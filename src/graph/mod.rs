@@ -21,6 +21,7 @@ pub mod user_interaction;
 pub mod validator;
 
 use crate::client::ApiStatusError;
+use crate::config::AgentVariable;
 use anyhow::Error;
 pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
@@ -109,6 +110,23 @@ pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
 /// State keys the dispatcher overwrites on every run; agent-node `inputs`
 /// may not pass them.
 pub(crate) const RESERVED_STATE_KEYS: [&str; 2] = ["initial_prompt", "previous_turns"];
+
+/// The agent-node `inputs` keys a config agent (config.yaml, no graph.yaml)
+/// refuses, sorted: it has no graph state, so an input can only be seated as
+/// one of its declared variables.
+pub(crate) fn undeclared_config_inputs<'a>(
+    declared: &[AgentVariable],
+    keys: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let mut undeclared: Vec<String> = keys
+        .into_iter()
+        .filter(|key| !declared.iter().any(|variable| &variable.name == *key))
+        .cloned()
+        .collect();
+    undeclared.sort_unstable();
+    undeclared
+}
+
 /// Environment variable carrying the serialized state to a script node when
 /// it fits; otherwise `GRAPH_STATE_FILE_ENV` names a temp file holding it.
 pub(super) const GRAPH_STATE_ENV: &str = "GRAPH_STATE";
@@ -152,6 +170,27 @@ mod tests {
     #[test]
     fn wall_clock_nonzero_is_that_many_seconds() {
         assert_eq!(wall_clock(7), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn undeclared_config_inputs_lists_only_undeclared_keys_sorted() {
+        let declared: Vec<AgentVariable> = ["project_dir", "build_lock"]
+            .into_iter()
+            .map(|name| AgentVariable {
+                name: name.to_string(),
+                description: String::new(),
+                default: None,
+                value: String::new(),
+            })
+            .collect();
+        let keys = ["worktree", "project_dir", "cadence"].map(String::from);
+
+        assert_eq!(
+            undeclared_config_inputs(&declared, &keys),
+            ["cadence", "worktree"]
+        );
+        assert!(undeclared_config_inputs(&declared, &keys[1..2]).is_empty());
+        assert_eq!(undeclared_config_inputs(&[], &keys[1..2]), ["project_dir"]);
     }
 
     #[test]
