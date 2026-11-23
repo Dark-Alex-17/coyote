@@ -1037,6 +1037,11 @@ fn hooks_page_lists_the_call_id_on_every_tool_event() {
         dispatch.find("publish_hook_event(").unwrap() < dispatch.find("fire_resolved(").unwrap(),
         "a typed event is published before its shell hooks run"
     );
+    let fire = fn_body(&hooks, "pub fn fire(");
+    assert!(
+        fire.find("publish_hook_event(").unwrap() < fire.find("if resolved.is_empty()").unwrap(),
+        "fire publishes before it looks for shell hooks"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Hooks.md"));

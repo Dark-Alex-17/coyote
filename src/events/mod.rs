@@ -58,7 +58,6 @@ pub enum NoticeKind {
     ToolWarning,
 }
 
-/// How an agent's run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutcome {
     Completed,
