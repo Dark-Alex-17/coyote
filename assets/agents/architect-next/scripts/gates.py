@@ -4240,25 +4240,23 @@ def _with_reason(request, reason):
     return request
 
 
-ONE_MORE_NO_REASON = ("the one-more option was taken with no reason stated; pick it again with the reason it should "
-                      "land this time, or another option")
-
-
-def _one_more_to_judge(state, u, esc, answer, options):
-    """Route a one-more fix round picked with no reason to the headless judge when the headless default, the ladder
-    or the navigator picked it and the judge has rulings left for the question; True when routed. Any other bare pick
-    is ledgered and runs as a plain fix round."""
+def _one_more_to_judge(state, u, esc, answer, options, what="fix round"):
+    """Route a one-more round (`what` names it, e.g. "rebase cycle") picked with no reason to the headless judge when
+    the headless default, the ladder or the navigator picked it and the judge has rulings left for the question; True
+    when routed. Any other bare pick is ledgered and runs as a plain round."""
     if _owner_reason(state, answer, options):
         return False
     kind, source = esc.get("kind", ""), state.get("answer_source") or ""
     if (source in ("headless", "ladder", "navigator")
             and as_int(as_dict(state.get("judge_rulings")).get(_judge_key(esc))) < STRIKE_LIMIT):
-        fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": ONE_MORE_NO_REASON}}
+        fault = (f"one more {what} was picked with no reason stated; pick it again with the reason it should land this "
+                 "time, or another option")
+        fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": fault}}
         u["escalation"] = fixed
-        ledger(state, u, f"{kind}: one more fix round picked by the {source} with no reason stated -> headless judge")
+        ledger(state, u, f"{kind}: one more {what} picked by the {source} with no reason stated -> headless judge")
         _to_headless_judge(state, u, fixed)
         return True
-    ledger(state, u, f"{kind}: one more fix round with no reason stated -> plain fix round")
+    ledger(state, u, f"{kind}: one more {what} with no reason stated -> plain {what}")
     return False
 
 
@@ -4465,7 +4463,9 @@ def apply_answer(state):
             ledger(state, u, "gate2: owner override - promoting a REJECTed plan (recorded)")
             u["gate2_verdict"] = "OKAY"
             u["_next"] = "reseal_return"
-        elif _named_option(answer, gate2_options) == GATE2_ANOTHER_ROUND:
+        elif _named_option(answer, gate2_options) != GATE2_ANOTHER_ROUND:
+            _ask_again(state, u, esc, answer)
+        elif not _one_more_to_judge(state, u, esc, answer, gate2_options, "Gate 2 fix round"):
             reason = _owner_reason(state, answer, gate2_options)
             ledger(state, u, "gate2: another fix round on the oracle's rejection"
                              + (f": {trim_items(reason, 300)}" if reason else ""))
@@ -4480,8 +4480,6 @@ def apply_answer(state):
             queue_amendments(u, "gate2", [_oracle_complaint(state.get("gate2_result") or "", rejects)]
                              + ([f"Owner's reason for another fix round: {reason}"] if reason else []))
             u["_next"] = "amend_plan"
-        else:
-            _ask_again(state, u, esc, answer)
     elif kind == "gate_fault":
         gate = as_dict(esc.get("data")).get("gate", "gate1")
         if _picked_key(answer, options, {"retry": ["retry"]}) == "retry":
@@ -4694,11 +4692,12 @@ def apply_answer(state):
         batch = state.get("current_batch") or ""
         bs = dict(as_dict(state.get("batch_state")))
         if a == "round":
-            reason = _continue_past_cap(state, u, answer, options, f"batch_strikeout:{batch}", f"batch: one more batch round on {batch} past the strike cap")
-            # batch_fix_route counts this round's strike, so the cap asks again after it
-            bs[batch] = {**as_dict(bs.get(batch)), "strikes": STRIKE_LIMIT - 1, "owner_reason": reason}
-            u["batch_state"] = bs
-            u["_next"] = "batch_fix_route"
+            if not _one_more_to_judge(state, u, esc, answer, options, f"batch round on {batch}"):
+                reason = _continue_past_cap(state, u, answer, options, f"batch_strikeout:{batch}", f"batch: one more batch round on {batch} past the strike cap")
+                # batch_fix_route counts this round's strike, so the cap asks again after it
+                bs[batch] = {**as_dict(bs.get(batch)), "strikes": STRIKE_LIMIT - 1, "owner_reason": reason}
+                u["batch_state"] = bs
+                u["_next"] = "batch_fix_route"
         elif a == "accept":
             bs.setdefault(batch, {})["passed"] = True
             u["batch_state"] = bs
@@ -4747,7 +4746,8 @@ def apply_answer(state):
         a = ("abort" if abort else "stop" if stop
              else _picked_key(answer, options, {"round": ["one more", "cycle", "round"], "abort": ["abort"], "stop": ["stop"]}))
         if a == "round":
-            if kind == "integration_conflict" or not _one_more_to_judge(state, u, esc, answer, options):
+            what = "rebase cycle" if kind == "integration_conflict" else "fix round"
+            if not _one_more_to_judge(state, u, esc, answer, options, what):
                 _integration_round(state, u, esc, answer, options, task)
         elif a == "abort":
             task["status"] = "failed"
@@ -4821,7 +4821,8 @@ def apply_answer(state):
     elif kind == "ci_exhausted" and as_dict(esc.get("data")).get("over"):
         a = "leave" if stop else _picked_key(answer, options, {"fix": ["resume"], "leave": ["leave", "stop watching"]})
         if a == "fix":
-            _ci_fix_past_cap(state, u, esc, answer, options)
+            if not _one_more_to_judge(state, u, esc, answer, options, "CI fix round"):
+                _ci_fix_past_cap(state, u, esc, answer, options)
         elif a == "leave":
             _ci_leave(state, u, kind)
         else:

@@ -3737,7 +3737,10 @@ CAP_CASES = {
                         dict(current_batch="B1", tasks=copy.deepcopy(ts_b), batch_state={"B1": {"strikes": STRIKE_LIMIT + 1}})),
     "ci_exhausted": (E_CE, E_CE_SPENT, "Resume with one more coder fix round (state reason)", "ci_exhausted:99:test",
                      dict(pr_number="99", tasks=ts_f, ci_owning_task=T1, ci_fix_strikes={"99": {"test": STRIKE_LIMIT + 1}})),
+    "gate2_stuck": (E_G2, g2_spent.get("escalation"), "Another fix round (state reason)", "gate2_stuck",
+                    dict(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT + 1)),
 }
+CAP_ROUND_NEXT = ("fix_round", "batch_fix_route", "amend_plan")
 for name, (first, spent, more, key, ctx) in CAP_CASES.items():
     check(f"{name}: the continue option is first and recommended at the cap; after {STRIKE_LIMIT} continues none is, with the cap-spent note",
           _cap_offer(first) == (more, [more]) and _cap_offer(spent) == (more, [])
@@ -3745,16 +3748,14 @@ for name, (first, spent, more, key, ctx) in CAP_CASES.items():
           (_cap_offer(first), _cap_offer(spent)))
     v = AA(first["kind"], more, esc=first, last_answer_text="1 - the last round found a new cause", cap_continues={}, **copy.deepcopy(ctx))
     check(f"apply_answer: {name} continue with a reason -> a real round dispatched, the reason ledgered, one continue counted",
-          v["_next"] in ("fix_round", "batch_fix_route") and any("the last round found a new cause" in d for d in v.get("decisions", []))
+          v["_next"] in CAP_ROUND_NEXT and any("the last round found a new cause" in d for d in v.get("decisions", []))
           and _lib.as_dict(v.get("cap_continues")).get(key) == 1, (v["_next"], v.get("cap_continues"), v.get("decisions")))
     s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
     s.update(gates.parse_answer(s))
     picked = s.get("last_answer")
     s.update(gates.apply_answer(s))
-    # a bare one-more pick on integration_red goes to the headless judge for its reason
-    expect = ("headless_judge",) if first["kind"] == "integration_red" else ("fix_round", "batch_fix_route")
-    check(f"headless: {name} guidance picks the continue option and dispatches the round, or asks the judge for a reason",
-          picked == more and s["_next"] in expect, (picked, s["_next"]))
+    check(f"headless: {name} guidance picks the continue option, which asks the judge for a reason",
+          picked == more and s["_next"] == "headless_judge", (picked, s["_next"]))
 cc_ = {n: AA(c[0]["kind"], c[2], esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
 fr_ = {n: _lib.as_dict(v.get("fix_request")) for n, v in cc_.items()}
 check("apply_answer: integration_conflict continue -> a rebase fix round for the task, back to integration, one cycle before it asks again",
@@ -3774,37 +3775,43 @@ def ledgered(u, line):
     return any(line in d for d in u.get("decisions", []))
 
 
-for name in ("integration_red", "integration_red at Phase F"):
+ONE_MORE_WHAT = {"integration_conflict": "rebase cycle", "integration_red": "fix round", "integration_red at Phase F": "fix round",
+                 "batch_strikeout": "batch round on B1", "ci_exhausted": "CI fix round", "gate2_stuck": "Gate 2 fix round"}
+ONE_MORE_UNTOUCHED = ("cap_continues", "task_rounds", "final_integration_strikes", "batch_state", "ci_fix_strikes", "oracle_rejects",
+                      "amend_counts", "amend_cycles", "pending_amendments", "fix_request")
+for name, what in ONE_MORE_WHAT.items():
     first, _, more, key, ctx = CAP_CASES[name]
+    kind = first["kind"]
     s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
     s.update(gates.parse_answer(s))
     source = s.get("answer_source")
     v = gates.apply_answer(s)
-    check(f"headless: {name} one more with no reason stated -> the headless judge, no continue counted, strikes unchanged",
+    check(f"headless: {name} one more with no reason stated -> the headless judge, no continue counted, state unchanged",
           source == "headless" and v["_next"] == "headless_judge"
           and _lib.as_dict(_lib.as_dict(v.get("escalation")).get("data")).get("judge_fault")
-          and "cap_continues" not in v and "task_rounds" not in v and "final_integration_strikes" not in v
-          and ledgered(v, "integration_red: one more fix round picked by the headless with no reason stated -> headless judge"),
+          and not set(ONE_MORE_UNTOUCHED) & set(v)
+          and ledgered(v, f"{kind}: one more {what} picked by the headless with no reason stated -> headless judge"),
           (source, v["_next"], v.get("decisions")))
     s.update(v)
     s.update({"reply_verdict": "option", "reply_option": more, "reply_reason": R82_JUDGE})
     s.update(gates.interpret_route(s))
     source = s.get("answer_source")
     s.update(gates.apply_answer(s))
-    check(f"headless judge: {name} one more with its reason -> a fix round carrying the reason, one continue counted",
-          source == "judge" and s["_next"] == "fix_round" and any(R82_JUDGE in i for i in s["fix_request"]["items"])
+    carried = repr((s.get("fix_request"), s.get("batch_state"), s.get("pending_amendments")))
+    check(f"headless judge: {name} one more with its reason -> the round runs carrying the reason, one continue counted",
+          source == "judge" and s["_next"] in CAP_ROUND_NEXT and R82_JUDGE in carried
           and _lib.as_dict(s.get("cap_continues")).get(key) == 1, (source, s["_next"], s.get("cap_continues")))
     v = AA(first["kind"], more, esc=first, cap_continues={}, answer_source="", **copy.deepcopy(ctx))
-    check(f"apply_answer: {name} owner one more with no reason stated -> a plain fix round, ledgered",
-          v["_next"] == "fix_round" and _lib.as_dict(v.get("cap_continues")).get(key) == 1
-          and ledgered(v, "integration_red: one more fix round with no reason stated -> plain fix round"), (v["_next"], v.get("decisions")))
+    check(f"apply_answer: {name} owner one more with no reason stated -> a plain round, ledgered",
+          v["_next"] in CAP_ROUND_NEXT and _lib.as_dict(v.get("cap_continues")).get(key) == 1
+          and ledgered(v, f"{kind}: one more {what} with no reason stated -> plain {what}"), (v["_next"], v.get("decisions")))
     s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
     spent = next(iter(_lib.as_dict(gates.apply_answer({**s, **gates.parse_answer(s)}).get("judge_rulings"))), "")
     v = AA(first["kind"], more, esc=first, cap_continues={}, answer_source="headless", judge_rulings={spent: STRIKE_LIMIT},
            **copy.deepcopy(ctx))
-    check(f"apply_answer: {name} headless one more with the judge's rulings spent -> a plain fix round, ledgered",
-          spent and v["_next"] == "fix_round"
-          and ledgered(v, "integration_red: one more fix round with no reason stated -> plain fix round"), (spent, v["_next"]))
+    check(f"apply_answer: {name} headless one more with the judge's rulings spent -> a plain round, ledgered",
+          spent and v["_next"] in CAP_ROUND_NEXT and _lib.as_dict(v.get("cap_continues")).get(key) == 1
+          and ledgered(v, f"{kind}: one more {what} with no reason stated -> plain {what}"), (spent, v["_next"]))
 s = base_state(escalation=e5, last_answer_text=HG, current_task=T1, tasks=tasks_with(), task_rounds=s5["task_rounds"])
 s.update(gates.parse_answer(s))
 v = gates.apply_answer(s)
@@ -3852,7 +3859,9 @@ check("apply_answer: ci_exhausted continue -> a coder fix round for the owning t
       cc_["ci_exhausted"]["_next"] == "fix_round" and fr_["ci_exhausted"].get("task") == T1 and fr_["ci_exhausted"].get("return_to") == "ci"
       and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
       (cc_["ci_exhausted"]["_next"], fr_["ci_exhausted"], cc_["ci_exhausted"].get("ci_fix_strikes")))
-ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
+# gate2_stuck asks again on such a reply; its own check sits with the other gate2_stuck rows
+ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()
+        if n != "gate2_stuck"}
 check("apply_answer: a reply that picks none of a cap's options goes to interpret_reply, never stopped",
       all(v["_next"] == "interpret_reply" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
       {n: v["_next"] for n, v in ask_.items()})
