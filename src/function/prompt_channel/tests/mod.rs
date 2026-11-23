@@ -542,10 +542,12 @@ fn answer_value_serialises_every_answer_shape() {
     );
     assert_eq!(answer_value(&Ok(PromptAnswer::Cancelled)), Value::Null);
     assert_eq!(answer_value(&Ok(PromptAnswer::Interrupted)), Value::Null);
+    assert_eq!(answer_value(&Ok(PromptAnswer::NeedsHuman)), Value::Null);
     assert_eq!(answer_value(&Err(anyhow!("boom"))), Value::Null);
 }
 
-/// A tool sees a Ctrl-C exactly as an Esc: either fits every action.
+/// A tool sees a Ctrl-C exactly as an Esc, and a run with no human as
+/// either: each fits every action and is answered null.
 #[test]
 fn a_cancel_or_an_interrupt_fits_every_action() {
     for action in [
@@ -557,6 +559,7 @@ fn a_cancel_or_an_interrupt_fits_every_action() {
     ] {
         assert!(fits(action, &PromptAnswer::Cancelled), "{action:?}");
         assert!(fits(action, &PromptAnswer::Interrupted), "{action:?}");
+        assert!(fits(action, &PromptAnswer::NeedsHuman), "{action:?}");
     }
 }
 

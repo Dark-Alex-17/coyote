@@ -177,7 +177,10 @@ fn fits(action: PromptAction, answer: &PromptAnswer) -> bool {
                 PromptAction::Input | PromptAction::Password,
                 PromptAnswer::Text(_)
             )
-            | (_, PromptAnswer::Cancelled | PromptAnswer::Interrupted)
+            | (
+                _,
+                PromptAnswer::Cancelled | PromptAnswer::Interrupted | PromptAnswer::NeedsHuman
+            )
     )
 }
 
