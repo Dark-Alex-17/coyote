@@ -5,7 +5,8 @@
 //! state. An agent node's `inputs:` for a variable the child declares
 //! outranks the inherited value in both places and is what the child's own
 //! children inherit. A value the parent only holds as its own declared
-//! default is not passed on.
+//! default is not passed on. A config child is seated the same way, seen
+//! through its instructions, which the dry-run client echoes back.
 //!
 //! Unix only: the child's script node runs through `bash`.
 #![cfg(unix)]
@@ -250,6 +251,31 @@ fn a_parents_own_default_is_not_passed_to_the_child() {
     let line = child_line("default", None, false, &[]);
 
     assert_eq!(line, "CHILD env=[child-default] state=[child-default]");
+}
+
+#[test]
+fn agent_node_inputs_seat_a_config_childs_declared_variable() {
+    let dir = fresh_dir("config-child");
+    write_fixture(&dir.0, Some("build_lock: from-inputs"), false);
+    let child_dir = dir.0.join("agents").join(CHILD);
+    fs::remove_file(child_dir.join("graph.yaml")).unwrap();
+    fs::write(
+        child_dir.join("config.yaml"),
+        format!(
+            "name: {CHILD}\n\
+             instructions: 'CHILD var=[{{{{build_lock}}}}]'\n\
+             variables:\n\
+             \x20 - name: build_lock\n\
+             \x20   description: gate prefix\n\
+             \x20   default: child-default\n"
+        ),
+    )
+    .unwrap();
+
+    let out = run_parent(&dir.0, &["--agent-variable", "build_lock", "from-cli"]);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(child_lines(&out.stdout), ["CHILD var=[from-inputs]"]);
 }
 
 fn child_lines(stdout: &[u8]) -> Vec<String> {
