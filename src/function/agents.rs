@@ -814,8 +814,7 @@ impl Drop for CancelOnDrop {
 
 /// Runs a child agent to completion. When the child is a graph agent,
 /// `graph_inputs` is overlaid on its `initial_state` before the graph
-/// starts. Passing inputs to a config-only agent is rejected before the
-/// child runs, since nothing could consume them.
+/// starts; a config child has no graph state and ignores them.
 fn run_child_agent_with_graph_inputs(
     mut child_ctx: RequestContext,
     initial_input: Input,
@@ -1113,8 +1112,9 @@ fn effective_max_agent_depth(parent_ctx: &RequestContext) -> usize {
 /// output. This is similar to `handle_spawn` but runs the child agent in the
 /// current task (no tokio::spawn, no supervisor handle registration) so the
 /// graph executor can sequence agent nodes directly.
-/// `graph_inputs` seeds the child's graph state and is only accepted when the
-/// target is a graph agent.
+/// `graph_inputs` seeds a graph child's state; a key the child declares as a
+/// variable is also seated as that variable. A config child accepts only
+/// keys it declares.
 pub async fn run_agent_for_graph(
     parent_ctx: &mut RequestContext,
     agent_name: &str,
@@ -1212,12 +1212,26 @@ pub async fn run_agent_for_graph(
         agent.set_instructions_appendix(roster);
     }
     child_ctx.agent = Some(agent);
-    if graph_inputs.is_some() && graph::active_agent_graph_name(&child_ctx).is_none() {
-        bail!(
-            "agent '{agent_name}' has no graph.yaml; `inputs:` is only valid on agent nodes that target a graph agent"
-        );
-    }
     if let Some(inputs) = graph_inputs.as_ref() {
+        let declared = child_ctx
+            .agent
+            .as_ref()
+            .map(Agent::defined_variables)
+            .unwrap_or_default();
+        if graph::active_agent_graph_name(&child_ctx).is_none() {
+            if inputs.is_empty() {
+                bail!(
+                    "agent '{agent_name}': `inputs:` is empty; a config agent takes only its declared variables as `inputs:`"
+                );
+            }
+            let undeclared = graph::undeclared_config_inputs(declared, inputs.keys());
+            if !undeclared.is_empty() {
+                bail!(
+                    "agent '{agent_name}': `inputs` names undeclared variable(s) {}; a config agent takes only its declared variables as `inputs:`",
+                    undeclared.join(", ")
+                );
+            }
+        }
         for key in graph::RESERVED_STATE_KEYS {
             if !inputs.contains_key(key) {
                 continue;
@@ -1231,11 +1245,6 @@ pub async fn run_agent_for_graph(
                 "agent '{agent_name}': `inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})"
             );
         }
-        let declared = child_ctx
-            .agent
-            .as_ref()
-            .map(Agent::defined_variables)
-            .unwrap_or_default();
         let seated = declared_inputs_as_variables(declared, inputs);
         merge_spawn_variables(&mut child_ctx.agent_variables, seated);
     }
@@ -4506,7 +4515,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn run_agent_for_graph_rejects_inputs_for_config_only_agent() {
+    fn run_agent_for_graph_rejects_empty_inputs_for_config_only_agent() {
         let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_inputs_plain_agent");
         write_config_only_agent(&agent_name);
@@ -4516,7 +4525,32 @@ mod tests {
         assert_eq!(
             chain,
             format!(
-                "agent '{agent_name}' has no graph.yaml; `inputs:` is only valid on agent nodes that target a graph agent"
+                "agent '{agent_name}': `inputs:` is empty; a config agent takes only its declared variables as `inputs:`"
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_rejects_undeclared_inputs_for_config_agent() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_inputs_undeclared_agent");
+        write_config_agent_with_setting(
+            &agent_name,
+            "variables:\n  - name: project_dir\n    description: d\n    default: ''",
+        );
+        let inputs = HashMap::from([
+            ("project_dir".to_string(), json!("/wt")),
+            ("worktree".to_string(), json!("/wt")),
+            ("cadence".to_string(), json!("per-task")),
+        ]);
+
+        let chain = run_agent_for_graph_error(&agent_name, Some(inputs));
+
+        assert_eq!(
+            chain,
+            format!(
+                "agent '{agent_name}': `inputs` names undeclared variable(s) cadence, worktree; a config agent takes only its declared variables as `inputs:`"
             )
         );
     }
