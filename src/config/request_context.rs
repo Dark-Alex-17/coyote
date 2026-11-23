@@ -27,7 +27,7 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
-use crate::events::{self, Event, Origin};
+use crate::events::{self, AgentOutcome, Event, Origin};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCall, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
@@ -7011,11 +7011,14 @@ impl RequestContext {
         let id = format!("top-{}-{nonce}", agent.name());
         self.top_level_agent_id = Some(id.clone());
 
-        hooks::fire(
-            HookEvent::AgentStarted,
+        hooks::emit(
             self,
-            &[("COYOTE_AGENT_ID", id)],
-            None,
+            Event::AgentStarted {
+                origin: Origin::from(&*self),
+                agent_id: id,
+                name: None,
+                session_id: None,
+            },
         );
     }
 
@@ -7028,33 +7031,24 @@ impl RequestContext {
             return;
         };
 
-        if abort_signal.is_some_and(|signal| signal.aborted_ctrlc()) {
-            hooks::fire(
-                HookEvent::AgentInterrupted,
-                self,
-                &[("COYOTE_AGENT_ID", id)],
-                None,
-            );
-            return;
-        }
-
-        match error {
-            None => hooks::fire(
-                HookEvent::AgentCompleted,
-                self,
-                &[("COYOTE_AGENT_ID", id)],
-                None,
-            ),
-            Some(err) => hooks::fire(
-                HookEvent::AgentFailed,
-                self,
-                &[
-                    ("COYOTE_AGENT_ID", id),
-                    ("COYOTE_AGENT_ERROR", format!("{err:#}")),
-                ],
-                None,
-            ),
-        }
+        let outcome = if abort_signal.is_some_and(|signal| signal.aborted_ctrlc()) {
+            AgentOutcome::Interrupted
+        } else {
+            match error {
+                None => AgentOutcome::Completed,
+                Some(err) => AgentOutcome::Failed(format!("{err:#}")),
+            }
+        };
+        hooks::emit(
+            self,
+            Event::AgentFinished {
+                origin: Origin::from(&*self),
+                agent_id: id,
+                name: None,
+                session_id: None,
+                outcome,
+            },
+        );
     }
 
     pub async fn edit_role(&mut self, app: &AppConfig, abort_signal: AbortSignal) -> Result<()> {

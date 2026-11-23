@@ -83,49 +83,34 @@ impl JobHookSnapshot {
         }
     }
 
-    /// Fires `job.completed` or `job.failed`. `fire_resolved` callers supply
-    /// their own base envs; the event name and timestamp are computed here so
-    /// they reflect the actual outcome rather than the moment the snapshot
-    /// was taken.
+    /// Fires `job.completed` or `job.failed`. The event name and timestamp
+    /// are computed when this runs, so they reflect the actual outcome
+    /// rather than the moment the snapshot was taken.
     fn fire_terminal(self, success: bool, error: Option<String>) {
-        let (event, resolved) = if success {
-            (HookEvent::JobCompleted, self.completed)
-        } else {
-            (HookEvent::JobFailed, self.failed)
-        };
-
-        let base_envs = hooks::base_envs_parts(
-            event,
+        let resolved = if success { self.completed } else { self.failed };
+        hooks::emit_resolved(
+            Event::JobFinished {
+                origin: Origin::detached(),
+                job_id: self.job_id,
+                tool: self.tool,
+                ok: success,
+                error,
+            },
+            resolved,
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
-        let mut extras = vec![
-            ("COYOTE_JOB_ID", self.job_id),
-            ("COYOTE_TOOL_NAME", self.tool),
-        ];
-
-        if let Some(error) = error {
-            extras.push(("COYOTE_JOB_ERROR", error));
-        }
-
-        hooks::publish_hook_event(event, &base_envs, &extras, None, Origin::detached());
-        if resolved.is_empty() {
-            return;
-        }
-
-        hooks::fire_resolved(event, resolved, base_envs, &extras, None);
     }
 }
 
 fn fire_job_started(ctx: &RequestContext, job_id: &str, tool: &str) {
-    hooks::fire(
-        HookEvent::JobStarted,
+    hooks::emit(
         ctx,
-        &[
-            ("COYOTE_JOB_ID", job_id.to_string()),
-            ("COYOTE_TOOL_NAME", tool.to_string()),
-        ],
-        None,
+        Event::JobStarted {
+            origin: Origin::from(ctx),
+            job_id: job_id.to_string(),
+            tool: tool.to_string(),
+        },
     );
 }
 

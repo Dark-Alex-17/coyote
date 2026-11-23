@@ -1823,14 +1823,13 @@ fn teardown_keys_do_nothing_new_and_the_strip_says_leaving() {
 /// A child agent's tool hooks leave the root's status row alone.
 #[test]
 fn only_root_tool_hooks_drive_the_status_row() {
-    use crate::hooks::HookEvent;
     let (tx, mut rx) = unbounded_channel();
     let sink = TuiSink::new(tx);
-    let hook = |origin: Origin| Event::Hook {
-        event: HookEvent::ToolStarted,
-        envs: vec![("COYOTE_TOOL_NAME".to_string(), "fs_write".to_string())],
-        payload: None,
+    let hook = |origin: Origin| Event::ToolStarted {
         origin,
+        name: "fs_write".to_string(),
+        call_id: String::new(),
+        args: "{}".to_string(),
     };
     sink.on_event(&hook(Origin {
         agent_id: Some("agent_1".to_string()),
@@ -2260,11 +2259,40 @@ fn alt(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::ALT)
 }
 
+/// Sends what the sink sends for the narration `Call <name> <args>`.
 fn narrate(harness: &mut Harness, call_id: &str, line: &str) {
+    let call = line.strip_prefix("Call ").unwrap_or(line);
+    let (name, args) = call.split_once(' ').unwrap_or((call, ""));
     harness.app.handle_msg(UiMsg::ToolNarration {
         call_id: call_id.to_string(),
+        name: name.to_string(),
+        args: vec![args.to_string()],
         line: line.to_string(),
     });
+}
+
+/// The row takes its name and arguments from the message, not from the
+/// styled line it draws when opened.
+#[test]
+fn a_narration_names_its_row_from_its_call_not_its_line() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("read it", false);
+    let line = "\x1b[2mCall \x1b[0m\x1b[1;36mfs_read\x1b[0m {\"path\": \"a\"}";
+    harness.app.handle_msg(UiMsg::ToolNarration {
+        call_id: "call-1".to_string(),
+        name: "fs_read".to_string(),
+        args: vec!["--fast".to_string(), "{\"path\":\"a\"}".to_string()],
+        line: line.to_string(),
+    });
+    assert!(matches!(
+        harness.app.transcript.cells().last(),
+        Some(Cell::Tool { call_id, name, args, narrated_args, summary, .. })
+            if call_id == "call-1"
+                && name == "fs_read"
+                && args == "--fast {\"path\":\"a\"}"
+                && narrated_args == "--fast {\"path\":\"a\"}"
+                && summary == line
+    ));
 }
 
 /// Sends what the sink sends for a tool's start hook: the status

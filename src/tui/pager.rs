@@ -177,6 +177,8 @@ fn recorded_row(entry: &ChildEntry) -> Option<Cell> {
     };
     Some(Cell::recorded_tool(
         call_id.clone(),
+        name,
+        args,
         entry_summary(name, args),
         output,
     ))
@@ -1420,6 +1422,8 @@ mod tests {
     fn long_tool(lines: usize) -> Cell {
         let mut cell = Cell::tool(
             "c1".to_string(),
+            "execute_command",
+            "{\"command\":\"seq\"}",
             "Call execute_command {\"command\":\"seq\"}".to_string(),
             Instant::now(),
         );

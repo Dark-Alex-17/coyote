@@ -16,7 +16,7 @@ use super::{
 use crate::config::{
     AgentVariable, AgentVariables, RenderMode, RequestContext, child_sessions_enabled,
 };
-use crate::events::Origin;
+use crate::events::{Event, Origin};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, TaskCancelGuard, wait_abort_signal, wait_user_interrupt};
@@ -628,49 +628,49 @@ impl NodeHookEmitter {
         }
     }
 
-    fn identity_extras(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("COYOTE_NODE_ID", self.node_id.clone()),
-            ("COYOTE_NODE_TYPE", self.node_type.to_string()),
-        ]
-    }
-
-    fn extras(&self, elapsed: Duration) -> Vec<(&'static str, String)> {
-        let mut extras = self.identity_extras();
-        extras.push(("COYOTE_NODE_DURATION_MS", elapsed.as_millis().to_string()));
-        extras
-    }
-
-    fn dispatch(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        let base_envs = hooks::base_envs_parts(
+    fn dispatch(&self, event: Event, resolved: &[ResolvedHook]) {
+        hooks::emit_resolved(
             event,
+            resolved.to_vec(),
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
-        hooks::publish_hook_event(event, &base_envs, extras, None, self.origin.clone());
-        hooks::fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
     }
 
     fn started(&self) {
         self.dispatch(
-            HookEvent::GraphNodeStarted,
+            Event::NodeStarted {
+                origin: self.origin.clone(),
+                node_id: self.node_id.clone(),
+                node_type: self.node_type.to_string(),
+            },
             &self.started,
-            &self.identity_extras(),
         );
     }
 
     fn completed(&self, elapsed: Duration, route: Option<&str>) {
-        let mut extras = self.extras(elapsed);
-        if let Some(route) = route {
-            extras.push(("COYOTE_NODE_ROUTE", route.to_string()));
-        }
-        self.dispatch(HookEvent::GraphNodeCompleted, &self.completed, &extras);
+        self.dispatch(
+            self.finished(elapsed, route.map(str::to_string), None),
+            &self.completed,
+        );
     }
 
     fn failed(&self, elapsed: Duration, error: &str) {
-        let mut extras = self.extras(elapsed);
-        extras.push(("COYOTE_NODE_ERROR", error.to_string()));
-        self.dispatch(HookEvent::GraphNodeFailed, &self.failed, &extras);
+        self.dispatch(
+            self.finished(elapsed, None, Some(error.to_string())),
+            &self.failed,
+        );
+    }
+
+    fn finished(&self, elapsed: Duration, route: Option<String>, error: Option<String>) -> Event {
+        Event::NodeFinished {
+            origin: self.origin.clone(),
+            node_id: self.node_id.clone(),
+            node_type: self.node_type.to_string(),
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            route,
+            error,
+        }
     }
 }
 

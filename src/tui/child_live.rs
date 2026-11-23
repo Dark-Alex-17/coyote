@@ -287,7 +287,10 @@ impl ChildLive {
             }
             None => {
                 let summary = call_summary(&name, args.as_ref());
-                thread.rows.push(Cell::tool(call_id, summary, now));
+                let args = args.as_ref().map(Value::to_string).unwrap_or_default();
+                thread
+                    .rows
+                    .push(Cell::tool(call_id, &name, &args, summary, now));
             }
         }
         self.cap_rows(agent_id);

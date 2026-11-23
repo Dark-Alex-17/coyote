@@ -2,7 +2,7 @@ use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::config::{
     RequestContext, builtin_manifest, ensure_parent_exists, paths, set_executable_bit_if_script,
 };
-use crate::events::{Event, Origin};
+use crate::events::{AgentOutcome, Event, Origin};
 use crate::function::write_file_atomic;
 use crate::prompt::Prompter;
 
@@ -556,6 +556,238 @@ pub fn fire(
     }
 
     fire_resolved(event, resolved, base, extras, payload);
+}
+
+/// The shell side of a typed hook event: the hook it fires, the env it adds
+/// after `COYOTE_HOOK_NAME` in order, its payload, and the origin its
+/// [`Event::Hook`] twin carries.
+struct HookSpec {
+    event: HookEvent,
+    extras: Vec<(&'static str, String)>,
+    payload: Option<String>,
+    origin: Origin,
+}
+
+/// Maps a typed event to the hook dispatch it stands for; `None` for an
+/// event no hook fires on.
+fn hook_spec(event: &Event) -> Option<HookSpec> {
+    let (hook, extras, payload, origin) = match event {
+        Event::ToolStarted {
+            origin,
+            name,
+            call_id,
+            args,
+        } => (
+            HookEvent::ToolStarted,
+            tool_extras(name, call_id),
+            Some(args.clone()),
+            origin,
+        ),
+        Event::ToolFinished {
+            origin,
+            name,
+            call_id,
+            args,
+            duration_ms,
+            error,
+        } => {
+            let mut extras = tool_extras(name, call_id);
+            if let Some(error) = error {
+                extras.push(("COYOTE_TOOL_ERROR", error.clone()));
+            }
+            if let Some(duration_ms) = duration_ms {
+                extras.push(("COYOTE_TOOL_DURATION_MS", duration_ms.to_string()));
+            }
+            let hook = if error.is_some() {
+                HookEvent::ToolFailed
+            } else {
+                HookEvent::ToolCompleted
+            };
+            (hook, extras, args.clone(), origin)
+        }
+        Event::JobStarted {
+            origin,
+            job_id,
+            tool,
+        } => (
+            HookEvent::JobStarted,
+            job_extras(job_id, tool),
+            None,
+            origin,
+        ),
+        Event::JobFinished {
+            origin,
+            job_id,
+            tool,
+            ok,
+            error,
+        } => {
+            let mut extras = job_extras(job_id, tool);
+            if let Some(error) = error {
+                extras.push(("COYOTE_JOB_ERROR", error.clone()));
+            }
+            let hook = if *ok {
+                HookEvent::JobCompleted
+            } else {
+                HookEvent::JobFailed
+            };
+            (hook, extras, None, origin)
+        }
+        Event::AgentStarted {
+            origin,
+            agent_id,
+            name,
+            session_id,
+        } => (
+            HookEvent::AgentStarted,
+            agent_extras(agent_id, name.as_deref(), session_id.as_deref()),
+            None,
+            origin,
+        ),
+        Event::AgentFinished {
+            origin,
+            agent_id,
+            name,
+            session_id,
+            outcome,
+        } => {
+            let mut extras = agent_extras(agent_id, name.as_deref(), session_id.as_deref());
+            let hook = match outcome {
+                AgentOutcome::Completed => HookEvent::AgentCompleted,
+                AgentOutcome::Interrupted => HookEvent::AgentInterrupted,
+                AgentOutcome::Failed(error) => {
+                    extras.push(("COYOTE_AGENT_ERROR", error.clone()));
+                    HookEvent::AgentFailed
+                }
+            };
+            (hook, extras, None, origin)
+        }
+        Event::NodeStarted {
+            origin,
+            node_id,
+            node_type,
+        } => (
+            HookEvent::GraphNodeStarted,
+            node_extras(node_id, node_type),
+            None,
+            origin,
+        ),
+        Event::NodeFinished {
+            origin,
+            node_id,
+            node_type,
+            duration_ms,
+            route,
+            error,
+        } => {
+            let mut extras = node_extras(node_id, node_type);
+            extras.push(("COYOTE_NODE_DURATION_MS", duration_ms.to_string()));
+            if let Some(route) = route {
+                extras.push(("COYOTE_NODE_ROUTE", route.clone()));
+            }
+            if let Some(error) = error {
+                extras.push(("COYOTE_NODE_ERROR", error.clone()));
+            }
+            let hook = if error.is_some() {
+                HookEvent::GraphNodeFailed
+            } else {
+                HookEvent::GraphNodeCompleted
+            };
+            (hook, extras, None, origin)
+        }
+        _ => return None,
+    };
+    Some(HookSpec {
+        event: hook,
+        extras,
+        payload,
+        origin: origin.clone(),
+    })
+}
+
+fn tool_extras(name: &str, call_id: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_TOOL_NAME", name.to_string()),
+        ("COYOTE_TOOL_CALL_ID", call_id.to_string()),
+    ]
+}
+
+fn job_extras(job_id: &str, tool: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_JOB_ID", job_id.to_string()),
+        ("COYOTE_TOOL_NAME", tool.to_string()),
+    ]
+}
+
+fn agent_extras(
+    agent_id: &str,
+    name: Option<&str>,
+    session_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut extras = vec![("COYOTE_AGENT_ID", agent_id.to_string())];
+    if let Some(name) = name {
+        extras.push(("COYOTE_AGENT_NAME", name.to_string()));
+    }
+    if let Some(session_id) = session_id {
+        extras.push(("COYOTE_AGENT_SESSION_ID", session_id.to_string()));
+    }
+    extras
+}
+
+fn node_extras(node_id: &str, node_type: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_NODE_ID", node_id.to_string()),
+        ("COYOTE_NODE_TYPE", node_type.to_string()),
+    ]
+}
+
+/// Publishes a typed hook event and fires the hooks `ctx` resolves for it.
+/// Its [`Event::Hook`] twin goes out first with the same origin, so an
+/// observer of either form sees every event. An event no hook fires on is
+/// only published.
+pub fn emit(ctx: &RequestContext, event: Event) {
+    let Some(spec) = hook_spec(&event) else {
+        crate::events::bus().publish(event);
+        return;
+    };
+    let resolved = ctx.resolved_hooks(spec.event);
+    let base = base_envs(spec.event, ctx);
+    dispatch(spec, event, resolved, base);
+}
+
+/// [`emit`] for call sites that outlive the context borrow their hooks were
+/// resolved from. `resolved` must hold the hooks for the event that `event`
+/// maps to; the base env is built here so its timestamp is the moment of
+/// the event, not of the resolution.
+pub(crate) fn emit_resolved(
+    event: Event,
+    resolved: Vec<ResolvedHook>,
+    session_name: Option<&str>,
+    agent_name: Option<&str>,
+) {
+    let Some(spec) = hook_spec(&event) else {
+        crate::events::bus().publish(event);
+        return;
+    };
+    let base = base_envs_parts(spec.event, session_name, agent_name);
+    dispatch(spec, event, resolved, base);
+}
+
+fn dispatch(
+    spec: HookSpec,
+    event: Event,
+    resolved: Vec<ResolvedHook>,
+    base_envs: Vec<(String, String)>,
+) {
+    publish_hook_event(
+        spec.event,
+        &base_envs,
+        &spec.extras,
+        spec.payload.clone(),
+        spec.origin,
+    );
+    crate::events::bus().publish(event);
+    fire_resolved(spec.event, resolved, base_envs, &spec.extras, spec.payload);
 }
 
 /// Publishes the [`Event::Hook`] twin of a dispatch. Call sites that hand
@@ -2506,6 +2738,267 @@ mod tests {
                 .all(|capture| capture.envs.get("HOOK_EXTRA") != Some(&probe.1)),
             "no shell hook is configured, so nothing may reach test_sink"
         );
+    }
+
+    fn extras_of(event: &Event) -> (HookEvent, Vec<(&'static str, String)>, Option<String>) {
+        let spec = hook_spec(event).expect("a typed hook event");
+        (spec.event, spec.extras, spec.payload)
+    }
+
+    fn owned(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (*key, value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn typed_events_map_to_hook_extras_in_order() {
+        let origin = Origin::detached();
+        let tool_finished = |duration_ms, error: Option<&str>, args: Option<&str>| {
+            extras_of(&Event::ToolFinished {
+                origin: origin.clone(),
+                name: "fs_read".to_string(),
+                call_id: "c1".to_string(),
+                args: args.map(str::to_string),
+                duration_ms,
+                error: error.map(str::to_string),
+            })
+        };
+        let tool_ids = [
+            ("COYOTE_TOOL_NAME", "fs_read"),
+            ("COYOTE_TOOL_CALL_ID", "c1"),
+        ];
+        assert_eq!(
+            extras_of(&Event::ToolStarted {
+                origin: origin.clone(),
+                name: "fs_read".to_string(),
+                call_id: "c1".to_string(),
+                args: "{}".to_string(),
+            }),
+            (HookEvent::ToolStarted, owned(&tool_ids), Some("{}".into()))
+        );
+        assert_eq!(
+            tool_finished(Some(12), None, Some("{}")),
+            (
+                HookEvent::ToolCompleted,
+                owned(&[tool_ids[0], tool_ids[1], ("COYOTE_TOOL_DURATION_MS", "12")]),
+                Some("{}".into())
+            )
+        );
+        assert_eq!(
+            tool_finished(None, Some("boom"), None),
+            (
+                HookEvent::ToolFailed,
+                owned(&[tool_ids[0], tool_ids[1], ("COYOTE_TOOL_ERROR", "boom")]),
+                None
+            )
+        );
+
+        let job_ids = [("COYOTE_JOB_ID", "job_1"), ("COYOTE_TOOL_NAME", "echo")];
+        assert_eq!(
+            extras_of(&Event::JobStarted {
+                origin: origin.clone(),
+                job_id: "job_1".to_string(),
+                tool: "echo".to_string(),
+            }),
+            (HookEvent::JobStarted, owned(&job_ids), None)
+        );
+        let job_finished = |ok, error: Option<&str>| {
+            extras_of(&Event::JobFinished {
+                origin: origin.clone(),
+                job_id: "job_1".to_string(),
+                tool: "echo".to_string(),
+                ok,
+                error: error.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            job_finished(true, None),
+            (HookEvent::JobCompleted, owned(&job_ids), None)
+        );
+        assert_eq!(
+            job_finished(false, Some("exit 1")),
+            (
+                HookEvent::JobFailed,
+                owned(&[job_ids[0], job_ids[1], ("COYOTE_JOB_ERROR", "exit 1")]),
+                None
+            )
+        );
+
+        assert_eq!(
+            extras_of(&Event::AgentStarted {
+                origin: origin.clone(),
+                agent_id: "agent_1".to_string(),
+                name: Some("coder".to_string()),
+                session_id: Some("sess_1".to_string()),
+            }),
+            (
+                HookEvent::AgentStarted,
+                owned(&[
+                    ("COYOTE_AGENT_ID", "agent_1"),
+                    ("COYOTE_AGENT_NAME", "coder"),
+                    ("COYOTE_AGENT_SESSION_ID", "sess_1"),
+                ]),
+                None
+            )
+        );
+        let agent_finished = |name: Option<&str>, outcome| {
+            extras_of(&Event::AgentFinished {
+                origin: origin.clone(),
+                agent_id: "agent_1".to_string(),
+                name: name.map(str::to_string),
+                session_id: None,
+                outcome,
+            })
+        };
+        assert_eq!(
+            agent_finished(None, AgentOutcome::Completed),
+            (
+                HookEvent::AgentCompleted,
+                owned(&[("COYOTE_AGENT_ID", "agent_1")]),
+                None
+            )
+        );
+        assert_eq!(
+            agent_finished(Some("coder"), AgentOutcome::Interrupted),
+            (
+                HookEvent::AgentInterrupted,
+                owned(&[
+                    ("COYOTE_AGENT_ID", "agent_1"),
+                    ("COYOTE_AGENT_NAME", "coder"),
+                ]),
+                None
+            )
+        );
+        assert_eq!(
+            agent_finished(Some("coder"), AgentOutcome::Failed("boom".into())),
+            (
+                HookEvent::AgentFailed,
+                owned(&[
+                    ("COYOTE_AGENT_ID", "agent_1"),
+                    ("COYOTE_AGENT_NAME", "coder"),
+                    ("COYOTE_AGENT_ERROR", "boom"),
+                ]),
+                None
+            )
+        );
+
+        let node_ids = [("COYOTE_NODE_ID", "plan"), ("COYOTE_NODE_TYPE", "llm")];
+        assert_eq!(
+            extras_of(&Event::NodeStarted {
+                origin: origin.clone(),
+                node_id: "plan".to_string(),
+                node_type: "llm".to_string(),
+            }),
+            (HookEvent::GraphNodeStarted, owned(&node_ids), None)
+        );
+        let node_finished = |route: Option<&str>, error: Option<&str>| {
+            extras_of(&Event::NodeFinished {
+                origin: origin.clone(),
+                node_id: "plan".to_string(),
+                node_type: "llm".to_string(),
+                duration_ms: 7,
+                route: route.map(str::to_string),
+                error: error.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            node_finished(Some("build"), None),
+            (
+                HookEvent::GraphNodeCompleted,
+                owned(&[
+                    node_ids[0],
+                    node_ids[1],
+                    ("COYOTE_NODE_DURATION_MS", "7"),
+                    ("COYOTE_NODE_ROUTE", "build"),
+                ]),
+                None
+            )
+        );
+        assert_eq!(
+            node_finished(None, Some("boom")),
+            (
+                HookEvent::GraphNodeFailed,
+                owned(&[
+                    node_ids[0],
+                    node_ids[1],
+                    ("COYOTE_NODE_DURATION_MS", "7"),
+                    ("COYOTE_NODE_ERROR", "boom"),
+                ]),
+                None
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn emit_publishes_the_typed_event_after_its_twin_with_the_same_origin() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_global_hooks(hooks_map("tool.started", &[("emit-probe", "true")]));
+        ctx.self_agent_id = Some("emit-child".to_string());
+        ctx.current_depth = 1;
+        test_sink::drain();
+        sink.drain();
+        let origin = Origin::from(&ctx);
+        let typed = Event::ToolStarted {
+            origin: origin.clone(),
+            name: "fs_read".to_string(),
+            call_id: "emit-probe-q2w".to_string(),
+            args: r#"{"path":"a"}"#.to_string(),
+        };
+
+        emit(&ctx, typed.clone());
+
+        let published: Vec<_> = sink
+            .drain()
+            .into_iter()
+            .filter(|published| match published {
+                Event::Hook { envs, .. } => envs.iter().any(|(_, value)| value == "emit-probe-q2w"),
+                Event::ToolStarted { call_id, .. } => call_id == "emit-probe-q2w",
+                _ => false,
+            })
+            .collect();
+        assert_eq!(published.len(), 2, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin: twin_origin,
+        } = &published[0]
+        else {
+            panic!("the twin must come first: {published:?}");
+        };
+        assert_eq!(*event, HookEvent::ToolStarted);
+        assert_eq!(payload.as_deref(), Some(r#"{"path":"a"}"#));
+        assert_eq!(*twin_origin, origin);
+        let tail: Vec<_> = envs[envs.len() - 2..]
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                ("COYOTE_TOOL_NAME", "fs_read"),
+                ("COYOTE_TOOL_CALL_ID", "emit-probe-q2w")
+            ]
+        );
+        assert_eq!(published[1], typed);
+
+        let captures: Vec<_> = test_sink::drain()
+            .into_iter()
+            .filter(|capture| capture.hook_name == "emit-probe")
+            .collect();
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("emit-probe-q2w")
+        );
+        assert_eq!(captures[0].payload.as_deref(), Some(r#"{"path":"a"}"#));
     }
 
     #[test]

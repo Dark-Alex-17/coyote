@@ -11,7 +11,7 @@ use crate::config::{
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
     load_agent_variables, paths, roster_line,
 };
-use crate::events::Origin;
+use crate::events::{AgentOutcome, Event, Origin};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
@@ -1340,21 +1340,6 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
 
 /// The `agent.*` extras every event about a spawned child carries. Only a
 /// seated child has a session to name, so the key is absent otherwise.
-fn spawned_agent_hook_extras(
-    agent_id: &str,
-    agent_name: &str,
-    session_id: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut extras = vec![
-        ("COYOTE_AGENT_ID", agent_id.to_string()),
-        ("COYOTE_AGENT_NAME", agent_name.to_string()),
-    ];
-    if let Some(session_id) = session_id {
-        extras.push(("COYOTE_AGENT_SESSION_ID", session_id.to_string()));
-    }
-    extras
-}
-
 /// Records a seated child's terminal status on its sidecar. The sidecar is
 /// bookkeeping about the child, not part of its result, so a sidecar that
 /// cannot be read or written is logged and the caller carries on with the
@@ -1485,20 +1470,23 @@ impl SpawnResultHooks {
     /// sidecar, so the hooks and the sidecar never disagree about a
     /// ctrl-c'd child, whatever its run returned.
     fn fire(self, error: Option<&str>, interrupted: bool) {
-        let mut extras =
-            spawned_agent_hook_extras(&self.agent_id, &self.agent_name, self.session_id.as_deref());
-        let (event, resolved) = match (interrupted, error) {
-            (true, _) => (HookEvent::AgentInterrupted, self.interrupted),
-            (false, None) => (HookEvent::AgentCompleted, self.completed),
-            (false, Some(error)) => {
-                extras.push(("COYOTE_AGENT_ERROR", error.to_string()));
-                (HookEvent::AgentFailed, self.failed)
-            }
+        let (outcome, resolved) = match (interrupted, error) {
+            (true, _) => (AgentOutcome::Interrupted, self.interrupted),
+            (false, None) => (AgentOutcome::Completed, self.completed),
+            (false, Some(error)) => (AgentOutcome::Failed(error.to_string()), self.failed),
         };
-        let base_envs =
-            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name));
-        hooks::publish_hook_event(event, &base_envs, &extras, None, Origin::detached());
-        hooks::fire_resolved(event, resolved, base_envs, &extras, None);
+        hooks::emit_resolved(
+            Event::AgentFinished {
+                origin: Origin::detached(),
+                agent_id: self.agent_id,
+                name: Some(self.agent_name.clone()),
+                session_id: self.session_id,
+                outcome,
+            },
+            resolved,
+            self.session_name.as_deref(),
+            Some(&self.agent_name),
+        );
     }
 }
 
@@ -2448,11 +2436,14 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
 
     debug!("Spawning child agent '{agent_name}' as '{agent_id}'");
 
-    hooks::fire(
-        HookEvent::AgentStarted,
+    hooks::emit(
         &child_ctx,
-        &spawned_agent_hook_extras(&agent_id, &agent_name, session_id.as_deref()),
-        None,
+        Event::AgentStarted {
+            origin: Origin::from(&child_ctx),
+            agent_id: agent_id.clone(),
+            name: Some(agent_name.clone()),
+            session_id: session_id.clone(),
+        },
     );
 
     Ok(SpawnBuild::Ready(Box::new(ChildSpawn {

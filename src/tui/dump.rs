@@ -104,6 +104,8 @@ mod tests {
     fn the_dump_prints_prompts_replies_commands_and_one_line_tool_rows() {
         let mut tool = Cell::tool(
             "c1".to_string(),
+            "fs_read",
+            "{\"path\":\"a.txt\"}",
             "Call fs_read {\"path\":\"a.txt\"}".to_string(),
             Instant::now(),
         );

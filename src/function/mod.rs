@@ -20,7 +20,7 @@ use crate::{
 use crate::config::ensure_parent_exists;
 use crate::config::paths;
 use crate::events::{self, Event, NoticeKind, Origin, OutputStream};
-use crate::hooks::{self, HookEvent};
+use crate::hooks;
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_META_FUNCTION_PREFIXES, MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
@@ -1619,6 +1619,9 @@ impl ToolCall {
         events::bus().publish(Event::ToolNarration {
             call_id,
             line: plain_call_log(&display_name, &cmd_args),
+            name: display_name,
+            args: cmd_args.to_vec(),
+            origin: Origin::from(ctx),
         });
         let result = if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) {
             Self::search_mcp_tools(ctx, cmd_name, &json_data)
@@ -1701,15 +1704,16 @@ impl ToolCall {
             // reaches eval_inner's start/finish lines. The error text can carry
             // the raw argument payload, so only the name goes to the log.
             info!("Tool call '{}' refused before running", self.name);
-            hooks::fire(
-                HookEvent::ToolFailed,
+            hooks::emit(
                 ctx,
-                &[
-                    ("COYOTE_TOOL_NAME", self.name.clone()),
-                    ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
-                    ("COYOTE_TOOL_ERROR", err.to_string()),
-                ],
-                None,
+                Event::ToolFinished {
+                    origin: Origin::from(&*ctx),
+                    name: self.name.clone(),
+                    call_id: self.id.clone().unwrap_or_default(),
+                    args: None,
+                    duration_ms: None,
+                    error: Some(err.to_string()),
+                },
             );
         }
         result
@@ -1758,16 +1762,19 @@ impl ToolCall {
         events::bus().publish(Event::ToolNarration {
             call_id,
             line: plain_call_log(&cmd_name, &cmd_args),
+            name: cmd_name.clone(),
+            args: cmd_args.clone(),
+            origin: Origin::from(&*ctx),
         });
 
-        hooks::fire(
-            HookEvent::ToolStarted,
+        hooks::emit(
             ctx,
-            &[
-                ("COYOTE_TOOL_NAME", self.name.clone()),
-                ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
-            ],
-            Some(args_json.clone()),
+            Event::ToolStarted {
+                origin: Origin::from(&*ctx),
+                name: self.name.clone(),
+                call_id: self.id.clone().unwrap_or_default(),
+                args: args_json.clone(),
+            },
         );
         info!("Tool call '{}' started", self.name);
         let tool_started_at = Instant::now();
@@ -1997,15 +2004,16 @@ impl ToolCall {
                     self.name,
                     tool_started_at.elapsed()
                 );
-                hooks::fire(
-                    HookEvent::ToolFailed,
+                hooks::emit(
                     ctx,
-                    &[
-                        ("COYOTE_TOOL_NAME", self.name.clone()),
-                        ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
-                        ("COYOTE_TOOL_ERROR", error),
-                    ],
-                    Some(args_json),
+                    Event::ToolFinished {
+                        origin: Origin::from(&*ctx),
+                        name: self.name.clone(),
+                        call_id: self.id.clone().unwrap_or_default(),
+                        args: Some(args_json),
+                        duration_ms: None,
+                        error: Some(error),
+                    },
                 );
             }
             None => {
@@ -2014,18 +2022,19 @@ impl ToolCall {
                     self.name,
                     tool_started_at.elapsed()
                 );
-                hooks::fire(
-                    HookEvent::ToolCompleted,
+                hooks::emit(
                     ctx,
-                    &[
-                        ("COYOTE_TOOL_NAME", self.name.clone()),
-                        ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
-                        (
-                            "COYOTE_TOOL_DURATION_MS",
-                            tool_started_at.elapsed().as_millis().to_string(),
+                    Event::ToolFinished {
+                        origin: Origin::from(&*ctx),
+                        name: self.name.clone(),
+                        call_id: self.id.clone().unwrap_or_default(),
+                        args: Some(args_json),
+                        duration_ms: Some(
+                            u64::try_from(tool_started_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
                         ),
-                    ],
-                    Some(args_json),
+                        error: None,
+                    },
                 );
             }
         }
@@ -5597,7 +5606,7 @@ mod tests {
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::ToolNarration { call_id, line }
+                Event::ToolNarration { call_id, line, .. }
                     if line.contains("mcp-narration-probe-x7x") =>
                 {
                     Some((call_id, line))
@@ -7407,21 +7416,33 @@ mod tests {
         run_async(call_with_args("echo", json!({"x": "narration-probe-x7x"})).eval(&mut ctx))
             .unwrap();
 
-        let narrations: Vec<(String, String)> = recording
+        let narrations: Vec<Event> = recording
             .drain()
             .into_iter()
-            .filter_map(|event| match event {
-                Event::ToolNarration { call_id, line } if line.contains("narration-probe-x7x") => {
-                    Some((call_id, line))
-                }
-                _ => None,
+            .filter(|event| {
+                matches!(event, Event::ToolNarration { line, .. } if line.contains("narration-probe-x7x"))
             })
             .collect();
         assert_eq!(narrations.len(), 1, "{narrations:?}");
-        let (call_id, line) = &narrations[0];
+        let Event::ToolNarration {
+            call_id,
+            name,
+            args,
+            line,
+            origin,
+        } = &narrations[0]
+        else {
+            unreachable!("filtered to narrations");
+        };
         assert_eq!(call_id, "id1");
         assert!(line.contains("echo"), "{line:?}");
         assert!(!line.contains('\x1b'), "{line:?}");
+        assert_eq!(*line, plain_call_log(name, args));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(r#"{"x":"narration-probe-x7x"}"#)
+        );
+        assert_eq!(*origin, Origin::detached());
     }
 
     // A child agent's tool call still announces itself on the bus, while the
@@ -7477,9 +7498,13 @@ mod tests {
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::ToolNarration { call_id, line }
-                    if line.contains("depth-one-narration-x7x") =>
-                {
+                Event::ToolNarration {
+                    call_id,
+                    line,
+                    origin,
+                    ..
+                } if line.contains("depth-one-narration-x7x") => {
+                    assert_eq!(origin.depth, 1);
                     Some((call_id, line))
                 }
                 _ => None,

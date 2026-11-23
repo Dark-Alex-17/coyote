@@ -538,6 +538,10 @@ pub(super) enum Cell {
         /// start hook's compact JSON once it has arrived, the narration
         /// line's text after the name until then.
         args: String,
+        /// The arguments the summary line names after the tool name,
+        /// whole: the open row repeats the summary only when the header
+        /// shows something else.
+        narrated_args: String,
         summary: String,
         status: ToolStatus,
         tail: OutputTail,
@@ -589,19 +593,6 @@ pub(super) fn is_bookkeeping(name: &str) -> bool {
         || name.starts_with("skill__")
         || name.starts_with("agent__list_")
         || matches!(name, "job__list" | "agent__task_list")
-}
-
-/// The tool name and the arguments a narration line names, after `Call `.
-fn narrated_call(line: &str) -> (String, String) {
-    let plain = render::plain_text(line);
-    let call = plain.strip_prefix("Call ").unwrap_or(&plain).trim_start();
-    let (name, args) = call.split_once(char::is_whitespace).unwrap_or((call, ""));
-    (name.to_string(), args.trim().to_string())
-}
-
-/// The tool name a narration line names, after `Call `.
-pub(super) fn narrated_tool_name(line: &str) -> String {
-    narrated_call(line).0
 }
 
 /// Width in characters of the arguments in a tool row's header, the
@@ -705,13 +696,24 @@ impl Cell {
         }
     }
 
-    pub(super) fn tool(call_id: String, summary: String, since: Instant) -> Self {
-        let (name, args) = narrated_call(&summary);
+    /// A running call's row. `summary` is the line drawn when the row is
+    /// open; `name` and `args` are what it says, `args` as the words after
+    /// the name.
+    pub(super) fn tool(
+        call_id: String,
+        name: &str,
+        args: &str,
+        summary: String,
+        since: Instant,
+    ) -> Self {
+        let name = render::plain_text(name);
+        let narrated_args = render::plain_text(args).trim().to_string();
         let bookkeeping = is_bookkeeping(&name);
         Self::Tool {
             call_id,
             name,
-            args: short_args(&args),
+            args: short_args(&narrated_args),
+            narrated_args,
             summary,
             status: ToolStatus::Running { since },
             tail: OutputTail::default(),
@@ -724,8 +726,14 @@ impl Cell {
 
     /// A call read back from a saved session: a finished tool row, folded,
     /// with what the call returned as its output.
-    pub(super) fn recorded_tool(call_id: String, summary: String, output: &str) -> Self {
-        let mut cell = Self::tool(call_id, summary, Instant::now());
+    pub(super) fn recorded_tool(
+        call_id: String,
+        name: &str,
+        args: &str,
+        summary: String,
+        output: &str,
+    ) -> Self {
+        let mut cell = Self::tool(call_id, name, args, summary, Instant::now());
         if let Cell::Tool { status, tail, .. } = &mut cell {
             *status = ToolStatus::Recorded;
             let text = append_output(tail, output.as_bytes());
@@ -1250,13 +1258,14 @@ impl Cell {
         let body = match self {
             Cell::Tool {
                 args,
+                narrated_args,
                 summary,
                 status,
                 tail,
                 ..
             } => {
                 let mut body = Vec::new();
-                if narrated_call(summary).1 != *args {
+                if narrated_args != args {
                     body = render::hard_wrap(vec![render::styled_line(summary)], body_width);
                 }
                 if let ToolStatus::Failed { error, .. } = status {
@@ -2014,6 +2023,18 @@ mod tests {
         Renderer::new(config.render_options().unwrap()).unwrap()
     }
 
+    /// A running row as a `Call name args` narration opens it.
+    fn narrated(call_id: &str, name: &str, args: &str, since: Instant) -> Cell {
+        let summary = format!("Call {name} {args}");
+        Cell::tool(call_id.to_string(), name, args, summary, since)
+    }
+
+    /// A row read back from a session, as the pager names it.
+    fn recorded(call_id: &str, name: &str, args: &str, output: &str) -> Cell {
+        let summary = format!("{name} {args}");
+        Cell::recorded_tool(call_id.to_string(), name, args, summary, output)
+    }
+
     /// Past the cap the oldest bytes go, on a char boundary, and the
     /// first line says how many.
     #[test]
@@ -2417,14 +2438,32 @@ mod tests {
         );
     }
 
+    /// The header takes the name and arguments it is given, drawn plain,
+    /// whatever styling the summary line carries.
     #[test]
-    fn the_narrated_tool_name_is_the_word_after_call() {
-        assert_eq!(
-            narrated_tool_name("Call \x1b[1mfs_write\x1b[0m {\"path\":\"x\"}"),
-            "fs_write"
+    fn a_tool_row_names_the_call_it_is_given() {
+        let mut renderer = renderer();
+        let mut cell = Cell::tool(
+            "c1".to_string(),
+            "\x1b[1mfs_write\x1b[0m",
+            " {\"path\":\"x\"} ",
+            "Call \x1b[1mfs_write\x1b[0m {\"path\":\"x\"}".to_string(),
+            Instant::now(),
         );
-        assert_eq!(narrated_tool_name("Call todo__add {}"), "todo__add");
-        assert_eq!(narrated_tool_name(""), "");
+        let header = cell.lines(80, &mut renderer)[0].to_string();
+        assert!(header.contains("fs_write({\"path\":\"x\"})"), "{header:?}");
+        let Cell::Tool {
+            name,
+            args,
+            narrated_args,
+            ..
+        } = &cell
+        else {
+            unreachable!();
+        };
+        assert_eq!(name, "fs_write");
+        assert_eq!(args, "{\"path\":\"x\"}");
+        assert_eq!(narrated_args, "{\"path\":\"x\"}");
     }
 
     #[test]
@@ -2469,7 +2508,8 @@ mod tests {
         let content = "x".repeat(2048);
         let narration =
             format!("Call fs_write {{\"path\":\"src/x.rs\",\"content\":\"{content}\"}}");
-        let mut cell = Cell::tool("c1".to_string(), narration.clone(), Instant::now());
+        let args = format!("{{\"path\":\"src/x.rs\",\"content\":\"{content}\"}}");
+        let mut cell = narrated("c1", "fs_write", &args, Instant::now());
         let running = format!("{} running 0s", crate::utils::SPINNER_FRAMES[0]);
         let header = "fs_write({\"path\":\"src/x.rs\",\"content\":\"xxxxxxxxxxxxxxx...)";
         let body = |lines: &[Line<'_>]| -> String {
@@ -2527,11 +2567,7 @@ mod tests {
     #[test]
     fn a_failed_tool_header_drops_format_characters_and_escapes_from_the_error() {
         let mut renderer = renderer();
-        let mut cell = Cell::tool(
-            "c1".to_string(),
-            "Call fs_read {\"path\":\"x\"}".to_string(),
-            Instant::now(),
-        );
+        let mut cell = narrated("c1", "fs_read", "{\"path\":\"x\"}", Instant::now());
         let Cell::Tool { status, .. } = &mut cell else {
             unreachable!();
         };
@@ -2629,9 +2665,9 @@ mod tests {
     fn no_color_headers_keep_their_attributes_and_lose_their_colours() {
         let mut renderer = renderer();
         renderer.no_color = true;
-        let narration = "Call fs_read {\"path\":\"x\"}".to_string();
-        let running = Cell::tool("c1".to_string(), narration.clone(), Instant::now());
-        let mut failed = Cell::tool("c2".to_string(), narration, Instant::now());
+        let args = "{\"path\":\"x\"}";
+        let running = narrated("c1", "fs_read", args, Instant::now());
+        let mut failed = narrated("c2", "fs_read", args, Instant::now());
         if let Cell::Tool { status, .. } = &mut failed {
             *status = ToolStatus::Failed {
                 elapsed: Duration::from_millis(100),
@@ -2687,11 +2723,7 @@ mod tests {
         let frame = throbber::frame_at(since, renderer.tick.now);
         assert_eq!(frame, crate::utils::SPINNER_FRAMES[3]);
         let mut cells = [
-            Cell::tool(
-                "c1".to_string(),
-                "Call fs_read {\"path\":\"x\"}".to_string(),
-                since,
-            ),
+            narrated("c1", "fs_read", "{\"path\":\"x\"}", since),
             Cell::Job {
                 job_id: "job-1".to_string(),
                 tool: "execute_command".to_string(),
@@ -2737,11 +2769,7 @@ mod tests {
     fn a_recorded_call_says_done_with_no_time() {
         assert_eq!(tool_state(&ToolStatus::Recorded, None), "done");
         let mut renderer = renderer();
-        let mut cell = Cell::recorded_tool(
-            "c1".to_string(),
-            "fs_read {\"path\":\"x\"}".to_string(),
-            "body\n",
-        );
+        let mut cell = recorded("c1", "fs_read", "{\"path\":\"x\"}", "body\n");
         let header = cell.lines(80, &mut renderer)[0].to_string();
         assert_eq!(header, "\u{25B8} fs_read({\"path\":\"x\"})  done");
     }
@@ -2755,11 +2783,7 @@ mod tests {
         let output: String = (1..=TOOL_OUTPUT_TAIL + 5)
             .map(|n| format!("line {n:02}\n"))
             .collect();
-        let mut cell = Cell::recorded_tool(
-            "c1".to_string(),
-            "execute_command {\"command\":\"seq\"}".to_string(),
-            &output,
-        );
+        let mut cell = recorded("c1", "execute_command", "{\"command\":\"seq\"}", &output);
         cell.toggle();
         let lines: Vec<String> = cell
             .thread_lines(80, &mut renderer)
@@ -2774,8 +2798,8 @@ mod tests {
         assert_eq!(lines.len(), 1 + TOOL_OUTPUT_TAIL + 5, "{lines:?}");
 
         let content = "x".repeat(200);
-        let summary = format!("fs_write {{\"content\":\"{content}\"}}");
-        let mut cut = Cell::recorded_tool("c2".to_string(), summary, "");
+        let args = format!("{{\"content\":\"{content}\"}}");
+        let mut cut = recorded("c2", "fs_write", &args, "");
         cut.toggle();
         let text: String = cut
             .thread_lines(80, &mut renderer)
@@ -2840,11 +2864,7 @@ mod tests {
     #[test]
     fn toggling_a_bookkeeping_row_does_nothing() {
         let mut renderer = renderer();
-        let mut cell = Cell::tool(
-            "c1".to_string(),
-            "Call memory__search {\"query\":\"x\"}".to_string(),
-            Instant::now(),
-        );
+        let mut cell = narrated("c1", "memory__search", "{\"query\":\"x\"}", Instant::now());
         assert!(!cell.collapsible());
         cell.toggle();
         assert!(matches!(
@@ -2862,11 +2882,7 @@ mod tests {
     #[test]
     fn a_bookkeeping_rows_output_shows_in_the_pager_only() {
         let mut renderer = renderer();
-        let mut cell = Cell::tool(
-            "c1".to_string(),
-            "Call memory__search {\"query\":\"x\"}".to_string(),
-            Instant::now(),
-        );
+        let mut cell = narrated("c1", "memory__search", "{\"query\":\"x\"}", Instant::now());
         let tail = cell.output_for("c1").unwrap();
         let text = append_output(tail, b"remembered fact\n");
         tail.full.push(&text);

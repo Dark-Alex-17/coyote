@@ -57,6 +57,14 @@ pub enum NoticeKind {
     ToolWarning,
 }
 
+/// How an agent's run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentOutcome {
+    Completed,
+    Failed(String),
+    Interrupted,
+}
+
 /// Something that happened inside the engine, published on the [`EventBus`]
 /// for in-process observers. Every variant owns its data so sinks can keep
 /// events past the publishing call.
@@ -73,9 +81,73 @@ pub enum Event {
         payload: Option<String>,
         origin: Origin,
     },
+    /// The plain narration line of a tool call, with the tool name and the
+    /// argument words it is built from.
     ToolNarration {
         call_id: String,
+        name: String,
+        args: Vec<String>,
         line: String,
+        origin: Origin,
+    },
+    /// A tool call began. `args` is the call's arguments JSON, the payload
+    /// its hooks receive. Like the other typed hook events below, it is
+    /// published right after its [`Event::Hook`] twin with the same origin.
+    ToolStarted {
+        origin: Origin,
+        name: String,
+        call_id: String,
+        args: String,
+    },
+    /// A tool call ended: failed when `error` is set. `args` is `None` for
+    /// a call refused before its arguments were read.
+    ToolFinished {
+        origin: Origin,
+        name: String,
+        call_id: String,
+        args: Option<String>,
+        duration_ms: Option<u64>,
+        error: Option<String>,
+    },
+    JobStarted {
+        origin: Origin,
+        job_id: String,
+        tool: String,
+    },
+    JobFinished {
+        origin: Origin,
+        job_id: String,
+        tool: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    AgentStarted {
+        origin: Origin,
+        agent_id: String,
+        name: Option<String>,
+        session_id: Option<String>,
+    },
+    AgentFinished {
+        origin: Origin,
+        agent_id: String,
+        name: Option<String>,
+        session_id: Option<String>,
+        outcome: AgentOutcome,
+    },
+    /// A graph node began; `origin.node` names it as well.
+    NodeStarted {
+        origin: Origin,
+        node_id: String,
+        node_type: String,
+    },
+    /// A graph node ended: failed when `error` is set.
+    NodeFinished {
+        origin: Origin,
+        node_id: String,
+        node_type: String,
+        duration_ms: u64,
+        route: Option<String>,
+        error: Option<String>,
     },
     TextDelta(String),
     /// The model's thinking phase began / ended. Each carries the

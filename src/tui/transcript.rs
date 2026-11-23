@@ -305,7 +305,10 @@ impl Transcript {
                     name,
                     args,
                     output,
-                } => Cell::recorded_tool(call_id, entry_summary(&name, &args), &output),
+                } => {
+                    let summary = entry_summary(&name, &args);
+                    Cell::recorded_tool(call_id, &name, &args, summary, &output)
+                }
             };
             self.push(cell);
         }
@@ -1315,6 +1318,8 @@ mod tests {
     fn tool(call_id: &str) -> Cell {
         Cell::tool(
             call_id.to_string(),
+            "fs_read",
+            call_id,
             format!("Call fs_read {call_id}"),
             Instant::now(),
         )
@@ -1455,6 +1460,8 @@ mod tests {
         transcript.push(tool("c1"));
         transcript.push(Cell::tool(
             "c2".to_string(),
+            "memory__read",
+            "{}",
             "Call memory__read {}".to_string(),
             Instant::now(),
         ));

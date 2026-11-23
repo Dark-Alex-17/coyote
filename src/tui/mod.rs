@@ -1674,12 +1674,22 @@ impl App {
                 self.transcript
                     .push_notice(self.notice_merge_from(), kind, text);
             }
-            UiMsg::ToolNarration { call_id, line } => {
+            UiMsg::ToolNarration {
+                call_id,
+                name,
+                args,
+                line,
+            } => {
                 // The todo panel shows what a todo call did; its row
                 // would only repeat it.
-                if !cells::narrated_tool_name(&line).starts_with("todo__") {
-                    self.transcript
-                        .push(Cell::tool(call_id, line, self.clock.now()));
+                if !name.starts_with("todo__") {
+                    self.transcript.push(Cell::tool(
+                        call_id,
+                        &name,
+                        &args.join(" "),
+                        line,
+                        self.clock.now(),
+                    ));
                 }
             }
             UiMsg::ToolOutput { call_id, bytes } => self.transcript.append_tool_output(
