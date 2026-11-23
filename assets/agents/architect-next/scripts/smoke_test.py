@@ -2100,27 +2100,66 @@ E_IR82_RPT = gates.integration_test(r82(task_rounds={T1: {"merged": True, "integ
 check("replay 08/2: integration_red carries the failed command and the latest fix-round report",
       E_IR82["data"].get("failed_command") == "sh check.sh" and gates.CAP_SPENT_NOTE in E_IR82["question"]
       and "REPORT-SUMMARY: the declared command needs the wrapper." in E_IR82_RPT["evidence"], E_IR82["data"])
-s = r82(escalation=E_IR82, last_answer_text=_lib.HEADLESS_GUIDANCE, reply_source="judge", reply_verdict="instruction",
-        reply_instruction="verification_command", reply_value=f"./run-checks -- {R82_WHY}", reply_reason="The project documents the wrapper.")
-s.update(gates.interpret_route(s))
-s.update(gates.apply_answer(s))
-check("replay 08/2: an integration_red verification_command instruction is applied through the one helper and re-runs the verification",
-      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks"]'
-      and s["verification_changes"][-1]["by"] == "headless judge" and s["verification_changes"][-1]["reason"] == R82_WHY, s.get("decisions"))
-s = r82(escalation=E_IR82, last_answer_text="run the wrapper instead", reply_verdict="instruction", reply_instruction="verification_command",
-        reply_value=f"`./run-checks -- --all` -- {R82_WHY}", reply_reason="The owner names the wrapper.")
-s.update(gates.interpret_route(s))
-s.update(gates.apply_answer(s))
-check("verification_command: an owner-typed instruction through interpret_reply is recorded by the owner and re-runs the verification",
-      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks -- --all"]'
-      and s["verification_changes"][-1]["by"] == "owner" and s["verification_changes"][-1]["reason"] == R82_WHY, s.get("decisions"))
-s = r82(escalation=E_VC, last_answer_text="use the other form", reply_verdict="instruction", reply_instruction="verification_command",
-        reply_value=f"`./run-checks --all` -- {R82_WHY}", reply_reason="The owner corrects the command.")
-s.update(gates.interpret_route(s))
-s.update(gates.apply_answer(s))
-check("verification_command: the question accepts a typed corrected command and re-runs only the verification",
-      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks --all"]' and "fix_request" not in s,
-      s.get("decisions"))
+
+
+def typed82(esc, value, judge=False, **over):
+    """A typed verification_command instruction on `esc`, routed by interpret_route and then apply_answer."""
+    who = (dict(last_answer_text=_lib.HEADLESS_GUIDANCE, reply_source="judge") if judge
+           else dict(last_answer_text="use this command instead"))
+    s = r82(escalation=esc, reply_verdict="instruction", reply_instruction="verification_command", reply_value=value,
+            reply_reason="The typed command runs the same checks.", **who, **over)
+    s.update(gates.interpret_route(s))
+    s.update(gates.apply_answer(s))
+    return s
+
+
+def asked_typed(s, by, new, scope):
+    esc = s.get("escalation") or {}
+    return (s["_next"] == "escalate_gate" and esc.get("kind") == "verification_command"
+            and esc["question"].startswith(f"The {by} reports ") and esc["data"]["by"] == by
+            and esc["data"]["replacement"] == new and esc["data"]["scope"] == scope
+            and [o["text"] for o in esc["options"]] == [gates.VERIFY_ADOPT, gates.VERIFY_KEEP, "Stop and report"]
+            and not any(o["recommended"] for o in esc["options"]) and esc.get("hard_trigger")
+            and "\n\nDocumentation check:\n## CONTRIBUTING.md\ncited line 5:\n" in esc["evidence"]
+            and s["verification_commands"] == '["true", "sh check.sh"]' and not s.get("verification_changes"))
+
+
+s = typed82(E_IR82, f"./run-checks -- {R82_WHY}", judge=True)
+check("verification_command: a judge-typed replacement on integration_red is asked with its documentation check, not adopted",
+      asked_typed(s, "headless judge", "./run-checks", "task") and s["escalation"]["data"]["task"] == T1, s.get("escalation"))
+E_TYPED82 = s["escalation"]
+u = gates.apply_answer(r82(escalation=E_TYPED82, last_answer=gates.VERIFY_ADOPT, answer_reason="The cited file documents it."))
+check("verification_command: adopting the judge-typed question replaces the command and re-runs only the verification",
+      u["_next"] == "integration_test" and u["verification_commands"] == '["true", "./run-checks"]'
+      and u["verification_changes"][-1]["by"] == "headless judge" and u["verification_changes"][-1]["reason"] == R82_WHY, u)
+E_IR82F = gates.integration_check(r82(final_integration_strikes=STRIKE_LIMIT, cap_continues={"integration_red:run": STRIKE_LIMIT}))["escalation"]
+s = typed82(E_IR82F, f"./run-checks -- {R82_WHY}", judge=True)
+check("verification_command: a judge-typed replacement on the Phase F integration_red is asked at run scope with its documentation check",
+      E_IR82F["kind"] == "integration_red" and asked_typed(s, "headless judge", "./run-checks", "run"), s.get("escalation"))
+u = gates.apply_answer({**s, "last_answer": gates.VERIFY_ADOPT, "answer_reason": "The cited file documents it."})
+check("verification_command: adopting the Phase F typed question re-runs only integration_check",
+      u["_next"] == "integration_check" and u["verification_commands"] == '["true", "./run-checks"]', u)
+s = typed82(E_IR82, f"`./run-checks -- --all` -- {R82_WHY}")
+check("verification_command: an owner-typed replacement through interpret_reply is asked with its documentation check, not adopted",
+      asked_typed(s, "owner", "./run-checks -- --all", "task"), s.get("escalation"))
+s = typed82(E_VC, f"`./run-checks` -- {R82_WHY}")
+check("verification_command: typing the question's own replacement adopts it as the adopt option does and re-runs the verification",
+      s["_next"] == "integration_test" and s["verification_commands"] == '["true", "./run-checks"]' and "fix_request" not in s
+      and s["verification_changes"][-1]["by"] == "owner", s.get("decisions"))
+s = typed82(E_VC, f"`./run-checks --all` -- {R82_WHY}")
+check("verification_command: a different typed replacement on the question raises a fresh question with that command's check",
+      asked_typed(s, "owner", "./run-checks --all", "task") and s["escalation"]["data"]["typed_rounds"] == 1, s.get("escalation"))
+E_RETYPED82 = s["escalation"]
+s = typed82(E_RETYPED82, f"`./run-checks --fast` -- {R82_WHY}")
+check("verification_command: a replacement re-typed past the bound is not adopted and the open question is asked again for an option",
+      s["_next"] == "ask_dispatch" and s["escalation"]["data"]["replacement"] == "./run-checks --all"
+      and s["escalation"]["question"].startswith("Could not act on the reply ")
+      and s["verification_commands"] == '["true", "sh check.sh"]' and not s.get("verification_changes"), s.get("escalation"))
+s = typed82(E_IR82, f"./run-checks -- {R82_WHY}", judge=True, verification_changes=[
+    {"from": "sh check.sh", "to": "./run-checks", "reason": R82_WHY, "by": "owner", "task": T1, "at": "t", "kept": True}])
+check("verification_command: a typed replacement already decided is not asked again and not adopted; the open question is re-asked",
+      s["_next"] == "ask_dispatch" and s["escalation"]["kind"] == "integration_red" and s["verification_commands"] == '["true", "sh check.sh"]'
+      and any("was already decided; not asked again" in d for d in s["decisions"]), s.get("decisions"))
 CHANGED82 = [{"from": "sh check.sh", "to": "./run-checks", "reason": R82_WHY, "by": "owner", "task": T1, "at": "t"},
              {"from": "true", "to": "./other", "reason": "r", "by": "headless judge", "task": T1, "at": "t", "kept": True}]
 rep82 = gates.final_report(base_state(plan_path=PROMOTED, tasks=TS_W, run_dir=R82_RUN, verification_changes=CHANGED82))["report"]

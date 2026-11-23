@@ -3027,7 +3027,7 @@ def _red_next(state, u, scope, tid, out, failed):
 
 VERIFY_ADOPT = "Run the proposed command in place of the declared one (recorded)"
 VERIFY_KEEP = "Keep the declared command and run a fix round"
-VERIFY_REPLACED_RERUN = "Run the verification again with the replaced command"
+VERIFY_TYPED_ASKED = "Ask about the typed command with its documentation check"
 CITED_PLACE_RE = re.compile(r"([\w./-]+):(\d+)")
 PATH_TOKEN_RE = re.compile(r"[\w./-]+")
 DOC_MATCH_CAP = 12
@@ -3107,12 +3107,12 @@ def _documentation_check(state, replacement, reason):
 
 def _verification_question(state, u, scope, tid, out, failed):
     """The verification_command question when the pending proposal replaces the command that failed; None
-    otherwise. A pending proposal is consumed either way."""
+    otherwise. A pending proposal is consumed either way. It is the fix round's unless its `by` names who typed it."""
     p = as_dict(state.get("verification_proposal"))
     if not p:
         return None
     u["verification_proposal"] = {}
-    cmd, new, reason = p.get("command") or "", p.get("replacement") or "", p.get("reason") or ""
+    cmd, new, reason, by = p.get("command") or "", p.get("replacement") or "", p.get("reason") or "", p.get("by") or "fix round"
     if cmd != failed.get("command"):
         ledger(state, u, f"verification: the proposal `{new}` replaces `{cmd}`, not the failing `{failed.get('command')}`; dropped")
         return None
@@ -3120,15 +3120,15 @@ def _verification_question(state, u, scope, tid, out, failed):
         ledger(state, u, f"verification: `{cmd}` -> `{new}` was already decided; not asked again")
         return None
     evidence = f"{tail(out, 2500)}\n\n{_documentation_check(state, new, reason)}"
-    # No option is recommended: the fix round proposed the command, so whether it runs the same check is for the owner or
-    # the headless judge to weigh, never the proposer.
+    # No option is recommended: whether the proposed command runs the same check is for the owner or the headless judge
+    # to weigh against the documentation check, never for the proposer to settle.
     return escalation(
-        "verification_command", f"The fix round reports the declared verification command `{cmd}` cannot run here as declared "
+        "verification_command", f"The {by} reports the declared verification command `{cmd}` cannot run here as declared "
                                 f"and proposes `{new}` ({reason or 'no reason given'}). Run `{new}` in its place for the rest "
                                 f"of the run, keep `{cmd}`, or stop?",
         [option(VERIFY_ADOPT), option(VERIFY_KEEP), option("Stop and report")], evidence=evidence, hard_trigger=True,
         data={"task": tid, "failed_command": cmd, "failed_exit": failed.get("exit"), "replacement": new, "reason": reason,
-              "scope": scope, "output": tail(out, 4000)})
+              "scope": scope, "output": tail(out, 4000), "by": by, "typed_rounds": as_int(p.get("typed_rounds"))})
 
 
 def _adopt_verification_command(state, u, failed, replacement, reason, by, task=""):
@@ -3160,6 +3160,29 @@ def _rerun_verification(state, u, data):
     else:
         u.update({"integration_task": data.get("task") or "", "current_task": data.get("task") or state.get("current_task")})
         u["_next"] = "integration_test"
+
+
+def _ask_typed_verification(state, u, esc):
+    """Raise the verification_command question for the replacement the open question's answerer typed, so it is
+    weighed with its documentation check like a fix round's proposal. Past RERUN_ONCE re-typed replacements, or for a
+    pair already decided, nothing is adopted and the open question is asked again for an option."""
+    data, p = as_dict(esc.get("data")), as_dict(state.get("verification_proposal"))
+    typed = f"`{p.get('replacement') or ''}` -- {p.get('reason') or ''}"
+    if as_int(p.get("typed_rounds")) > RERUN_ONCE:
+        u["verification_proposal"] = {}
+        ledger(state, u, f"verification: `{p.get('replacement')}` is typed past {RERUN_ONCE} re-typed replacements; not "
+                         f"asked about and not adopted")
+        _reask_unmatched(state, u, esc, typed, why=f"{RERUN_ONCE} typed replacements were already asked about. Pick an "
+                                                   f"option by its number or its text.")
+        return
+    scope = data.get("scope") or ("task" if data.get("task") else "run")
+    tid = data.get("task") or (_final_red_owner(state) if scope == "run" else "")
+    failed = {"command": data.get("failed_command") or "", "exit": data.get("failed_exit")}
+    if q := _verification_question(state, u, scope, tid, data.get("output") or esc.get("evidence", ""), failed):
+        raise_escalation(state, u, q)
+    else:
+        _reask_unmatched(state, u, esc, typed, why="that replacement was already decided. Pick an option by its number "
+                                                   "or its text.")
 
 
 def _unmerged_reason(state, code, task, run_branch):
@@ -3652,9 +3675,16 @@ def _apply_instruction(state, u, esc, shape, value, text):
     if shape == "verification_command":
         data = as_dict(esc.get("data"))
         replacement, why = _parse_verification_line(value)
-        return VERIFY_REPLACED_RERUN if _adopt_verification_command(
-            state, u, data.get("failed_command") or "", replacement, why, _decided_by(state),
-            data.get("task") or "") else ""
+        if not replacement:
+            return ""
+        retyped = esc.get("kind") == "verification_command"
+        # the answerer has already read this command's documentation check in the question's evidence
+        if retyped and replacement == data.get("replacement"):
+            return VERIFY_ADOPT
+        u["verification_proposal"] = {"command": data.get("failed_command") or "", "replacement": replacement, "reason": why,
+                                      "task": data.get("task") or "", "by": _decided_by(state),
+                                      "typed_rounds": as_int(data.get("typed_rounds")) + 1 if retyped else 0}
+        return VERIFY_TYPED_ASKED
     if shape in FREE_FORM_SHAPES:
         return INSTRUCTION_ANSWERS[shape].format(text.strip()) if text.strip() else ""
     return INSTRUCTION_ANSWERS[shape].format(value) if value and shape in INSTRUCTION_ANSWERS else ""
@@ -4688,8 +4718,8 @@ def apply_answer(state):
         ledger(state, u, f"relay: {tid}: the owner answered {tail(answer, 200)!r} -> resuming the implementer's run "
                          f"{data.get('child_run_id')}")
         u["_next"] = "compose_delegation"
-    elif kind in ("integration_red", "verification_command") and answer == VERIFY_REPLACED_RERUN:
-        _rerun_verification(state, u, as_dict(esc.get("data")))
+    elif kind in ("integration_red", "verification_command") and answer == VERIFY_TYPED_ASKED:
+        _ask_typed_verification(state, u, esc)
     elif kind in ("integration_conflict", "integration_red"):
         a = ("abort" if abort else "stop" if stop
              else _picked_key(answer, options, {"round": ["one more", "cycle", "round"], "abort": ["abort"], "stop": ["stop"]}))
