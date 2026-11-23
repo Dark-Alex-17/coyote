@@ -866,11 +866,14 @@ fn review_lanes_are_seated_in_the_worktree_under_review() {
             .unwrap()
             .iter()
             .filter(|(_, node)| node["type"].as_str() == Some("agent"))
-            .filter(|(_, node)| declares_project_dir(node["agent"].as_str().unwrap()))
             .map(|(id, node)| (id.as_str().unwrap().to_string(), node.clone()))
             .collect();
         assert!(!lanes.is_empty(), "{graph}: no agent nodes");
         for (id, node) in lanes {
+            assert!(
+                declares_project_dir(node["agent"].as_str().unwrap()),
+                "{graph} {id}: the child agent declares no project_dir to seat"
+            );
             let seated = rendered_project_dir(&node, &state).unwrap_or_else(|| inherited.clone());
             let run = review_run(Path::new(&seated));
             let out = run_tool(
