@@ -37,6 +37,7 @@ mod propagation_fetch;
 mod propagation_nodes;
 mod protocol;
 pub(crate) mod request;
+mod routes;
 // pub(crate): the REPL pins the shared refusal wording in its tests.
 pub(crate) mod schema;
 mod sent_threads;
@@ -66,6 +67,7 @@ pub(crate) use propagation_fetch::{
 };
 pub(crate) use propagation_nodes::{NodePurpose, PROPAGATION_NODE_TTL, PropagationNodeRecord};
 pub(crate) use request::{RequestOptions, redact_hashes, short};
+pub(crate) use routes::with_progress;
 
 use crate::config::sanitize_display_text;
 use anyhow::{Context, Result, bail};

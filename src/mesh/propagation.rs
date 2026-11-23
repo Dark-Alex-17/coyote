@@ -1256,6 +1256,7 @@ mod tests {
                 path: path.clone(),
                 after,
                 recently_seen: false,
+                retried_to: None,
             },
             RequestError::LocalTimeout {
                 path: path.clone(),

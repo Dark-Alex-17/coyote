@@ -27,6 +27,7 @@ impl OriginName {
 }
 
 /// A msgpack map with `v`, `name_hash` and `body` keys; every request body travels in one.
+#[derive(Clone)]
 pub(crate) struct Envelope {
     pub version: u16,
     pub origin: OriginName,

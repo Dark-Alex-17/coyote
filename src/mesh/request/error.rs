@@ -20,10 +20,14 @@ pub(crate) enum RequestError {
     /// The link to the peer did not come up within `after`, so nothing was asked.
     /// `recently_seen` is set by the caller that knows the peer table, when the peer had
     /// announced within `PEER_STALE_AFTER`: the message then says it may have left.
+    /// `retried_to` names the destination when the link was tried a second time, on a
+    /// route just asked for or a first contact after a path request: the message then
+    /// says a far peer can take longer, never that it may have left.
     LinkActivationTimeout {
         path: String,
         after: Duration,
         recently_seen: bool,
+        retried_to: Option<String>,
     },
     /// This node's own wait ran out before the request left it: the link lock stayed
     /// held, or the transport did not take the request, within `after`.
@@ -134,14 +138,22 @@ impl fmt::Display for RequestError {
             Self::LinkActivationTimeout {
                 after,
                 recently_seen,
+                retried_to,
                 ..
             } => {
+                if let Some(who) = retried_to {
+                    // Every caller ends this message with its own full stop.
+                    return write!(
+                        f,
+                        "No mesh link to {who} came up within {} s. Far peers (several hops, a public gateway) can take longer; try once more",
+                        after.as_secs_f64().round()
+                    );
+                }
                 write!(
                     f,
                     "No mesh link to that session came up within {:.1}s",
                     after.as_secs_f64()
                 )?;
-                // Every caller ends this message with its own full stop.
                 let hint = left_mesh_hint_when(*recently_seen).trim_end_matches('.');
                 if !hint.is_empty() {
                     write!(f, ".{hint}")?;
@@ -265,6 +277,10 @@ impl RefusalCode {
 /// serve only a caller that wraps without the remap.
 pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
     match err {
+        RequestError::LinkActivationTimeout {
+            retried_to: Some(_),
+            ..
+        } => "`.mesh people list` shows when it was last heard",
         RequestError::Timeout { .. }
         | RequestError::LinkActivationTimeout { .. }
         | RequestError::LocalTimeout { .. }
@@ -560,6 +576,7 @@ mod no_answer_tests {
             path: "/message".to_string(),
             after: Duration::from_secs(10),
             recently_seen: false,
+            retried_to: None,
         };
 
         assert_eq!(
@@ -580,6 +597,7 @@ mod no_answer_tests {
             path: "/status".to_string(),
             after: Duration::from_secs(10),
             recently_seen: true,
+            retried_to: None,
         };
 
         assert_eq!(
@@ -599,6 +617,7 @@ mod no_answer_tests {
                 path: path.clone(),
                 after,
                 recently_seen: false,
+                retried_to: None,
             },
             RequestError::LocalTimeout {
                 path: path.clone(),

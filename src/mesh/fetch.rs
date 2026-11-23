@@ -1842,6 +1842,7 @@ mod no_answer_tests {
                 path: LIST_PATH.to_string(),
                 after,
                 recently_seen: false,
+                retried_to: None,
             },
         );
         assert!(

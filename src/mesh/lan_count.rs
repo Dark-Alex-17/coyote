@@ -432,23 +432,7 @@ impl RnsdLanReader {
                 Err(_) => return *self.last.lock(),
             },
         };
-        if matches!(*target, RpcTarget::Unresolved) {
-            let dir = self.locator.config_dir();
-            let resolved = dir
-                .ok_or_else(|| "no home directory to look for rnsd's config in".to_string())
-                .and_then(|dir| {
-                    let abstract_sockets = cfg!(any(target_os = "linux", target_os = "android"));
-                    resolve_target(&dir, &self.instance, abstract_sockets)
-                        .map(|(endpoint, key)| (dir, endpoint, key))
-                });
-            *target = match resolved {
-                Ok((dir, endpoint, key)) => RpcTarget::Ready { dir, endpoint, key },
-                Err(reason) => {
-                    tell_unavailable(&reason);
-                    RpcTarget::Unavailable
-                }
-            };
-        }
+        self.resolve(&mut target);
         let RpcTarget::Ready { dir, endpoint, key } = &*target else {
             return RnsdReading::UNKNOWN;
         };
@@ -498,6 +482,60 @@ impl RnsdLanReader {
             );
         }
         RnsdReading::UNKNOWN
+    }
+
+    /// Resolves rnsd's RPC endpoint and key on first use, as a read does.
+    fn resolve(&self, target: &mut RpcTarget) {
+        if !matches!(*target, RpcTarget::Unresolved) {
+            return;
+        }
+        let dir = self.locator.config_dir();
+        let resolved = dir
+            .ok_or_else(|| "no home directory to look for rnsd's config in".to_string())
+            .and_then(|dir| {
+                let abstract_sockets = cfg!(any(target_os = "linux", target_os = "android"));
+                resolve_target(&dir, &self.instance, abstract_sockets)
+                    .map(|(endpoint, key)| (dir, endpoint, key))
+            });
+        *target = match resolved {
+            Ok((dir, endpoint, key)) => RpcTarget::Ready { dir, endpoint, key },
+            Err(reason) => {
+                tell_unavailable(&reason);
+                RpcTarget::Unavailable
+            }
+        };
+    }
+
+    /// rnsd's RPC endpoint and key, for the path calls: `None` when rnsd's config names
+    /// none usable or rnsd refused the key for the run.
+    pub(crate) async fn rpc_target(&self) -> Option<(RpcEndpoint, RpcKey)> {
+        let mut target = self.target.lock().await;
+        self.resolve(&mut target);
+        match &*target {
+            RpcTarget::Ready { endpoint, key, .. } => Some((endpoint.clone(), key.clone())),
+            RpcTarget::Unresolved | RpcTarget::Unavailable => None,
+        }
+    }
+
+    /// Every interface rnsd runs, by its `Type[name]`, and whether it is online now: one
+    /// call on `QUICK_RPC_BUDGET`, for a route check a failed link waits on. `None` when
+    /// the call did not reach rnsd. Leaves the LAN reading alone.
+    pub(crate) async fn interface_states(&self) -> Option<Vec<InterfaceHosts>> {
+        let (endpoint, key) = self.rpc_target().await?;
+        match self
+            .source
+            .interface_hosts(&endpoint, &key, QUICK_RPC_BUDGET)
+            .await
+        {
+            Ok(entries) => Some(entries),
+            Err(err) => {
+                debug!(
+                    "Mesh could not read rnsd's interface states for a route check: {}",
+                    redact_hashes(&err.to_string())
+                );
+                None
+            }
+        }
     }
 
     /// Whether the latest read that reached rnsd had a TCP client online, with no call;

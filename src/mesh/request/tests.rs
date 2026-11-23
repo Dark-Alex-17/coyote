@@ -108,6 +108,7 @@ fn every_request_error_has_a_next_step() {
             path: "/status".to_string(),
             after: Duration::from_secs(5),
             recently_seen: false,
+            retried_to: None,
         },
         RequestError::LocalTimeout {
             path: "/status".to_string(),

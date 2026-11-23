@@ -11164,6 +11164,59 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
     );
 }
 
+/// The route part of "Moving between networks" and the commands page quote the stale
+/// route sentence and the far-peer error as the source words them, and the section says
+/// `rnpath -d` is no longer needed.
+#[test]
+fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
+    let routes = read(repo_root().join("src/mesh/routes.rs"));
+    assert!(
+        routes.contains(
+            "format!(\"The route to {who} looked stale; asking the network for a new one...\")"
+        ),
+        "src/mesh/routes.rs no longer words the stale route sentence"
+    );
+    let error_rs = read(repo_root().join("src/mesh/request/error.rs"));
+    for piece in [
+        "\"No mesh link to {who} came up within {} s. Far peers (several hops, a public gateway) can take longer; try once more\"",
+        "=> \"`.mesh people list` shows when it was last heard\"",
+    ] {
+        assert!(
+            error_rs.contains(piece),
+            "src/mesh/request/error.rs no longer words {piece}"
+        );
+    }
+    let stale =
+        "`The route to <user> / <session> looked stale; asking the network for a new one...`";
+    let far = "``No mesh link to <user> / <session> came up within <n> s. Far peers (several hops, a public gateway) can take longer; try once more. `.mesh people list` shows when it was last heard.``";
+
+    let Some(wiki) = wiki_dir() else { return };
+    let moving = folded_section(
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## Moving between networks",
+    );
+    for needle in [
+        stale,
+        "drops the route (in rnsd's table as well as its own), asks the network for a new one once, and tries the link once more before it reports anything",
+        "every route over that interface counts as stale before its next request",
+        "the trusted sessions and the propagation nodes reached the long way round over another interface are asked for once more",
+        "A route over an interface that is up always wins over one over an interface that is down, whatever their hops.",
+        "`rnpath -d` is no longer needed after a move.",
+    ] {
+        assert!(
+            moving.contains(needle),
+            "Mesh-Deployment.md's Moving between networks section does not say {needle:?}"
+        );
+    }
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for needle in [stale, far, "It never says the session may have left"] {
+        assert!(
+            commands.contains(needle),
+            "Mesh-Commands.md does not quote {needle:?}"
+        );
+    }
+}
+
 /// The "Moving between networks" section and the commands page quote the two greeting
 /// lines as `upstream_line` words them, and the section gives the poll interval
 /// `UPSTREAM_POLL` sets and the hourly limit the greetings share.

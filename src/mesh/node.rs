@@ -74,6 +74,7 @@ use crate::mesh::request::{
     NoAnswer, OriginName, PathHash, RefusalCode, RemoteRefusal, RequestError, RequestOptions,
     STATUS_PATH, redact_hashes, request as link_request, short,
 };
+use crate::mesh::routes::{Affected, LinkTry, RouteBook, Routes};
 use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -796,6 +797,8 @@ pub(crate) struct MeshRuntime {
     /// The rnsd TCP interfaces that went offline or came back and the host interfaces
     /// whose addresses changed, with when, as the interface watcher saw them.
     interface_transitions: InterfaceTransitions,
+    /// This node's own interfaces' state and the paths a network change made suspect.
+    route_book: RouteBook,
     destination: Mutex<DestinationState>,
     /// Held shared for the node's lifetime so no process rotates the key it announces
     /// under; `None` once `shutdown` has released it. Outside `DestinationState` because a
@@ -1104,6 +1107,7 @@ impl MeshRuntime {
             interfaces: Mutex::new(joined),
             rnsd_lan,
             interface_transitions: InterfaceTransitions::default(),
+            route_book: RouteBook::default(),
             destination: Mutex::new(DestinationState {
                 dest,
                 hash,
@@ -1770,6 +1774,97 @@ impl MeshRuntime {
         self.rnsd_lan.as_ref()
     }
 
+    /// This node's routes over `transport`, for reading and replacing a stale path.
+    pub(crate) fn routes<'a>(&'a self, transport: &'a Transport) -> Routes<'a> {
+        Routes {
+            transport,
+            rnsd: self.rnsd_lan.as_ref(),
+            transitions: &self.interface_transitions,
+            book: &self.route_book,
+        }
+    }
+
+    pub(crate) fn route_book(&self) -> &RouteBook {
+        &self.route_book
+    }
+
+    /// The destinations a returned interface asks a shorter route for: the sessions the
+    /// peer table holds that this node trusts, and the filed propagation nodes.
+    fn return_home_wanted(&self) -> HashSet<String> {
+        let mut wanted: HashSet<String> = self
+            .peers
+            .snapshot()
+            .into_iter()
+            .filter(|peer| {
+                self.trust
+                    .authorize(&peer.identity_hash, &peer.destination_hash)
+                    .decision
+                    == Decision::Allow
+            })
+            .map(|peer| peer.destination_hash)
+            .collect();
+        wanted.extend(
+            self.propagation_nodes
+                .snapshot()
+                .into_iter()
+                .map(|record| record.node.destination.address_hash.to_hex_string()),
+        );
+        wanted
+    }
+
+    /// After the watch saw rnsd's upstream come back or the host's network change: every
+    /// path over the interface that changed (every path, for a network change) is marked
+    /// suspect, so its next request asks the network first, and the trusted sessions and
+    /// filed nodes routed the long way round are asked for once over the one that came
+    /// back. Runs off the watcher, which it never holds up.
+    fn after_upstream_change(self: &Arc<Self>, change: &UpstreamChange) {
+        let reconnected = change.reconnected.clone();
+        let moved = !change.network_changed.is_empty();
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let Some(transport) = runtime.transport_handle().await else {
+                return;
+            };
+            let routes = runtime.routes(&transport);
+            let mut affected: Vec<Affected> = reconnected
+                .iter()
+                .cloned()
+                .map(Affected::Interface)
+                .collect();
+            if moved {
+                affected = vec![Affected::Everything];
+            }
+            for affected in &affected {
+                let marked = routes.destinations_over(affected).await;
+                debug!(
+                    "Mesh marked {} path(s) over {affected:?} suspect",
+                    marked.len()
+                );
+                runtime.route_book.mark(marked);
+            }
+            let wanted = runtime.return_home_wanted();
+            for returned in &reconnected {
+                routes.return_home_rnsd(returned, &wanted).await;
+            }
+        });
+    }
+
+    /// `after_upstream_change` for an in-process interface that connected again after a
+    /// disconnect.
+    fn after_interface_back(self: &Arc<Self>, iface: AddressHash) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let Some(transport) = runtime.transport_handle().await else {
+                return;
+            };
+            let routes = runtime.routes(&transport);
+            let marked = routes.own_destinations_over(iface).await;
+            runtime.route_book.mark(marked);
+            let wanted = runtime.return_home_wanted();
+            routes.return_home_in_process(iface, &wanted).await;
+        });
+    }
+
     /// Marks every interface row unreachable and retrying, as the watcher does once a
     /// relay's redials keep failing, for a test that needs a node on no relay now.
     #[cfg(all(test, unix))]
@@ -2097,16 +2192,36 @@ impl MeshRuntime {
             path_requested: options.path_requested || asked,
             ..*options
         };
-        propagation::propagate(
-            &transport,
-            &sender,
-            recipient,
-            node,
-            &build(&origin),
-            cancel,
-            &options,
-        )
-        .await?;
+        let message = build(&origin);
+        let node_hex = node.destination.address_hash.to_hex_string();
+        self.routes(&transport)
+            .recovering(
+                &node.destination.address_hash,
+                || format!("propagation node {}", short(&node_hex)),
+                LinkTry {
+                    link_timeout: options.link_timeout,
+                    path_requested: options.path_requested,
+                },
+                |link| {
+                    let options = PropagationOptions {
+                        link_timeout: link.link_timeout,
+                        path_requested: link.path_requested,
+                        ..options
+                    };
+                    let cancel = cancel.clone();
+                    let transport = &transport;
+                    let sender = &sender;
+                    let message = &message;
+                    async move {
+                        propagation::propagate(
+                            transport, sender, recipient, node, message, cancel, &options,
+                        )
+                        .await
+                    }
+                },
+                crate::mesh::routes::post_link_error,
+            )
+            .await?;
         Ok(())
     }
 
@@ -2199,13 +2314,29 @@ impl MeshRuntime {
             path_requested: options.path_requested || gone,
             ..options
         };
-        let request = link_request(
-            &transport,
-            &self.transport_identity,
-            destination,
-            path,
-            envelope,
-            options,
+        let routes = self.routes(&transport);
+        let request = routes.recovering(
+            &destination.address_hash,
+            || self.who_at(&dest_hex).to_string(),
+            LinkTry {
+                link_timeout: options.link_timeout,
+                path_requested: options.path_requested,
+            },
+            |link| {
+                link_request(
+                    &transport,
+                    &self.transport_identity,
+                    destination,
+                    path,
+                    envelope.clone(),
+                    RequestOptions {
+                        link_timeout: link.link_timeout,
+                        path_requested: link.path_requested,
+                        ..options
+                    },
+                )
+            },
+            crate::mesh::routes::the_error,
         );
         // Dropping the request future does not cancel it in the library: the responder
         // still serves it and the library's own timer retires the entry.
@@ -2403,7 +2534,7 @@ impl MeshRuntime {
         node: &PropagationNode,
         store_path: PathBuf,
     ) -> Result<FetchReport, FetchError> {
-        let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        let store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
         let cancel = self.cancellation_token();
         let asked = request_path_to_node(transport, node, &cancel, FetchError::Cancelled).await?;
         let peers = PeerRouting {
@@ -2424,24 +2555,51 @@ impl MeshRuntime {
             cache_dir: self.cache_dir.clone(),
             instance_id: self.current_instance_id(),
         };
-        propagation_fetch::fetch(
-            transport,
-            &self.transport_identity,
-            node,
-            &self.peers,
-            &self.trust,
-            &mut store,
-            &routing,
-            &hold,
-            &self.left_for_sessions,
-            &FetchOptions {
-                path_requested: asked,
-                retry_every: self.sync_every,
-                ..FetchOptions::default()
-            },
-            cancel,
-        )
-        .await
+        // The store is taken by each try in turn; a mutex keeps the retry's future `Send`.
+        let store = tokio::sync::Mutex::new(store);
+        let defaults = FetchOptions {
+            path_requested: asked,
+            retry_every: self.sync_every,
+            ..FetchOptions::default()
+        };
+        let node_hex = node.destination.address_hash.to_hex_string();
+        self.routes(transport)
+            .recovering(
+                &node.destination.address_hash,
+                || format!("propagation node {}", short(&node_hex)),
+                LinkTry {
+                    link_timeout: defaults.link_timeout,
+                    path_requested: defaults.path_requested,
+                },
+                |link| {
+                    let options = FetchOptions {
+                        link_timeout: link.link_timeout,
+                        path_requested: link.path_requested,
+                        ..defaults
+                    };
+                    let cancel = cancel.clone();
+                    let (store, routing, hold) = (&store, &routing, &hold);
+                    async move {
+                        let mut store = store.lock().await;
+                        propagation_fetch::fetch(
+                            transport,
+                            &self.transport_identity,
+                            node,
+                            &self.peers,
+                            &self.trust,
+                            &mut store,
+                            routing,
+                            hold,
+                            &self.left_for_sessions,
+                            &options,
+                            cancel,
+                        )
+                        .await
+                    }
+                },
+                crate::mesh::routes::fetch_link_error,
+            )
+            .await
     }
 
     /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
@@ -3768,8 +3926,15 @@ fn note_link_outcome(
     now: SystemTime,
 ) -> Result<rmpv::Value, RequestError> {
     match &mut outcome {
-        Err(RequestError::LinkActivationTimeout { recently_seen, .. }) => {
-            *recently_seen = peers.get(dest_hex).is_some_and(|peer| !peer.is_stale(now));
+        // A link tried again over a route just asked for, or after a path request, is
+        // the far-peer case: it never reads as the peer having left.
+        Err(RequestError::LinkActivationTimeout {
+            recently_seen,
+            retried_to,
+            ..
+        }) => {
+            *recently_seen =
+                retried_to.is_none() && peers.get(dest_hex).is_some_and(|peer| !peer.is_stale(now));
             peers.mark_link_failed(dest_hex);
         }
         Err(RequestError::LinkNotOpened(_)) => peers.mark_link_failed(dest_hex),
@@ -3827,6 +3992,20 @@ async fn receive_announces(
         };
         let desc = event.destination.lock().await.desc;
         let now = SystemTime::now();
+        // A path held over an interface that is down gives way to this one, which arrived
+        // over an interface that is up; weighed off the receiver, which never waits on it.
+        if let Some(runtime) = runtime.upgrade() {
+            let destination = desc.address_hash;
+            let arrival = AddressHash::new_from_slice(&event.interface);
+            tokio::spawn(async move {
+                if let Some(transport) = runtime.transport_handle().await {
+                    runtime
+                        .routes(&transport)
+                        .prefer_up(&destination, arrival)
+                        .await;
+                }
+            });
+        }
         if propagation_nodes.observe_announce(
             &desc,
             event.app_data.as_slice(),
@@ -4302,6 +4481,11 @@ async fn watch_interfaces(
                         runtime.interface_transitions(),
                     ) => change,
                 };
+                // The paths over what changed are marked whether or not the greeting is
+                // held back a poll.
+                if !change.is_empty() {
+                    runtime.after_upstream_change(&change);
+                }
                 let change = move_greeting.decide(
                     change,
                     defers_moves,
@@ -4319,6 +4503,15 @@ async fn watch_interfaces(
             }
             received = next_interface_event(&mut events) => match received {
                 Ok(event) => {
+                    if let Some(runtime) = runtime.upgrade()
+                        && runtime.route_book().note_interface_event(
+                            event.iface(),
+                            event.kind(),
+                            SystemTime::now(),
+                        )
+                    {
+                        runtime.after_interface_back(event.iface());
+                    }
                     transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
                 }
                 Err(missed) => transitions = reconcile_tcp_after_lag(&mut watches, missed),
@@ -18960,22 +19153,30 @@ mod tests {
         }
 
         async fn start_with(tag: &str, port: u16, options: NodeOptions) -> Self {
+            Self::start_watched(tag, private_config(port), options, true).await
+        }
+
+        /// A node on `config`, installed in a slot (which runs its interface watcher) when
+        /// `watched`; an unwatched node greets no relay it connects to after it started.
+        async fn start_watched(
+            tag: &str,
+            config: MeshConfig,
+            options: NodeOptions,
+            watched: bool,
+        ) -> Self {
             let tmp = TempDir::new(tag);
             let mut session = Session::default();
-            let runtime = MeshRuntime::start(
-                &private_config(port),
-                true,
-                &mut session,
-                mesh_paths(&tmp),
-                options,
-            )
-            .await
-            .unwrap();
+            let runtime =
+                MeshRuntime::start(&config, true, &mut session, mesh_paths(&tmp), options)
+                    .await
+                    .unwrap();
             let hash = runtime.destination_hash().await;
             let slot = Arc::new(MeshSlot::default());
             let notifier = Arc::new(RecordingSink::default());
             slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
-            slot.install(runtime.clone()).unwrap();
+            if watched {
+                slot.install(runtime.clone()).unwrap();
+            }
             Self {
                 runtime,
                 slot,
@@ -19004,6 +19205,95 @@ mod tests {
                 .last_announce
                 .expect("the start announce sets the floor")
         }
+    }
+
+    /// A path learned over a relay that then goes away rests on an interface that is
+    /// down: the next request drops it, asks the network once, and lands over the other
+    /// relay, which answers the path request from the session behind it, with nothing
+    /// typed in between. B never greets the second relay, so its route there is learned
+    /// only by that path request.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_over_a_relay_that_went_away_lands_over_the_other_relay() {
+        use crate::mesh::card::StatusError;
+        use crate::mesh::routes::{SuspectWhy, Suspicion};
+        use crate::mesh::test_support::wait_for_peer;
+
+        install_log_collector();
+        let first = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let second_port = closed_port().await;
+        let both = || MeshConfig {
+            interfaces: vec![
+                MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: first.port,
+                },
+                MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: second_port,
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let a = RelayNode::start_watched("node-roam-a", both(), short_connect(), true).await;
+        let b = RelayNode::start_watched("node-roam-b", both(), short_connect(), false).await;
+        wait_for_peer(&a.runtime, &b.hash).await;
+        let second = TransportRelay::start_on_with_retries(second_port, 0).await;
+        let connected = format!("{} connected", private_label(second_port));
+        wait_for_mesh_line(&a.notifier, &connected).await;
+        // B's client to the second relay redials on its own; give it time to land.
+        sleep(Duration::from_secs(3)).await;
+
+        let transport = a.runtime.transport_handle().await.unwrap();
+        let b_hash = AddressHash::new_from_hex_string(&b.hash).unwrap();
+        let learned_over = transport
+            .path_interface(&b_hash)
+            .await
+            .expect("A holds a path to B")
+            .iface;
+
+        first.stop().await;
+        let down = Suspicion::Suspect(SuspectWhy::InterfaceDown);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while a
+            .runtime
+            .routes(&transport)
+            .facts(&b_hash)
+            .await
+            .suspicion()
+            != down
+        {
+            assert!(
+                Instant::now() < deadline,
+                "A never saw the first relay's interface go down"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let desc = a.runtime.resolve_destination(&b.hash).await.unwrap();
+        // B does not trust A, so it refuses or stays silent; either way the link came up,
+        // which is what this asks.
+        let answered = a.runtime.request_status(Route::unasked(desc)).await;
+        assert!(
+            !matches!(
+                answered,
+                Err(StatusError::Transport(
+                    RequestError::LinkActivationTimeout { .. }
+                        | RequestError::LinkNotOpened(_)
+                        | RequestError::LinkFailed(_)
+                ))
+            ),
+            "the request after the relay went away failed: {answered:?}"
+        );
+        let path = transport.path_interface(&b_hash).await.unwrap();
+        assert_ne!(
+            path.iface, learned_over,
+            "the route now runs over the second relay"
+        );
+
+        assert!(a.slot.stop().await.unwrap());
+        b.runtime.shutdown().await.unwrap();
+        second.stop().await;
     }
 
     /// Two nodes on a fresh relay, both heard by it, connected long enough that the
@@ -19749,6 +20039,7 @@ mod tests {
                 path: STATUS_PATH.to_string(),
                 after: Duration::from_secs(10),
                 recently_seen: false,
+                retried_to: None,
             };
             let sentences = reconnect_lines.into_iter().chain([
                 no_answer.to_string(),
@@ -25867,6 +26158,7 @@ mod tests {
                 path: STATUS_PATH.to_string(),
                 after: Duration::from_secs(10),
                 recently_seen: false,
+                retried_to: None,
             })
         };
 

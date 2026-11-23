@@ -3777,6 +3777,7 @@ mod tests {
             path: GET_PATH.to_string(),
             after: Duration::from_secs(10),
             recently_seen: true,
+            retried_to: None,
         };
         let every = Some(Duration::from_secs(300));
         let err = fetch_error(never_linked.clone(), "9af2fd91", "id1", every);
@@ -3824,6 +3825,7 @@ mod tests {
                 path: path.clone(),
                 after,
                 recently_seen: true,
+                retried_to: None,
             },
             RequestError::LocalTimeout {
                 path: path.clone(),

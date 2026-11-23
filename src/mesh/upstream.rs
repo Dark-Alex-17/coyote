@@ -345,6 +345,21 @@ impl InterfaceTransitions {
     pub(crate) fn snapshot(&self) -> Vec<InterfaceTransition> {
         self.recent.lock().iter().cloned().collect()
     }
+
+    /// Whether a path learned over the rnsd interface `interface` at `since` has seen
+    /// the network change under it: that interface came back online after `since`, or
+    /// the host's addresses changed after it, which moves every path. A transition the
+    /// record has dropped as too old is not seen.
+    pub(crate) fn changed_since(&self, interface: &str, since: SystemTime) -> bool {
+        self.recent.lock().iter().any(|transition| {
+            transition.at > since
+                && match transition.kind {
+                    TransitionKind::Up => transition.interface == interface,
+                    TransitionKind::AddressesChanged => true,
+                    TransitionKind::Down => false,
+                }
+        })
+    }
 }
 
 #[cfg(test)]

@@ -364,7 +364,17 @@ const PRUNE_DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * 24 * 60 * 60
 /// allow rule, which `.mesh files list` lists and `.mesh files unshare` takes back.
 const GRANT_FOR_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// Runs one `.mesh` command. Its progress lines, such as a stale route being replaced
+/// while it waits, go to the command's output as it runs.
 pub(crate) async fn run(
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+    args: Option<&str>,
+) -> Result<()> {
+    crate::mesh::with_progress(Arc::new(out_text), run_verb(ctx, abort_signal, args)).await
+}
+
+async fn run_verb(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
     args: Option<&str>,

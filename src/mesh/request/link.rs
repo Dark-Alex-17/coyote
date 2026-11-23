@@ -129,6 +129,7 @@ impl Deadline {
             path: path.to_string(),
             after: self.after,
             recently_seen: false,
+            retried_to: None,
         }
     }
 
@@ -139,6 +140,7 @@ impl Deadline {
             path: path.to_string(),
             after: self.after.saturating_sub(self.remaining()),
             recently_seen: false,
+            retried_to: None,
         }
     }
 }
