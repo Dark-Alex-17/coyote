@@ -890,16 +890,16 @@ impl Prompter for ScriptedPrompter {
         if let Some(message) = &self.failure {
             return Err(anyhow!("{message}"));
         }
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(req.clone());
         let answer = self
             .answers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop_front()
             .unwrap_or_else(|| panic!("unexpected prompt: {req:?}"));
-        self.requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(req);
         Ok(answer)
     }
 
