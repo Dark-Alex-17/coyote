@@ -3355,12 +3355,21 @@ def batch_close(state):
 
 
 # ====================================================================== 2.8 escalation ladder
+def _choice_decision_id(esc):
+    """A multiple-choice question's decision id: its kind, its place in the queue and a digest of the question, since
+    every new queue starts again at index 0. The same question asked again keeps its id."""
+    data = as_dict(esc.get("data"))
+    question = str(data.get("question") or esc.get("question") or render_question(esc))
+    digest = hashlib.sha1(question.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}~{digest}"
+
+
 def _decision_key(state, esc):
     """What the resolve-autonomously-once rule counts: the decision, the task it was raised in and the phase."""
     data = as_dict(esc.get("data"))
     decision = data.get("decision")
     if not decision and data.get("multiple_choice"):
-        decision = f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
+        decision = _choice_decision_id(esc)
     decision = decision or esc.get("kind", "unknown")
     task = data.get("task") or state.get("current_task") or ""
     phase = "run" if state.get("closeout_scope") == "run" else "task"
@@ -3455,7 +3464,7 @@ def consult_route(state):
 _TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft",
                      "choice_2": "ask_choice_2", "choice_3": "ask_choice_3", "choice_4": "ask_choice_4"}
 # escalation kinds answered at an approval node of their own: the ones above, and the two plan gates routed to theirs
-OWN_PROMPT_KINDS = ("review_incomplete", "seed_confirm", "draft_confirm", "approve_breakdown", "approve_next")
+OWN_PROMPT_KINDS = tuple(k for k in _TERMINAL_PROMPTS if not k.startswith("choice_")) + ("approve_breakdown", "approve_next")
 
 
 def _terminal_prompt(esc):
@@ -3482,7 +3491,7 @@ def ask_dispatch(state):
             and esc.get("kind") not in OWN_PROMPT_KINDS:
         # the picker answers itself with no human, so a repeat goes to the typed prompt under the key it was answered by
         data = {k: v for k, v in as_dict(esc.get("data")).items() if k != "multiple_choice"}
-        data["decision"] = data.get("decision") or f"{esc.get('kind', 'unknown')}#{as_int(data.get('index'))}"
+        data["decision"] = data.get("decision") or _choice_decision_id(esc)
         esc = {**esc, "data": data}
         u["escalation"] = esc
         u["ask_question"] = render_question(esc)
@@ -3507,7 +3516,7 @@ def ask_owner_poll(state):
     opts = " | ".join(f"{i}) {o.get('text', '')}" for i, o in enumerate(esc.get("options") or [], 1))
     data = as_dict(esc.get("data"))
     thread = f"{state.get('run_id', 'run')}-{esc.get('kind', 'q')}"
-    if data.get("multiple_choice"):
+    if data.get("multiple_choice") or "index" in data:
         # one remote thread per question, so a reply to an earlier question never lands on the next one
         thread += f"-{as_int(data.get('index'))}"
         if data.get("batch"):

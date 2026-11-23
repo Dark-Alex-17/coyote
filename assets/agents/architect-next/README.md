@@ -492,7 +492,9 @@ stated goes to the judge for one when the headless default, the ladder or the na
 it and the judge has rulings left for the question; any other bare pick runs as a plain round.
 Under `escalation_policy=autonomous` a decision goes to the ladder once and to the owner after
 that, keyed `<decision>|<task>|<phase>` (`_decision_key`: the decision is `data.decision`,
-else `kind#index` for a multiple-choice question, else the kind; the phase is `run` during
+else `kind#index~digest` for a multiple-choice question, the digest a short hash of the
+question so a new queue that starts again at index 0 is a new decision while the same
+question asked again is not, else the kind; the phase is `run` during
 the run close-out and `task` otherwise) in the `autonomous_decisions` seed; the
 `answer_source` seed names who picked the answer (headless default, ladder, navigator or
 judge) and `apply_reasks` counts `apply_answer`'s re-asks, reset by every new escalation.
@@ -506,7 +508,7 @@ hands it to the judge. A decision the run already answered that comes back is a 
 with no human, the engine's no-human reply sends it to the headless judge instead of the
 recommended option, unless it is a hard trigger or its kind has an approval node of its own
 (`OWN_PROMPT_KINDS`); and a repeated multiple-choice question, whose picker answers itself
-with no human, is asked at the typed prompt under the same `kind#index` key.
+with no human, is asked at the typed prompt under the same `kind#index~digest` key.
 
 Verification commands the project cannot run as declared: a RED integration run (per task
 or at Phase F) hands the fix round the failing command and its exit. If the command cannot

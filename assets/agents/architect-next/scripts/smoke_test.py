@@ -15,6 +15,7 @@ Usage: smoke_test.py   (exit 1 on any failure; prints one line per check)
 
 import ast
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -2872,12 +2873,13 @@ check("apply_answer: the forced reply recorded (via other) and the force lifted 
 u = gates.parse_answer(base_state(escalation=E, last_answer_text="banana", reask_rounds=0, choice_forced=True, reply_interpreted=True))
 check("parse_answer: a non-design escalation ignores the force and still re-asks", u["_next"] == "ask_user" and u["reask_rounds"] == 1, u)
 E_DQ2 = {**E_DQ, "data": {**E_DQ["data"], "index": 1}}
-check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index",
-      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_decisions=["design_round#0||task"]))["_next"] == "ladder_judge"
-      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_decisions=["design_round#0||task"]))["_next"] == "ask_dispatch")
+E_DQ_KEY = f"design_round#0~{hashlib.sha1(E_DQ['data']['question'].encode()).hexdigest()[:8]}||task"
+check("escalate_gate: autonomous - each design question is ruled autonomously once, keyed by its index and question",
+      gates.escalate_gate(base_state(escalation=E_DQ2, escalation_policy="autonomous", autonomous_decisions=[E_DQ_KEY]))["_next"] == "ladder_judge"
+      and gates.escalate_gate(base_state(escalation=E_DQ, escalation_policy="autonomous", autonomous_decisions=[E_DQ_KEY]))["_next"] == "ask_dispatch")
 u2 = gates.ladder_route(base_state(escalation=E_DQ, ladder_resolution="recommended", ladder_choice=""))
-check("ladder_route: a multiple-choice question records its kind and index, task and phase as ruled autonomously",
-      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2.get("autonomous_decisions") == ["design_round#0||task"], u2)
+check("ladder_route: a multiple-choice question records its kind, index and question digest, task and phase as ruled autonomously",
+      u2["_next"] == "apply_answer" and u2["last_answer"] == "pg" and u2.get("autonomous_decisions") == [E_DQ_KEY], u2)
 
 # ---------------------------------------------------------------- apply_answer (every kind)
 # The options each kind is raised with, since apply_answer reads a reply only by the option it names.
@@ -3258,6 +3260,18 @@ check("repeat decisions: a repeated multiple-choice decision is asked at the typ
       PICKER_FIRST["_next"] == "ask_choice_2" and u["_next"] == "ask_user" and "multiple_choice" not in u["escalation"]["data"]
       and gates._decision_key(base_state(), u["escalation"]) == PICKER_KEY and "One more round" in u["ask_question"]
       and any(f"repeat decision {PICKER_KEY} -> typed prompt" in d for d in u["decisions"]), u)
+LEAK_OPTS = [option("Use the default", True), option("Ask the owner")]
+LEAK_A = escalation("leak_question", "q", LEAK_OPTS, data={"multiple_choice": True, "question": "Which port?", "index": 0})
+LEAK_B = escalation("leak_question", "q", LEAK_OPTS, data={"multiple_choice": True, "question": "Which host?", "index": 0})
+LEAK_A_AGAIN = escalation("leak_question", "q again", LEAK_OPTS, data={"multiple_choice": True, "question": "Which port?", "index": 0})
+check("repeat decisions: two leak_question queues that each start at question 1 with different questions get distinct keys",
+      gates._decision_key(base_state(), LEAK_A) != gates._decision_key(base_state(), LEAK_B)
+      and gates.ask_dispatch(base_state(escalation=LEAK_B, answered_decisions=[gates._decision_key(base_state(), LEAK_A)]))["_next"]
+      == "ask_choice_2")
+check("repeat decisions: the same multiple-choice question asked again keeps its key, so it is still a repeat",
+      gates._decision_key(base_state(), LEAK_A) == gates._decision_key(base_state(), LEAK_A_AGAIN)
+      and gates.ask_dispatch(base_state(escalation=LEAK_A_AGAIN, answered_decisions=[gates._decision_key(base_state(), LEAK_A)]))["_next"]
+      == "ask_user")
 PROMOTE_KEY = gates._decision_key(base_state(), E_PROMOTE_DEFECTS)
 acted = gates.apply_answer(base_state(escalation=E_PROMOTE_DEFECTS, last_answer="Continue with the tasks as promoted"))
 check("repeat decisions: apply_answer records a decision it acted on, never one it sent to be read or asked again",
@@ -4416,6 +4430,21 @@ def _long_checklist_review_each():
 
 guarded("checklist batch: review each -> the per-item queue over the same 40 items, item 1 asked, no new fan-out",
         _long_checklist_review_each)
+
+
+def _long_checklist_review_each_not_repeat():
+    s = checklist_batch_answer("Option 2")
+    batch_keys = list(s.get("answered_decisions") or [])
+    s.update(gates.ask_dispatch(s))
+    asked = s["_next"]
+    u = gates.parse_answer({**s, "last_answer_text": _lib.HEADLESS_GUIDANCE})
+    return (len(batch_keys) == 1 and asked == "ask_choice_2" and s["escalation"]["data"].get("multiple_choice") is True
+            and u["_next"] == "apply_answer" and u.get("last_answer") == gates.CHECKLIST_ACCEPT
+            and "judge_rulings" not in u), (batch_keys, asked, u["_next"], u.get("last_answer"), u.get("decisions", [])[-3:])
+
+
+guarded("checklist batch: after review each, item 1 is a new question at ask_choice_2, never a repeat of the batch "
+        "question, and headless takes its recommended option", _long_checklist_review_each_not_repeat)
 
 
 def _long_checklist_other():
