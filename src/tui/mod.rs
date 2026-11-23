@@ -402,6 +402,9 @@ pub(crate) struct App {
     /// The images pasted into the draft, by path; its `[Image #N]` names
     /// the Nth. Emptied whenever the draft is sent or replaced.
     pasted_images: Vec<String>,
+    /// The draft's pasted images while a history walk shows other
+    /// entries; they come back with the draft when the walk ends on it.
+    stashed_pasted_images: Vec<String>,
     /// Lines entered while a turn ran, oldest first; the loop submits
     /// what the model did not get, one per turn, once it ends.
     queued: Vec<QueuedLine>,
@@ -545,6 +548,7 @@ impl App {
             todo: TodoPanel::default(),
             composer: Composer::new(background, config.command_prefix),
             pasted_images: Vec::new(),
+            stashed_pasted_images: Vec::new(),
             queued: Vec::new(),
             prompts: VecDeque::new(),
             lend_requests: Vec::new(),
@@ -650,9 +654,21 @@ impl App {
         self.composer.set_text(text);
         // Text put there by anything but the walk ends the walk: the next
         // Up starts from the newest entry again.
-        self.history.reset();
+        self.end_history_walk();
         self.palette_dirty = true;
         self.schedule_frame();
+    }
+
+    fn end_history_walk(&mut self) {
+        self.history.reset();
+        self.stashed_pasted_images.clear();
+    }
+
+    /// Drops the draft's pasted images, and those a history walk holds
+    /// for it, once the draft is sent or replaced.
+    fn forget_pasted_images(&mut self) {
+        self.pasted_images.clear();
+        self.stashed_pasted_images.clear();
     }
 
     /// Re-reads what the footer and the renderer take from the context;
@@ -703,7 +719,7 @@ impl App {
         }
         if let Some(text) = ctx.pending_prefill.take() {
             self.set_composer_text(&text);
-            self.pasted_images.clear();
+            self.forget_pasted_images();
         }
         self.todo
             .set(ctx.todo_list.goal.clone(), ctx.todo_list.todos.clone());
@@ -919,7 +935,7 @@ impl App {
             return None;
         }
         self.composer.clear();
-        self.pasted_images.clear();
+        self.forget_pasted_images();
         self.palette_dirty = true;
         self.transcript.clear_focus();
         // The next line is typed, so the vi layer starts it in insert.
@@ -1128,7 +1144,7 @@ impl App {
                     Some(text) => self.recall_history_entry(&text),
                     None => self.close_view(),
                 }
-                self.history.reset();
+                self.end_history_walk();
                 None
             }
             View::Rewind(rewind) => {
@@ -1284,7 +1300,7 @@ impl App {
             }
             Action::ClearComposer => {
                 self.set_composer_text("");
-                self.pasted_images.clear();
+                self.forget_pasted_images();
                 None
             }
             Action::DeleteToLineHead => {
@@ -1416,7 +1432,11 @@ impl App {
             }
             Action::HistoryPrev => {
                 let draft = self.composer_text();
+                let starting = !self.history.is_walking();
                 if let Some(entry) = self.history.prev(&draft).map(str::to_string) {
+                    if starting {
+                        self.stashed_pasted_images = std::mem::take(&mut self.pasted_images);
+                    }
                     self.recall_history_entry(&entry);
                 }
                 None
@@ -1424,6 +1444,9 @@ impl App {
             Action::HistoryNext => {
                 if let Some(text) = self.history.next() {
                     self.recall_history_entry(&text);
+                    if !self.history.is_walking() {
+                        self.pasted_images = std::mem::take(&mut self.stashed_pasted_images);
+                    }
                 }
                 None
             }

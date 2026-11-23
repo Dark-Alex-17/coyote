@@ -100,6 +100,10 @@ impl ComposerHistory {
         self.draft = None;
     }
 
+    pub(crate) fn is_walking(&self) -> bool {
+        self.cursor.is_some()
+    }
+
     /// One step towards the oldest entry. The first step stashes `draft`;
     /// a step from the oldest entry stays there.
     pub(crate) fn prev(&mut self, draft: &str) -> Option<&str> {

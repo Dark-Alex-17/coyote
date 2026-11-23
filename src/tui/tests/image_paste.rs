@@ -175,6 +175,49 @@ fn clearing_or_replacing_the_line_forgets_the_pasted_images() {
 }
 
 #[test]
+fn walking_the_history_and_back_keeps_the_drafts_images() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.history.push("earlier");
+    harness.type_text("look at ");
+    let path = paste_image(&mut harness, "shot.png");
+    harness.press(KeyCode::Up);
+    assert_eq!(harness.app.composer_text(), "earlier");
+    assert!(harness.app.pasted_images.is_empty());
+    harness.press(KeyCode::Down);
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit(
+            "look at [Image #1]".to_string(),
+            vec![path]
+        ))
+    );
+}
+
+#[test]
+fn sending_a_recalled_entry_drops_the_drafts_images_for_good() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.history.push("earlier");
+    harness.type_text("look at ");
+    paste_image(&mut harness, "shot.png");
+    harness.press(KeyCode::Up);
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit("earlier".to_string(), Vec::new()))
+    );
+    harness.press(KeyCode::Down);
+    assert!(harness.app.pasted_images.is_empty());
+    harness.press(KeyCode::Up);
+    harness.press(KeyCode::Down);
+    assert_eq!(harness.app.composer_text(), "");
+    assert!(harness.app.pasted_images.is_empty());
+    harness.type_text("fresh [Image #1]");
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit("fresh [Image #1]".to_string(), Vec::new()))
+    );
+}
+
+#[test]
 fn a_line_with_images_waits_for_the_turn_and_a_plain_one_is_queued() {
     let mut harness = Harness::new(120, 24, plain_config(), FooterInfo::default());
     harness.app.begin_turn("explain", false);
