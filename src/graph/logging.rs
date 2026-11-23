@@ -115,14 +115,8 @@ impl GraphLogger {
         self.silent
     }
 
-    pub fn node_start(&self, node: &Node, in_super_step: bool) {
-        narrate_node_start(
-            self.ui.as_ref(),
-            self.silent,
-            node,
-            in_super_step,
-            &self.origin,
-        );
+    pub fn node_start(&self, node: &Node, in_super_step: bool, origin: &Origin) {
+        narrate_node_start(self.ui.as_ref(), self.silent, node, in_super_step, origin);
     }
 
     pub fn super_step_start(&self, branches: &[String]) {

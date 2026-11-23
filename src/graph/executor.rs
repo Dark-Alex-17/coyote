@@ -271,8 +271,8 @@ impl GraphExecutor {
                         anyhow!("Node '{}' not found in graph '{}'", node_id, graph.name)
                     })?
                     .clone();
-                logger.node_start(&node, in_super_step);
                 let node_hooks = NodeHookEmitter::resolve(ctx, node_id, node_type_label(&node));
+                logger.node_start(&node, in_super_step, &node_hooks.origin);
                 node_hooks.started();
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
