@@ -785,6 +785,7 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
             return Ok(interrupted());
         }
 
+        super::wait_race_point();
         if ctx.user_message_waiting() {
             // A job that finished since the check above is collected: its
             // result is not given up for the message, which reaches the
@@ -1064,6 +1065,7 @@ async fn handle_wait(ctx: &RequestContext, args: &Value) -> Result<Value> {
             break interrupted();
         }
 
+        super::wait_race_point();
         if ctx.user_message_waiting() {
             // A job that finished since the pass above is reported ready on
             // the next pass rather than given up for the message.
@@ -4578,7 +4580,7 @@ mod tests {
                     time::sleep(run_for).await;
                     queue.push(
                         crate::supervisor::notification::SystemNotification::UserMessage {
-                            text: "landed together j2c".to_string(),
+                            text: "sent with the finish".to_string(),
                         },
                     );
                 };
@@ -4611,6 +4613,102 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The worst moment for the race: the loop has just found the job
+    /// running, and before it looks for a message the user's message lands
+    /// and the job finishes. job__collect still returns the job's own
+    /// result and job__wait reports it ready; the message stays queued for
+    /// the model. The tool runs on this thread and the job on a worker, so
+    /// the hook can wait for the job to finish in between.
+    #[test]
+    fn a_job_finishing_between_the_loop_checks_returns_its_result() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        for collect in [true, false] {
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.session_abort = Some(create_abort_signal());
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let task_state = Arc::clone(&state);
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            let join_handle = tokio::spawn(async move {
+                let _ = released.await;
+                task_state.lock().status = JobStatus::Completed;
+                Ok(JobResult {
+                    output: json!("the racer's own result"),
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let supervisor = Arc::clone(ctx.supervisor.as_ref().unwrap());
+            supervisor
+                .write()
+                .register(JobHandle {
+                    id: "job_racer".to_string(),
+                    tool: "execute_command".to_string(),
+                    started_at: Instant::now(),
+                    join_handle,
+                    abort_signal: create_abort_signal(),
+                    state,
+                    output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                    no_change_checks: 0,
+                    last_check_state: None,
+                })
+                .unwrap();
+            let queue = Arc::clone(&ctx.notification_queue);
+            super::super::at_wait_race_point(move || {
+                queue.push(
+                    crate::supervisor::notification::SystemNotification::UserMessage {
+                        text: "sent as it finished".to_string(),
+                    },
+                );
+                let _ = release.send(());
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while !supervisor
+                    .read()
+                    .job("job_racer")
+                    .is_some_and(|job| job.join_handle.is_finished())
+                {
+                    assert!(std::time::Instant::now() < until, "the job never finished");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let result = if collect {
+                runtime.block_on(time::timeout(
+                    Duration::from_secs(5),
+                    handle_collect(&ctx, &json!({"id": "job_racer"})),
+                ))
+            } else {
+                runtime.block_on(time::timeout(
+                    Duration::from_secs(5),
+                    handle_wait(&ctx, &json!({})),
+                ))
+            }
+            .expect("the call must end")
+            .unwrap();
+            if collect {
+                assert_eq!(result["status"], "completed", "{result}");
+                assert!(
+                    result["result"]
+                        .to_string()
+                        .contains("the racer's own result"),
+                    "{result}"
+                );
+            } else {
+                assert_eq!(result["status"], "ready", "{result}");
+            }
+            assert!(
+                ctx.notification_queue.has_user_message(),
+                "collect={collect}: the message was lost"
+            );
+        }
     }
 
     /// The bare-SIGINT arm a spawned child latches cannot be driven

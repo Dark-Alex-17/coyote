@@ -2782,6 +2782,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             return Ok(interrupted());
         }
 
+        super::wait_race_point();
         if ctx.user_message_waiting() {
             // An agent that finished since the check above is collected:
             // its result is not given up for the message, which reaches
@@ -3033,6 +3034,7 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             break interrupted();
         }
 
+        super::wait_race_point();
         if ctx.user_message_waiting() {
             // An agent that finished since the pass above is reported
             // ready on the next pass rather than given up for the message.
@@ -17430,7 +17432,7 @@ mod tests {
                 let message = async move {
                     time::sleep(run_for).await;
                     queue.push(SystemNotification::UserMessage {
-                        text: "landed together r2c".to_string(),
+                        text: "sent with the finish".to_string(),
                     });
                 };
                 if already {
@@ -17463,6 +17465,96 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The worst moment for the race: the loop has just found the agent
+    /// running, and before it looks for a message the user's message lands
+    /// and the agent finishes. agent__collect still returns the agent's
+    /// own output and agent__wait reports it ready; the message stays
+    /// queued for the model. The tool runs on this thread and the agent on
+    /// a worker, so the hook can wait for the agent to finish in between.
+    #[test]
+    fn an_agent_finishing_between_the_loop_checks_returns_its_result() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        for collect in [true, false] {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.session_abort = Some(create_abort_signal());
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            let join_handle = tokio::spawn(async move {
+                let _ = released.await;
+                Ok(AgentResult {
+                    id: "racer".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: "the racer's own output".to_string(),
+                    exit_status: AgentExitStatus::Completed,
+                    session_id: None,
+                })
+            });
+            let supervisor = Arc::clone(ctx.supervisor.as_ref().unwrap());
+            supervisor
+                .write()
+                .register(AgentHandle {
+                    id: "racer".to_string(),
+                    agent_name: "explore".to_string(),
+                    depth: 1,
+                    inbox: Arc::new(Inbox::new()),
+                    abort_signal: create_abort_signal(),
+                    join_handle,
+                    child_supervisor: None,
+                    session_id: None,
+                    child_session_root: None,
+                    succeeded: Default::default(),
+                })
+                .unwrap();
+            let queue = Arc::clone(&ctx.notification_queue);
+            super::super::at_wait_race_point(move || {
+                queue.push(SystemNotification::UserMessage {
+                    text: "sent as it finished".to_string(),
+                });
+                let _ = release.send(());
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while !supervisor.read().is_finished("racer").unwrap_or(false) {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "the agent never finished"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let result = if collect {
+                runtime.block_on(time::timeout(
+                    Duration::from_secs(5),
+                    handle_collect(&mut ctx, &json!({"id": "racer"})),
+                ))
+            } else {
+                runtime.block_on(time::timeout(
+                    Duration::from_secs(5),
+                    handle_wait(&mut ctx, &json!({})),
+                ))
+            }
+            .expect("the call must end")
+            .unwrap();
+            if collect {
+                assert_eq!(result["status"], "completed", "{result}");
+                assert!(
+                    result["output"]
+                        .to_string()
+                        .contains("the racer's own output"),
+                    "{result}"
+                );
+            } else {
+                assert_eq!(result["status"], "ready", "{result}");
+            }
+            assert!(
+                ctx.notification_queue.has_user_message(),
+                "collect={collect}: the message was lost"
+            );
+        }
     }
 
     /// A spawned child's wait answers no user, so a message on its queue

@@ -327,6 +327,32 @@ fn prune_stale_bin_entries(
     Ok(())
 }
 
+/// The point in a wait or collect loop after it has found the work still
+/// running and before it looks for a message from the user. A no-op
+/// outside tests.
+#[cfg(not(test))]
+pub(crate) fn wait_race_point() {}
+
+#[cfg(test)]
+pub(crate) fn wait_race_point() {
+    if let Some(hook) = WAIT_RACE_POINT.with(|slot| slot.take()) {
+        hook();
+    }
+}
+
+/// Runs `hook` once, the next time a wait or collect loop on this thread
+/// reaches `wait_race_point`.
+#[cfg(test)]
+pub(crate) fn at_wait_race_point(hook: impl FnOnce() + 'static) {
+    WAIT_RACE_POINT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAIT_RACE_POINT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub async fn eval_tool_calls(
     ctx: &mut RequestContext,
     mut calls: Vec<ToolCall>,
