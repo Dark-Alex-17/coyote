@@ -544,6 +544,10 @@ pub async fn create_config(
     Ok((model, clients))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "first-run config wizard; runs before any UI starts"
+)]
 pub async fn create_openai_compatible_client_config(
     client: &str,
 ) -> Result<Option<(String, Value)>> {
@@ -1131,6 +1135,10 @@ pub fn json_str_from_map<'a>(
     map.get(field_name).and_then(|v| v.as_str())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "first-run config wizard; runs before any UI starts"
+)]
 pub async fn set_client_models_config(client_config: &mut Value, client: &str) -> Result<String> {
     if let Some(provider) = ALL_PROVIDER_MODELS.iter().find(|v| v.provider == client) {
         let models: Vec<String> = provider
@@ -1235,6 +1243,10 @@ pub async fn set_client_models_config(client_config: &mut Value, client: &str) -
     Ok(format!("{client}:{model_name}"))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "first-run config wizard; runs before any UI starts"
+)]
 fn select_model(model_names: Vec<String>) -> Result<String> {
     if model_names.is_empty() {
         bail!("No models");
@@ -1247,6 +1259,10 @@ fn select_model(model_names: Vec<String>) -> Result<String> {
     Ok(model)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "first-run config wizard; runs before any UI starts"
+)]
 fn prompt_input_string(desc: &str, required: bool, help_message: Option<&str>) -> Result<String> {
     let desc = if required {
         format!("{desc} (required):")

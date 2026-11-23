@@ -5,6 +5,10 @@ use std::io::{Write, stdout};
 
 /// Reads a single character from stdin without requiring Enter
 /// Returns the character if it's one of the valid options, or the default if Enter is pressed
+#[expect(
+    clippy::disallowed_methods,
+    reason = "its sole caller is shell_execute (-e), a CLI flow; the process never reaches a UI"
+)]
 pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Result<char> {
     print!("{prompt}");
     stdout().flush()?;

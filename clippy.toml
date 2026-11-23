@@ -1,0 +1,19 @@
+# Calls that read the keyboard or hand the terminal to someone else.
+# Under the TUI the event stream owns the terminal, so each caller must
+# either lend it (gate on crate::tui::active()) or never run under the UI.
+# A caller states which with #[expect(clippy::disallowed_methods, reason)].
+disallowed-methods = [
+    { path = "crossterm::event::read", reason = "reads the keyboard; the TUI event stream owns it" },
+    { path = "crossterm::event::poll", reason = "polls the keyboard; the TUI event stream owns it" },
+    { path = "inquire::Confirm::new", reason = "an inquire widget reads the terminal; the TUI seats TuiPrompter" },
+    { path = "inquire::Select::new", reason = "an inquire widget reads the terminal; the TUI seats TuiPrompter" },
+    { path = "inquire::MultiSelect::new", reason = "an inquire widget reads the terminal; the TUI seats TuiPrompter" },
+    { path = "inquire::Text::new", reason = "an inquire widget reads the terminal; the TUI seats TuiPrompter" },
+    { path = "inquire::Password::new", reason = "an inquire widget reads the terminal; the TUI seats TuiPrompter" },
+    { path = "coyote::utils::input::read_single_key", reason = "reads the keyboard; the TUI event stream owns it" },
+    { path = "coyote::utils::command::edit_file", reason = "hands the terminal to $EDITOR" },
+    { path = "coyote::utils::command::run_command", reason = "runs a child on the inherited terminal" },
+    { path = "coyote::utils::command::wait_for_status", reason = "waits on a child that may read the inherited terminal" },
+    { path = "coyote::utils::command::wait_for_status_interruptible", reason = "waits on a child that may read the inherited terminal" },
+    { path = "coyote::prompt::InquirePrompter::new", reason = "a terminal prompter bypasses the one on ctx.prompter" },
+]

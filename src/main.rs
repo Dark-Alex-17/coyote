@@ -260,6 +260,10 @@ async fn async_main() -> Result<()> {
 /// The CLI-only flag paths, in the order the flags take precedence; each
 /// finishes the run before any UI starts. `Ok(false)` means no such flag
 /// was given and the caller goes on to the REPL or TUI.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the CLI flag paths of main (--install, --update, --vault, ...) and install_builtins (Skip mode, never prompts); each returns before any UI starts"
+)]
 async fn run_cli_flag(
     cli: &Cli,
     inspection_only: bool,
@@ -274,7 +278,7 @@ async fn run_cli_flag(
     if let Some(version) = &cli.update {
         let version = version.clone();
         let force = cli.force;
-        let prompter = InquirePrompter::default();
+        let prompter = InquirePrompter::new(Arc::default());
         tokio::task::spawn_blocking(move || {
             config::run_self_update(version, force, &prompter, " or pass --force.")
         })
@@ -298,13 +302,13 @@ async fn run_cli_flag(
     }
 
     if !inspection_only {
-        install_builtins(&InquirePrompter::default())?;
+        install_builtins(&InquirePrompter::new(Arc::default()))?;
     }
 
     if let Some(category) = cli.install_builtins {
         config::install_assets(
             category,
-            &InquirePrompter::default(),
+            &InquirePrompter::new(Arc::default()),
             cli.yes,
             " or pass --yes.",
         )?;
@@ -319,7 +323,7 @@ async fn run_cli_flag(
             cli.install_force,
             config::InstallIo {
                 prefix: config::CommandPrefix::default(),
-                prompter: &InquirePrompter::default(),
+                prompter: &InquirePrompter::new(Arc::default()),
                 remedy: config::CLI_CONFLICT_REMEDY,
                 force_flag: "--install-force",
             },
@@ -328,19 +332,19 @@ async fn run_cli_flag(
     }
 
     if let Some(spec) = cli.update_bundle.as_deref() {
-        config::update_bundle(spec, cli.yes, &InquirePrompter::default())?;
+        config::update_bundle(spec, cli.yes, &InquirePrompter::new(Arc::default()))?;
         return Ok(true);
     }
 
     if let Some(name) = cli.uninstall.as_deref() {
-        config::uninstall_bundle(name, cli.yes, &InquirePrompter::default())?;
+        config::uninstall_bundle(name, cli.yes, &InquirePrompter::new(Arc::default()))?;
         return Ok(true);
     }
 
     if let Some(client_arg) = &cli.authenticate {
         let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
-        let prompter = InquirePrompter::default();
+        let prompter = InquirePrompter::new(Arc::default());
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
         oauth::run_oauth_flow(&*provider, &client_name, &prompter, &Origin::detached()).await?;
@@ -384,7 +388,7 @@ async fn run_cli_flag(
         }
 
         let url = spec.url.as_deref().expect("validated: remote spec has url");
-        let prompter = InquirePrompter::default();
+        let prompter = InquirePrompter::new(Arc::default());
         mcp::oauth::run_mcp_oauth_flow(
             server_name,
             url,
@@ -433,7 +437,7 @@ async fn run_cli_flag(
             AppConfig::from_config(cfg)?
         };
         let vault = Vault::init(&app_config)?;
-        Vault::handle_vault_flags(cli, &vault, &InquirePrompter::default())?;
+        Vault::handle_vault_flags(cli, &vault, &InquirePrompter::new(Arc::default()))?;
         return Ok(true);
     }
 
@@ -816,6 +820,10 @@ async fn start_interactive(ctx: RequestContext) -> Result<()> {
     repl.run().await
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a CLI flow (-e, --mcp); the process never reaches a UI"
+)]
 async fn shell_execute(
     ctx: &mut RequestContext,
     shell: &Shell,

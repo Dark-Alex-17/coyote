@@ -18,22 +18,17 @@
 //! fail rather than pass against nothing.
 //!
 //! There is no lib target, so the code side of each check is read from the
-//! repo's text. The keys table is compared with the match arms of `map_key`,
-//! `vi_normal`, `help_key`, `tasks_key` and `pager_key` in `src/tui/keys.rs`:
-//! each arm whose pattern
-//! names a key and whose action is not `Action::Nothing` becomes one
-//! (context, chord) pair, the context taken from the arm's block (see
-//! `key_context_marker`) and the chord from the pattern and the modifier
-//! terms of its guard (see `arm_chords`). Inside a keyed block every line
-//! with an `=>` must open a context, be a `KeyCode::` arm or be one of the
-//! key-less shapes `non_key_arm` names, and no other line may name a
-//! `KeyCode::`; anything else panics, so a reshaped `keys.rs` fails loudly
-//! rather than shrinking the table. The literal scraper reads plain `"..."`
-//! strings only.
+//! repo's text. The literal scraper reads plain `"..."` strings only.
+//!
+//! The `# Keys` table of `TUI.md` is checked against the key map itself by
+//! a unit test of the binary, which reads the same variable:
+//!
+//! ```sh
+//! COYOTE_WIKI_DIR=../coyote.wiki cargo test --bin coyote keys::
+//! ```
 
 mod common;
 
-use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,29 +38,11 @@ use common::source_scan::{const_str, fn_body, read, repo_root, src, string_liter
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test tui_wiki_docs`";
 const PAGE: &str = "TUI.md";
-const KEYS_HEADING: &str = "# Keys";
 const PROTOCOL_HEADING: &str = "## Prompting the user from a tool";
 const CHANNEL_HEADING: &str = "# The Prompt Channel";
 const ENV_HEADING: &str = "# UI and Prompt Related Variables";
 const HEADLESS_HEADING: &str = "## Prompts without a human";
 const IN_PROCESS_LEAD: &str = "- **Also published in-process.**";
-/// The contexts of the keys table.
-const KEY_CONTEXTS: [&str; 14] = [
-    "Anywhere",
-    "Transcript",
-    "Confirm",
-    "Text field",
-    "List",
-    "Composer",
-    "Roster",
-    "Popup",
-    "Vim insert",
-    "Vim mode",
-    "Key help",
-    "Transcript view find",
-    "Thread picker",
-    "Transcript view",
-];
 /// The settings whose README and Getting-Started rows this lint checks.
 const SETTINGS: [&str; 4] = ["ui", "tui_dump_on_exit", "editor", "theme"];
 const WIKI_URL: &str = "https://github.com/Dark-Alex-17/coyote/wiki/";
@@ -74,10 +51,6 @@ const PLANNING_WORDS: [&str; 8] = [
     "phase", "phases", "round", "rounds", "wave", "waves", "ruling", "rulings",
 ];
 const CHANGELOG_WORDS: [&str; 2] = ["new", "now"];
-
-/// A key binding: the keys table context and the chord, e.g.
-/// `("Transcript view", "G")`.
-type Binding = (String, String);
 
 fn asset(parts: &[&str]) -> String {
     let mut path = repo_root().join("assets");
@@ -423,301 +396,6 @@ fn tool_events() -> Vec<(String, String)> {
                 .then(|| (variant.trim_start_matches("HookEvent::").to_string(), name))
         })
         .collect()
-}
-
-/// The context a line of keys.rs opens, if it opens one: `Some(None)` for a
-/// line that leaves every keyed block behind.
-fn key_context_marker(line: &str) -> Option<Option<&'static str>> {
-    let opened = match line {
-        _ if line.starts_with("pub(crate) fn map_key(") => Some("Anywhere"),
-        "let modal = match ctx.layer() {" => Some("Transcript"),
-        _ if line.starts_with("Some(ModalKind::Confirm") => Some("Confirm"),
-        "ModalKind::Input" => Some("Text field"),
-        "custom_field_open: false," => Some("List"),
-        "None => match code {" => Some("Composer"),
-        _ if line.starts_with("fn vi_normal(") => Some("Vim mode"),
-        _ if line.starts_with("fn help_key(") => Some("Key help"),
-        _ if line.starts_with("fn tasks_key(") => Some("Roster"),
-        _ if line.starts_with("PagerMode::Find =>") => Some("Transcript view find"),
-        _ if line.starts_with("PagerMode::Picker =>") => Some("Thread picker"),
-        _ if line.starts_with("PagerMode::Browse =>") => Some("Transcript view"),
-        _ if line.starts_with("fn pager_key(") || line.starts_with("fn lowercase(") => {
-            return Some(None);
-        }
-        _ => return None,
-    };
-    Some(opened)
-}
-
-/// A composer arm's guard that names a popup or Vim insert mode moves the
-/// arm to that table context.
-fn composer_subcontext(guard: &str) -> &'static str {
-    if guard.contains("ctx.popup") {
-        "Popup"
-    } else if guard.contains("ViMode::Insert") {
-        "Vim insert"
-    } else {
-        "Composer"
-    }
-}
-
-/// The table name of one `KeyCode` variant other than `Char`.
-fn key_name(variant: &str) -> String {
-    match variant {
-        "Esc" | "Enter" | "Tab" | "Backspace" | "Up" | "Down" | "Left" | "Right" | "Home"
-        | "End" | "PageUp" | "PageDown" => variant.to_string(),
-        "BackTab" => "Shift+Tab".to_string(),
-        _ if variant.starts_with("F(") => {
-            panic!("keys.rs binds a function key; multiplexers own them")
-        }
-        _ => panic!("keys.rs binds KeyCode::{variant}; extend key_name in tests/tui_wiki_docs.rs"),
-    }
-}
-
-/// The chords one arm binds. `pattern` is the arm's `KeyCode::...`
-/// alternatives, `guard` the text after its `if`, `action` the arm's right
-/// side. An arm on `Char(_)` or a bound name (typing, not a key) binds none.
-fn arm_chords(pattern: &str, guard: &str, action: &str) -> Vec<String> {
-    let terms: Vec<&str> = guard.split("&&").map(str::trim).collect();
-    let has = |name: &str| terms.contains(&name);
-    let prefixes: Vec<String> = if let Some(at) = guard.find("intersects(") {
-        let args = &guard[at..];
-        [("SHIFT", "Shift+"), ("ALT", "Alt+")]
-            .into_iter()
-            .filter(|(flag, _)| args.contains(&format!("KeyModifiers::{flag}")))
-            .map(|(_, prefix)| prefix.to_string())
-            .collect()
-    } else {
-        let mut prefix = String::new();
-        for (term, name) in [("ctrl", "Ctrl+"), ("alt", "Alt+"), ("shift", "Shift+")] {
-            if has(term) {
-                prefix.push_str(name);
-            }
-        }
-        vec![prefix]
-    };
-    let upper = has("upper");
-    let both_cases = !upper && action.contains("upper");
-    let mut chords = Vec::new();
-    for alternative in pattern.split("KeyCode::").skip(1) {
-        let alternative = alternative.trim().trim_end_matches('|').trim();
-        let keys: Vec<String> = match alternative.strip_prefix("Char(") {
-            Some(inner) => {
-                let quoted: Vec<&str> = inner.split('\'').skip(1).step_by(2).collect();
-                if inner.contains("..=") {
-                    assert_eq!(quoted.len(), 2, "a char range has two ends: {inner}");
-                    vec![format!("{}-{}", quoted[0], quoted[1])]
-                } else {
-                    quoted.iter().map(|c| c.to_string()).collect()
-                }
-            }
-            None => vec![key_name(alternative)],
-        };
-        for key in keys {
-            for prefix in &prefixes {
-                let letter = key.len() == 1 && key.chars().all(|c| c.is_ascii_alphabetic());
-                let key = match key.as_str() {
-                    " " => "Space".to_string(),
-                    _ if letter && (upper || !prefix.is_empty()) => key.to_ascii_uppercase(),
-                    _ => key.clone(),
-                };
-                chords.push(format!("{prefix}{key}"));
-                if both_cases && letter {
-                    chords.push(format!("{prefix}{}", key.to_ascii_uppercase()));
-                }
-            }
-        }
-    }
-    chords
-}
-
-/// An arm line of a keyed block that binds no named key: a wildcard that
-/// swallows the key or hands it on as typing, the close of a multi-line
-/// modal pattern, or an arm on the screen layer that names no key.
-fn non_key_arm(line: &str) -> bool {
-    if matches!(line, ") => match code {" | ") => {")
-        || (line.starts_with("Layer::") && !line.contains("KeyCode::"))
-    {
-        return true;
-    }
-    let Some(rest) = line.strip_prefix('_') else {
-        return false;
-    };
-    let Some((_, action)) = rest.split_once("=>") else {
-        return false;
-    };
-    matches!(
-        action.trim(),
-        "{}" | "Action::Nothing," | "Action::ModalInput(key)," | "Action::ComposerInput(key),"
-    )
-}
-
-/// Every (context, chord) pair `src/tui/keys.rs` binds to an action. Every
-/// arm line of a keyed block is accounted for: it opens a context, is a
-/// `KeyCode::` arm, or binds no key (`non_key_arm`); any other line with an
-/// `=>` or a `KeyCode::` not at its start panics.
-fn key_bindings() -> BTreeSet<Binding> {
-    let source = src(&["tui", "keys.rs"]);
-    let mut bindings = BTreeSet::new();
-    let mut context: Option<&'static str> = None;
-    let mut head: Option<String> = None;
-    let mut record = |arm: &str, context: Option<&'static str>| {
-        let Some(context) = context else { return };
-        let (lhs, action) = arm.split_once("=>").expect("an arm has `=>`");
-        let action = action.trim();
-        if action.starts_with("Action::Nothing") {
-            return;
-        }
-        let (pattern, guard) = lhs.split_once(" if ").unwrap_or((lhs, ""));
-        let context = if context == "Composer" {
-            composer_subcontext(guard)
-        } else {
-            context
-        };
-        for chord in arm_chords(pattern.trim(), guard.trim(), action) {
-            bindings.insert((context.to_string(), chord));
-        }
-    };
-    for line in production(&source).lines() {
-        let line = line.trim();
-        if let Some(open) = head.as_mut() {
-            open.push(' ');
-            open.push_str(line);
-            if line.contains("=>") {
-                let arm = head.take().unwrap();
-                record(&arm, context);
-            }
-            continue;
-        }
-        if let Some(next) = key_context_marker(line) {
-            context = next;
-            continue;
-        }
-        if line.starts_with("KeyCode::") {
-            if line.contains("=>") {
-                record(line, context);
-            } else {
-                head = Some(line.to_string());
-            }
-            continue;
-        }
-        if context.is_some() {
-            assert!(
-                !line.contains("KeyCode::"),
-                "keys.rs names a key the scraper does not read in {context:?}: {line}; \
-                 extend key_bindings in tests/tui_wiki_docs.rs"
-            );
-            assert!(
-                !line.contains("=>") || non_key_arm(line),
-                "keys.rs has an arm the scraper does not read in {context:?}: {line}; \
-                 extend key_bindings in tests/tui_wiki_docs.rs"
-            );
-        }
-    }
-    bindings
-}
-
-/// The (context, chord) pairs of the keys table on `TUI.md`, and every pair
-/// the table lists more than once.
-fn documented_bindings(page: &str) -> (BTreeSet<Binding>, Vec<Binding>) {
-    let keys = section(PAGE, page, KEYS_HEADING);
-    let mut pairs = BTreeSet::new();
-    let mut repeated = Vec::new();
-    for row in table_rows(&keys) {
-        assert_eq!(row.len(), 3, "a keys row has three cells: {row:?}");
-        let chords = code_spans(&row[1]);
-        assert!(!chords.is_empty(), "a keys row names a key: {row:?}");
-        for chord in chords {
-            let pair = (row[0].clone(), chord);
-            if !pairs.insert(pair.clone()) {
-                repeated.push(pair);
-            }
-        }
-    }
-    (pairs, repeated)
-}
-
-#[test]
-fn key_scraper_reads_every_context_of_the_key_map() {
-    let bindings = key_bindings();
-    let contexts: BTreeSet<&str> = bindings.iter().map(|(c, _)| c.as_str()).collect();
-    assert_eq!(contexts, BTreeSet::from(KEY_CONTEXTS));
-    for (context, chord) in [
-        ("Anywhere", "Ctrl+Z"),
-        ("Transcript", "Ctrl+X"),
-        ("Confirm", "a"),
-        ("Text field", "Enter"),
-        ("List", "1-9"),
-        ("Composer", "Shift+Enter"),
-        ("Composer", "Alt+Enter"),
-        ("Composer", "Ctrl+T"),
-        ("Composer", "Alt+T"),
-        ("Composer", "?"),
-        ("Composer", "Shift+G"),
-        ("Popup", "Shift+Tab"),
-        ("Roster", "x"),
-        ("Vim insert", "Esc"),
-        ("Vim mode", "A"),
-        ("Key help", "?"),
-        ("Key help", "Ctrl+C"),
-        ("Key help", "Ctrl+D"),
-        ("Transcript view", "G"),
-        ("Transcript view", "N"),
-        ("Thread picker", "q"),
-        ("Transcript view find", "Backspace"),
-        ("Composer", "Ctrl+J"),
-        ("Composer", "Ctrl+U"),
-        ("Composer", "Ctrl+_"),
-        ("Composer", "Ctrl+7"),
-        ("Text field", "Ctrl+U"),
-        ("Text field", "Ctrl+/"),
-    ] {
-        assert!(
-            bindings.contains(&(context.to_string(), chord.to_string())),
-            "the scrape finds {chord} in {context}: {bindings:?}"
-        );
-    }
-    // The field swallows Ctrl+J with `Action::Nothing`: no binding.
-    let swallowed = ("Text field".to_string(), "Ctrl+J".to_string());
-    assert!(!bindings.contains(&swallowed));
-}
-
-#[test]
-fn a_wildcard_arm_with_an_action_is_not_a_key_less_arm() {
-    for line in [
-        "_ => {}",
-        "_ => Action::Nothing,",
-        "_ if !answerable => Action::Nothing,",
-        "_ => Action::ComposerInput(key),",
-        ") => match code {",
-        ") => {",
-    ] {
-        assert!(non_key_arm(line), "{line}");
-    }
-    for line in [
-        "_ if ctrl => Action::ClosePager,",
-        "Some(KeyCode::Esc) => Action::ClosePopup,",
-        "other => other,",
-    ] {
-        assert!(!non_key_arm(line), "{line}");
-    }
-}
-
-#[test]
-fn keys_table_matches_the_key_map_both_ways() {
-    let bindings = key_bindings();
-    assert!(!bindings.is_empty());
-
-    let Some(wiki) = wiki_dir() else { return };
-    let (documented, repeated) = documented_bindings(&read(wiki.join(PAGE)));
-    assert!(repeated.is_empty(), "{PAGE} lists twice: {repeated:?}");
-    let undocumented: Vec<_> = bindings.difference(&documented).collect();
-    assert!(
-        undocumented.is_empty(),
-        "{PAGE} does not document: {undocumented:?}"
-    );
-    let unbound: Vec<_> = documented.difference(&bindings).collect();
-    assert!(unbound.is_empty(), "keys.rs does not bind: {unbound:?}");
 }
 
 #[test]

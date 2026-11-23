@@ -241,6 +241,10 @@ macro_rules! create_client_config {
 #[macro_export]
 macro_rules! create_oauth_supported_client_config {
     () => {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "first-run config wizard; runs before any UI starts"
+        )]
         pub async fn create_client_config(vault: &$crate::vault::Vault, prompter: &dyn $crate::prompt::Prompter) -> anyhow::Result<(String, serde_json::Value)> {
         let mut config = serde_json::json!({ "type": Self::NAME });
 

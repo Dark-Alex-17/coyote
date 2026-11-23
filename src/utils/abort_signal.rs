@@ -114,6 +114,10 @@ pub struct DrainOutcome {
 
 /// Drains queued terminal events until an abort key is seen; `timeout` applies
 /// to the first poll only.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "polled by the spinner and the REPL stream painter, both replaced under the TUI"
+)]
 pub fn drain_terminal_events(
     abort_signal: &AbortSignal,
     timeout: Duration,

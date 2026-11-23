@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 impl From<McpTransportArg> for McpTransportType {
     fn from(value: McpTransportArg) -> Self {
@@ -167,12 +168,16 @@ fn handle_add(cli: &Cli, name: &str, vault: &Vault) -> Result<()> {
 /// A yes/no question on the terminal, defaulting to no. A run with
 /// nowhere to ask is refused in the shared shape rather than left on a
 /// widget nothing can answer; `remedy` names the flag that skips it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a CLI flow (-e, --mcp); the process never reaches a UI"
+)]
 fn confirm_on_the_terminal(
     action: fmt::Arguments<'_>,
     question: String,
     remedy: &str,
 ) -> Result<bool> {
-    let prompter = InquirePrompter::default();
+    let prompter = InquirePrompter::new(Arc::default());
     require_human(&prompter, action, remedy)?;
     crate::prompt::confirm(&prompter, question, false)
 }
@@ -321,6 +326,10 @@ fn build_remote(cli: &Cli, transport: McpTransportType, has_command: bool) -> Re
     })
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a CLI flow (-e, --mcp); the process never reaches a UI"
+)]
 fn provision_secrets(cli: &Cli, server: &str, vault: &Vault) -> Result<()> {
     let mut sources: Vec<&str> = Vec::new();
     if let Some(s) = cli.url.as_deref() {
@@ -363,7 +372,7 @@ fn provision_secrets(cli: &Cli, server: &str, vault: &Vault) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let prompter = InquirePrompter::default();
+    let prompter = InquirePrompter::new(Arc::default());
     refuse_missing_secrets_without_a_terminal(&prompter, server, &missing)?;
     for name in missing {
         eprintln!("Value references vault secret {{{{ {name} }}}} which is not stored yet.");

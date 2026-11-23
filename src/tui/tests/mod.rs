@@ -4594,41 +4594,6 @@ fn fn_body(source: &str, signature: &str) -> String {
     body[..body.find("\n}\n").unwrap()].to_string()
 }
 
-/// A `(file, function)` pair under `src/` whose body reads the
-/// keyboard directly, with whether that body checks the TUI flag.
-struct KeyboardReader {
-    file: String,
-    function: String,
-    gated: bool,
-}
-
-/// The name on a `fn` line, if the line declares one.
-fn declared_fn(line: &str) -> Option<&str> {
-    let mut rest = line.trim_start();
-    if rest.starts_with("//") {
-        return None;
-    }
-    loop {
-        if let Some(after) = rest.strip_prefix("pub") {
-            rest = match after.strip_prefix('(') {
-                Some(scoped) => &scoped[scoped.find(')')? + 1..],
-                None => after,
-            }
-            .trim_start();
-        } else if let Some(after) = ["async ", "unsafe ", "const "]
-            .iter()
-            .find_map(|prefix| rest.strip_prefix(prefix))
-        {
-            rest = after;
-        } else {
-            break;
-        }
-    }
-    let name = rest.strip_prefix("fn ")?;
-    let end = name.find(['(', '<'])?;
-    Some(&name[..end])
-}
-
 /// Every `.rs` file under `dir`, sorted.
 fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -4647,400 +4612,45 @@ fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// The calls that read the keyboard directly: crossterm's
-/// `read`/`poll`, `read_single_key`, `edit_file` (which hands the tty
-/// to `$EDITOR`), `run_command` and `wait_for_status` (a child on the
-/// inherited tty), inquire's prompt builders (nothing else under
-/// `src/` constructs a `Text`, `Select` or the like), and the
-/// `InquirePrompter` constructors, since a handler seating its own
-/// terminal prompter bypasses the one on `ctx.prompter`.
-const NEEDLES: [&str; 14] = [
-    "event::read(",
-    "event::poll(",
-    "read_single_key(",
-    "edit_file(",
-    "run_command(",
-    "wait_for_status(",
-    "wait_for_status_interruptible(",
-    "Confirm::new(",
-    "Select::new(",
-    "MultiSelect::new(",
-    "Text::new(",
-    "Password::new(",
-    "InquirePrompter::default(",
-    "InquirePrompter::new(",
-];
-
-/// Every function outside `src/tui` whose body makes one of the
-/// [`NEEDLES`] calls.
-fn keyboard_readers() -> Vec<KeyboardReader> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src = root.join("src");
-    let mut readers: Vec<KeyboardReader> = Vec::new();
-    for path in rust_files(&src) {
-        if path.starts_with(src.join("tui")) {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path)
-            .unwrap()
-            .replace("\r\n", "\n");
-        let file = path
-            .strip_prefix(root)
-            .unwrap()
-            .display()
-            .to_string()
-            .replace('\\', "/");
-        readers.extend(classify_readers(&file, &text));
-    }
-    readers
-}
-
-/// The functions in `source` (the text of `file`) whose body makes one
-/// of the [`NEEDLES`] calls, each once, with whether the body checks
-/// the TUI flag. Comments do not count on either side: a needle in
-/// one is not a reader, and a gate named only in one is no gate. A
-/// `debug_assert!` is no gate either: release builds drop it, so the
-/// reader still runs under the UI there.
-fn classify_readers(file: &str, source: &str) -> Vec<KeyboardReader> {
-    fn at_word_start(line: &str, at: usize) -> bool {
-        line[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
-    }
-    /// The line up to its `//` comment, if any. A `//` inside a string
-    /// literal on the same line is part of the string.
-    fn without_comment(line: &str) -> &str {
-        let bytes = line.as_bytes();
-        let mut in_string = false;
-        let mut at = 0;
-        while at < bytes.len() {
-            match bytes[at] {
-                b'\\' if in_string => at += 1,
-                b'\'' if !in_string => {
-                    for quote_char in ["'\"'", "'\\\"'"] {
-                        if line[at..].starts_with(quote_char) {
-                            at += quote_char.len() - 1;
-                            break;
-                        }
-                    }
-                }
-                b'"' => in_string = !in_string,
-                b'/' if !in_string && bytes.get(at + 1) == Some(&b'/') => {
-                    return &line[..at];
-                }
-                _ => {}
-            }
-            at += 1;
-        }
-        line
-    }
-    /// The body's lines with every `debug_assert` invocation removed,
-    /// through the line its parentheses close on.
-    fn without_debug_asserts<'a>(lines: &[&'a str]) -> Vec<&'a str> {
-        let mut kept = Vec::new();
-        let mut depth: i32 = 0;
-        for line in lines {
-            let rest = if depth > 0 {
-                *line
-            } else if let Some(at) = line.find("debug_assert") {
-                kept.push(&line[..at]);
-                &line[at..]
-            } else {
-                kept.push(*line);
-                continue;
-            };
-            depth += rest.matches('(').count() as i32 - rest.matches(')').count() as i32;
-            depth = depth.max(0);
-        }
-        kept
-    }
-    let lines: Vec<&str> = source.lines().collect();
-    let mut readers: Vec<KeyboardReader> = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with("//") {
-            continue;
-        }
-        let code = without_comment(line);
-        let hit = NEEDLES.iter().any(|needle| {
-            code.match_indices(needle)
-                .any(|(at, _)| at_word_start(code, at))
-        });
-        if !hit {
-            continue;
-        }
-        let fn_index = (0..=index)
-            .rev()
-            .find(|i| declared_fn(lines[*i]).is_some())
-            .unwrap_or_else(|| panic!("{file}:{} is outside any fn", index + 1));
-        let fn_line = lines[fn_index];
-        let indent = &fn_line[..fn_line.len() - fn_line.trim_start().len()];
-        let close = format!("{indent}}}");
-        let body_end = (fn_index..lines.len())
-            .find(|i| lines[*i] == close || (*i == fn_index && fn_line.ends_with('}')))
-            .unwrap();
-        let code_lines: Vec<&str> = lines[fn_index..=body_end]
-            .iter()
-            .map(|line| without_comment(line))
-            .collect();
-        let body = without_debug_asserts(&code_lines).join("\n");
-        let function = declared_fn(fn_line).unwrap().to_string();
-        if readers.iter().any(|r| r.function == function) {
-            continue;
-        }
-        readers.push(KeyboardReader {
-            gated: body.contains("crate::tui::active()"),
-            file: file.to_string(),
-            function,
-        });
-    }
-    readers
-}
-
+/// Each binding names one path `clippy.toml` bans, under an
+/// expectation of the lint: drop the path from the list and the
+/// expectation goes unfulfilled, which fails clippy. The two
+/// `wait_for_status` fns are private to `utils::command`, so their
+/// canary lives in that module's tests. Nothing here is called.
 #[test]
-fn a_bare_inquire_builder_is_an_ungated_reader() {
-    let readers = classify_readers(
-        "src/probe.rs",
-        "fn fresh() { Select::new(\"q\", vec![]).prompt(); }\n",
-    );
-    let [reader] = readers.as_slice() else {
-        panic!("{} readers", readers.len());
-    };
-    assert_eq!(reader.file, "src/probe.rs");
-    assert_eq!(reader.function, "fresh");
-    assert!(!reader.gated);
+fn every_terminal_reader_stays_banned() {
+    #[expect(clippy::disallowed_methods, reason = "canary: crossterm::event::read")]
+    let _read = crossterm::event::read;
+    #[expect(clippy::disallowed_methods, reason = "canary: crossterm::event::poll")]
+    let _poll = crossterm::event::poll;
+    #[expect(clippy::disallowed_methods, reason = "canary: inquire::Confirm::new")]
+    let _confirm = inquire::Confirm::new;
+    #[expect(clippy::disallowed_methods, reason = "canary: inquire::Select::new")]
+    let _select = inquire::Select::<&str>::new;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "canary: inquire::MultiSelect::new"
+    )]
+    let _multi_select = inquire::MultiSelect::<&str>::new;
+    #[expect(clippy::disallowed_methods, reason = "canary: inquire::Text::new")]
+    let _text = inquire::Text::new;
+    #[expect(clippy::disallowed_methods, reason = "canary: inquire::Password::new")]
+    let _password = inquire::Password::new;
+    #[expect(clippy::disallowed_methods, reason = "canary: read_single_key")]
+    let _read_single_key = crate::utils::read_single_key;
+    #[expect(clippy::disallowed_methods, reason = "canary: edit_file")]
+    let _edit_file = crate::utils::edit_file;
+    #[expect(clippy::disallowed_methods, reason = "canary: run_command")]
+    let _run_command = crate::utils::run_command::<&str>;
+    #[expect(clippy::disallowed_methods, reason = "canary: InquirePrompter::new")]
+    let _inquire_prompter = crate::prompt::InquirePrompter::new;
 }
 
+/// The loader never lends the terminal: both of its branches hand the
+/// child /dev/null, so the source says `Stdio::null()` for every spawn
+/// it makes and never `Stdio::inherit()`.
 #[test]
-fn a_real_tui_gate_marks_the_reader_gated() {
-    let readers = classify_readers(
-        "src/probe.rs",
-        "fn fresh() {\n    if crate::tui::active() {\n        return;\n    }\n    Select::new(\"q\", vec![]).prompt();\n}\n",
-    );
-    let [reader] = readers.as_slice() else {
-        panic!("{} readers", readers.len());
-    };
-    assert_eq!(reader.function, "fresh");
-    assert!(reader.gated);
-}
-
-#[test]
-fn a_gate_mentioned_only_in_a_comment_does_not_count() {
-    let readers = classify_readers(
-        "src/probe.rs",
-        "fn fresh() {\n    // crate::tui::active() is checked by the caller\n    Select::new(\"q\", vec![]).prompt(); // not crate::tui::active()\n}\n",
-    );
-    let [reader] = readers.as_slice() else {
-        panic!("{} readers", readers.len());
-    };
-    assert_eq!(reader.function, "fresh");
-    assert!(!reader.gated);
-}
-
-#[test]
-fn a_debug_assert_on_the_tui_flag_is_no_gate() {
-    let readers = classify_readers(
-        "src/fixture.rs",
-        "fn fresh() {\n    debug_assert!(\n        !crate::tui::active(),\n        \"never under the UI\"\n    );\n    Select::new(\"q\", vec![]).prompt();\n}\n",
-    );
-    let [reader] = readers.as_slice() else {
-        panic!("{} readers", readers.len());
-    };
-    assert_eq!(reader.function, "fresh");
-    assert!(!reader.gated);
-}
-
-#[test]
-fn a_needle_only_in_a_trailing_comment_is_no_reader() {
-    let readers = classify_readers(
-        "src/fixture.rs",
-        "fn fresh() {\n    let x = 1; // Select::new(\"q\", vec![]) used to live here\n}\n",
-    );
-    assert!(readers.is_empty(), "{} readers", readers.len());
-}
-
-#[test]
-fn a_double_slash_inside_a_string_is_not_a_comment() {
-    let readers = classify_readers(
-        "src/fixture.rs",
-        "fn fresh() {\n    if url == \"http://x\" && crate::tui::active() {\n        return;\n    }\n    Select::new(\"q\", vec![]).prompt();\n}\n",
-    );
-    let [reader] = readers.as_slice() else {
-        panic!("{} readers", readers.len());
-    };
-    assert_eq!(reader.function, "fresh");
-    assert!(reader.gated);
-}
-
-/// Every direct keyboard reader outside `src/tui` either checks the
-/// TUI flag or is listed here with the reason it stays REPL-only, so
-/// a new reader cannot appear without a decision about the TUI.
-#[test]
-fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
-    const BEFORE_UI: &str = "first-run config wizard; runs before any UI starts";
-    const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
-    const CLI_FLAGS: &str = "the CLI flag paths of main (--install, --update, --vault, ...) and install_builtins (Skip mode, never prompts); each returns before any UI starts";
-    const REPL_PROMPTER: &str =
-        "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
-    const VIA_EDIT_GATE: &str = "calls edit_file, which lends the terminal under the TUI";
-    const VIA_RUN_GATE: &str = "calls run_command, which lends the terminal under the TUI";
-    const REPL_PAINTER: &str =
-        "polled by the spinner and the REPL stream painter, both replaced under the TUI";
-    const NULL_STDIN: &str = "a unit test; the child it waits on has stdin at /dev/null";
-    const LOADER_STDIN_CLOSED: &str =
-        "a document loader; its child runs with stdin at /dev/null on every path";
-    let allowlist: &[(&str, &str, &str)] = &[
-        (
-            "src/client/common.rs",
-            "create_openai_compatible_client_config",
-            BEFORE_UI,
-        ),
-        (
-            "src/client/common.rs",
-            "set_client_models_config",
-            BEFORE_UI,
-        ),
-        ("src/client/common.rs", "select_model", BEFORE_UI),
-        ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
-        ("src/client/macros.rs", "create_client_config", BEFORE_UI),
-        ("src/config/mod.rs", "create_config_file", BEFORE_UI),
-        ("src/config/mod.rs", "create_config_file_sandbox", BEFORE_UI),
-        (
-            "src/config/request_context.rs",
-            "edit_config",
-            VIA_EDIT_GATE,
-        ),
-        (
-            "src/config/request_context.rs",
-            "edit_mcp_config",
-            VIA_EDIT_GATE,
-        ),
-        (
-            "src/config/request_context.rs",
-            "edit_session",
-            VIA_EDIT_GATE,
-        ),
-        (
-            "src/config/request_context.rs",
-            "edit_agent_config",
-            VIA_EDIT_GATE,
-        ),
-        ("src/config/request_context.rs", "new_macro", VIA_EDIT_GATE),
-        (
-            "src/config/request_context.rs",
-            "upsert_role",
-            VIA_EDIT_GATE,
-        ),
-        (
-            "src/config/request_context.rs",
-            "upsert_skill",
-            VIA_EDIT_GATE,
-        ),
-        (
-            "src/config/request_context.rs",
-            "edit_rag_docs",
-            VIA_EDIT_GATE,
-        ),
-        (
-            "src/config/request_context.rs",
-            "default_prompter",
-            REPL_PROMPTER,
-        ),
-        ("src/main.rs", "run_cli_flag", CLI_FLAGS),
-        ("src/main.rs", "shell_execute", CLI_ONLY),
-        ("src/mcp/manage.rs", "confirm_on_the_terminal", CLI_ONLY),
-        ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
-        ("src/prompt/mod.rs", "select", REPL_PROMPTER),
-        ("src/prompt/mod.rs", "input", REPL_PROMPTER),
-        ("src/prompt/mod.rs", "password", REPL_PROMPTER),
-        ("src/prompt/mod.rs", "confirm", REPL_PROMPTER),
-        ("src/prompt/mod.rs", "prompt", REPL_PROMPTER),
-        ("src/repl/mod.rs", "handle_shell_passthrough", VIA_RUN_GATE),
-        (
-            "src/utils/abort_signal.rs",
-            "drain_terminal_events",
-            REPL_PAINTER,
-        ),
-        (
-            "src/utils/command.rs",
-            "a_signal_killed_loader_is_not_a_success",
-            NULL_STDIN,
-        ),
-        (
-            "src/utils/command.rs",
-            "run_loader_command",
-            LOADER_STDIN_CLOSED,
-        ),
-        (
-            "src/utils/input.rs",
-            "read_single_key",
-            "its sole caller is shell_execute (-e), a CLI flow; the process never reaches a UI",
-        ),
-    ];
-    let readers = keyboard_readers();
-    assert!(!readers.is_empty());
-    let unaccounted: Vec<String> = readers
-        .iter()
-        .filter(|r| !r.gated)
-        .filter(|r| {
-            !allowlist
-                .iter()
-                .any(|(file, function, _)| *file == r.file && *function == r.function)
-        })
-        .map(|r| format!("{}:{}", r.file, r.function))
-        .collect();
-    assert!(
-        unaccounted.is_empty(),
-        "keyboard readers neither gated on crate::tui::active() nor allowlisted:\n{}",
-        unaccounted.join("\n")
-    );
-    let stale: Vec<String> = allowlist
-        .iter()
-        .filter(|(file, function, _)| {
-            !readers
-                .iter()
-                .any(|r| r.file == *file && r.function == *function && !r.gated)
-        })
-        .map(|(file, function, _)| format!("{file}:{function}"))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "allowlist entries with no matching ungated reader:\n{}",
-        stale.join("\n")
-    );
-    assert!(
-        readers
-            .iter()
-            .any(|r| r.file == "src/utils/command.rs" && r.function == "edit_file" && r.gated)
-    );
-    // The allowlist keys the inquire prompter's methods by bare name,
-    // which the prompt module's free fns `confirm` and `input` share.
-    // Those, and the other free askers beside them, must stay free of
-    // widgets so a builder in one cannot hide behind a method's entry;
-    // so must the headless prompter's `prompt`, which shares its name
-    // with the inquire prompter's allowlisted method.
-    let prompt = include_str!("../../prompt/mod.rs");
-    for signature in [
-        "pub fn ask(",
-        "pub(crate) fn confirm(",
-        "pub(crate) fn confirm_or_cancel(",
-        "pub(crate) fn confirm_with_help(",
-        "pub(crate) fn select_closed(",
-        "pub(crate) fn select_closed_or_cancel(",
-        "pub(crate) fn input(",
-        "impl Prompter for HeadlessPrompter",
-    ] {
-        let body = fn_body(prompt, signature);
-        for needle in NEEDLES {
-            assert!(
-                !body.contains(needle),
-                "{signature} reads the keyboard itself:\n{body}"
-            );
-        }
-    }
-    // The loader never reads the terminal: both of its branches hand
-    // the child /dev/null, so the source says `Stdio::null()` for every
-    // spawn it makes and never `Stdio::inherit()`.
+fn the_loader_gives_its_child_a_null_stdin() {
     let loader = fn_body(
         include_str!("../../utils/command.rs"),
         "pub async fn run_loader_command",

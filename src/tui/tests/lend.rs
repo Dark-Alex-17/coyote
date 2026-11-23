@@ -115,6 +115,10 @@ fn an_owner_guard_restores_the_owner_when_its_scope_panics() {
 /// given is not a program at all).
 #[test]
 #[serial]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a TUI test; with the flag on and no lender the call fails before touching the terminal"
+)]
 fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
     let _tui_on = OwnerGuard::tui_for_test();
     let err = crate::utils::edit_file(
@@ -128,6 +132,10 @@ fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
 /// `!cmd` fails the same way without a lender.
 #[test]
 #[serial]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a TUI test; with the flag on and no lender the call fails before touching the terminal"
+)]
 fn run_command_without_a_lender_fails_without_spawning_a_child() {
     let _tui_on = OwnerGuard::tui_for_test();
     let err =
@@ -141,6 +149,10 @@ fn run_command_without_a_lender_fails_without_spawning_a_child() {
 #[cfg(unix)]
 #[test]
 #[serial]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a TUI test; the calls go through a test lender standing in for the UI loop"
+)]
 fn run_command_and_edit_file_run_through_the_lender_under_the_tui() {
     let (_lender, lent) = test_lender();
     let code = crate::utils::run_command("sh", &["-c", "exit 7"], None).unwrap();

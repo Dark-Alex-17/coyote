@@ -150,6 +150,10 @@ pub fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "stands down when crate::tui::active()"
+)]
 pub fn drain_stale_tty_input() {
     use crossterm::event::{poll, read};
     use std::time::{Duration, Instant};

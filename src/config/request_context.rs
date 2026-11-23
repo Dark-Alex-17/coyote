@@ -326,6 +326,10 @@ fn seed_delegate_shared_variables(
 
 /// A run with no human -- headless or the ACP server -- answers for itself;
 /// every other run draws prompts on the terminal.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead"
+)]
 fn default_prompter(memory: &Arc<PromptMemory>) -> Arc<dyn Prompter> {
     if human_present() {
         Arc::new(InquirePrompter::new(Arc::clone(memory)))
@@ -4213,6 +4217,10 @@ impl RequestContext {
     }
 
     /// Opens the config in the editor; returns the reminder to show after.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub fn edit_config(&self) -> Result<String> {
         let config_path = paths::config_file();
         let editor = self.app.config.editor()?;
@@ -4226,6 +4234,10 @@ impl RequestContext {
 
     /// Opens the MCP config in the editor; returns the reminder to show
     /// after.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub fn edit_mcp_config(&self) -> Result<String> {
         let mcp_path = paths::mcp_config_file();
         let editor = self.app.config.editor()?;
@@ -4304,6 +4316,10 @@ impl RequestContext {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub fn edit_session(&mut self, app: &AppConfig) -> Result<()> {
         let (name, scope) = match &self.session {
             Some(session) => (session.name().to_string(), session.scope()),
@@ -4333,6 +4349,10 @@ impl RequestContext {
 
     /// Opens the agent's config in the editor, writing a stub first when
     /// it has none; returns the reminder to show after.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub fn edit_agent_config(&self, app: &AppConfig) -> Result<String> {
         let agent_name = match &self.agent {
             Some(agent) => agent.name(),
@@ -4364,6 +4384,10 @@ impl RequestContext {
         ))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub fn new_macro(&self, app: &AppConfig, name: &str) -> Result<()> {
         if RESERVED_MACRO_NAMES.contains(&name) {
             bail!("'{name}' is a reserved macro name");
@@ -7075,6 +7099,10 @@ impl RequestContext {
         self.use_role(app, &name, abort_signal).await
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         crate::tui::ensure_terminal_lendable()?;
         let role_path = paths::role_file(name);
@@ -7089,6 +7117,10 @@ impl RequestContext {
 
     /// Opens the skill in the editor, scaffolding it first when missing;
     /// returns the confirmation to show after.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<String> {
         paths::validate_skill_name(name)?;
         crate::tui::ensure_terminal_lendable()?;
@@ -7698,6 +7730,10 @@ impl RequestContext {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "calls edit_file, which lends the terminal under the TUI"
+    )]
     pub async fn edit_rag_docs(&mut self, abort_signal: AbortSignal) -> Result<()> {
         let mut rag = match self.rag.clone() {
             Some(v) => v.as_ref().clone(),

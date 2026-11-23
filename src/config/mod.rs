@@ -1065,8 +1065,12 @@ impl AssertState {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "first-run config wizard; runs before any UI starts"
+)]
 pub async fn create_config_file(config_path: &Path) -> Result<()> {
-    let prompter = crate::prompt::InquirePrompter::default();
+    let prompter = crate::prompt::InquirePrompter::new(Arc::default());
     crate::prompt::require_human(
         &prompter,
         format_args!("create the config file at '{}'", config_path.display()),
@@ -1115,6 +1119,10 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
     write_config_file(config_path, &config_data)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "first-run config wizard; runs before any UI starts"
+)]
 async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 

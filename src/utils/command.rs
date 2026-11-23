@@ -83,6 +83,10 @@ pub fn detect_shell() -> Shell {
 /// shell passthrough and `-e` come through here, so under the TUI, where
 /// the child would otherwise inherit a raw tty and the capture pipe, it
 /// runs with the terminal lent to it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "lends the terminal to the TUI when crate::tui::active()"
+)]
 pub fn run_command<T: AsRef<OsStr>>(
     cmd: &str,
     args: &[T],
@@ -216,6 +220,10 @@ pub fn run_command_with_output<T: AsRef<OsStr>>(
     Ok((status.success(), stdout.to_string(), stderr.to_string()))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a document loader; its child runs with stdin at /dev/null on every path"
+)]
 pub async fn run_loader_command(
     path: &str,
     extension: &str,
@@ -389,9 +397,27 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// The ban on the private waits, checked the way the TUI tests
+    /// check the public paths: each binding's expectation fails clippy
+    /// if `clippy.toml` stops banning its path. Nothing here is called.
+    #[test]
+    fn the_private_waits_stay_banned() {
+        #[expect(clippy::disallowed_methods, reason = "canary: wait_for_status")]
+        let _wait = wait_for_status::<&str>;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "canary: wait_for_status_interruptible"
+        )]
+        let _wait_interruptible = wait_for_status_interruptible::<&str>;
+    }
+
     /// A loader killed by a signal reports a non-zero status, so its
     /// partial output is never read as success.
     #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a unit test; the child it waits on has stdin at /dev/null"
+    )]
     async fn a_signal_killed_loader_is_not_a_success() {
         let status = wait_for_status_interruptible("sh", &["-c", "kill -9 $$"], Stdio::null())
             .await

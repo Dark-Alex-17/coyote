@@ -634,6 +634,10 @@ impl InquirePrompter {
     /// A closed command menu is inquire's bare widget; a tool's select,
     /// closed or not, keeps the REPL styling (no type-to-filter, the
     /// movement hint as help), and only an open one offers the custom row.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead"
+    )]
     fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let question = Self::prompt_text(req);
         let select = Select::new(&question, Self::select_options(req));
@@ -657,6 +661,10 @@ impl InquirePrompter {
         req.closed && req.tool.is_none()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead"
+    )]
     fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let default = input_default_text(req);
         let hint = default.as_deref().and_then(input_hint);
@@ -679,6 +687,10 @@ impl InquirePrompter {
         }))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead"
+    )]
     fn password(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let question = Self::prompt_text(req);
         let mut password = Password::new(&question)
@@ -690,6 +702,10 @@ impl InquirePrompter {
         password.prompt().map(PromptAnswer::Text)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead"
+    )]
     fn confirm(&self, req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         if req.tool.is_none() {
             let default = req
@@ -721,13 +737,11 @@ impl InquirePrompter {
     }
 }
 
-impl Default for InquirePrompter {
-    fn default() -> Self {
-        Self::new(Arc::new(PromptMemory::default()))
-    }
-}
-
 impl Prompter for InquirePrompter {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead"
+    )]
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
         crate::utils::drain_stale_tty_input();
         let answer = match req.action {

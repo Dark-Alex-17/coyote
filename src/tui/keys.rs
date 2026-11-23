@@ -3819,4 +3819,284 @@ mod tests {
         }
         assert_eq!(map_key(alt_c, &FIND), Action::PagerFindChar('c'));
     }
+
+    const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
+    const WIKI_PAGE: &str = "TUI.md";
+
+    /// The wiki checkout `COYOTE_WIKI_DIR` names, a relative value taken
+    /// from the crate root, or `None` after printing `skipping:` when the
+    /// variable is unset. A set value with no `TUI.md` fails rather than
+    /// passing against nothing.
+    fn wiki_dir() -> Option<std::path::PathBuf> {
+        let Some(value) = std::env::var_os(WIKI_DIR).filter(|value| !value.is_empty()) else {
+            eprintln!(
+                "skipping: {WIKI_DIR} unset; point it at a coyote.wiki checkout and run \
+                 `COYOTE_WIKI_DIR=../coyote.wiki cargo test --bin coyote keys::`"
+            );
+            return None;
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(value);
+        assert!(
+            dir.join(WIKI_PAGE).is_file(),
+            "{WIKI_DIR}={} has no {WIKI_PAGE}; point it at a coyote.wiki checkout",
+            dir.display()
+        );
+        Some(dir)
+    }
+
+    /// The lines of `page` under the heading line `heading`, up to the
+    /// next heading of the same or a higher level outside a code fence.
+    fn section<'a>(page: &'a str, heading: &str) -> Vec<&'a str> {
+        let level = heading.bytes().take_while(|b| *b == b'#').count();
+        let mut lines = page.lines().skip_while(|line| *line != heading);
+        assert!(
+            lines.next().is_some(),
+            "{WIKI_PAGE} has no {heading:?} heading"
+        );
+        let mut fenced = false;
+        lines
+            .take_while(|line| {
+                if line.trim_start().starts_with("```") {
+                    fenced = !fenced;
+                }
+                let depth = line.bytes().take_while(|b| *b == b'#').count();
+                fenced || !((1..=level).contains(&depth) && line[depth..].starts_with(' '))
+            })
+            .collect()
+    }
+
+    /// The trimmed cells of every body row of every table in `lines`:
+    /// header and separator rows left out.
+    fn table_rows<'a>(lines: &[&'a str]) -> Vec<Vec<&'a str>> {
+        let mut rows = Vec::new();
+        let mut header_seen = false;
+        for line in lines {
+            if !line.starts_with('|') {
+                header_seen = false;
+            } else if !header_seen {
+                header_seen = true;
+            } else if !line.starts_with("|-") {
+                rows.push(
+                    line.trim()
+                        .trim_matches('|')
+                        .split('|')
+                        .map(str::trim)
+                        .collect(),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Every `` `...` `` span of `text`, in order.
+    fn code_spans(text: &str) -> Vec<&str> {
+        text.split('`').skip(1).step_by(2).collect()
+    }
+
+    type AppliesIn = fn(&KeyContext) -> bool;
+
+    /// The contexts of the wiki's keys table, each with the test of
+    /// whether a swept context is one its keys apply in.
+    const WIKI_CONTEXTS: [(&str, AppliesIn); 14] = [
+        ("Anywhere", |_| true),
+        ("Transcript", |ctx| ctx.overlay.is_none()),
+        ("Confirm", |ctx| {
+            matches!(ctx.modal, Some(ModalKind::Confirm { .. }))
+        }),
+        ("Text field", |ctx| {
+            matches!(
+                ctx.modal,
+                Some(
+                    ModalKind::Input
+                        | ModalKind::Password
+                        | ModalKind::Select {
+                            custom_field_open: true
+                        }
+                )
+            )
+        }),
+        ("List", |ctx| {
+            matches!(
+                ctx.modal,
+                Some(
+                    ModalKind::Select {
+                        custom_field_open: false
+                    } | ModalKind::Checkbox
+                )
+            )
+        }),
+        ("Composer", |ctx| {
+            ctx.modal.is_none() && ctx.popup.is_none() && ctx.overlay.is_none()
+        }),
+        ("Roster", |ctx| ctx.overlay == Some(OverlayKind::Tasks)),
+        ("Popup", |ctx| ctx.popup.is_some()),
+        ("Vim insert", |ctx| ctx.vi == Some(ViMode::Insert)),
+        ("Vim mode", |ctx| ctx.vi == Some(ViMode::Normal)),
+        ("Key help", |ctx| ctx.overlay == Some(OverlayKind::Help)),
+        ("Transcript view find", |ctx| {
+            ctx.overlay == Some(OverlayKind::Pager(PagerMode::Find))
+        }),
+        ("Thread picker", |ctx| {
+            ctx.overlay == Some(OverlayKind::Pager(PagerMode::Picker))
+        }),
+        ("Transcript view", |ctx| {
+            ctx.overlay == Some(OverlayKind::Pager(PagerMode::Browse))
+        }),
+    ];
+
+    /// The swept contexts a keys table context of the wiki stands for;
+    /// panics on a label the table should not use.
+    fn wiki_context(label: &str) -> Vec<KeyContext> {
+        let (_, applies) = WIKI_CONTEXTS
+            .iter()
+            .find(|(name, _)| *name == label)
+            .unwrap_or_else(|| panic!("{WIKI_PAGE}: no keys table context is called {label:?}"));
+        swept_contexts()
+            .into_iter()
+            .map(|(ctx, _)| ctx)
+            .filter(applies)
+            .collect()
+    }
+
+    /// The keys a chord of the wiki's keys table names, as a terminal
+    /// sends them. The wiki spells PgUp and PgDn out, names the kitty
+    /// Ctrl+_ by the keys held, and writes a capital as `G` or
+    /// `Shift+G`; otherwise it spells a key the way a help label does.
+    fn wiki_chord(spelling: &str) -> Vec<KeyEvent> {
+        if spelling == "Ctrl+Shift+-" {
+            return vec![kitty_ctrl_underscore()];
+        }
+        let unshifted = spelling.strip_prefix("Shift+").unwrap_or(spelling);
+        let mut chars = unshifted.chars();
+        if let (Some(c), None) = (chars.next(), chars.next())
+            && c.is_ascii_uppercase()
+        {
+            return vec![press(KeyCode::Char(c), KeyModifiers::SHIFT)];
+        }
+        let label = spelling
+            .replace("PageUp", "PgUp")
+            .replace("PageDown", "PgDn");
+        label_keys(&label)
+            .into_iter()
+            .map(|(code, modifiers)| press(code, modifiers))
+            .collect()
+    }
+
+    #[test]
+    fn the_wiki_contexts_are_the_keys_table_labels() {
+        let labels: Vec<&str> = WIKI_CONTEXTS.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Anywhere",
+                "Transcript",
+                "Confirm",
+                "Text field",
+                "List",
+                "Composer",
+                "Roster",
+                "Popup",
+                "Vim insert",
+                "Vim mode",
+                "Key help",
+                "Transcript view find",
+                "Thread picker",
+                "Transcript view",
+            ]
+        );
+        for label in &labels {
+            assert!(!wiki_context(label).is_empty(), "{label} covers no context");
+        }
+        for (ctx, _) in swept_contexts() {
+            assert!(
+                labels
+                    .iter()
+                    .filter(|label| !matches!(**label, "Anywhere" | "Transcript"))
+                    .any(|label| wiki_context(label).contains(&ctx)),
+                "{ctx:?} has no context of its own on the keys table"
+            );
+        }
+    }
+
+    /// The keys table of the wiki's `TUI.md` agrees with the key map
+    /// both ways: each chord it lists does something in a context its
+    /// row names, each key help replay that binds a key is listed under
+    /// a context covering the replay's, and no context lists a chord
+    /// twice. Runs only with `COYOTE_WIKI_DIR` set, since the wiki is a
+    /// separate clone.
+    #[test]
+    fn the_wiki_keys_table_matches_the_key_map_both_ways() {
+        let Some(wiki) = wiki_dir() else { return };
+        let page = std::fs::read_to_string(wiki.join(WIKI_PAGE)).unwrap();
+        let mut documented: Vec<(&str, &str)> = Vec::new();
+        for row in table_rows(&section(&page, "# Keys")) {
+            let [label, keys, _] = row[..] else {
+                panic!("a keys row has three cells: {row:?}");
+            };
+            let chords = code_spans(keys);
+            assert!(!chords.is_empty(), "a keys row names a key: {row:?}");
+            documented.extend(chords.into_iter().map(|chord| (label, chord)));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let repeated: Vec<_> = documented
+            .iter()
+            .filter(|pair| !seen.insert(**pair))
+            .collect();
+        assert!(repeated.is_empty(), "{WIKI_PAGE} lists twice: {repeated:?}");
+        let labels: std::collections::BTreeSet<&str> =
+            documented.iter().map(|(label, _)| *label).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            WIKI_CONTEXTS.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels, expected,
+            "the contexts {WIKI_PAGE} lists keys under"
+        );
+
+        let mut unbound = Vec::new();
+        for (label, chord) in &documented {
+            let contexts = wiki_context(label);
+            for key in wiki_chord(chord) {
+                if contexts
+                    .iter()
+                    .all(|ctx| passes_through(&map_key(key, ctx)))
+                {
+                    unbound.push(format!("{label}: {chord} ({key:?})"));
+                }
+            }
+        }
+        assert!(
+            unbound.is_empty(),
+            "{WIKI_PAGE} lists keys the key map does not bind there:\n{}",
+            unbound.join("\n")
+        );
+
+        let listed: Vec<_> = documented
+            .iter()
+            .map(|(label, chord)| {
+                let keys: Vec<_> = wiki_chord(chord).into_iter().map(normalise).collect();
+                (wiki_context(label), keys)
+            })
+            .collect();
+        let mut undocumented = Vec::new();
+        for (context, label, replays) in help_examples() {
+            for (key, ctx, action) in replays {
+                if passes_through(&action) {
+                    continue;
+                }
+                let named = normalise(key);
+                if !listed
+                    .iter()
+                    .any(|(contexts, keys)| contexts.contains(&ctx) && keys.contains(&named))
+                {
+                    undocumented.push(format!("{context:?} {label:?}: {key:?} in {ctx:?}"));
+                }
+            }
+        }
+        assert!(
+            undocumented.is_empty(),
+            "key help replays {WIKI_PAGE} does not list:\n{}",
+            undocumented.join("\n")
+        );
+    }
 }
