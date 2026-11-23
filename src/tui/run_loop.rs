@@ -9,10 +9,11 @@ use super::run_now::{CommandOutput, replay_deferred};
 use super::sink::{LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use super::terminal::Screen;
 use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, redirect, render};
+use crate::client::Model;
 use crate::config::{CommandPrefix, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::repl::{
-    EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, PasteOutcome, is_command, paste_clipboard_content,
+    EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, PreparedPaste, is_command, prepare_clipboard_paste,
 };
 use crate::supervisor::notification::{NotificationQueue, SystemNotification};
 use crate::utils::{AbortSignal, ClipboardContent, create_abort_signal};
@@ -972,33 +973,29 @@ pub(super) fn copy_notice(
     (NoticeKind::Checkpoint, notice)
 }
 
-/// Reads the clipboard through `read` into the composer as the REPL's
-/// paste key does: text as a paste, an image as a placeholder. The model
-/// is checked only while the context is in hand; during a turn the send
-/// checks it instead.
-pub(super) fn paste_clipboard_with(
-    app: &mut App,
-    ctx: Option<&RequestContext>,
+/// Reads the clipboard through `read` as the REPL's paste key does. The
+/// model is checked only while the context is in hand; during a turn the
+/// send checks it instead.
+pub(super) fn read_clipboard_paste(
+    model: Option<&Model>,
     read: impl FnOnce() -> Result<ClipboardContent>,
-) {
-    let outcome = match read() {
-        Ok(content) => paste_clipboard_content(
-            content,
-            ctx.map(RequestContext::current_model),
-            &mut app.pasted_images,
-        ),
-        Err(err) => PasteOutcome::Error(format!("Clipboard unavailable: {err:#}")),
-    };
-    match outcome {
-        PasteOutcome::InsertText(text) => {
-            app.handle_input(events::TermInput::Paste(text));
-        }
-        PasteOutcome::Nothing => {}
-        PasteOutcome::Error(text) => app.handle_msg(UiMsg::Notice {
-            kind: NoticeKind::ToolWarning,
-            text,
-        }),
+) -> PreparedPaste {
+    match read() {
+        Ok(content) => prepare_clipboard_paste(content, model),
+        Err(err) => PreparedPaste::Error(format!("Clipboard unavailable: {err:#}")),
     }
+}
+
+/// Reads the clipboard off the loop's thread, since encoding and saving
+/// a large screenshot would stall drawing and keys; the result comes back
+/// as [`UiMsg::ClipboardPasted`].
+fn spawn_clipboard_paste(tx: &UnboundedSender<UiMsg>, model: Option<Model>) {
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let prepared = read_clipboard_paste(model.as_ref(), crate::utils::read_for_paste);
+        // A closed inbox means the UI is gone; nobody is left to paste into.
+        let _ = tx.send(UiMsg::ClipboardPasted(prepared));
+    });
 }
 
 /// Replaces the event stream, dropping the old one first. Constructing a
@@ -1129,6 +1126,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             // goes back rather than vanishing.
                             debug_assert!(false, "a submit while the context was away");
                             app.set_composer_text(&line);
+                            app.pasted_images = images;
                         }
                     }
                     Some(Command::Queue(text)) => {
@@ -1241,7 +1239,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         dropped,
                     }) => copy_and_report(app, screen, &text, &from, dropped),
                     Some(Command::PasteImage) => {
-                        paste_clipboard_with(app, ctx.as_ref(), crate::utils::read_for_paste);
+                        spawn_clipboard_paste(
+                            tx,
+                            ctx.as_ref().map(|ctx| ctx.current_model().clone()),
+                        );
                     }
                     Some(Command::Rewind(target)) => {
                         if let Some(ctx) = ctx.as_mut() {

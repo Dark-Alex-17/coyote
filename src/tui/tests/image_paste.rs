@@ -1,9 +1,21 @@
 use super::*;
-use crate::tui::run_loop::paste_clipboard_with;
+use crate::client::Model;
+use crate::repl::PreparedPaste;
+use crate::tui::run_loop::read_clipboard_paste;
 use crate::utils::ClipboardContent;
 
-fn paste(harness: &mut Harness, ctx: Option<&RequestContext>, content: ClipboardContent) {
-    paste_clipboard_with(&mut harness.app, ctx, || Ok(content));
+/// The loop's paste without its worker thread: the read and the save run
+/// in line, and the result lands as the worker's message would.
+fn paste_clipboard_with(
+    app: &mut App,
+    model: Option<&Model>,
+    read: impl FnOnce() -> anyhow::Result<ClipboardContent>,
+) {
+    app.handle_msg(UiMsg::ClipboardPasted(read_clipboard_paste(model, read)));
+}
+
+fn paste(harness: &mut Harness, model: Option<&Model>, content: ClipboardContent) {
+    paste_clipboard_with(&mut harness.app, model, || Ok(content));
 }
 
 fn paste_image(harness: &mut Harness, name: &str) -> String {
@@ -89,7 +101,7 @@ fn an_image_for_a_model_without_vision_is_refused_while_idle() {
     let mut harness = Harness::new(200, 24, plain_config(), FooterInfo::default());
     paste(
         &mut harness,
-        Some(&ctx),
+        Some(ctx.current_model()),
         ClipboardContent::ImageFiles(vec![PathBuf::from("shot.png")]),
     );
     let frame = harness.draw();
@@ -185,5 +197,132 @@ fn a_line_with_images_waits_for_the_turn_and_a_plain_one_is_queued() {
     assert_eq!(
         harness.press(KeyCode::Enter),
         Some(Command::Queue("plain".to_string()))
+    );
+}
+
+#[test]
+fn a_line_held_for_its_images_is_sent_by_enter_once_the_turn_ends() {
+    let mut harness = Harness::new(120, 24, plain_config(), FooterInfo::default());
+    harness.app.begin_turn("explain", false);
+    harness.type_text("and this ");
+    let path = paste_image(&mut harness, "shot.png");
+    assert_eq!(harness.press(KeyCode::Enter), None);
+
+    harness.app.end_turn(false, &TurnOutcome::default());
+    assert_eq!(harness.app.composer_text(), "and this [Image #1]");
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit(
+            "and this [Image #1]".to_string(),
+            vec![path]
+        ))
+    );
+    assert_eq!(harness.app.composer_text(), "");
+    assert!(harness.app.pasted_images.is_empty());
+}
+
+#[test]
+fn ctrl_v_and_alt_v_paste_during_a_turn_too() {
+    let mut harness = Harness::new(120, 24, plain_config(), FooterInfo::default());
+    harness.app.begin_turn("explain", false);
+    for key in [ctrl(KeyCode::Char('v')), alt(KeyCode::Char('v'))] {
+        assert_eq!(
+            harness.app.handle_key(key),
+            Some(Command::PasteImage),
+            "{key:?}"
+        );
+    }
+}
+
+#[test]
+fn ctrl_v_and_alt_v_leave_the_cursor_of_a_long_draft_where_it_was() {
+    let mut harness = Harness::standalone(40, 8);
+    let draft: Vec<String> = (0..30).map(|n| format!("line{n}")).collect();
+    harness.app.set_composer_text(&draft.join("\n"));
+    for _ in 0..30 {
+        harness.press(KeyCode::Up);
+    }
+    harness.press(KeyCode::Home);
+    harness.draw();
+    harness.app.handle_key(ctrl(KeyCode::Char('v')));
+    harness.app.handle_key(alt(KeyCode::Char('v')));
+    harness.type_text("X");
+    assert_eq!(harness.app.composer.lines()[0], "Xline0");
+    assert_eq!(harness.app.composer.lines().len(), 30);
+}
+
+#[test]
+fn one_clipboard_holding_two_images_gets_a_placeholder_for_each() {
+    let mut harness = Harness::standalone(80, 24);
+    paste(
+        &mut harness,
+        None,
+        ClipboardContent::ImageFiles(vec![PathBuf::from("a.png"), PathBuf::from("b.png")]),
+    );
+    let text = harness.app.composer_text();
+    assert!(text.contains("[Image #1]"), "{text}");
+    assert!(text.contains("[Image #2]"), "{text}");
+    assert_eq!(harness.app.pasted_images.len(), 2);
+}
+
+#[test]
+fn a_placeholder_removed_whole_leaves_a_plain_line_to_send() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.type_text("hi ");
+    paste_image(&mut harness, "shot.png");
+    harness.press(KeyCode::Backspace);
+    assert_eq!(harness.app.composer_text(), "hi ");
+    assert!(matches!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit(line, _)) if line == "hi"
+    ));
+    assert!(harness.app.pasted_images.is_empty());
+}
+
+#[test]
+fn pastes_are_numbered_in_the_order_they_land() {
+    let mut harness = Harness::standalone(80, 24);
+    let second = PreparedPaste::Images(vec!["/tmp/second.png".to_string()]);
+    let first = PreparedPaste::Images(vec!["/tmp/first.png".to_string()]);
+    harness.app.handle_msg(UiMsg::ClipboardPasted(second));
+    harness.type_text(" ");
+    harness.app.handle_msg(UiMsg::ClipboardPasted(first));
+    assert_eq!(harness.app.composer_text(), "[Image #1] [Image #2]");
+    assert_eq!(
+        harness.app.pasted_images,
+        ["/tmp/second.png", "/tmp/first.png"]
+    );
+}
+
+#[test]
+fn a_paste_landing_after_the_send_goes_into_the_next_draft() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.type_text("sent");
+    assert!(matches!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit(..))
+    ));
+    harness.type_text("next ");
+    harness
+        .app
+        .handle_msg(UiMsg::ClipboardPasted(PreparedPaste::Images(vec![
+            "/tmp/late.png".to_string(),
+        ])));
+    assert_eq!(harness.app.composer_text(), "next [Image #1]");
+    assert_eq!(harness.app.pasted_images, ["/tmp/late.png"]);
+}
+
+#[test]
+fn a_prefill_replacing_the_draft_forgets_the_pasted_images() {
+    let mut ctx = chat_ctx();
+    let mut harness = Harness::for_ctx(&ctx);
+    paste_image(&mut harness, "shot.png");
+    ctx.pending_prefill = Some("edited line".to_string());
+    harness.app.sync_from_ctx(&mut ctx);
+    assert_eq!(harness.app.composer_text(), "edited line");
+    assert!(harness.app.pasted_images.is_empty());
+    assert_eq!(
+        harness.press(KeyCode::Enter),
+        Some(Command::Submit("edited line".to_string(), Vec::new()))
     );
 }

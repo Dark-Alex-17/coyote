@@ -650,6 +650,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     // A chord's letter is matched case-folded once here: with the kitty
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
+    let searching = ctx.popup == Some(PopupKind::HistorySearch);
     // Job control, repaint and the mouse mode are the terminal's, not the
     // modal's: they work the same whatever is on screen. So do the keys
     // that only move the view or copy from it: a question waiting below
@@ -781,6 +782,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             {
                 Action::PaletteAccept
             }
+            // Nothing behind the search band would show the paste.
+            KeyCode::Char('v') if (ctrl || alt) && searching => Action::Nothing,
             KeyCode::Char(_) if !ctrl && ctx.popup == Some(PopupKind::HistorySearch) => {
                 match key.code {
                     KeyCode::Char(typed) => Action::PopupChar(typed),
@@ -1377,8 +1380,9 @@ mod tests {
     }
 
     /// With the search band open the letters and Backspace edit its
-    /// filter and Enter takes the highlighted entry however it is held;
-    /// the rewind picker types into the composer instead.
+    /// filter, Enter takes the highlighted entry however it is held and
+    /// the paste keys do nothing; the rewind picker types into the
+    /// composer instead.
     #[test]
     fn history_search_and_rewind_popup_keys() {
         let search = KeyContext {
@@ -1410,6 +1414,12 @@ mod tests {
             (plain(KeyCode::Down), search, Action::PaletteMove(1)),
             (plain(KeyCode::Esc), search, Action::ClosePopup),
             (ctrl('r'), search, Action::OpenHistorySearch),
+            (ctrl('v'), search, Action::Nothing),
+            (
+                press(KeyCode::Char('v'), KeyModifiers::ALT),
+                search,
+                Action::Nothing,
+            ),
             (ctrl('c'), search, Action::ClosePopup),
             (ctrl('d'), search, Action::ClosePopup),
             (plain(KeyCode::Enter), rewind, Action::PaletteAccept),

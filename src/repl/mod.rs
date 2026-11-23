@@ -2888,20 +2888,27 @@ pub(crate) enum PasteOutcome {
 }
 
 fn handle_clipboard_paste(ctx: &mut RequestContext, content: ClipboardContent) -> PasteOutcome {
-    let model = ctx.current_model().clone();
-    paste_clipboard_content(content, Some(&model), &mut ctx.pasted_images)
+    let prepared = prepare_clipboard_paste(content, Some(ctx.current_model()));
+    place_prepared_paste(prepared, &mut ctx.pasted_images)
 }
 
-/// An image paste puts an `[Image #N]` placeholder at the cursor; the image
-/// is sent where the placeholder stands, and deleting the placeholder drops
-/// it. Each image's path is pushed onto `pasted`, so placeholder N names
-/// entry N-1. With no `model` to check, an image is taken whatever model
-/// is in use; the send refuses it later if that model cannot read images.
-pub(crate) fn paste_clipboard_content(
+/// What a clipboard read leaves to paste, before any image is numbered.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PreparedPaste {
+    Images(Vec<String>),
+    Text(String),
+    Error(String),
+    Nothing,
+}
+
+/// The slow half of a paste: checks the model and saves a pasted bitmap
+/// as a PNG file. With no `model` to check, an image is taken whatever
+/// model is in use; the send refuses it later if that model cannot read
+/// images.
+pub(crate) fn prepare_clipboard_paste(
     content: ClipboardContent,
     model: Option<&Model>,
-    pasted: &mut Vec<String>,
-) -> PasteOutcome {
+) -> PreparedPaste {
     if let Some(model) = model
         && !model.supports_vision()
         && matches!(
@@ -2909,27 +2916,43 @@ pub(crate) fn paste_clipboard_content(
             ClipboardContent::ImageFiles(_) | ClipboardContent::ImagePng(_)
         )
     {
-        return PasteOutcome::Error(vision_unsupported_message(model));
+        return PreparedPaste::Error(vision_unsupported_message(model));
     }
-    let paths = match content {
-        ClipboardContent::Text(text) => return PasteOutcome::InsertText(text),
-        ClipboardContent::Empty => return PasteOutcome::Nothing,
+    match content {
+        ClipboardContent::Text(text) => PreparedPaste::Text(text),
+        ClipboardContent::Empty => PreparedPaste::Nothing,
         ClipboardContent::NonImageFiles(_) => {
-            return PasteOutcome::Error("Copied files are not images.".into());
+            PreparedPaste::Error("Copied files are not images.".into())
         }
         ClipboardContent::ImageFiles(paths) => {
             let cwd = env::current_dir().unwrap_or_default();
-            paths
-                .iter()
-                .filter_map(|path| cwd.join(path).to_str().map(str::to_string))
-                .collect()
+            PreparedPaste::Images(
+                paths
+                    .iter()
+                    .filter_map(|path| cwd.join(path).to_str().map(str::to_string))
+                    .collect(),
+            )
         }
         ClipboardContent::ImagePng(bytes) => match save_pasted_png(&bytes) {
-            Ok(path) => vec![path],
-            Err(err) => {
-                return PasteOutcome::Error(format!("Failed to save pasted image: {err:#}"));
-            }
+            Ok(path) => PreparedPaste::Images(vec![path]),
+            Err(err) => PreparedPaste::Error(format!("Failed to save pasted image: {err:#}")),
         },
+    }
+}
+
+/// An image paste puts an `[Image #N]` placeholder at the cursor; the image
+/// is sent where the placeholder stands, and deleting the placeholder drops
+/// it. Each image's path is pushed onto `pasted`, so placeholder N names
+/// entry N-1.
+pub(crate) fn place_prepared_paste(
+    prepared: PreparedPaste,
+    pasted: &mut Vec<String>,
+) -> PasteOutcome {
+    let paths = match prepared {
+        PreparedPaste::Images(paths) => paths,
+        PreparedPaste::Text(text) => return PasteOutcome::InsertText(text),
+        PreparedPaste::Error(message) => return PasteOutcome::Error(message),
+        PreparedPaste::Nothing => return PasteOutcome::Nothing,
     };
     let placeholders: Vec<String> = paths
         .into_iter()

@@ -46,7 +46,9 @@ use crate::events::NoticeKind;
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
 use crate::function::jobs::JOB_KILL_GRACE;
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory};
-use crate::repl::{is_command, recorded_placeholder_indices};
+use crate::repl::{
+    PasteOutcome, PreparedPaste, is_command, place_prepared_paste, recorded_placeholder_indices,
+};
 use anyhow::Result;
 use bottom_pane::{
     PaletteSnapshot, PaletteState, PaletteView, RewindTarget, RewindView, SearchState, SearchView,
@@ -701,6 +703,7 @@ impl App {
         }
         if let Some(text) = ctx.pending_prefill.take() {
             self.set_composer_text(&text);
+            self.pasted_images.clear();
         }
         self.todo
             .set(ctx.todo_list.goal.clone(), ctx.todo_list.todos.clone());
@@ -931,6 +934,24 @@ impl App {
         let images = std::mem::take(&mut self.pasted_images);
         self.take_composer_line()
             .map(|line| Command::Submit(line, images))
+    }
+
+    /// Numbers a paste's images against the draft being edited when it
+    /// lands, so two pastes in flight keep the order they arrive in.
+    fn paste_prepared(&mut self, prepared: PreparedPaste) {
+        match place_prepared_paste(prepared, &mut self.pasted_images) {
+            PasteOutcome::InsertText(text) => {
+                self.handle_input(events::TermInput::Paste(text));
+            }
+            PasteOutcome::Nothing => {}
+            PasteOutcome::Error(text) => {
+                self.transcript.push_notice(
+                    self.notice_merge_from(),
+                    NoticeKind::ToolWarning,
+                    text,
+                );
+            }
+        }
     }
 
     fn queue_composer(&mut self) -> Option<Command> {
@@ -1918,6 +1939,7 @@ impl App {
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
             UiMsg::LendTerminal(job) => self.lend_requests.push(job),
             UiMsg::Copy(text) => self.copy_requests.push(text),
+            UiMsg::ClipboardPasted(prepared) => self.paste_prepared(prepared),
             UiMsg::History(entries) => self.transcript.push_history(entries),
             UiMsg::ChildTranscriptFlushed { session_id } => {
                 if !is_plain_session_id(&session_id) {
