@@ -547,14 +547,10 @@ fn tell_unavailable(reason: &str) {
 }
 
 /// What goes away by itself: rnsd slow past the budget, or a transient drop on either
-/// side of the dial, read off the typed io kind of an `Io` or `Connect` failure.
+/// side of the dial, as the library's own predicate reads it. A refused dial is not one;
+/// `not_listening_yet` polls for that separately.
 fn retryable(err: &RpcError) -> bool {
-    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
-    matches!(err, RpcError::Timeout)
-        || matches!(
-            err.io_kind(),
-            Some(ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof)
-        )
+    err.is_transient()
 }
 
 /// rnsd is up but its RPC listener is not bound yet: it binds a few seconds after the

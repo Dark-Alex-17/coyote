@@ -208,6 +208,16 @@ if-addrs = "0.15"
 # `RpcError::io_kind()` (the `std::io::ErrorKind` of an `Io` or `Connect` failure), which
 # the stats read retries on instead of matching error text.
 #
+# The 0.18.5 release drives rnsd's path table over the same RPC: `path_table`,
+# `next_hop_interface_name`, `drop_path`, `drop_path_settled` (a drop that waits for
+# rnsd's cull, so the path request after it is not answered from the dropped row) and
+# `first_hop_timeout`, plus `RpcError::is_transient()`, which the stats read retries on,
+# and the in-process `Transport::path_interface`, which names the interface a path was
+# learned over. A link that recovers a stale route uses these to drop it, ask the
+# network once and try again. The release also sizes the link establishment timeout's
+# first hop by Reticulum's MTU, so a link over a dead path times out in about 12 s, not
+# about 45 s.
+#
 # The fork re-exports `rand_core` and `rmpv`, so Coyote names the RNG its constructors
 # take as `rns_transport::rand_core::OsRng` and needs no `rand_core` entry of its own.
 #
@@ -228,7 +238,7 @@ if-addrs = "0.15"
 # re-exports surface this crate does not use, and it covers only the `rns-*` crates and
 # not `lxmf-wire`, so it cannot replace both entries anyway. Depending on the two
 # directly keeps one mechanism instead of two.
-coyote-rns-transport = "0.18.4"
+coyote-rns-transport = "0.18.5"
 lxmf-wire = "0.14.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the
