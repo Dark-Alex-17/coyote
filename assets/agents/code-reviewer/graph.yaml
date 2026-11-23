@@ -338,6 +338,14 @@ nodes:
       agent__spawn / agent__collect tools). Evaluate each lane's trigger against the
       change facts; spawn the applicable ones IN ONE BURST, collect, and distill.
 
+      The checkout under review is {{project_dir}}, which may differ from the checkout
+      this run was started in. A spawned agent keeps the parent run's project_dir unless
+      agent__spawn passes `variables: {"project_dir": "{{project_dir}}"}`, so every lane
+      agent that declares a `project_dir` variable (agent__list_available reports the
+      declared variables) gets that argument. agent__spawn refuses a variable the agent
+      does not declare, so a lane agent without `project_dir` is spawned with no
+      `variables` argument, and `aux_note` says that lane read the inherited checkout.
+
       **Org-context lane** — only if `{{org_context_agent}}` is a non-empty agent name AND
       the diff touches surface where a recorded decision plausibly exists (public API
       shapes, money/entitlement logic, auth flows, data retention/deletion, domain state
