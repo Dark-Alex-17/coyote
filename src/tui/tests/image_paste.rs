@@ -18,18 +18,16 @@ fn paste(harness: &mut Harness, model: Option<&Model>, content: ClipboardContent
     paste_clipboard_with(&mut harness.app, model, || Ok(content));
 }
 
+/// Pastes the image file at `/tmp/<name>`; an absolute path keeps the test
+/// clear of the working directory, which other tests move.
 fn paste_image(harness: &mut Harness, name: &str) -> String {
+    let path = PathBuf::from("/tmp").join(name);
     paste(
         harness,
         None,
-        ClipboardContent::ImageFiles(vec![PathBuf::from(name)]),
+        ClipboardContent::ImageFiles(vec![path.clone()]),
     );
-    std::env::current_dir()
-        .unwrap()
-        .join(name)
-        .to_str()
-        .unwrap()
-        .to_string()
+    path.to_str().unwrap().to_string()
 }
 
 #[test]

@@ -937,11 +937,16 @@ impl App {
     }
 
     /// Numbers a paste's images against the draft being edited when it
-    /// lands, so two pastes in flight keep the order they arrive in.
+    /// lands, so two pastes in flight keep the order they arrive in. The
+    /// result goes into the composer whatever has opened over it since the
+    /// key was pressed, since the draft is what the key was pressed in.
     fn paste_prepared(&mut self, prepared: PreparedPaste) {
         match place_prepared_paste(prepared, &mut self.pasted_images) {
             PasteOutcome::InsertText(text) => {
-                self.handle_input(events::TermInput::Paste(text));
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.composer.insert_str(&text);
+                self.palette_dirty = true;
+                self.schedule_frame();
             }
             PasteOutcome::Nothing => {}
             PasteOutcome::Error(text) => {
