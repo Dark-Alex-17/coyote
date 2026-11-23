@@ -342,6 +342,7 @@ initial_state:
   owner_poll_result: ''
   owner_polls: 0
   reask_rounds: 0
+  apply_reasks: 0
   reply_kind: ''
   reply_reason: ''
   reply_verdict: ''
@@ -353,6 +354,7 @@ initial_state:
   reply_interpreted: false
   reply_source: ''
   answer_reason: ''
+  answer_source: ''
   judge_rulings: {}
   discussion: {}
   discussion_run_id: ''
@@ -363,7 +365,7 @@ initial_state:
   base_branch_override: ''
   code_dir_override: ''
   autonomous_digest: []
-  autonomous_kinds: []
+  autonomous_decisions: []
   # --- phase F ---
   integration_checked: false
   final_integration_strikes: 0

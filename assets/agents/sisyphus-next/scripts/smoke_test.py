@@ -213,6 +213,10 @@ check("intake: roster parse", roster.get("TASK-002") == ["src/auth/", "src/api/u
 # ---------------------------------------------------------------- assess_fault / route_intent (B1)
 u = gates.assess_fault(base_state(last_script_error="boom"))
 check("assess_fault: fail-safe -> ambiguous with options", u["intent"] == "ambiguous" and u["clarifying_questions"])
+u = gates.route_intent(base_state(**gates.assess_fault(base_state(last_script_error="the token expired")), clarify_rounds=0))
+check("assess_fault: a trigger word only in the error text -> the clarify question is no hard trigger",
+      u.get("escalation", {}).get("kind") == "clarify" and u.get("escalation", {}).get("hard_trigger") is False,
+      u.get("escalation"))
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "which module?", "options": [{"text": "a", "recommended": True, "evidence": "e"}]}], clarify_rounds=0))
 check("route_intent: ambiguous -> escalation clarify (round 1)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "clarify" and u["clarify_rounds"] == 1)
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "q"}], clarify_rounds=CLARIFY_MAX))
@@ -356,6 +360,24 @@ check("escalate_gate: a decision already resolved autonomously in this subtask -
       u)
 secret = escalation("yellow_findings", "rotate the API secret?", [option("yes", True)])
 check("escalation: secret/money wording auto-flags hard trigger", secret["hard_trigger"])
+
+
+def quoted_trigger(question, quoted):
+    try:
+        return escalation("retry", question, quoted=quoted)["hard_trigger"]
+    except TypeError:
+        return None
+
+
+_err = "the token expired"
+check("escalation: a trigger word only in the quoted error text -> no hard trigger",
+      quoted_trigger(f"Retry {_err}?", (_err,)) is False)
+check("escalation: the same error text not marked as quoted -> hard trigger",
+      escalation("retry", f"Retry {_err}?")["hard_trigger"] is True)
+check("escalation: a one-letter quoted value does not blank the letter inside the stem's own words",
+      quoted_trigger("Delete the branch a?", ("a",)) is True)
+check("escalation: a stem matching on its own still trips with the quoted name blanked",
+      quoted_trigger("Delete the branch feat-a?", ("feat-a",)) is True)
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="A", ladder_basis="recommended option"))
 check("ladder_route: recommended -> digest + apply", u["_next"] == "apply_answer" and u["autonomous_digest"] and u["last_answer"] == "A")
 u = gates.ladder_route(base_state(escalation=esc, ladder_resolution="recommended", ladder_choice="Z"))
@@ -1475,6 +1497,9 @@ u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\nLast script 
 check("route_coder_result: B5 strike 3 -> strikeout", u["_next"] == "strikeout")
 u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' failed: exit 2\n\nLast build output:\n", fix_strikes=0))
 check("route_coder_result: crashed gate -> engine_fault escalation (not a code fix)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "engine_fault")
+u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' failed: token expired\n\nLast build output:\n", fix_strikes=0))
+check("route_coder_result: a trigger word only in the crash text -> engine_fault is no hard trigger",
+      u.get("escalation", {}).get("kind") == "engine_fault" and u.get("escalation", {}).get("hard_trigger") is False)
 # the coder's own end_failure template, rendered the way a red test gate leaves it: no script error
 _coder_end = re.search(r"(?ms)^  end_failure:\n.*?^    output: \|\n(.*?)(?=^  \w+:\n|\Z)",
                        open(os.path.join(HERE, "..", "..", "coder", "graph.yaml")).read()).group(1)
@@ -1774,6 +1799,9 @@ u = gates.route_gauntlet(base_state(gauntlet_result=inc, debris_reruns=RERUN_ONC
 check("route_gauntlet: B11 exhausted -> three-option escalation", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "review_incomplete" and len(u["escalation"]["options"]) == 3)
 u = gates.route_gauntlet(base_state(gauntlet_result="GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: security, pipeline\n", round_heads=[{}]))
 check("route_gauntlet: other lane incomplete -> straight to the options", u["escalation"]["kind"] == "review_incomplete" and u["gauntlet_incomplete"] == ["security", "pipeline"])
+u = gates.route_gauntlet(base_state(gauntlet_result="GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: secret-scan\n", round_heads=[{}]))
+check("route_gauntlet: a trigger word only in a lane name -> review_incomplete is no hard trigger",
+      u.get("escalation", {}).get("kind") == "review_incomplete" and u.get("escalation", {}).get("hard_trigger") is False)
 u = gates.route_gauntlet(base_state(gauntlet_result="Agent node failed: killed", round_heads=[{}]))
 check("route_gauntlet: agent-node failure -> incomplete pipeline (never PASS)", u["gauntlet_verdict"] == "BLOCKED" and u["gauntlet_incomplete"] == ["pipeline"])
 tri = [{"finding": "🔴 null deref", "action": "reject", "citation": "src/x.go:1", "lane": "code-review"},
@@ -1789,6 +1817,17 @@ _same = [{"code_tree": "t1", "lane_blockers": {"adversary": ["DIVERGES: c1"]}}] 
 u = gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "adversary"}], review_rounds=0,
                                   lane_block_streak={"adversary": 1}, round_heads=_same))
 check("triage_route: adversary blocking twice after a fix -> lane_stuck escalation (re-run once rule)", u["escalation"]["kind"] == "lane_stuck")
+_same_secret = [{"code_tree": "t1", "lane_blockers": {"secret-scan": ["DIVERGES: c1"]}}] * 2
+_saved_lanes = gates.GAUNTLET_LANES, gates.RERUN_ONCE_LANES
+gates.GAUNTLET_LANES, gates.RERUN_ONCE_LANES = (lanes + ("secret-scan",) for lanes in _saved_lanes)
+try:
+    u = gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "secret-scan"}],
+                                      review_rounds=0, lane_block_streak={"secret-scan": 1}, round_heads=_same_secret))
+finally:
+    gates.GAUNTLET_LANES, gates.RERUN_ONCE_LANES = _saved_lanes
+check("triage_route: a trigger word only in a lane name -> lane_stuck is no hard trigger",
+      u.get("escalation", {}).get("kind") == "lane_stuck" and u.get("escalation", {}).get("hard_trigger") is False,
+      u.get("escalation"))
 u = gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}], review_rounds=STRIKE_LIMIT))
 check("triage_route: B10 review rounds exhausted -> review_exhausted escalation", u["escalation"]["kind"] == "review_exhausted")
 u = gates.triage_route(base_state(triage=[{"finding": "USAGE_PROBE: INCONCLUSIVE no recipe", "action": "fix", "lane": "probe"}], review_rounds=0))
@@ -2257,6 +2296,10 @@ _esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=_u2.get("ci
 check("ci_route: a cancelled run already re-run this run -> re-run not offered, leaving the PR in draft recommended",
       opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
 _esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["lint", "cancel", ""]])).get("escalation", {})
+_esc_secret = gates.ci_route(base_state(ci_status="inconclusive",
+                                        ci_checks=[["build", "pass", ""], ["secret-scan", "skipping", ""]])).get("escalation", {})
+check("ci_route: an inconclusive check named with a trigger word outside a review watch -> no hard trigger",
+      _esc_secret.get("kind") == "ci_inconclusive" and _esc_secret.get("hard_trigger") is False, _esc_secret)
 check("ci_route: a cancelled check naming no run -> re-run not offered, leaving the PR in draft recommended",
       opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
 _u2 = {}
@@ -6424,6 +6467,9 @@ with scenario("base: at the integration budget the question asks for a reason, s
           and base_rec(_full) == "Leave the PR in draft and report"
           and not any(o["text"].startswith("Integrate") for o in _full["options"])
           and not any(e["hard_trigger"] for e in (_below, _at, _clean, _full)), (_at, _clean, _full))
+_esc_secret = gates._base_moved(base_state(), {}, dict(CAP_FACTS, conflicted=["secret.txt"]))["escalation"]
+check("base: a conflicted path holding a trigger word before the review watch -> no hard trigger",
+      "secret.txt" in _esc_secret.get("question", "") and _esc_secret.get("hard_trigger") is False, _esc_secret)
 with scenario("base: the report's Base line says contained, integrated, not integrated with the decision, or not "
               "checked with the reason, and not checked when a push ran without a base check") as name:
     report_facts = {"remote": "origin", "base": "main", "tip": "d" * 40, "count": 2}

@@ -355,7 +355,8 @@ STATE_KEYS = (
     "gate2_verdict", "sealed",
     "current_task", "current_unit", "run_branch", "group_index", "pending_fixes", "task_rounds",
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",
-    "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",
+    "autonomous_digest", "autonomous_decisions", "decisions", "follow_ups", "rejected_findings", "deferred_findings",
+    "skipped_reviews",
     "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands", "verification_changes",
     "quality_rigor", "quality_surfaces", "round_log", "open_questions", "carried_questions",
     "rigor_proposal", "surfaces_proposal", "quality_evidence", "quality_recorded",
@@ -363,6 +364,7 @@ STATE_KEYS = (
     "leak_questions", "leak_unanswerable", "leak_pending_answers", "leak_owner_reason",
     "design_rounds", "choice_kind", "choice_queue", "choice_index", "choice_answers", "choice_reframed", "choice_parks",
     "choice_forced", "run_branch_override", "run_branch_override_group", "base_branch_override", "code_dir_override",
+    "answer_source", "apply_reasks",
 )
 
 
@@ -445,13 +447,22 @@ def option(text, recommended=False, evidence=""):
     return {"text": text, "recommended": bool(recommended), "evidence": evidence or ""}
 
 
-def escalation(kind, question, options=None, evidence="", hard_trigger=False, tier3_ok=True, data=None, return_to=""):
+def _own_text(question, quoted):
+    """The question with the data it quotes blanked out as whole tokens; longest first so a quoted string inside another goes too."""
+    text = question or ""
+    for q in sorted({str(q) for q in quoted if q not in (None, "")}, key=len, reverse=True):
+        text = re.sub(r"(?<!\w)" + re.escape(q) + r"(?!\w)", " ", text)
+    return text
+
+
+def escalation(kind, question, options=None, evidence="", hard_trigger=False, tier3_ok=True, data=None, return_to="",
+               quoted=()):
     return {
         "kind": kind,
         "question": question,
         "options": options or [],
         "evidence": evidence or "",
-        "hard_trigger": bool(hard_trigger) or bool(HARD_TRIGGER_RE.search(question or "")),
+        "hard_trigger": bool(hard_trigger) or bool(HARD_TRIGGER_RE.search(_own_text(question, quoted))),
         "tier3_ok": bool(tier3_ok),
         "data": data or {},
         "return_to": return_to,
@@ -494,8 +505,10 @@ def raise_escalation(state, updates, esc):
     updates["last_answer"] = ""
     updates["last_answer_text"] = ""
     updates["reask_rounds"] = 0
+    updates["apply_reasks"] = 0
     updates["reply_interpreted"] = False
     updates["answer_reason"] = ""
+    updates["answer_source"] = ""
     updates["_next"] = "escalate_gate"
     return updates
 

@@ -407,6 +407,7 @@ def assess_fault(state):
                 option("Treat it as a question (research answer, no edits)"),
                 option("Abort"),
             ],
+            "quoted": [err[:200]],
         }],
     })
     return u
@@ -810,7 +811,7 @@ def _route_intent(state, u):
         stops = ["Abort"] if truthy(state.get("assess_faulted")) else []
         asked = q.get("question", "")
         return raise_escalation(state, u, escalation("clarify", asked, opts, data={
-            "stop_options": stops, "decision": _hashed_decision("clarify", asked)}))
+            "stop_options": stops, "decision": _hashed_decision("clarify", asked)}, quoted=as_list(q.get("quoted"))))
 
     if intent in ("exploration", "design_question"):
         u["_next"] = "research_answer"
@@ -3429,11 +3430,12 @@ def route_coder_result(state):
         # an empty value renders as a blank line; the body must not run on into the next section header
         m = re.search(r"Last script error:[ \t]*\n(.*?)(?=\n[ \t]*\n|\nLast |\Z)", result, re.S)
         if m and m.group(1).strip() and m.group(1).strip() != "null":
+            crash = m.group(1).strip()[:300]
             return raise_escalation(state, u, escalation(
                 "engine_fault",
-                f"The coder's verification gate crashed (an engine-side fault, not a code fix): {m.group(1).strip()[:300]}. Retry the round or abort?",
+                f"The coder's verification gate crashed (an engine-side fault, not a code fix): {crash}. Retry the round or abort?",
                 [option("Retry the coder round", recommended=True, evidence="a crashed gate is transient more often than not"),
-                 option("Abort this task")], evidence=err))
+                 option("Abort this task")], evidence=err, quoted=(crash,)))
         _strike_next(u, strikes)
     snapshot(state, u, "coder")
     return u
@@ -4472,7 +4474,7 @@ def route_gauntlet(state):
                 f"NEEDS-HUMAN (proceed without the {lanes_txt} review, recorded in the report / PR body), or abort?",
                 [option("Retry the review again"),
                  option("Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)"),
-                 option("Abort this task")], evidence=tail(text, 1500)))
+                 option("Abort this task")], evidence=tail(text, 1500), quoted=(lanes_txt,)))
     snapshot(state, u, "gauntlet")
     return u
 
@@ -4646,7 +4648,8 @@ def triage_route(state):
             opts, hard = _extra_round_options(state, unchanged + capped)
             return raise_escalation(state, u, escalation(
                 "lane_stuck", _stuck_question(unchanged, capped, streak), opts,
-                evidence=("\n".join(notes) + "\n\nFindings:\n" + findings)[:2500], hard_trigger=hard))
+                evidence=("\n".join(notes) + "\n\nFindings:\n" + findings)[:2500], hard_trigger=hard,
+                quoted=unchanged + capped))
         if rounds >= STRIKE_LIMIT:
             opts, hard = _extra_round_options(state, {lane for lane, _ in fixes})
             return raise_escalation(state, u, escalation(
@@ -5263,7 +5266,7 @@ def _base_merge_read(state, u, task):
             [option(BASE_MERGE_RETRY, recommended=_base_round_fits(state)),
              option(_ci_leave_option(state), recommended=not _base_round_fits(state),
                     evidence=_one_line(state.get("git_report"), 600))],
-            evidence=detail, hard_trigger=_watch_started(state), data={"task": task}))
+            evidence=detail, hard_trigger=_watch_started(state), data={"task": task}, quoted=(tip[:8],)))
     staged = []
     if pending:
         unmerged = git_out(root, "diff", "--name-only", "--diff-filter=U").splitlines()
@@ -5873,7 +5876,8 @@ def _base_moved(state, u, facts):
     data = {k: facts.get(k) for k in ("remote", "base", "tip", "merge_base", "conflict_state", "conflicted", "overlap",
                                       "behind_required", "count")}
     return raise_escalation(state, u, escalation("base_moved", question, options, evidence=_base_evidence(facts),
-                                                 hard_trigger=_watch_started(state), data=data))
+                                                 hard_trigger=_watch_started(state), data=data,
+                                                 quoted=(_base_where(facts), *as_list(facts.get("conflicted")))))
 
 
 def base_check(state):
@@ -6016,7 +6020,7 @@ def _ci_unclear(state, u, status):
                    option(leave, recommended=not rerunnable and not quiet)]
     return raise_escalation(state, u, escalation(
         f"ci_{status}", question, options, evidence=evidence, hard_trigger=_watch_started(state),
-        data={"non_pass": non_pass, "cancelled": cancelled}))
+        data={"non_pass": non_pass, "cancelled": cancelled}, quoted=(names,) if status != "no_checks" else ()))
 
 
 def ci_route(state):
@@ -6086,7 +6090,8 @@ def ci_route(state):
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"CI watch ended without a verdict ({status}). Keep waiting, or leave the PR in draft and report?",
             [option(CI_KEEP_WAITING), option("Leave the PR in draft and report", recommended=True,
-                                             evidence="a draft with a named blocker beats a ready PR on red/pending")]))
+                                             evidence="a draft with a named blocker beats a ready PR on red/pending")],
+            quoted=(status,)))
     return u
 
 

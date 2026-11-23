@@ -347,13 +347,21 @@ def option(text, recommended=False, evidence=""):
     return {"text": text, "recommended": bool(recommended), "evidence": evidence or ""}
 
 
-def escalation(kind, question, options=None, evidence="", hard_trigger=False, tier3_ok=True, data=None):
+def _own_text(question, quoted):
+    """The question with the data it quotes blanked out as whole tokens; longest first so a quoted string inside another goes too."""
+    text = question or ""
+    for q in sorted({str(q) for q in quoted if q not in (None, "")}, key=len, reverse=True):
+        text = re.sub(r"(?<!\w)" + re.escape(q) + r"(?!\w)", " ", text)
+    return text
+
+
+def escalation(kind, question, options=None, evidence="", hard_trigger=False, tier3_ok=True, data=None, quoted=()):
     return {
         "kind": kind,
         "question": question,
         "options": options or [],
         "evidence": evidence or "",
-        "hard_trigger": bool(hard_trigger) or bool(HARD_TRIGGER_RE.search(question or "")),
+        "hard_trigger": bool(hard_trigger) or bool(HARD_TRIGGER_RE.search(_own_text(question, quoted))),
         "tier3_ok": bool(tier3_ok),
         "data": data or {},
         "raised_at": now_iso(),
