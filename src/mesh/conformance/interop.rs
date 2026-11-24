@@ -2670,7 +2670,10 @@ async fn a_node_reads_the_lan_host_count_of_its_rnsd() {
     let reading = reader.read().await.lan;
     assert_eq!(reading, Some(LanReading::Unknown));
     assert!(reader.unavailable().await);
-    assert!(!reader.relay_online_seen(), "a refused key reads no relay");
+    assert!(
+        !reader.reading_seen().is_some_and(|seen| seen.relay_online),
+        "a refused key reads no relay"
+    );
     let wrong_key_path = wrong_key_dir.path.display().to_string();
     let told = |lines: Vec<String>| {
         lines

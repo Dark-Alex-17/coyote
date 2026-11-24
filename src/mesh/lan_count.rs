@@ -550,12 +550,6 @@ impl RnsdLanReader {
         }
     }
 
-    /// Whether the latest read that reached rnsd had a TCP client online, with no call;
-    /// `false` before any read reached it.
-    pub(crate) fn relay_online_seen(&self) -> bool {
-        self.last.lock().relay_online
-    }
-
     /// One patient read for the upstream watch: rnsd's TCP client interfaces and whether
     /// each is online, from the same `interface_stats` answer the count comes from, so
     /// the LAN row and the relay flag are kept up to date by it too. `None` when the read
@@ -577,10 +571,16 @@ impl RnsdLanReader {
         self.last_tcp.lock().clone()
     }
 
-    /// Whether the latest read that reached rnsd found an AutoInterface, with no call;
-    /// `false` before any read reached it.
-    pub(crate) fn lan_seen(&self) -> bool {
-        self.last.lock().lan.is_some()
+    /// The latest reading that reached rnsd, with no call; `None` before any read has. A
+    /// read that fails leaves the one before it standing, so this is never a default that
+    /// stands in for a reading.
+    pub(crate) fn reading_seen(&self) -> Option<RnsdReading> {
+        (self.answered.load(std::sync::atomic::Ordering::Acquire) > 0).then(|| *self.last.lock())
+    }
+
+    /// How many reads have reached rnsd, so a caller can tell whether its own read did.
+    pub(crate) fn reads_answered(&self) -> u64 {
+        self.answered.load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -818,21 +818,21 @@ mod tests {
         let dir = keyed_dir("lan-count-rnsd-verdict");
         let source = Scripted::new([Ok(vec![auto(0)]), Ok(vec![auto(1), tcp_client(true)])]);
         let reader = reader_at(&dir.path, source);
-        assert!(
-            !reader.relay_online_seen() && !reader.lan_seen(),
-            "nothing read yet"
-        );
+        assert_eq!(reader.reading_seen(), None, "nothing read yet");
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
         assert!(!readings.relay_online);
         assert_eq!(readings.readings, [LanReading::Count(0)]);
-        assert!(!reader.relay_online_seen());
-        assert!(reader.lan_seen(), "an AutoInterface was read");
+        assert!(!reader.reading_seen().is_some_and(|seen| seen.relay_online));
+        assert!(
+            reader.reading_seen().is_some_and(|seen| seen.lan.is_some()),
+            "an AutoInterface was read"
+        );
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
         assert_eq!(readings.readings, [LanReading::Count(1)]);
         assert!(readings.relay_online);
-        assert!(reader.relay_online_seen());
+        assert!(reader.reading_seen().is_some_and(|seen| seen.relay_online));
     }
 
     /// The quick read a `.mesh people list` takes keeps the relay flag the note reads:
@@ -844,8 +844,51 @@ mod tests {
             let source = Scripted::new([Ok(vec![auto(0), tcp_client(relay_online)])]);
             let reader = reader_at(&dir.path, source);
             lan_readings(None, &[], Some(&reader), ReadEffort::Quick).await;
-            assert_eq!(reader.relay_online_seen(), relay_online);
+            assert_eq!(
+                reader.reading_seen().is_some_and(|seen| seen.relay_online),
+                relay_online
+            );
         }
+    }
+
+    /// The Windows VM of #105: rnsd runs the `[[Coyote Local]]` AutoInterface with no
+    /// host, the `[[Coyote Sessions]]` loopback server with a session's spawned client and
+    /// its shared instance; `[[Team Relay]]` is `enabled = No`, so RNS lists nothing for
+    /// it. Until a read reaches rnsd nothing is held, not a default that reads as no LAN;
+    /// a read that reaches it holds a LAN of 0 hosts and no relay, and a later read that
+    /// fails leaves that standing.
+    #[tokio::test]
+    async fn the_windows_vm_reading_is_held_and_a_failed_read_never_stands_in_for_one() {
+        let server = entry("TCPServerInterface", None);
+        let session = InterfaceHosts {
+            name: "TCPClientInterface[Client on Coyote Sessions]".to_string(),
+            spawned: true,
+            ..tcp_client(true)
+        };
+        let shared = entry("LocalServerInterface", None);
+        let dir = keyed_dir("lan-count-windows-vm");
+        let source = Scripted::new([
+            Err(RpcError::Timeout),
+            Ok(vec![auto(0), server, session, shared]),
+            Err(RpcError::Timeout),
+        ]);
+        let reader = reader_at(&dir.path, source);
+        assert_eq!(reader.read_quick().await, RnsdReading::UNKNOWN);
+        assert_eq!(reader.reading_seen(), None, "no read has reached rnsd");
+        assert_eq!(reader.reads_answered(), 0);
+        let vm = RnsdReading {
+            lan: Some(LanReading::Count(0)),
+            relay_online: false,
+        };
+        assert_eq!(reader.read_quick().await, vm);
+        assert_eq!(reader.reading_seen(), Some(vm));
+        assert_eq!(reader.read_quick().await, RnsdReading::UNKNOWN);
+        assert_eq!(
+            reader.reading_seen(),
+            Some(vm),
+            "the failed read leaves it standing"
+        );
+        assert_eq!(reader.reads_answered(), 1);
     }
 
     /// A TCP server's child for one client that dialled in (rnsd gives it a parent
@@ -883,7 +926,10 @@ mod tests {
         ]);
         let reader = reader_at(&dir.path, source);
         assert_eq!(reader.read_tcp_interfaces().await, Some(Vec::new()));
-        assert!(!reader.relay_online_seen(), "a spawned client is no relay");
+        assert!(
+            !reader.reading_seen().is_some_and(|seen| seen.relay_online),
+            "a spawned client is no relay"
+        );
         assert_eq!(
             reader.read_tcp_interfaces().await,
             Some(vec![RnsdTcpInterface {
@@ -891,7 +937,10 @@ mod tests {
                 online: true,
             }])
         );
-        assert!(reader.relay_online_seen(), "a Backbone client is a relay");
+        assert!(
+            reader.reading_seen().is_some_and(|seen| seen.relay_online),
+            "a Backbone client is a relay"
+        );
     }
 
     /// A host that sleeps through several poll periods reads rnsd once on waking, not
@@ -955,7 +1004,8 @@ mod tests {
         assert_eq!(*source.budgets.lock(), [RPC_BUDGET; 4]);
         assert_eq!(reconnects, [0, 1, 0, 0], "the one offline-to-online edge");
         assert!(
-            reader.relay_online_seen() && reader.lan_seen(),
+            reader.reading_seen().is_some_and(|seen| seen.relay_online)
+                && reader.reading_seen().is_some_and(|seen| seen.lan.is_some()),
             "the LAN row follows"
         );
 
@@ -1013,17 +1063,17 @@ mod tests {
         assert_eq!(source.calls(), RPC_ATTEMPTS as usize);
         assert_eq!(source.gaps(), [RPC_RETRY_WAIT; 2]);
         assert_eq!(*source.budgets.lock(), [RPC_BUDGET; 3]);
-        assert!(!reader.relay_online_seen());
+        assert!(!reader.reading_seen().is_some_and(|seen| seen.relay_online));
 
         let idle = Duration::from_secs(3600);
         tokio::time::advance(idle).await;
         assert_eq!(source.calls(), 3, "the reader makes no call of its own");
         assert!(reader.read_quick().await.relay_online, "the first ask");
-        assert!(reader.relay_online_seen());
+        assert!(reader.reading_seen().is_some_and(|seen| seen.relay_online));
         assert_eq!(source.calls(), 4, "one call per ask");
         assert_eq!(source.gaps()[2], idle);
         assert!(!reader.read_quick().await.relay_online, "the second ask");
-        assert!(!reader.relay_online_seen());
+        assert!(!reader.reading_seen().is_some_and(|seen| seen.relay_online));
         assert_eq!(source.calls(), 5);
         assert_eq!(
             *source.budgets.lock(),
@@ -1045,7 +1095,7 @@ mod tests {
             assert_eq!(reader.read_quick().await, RnsdReading::UNKNOWN);
         }
         assert_eq!(source.calls(), 1, "no call after the key was refused");
-        assert!(!reader.relay_online_seen());
+        assert!(!reader.reading_seen().is_some_and(|seen| seen.relay_online));
 
         let dir = keyed_dir("lan-count-tick-status");
         let source = Scripted::new([Err(refused()), Ok(vec![auto(3)]), Ok(vec![auto(1)])]);

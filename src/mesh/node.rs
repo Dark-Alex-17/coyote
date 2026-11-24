@@ -36,7 +36,9 @@ use crate::mesh::knock::{
     drain_knocks, knock_message,
 };
 use crate::mesh::knocks::KnockCache;
-use crate::mesh::lan_count::{LanReadings, ReadEffort, RnsdLanReader, RnsdLocator, lan_readings};
+use crate::mesh::lan_count::{
+    LanReadings, ReadEffort, RnsdLanReader, RnsdLocator, RnsdReading, lan_readings,
+};
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
@@ -1968,29 +1970,59 @@ impl MeshRuntime {
     /// to be silent: a `lan` interface, or a local rnsd whose latest reading had an
     /// AutoInterface; a node on relays alone never gets the multicast advice. `None`
     /// otherwise.
+    ///
+    /// When no read has reached the local rnsd yet (the read at join raced an rnsd still
+    /// binding its RPC listener, and the quick read did not reach it either), what rnsd
+    /// would say is unknown and reads as no relay and a LAN: the user asked why the
+    /// answer is empty, and the multicast hint is the safer reply. A peer on disk or a
+    /// connected relay of this node's own still takes the note away.
     pub(crate) fn silent_lan_note(&self, now: SystemTime) -> Option<&'static str> {
+        self.silent_lan_note_for(now, "an unresolved name", None)
+    }
+
+    fn silent_lan_note_for(
+        &self,
+        now: SystemTime,
+        asked: &str,
+        quick_reached: Option<bool>,
+    ) -> Option<&'static str> {
         let interfaces = self.interface_states();
-        let (rnsd_relay, rnsd_lan) = self.rnsd_lan.as_ref().map_or((false, false), |reader| {
-            (reader.relay_online_seen(), reader.lan_seen())
-        });
+        let reading = self.rnsd_lan.as_ref().map(RnsdLanReader::reading_seen);
+        let (rnsd_relay, rnsd_lan) = reading.map_or((false, false), rnsd_note_inputs);
         let has_lan = rnsd_lan || interfaces.iter().any(|status| status.kind == "lan");
-        lan_silent_note(
-            knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now),
-            on_relay(&interfaces, rnsd_relay),
-            has_lan,
-        )
+        let known = knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now);
+        let relayed = on_relay(&interfaces, rnsd_relay);
+        let note = lan_silent_note(known, relayed, has_lan);
+        debug!(
+            "Mesh silent-LAN note for {asked}: knows_peers {known}, on_relay {relayed}, has_lan {has_lan}; rnsd {}{}; {}",
+            match reading {
+                None => "not attached",
+                Some(None) => "never reached (read as no relay and a LAN)",
+                Some(Some(_)) => "reading held",
+            },
+            match quick_reached {
+                Some(true) => ", the quick read reached it",
+                Some(false) => ", the quick read did not reach it",
+                None => "",
+            },
+            if note.is_some() { "shown" } else { "not shown" }
+        );
+        note
     }
 
     /// `silent_lan_note` after a quick read of the local rnsd, for `.mesh people list`:
-    /// one call on the short budget, none when the peer table already rules the note out.
+    /// one call on the short budget. A quick read that does not reach rnsd leaves the
+    /// latest reading that did, the patient read at join or a later one, to decide.
     pub(crate) async fn silent_lan_note_now(&self, now: SystemTime) -> Option<&'static str> {
-        if knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now) {
-            return None;
-        }
-        if self.rnsd_lan.is_some() {
-            let _ = self.lan_readings(ReadEffort::Quick).await;
-        }
-        self.silent_lan_note(now)
+        let quick_reached = match self.rnsd_lan.as_ref() {
+            Some(reader) => {
+                let before = reader.reads_answered();
+                let _ = self.lan_readings(ReadEffort::Quick).await;
+                Some(reader.reads_answered() > before)
+            }
+            None => None,
+        };
+        self.silent_lan_note_for(now, "an empty people list", quick_reached)
     }
 
     /// One patient read of the local rnsd, so its relay state is known before anyone asks;
@@ -4754,6 +4786,15 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
             "{label} reconnected; this session does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
         ),
     }
+}
+
+/// What the local rnsd's latest reading says for the silent-LAN note: whether a relay is
+/// online and whether it has a LAN. `None`, no read having reached rnsd, reads as no relay
+/// and a LAN, so an empty answer gets the hint rather than nothing.
+fn rnsd_note_inputs(reading: Option<RnsdReading>) -> (bool, bool) {
+    reading.map_or((false, true), |reading| {
+        (reading.relay_online, reading.lan.is_some())
+    })
 }
 
 /// `LAN_SILENT_NOTE`, for an empty result the user asked for, when the node knows no peer
@@ -20298,6 +20339,53 @@ mod tests {
                     "peers {knows_peers}, relay {on_relay}"
                 );
             }
+        }
+
+        /// The Windows VM of #105: `mesh.interfaces` is `local` alone, rnsd runs the
+        /// `[[Coyote Local]]` AutoInterface with no host, the `[[Coyote Sessions]]`
+        /// loopback server, and a `[[Team Relay]]` set `enabled = No`, which RNS never
+        /// builds. Nobody is heard. Whether no read has reached rnsd yet (the join read
+        /// raced its restart and the quick read missed it) or one has, the empty list gets
+        /// the note; a relay rnsd reads online, or a peer on disk, still takes it away.
+        #[test]
+        fn the_windows_vm_shape_gets_the_note_read_or_not_yet_read() {
+            let local = InterfaceStatus {
+                label: "local rnsd at 127.0.0.1:37428".to_string(),
+                kind: "local",
+                endpoint: Some("127.0.0.1:37428".to_string()),
+                state: InterfaceState::Connected,
+            };
+            let note = |reading: Option<RnsdReading>, knows: bool| {
+                let (relay, lan) = rnsd_note_inputs(reading);
+                lan_silent_note(knows, on_relay(std::slice::from_ref(&local), relay), lan)
+            };
+            let vm = RnsdReading {
+                lan: Some(crate::mesh::lan_count::LanReading::Count(0)),
+                relay_online: false,
+            };
+            assert_eq!(
+                note(None, false),
+                Some(LAN_SILENT_NOTE),
+                "no read reached rnsd yet"
+            );
+            assert_eq!(note(Some(vm), false), Some(LAN_SILENT_NOTE), "a read did");
+            assert_eq!(
+                note(
+                    Some(RnsdReading {
+                        relay_online: true,
+                        ..vm
+                    }),
+                    false
+                ),
+                None,
+                "a relay rnsd reads online"
+            );
+            assert_eq!(note(None, true), None, "a peer on disk");
+            assert_eq!(
+                note(Some(RnsdReading { lan: None, ..vm }), false),
+                None,
+                "an rnsd read with no AutoInterface has no LAN"
+            );
         }
 
         /// What the LAN reads never brings the note: an unknown count or no LAN reading at
