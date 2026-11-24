@@ -725,8 +725,14 @@ impl Routes<'_> {
         let mut said = false;
         let mut asked_for_mark = false;
         // Taken whether or not this node holds a path itself: rnsd may still hold the
-        // stale row, and would answer a path request from it.
-        if self.book.take_mark(&destination_hex) {
+        // stale row, and would answer a path request from it. A path learned again since
+        // the mark, as from the session's own greeting, is sound and is left alone.
+        if self.book.take_mark(&destination_hex)
+            && matches!(
+                self.facts(destination).await.suspicion(),
+                Suspicion::Suspect(_)
+            )
+        {
             debug!(
                 "Mesh path to {dest8} rests on an interface that changed; asking the network for a new one first"
             );
@@ -1161,6 +1167,16 @@ mod rnsd_tests {
         }
     }
 
+    /// Whether a transition marked the path before the request: `AfterChange` with Team
+    /// Relay coming back since the row was learned, `Refreshed` with the row learned again
+    /// since.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        No,
+        AfterChange,
+        Refreshed,
+    }
+
     /// What `recovering` did: the tries it made, the progress lines it said, and the
     /// paths it dropped in rnsd.
     struct Run {
@@ -1176,7 +1192,7 @@ mod rnsd_tests {
         tag: &str,
         age: Duration,
         online: bool,
-        marked: bool,
+        marked: Mark,
         asked: bool,
         first: Option<RequestError>,
         second: Option<RequestError>,
@@ -1187,8 +1203,11 @@ mod rnsd_tests {
         let transport = transport();
         let transitions = InterfaceTransitions::default();
         let book = RouteBook::default();
-        if marked {
+        if marked != Mark::No {
             book.mark([destination().to_hex_string()]);
+        }
+        if marked == Mark::AfterChange {
+            transitions.record(TEAM_RELAY, TransitionKind::Up, SystemTime::now());
         }
         let routes = Routes {
             transport: &transport,
@@ -1245,7 +1264,7 @@ mod rnsd_tests {
             "routes-recover-offline",
             Duration::from_secs(3600),
             false,
-            false,
+            Mark::No,
             false,
             Some(never_linked()),
             None,
@@ -1270,7 +1289,7 @@ mod rnsd_tests {
             "routes-recover-first-contact",
             Duration::from_secs(3600),
             true,
-            false,
+            Mark::No,
             true,
             Some(never_linked()),
             Some(never_linked()),
@@ -1310,7 +1329,7 @@ mod rnsd_tests {
             "routes-recover-sound",
             Duration::from_secs(3600),
             true,
-            false,
+            Mark::No,
             false,
             Some(never_linked()),
             None,
@@ -1330,7 +1349,7 @@ mod rnsd_tests {
             "routes-recover-marked",
             Duration::from_secs(3600),
             true,
-            true,
+            Mark::AfterChange,
             false,
             None,
             None,
@@ -1342,6 +1361,27 @@ mod rnsd_tests {
         assert_eq!(run.said, [STALE]);
     }
 
+    /// A marked path learned again since its interface changed, as from the session's
+    /// own greeting, is sound: it is neither dropped nor asked for before the try.
+    #[tokio::test]
+    async fn a_marked_path_learned_again_since_is_left_alone() {
+        let run = recover(
+            "routes-recover-marked-refreshed",
+            Duration::from_secs(3600),
+            true,
+            Mark::Refreshed,
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(run.outcome, Ok(()));
+        assert_eq!(run.tries.len(), 1);
+        assert_eq!(run.drops, 0);
+        assert!(!run.tries[0].path_requested);
+        assert!(run.said.is_empty());
+    }
+
     /// An up path refreshed seconds ago is no first contact: a link over it that never
     /// came up gives the plain error, with no drop and no retry.
     #[tokio::test]
@@ -1350,7 +1390,7 @@ mod rnsd_tests {
             "routes-recover-fresh",
             Duration::from_secs(2),
             true,
-            false,
+            Mark::No,
             false,
             Some(never_linked()),
             None,
@@ -1369,7 +1409,7 @@ mod rnsd_tests {
             "routes-recover-marked-down",
             Duration::from_secs(3600),
             false,
-            true,
+            Mark::AfterChange,
             false,
             Some(never_linked()),
             None,
@@ -1389,7 +1429,7 @@ mod rnsd_tests {
             "routes-recover-suspect-twice",
             Duration::from_secs(3600),
             false,
-            false,
+            Mark::No,
             false,
             Some(never_linked()),
             Some(never_linked()),

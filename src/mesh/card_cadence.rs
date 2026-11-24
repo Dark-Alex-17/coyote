@@ -1495,10 +1495,12 @@ mod network {
                 .running
                 .contains_key(&there_dest)
         );
+        // A card request is one link and one request; a loaded suite can stretch that
+        // past the link timeout, which is the wait here.
         let started = Instant::now();
         while status_requests(&here.runtime) == before {
             assert!(
-                started.elapsed() < Duration::from_secs(15),
+                started.elapsed() < Duration::from_secs(30),
                 "its first hearing never asked for its card"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;

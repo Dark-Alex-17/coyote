@@ -19304,12 +19304,30 @@ mod tests {
         };
         let a = RelayNode::start_watched("node-roam-a", both(), short_connect(), true).await;
         let b = RelayNode::start_watched("node-roam-b", both(), short_connect(), false).await;
+        // B is unwatched, so its interface events are this test's to read: its client to
+        // the second relay has landed once it has connected twice.
+        let mut b_events = b
+            .runtime
+            .interface_events
+            .lock()
+            .take()
+            .expect("an unwatched node keeps its interface events");
         wait_for_peer(&a.runtime, &b.hash).await;
         let second = TransportRelay::start_on_with_retries(second_port, 0).await;
         let connected = format!("{} connected", private_label(second_port));
         wait_for_mesh_line(&a.notifier, &connected).await;
-        // B's client to the second relay redials on its own; give it time to land.
-        sleep(Duration::from_secs(3)).await;
+        let mut connected = 0;
+        timeout(Duration::from_secs(30), async {
+            while connected < 2 {
+                if let Ok(event) = b_events.recv().await
+                    && matches!(event.kind(), InterfaceEventKind::Connected)
+                {
+                    connected += 1;
+                }
+            }
+        })
+        .await
+        .expect("B's client to the second relay connected");
 
         let transport = a.runtime.transport_handle().await.unwrap();
         let b_hash = AddressHash::new_from_hex_string(&b.hash).unwrap();
@@ -19350,7 +19368,11 @@ mod tests {
                         | RequestError::LinkFailed(_)
                 ))
             ),
-            "the request after the relay went away failed: {answered:?}"
+            "the request after the relay went away failed: {answered:?}; {:#?}",
+            debug_snapshot()
+                .into_iter()
+                .filter(|line| line.contains(&b.hash[..8]) && line.contains("Mesh"))
+                .collect::<Vec<_>>()
         );
         let path = transport.path_interface(&b_hash).await.unwrap();
         assert_ne!(
