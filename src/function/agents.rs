@@ -1221,32 +1221,14 @@ pub async fn run_agent_for_graph(
             .as_ref()
             .map(Agent::defined_variables)
             .unwrap_or_default();
-        if graph::active_agent_graph_name(&child_ctx).is_none() {
-            if inputs.is_empty() {
-                bail!(
-                    "agent '{agent_name}': `inputs:` is empty; a config agent takes only its declared variables as `inputs:`"
-                );
-            }
-            let undeclared = graph::undeclared_config_inputs(declared, inputs.keys());
-            if !undeclared.is_empty() {
-                bail!(
-                    "agent '{agent_name}': `inputs` names undeclared variable(s) {}; a config agent takes only its declared variables as `inputs:`",
-                    undeclared.join(", ")
-                );
-            }
-        }
-        for key in graph::RESERVED_STATE_KEYS {
-            if !inputs.contains_key(key) {
-                continue;
-            }
-            let seeded_from = if key == "initial_prompt" {
-                " from `prompt:`"
-            } else {
-                ""
-            };
-            bail!(
-                "agent '{agent_name}': `inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})"
-            );
+        let config_declared = graph::active_agent_graph_name(&child_ctx)
+            .is_none()
+            .then_some(declared);
+        if let Some(body) = graph::agent_inputs_errors(agent_name, config_declared, inputs.keys())
+            .into_iter()
+            .next()
+        {
+            bail!("agent '{agent_name}': {body}");
         }
         let seated = declared_inputs_as_variables(declared, inputs);
         merge_spawn_variables(&mut child_ctx.agent_variables, seated);
@@ -4528,7 +4510,7 @@ mod tests {
         assert_eq!(
             chain,
             format!(
-                "agent '{agent_name}': `inputs:` is empty; a config agent takes only its declared variables as `inputs:`"
+                "agent '{agent_name}': `inputs:` is empty and agent '{agent_name}' has no graph.yaml; a config agent takes only its declared variables as `inputs:`"
             )
         );
     }
@@ -4553,7 +4535,7 @@ mod tests {
         assert_eq!(
             chain,
             format!(
-                "agent '{agent_name}': `inputs` names undeclared variable(s) cadence, worktree; a config agent takes only its declared variables as `inputs:`"
+                "agent '{agent_name}': `inputs` names variable(s) agent '{agent_name}' does not declare: cadence, worktree; a config agent takes only its declared variables as `inputs:`"
             )
         );
     }
@@ -4592,6 +4574,81 @@ mod tests {
                 "agent '{agent_name}': `inputs.previous_turns` is reserved (the dispatcher seeds it)"
             )
         );
+    }
+
+    /// The `inputs` errors the validator reports for agent node `a` calling
+    /// `agent_name`, location prefix stripped.
+    fn validator_inputs_errors(agent_name: &str, inputs: &str) -> Vec<String> {
+        let yaml = format!(
+            "name: parent\nstart: a\nnodes:\n  a:\n    id: a\n    type: agent\n    agent: {agent_name}\n    prompt: hi\n    inputs: {inputs}\n    next: end\n  end:\n    id: end\n    type: end\n    output: done\n"
+        );
+        let dir = paths::agent_data_dir("parent");
+        let graph = graph::GraphParser::new(&dir)
+            .load_from_string(&yaml)
+            .unwrap();
+        graph::validator::GraphValidator::new(&dir)
+            .validate(&graph)
+            .errors
+            .into_iter()
+            .filter_map(|e| {
+                e.message
+                    .strip_prefix("agent node 'a': ")
+                    .filter(|body| body.starts_with("`inputs"))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_and_validator_report_the_same_inputs_errors() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let config_agent = unique_agent_name("test_inputs_parity_config");
+        write_config_agent_with_setting(
+            &config_agent,
+            "variables:\n  - name: project_dir\n    description: d\n    default: ''",
+        );
+        let graph_agent = unique_agent_name("test_inputs_parity_graph");
+        write_graph_agent(&graph_agent);
+        let cases = [
+            (&config_agent, "{}", HashMap::new()),
+            (
+                &config_agent,
+                "{project_dir: /wt, worktree: /wt, cadence: per-task}",
+                HashMap::from([
+                    ("project_dir".to_string(), json!("/wt")),
+                    ("worktree".to_string(), json!("/wt")),
+                    ("cadence".to_string(), json!("per-task")),
+                ]),
+            ),
+            (
+                &config_agent,
+                "{initial_prompt: x, project_dir: /wt}",
+                HashMap::from([
+                    ("initial_prompt".to_string(), json!("x")),
+                    ("project_dir".to_string(), json!("/wt")),
+                ]),
+            ),
+            (
+                &graph_agent,
+                "{previous_turns: x}",
+                HashMap::from([("previous_turns".to_string(), json!("x"))]),
+            ),
+        ];
+
+        for (agent_name, yaml_inputs, runtime_inputs) in cases {
+            let chain = run_agent_for_graph_error(agent_name, Some(runtime_inputs));
+            let runtime_body = chain
+                .strip_prefix(&format!("agent '{agent_name}': "))
+                .unwrap_or(&chain)
+                .to_string();
+
+            assert_eq!(
+                validator_inputs_errors(agent_name, yaml_inputs),
+                [runtime_body],
+                "inputs {yaml_inputs} on '{agent_name}'"
+            );
+        }
     }
 
     /// The child ctx must carry the parent's session flag: a session already

@@ -823,41 +823,14 @@ impl GraphValidator {
                     ));
                 }
                 if let Some(inputs) = &a.inputs {
-                    if has_config && !has_graph {
-                        if inputs.is_empty() {
-                            result.error(ValidationError::with_node(
-                                node_id,
-                                format!(
-                                    "agent node '{node_id}': `inputs:` is empty and agent '{}' has no graph.yaml; a config agent takes only its declared variables as `inputs:`",
-                                    a.agent
-                                ),
-                            ));
-                        }
-                        let declared = config::load_agent_variables(&a.agent);
-                        for key in super::undeclared_config_inputs(&declared, inputs.keys()) {
-                            result.error(ValidationError::with_node(
-                                node_id,
-                                format!(
-                                    "agent node '{node_id}': `inputs.{key}` is not a variable agent '{}' declares; a config agent takes only its declared variables as `inputs:`",
-                                    a.agent
-                                ),
-                            ));
-                        }
-                    }
-                    for key in super::RESERVED_STATE_KEYS {
-                        if !inputs.contains_key(key) {
-                            continue;
-                        }
-                        let seeded_from = if key == "initial_prompt" {
-                            " from `prompt:`"
-                        } else {
-                            ""
-                        };
+                    let declared =
+                        (has_config && !has_graph).then(|| config::load_agent_variables(&a.agent));
+                    for body in
+                        super::agent_inputs_errors(&a.agent, declared.as_deref(), inputs.keys())
+                    {
                         result.error(ValidationError::with_node(
                             node_id,
-                            format!(
-                                "agent node '{node_id}': `inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})"
-                            ),
+                            format!("agent node '{node_id}': {body}"),
                         ));
                     }
                 }
@@ -5268,7 +5241,7 @@ mod tests {
         assert_eq!(
             messages(&result.errors),
             [
-                "agent node 'a': `inputs.x` is not a variable agent 'plain-agent' declares; a config agent takes only its declared variables as `inputs:`"
+                "agent node 'a': `inputs` names variable(s) agent 'plain-agent' does not declare: x; a config agent takes only its declared variables as `inputs:`"
             ]
         );
         assert_eq!(result.errors[0].node_id.as_deref(), Some("a"));
@@ -5292,7 +5265,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn agent_inputs_undeclared_by_config_agent_error_per_key() {
+    fn agent_inputs_undeclared_by_config_agent_are_listed_in_one_error() {
         let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_agent_with(
             "plain-agent",
@@ -5314,8 +5287,7 @@ mod tests {
         assert_eq!(
             messages(&result.errors),
             [
-                "agent node 'a': `inputs.cadence` is not a variable agent 'plain-agent' declares; a config agent takes only its declared variables as `inputs:`",
-                "agent node 'a': `inputs.worktree` is not a variable agent 'plain-agent' declares; a config agent takes only its declared variables as `inputs:`",
+                "agent node 'a': `inputs` names variable(s) agent 'plain-agent' does not declare: cadence, worktree; a config agent takes only its declared variables as `inputs:`"
             ]
         );
         assert!(
@@ -5336,11 +5308,13 @@ mod tests {
 
         let result = validator().validate(&graph);
 
-        assert!(
-            config_agent_inputs_error(&result, "a"),
-            "{:?}",
-            result.errors
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "agent node 'a': `inputs:` is empty and agent 'plain-agent' has no graph.yaml; a config agent takes only its declared variables as `inputs:`"
+            ]
         );
+        assert_eq!(result.errors[0].node_id.as_deref(), Some("a"));
     }
 
     #[test]
