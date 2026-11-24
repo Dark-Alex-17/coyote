@@ -371,7 +371,9 @@ pub(crate) async fn run(
     abort_signal: AbortSignal,
     args: Option<&str>,
 ) -> Result<()> {
-    crate::mesh::with_progress(Arc::new(out_text), run_verb(ctx, abort_signal, args)).await
+    // `out_path_text`: the line carries a session's name, which hint rendering must not
+    // rewrite as a command.
+    crate::mesh::with_progress(Arc::new(out_path_text), run_verb(ctx, abort_signal, args)).await
 }
 
 async fn run_verb(
@@ -4181,8 +4183,12 @@ async fn send_request(
         valid.paths.clone(),
         reason.to_string(),
     );
-    let mut handle =
-        tokio::spawn(async move { mesh.request_access(&to, &paths, &why, Some(route)).await });
+    // The request runs on its own task, which does not inherit the command's progress
+    // sink, so it is given one.
+    let mut handle = tokio::spawn(crate::mesh::with_progress(
+        Arc::new(out_path_text),
+        async move { mesh.request_access(&to, &paths, &why, Some(route)).await },
+    ));
     let joined = tokio::select! {
         joined = &mut handle => joined,
         _ = wait_user_interrupt(Some(abort_signal)) => {

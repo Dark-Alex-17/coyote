@@ -1820,8 +1820,7 @@ impl MeshRuntime {
     fn after_upstream_change(self: &Arc<Self>, change: &UpstreamChange) {
         let reconnected = change.reconnected.clone();
         let moved = !change.network_changed.is_empty();
-        let runtime = self.clone();
-        tokio::spawn(async move {
+        self.spawn_route_work(move |runtime| async move {
             let Some(transport) = runtime.transport_handle().await else {
                 return;
             };
@@ -1849,11 +1848,48 @@ impl MeshRuntime {
         });
     }
 
+    /// Runs route work off the caller as a task the node owns: registered, and ended when
+    /// the node stops, so nothing drops or asks for a path after it.
+    fn spawn_route_work<F, Fut>(self: &Arc<Self>, work: F)
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let cancel = self.cancellation_token();
+        let work = work(self.clone());
+        self.register_task(tokio::spawn(async move {
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = work => {}
+            }
+        }));
+    }
+
+    /// Whether an announce for `destination` is worth weighing against the path held: some
+    /// interface is down (rnsd's upstream or one of this node's own), and the destination
+    /// is a session this node trusts or a filed propagation node, the ones a stale route
+    /// costs. No call is made.
+    fn worth_weighing(&self, destination: &str) -> bool {
+        let something_down = self.route_book.any_down()
+            || self.rnsd_lan.as_ref().is_some_and(|reader| {
+                reader
+                    .tcp_interfaces_seen()
+                    .is_some_and(|interfaces| interfaces.iter().any(|interface| !interface.online))
+            });
+        something_down
+            && (self.propagation_nodes.holds(destination, SystemTime::now())
+                || self.peers.get(destination).is_some_and(|peer| {
+                    self.trust
+                        .authorize(&peer.identity_hash, &peer.destination_hash)
+                        .decision
+                        == Decision::Allow
+                }))
+    }
+
     /// `after_upstream_change` for an in-process interface that connected again after a
     /// disconnect.
     fn after_interface_back(self: &Arc<Self>, iface: AddressHash) {
-        let runtime = self.clone();
-        tokio::spawn(async move {
+        self.spawn_route_work(move |runtime| async move {
             let Some(transport) = runtime.transport_handle().await else {
                 return;
             };
@@ -2159,7 +2195,10 @@ impl MeshRuntime {
 
     /// Adopts a task so `stop` waits for it to finish.
     pub(crate) fn register_task(&self, handle: JoinHandle<()>) {
-        self.tasks.lock().push(handle);
+        let mut tasks = self.tasks.lock();
+        // Short route tasks come and go; only the running ones need stopping.
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 
     /// A handle on the running transport, `None` once the node has stopped. Taken so the
@@ -2201,6 +2240,7 @@ impl MeshRuntime {
                 LinkTry {
                     link_timeout: options.link_timeout,
                     path_requested: options.path_requested,
+                    asked: options.path_requested,
                 },
                 |link| {
                     let options = PropagationOptions {
@@ -2287,7 +2327,14 @@ impl MeshRuntime {
                 .peers
                 .get(&dest_hex)
                 .is_some_and(|row| row.left_at.is_some());
+        // Whether a path request went out just before this request's link: the resolve
+        // sent one, or the request below does. Only then is a link that does not come up
+        // a first contact, tried once more for a request the user typed; a background
+        // request has its own retry (the card cadence asks again on the next hearing) and
+        // is not held up by a second link wait.
+        let mut asked = options.path_requested;
         if gone && !transport.has_path(&destination.address_hash).await {
+            asked = true;
             transport
                 .request_path(&destination.address_hash, None, None)
                 .await;
@@ -2321,6 +2368,7 @@ impl MeshRuntime {
             LinkTry {
                 link_timeout: options.link_timeout,
                 path_requested: options.path_requested,
+                asked: asked && options.foreground,
             },
             |link| {
                 link_request(
@@ -2570,6 +2618,7 @@ impl MeshRuntime {
                 LinkTry {
                     link_timeout: defaults.link_timeout,
                     path_requested: defaults.path_requested,
+                    asked: defaults.path_requested,
                 },
                 |link| {
                     let options = FetchOptions {
@@ -2880,7 +2929,7 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 }
 
 /// Arms a session destination with the responder's caps on what it accepts and what it
-/// sends. With `MAX_REQUEST_PAYLOAD_BYTES`, coyote-rns-transport 0.18.4 refuses an oversize
+/// sends. With `MAX_REQUEST_PAYLOAD_BYTES`, coyote-rns-transport 0.18.5 refuses an oversize
 /// request at the advertisement, before it reaches a handler (a request that travels as a
 /// resource; a packet-form one over the cap is dropped). With `MAX_FETCH_RESPONSE_BYTES`,
 /// the widest bound any requester accepts, a reply no peer could take is refused before it
@@ -3926,15 +3975,19 @@ fn note_link_outcome(
     now: SystemTime,
 ) -> Result<rmpv::Value, RequestError> {
     match &mut outcome {
-        // A link tried again over a route just asked for, or after a path request, is
-        // the far-peer case: it never reads as the peer having left.
+        // A link tried again over a route just asked for, or right after a path request,
+        // is the far-session case and never reads as the session having left, unless its row
+        // said it left: that keeps today's wording.
         Err(RequestError::LinkActivationTimeout {
             recently_seen,
             retried_to,
             ..
         }) => {
-            *recently_seen =
-                retried_to.is_none() && peers.get(dest_hex).is_some_and(|peer| !peer.is_stale(now));
+            let row = peers.get(dest_hex);
+            if row.as_ref().is_some_and(|row| row.left_at.is_some()) {
+                *retried_to = None;
+            }
+            *recently_seen = retried_to.is_none() && row.is_some_and(|peer| !peer.is_stale(now));
             peers.mark_link_failed(dest_hex);
         }
         Err(RequestError::LinkNotOpened(_)) => peers.mark_link_failed(dest_hex),
@@ -3994,10 +4047,12 @@ async fn receive_announces(
         let now = SystemTime::now();
         // A path held over an interface that is down gives way to this one, which arrived
         // over an interface that is up; weighed off the receiver, which never waits on it.
-        if let Some(runtime) = runtime.upgrade() {
+        if let Some(runtime) = runtime.upgrade()
+            && runtime.worth_weighing(&desc.address_hash.to_hex_string())
+        {
             let destination = desc.address_hash;
             let arrival = AddressHash::new_from_slice(&event.interface);
-            tokio::spawn(async move {
+            runtime.spawn_route_work(move |runtime| async move {
                 if let Some(transport) = runtime.transport_handle().await {
                     runtime
                         .routes(&transport)
@@ -4514,7 +4569,14 @@ async fn watch_interfaces(
                     }
                     transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
                 }
-                Err(missed) => transitions = reconcile_tcp_after_lag(&mut watches, missed),
+                Err(missed) => {
+                    // The route book missed the same events: until each interface reports
+                    // again, a path over it cannot be told sound.
+                    if let Some(runtime) = runtime.upgrade() {
+                        runtime.route_book().note_lag();
+                    }
+                    transitions = reconcile_tcp_after_lag(&mut watches, missed);
+                }
             },
             // The `local` row reads its client's own state stream, not the interface
             // events: the shared-instance client exposes no state to re-read, so an event
@@ -15487,7 +15549,12 @@ mod tests {
             .await;
             pending.lock().await.close();
         };
-        let (result, ()) = tokio::join!(timeout(Duration::from_secs(5), attempt), close);
+        // The path rests on the stub's interface, which went down with it, so it is
+        // suspect: the failed link waits one path request before it is reported.
+        let (result, ()) = tokio::join!(
+            timeout(PATH_REQUEST_TIMEOUT + Duration::from_secs(5), attempt),
+            close
+        );
 
         let result = result.expect("the request ends at the close, not at its 30 s link timeout");
         assert!(
@@ -26217,6 +26284,51 @@ mod tests {
         assert_eq!(
             peers.get(&hash).unwrap().compatibility,
             Compatibility::Compatible
+        );
+    }
+
+    /// A link retried right after a path request that still did not come up never says
+    /// a recently heard session may have left; a row that said it left keeps today's
+    /// wording instead of the far-session one.
+    #[test]
+    fn a_retried_link_says_may_have_left_only_for_a_row_that_left() {
+        use crate::mesh::peers::FarewellTime;
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-link-outcome-retried");
+        let now = SystemTime::now();
+        let retried = || {
+            Err(RequestError::LinkActivationTimeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(13),
+                recently_seen: false,
+                retried_to: Some("Ann / laptop".to_string()),
+            })
+        };
+        let outcome = note_link_outcome(&peers, &hash, retried(), now);
+        assert!(
+            matches!(
+                &outcome,
+                Err(RequestError::LinkActivationTimeout {
+                    recently_seen: false,
+                    retried_to: Some(_),
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+
+        peers.mark_left(&hash, FarewellTime::Arrived(now + Duration::from_secs(1)));
+        let outcome = note_link_outcome(&peers, &hash, retried(), now);
+        assert!(
+            matches!(
+                &outcome,
+                Err(RequestError::LinkActivationTimeout {
+                    recently_seen: true,
+                    retried_to: None,
+                    ..
+                })
+            ),
+            "{outcome:?}"
         );
     }
 

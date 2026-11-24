@@ -11178,7 +11178,7 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
     );
     let error_rs = read(repo_root().join("src/mesh/request/error.rs"));
     for piece in [
-        "\"No mesh link to {who} came up within {} s. Far peers (several hops, a public gateway) can take longer; try once more\"",
+        "\"No mesh link to {who} came up within {} s. Far sessions (several hops, a public gateway) can take longer; try once more\"",
         "=> \"`.mesh people list` shows when it was last heard\"",
     ] {
         assert!(
@@ -11188,7 +11188,7 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
     }
     let stale =
         "`The route to <user> / <session> looked stale; asking the network for a new one...`";
-    let far = "``No mesh link to <user> / <session> came up within <n> s. Far peers (several hops, a public gateway) can take longer; try once more. `.mesh people list` shows when it was last heard.``";
+    let far = "``No mesh link to <user> / <session> came up within <n> s. Far sessions (several hops, a public gateway) can take longer; try once more. `.mesh people list` shows when it was last heard.``";
 
     let Some(wiki) = wiki_dir() else { return };
     let moving = folded_section(
@@ -11202,6 +11202,7 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
         "the trusted sessions and the propagation nodes reached the long way round over another interface are asked for once more",
         "A route over an interface that is up always wins over one over an interface that is down, whatever their hops.",
         "`rnpath -d` is no longer needed after a move.",
+        "A route over an interface that is up, and not just asked for, gets no extra try: its failure is reported as it is.",
     ] {
         assert!(
             moving.contains(needle),
@@ -11209,7 +11210,12 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
         );
     }
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
-    for needle in [stale, far, "It never says the session may have left"] {
+    for needle in [
+        stale,
+        far,
+        "It says the session may have left only when its row says it left",
+        "Over a route that is up and was not just asked for, a link that does not come up is reported as it is.",
+    ] {
         assert!(
             commands.contains(needle),
             "Mesh-Commands.md does not quote {needle:?}"

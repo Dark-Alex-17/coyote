@@ -363,6 +363,9 @@ pub(crate) struct RnsdLanReader {
     source: Arc<dyn LanStatsSource>,
     retry_wait: Duration,
     target: Mutex<RpcTarget>,
+    /// `target`'s endpoint and key once resolved, readable without waiting on a read
+    /// that holds `target` across its calls; cleared when rnsd refuses the key.
+    resolved: parking_lot::Mutex<Option<(RpcEndpoint, RpcKey)>>,
     /// What the latest read that reached rnsd returned, for a quick read that finds
     /// another read under way.
     last: parking_lot::Mutex<RnsdReading>,
@@ -397,6 +400,7 @@ impl RnsdLanReader {
             source,
             retry_wait,
             target: Mutex::new(RpcTarget::Unresolved),
+            resolved: parking_lot::Mutex::new(None),
             last: parking_lot::Mutex::new(RnsdReading::default()),
             last_tcp: parking_lot::Mutex::new(None),
             answered: std::sync::atomic::AtomicU64::new(0),
@@ -474,6 +478,7 @@ impl RnsdLanReader {
                 dir.display()
             ));
             *target = RpcTarget::Unavailable;
+            *self.resolved.lock() = None;
         } else {
             debug!(
                 "Mesh read no LAN count from the rnsd configured in {} this time: {}",
@@ -498,7 +503,10 @@ impl RnsdLanReader {
                     .map(|(endpoint, key)| (dir, endpoint, key))
             });
         *target = match resolved {
-            Ok((dir, endpoint, key)) => RpcTarget::Ready { dir, endpoint, key },
+            Ok((dir, endpoint, key)) => {
+                *self.resolved.lock() = Some((endpoint.clone(), key.clone()));
+                RpcTarget::Ready { dir, endpoint, key }
+            }
             Err(reason) => {
                 tell_unavailable(&reason);
                 RpcTarget::Unavailable
@@ -507,8 +515,12 @@ impl RnsdLanReader {
     }
 
     /// rnsd's RPC endpoint and key, for the path calls: `None` when rnsd's config names
-    /// none usable or rnsd refused the key for the run.
+    /// none usable or rnsd refused the key for the run. Once resolved it never waits on
+    /// a read under way.
     pub(crate) async fn rpc_target(&self) -> Option<(RpcEndpoint, RpcKey)> {
+        if let Some(resolved) = self.resolved.lock().clone() {
+            return Some(resolved);
+        }
         let mut target = self.target.lock().await;
         self.resolve(&mut target);
         match &*target {

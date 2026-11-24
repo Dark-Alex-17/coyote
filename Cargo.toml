@@ -206,15 +206,15 @@ if-addrs = "0.15"
 # Python's `multiprocessing.connection` offers. The 0.18.4 release adds `RpcError::Io` (an
 # io failure after the dial succeeded; `Protocol` now means only wrong bytes) and
 # `RpcError::io_kind()` (the `std::io::ErrorKind` of an `Io` or `Connect` failure), which
-# the stats read retries on instead of matching error text.
+# the refused-dial poll reads; the stats read's retry moved to 0.18.5's `is_transient()`.
 #
 # The 0.18.5 release drives rnsd's path table over the same RPC: `path_table`,
 # `next_hop_interface_name`, `drop_path`, `drop_path_settled` (a drop that waits for
 # rnsd's cull, so the path request after it is not answered from the dropped row) and
 # `first_hop_timeout`, plus `RpcError::is_transient()`, which the stats read retries on,
 # and the in-process `Transport::path_interface`, which names the interface a path was
-# learned over. A link that recovers a stale route uses these to drop it, ask the
-# network once and try again. The release also sizes the link establishment timeout's
+# learned over. A link that recovers a stale route uses all but `next_hop_interface_name`
+# and the unsettled `drop_path` to drop it, ask the network once and try again. The release also sizes the link establishment timeout's
 # first hop by Reticulum's MTU, so a link over a dead path times out in about 12 s, not
 # about 45 s.
 #

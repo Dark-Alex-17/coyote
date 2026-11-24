@@ -40,7 +40,7 @@ const PER_HOP: Duration = Duration::from_secs(6);
 /// The link maintenance job runs once a second, so a link's own timeout can land up to
 /// that much after its figure.
 const MAINTENANCE_SLACK: Duration = Duration::from_secs(1);
-/// Hops past this are counted as this many when sizing a retry.
+/// The most hops a retry is sized for; a count past it is read as unknown.
 const MAX_HOPS_COUNTED: u8 = 16;
 /// The least time between two weighings of one destination's path against an announce.
 const PREFERENCE_GAP: Duration = Duration::from_secs(60);
@@ -123,11 +123,6 @@ impl RouteFacts {
             Self::Known { .. } => Suspicion::Sound,
         }
     }
-
-    /// Whether the path was learned at or after `since`.
-    fn learned_since(&self, since: SystemTime) -> bool {
-        matches!(self, Self::Known { learned_at, .. } if *learned_at >= since)
-    }
 }
 
 /// What a failed link does next.
@@ -167,16 +162,22 @@ pub(crate) fn decide(err: &RequestError, suspicion: Suspicion, first_contact: bo
 }
 
 /// The link timeout of the one retry: rnsd's first-hop figure plus `PER_HOP` a hop and the
-/// maintenance slack, as a link's own establishment timeout runs, and never less than
-/// `link_timeout`.
+/// maintenance slack, as a link's own establishment timeout runs, never less than
+/// `link_timeout` and never more than twice it, so a retry adds at most one more link
+/// timeout to what the failure took. A hop count past `MAX_HOPS_COUNTED`, as the
+/// transport reads one it holds no path for, counts as one hop.
 pub(crate) fn retry_link_timeout(
     first_hop: Option<Duration>,
     hops: u8,
     link_timeout: Duration,
 ) -> Duration {
-    let hops = u32::from(hops.clamp(1, MAX_HOPS_COUNTED));
-    let sized = first_hop.unwrap_or(PER_HOP) + PER_HOP * hops + MAINTENANCE_SLACK;
-    sized.max(link_timeout)
+    let hops = if hops > MAX_HOPS_COUNTED {
+        1
+    } else {
+        hops.max(1)
+    };
+    let sized = first_hop.unwrap_or(PER_HOP) + PER_HOP * u32::from(hops) + MAINTENANCE_SLACK;
+    sized.clamp(link_timeout, link_timeout * 2)
 }
 
 /// What a network transition made suspect.
@@ -233,6 +234,9 @@ pub(crate) struct RouteBook {
     /// arrived over another interface, so a stream of announces weighs it at most once
     /// per `PREFERENCE_GAP`.
     weighed: Mutex<HashMap<String, std::time::Instant>>,
+    /// Set when interface events were missed: an in-process interface with no event since
+    /// cannot be told down or up, so a path over it reads `Unknown`.
+    lagged: Mutex<Option<HashSet<AddressHash>>>,
 }
 
 impl RouteBook {
@@ -244,6 +248,9 @@ impl RouteBook {
         kind: InterfaceEventKind,
         at: SystemTime,
     ) -> bool {
+        if let Some(seen) = self.lagged.lock().as_mut() {
+            seen.insert(iface);
+        }
         match kind {
             InterfaceEventKind::Disconnected { .. } => {
                 self.down.lock().insert(iface);
@@ -258,6 +265,26 @@ impl RouteBook {
             }
             _ => false,
         }
+    }
+
+    /// Interface events were missed: until each in-process interface reports again, its
+    /// state cannot be told.
+    pub(crate) fn note_lag(&self) {
+        *self.lagged.lock() = Some(HashSet::new());
+    }
+
+    /// Whether events for `iface` were missed and none has come since.
+    fn in_process_unknown(&self, iface: &AddressHash) -> bool {
+        self.lagged
+            .lock()
+            .as_ref()
+            .is_some_and(|seen| !seen.contains(iface))
+    }
+
+    /// Whether any in-process interface is down now: only then can an announce over an
+    /// up one displace a path.
+    pub(crate) fn any_down(&self) -> bool {
+        !self.down.lock().is_empty()
     }
 
     fn in_process_online(&self, iface: &AddressHash) -> bool {
@@ -293,6 +320,7 @@ impl RouteBook {
         {
             return false;
         }
+        weighed.retain(|_, at| now.saturating_duration_since(*at) < PREFERENCE_GAP);
         weighed.insert(destination.to_string(), now);
         true
     }
@@ -382,14 +410,13 @@ impl Routes<'_> {
         let Some(path) = self.transport.path_interface(destination).await else {
             return RouteFacts::NoPath;
         };
+        if self.book.in_process_unknown(&path.iface) {
+            return RouteFacts::Unknown;
+        }
         let online = self.book.in_process_online(&path.iface);
-        // An interface the manager keeps no name for may be one detached since, which
-        // cannot be told from one never named; one seen going down is down either way.
-        let interface = match path.name {
-            Some(name) => name,
-            None if !online => path.iface.to_hex_string(),
-            None => return RouteFacts::Unknown,
-        };
+        // Every in-process interface reports its disconnects as events, which the book
+        // folds in, so one the manager keeps no name for is told by its hash.
+        let interface = path.name.unwrap_or_else(|| path.iface.to_hex_string());
         RouteFacts::Known {
             interface,
             online: Some(online),
@@ -405,6 +432,21 @@ impl Routes<'_> {
     /// not answered from the dropped row, then this node's own, and asks the network once,
     /// waiting up to `wait` for an answer. Whether a path came back.
     pub(crate) async fn drop_and_ask(&self, destination: &AddressHash, wait: Duration) -> bool {
+        let dest8 = short(&destination.to_hex_string()).to_string();
+        self.drop_rnsd(destination).await;
+        self.transport.expire_path(destination).await;
+        let found = self.transport.await_path(destination, wait, None).await;
+        debug!(
+            "Mesh asked the network for a new path to {dest8} and {} within {:.1} s",
+            if found { "heard one" } else { "heard none" },
+            wait.as_secs_f64()
+        );
+        found
+    }
+
+    /// Drops rnsd's path to `destination`, settled, when the node attaches to an rnsd;
+    /// this node's own copy is left alone.
+    async fn drop_rnsd(&self, destination: &AddressHash) {
         let dest8 = short(&destination.to_hex_string()).to_string();
         if let Some(reader) = self.rnsd
             && let Some((endpoint, key)) = reader.rpc_target().await
@@ -425,20 +467,21 @@ impl Routes<'_> {
                 ),
             }
         }
-        self.transport.expire_path(destination).await;
-        let found = self.transport.await_path(destination, wait, None).await;
-        debug!(
-            "Mesh asked the network for a new path to {dest8} and {} within {:.1} s",
-            if found { "heard one" } else { "heard none" },
-            wait.as_secs_f64()
-        );
-        found
+    }
+
+    /// Drops rnsd's row to `destination` and asks the network once, keeping this node's
+    /// own copy, so links opened meanwhile still have a path: rnsd would answer a request
+    /// from its row, so only its row goes.
+    async fn replace_rnsd_row(&self, destination: &AddressHash) {
+        self.drop_rnsd(destination).await;
+        self.transport.request_path(destination, None, None).await;
     }
 
     /// An announce for `destination` arrived over `arrival`, an interface that is up. A
     /// path held over an interface that is down is replaced whatever its hops: dropped
     /// (rnsd's too, settled) and asked for again, the request in process going out over
-    /// `arrival`. Reticulum itself keeps the path with fewer hops. Through rnsd every
+    /// `arrival`. Reticulum itself keeps the path with fewer hops. Through rnsd only rnsd's
+    /// row is dropped, this node's copy from the announce kept. Through rnsd every
     /// announce arrives over the shared instance, so rnsd's row is read, and only while
     /// the latest stats read saw one of its upstreams offline. Whether the path was
     /// replaced.
@@ -471,7 +514,7 @@ impl Routes<'_> {
                 "Mesh replaces rnsd's path to {dest8} over {}, which is down, with one over an interface that is up",
                 row.interface
             );
-            self.drop_and_ask(destination, Duration::ZERO).await;
+            self.replace_rnsd_row(destination).await;
             return true;
         }
         let Some(path) = self.transport.path_interface(destination).await else {
@@ -570,8 +613,10 @@ impl Routes<'_> {
     }
 
     /// After the rnsd interface `returned` came back: each of `wanted` routed the long way
-    /// round over another interface has rnsd's path dropped and asked for once, so the
-    /// shorter route over `returned` can answer. Whether any was asked for.
+    /// round over another interface has rnsd's row dropped and asked for once, so the
+    /// shorter route over `returned` can answer; rnsd would answer the request from the
+    /// long row otherwise. This node's own copy stays, so a link opened meanwhile still
+    /// has a path. How many were asked for.
     pub(crate) async fn return_home_rnsd(&self, returned: &str, wanted: &HashSet<String>) -> usize {
         let Some(rows) = self.rnsd_rows().await else {
             return 0;
@@ -590,7 +635,7 @@ impl Routes<'_> {
                 "Mesh is asking again for the path to {}, which runs the long way round now that {returned} is back",
                 short(&destination)
             );
-            self.drop_and_ask(&hash, Duration::ZERO).await;
+            self.replace_rnsd_row(&hash).await;
             asked += 1;
         }
         asked
@@ -598,7 +643,7 @@ impl Routes<'_> {
 
     /// `return_home_rnsd` for an in-process interface that came back: a path request on
     /// that interface alone, which the transport takes over the long route only for fewer
-    /// hops, so the working path is never dropped.
+    /// hops, so the working path is never dropped. How many were asked for.
     pub(crate) async fn return_home_in_process(
         &self,
         iface: AddressHash,
@@ -621,12 +666,15 @@ impl Routes<'_> {
     }
 }
 
-/// One try of a link: its timeout and whether a path request for the destination was
-/// already sent, so the link does not ask again.
+/// One try of a link: its timeout, whether the link should leave the path request to
+/// its caller (`path_requested`), and whether a path request for the destination was
+/// actually sent just before it, by this call or the resolve that led to it (`asked`):
+/// only such a try is a first contact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LinkTry {
     pub link_timeout: Duration,
     pub path_requested: bool,
+    pub asked: bool,
 }
 
 /// How a caller's error is read for recovery: the link error it carries, if any.
@@ -675,6 +723,7 @@ impl Routes<'_> {
         let dest8 = short(&destination_hex).to_string();
         let mut first = first;
         let mut said = false;
+        let mut asked_for_mark = false;
         // Taken whether or not this node holds a path itself: rnsd may still hold the
         // stale row, and would answer a path request from it.
         if self.book.take_mark(&destination_hex) {
@@ -685,6 +734,8 @@ impl Routes<'_> {
             said = true;
             self.drop_and_ask(destination, PATH_REQUEST_TIMEOUT).await;
             first.path_requested = true;
+            first.asked = true;
+            asked_for_mark = true;
         }
         let mut outcome = attempt(first).await;
         let Err(err) = &mut outcome else {
@@ -694,13 +745,16 @@ impl Routes<'_> {
             return outcome;
         };
         let facts = self.facts(destination).await;
-        let window = PATH_REQUEST_TIMEOUT + first.link_timeout + MAINTENANCE_SLACK;
-        let first_contact = first.path_requested
-            || SystemTime::now()
-                .checked_sub(window)
-                .is_some_and(|since| facts.learned_since(since));
+        // A first contact is a try made right after a path request that was actually
+        // sent; a path's age is no evidence of one, as every announce refreshes it.
+        let first_contact = first.asked;
         let suspicion = facts.suspicion();
-        match decide(failed, suspicion, first_contact) {
+        let mut recovery = decide(failed, suspicion, first_contact);
+        // One path request per call: a marked path already had its drop and ask.
+        if recovery == Recovery::DropAndAsk && asked_for_mark {
+            recovery = Recovery::RetryOnce;
+        }
+        match recovery {
             Recovery::Report => return outcome,
             Recovery::DropAndAsk => {
                 debug!(
@@ -711,21 +765,27 @@ impl Routes<'_> {
                     say_progress(&stale_route_sentence(&who()));
                 }
                 if !self.drop_and_ask(destination, PATH_REQUEST_TIMEOUT).await {
-                    // Without a path the retry fails at once naming none, which is what is
-                    // reported.
                     debug!("Mesh found no new path to {dest8}");
                 }
             }
             Recovery::RetryOnce => debug!(
-                "Mesh link to {dest8} did not come up on a first contact; trying it once more"
+                "Mesh link to {dest8} did not come up right after a path request; trying it once more"
             ),
         }
         let link_timeout = self.retry_timeout(destination, first.link_timeout).await;
         let mut retried = attempt(LinkTry {
             link_timeout,
             path_requested: true,
+            asked: true,
         })
         .await;
+        // A retry that found no path at all says less than the first failure did.
+        if let Err(err) = &mut retried
+            && matches!(link_error(err), Some(RequestError::LinkNotOpened(_)))
+            && !self.transport.has_path(destination).await
+        {
+            return outcome;
+        }
         if let Err(err) = &mut retried
             && let Some(RequestError::LinkActivationTimeout {
                 retried_to,
@@ -1101,10 +1161,12 @@ mod rnsd_tests {
         }
     }
 
-    /// What `recovering` did: the tries it made and the progress lines it said.
+    /// What `recovering` did: the tries it made, the progress lines it said, and the
+    /// paths it dropped in rnsd.
     struct Run {
         tries: Vec<LinkTry>,
         said: Vec<String>,
+        drops: usize,
         outcome: Result<(), RequestError>,
     }
 
@@ -1115,6 +1177,7 @@ mod rnsd_tests {
         age: Duration,
         online: bool,
         marked: bool,
+        asked: bool,
         first: Option<RequestError>,
         second: Option<RequestError>,
     ) -> Run {
@@ -1144,7 +1207,8 @@ mod rnsd_tests {
                 || "Ann / laptop".to_string(),
                 LinkTry {
                     link_timeout: Duration::from_secs(10),
-                    path_requested: false,
+                    path_requested: asked,
+                    asked,
                 },
                 |link| {
                     tries.lock().push(link);
@@ -1156,9 +1220,15 @@ mod rnsd_tests {
         )
         .await;
         let said = said.lock().clone();
+        let drops = rnsd
+            .asked()
+            .iter()
+            .filter(|verb| *verb == &("drop".to_string(), "path".to_string()))
+            .count();
         Run {
             tries: tries.into_inner(),
             said,
+            drops,
             outcome,
         }
     }
@@ -1176,32 +1246,46 @@ mod rnsd_tests {
             Duration::from_secs(3600),
             false,
             false,
+            false,
             Some(never_linked()),
             None,
         )
         .await;
         assert_eq!(run.outcome, Ok(()));
+        assert_eq!(run.drops, 1, "rnsd's row is dropped once");
         assert_eq!(run.tries.len(), 2);
         assert!(run.tries[1].path_requested);
         assert!(run.tries[1].link_timeout > Duration::from_secs(10));
         assert_eq!(run.said, [STALE]);
     }
 
-    /// A first contact, a path learned just now, whose link never came up is tried once
-    /// more as it is, saying nothing of a stale route; when the second try fails too, the
-    /// error names the session and says a far peer can take longer, never that it left.
+    /// A first contact, a link right after a path request was sent, that never came up
+    /// is tried once more as it is, without dropping the path and with the timeout sized
+    /// from rnsd's first hop, saying nothing of a stale route; when the second try fails
+    /// too, the error names the session and says a far session can take longer, never that
+    /// it left.
     #[tokio::test]
     async fn a_first_contact_is_retried_once_and_reports_the_far_peer_wording() {
         let run = recover(
             "routes-recover-first-contact",
-            Duration::from_secs(2),
+            Duration::from_secs(3600),
             true,
             false,
+            true,
             Some(never_linked()),
             Some(never_linked()),
         )
         .await;
         assert_eq!(run.tries.len(), 2);
+        assert_eq!(run.drops, 0, "a sound path is never dropped");
+        assert_eq!(
+            run.tries[1].link_timeout,
+            retry_link_timeout(
+                Some(Duration::from_secs_f64(6.05)),
+                1,
+                Duration::from_secs(10)
+            )
+        );
         assert!(run.said.is_empty(), "{:?}", run.said);
         let err = run.outcome.unwrap_err();
         assert!(
@@ -1214,7 +1298,7 @@ mod rnsd_tests {
         let text = format!("{err}. {}.", crate::mesh::request::request_remedy(&err));
         assert_eq!(
             text,
-            "No mesh link to Ann / laptop came up within 10 s. Far peers (several hops, a public gateway) can take longer; try once more. `.mesh people list` shows when it was last heard."
+            "No mesh link to Ann / laptop came up within 10 s. Far sessions (several hops, a public gateway) can take longer; try once more. `.mesh people list` shows when it was last heard."
         );
         assert!(!text.contains("may have left"), "{text}");
     }
@@ -1227,11 +1311,13 @@ mod rnsd_tests {
             Duration::from_secs(3600),
             true,
             false,
+            false,
             Some(never_linked()),
             None,
         )
         .await;
         assert_eq!(run.tries.len(), 1);
+        assert_eq!(run.drops, 0);
         assert_eq!(run.outcome, Err(never_linked()));
         assert!(run.said.is_empty());
     }
@@ -1245,6 +1331,7 @@ mod rnsd_tests {
             Duration::from_secs(3600),
             true,
             true,
+            false,
             None,
             None,
         )
@@ -1253,6 +1340,66 @@ mod rnsd_tests {
         assert_eq!(run.tries.len(), 1);
         assert!(run.tries[0].path_requested);
         assert_eq!(run.said, [STALE]);
+    }
+
+    /// An up path refreshed seconds ago is no first contact: a link over it that never
+    /// came up gives the plain error, with no drop and no retry.
+    #[tokio::test]
+    async fn a_failed_link_over_a_sound_fresh_path_is_reported_as_it_is() {
+        let run = recover(
+            "routes-recover-fresh",
+            Duration::from_secs(2),
+            true,
+            false,
+            false,
+            Some(never_linked()),
+            None,
+        )
+        .await;
+        assert_eq!(run.tries.len(), 1);
+        assert_eq!(run.drops, 0);
+        assert_eq!(run.outcome, Err(never_linked()));
+    }
+
+    /// A marked path whose first try, after its drop and ask, still fails over an
+    /// interface that is down is tried once more without a second drop or path request.
+    #[tokio::test]
+    async fn a_marked_path_still_suspect_is_asked_for_once_per_call() {
+        let run = recover(
+            "routes-recover-marked-down",
+            Duration::from_secs(3600),
+            false,
+            true,
+            false,
+            Some(never_linked()),
+            None,
+        )
+        .await;
+        assert_eq!(run.outcome, Ok(()));
+        assert_eq!(run.tries.len(), 2);
+        assert_eq!(run.drops, 1, "one drop and one path request per call");
+        assert_eq!(run.said, [STALE]);
+    }
+
+    /// A link over a suspect path that fails both tries reports the far-session wording,
+    /// never that the session may have left.
+    #[tokio::test]
+    async fn a_suspect_path_that_fails_twice_never_says_may_have_left() {
+        let run = recover(
+            "routes-recover-suspect-twice",
+            Duration::from_secs(3600),
+            false,
+            false,
+            false,
+            Some(never_linked()),
+            Some(never_linked()),
+        )
+        .await;
+        assert_eq!(run.tries.len(), 2);
+        let err = run.outcome.unwrap_err();
+        let text = format!("{err}. {}.", crate::mesh::request::request_remedy(&err));
+        assert!(!text.contains("may have left"), "{text}");
+        assert!(text.contains("Far sessions"), "{text}");
     }
 }
 
@@ -1354,9 +1501,9 @@ mod tests {
         );
     }
 
-    /// The retry waits for rnsd's first hop plus 6 s a hop and a second of slack, never
-    /// less than the configured link timeout, with 6 s for the first hop when rnsd cannot
-    /// be asked.
+    /// The retry waits for rnsd's first hop plus 6 s a hop and a second of slack, between
+    /// the configured link timeout and twice it, with 6 s for the first hop when rnsd
+    /// cannot be asked.
     #[test]
     fn the_retry_is_sized_from_the_first_hop_and_the_hops() {
         let ten = Duration::from_secs(10);
@@ -1366,7 +1513,12 @@ mod tests {
         );
         assert_eq!(
             retry_link_timeout(Some(Duration::from_secs(6)), 3, ten),
-            Duration::from_secs(25)
+            Duration::from_secs(20),
+            "capped at twice the link timeout"
+        );
+        assert_eq!(
+            retry_link_timeout(Some(Duration::from_secs(6)), 2, ten),
+            Duration::from_secs(19)
         );
         assert_eq!(retry_link_timeout(None, 1, ten), Duration::from_secs(13));
         assert_eq!(
@@ -1374,8 +1526,9 @@ mod tests {
             Duration::from_secs(30)
         );
         assert_eq!(
-            retry_link_timeout(None, u8::MAX, ten),
-            PER_HOP * 17 + MAINTENANCE_SLACK
+            retry_link_timeout(None, 128, ten),
+            Duration::from_secs(13),
+            "the hop count of a destination with no path is read as one hop"
         );
     }
 
@@ -1462,6 +1615,30 @@ mod tests {
         assert!(book.in_process_online(&iface));
         assert!(book.in_process_back_since(&iface, t0));
         assert!(!book.in_process_back_since(&iface, back));
+    }
+
+    /// After missed events, an in-process interface cannot be told until it reports
+    /// again, and only one is down while any is.
+    #[test]
+    fn missed_events_leave_an_interface_unknown_until_it_reports() {
+        let book = RouteBook::default();
+        let iface = AddressHash::new_from_hex_string(&"ab".repeat(16)).unwrap();
+        let other = AddressHash::new_from_hex_string(&"cd".repeat(16)).unwrap();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        assert!(!book.in_process_unknown(&iface));
+        assert!(!book.any_down());
+        book.note_lag();
+        assert!(book.in_process_unknown(&iface) && book.in_process_unknown(&other));
+        book.note_interface_event(
+            iface,
+            InterfaceEventKind::Disconnected {
+                reason: rns_transport::transport::DisconnectReason::PeerClosed,
+            },
+            t0,
+        );
+        assert!(!book.in_process_unknown(&iface));
+        assert!(book.in_process_unknown(&other));
+        assert!(book.any_down());
     }
 
     /// A mark lasts until the destination is next requested.

@@ -22,7 +22,7 @@ pub(crate) enum RequestError {
     /// announced within `PEER_STALE_AFTER`: the message then says it may have left.
     /// `retried_to` names the destination when the link was tried a second time, on a
     /// route just asked for or a first contact after a path request: the message then
-    /// says a far peer can take longer, never that it may have left.
+    /// says a far session can take longer, never that it may have left.
     LinkActivationTimeout {
         path: String,
         after: Duration,
@@ -145,7 +145,7 @@ impl fmt::Display for RequestError {
                     // Every caller ends this message with its own full stop.
                     return write!(
                         f,
-                        "No mesh link to {who} came up within {} s. Far peers (several hops, a public gateway) can take longer; try once more",
+                        "No mesh link to {who} came up within {} s. Far sessions (several hops, a public gateway) can take longer; try once more",
                         after.as_secs_f64().round()
                     );
                 }
