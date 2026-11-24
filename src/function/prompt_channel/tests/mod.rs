@@ -1,7 +1,9 @@
 use super::*;
 use crate::config::{AppState, RequestContext, WorkingMode};
 use crate::events::{Event, OutputStream, RecordingSink};
-use crate::function::{FunctionDeclaration, JsonSchema, ToolCall, ToolIo, jobs, run_llm_function};
+use crate::function::{
+    FunctionDeclaration, JsonSchema, ToolAgent, ToolCall, ToolIo, jobs, run_llm_function,
+};
 use crate::prompt::{ScriptedPrompter, prompt_events};
 use crate::testing::{AtomicFlagGuard, EnvVarGuard, TestConfigDirGuard, bash_program};
 use crate::turn::SilentSink;
@@ -275,7 +277,10 @@ fn a_global_tool_run_under_an_agent_asks_under_its_own_name() {
         "ask-x7x".to_string(),
         vec![r#"{"path":"args-x7x"}"#.to_string()],
         tool_envs(),
-        Some(agent.to_string()),
+        Some(ToolAgent {
+            name: agent.to_string(),
+            script: false,
+        }),
         None,
         io_with(&prompter, Arc::new(PromptMemory::default())),
         None,

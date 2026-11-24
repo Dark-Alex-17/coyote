@@ -1,10 +1,149 @@
+use super::mcp_tool_policy::expand_mcp_server_alias;
 use super::role::{Role, RoleLike};
 use super::skill::Skill;
 use super::skill_policy::SkillPolicy;
+use super::{Agent, AppConfig};
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+
+/// Holds a skill's grants to what the active agent declares: a skill must never
+/// give the model tools or MCP servers the agent definition does not.
+pub struct AgentToolGate<'a> {
+    agent_name: &'a str,
+    declared_tools: HashSet<String>,
+    mapping_tools: &'a IndexMap<String, String>,
+    /// `None` when the agent declares `all`.
+    declared_mcp_servers: Option<BTreeSet<String>>,
+    mapping_mcp_servers: &'a IndexMap<String, String>,
+}
+
+impl<'a> AgentToolGate<'a> {
+    pub fn new(agent: &'a Agent, app: &'a AppConfig) -> Self {
+        let names = agent.mcp_server_names();
+        let declared_mcp_servers = (!names.iter().any(|entry| entry.trim() == "all")).then(|| {
+            let mut servers = BTreeSet::new();
+            for entry in names.iter().map(|entry| entry.trim()) {
+                let members = expand_mcp_server_alias(&app.mapping_mcp_servers, entry);
+                if members.is_empty() {
+                    servers.insert(entry.to_string());
+                } else {
+                    servers.extend(members);
+                }
+            }
+            servers
+        });
+        Self {
+            agent_name: agent.name(),
+            declared_tools: agent
+                .functions()
+                .declarations()
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect(),
+            mapping_tools: &app.mapping_tools,
+            declared_mcp_servers,
+            mapping_mcp_servers: &app.mapping_mcp_servers,
+        }
+    }
+
+    pub fn partition(&self, granted: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut allowed = vec![];
+        let mut denied = vec![];
+        for entry in granted.iter().map(|entry| entry.trim()) {
+            if entry.is_empty() {
+                continue;
+            }
+            if entry == "all" {
+                let mut declared: Vec<String> = self.declared_tools.iter().cloned().collect();
+                declared.sort();
+                allowed.extend(declared);
+                continue;
+            }
+            let members: Vec<&str> = match self.mapping_tools.get(entry) {
+                Some(values) => values.split(',').map(str::trim).collect(),
+                None => vec![entry],
+            };
+            for tool in members.into_iter().filter(|tool| !tool.is_empty()) {
+                let bucket = if self.declared_tools.contains(tool) {
+                    &mut allowed
+                } else {
+                    &mut denied
+                };
+                if !bucket.iter().any(|seen| seen == tool) {
+                    bucket.push(tool.to_string());
+                }
+            }
+        }
+        (allowed, denied)
+    }
+
+    pub fn allows_mcp_server(&self, server: &str) -> bool {
+        self.declared_mcp_servers
+            .as_ref()
+            .is_none_or(|servers| servers.contains(server))
+    }
+
+    pub fn partition_mcp_servers(&self, granted: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut allowed = vec![];
+        let mut denied = vec![];
+        for entry in granted.iter().map(|entry| entry.trim()) {
+            if entry.is_empty() {
+                continue;
+            }
+            if entry == "all" {
+                match &self.declared_mcp_servers {
+                    Some(servers) => allowed.extend(servers.iter().cloned()),
+                    None => allowed.push(entry.to_string()),
+                }
+                continue;
+            }
+            let mut members = expand_mcp_server_alias(self.mapping_mcp_servers, entry);
+            if members.is_empty() {
+                members.push(entry.to_string());
+            }
+            for server in members {
+                let bucket = if self.allows_mcp_server(&server) {
+                    &mut allowed
+                } else {
+                    &mut denied
+                };
+                if !bucket.contains(&server) {
+                    bucket.push(server);
+                }
+            }
+        }
+        (allowed, denied)
+    }
+
+    pub fn warnings(&self, skill: &Skill) -> Vec<String> {
+        let (_, denied) = self.partition(skill.enabled_tools().unwrap_or_default());
+        let (_, denied_servers) =
+            self.partition_mcp_servers(skill.enabled_mcp_servers().unwrap_or_default());
+        let tool_warnings = denied
+            .iter()
+            .map(|tool| not_enabled_warning(skill.name(), tool, self.agent_name));
+        let server_warnings = denied_servers
+            .iter()
+            .map(|server| mcp_not_enabled_warning(skill.name(), server, self.agent_name));
+        tool_warnings.chain(server_warnings).collect()
+    }
+}
+
+pub fn not_enabled_warning(skill: &str, tool: &str, agent: &str) -> String {
+    format!(
+        "Skill '{skill}' grants tool '{tool}', but it is not enabled for agent '{agent}' and will not be offered. \
+         To use it with this skill, add {tool} to {agent}'s global_tools in the agent definition."
+    )
+}
+
+pub fn mcp_not_enabled_warning(skill: &str, server: &str, agent: &str) -> String {
+    format!(
+        "Skill '{skill}' grants MCP server '{server}', but it is not enabled for agent '{agent}' and will not be offered. \
+         To use it with this skill, add {server} to {agent}'s mcp_servers in the agent definition."
+    )
+}
 
 #[derive(Clone, Default)]
 pub struct SkillRegistry {
@@ -38,7 +177,7 @@ impl SkillRegistry {
         self.loaded.values()
     }
 
-    pub fn loaded_mcp_servers(&self) -> BTreeSet<String> {
+    pub fn loaded_mcp_servers(&self, agent_gate: Option<&AgentToolGate>) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for skill in self.loaded.values() {
             if let Some(servers) = skill.enabled_mcp_servers() {
@@ -50,7 +189,13 @@ impl SkillRegistry {
                 }
             }
         }
-        out
+        match agent_gate {
+            Some(gate) => {
+                let granted: Vec<String> = out.into_iter().collect();
+                gate.partition_mcp_servers(&granted).0.into_iter().collect()
+            }
+            None => out,
+        }
     }
 
     pub fn is_loaded(&self, name: &str) -> bool {
@@ -61,7 +206,12 @@ impl SkillRegistry {
         self.loaded.retain(|_, skill| !skill.auto_unload());
     }
 
-    pub fn effective_role(&self, base: &Role, policy: &SkillPolicy) -> Role {
+    pub fn effective_role(
+        &self,
+        base: &Role,
+        policy: &SkillPolicy,
+        agent_gate: Option<&AgentToolGate>,
+    ) -> Role {
         if !policy.skills_enabled || self.loaded.is_empty() {
             return base.clone();
         }
@@ -82,10 +232,16 @@ impl SkillRegistry {
                 continue;
             }
             if let Some(skill_tools) = skill.enabled_tools() {
-                tools.extend(skill_tools.iter().cloned());
+                match agent_gate {
+                    Some(gate) => tools.extend(gate.partition(skill_tools).0),
+                    None => tools.extend(skill_tools.iter().cloned()),
+                }
             }
             if let Some(servers) = skill.enabled_mcp_servers() {
-                mcps.extend(servers.iter().cloned());
+                match agent_gate {
+                    Some(gate) => mcps.extend(gate.partition_mcp_servers(servers).0),
+                    None => mcps.extend(servers.iter().cloned()),
+                }
             }
             if !skip_body && !skill.body().is_empty() {
                 let separator = if effective.is_empty_prompt() {
@@ -122,7 +278,7 @@ impl SkillRegistry {
             enabled: self.loaded.keys().cloned().collect(),
             compatible_enabled: self.loaded.keys().cloned().collect(),
         };
-        self.effective_role(base, &policy)
+        self.effective_role(base, &policy, None)
     }
 }
 
@@ -314,5 +470,107 @@ mod tests {
         let registry = SkillRegistry::default();
 
         assert!(!registry.is_loaded("nothing"));
+    }
+
+    fn agent_providing(tools: &[&str]) -> Agent {
+        let mut agent = Agent::test_new(super::super::AgentConfig {
+            name: "gated".into(),
+            ..Default::default()
+        });
+        for tool in tools {
+            agent
+                .functions_mut()
+                .append_declaration(crate::function::FunctionDeclaration {
+                    name: tool.to_string(),
+                    description: String::new(),
+                    parameters: Default::default(),
+                    agent: false,
+                });
+        }
+        agent
+    }
+
+    #[test]
+    fn agent_gate_holds_skill_mcp_servers_to_the_agents_declaration() {
+        let app = AppConfig {
+            mapping_mcp_servers: IndexMap::from([("gh".to_string(), "github, gitlab".to_string())]),
+            ..AppConfig::default()
+        };
+        let agent = Agent::test_new(super::super::AgentConfig {
+            name: "gated".into(),
+            mcp_servers: vec!["gh".into()],
+            ..Default::default()
+        });
+        let gate = AgentToolGate::new(&agent, &app);
+
+        let granted = ["github", "slack"].map(String::from);
+        assert_eq!(
+            gate.partition_mcp_servers(&granted),
+            (vec!["github".to_string()], vec!["slack".to_string()])
+        );
+        assert_eq!(
+            gate.partition_mcp_servers(&["all".to_string()]),
+            (vec!["github".to_string(), "gitlab".to_string()], vec![])
+        );
+
+        let open = Agent::test_new(super::super::AgentConfig {
+            name: "open".into(),
+            mcp_servers: vec!["all".into()],
+            ..Default::default()
+        });
+        assert!(AgentToolGate::new(&open, &app).allows_mcp_server("slack"));
+    }
+
+    #[test]
+    fn agent_gate_expands_aliases_and_all_before_splitting() {
+        let agent = agent_providing(&["fs_read", "fs_ls"]);
+        let app = AppConfig {
+            mapping_tools: IndexMap::from([("fs".to_string(), "fs_read, fs_write".to_string())]),
+            ..AppConfig::default()
+        };
+        let gate = AgentToolGate::new(&agent, &app);
+
+        let granted = ["fs", "execute_command", "fs_read"].map(String::from);
+        assert_eq!(
+            gate.partition(&granted),
+            (
+                vec!["fs_read".to_string()],
+                vec!["fs_write".to_string(), "execute_command".to_string()]
+            )
+        );
+        assert_eq!(
+            gate.partition(&["all".to_string()]),
+            (vec!["fs_ls".to_string(), "fs_read".to_string()], vec![])
+        );
+    }
+
+    #[test]
+    fn effective_role_inside_an_agent_keeps_only_the_grants_the_agent_provides() {
+        let mut registry = SkillRegistry::default();
+        registry.insert_for_test(make_skill(
+            "grants-exec",
+            "enabled_tools: fs_read, execute_command",
+            "body",
+        ));
+        let agent = agent_providing(&["fs_read"]);
+        let app = AppConfig::default();
+        let gate = AgentToolGate::new(&agent, &app);
+        let policy = SkillPolicy {
+            skills_enabled: true,
+            enabled: registry.loaded.keys().cloned().collect(),
+            compatible_enabled: registry.loaded.keys().cloned().collect(),
+        };
+
+        let effective = registry.effective_role(&Role::new("r", "p"), &policy, Some(&gate));
+
+        assert_eq!(effective.enabled_tools(), Some(vec!["fs_read".to_string()]));
+        assert_eq!(
+            gate.warnings(registry.loaded.get("grants-exec").unwrap()),
+            vec![not_enabled_warning(
+                "grants-exec",
+                "execute_command",
+                "gated"
+            )]
+        );
     }
 }

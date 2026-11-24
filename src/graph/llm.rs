@@ -6,7 +6,8 @@ use super::{is_transient_error, wall_clock};
 use crate::client::{Model, ModelType, call_chat_completions_streaming_quiet};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
-    Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
+    AgentToolGate, Input, RequestContext, Role, RoleLike, SkillPolicy,
+    should_inject_skill_instructions,
 };
 use crate::events::Origin;
 use crate::function::ToolResult;
@@ -201,7 +202,15 @@ async fn run(
         }
     }
 
-    let composed_role = parent_ctx.skill_registry.effective_role(&role, &policy);
+    let composed_role = {
+        let agent_gate = parent_ctx
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, &parent_ctx.app.config));
+        parent_ctx
+            .skill_registry
+            .effective_role(&role, &policy, agent_gate.as_ref())
+    };
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(composed_role);
