@@ -3379,7 +3379,6 @@ mod binary_menus {
             assert_tty_restored(&transcript);
         }
 
-        /// `--tui` alone picks the full-screen UI.
         #[test]
         #[serial]
         fn the_tui_flag_starts_the_full_screen_ui() {
@@ -3391,7 +3390,6 @@ mod binary_menus {
             assert_full_screen_ui_then_ctrl_d(&mut pty, "--tui");
         }
 
-        /// `ui: tui` in the config picks the full-screen UI with no flag.
         #[test]
         #[serial]
         fn a_tui_config_key_starts_the_full_screen_ui() {
@@ -3430,7 +3428,6 @@ mod binary_menus {
             assert_plain_repl_then_ctrl_d(&mut pty, "no ui: key under COYOTE_UI=tui");
         }
 
-        /// `--repl` overrides `ui: tui` in the config.
         #[test]
         #[serial]
         fn the_repl_flag_beats_a_tui_config_key() {
@@ -3503,8 +3500,6 @@ mod binary_menus {
             }
         }
 
-        /// With no `ui:` key and no flag, an interactive start is the plain
-        /// REPL it always was.
         #[test]
         #[serial]
         fn an_interactive_start_with_no_preference_is_the_plain_repl() {

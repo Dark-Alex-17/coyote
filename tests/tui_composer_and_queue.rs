@@ -116,7 +116,6 @@ mod queue_vi_and_headless {
             queued_at,
             "the end of the held reply",
         );
-        // The queued text's own reply.
         wait_for_squeezed_after(
             &mut pty,
             "reply two kq7",

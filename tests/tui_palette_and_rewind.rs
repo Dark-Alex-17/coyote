@@ -4101,7 +4101,6 @@ mod success_gated_barriers_band_close_and_headless_create {
                 "[{what}] the composer is not empty after the band closed:\n{closed}"
             ));
         }
-        // Keys still land: the composer is live.
         let live_at = pty.raw().len();
         assert_composer_takes_keys(&mut pty, live_at, &what);
 

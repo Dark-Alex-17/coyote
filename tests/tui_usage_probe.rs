@@ -667,7 +667,6 @@ mod welcome_sweep {
         );
     }
 
-    /// The first key settles the sweep at once.
     #[test]
     #[serial]
     fn the_first_key_settles_the_sweep() {
@@ -679,7 +678,6 @@ mod welcome_sweep {
         quit_declining_save(&mut pty);
     }
 
-    /// A click settles the sweep at once too.
     #[test]
     #[serial]
     fn a_click_settles_the_sweep() {
@@ -735,7 +733,6 @@ mod welcome_sweep {
         quit_and_check(&mut pty);
     }
 
-    /// A paste settles the sweep at once, as a key does.
     #[test]
     #[serial]
     fn a_paste_settles_the_sweep() {

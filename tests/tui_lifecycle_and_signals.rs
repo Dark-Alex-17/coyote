@@ -3531,7 +3531,7 @@ mod interrupt_and_paste {
         let before = paste_two_lines(&mut pty, "lf-top-z2q", "\n", "lf-bottom-v9c");
         assert_stacked_once(&pty, before, "lf-top-z2q", "lf-bottom-v9c", "\n");
 
-        // Clear the draft, then the quit chord.
+        // The draft must be cleared before Ctrl+D is the quit chord.
         pty.send(b"\x03").unwrap();
         pty.read_for(HOTKEY_GAP);
         pty.send(b"\x04").unwrap();
