@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1654,7 +1655,7 @@ def _delegation_text(state, task, kind, fix_items=(), fix_note="", project_dir=N
              ["", "### Your prior report (verbatim)", tail(prior, 8000) or "(none recorded)"]
         if m := SISYPHUS_RUN_RE.search(prior):
             L += ["", f"Sisyphus run id: {m.group(1)}"]
-    if kind == "hygiene":
+    if kind == "hygiene" or (kind == "fix" and task.get("type") == "hygiene"):
         L += ["", "## HYGIENE BRIEF", state.get("hygiene_brief") or "(missing)"]
     return "\n".join(x for x in L if x is not None)
 
@@ -1826,7 +1827,14 @@ def route_delegate(state):
     if (kind == "fix" and state.get("fix_source") in ("probe_adopt",)):
         u["_next"] = "post_round"
         return u
-    u["verify_scope"] = "hygiene" if kind == "hygiene" else "task"
+    if task.get("type") == "hygiene":
+        # the criteria stay fixed across rounds; only the latest report rides along, for the reviewer to check against
+        criteria = (state.get("hygiene_criteria") or "").split("\n" + HYGIENE_REPORT_LABEL)[0]
+        report = os.path.join(state.get("run_dir", ""), "reports", f"{task['id']}-r{n + 1}.md")
+        u["hygiene_criteria"] = f"{criteria}\n{HYGIENE_REPORT_LABEL}, saved at {report}:\n{trim_items(text, 4000)}"
+        u["verify_scope"] = "hygiene"
+    else:
+        u["verify_scope"] = "task"
     u["_next"] = "verify_gate"
     return u
 
@@ -4802,6 +4810,18 @@ def apply_answer(state):
             u["_next"] = "end_blocked"
         else:
             _unmatched(state, u, esc, answer)
+    elif kind == "pr_create_failed":
+        data = as_dict(esc.get("data"))
+        a = _picked_key(answer, options, {"retry": ["retry"], "finish": ["finish"]})
+        if a == "retry":
+            _count_continue(state, u, f"pr_create_failed:{data.get('unit') or 'run'}")
+            u["_next"] = "open_pr"
+        elif a == "finish":
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Open the draft PR by hand from {data.get('branch')} -> {data.get('base')}: gh pr create failed"]
+            u["_next"] = "finish_plan"
+        else:
+            _unmatched(state, u, esc, answer)
     elif kind == "approve_next":
         a = _answered(state, {"continue": ["continue"], "park": ["stop here", "park"], "abort": ["abort"]})
         if a == "continue":
@@ -5032,9 +5052,11 @@ HYGIENE_CRITERIA = (
     "These two are the ONLY criteria:\n"
     "- Behaviour unchanged: the full build and test suite is green and no production code path changed other than removal of "
     "unreachable code and lapsed scaffolding; a `debris-exempt` token added to a justified line is not a code path change\n"
-    "- Debris gone: every `debris-exempt` token in the {scope} diff sits on a line named in the HYGIENE list pasted below, every other "
-    "HYGIENE row cites its justification, and the {scope}-wide lint over the {SCOPE} base exits 0\n"
+    "- Debris gone: every `debris-exempt` token in the {scope} diff sits on a line the pass's own report names under its `HYGIENE:` "
+    "heading, every other row under that heading cites its justification, and the {scope}-wide lint over the {SCOPE} base, "
+    "`{lint_cmd}`, exits 0\n"
 )
+HYGIENE_REPORT_LABEL = "The pass's latest report (context, not criteria)"
 
 
 def _hygiene_brief(state, base, scope_word, ledger_lines, lint_cmd, pr_line):
@@ -5097,10 +5119,12 @@ def hygiene_create(state):
                                plan=state.get("plan_path", ""), tasks=group_tasks)
     ledger_lines = ledger_out.strip() if ok else "(collect_ledger_lines unavailable: " + tail(ledger_out, 120) + ")"
     agents_dir = os.path.join(os.environ.get("LLM_ROOT_DIR", os.path.expanduser("~/.config/coyote")), "agents")
-    lint_cmd = f"python3 {agents_dir}/.shared/debris.py {code} {base}"
+    excludes = "".join(f" --exclude {shlex.quote(d)}" for d in json.loads(_planning_exclude(state, code) or "[]"))
+    lint_cmd = f"python3 {agents_dir}/.shared/debris.py{excludes} {code} {base}"
+    criteria = HYGIENE_CRITERIA.format(scope=scope_word, SCOPE=scope_word.upper(), lint_cmd=lint_cmd)
     slug = "run-hygiene" if (is_single(state) or MULTI_IS_GROUPS) else f"run-hygiene-{unit['id']}".lower()
     body = ("## What\n\nRun-closing hygiene pass over the " + scope_word + " diff " + base + "..HEAD.\n\n## Acceptance criteria\n\n"
-            + HYGIENE_CRITERIA.format(scope=scope_word, SCOPE=scope_word.upper()))
+            + criteria)
     tid, tdir = new_task(state, slug, f"Run-closing hygiene pass ({unit['id']})", body, blocked_by=tuple(unit.get("members", [])),
                          task_type="chore", plan_name=os.path.basename(state.get("plan_path", "")))
     if not tid:
@@ -5120,7 +5144,7 @@ def hygiene_create(state):
     save_tasks(state, u, tasks)
     u.update({
         "current_task": tid, "delegation_kind": "hygiene", "fix_items": [], "hygiene_base": base, "hygiene_lint_cmd": lint_cmd,
-        "hygiene_criteria": HYGIENE_CRITERIA.format(scope=scope_word, SCOPE=scope_word.upper()) + "\nHYGIENE list (context, not criteria):\n(pasted after the pass)",
+        "hygiene_criteria": criteria,
         "hygiene_brief": _hygiene_brief(state, base, scope_word, ledger_lines, lint_cmd, pr_line),
         "hygiene_done": list(as_list(state.get("hygiene_done"))) + [unit["id"]], "hygiene_units": units[1:],
     })
@@ -5216,6 +5240,9 @@ def pr_body(state):
     return u
 
 
+PR_CREATE_RETRIES = 2  # a failed `gh pr create` recommends a retry this many times, then finishing without a PR
+
+
 def open_pr(state):
     u = {}
     harvest_anomaly_lines(state, u, state.get("pr_body_fix_report") or "", "pr_body_fix")
@@ -5244,10 +5271,19 @@ def open_pr(state):
         rc, out = sh(["gh", "pr", "create", "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", state.get("pr_body_path", "")], cwd=code, timeout=GH_CALL_SECS)
     m = PR_URL_RE.search(out or "")
     if rc != 0 or not m:
-        ledger(state, u, f"pr: gh pr create failed: {tail(out, 300)}")
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Open the draft PR by hand from {branch} -> {base}: gh pr create failed"]
-        u["_next"] = "finish_plan"
-        return u
+        # the create may have landed before the call failed
+        vrc, vout = _pr_view(state, branch, "url")
+        m = PR_URL_RE.search(vout or "") if vrc == 0 else None
+        if not m:
+            unit = state.get("closeout_unit") or "run"
+            retry = _cap_continues(state, f"pr_create_failed:{unit}") < PR_CREATE_RETRIES
+            ledger(state, u, f"pr: gh pr create failed and {branch} has no PR: {tail(out, 300)}")
+            return raise_escalation(state, u, escalation(
+                "pr_create_failed", f"Opening the draft PR from {branch} -> {base} failed and the branch has no PR. Retry, or finish "
+                                    "without a PR?",
+                [option("Retry opening the PR", recommended=retry), option("Finish without a PR (recorded as a follow-up)", recommended=not retry)],
+                evidence=tail(out, 2000), data={"unit": unit, "branch": branch, "base": base}))
+        ledger(state, u, f"pr: gh pr create failed ({tail(out, 300)}), but {branch} already has a PR -> adopted")
     u.update({"pr_number": m.group(2), "pr_url": m.group(0), "ci_polls": 0, "ci_poll_fails": 0, "ci_rounds": 0, "ci_started_at": int(time.time())})
     prs = dict(as_dict(state.get("pr_numbers")))
     prs[state.get("closeout_unit") or "run"] = m.group(2)
