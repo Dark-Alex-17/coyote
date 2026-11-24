@@ -1487,6 +1487,15 @@ def vg(**over):
     return gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task", **over))
 
 
+# A batch is reviewed in the code repo even when a delegation worktree is still recorded.
+for sc in ("task", "batch"):
+    nodir = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope=sc,
+                                         code_repo_path="", delegate_project_dir="" if sc == "task" else CODE))
+    check(f"verify_gate ({sc}): no checkout to review -> end_failure with a ledger line, never an empty review_project_dir",
+          nodir.get("_next") == "end_failure" and not nodir.get("review_project_dir")
+          and "no checkout to review" in str(nodir.get("decisions")) + str(nodir.get("failure_reason")), nodir)
+
+
 bare = {"code_repo_path": BARE_CODE, "git_root": BARE_CODE}
 cases = {
     "gauntlet, plans/": (vg(), "run_gauntlet", None),

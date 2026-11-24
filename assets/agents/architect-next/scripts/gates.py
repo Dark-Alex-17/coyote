@@ -1879,6 +1879,12 @@ def verify_gate(state):
     code = state.get("code_repo_path", "")
     # A batch is reviewed on the run branch; the last delegation's worktree may already be removed.
     rdir = code if scope == "batch" else (state.get("delegate_project_dir") or code)
+    if not rdir:
+        ledger(state, u, "verify_gate: no checkout to review (code_repo_path and delegate_project_dir are both empty); "
+                         "stopping instead of seating reviewers with an empty project_dir")
+        u["failure_reason"] = "no checkout to review: code_repo_path is empty"
+        u["_next"] = "end_failure"
+        return u
     task = task_by_id(tasks, state.get("current_task")) or {}
     head = git_out(rdir, "rev-parse", "HEAD", default=task.get("head_sha", ""))
     unit = state.get("current_batch") if scope == "batch" else task.get("id", "run")
