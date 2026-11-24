@@ -1264,6 +1264,12 @@ check("compose_delegation: fix round = artifact re-entry (prior report + finding
       "## FIX ROUND 1" in p and "criterion 2 DIVERGES" in p and "Implemented." in p and "Sisyphus run id: 20260101T000000-0badf00d" in p)
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegation_kind="hygiene", hygiene_brief="Sweep the RUN's whole diff"))
 check("compose_delegation: hygiene brief pasted", "## HYGIENE BRIEF" in u["delegation_prompt"] and "Sweep the RUN" in u["delegation_prompt"])
+TS_HYG = [dict(t, type="hygiene") if t["id"] == T1 else t for t in copy.deepcopy(TS1)]
+u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS_HYG, current_task=T1, delegation_kind="fix", fix_items=["debris: a.go:3 hit"],
+                                        hygiene_brief="Sweep the RUN's whole diff"))
+check("compose_delegation: a fix round on the hygiene task carries the HYGIENE BRIEF too",
+      "## FIX ROUND" in u["delegation_prompt"] and "## HYGIENE BRIEF" in u["delegation_prompt"] and "Sweep the RUN" in u["delegation_prompt"],
+      u["delegation_prompt"][-600:])
 REPORT_OK = ("Done.\nCommits: 1a2b3c4d5e6f\nHEAD SHA: 1a2b3c4d5e6f\n\nFOLLOW-UPS:\n- Provision the WIDGET_SECRET in vault (post-merge)\n\n"
              "Debt left behind:\n- src/a.go:12 #[allow(dead_code)] owner TASK-999\n\nDebris exemptions:\n- src/b.go:3 -- the glyph is the point\n\n"
              "Design decisions:\n- introduced a WidgetStore interface in src/a.go\n- ASK -- should the worker share the store?\n\nSisyphus run id: 20260101T000000-0badf00d\n")
@@ -1427,8 +1433,29 @@ u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=
 check("route_delegate: STOP-and-report (plan wrong) -> oracle_diagnose", u["_next"] == "oracle_diagnose")
 u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="Committed the probe tests. HEAD SHA: 2b3c4d5e6f7a", delegation_kind="fix", fix_source="probe_adopt"))
 check("route_delegate: probe-adopt round -> post_round (no re-verify)", u["_next"] == "post_round")
-u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result="HYGIENE:\n- none kept\nHEAD SHA: 3c4d5e6f7a8b", delegation_kind="hygiene"))
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_HYG), current_task=T1, delegate_result="HYGIENE:\n- none kept\nHEAD SHA: 3c4d5e6f7a8b", delegation_kind="hygiene"))
 check("route_delegate: hygiene -> verify_gate scope hygiene", u["_next"] == "verify_gate" and u["verify_scope"] == "hygiene")
+HYG_CRIT = "These two are the ONLY criteria:\n- behaviour unchanged\n- debris gone\n"
+s_hy = base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_HYG), current_task=T1, delegation_kind="fix", fix_source="review",
+                  delegate_result="HYGIENE:\n- src/a.go:3 -- the glyph is the point (CONTRIBUTING.md:12)\nHEAD SHA: 4d5e6f7a8b9c\n",
+                  hygiene_criteria=HYG_CRIT)
+u = gates.route_delegate(s_hy)
+crit_hy = u.get("hygiene_criteria", "")
+saved_hy = os.path.join(rd, "reports", f"{T1}-r{gates._prior_report(s_hy, T1)[1]}.md")
+check("route_delegate: a fix round on the hygiene task -> verify_gate scope hygiene, the criteria kept and the latest report pasted as context with its saved path",
+      u["_next"] == "verify_gate" and u.get("verify_scope") == "hygiene" and crit_hy.startswith(HYG_CRIT) and gates.HYGIENE_REPORT_LABEL in crit_hy
+      and saved_hy in crit_hy and "src/a.go:3 -- the glyph is the point" in crit_hy, (u.get("verify_scope"), crit_hy))
+u = gates.route_delegate({**s_hy, "hygiene_criteria": crit_hy, "delegate_result": "HYGIENE:\n- none kept\nHEAD SHA: 5e6f7a8b9c0d\n"})
+crit_hy = u.get("hygiene_criteria", "")
+check("route_delegate: a later hygiene round replaces the pasted report, never stacks it",
+      crit_hy.startswith(HYG_CRIT) and crit_hy.count(gates.HYGIENE_REPORT_LABEL) == 1 and "none kept" in crit_hy and "src/a.go:3" not in crit_hy,
+      crit_hy)
+LONG_HYG = "HYGIENE:\n" + "".join(f"- src/f{i}.go:{i} -- kept, the glyph is the point {'x' * 90}\n" for i in range(60)) + "HEAD SHA: 6f7a8b9c0d1e\n"
+u = gates.route_delegate({**s_hy, "hygiene_criteria": crit_hy, "delegate_result": LONG_HYG})
+paste_hy = u.get("hygiene_criteria", "").split(gates.HYGIENE_REPORT_LABEL, 1)[-1].split(":\n", 1)[-1]
+check("route_delegate: a hygiene report over the paste budget keeps its first row's head and is never tail-trimmed",
+      len(LONG_HYG) > 4000 and "- src/f0.go:0 -- kept" in paste_hy and not paste_hy.startswith("... [trimmed] ...")
+      and "every kept item" in u.get("hygiene_criteria", ""), paste_hy[:300])
 u = gates.task_failed_route(base_state(current_task=T1, oracle_result="Cause: X. Direction: do Y.", failure_evidence="e", task_rounds={}))
 check("task_failed_route: escalation task_failed with the oracle-directed retry recommended (B8 unused)", u["escalation"]["kind"] == "task_failed" and u["escalation"]["options"][0]["recommended"] and u["escalation"]["hard_trigger"])
 u = gates.task_failed_route(base_state(current_task=T1, oracle_result="x", task_rounds={T1: {"retry_rounds": 1}}))
@@ -1458,6 +1485,15 @@ make_repo(BARE_CODE, {"README.md": "x\n"})
 
 def vg(**over):
     return gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="task", **over))
+
+
+# A batch is reviewed in the code repo even when a delegation worktree is still recorded.
+for sc in ("task", "batch"):
+    nodir = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope=sc,
+                                         code_repo_path="", delegate_project_dir="" if sc == "task" else CODE))
+    check(f"verify_gate ({sc}): no checkout to review -> end_failure with a ledger line, never an empty review_project_dir",
+          nodir.get("_next") == "end_failure" and not nodir.get("review_project_dir")
+          and "no checkout to review" in str(nodir.get("decisions")) + str(nodir.get("failure_reason")), nodir)
 
 
 bare = {"code_repo_path": BARE_CODE, "git_root": BARE_CODE}
@@ -2927,6 +2963,9 @@ AA_ESC = {
     "hygiene_base_missing": escalation("hygiene_base_missing", "q", [option("Stop and report", True),
                                                                      option("Skip the hygiene pass (recorded as a follow-up)")],
                                        hard_trigger=True),
+    "pr_create_failed": escalation("pr_create_failed", "q", [option("Retry opening the PR", True),
+                                                             option("Finish without a PR (recorded as a follow-up)")],
+                                   data={"unit": "run", "branch": "feat/PLAN-widgets", "base": "main"}),
     "review_exhausted": escalation("review_exhausted", "q", [option("Keep watching (re-arm the review watch)"),
                                                              option("Stop watching and report", True)]),
     "review_read_truncated": escalation("review_read_truncated", "q", [option("Keep watching (re-arm the review watch)"),
@@ -3202,6 +3241,7 @@ AA_WORDS = (
     ("review_round_cap", AA_ESC["review_round_cap"], "resume with one more round", dict(pr_number="99")),
     ("review_owner_judgment", E_UNTRUSTED, "address them as a fix round", dict(pr_number="99")),
     ("hygiene_base_missing", AA_ESC["hygiene_base_missing"], "skip it for now", {}),
+    ("pr_create_failed", AA_ESC["pr_create_failed"], "retry later, or just finish", {}),
 )
 for kind, esc_, text, over in AA_WORDS:
     u = gates.apply_answer(base_state(escalation=esc_, last_answer=text, **over))
@@ -3214,6 +3254,7 @@ AA_PREFIX = (
     ("integration_red", AA_ESC["integration_red"], "One", dict(current_task=T1, tasks=TS_W)),
     ("promote_failed", E_PROMOTE_DEFECTS, "Continue", {}),
     ("hygiene_base_missing", AA_ESC["hygiene_base_missing"], "Skip", {}),
+    ("pr_create_failed", AA_ESC["pr_create_failed"], "Retry", {}),
 )
 for kind, esc_, text, over in AA_PREFIX:
     u = gates.apply_answer(base_state(escalation=esc_, last_answer=text, **over))
@@ -3299,6 +3340,7 @@ AA_NOTED = (
     ("gate_fault", AA_ESC["gate_fault"], "1", "the model timed out", "gate1_build", {}),
     ("promote_failed", E_PROMOTE_DEFECTS, "2", "the defects are cosmetic", "branch_setup", {}),
     ("hygiene_base_missing", AA_ESC["hygiene_base_missing"], "2", "the base was rewritten", "hygiene_create", {}),
+    ("pr_create_failed", AA_ESC["pr_create_failed"], "2", "the network is down", "finish_plan", {}),
     ("conformance_stuck", AA_ESC["conformance_stuck"], "2", "known debt", "post_round", dict(current_task=T1, tasks=tasks_with())),
 )
 for kind, esc_, number, note, want, over in AA_NOTED:
@@ -3668,6 +3710,23 @@ check("hygiene_create: single - chore task created + claimed, base literal in th
       u["_next"] == "compose_delegation" and u["delegation_kind"] == "hygiene" and u["hygiene_base"] == CODE_BASE and f"{CODE_BASE}..HEAD" in u["hygiene_brief"]
       and "debris.py" in u["hygiene_lint_cmd"] and "These two are the ONLY criteria" in u["hygiene_criteria"] and "Starting ledger" in u["hygiene_brief"]
       and u["tasks"][-1]["type"] == "hygiene" and u["tasks"][-1]["blocked_by"] == [T1, T2, T3] and u["hygiene_done"] == ["run"] and "NO separate hygiene PR" in u["hygiene_brief"])
+check("hygiene_create: the lint leaves the repo's plans/ out, one --exclude before the positionals",
+      f"debris.py --exclude plans {CODE} {CODE_BASE}" in u["hygiene_lint_cmd"], u["hygiene_lint_cmd"])
+check("hygiene_create: the criteria point at the pass's own HYGIENE: heading and name the exact lint, nothing left to paste in later",
+      "pasted" not in u["hygiene_criteria"] and "`HYGIENE:` heading" in u["hygiene_criteria"] and f"`{u['hygiene_lint_cmd']}`" in u["hygiene_criteria"]
+      and u["hygiene_criteria"] in read_file(os.path.join(u["tasks"][-1]["dir"], "index.md")), u["hygiene_criteria"])
+u_hx = gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_f), hygiene_units=[{"id": "run", "members": [T1, T2, T3]}],
+                                       unit_base_sha=CODE_BASE, run_branch="feat/PLAN-widgets", debris_exclude='["docs"]'))
+check("hygiene_create: a preset debris_exclude is the lint's exclude list, as the gauntlet debris lane gets it",
+      f"debris.py --exclude docs {CODE} {CODE_BASE}" in u_hx.get("hygiene_lint_cmd", ""), u_hx.get("hygiene_lint_cmd"))
+SPACED_ROOT = os.path.join(rd, "llm root")
+os.environ["LLM_ROOT_DIR"] = SPACED_ROOT
+u_hx = gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_f), hygiene_units=[{"id": "run", "members": [T1, T2, T3]}],
+                                       unit_base_sha=CODE_BASE, run_branch="feat/PLAN-widgets"))
+os.environ["LLM_ROOT_DIR"] = ROOT
+check("hygiene_create: every path in the lint command is shell-quoted",
+      u_hx.get("hygiene_lint_cmd", "").startswith(f"python3 {gates.shlex.quote(os.path.join(SPACED_ROOT, 'agents', '.shared', 'debris.py'))} "),
+      u_hx.get("hygiene_lint_cmd"))
 check("hygiene_create: no units -> pr_summary (single)", gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=ts_f, hygiene_units=[]))["_next"] == "pr_summary")
 check("hygiene_create: no units -> stack_gate_final (multi)", MULTI_IS_GROUPS or gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=ts_f, hygiene_units=[], pr_strategy="multi"))["_next"] == "stack_gate_final")
 u = gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_chain), pr_strategy="multi", hygiene_units=[{"id": "chain-" + T1, "members": [T1, T2], "top_branch": "feat/nonexistent"}]))
@@ -3683,9 +3742,45 @@ check("pr_body: dead summary -> Problem/Approach pasted verbatim (declared)", "W
 os.environ["ARCHITECT_GH_CREATE_CMD"] = "echo https://github.com/o/r/pull/99"
 u = gates.open_pr(base_state(plan_path=PROMOTED, tasks=ts_f, run_branch="feat/PLAN-widgets", pr_body_path=os.path.join(rd, "pr-body.md"), pr_body_fix_report="fixed\nANOMALY: body had stale sha"))
 check("open_pr: draft PR opened -> number recorded, CI watch armed, A10 line harvested", u["_next"] == "pr_round_comments" and u["pr_number"] == "99" and u["ci_rounds"] == 0 and any("stale sha" in a for a in u["anomalies_log"]))
-os.environ["ARCHITECT_GH_CREATE_CMD"] = "false"
+os.environ["ARCHITECT_GH_CREATE_CMD"] = "echo 'dial tcp 140.82.112.6:443: i/o timeout' >&2; false"
+PR_VIEW_SEAM = "[ \"$1\" = feat/PLAN-widgets ] && [ \"$2\" = url,state,baseRefName ] || exit 1; echo https://github.com/o/r/pull/77 {state} {base}"
+os.environ["ARCHITECT_GH_VIEW_CMD"] = PR_VIEW_SEAM.format(state="OPEN", base="main")
 u = gates.open_pr(base_state(plan_path=PROMOTED, tasks=ts_f, run_branch="feat/PLAN-widgets", pr_body_path="x"))
-check("open_pr: gh failure -> follow-up, finish_plan (never silent)", u["_next"] == "finish_plan" and u["follow_ups"])
+check("open_pr: gh pr create failed but the branch already has a PR -> adopted like a create (number recorded, CI watch armed)",
+      u["_next"] == "pr_round_comments" and u.get("pr_number") == "77" and u.get("ci_rounds") == 0 and "escalation" not in u
+      and any("-> adopted" in d for d in u.get("decisions", [])) and not any("draft PR #77 opened" in d for d in u.get("decisions", [])), u)
+for why, state_word, base_word in (("a CLOSED PR", "CLOSED", "main"), ("an open PR onto another base", "OPEN", "release")):
+    os.environ["ARCHITECT_GH_VIEW_CMD"] = PR_VIEW_SEAM.format(state=state_word, base=base_word)
+    u = gates.open_pr(base_state(plan_path=PROMOTED, tasks=ts_f, run_branch="feat/PLAN-widgets", pr_body_path="x"))
+    check(f"open_pr: gh failure and the branch has only {why} -> pr_create_failed, nothing adopted",
+          u["_next"] == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "pr_create_failed" and "pr_number" not in u, u)
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo 'no pull requests found for branch' >&2; exit 1"
+u = gates.open_pr(base_state(plan_path=PROMOTED, tasks=ts_f, run_branch="feat/PLAN-widgets", pr_body_path="x"))
+E_PRC = u.get("escalation") or {}
+check("open_pr: gh failure and no PR for the branch -> pr_create_failed with the gh output, retry recommended, nothing recorded yet",
+      u["_next"] == "escalate_gate" and E_PRC.get("kind") == "pr_create_failed" and "i/o timeout" in E_PRC.get("evidence", "")
+      and "retried 0 of 2" in E_PRC.get("question", "") and "remaining PR groups" not in E_PRC.get("question", "")
+      and [o["text"] for o in E_PRC.get("options", []) if o["recommended"]] == ["Retry opening the PR"] and "follow_ups" not in u, u)
+_real_groups = gates.MULTI_IS_GROUPS
+gates.MULTI_IS_GROUPS = True
+try:
+    E_PRC_GROUP = (gates.open_pr(base_state(plan_path=PROMOTED, tasks=ts_f, run_branch="feat/PLAN-widgets", pr_body_path="x",
+                                            pr_strategy="multi")).get("escalation") or {})
+finally:
+    gates.MULTI_IS_GROUPS = _real_groups
+check("open_pr: in group mode the pr_create_failed question says finishing leaves the remaining PR groups unopened",
+      "Finishing ends the run with the remaining PR groups unopened." in E_PRC_GROUP.get("question", ""), E_PRC_GROUP)
+E_PRC_SPENT = (gates.open_pr(base_state(plan_path=PROMOTED, tasks=ts_f, run_branch="feat/PLAN-widgets", pr_body_path="x",
+                                        cap_continues={"pr_create_failed:run": 2})).get("escalation") or {})
+check("open_pr: after two retries the finish option is recommended instead",
+      [o["text"] for o in E_PRC_SPENT.get("options", []) if o["recommended"]] == ["Finish without a PR (recorded as a follow-up)"], E_PRC_SPENT)
+os.environ.pop("ARCHITECT_GH_VIEW_CMD")
+u = AA("pr_create_failed", "Retry opening the PR", esc=E_PRC, cap_continues={"pr_create_failed:run": 1})
+check("apply_answer: pr_create_failed retry -> open_pr, the retry counted",
+      u["_next"] == "open_pr" and u.get("cap_continues", {}).get("pr_create_failed:run") == 2, u)
+u = AA("pr_create_failed", "Finish without a PR (recorded as a follow-up)", esc=E_PRC)
+check("apply_answer: pr_create_failed finish -> follow-up naming the branch, finish_plan (never silent)",
+      u["_next"] == "finish_plan" and any("feat/PLAN-widgets" in f for f in u.get("follow_ups", [])), u)
 check("open_pr: PR already exists -> pr_round_comments", gates.open_pr(base_state(pr_number="99"))["_next"] == "pr_round_comments")
 u = gates.pr_round_comments(base_state(pr_number="99", pending_pr_comments=[{"unit": T1, "body": "## Review round 1 @ h"}]))
 check("pr_round_comments: deferred comments posted -> ci_poll", u["_next"] == "ci_poll" and u["pending_pr_comments"] == [] and any("1/1" in d for d in u["decisions"]))
