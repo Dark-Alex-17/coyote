@@ -9,6 +9,9 @@
 //!   `project_dir` of `.` the guard is inert;
 //! - the review agents declare the `review_grounding` variable that turns the
 //!   guard on;
+//! - every agent node whose child declares `project_dir` seats it in the
+//!   checkout its own script resolved, and a spawn variable carries that path
+//!   JSON-encoded;
 //! - code-reviewer keeps an unverified finding at its stated severity (only a
 //!   verifier refutation drops one), and the review gauntlet reads a
 //!   verification that failed as a whole as an incomplete review;
@@ -807,6 +810,14 @@ fn python_available() -> bool {
     ok
 }
 
+fn jq_available() -> bool {
+    let ok = which::which("jq").is_ok();
+    if !ok {
+        eprintln!("skipping: jq not available");
+    }
+    ok
+}
+
 fn agent_doc(rel: &str) -> serde_yaml::Value {
     let path = manifest().join("assets/agents").join(rel);
     serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap()
@@ -835,14 +846,48 @@ fn rendered_project_dir(node: &serde_yaml::Value, state: &Value) -> Option<Strin
 }
 
 /// The project_dir an llm node tells the model to hand to agent__spawn: the
-/// `"project_dir": "{{key}}"` snippet in its instructions, which the engine
-/// interpolates, resolved against `state`. None when the instructions name
-/// no such spawn variable.
-fn spawned_project_dir(node: &serde_yaml::Value, state: &Value) -> Option<String> {
-    let instructions = node["instructions"].as_str()?;
-    let (_, rest) = instructions.split_once(r#""project_dir": "{{"#)?;
-    let (key, _) = rest.split_once(r#"}}""#)?;
-    state[key.trim()].as_str().map(str::to_string)
+/// `{"project_dir": ...}` object in its instructions with its first `{{key}}`
+/// replaced by the state value, as the engine interpolates it, then read back
+/// as JSON. Err when the instructions name no such object or the rendered
+/// object is not valid JSON.
+fn spawned_project_dir(node: &serde_yaml::Value, state: &Value) -> Result<String, String> {
+    let marker = r#"{"project_dir": "#;
+    let instructions = node["instructions"].as_str().unwrap_or_default();
+    let start = instructions.find(marker).ok_or_else(|| {
+        format!("the instructions never tell the model to pass a {marker}...}} spawn variable")
+    })?;
+    let snippet = &instructions[start..];
+    let open = snippet
+        .find("{{")
+        .ok_or("the spawn variable names no state key")?;
+    let close = open
+        + snippet[open..]
+            .find("}}")
+            .ok_or("the spawn variable's state key is unterminated")?;
+    let key = snippet[open + 2..close].trim();
+    let value = state[key]
+        .as_str()
+        .ok_or_else(|| format!("state holds no string {key}"))?;
+    let rendered = format!("{}{value}{}", &snippet[..open], &snippet[close + 2..]);
+    let spawned: Value = serde_json::Deserializer::from_str(&rendered)
+        .into_iter()
+        .next()
+        .ok_or("the rendered spawn variables are empty")?
+        .map_err(|e| {
+            let head: String = rendered.chars().take(200).collect();
+            format!("the rendered spawn variables are not JSON ({e}): {head}")
+        })?;
+    spawned["project_dir"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("the rendered spawn variables hold no project_dir: {spawned}"))
+}
+
+/// Merges a script's output into `state` key by key, as the engine does.
+fn merge_into(state: &mut Value, update: &Value) {
+    for (key, value) in update.as_object().unwrap() {
+        state[key] = value.clone();
+    }
 }
 
 /// Each review graph with the state its facts/signals script resolves when
@@ -863,7 +908,7 @@ fn resolved_review_states(w: &Worktree) -> Vec<(&'static str, Value)> {
             "diff_spec": "worktree",
         });
         let resolved = run_script(script, &state);
-        state["project_dir"] = resolved["project_dir"].clone();
+        merge_into(&mut state, &resolved);
         (graph, state)
     })
     .collect()
@@ -941,16 +986,111 @@ fn spawned_review_lanes_are_seated_in_the_worktree_under_review() {
             }
             spawners += 1;
             let label = format!("{graph} {}", id.as_str().unwrap());
-            let seated = spawned_project_dir(node, &state).unwrap_or_else(|| {
-                panic!(
-                    "{label}: the instructions never tell the model to pass \
-                     \"project_dir\": \"{{{{<state key>}}}}\" as a spawn variable"
-                )
-            });
+            let seated =
+                spawned_project_dir(node, &state).unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_seated_in_worktree(&w, &seated, &label);
         }
     }
     assert!(spawners > 0, "no llm node spawns lane agents");
+}
+
+/// The spawn variables are a JSON object the model copies verbatim, so a
+/// checkout path holding a quote, a backslash, a newline or a non-ASCII
+/// letter must reach the spawned lane unchanged rather than break or extend
+/// that object. facts.py takes the path as given, so it need not exist.
+#[test]
+fn spawn_variables_carry_an_awkward_project_dir_intact() {
+    if !python_available() {
+        return;
+    }
+    let dir = temp_dir("awkward");
+    let awkward = s(&dir.0.join("say \"hi\" \\ there\nnext").join("jos\u{e9}"));
+    let mut state = json!({
+        "project_dir": s(&dir.0),
+        "project_dir_in": awkward,
+        "diff_spec": "worktree",
+    });
+    let resolved = run_script("code-reviewer/scripts/facts.py", &state);
+    merge_into(&mut state, &resolved);
+    let doc = agent_doc("code-reviewer/graph.yaml");
+    assert_eq!(
+        spawned_project_dir(&doc["nodes"]["aux_lanes"], &state),
+        Ok(awkward)
+    );
+}
+
+/// Runs step-runner's resolve_step.sh from `cwd` with `project_dir` as the
+/// caller's variable and returns the state it emits.
+fn resolve_step_state(cwd: &Path, project_dir: &str) -> Value {
+    let out = Command::new(bash_program().unwrap())
+        .arg(manifest().join("assets/agents/step-runner/scripts/resolve_step.sh"))
+        .current_dir(cwd)
+        .env("LLM_AGENT_VAR_PROJECT_DIR", project_dir)
+        .env("GRAPH_STATE", "{}")
+        .env_remove("GRAPH_STATE_FILE")
+        .env_remove("LLM_AGENT_VAR_PLANS_DIR")
+        .env_remove("LLM_AGENT_VAR_STEP")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve_step.sh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "resolve_step.sh emitted invalid JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+/// step-runner is started with a relative project_dir; resolve_step, the
+/// only way into the step's agent nodes, makes it absolute. Each agent node
+/// whose child declares project_dir must pass that resolved value, or the
+/// child keeps the root run's checkout.
+#[test]
+fn step_runner_agents_are_seated_in_the_resolved_project_dir() {
+    if !tools_available() || !jq_available() {
+        return;
+    }
+    let dir = temp_dir("step-runner");
+    write(
+        &dir.0.join("checkout/plans/steps/01-first.md"),
+        "---\ntitle: first\nstatus: pending\n---\nfirst\n",
+    );
+    let state = resolve_step_state(&dir.0, "checkout");
+    let resolved = state["project_dir"].as_str().unwrap();
+    assert!(
+        resolved != "checkout"
+            && resolved.ends_with("checkout")
+            && (resolved.starts_with('/') || Path::new(resolved).is_absolute()),
+        "resolve_step.sh left project_dir unresolved: {resolved}"
+    );
+    let doc = agent_doc("step-runner/graph.yaml");
+    let mut seated = 0;
+    for (id, node) in doc["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("agent") {
+            continue;
+        }
+        seated += 1;
+        let id = id.as_str().unwrap();
+        assert!(
+            declares_project_dir(node["agent"].as_str().unwrap()),
+            "step-runner {id}: the child agent declares no project_dir to seat"
+        );
+        assert_eq!(
+            node["inputs"]["project_dir"].as_str(),
+            Some("{{project_dir}}"),
+            "step-runner {id}: inputs.project_dir"
+        );
+        assert_eq!(
+            rendered_project_dir(node, &state).as_deref(),
+            Some(resolved),
+            "step-runner {id}"
+        );
+    }
+    assert!(seated > 0, "step-runner: no agent node seats a child");
 }
 
 /// Runs a shipped graph script with `state` delivered via GRAPH_STATE_FILE.

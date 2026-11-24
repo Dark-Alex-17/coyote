@@ -6,8 +6,9 @@
 //! cycles against their bounds), `smoke_test.py` (every gate, both sides of
 //! every bound, the fail-open paths, the run-dir resolution) and
 //! `check_session_block.sh` (session block rules plus the variable mirror
-//! against the prose `sisyphus/config.yaml`). Both `audit_graph.py` and
-//! `check_session_block.sh` need the Go `yq` by mikefarah and skip without it.
+//! against the prose `sisyphus/config.yaml`). `audit_graph.py`,
+//! `smoke_test.py` and `check_session_block.sh` need the Go `yq` by mikefarah
+//! and skip without it, or fail when `SISYPHUS_NEXT_REQUIRE_YQ` is set.
 //! Every run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
 //! `SISYPHUS_RUNS_ROOT` at a scratch directory and sets
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or `~/.config/coyote`
@@ -95,15 +96,34 @@ fn python3() -> Option<PathBuf> {
     }
 }
 
-/// `audit_graph.py` and `check_session_block.sh` are written against the Go
-/// `yq` by mikefarah; python-yq has a different syntax, so anything else
-/// skips.
+/// `audit_graph.py`, `smoke_test.py` and `check_session_block.sh` are written
+/// against the Go `yq` by mikefarah; python-yq has a different syntax, so
+/// anything else skips. A non-empty `SISYPHUS_NEXT_REQUIRE_YQ` turns every
+/// skip into a failure, so a lane that installs yq cannot pass by silently
+/// skipping.
 fn mikefarah_yq() -> Option<PathBuf> {
-    let Ok(yq) = which::which("yq") else {
-        eprintln!("skipping: yq not available");
-        return None;
+    let require = std::env::var_os("SISYPHUS_NEXT_REQUIRE_YQ").is_some_and(|v| !v.is_empty());
+    mikefarah_yq_at(which::which("yq").ok(), require)
+}
+
+/// The decision behind `mikefarah_yq` for the `yq` found on `PATH`, if any:
+/// the path when it is the mikefarah build, otherwise a skip, or a panic
+/// with the same reason when `require` is set.
+fn mikefarah_yq_at(found: Option<PathBuf>, require: bool) -> Option<PathBuf> {
+    let skip = |reason: String| {
+        if require {
+            panic!("SISYPHUS_NEXT_REQUIRE_YQ is set: {reason}");
+        }
+        eprintln!("skipping: {reason}");
+        None
     };
-    let version = Command::new(&yq).arg("--version").output().ok()?;
+    let Some(yq) = found else {
+        return skip("yq not available".to_string());
+    };
+    let version = match Command::new(&yq).arg("--version").output() {
+        Ok(version) => version,
+        Err(e) => return skip(format!("yq --version could not run: {e}")),
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&version.stdout),
@@ -112,9 +132,29 @@ fn mikefarah_yq() -> Option<PathBuf> {
     if text.contains("mikefarah") {
         Some(yq)
     } else {
-        eprintln!("skipping: yq is not the mikefarah build");
-        None
+        skip("yq is not the mikefarah build".to_string())
     }
+}
+
+/// A scratch `yq` whose `--version` names python-yq, not the mikefarah build.
+fn python_yq_stub(scratch: &TempDirGuard) -> PathBuf {
+    let stub = scratch.0.join("yq");
+    fs::write(&stub, "#!/bin/sh\necho \"yq 3.4.3\"\n").unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    stub
+}
+
+#[test]
+#[should_panic(expected = "SISYPHUS_NEXT_REQUIRE_YQ is set: yq is not the mikefarah build")]
+fn required_yq_panics_on_a_non_mikefarah_build() {
+    let scratch = scratch_dir("yq-required");
+    mikefarah_yq_at(Some(python_yq_stub(&scratch)), true);
+}
+
+#[test]
+fn optional_yq_skips_a_non_mikefarah_build() {
+    let scratch = scratch_dir("yq-optional");
+    assert_eq!(mikefarah_yq_at(Some(python_yq_stub(&scratch)), false), None);
 }
 
 /// The current `PATH` with `yq_dir` in front, so the battery resolves the
@@ -364,8 +404,10 @@ fn audit_graph_reports_no_problems() {
 #[test]
 fn smoke_battery_passes_every_check() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("smoke");
     let output = battery(&python, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
         .arg("scripts/smoke_test.py")
         .output()
         .unwrap();
@@ -455,6 +497,7 @@ fn smoke_scrub_list_matches_the_wrapper_seam_list() {
 #[test]
 fn smoke_battery_drops_git_config_injected_through_the_environment() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("smoke-git-config");
     let hooks = scratch.0.join("hooks");
     fs::create_dir_all(&hooks).unwrap();
@@ -462,6 +505,7 @@ fn smoke_battery_drops_git_config_injected_through_the_environment() {
     fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     let output = battery(&python, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", &hooks)
@@ -482,6 +526,7 @@ fn smoke_battery_drops_git_config_injected_through_the_environment() {
 #[test]
 fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("smoke-git-global");
     let hooks = scratch.0.join("hooks");
     fs::create_dir_all(&hooks).unwrap();
@@ -495,6 +540,7 @@ fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
     )
     .unwrap();
     let output = battery(&python, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
         .env("GIT_CONFIG_GLOBAL", &global)
         .arg("scripts/smoke_test.py")
         .output()
@@ -513,8 +559,10 @@ fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
 #[test]
 fn smoke_battery_drops_seams_injected_through_the_environment() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("smoke-seams");
     let output = battery(&python, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
         .env("SISYPHUS_GH_REVIEWS_CMD", "exit 7")
         .env("SISYPHUS_GH_CHECKS_CMD", "exit 7")
         .env("SISYPHUS_GH_RESOLVE_CMD", "exit 7")
@@ -1056,7 +1104,7 @@ fn batteries_never_consult_the_user_config_dir() {
 
     let yq = mikefarah_yq();
     if yq.is_none() {
-        eprintln!("skipping: the audit and session legs need the mikefarah yq");
+        eprintln!("skipping: the audit, smoke and session legs need the mikefarah yq");
     }
     let bash = which::which("bash").ok();
     if bash.is_none() {
@@ -1076,19 +1124,20 @@ fn batteries_never_consult_the_user_config_dir() {
             "{}",
             transcript(&audit)
         );
-    }
 
-    let smoke = battery(&python, &scratch)
-        .arg("scripts/smoke_test.py")
-        .output()
-        .unwrap();
-    let smoke_out = String::from_utf8_lossy(&smoke.stdout);
-    assert!(smoke.status.success(), "{}", transcript(&smoke));
-    assert!(
-        !smoke_out.lines().any(|l| l.starts_with("FAIL ")),
-        "{}",
-        transcript(&smoke)
-    );
+        let smoke = battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py")
+            .output()
+            .unwrap();
+        let smoke_out = String::from_utf8_lossy(&smoke.stdout);
+        assert!(smoke.status.success(), "{}", transcript(&smoke));
+        assert!(
+            !smoke_out.lines().any(|l| l.starts_with("FAIL ")),
+            "{}",
+            transcript(&smoke)
+        );
+    }
 
     if let (Some(yq), Some(bash)) = (&yq, &bash) {
         let session = battery(bash, &scratch)
@@ -1455,13 +1504,19 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("adversary").join("scripts"),
         &agents.join("adversary").join("scripts"),
     );
-    // the red-gate rows render the coder's own end_failure template
-    fs::create_dir_all(agents.join("coder")).unwrap();
-    fs::copy(
-        agents_dir().join("coder").join("graph.yaml"),
-        agents.join("coder").join("graph.yaml"),
-    )
-    .unwrap();
+    // the red-gate rows render the coder's own end_failure template, and the
+    // seating rows read every child agent's declared variables
+    for entry in fs::read_dir(agents_dir()).unwrap() {
+        let agent = entry.unwrap().path();
+        for name in ["graph.yaml", "config.yaml"] {
+            let manifest = agent.join(name);
+            if manifest.is_file() {
+                let dest = agents.join(agent.file_name().unwrap());
+                fs::create_dir_all(&dest).unwrap();
+                fs::copy(&manifest, dest.join(name)).unwrap();
+            }
+        }
+    }
     let copy = agents.join(CANDIDATE);
     copy_tree(&candidate_dir(), &copy);
     copy
@@ -1487,11 +1542,14 @@ fn smoke_summary(stdout: &str) -> (usize, usize) {
 #[test]
 fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("tally");
     let copy = scratch_candidate_copy(&scratch);
     let run = |copy: &Path| {
         let mut cmd = battery(&python, &scratch);
-        cmd.current_dir(copy).arg("scripts/smoke_test.py");
+        cmd.current_dir(copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py");
         cmd.output().unwrap()
     };
 
@@ -1777,6 +1835,7 @@ fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// gates.py (`old` must occur exactly once) and requires the battery to fail
 /// with a `FAIL <row>` line.
 fn run_smoke_sabotages(python: &Path, sabotages: &[(&str, &str, &str, &str)]) {
+    let Some(yq) = mikefarah_yq() else { return };
     for &(label, old, new, row) in sabotages {
         let scratch = scratch_dir(&format!("sabotage-{label}"));
         let copy = scratch_candidate_copy(&scratch);
@@ -1790,6 +1849,7 @@ fn run_smoke_sabotages(python: &Path, sabotages: &[(&str, &str, &str, &str)]) {
         fs::write(&gates, text.replacen(old, new, 1)).unwrap();
         let output = battery(python, &scratch)
             .current_dir(&copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
             .arg("scripts/smoke_test.py")
             .output()
             .unwrap();
@@ -3295,7 +3355,7 @@ fn gauntlet_sentinels_are_column_zero_whole_lines_first_match_wins() {
 /// reach the coder, review-gauntlet and step-runner children by inheritance
 /// alone; their `inputs:` lines also carry the default. This pins that
 /// census: exactly those three nodes carry it, and no other agent node
-/// carries `inputs:` at all.
+/// carries a `build_lock` input.
 #[test]
 fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -3325,8 +3385,8 @@ fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
                 seen.push(id);
             }
             None => assert!(
-                node.get("inputs").is_none(),
-                "{id} ({agent}) is outside the recorded build_lock inputs census and must not carry inputs: {node:?}"
+                node["inputs"].get("build_lock").is_none(),
+                "{id} ({agent}) is outside the recorded build_lock inputs census and must not carry a build_lock input: {node:?}"
             ),
         }
     }
