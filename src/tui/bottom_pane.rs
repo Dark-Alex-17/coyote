@@ -695,6 +695,67 @@ mod tests {
         }
     }
 
+    /// Both surfaces list the built-in commands A-Z and then the macros
+    /// A-Z, for the bare sigil and for a typed prefix.
+    #[test]
+    #[serial]
+    fn commands_then_macros_are_each_listed_by_name() {
+        let _guard = TestConfigDirGuard::new("palette-order");
+        for name in ["zz-order-macro", "ab-order-macro", "se-order-macro"] {
+            let path = crate::config::paths::macro_file(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "isolated: false\nsteps:\n  - \".info\"\n").unwrap();
+        }
+        let ordered = |line: &str| -> (Vec<String>, Vec<String>) {
+            let ctx = ctx_with(CommandPrefix::Dot, true);
+            let macros: Vec<(String, String)> = ctx
+                .visible_macro_completions()
+                .into_iter()
+                .map(|(name, description)| (name, description.unwrap_or_default()))
+                .collect();
+            let palette = PaletteState::build(
+                line,
+                ctx.command_prefix(),
+                PaletteSnapshot::from_ctx(&ctx),
+                &macros,
+                Some(&ctx),
+            )
+            .expect("rows")
+            .rows
+            .into_iter()
+            .map(|row| row.value.trim_end().to_string())
+            .collect();
+            let mut completer = ReplCompleter::new(Arc::new(RwLock::new(ctx)));
+            let completer = completer
+                .suggestions_for(line, line.len())
+                .into_iter()
+                .map(|s| s.value.trim_end().to_string())
+                .collect();
+            (palette, completer)
+        };
+        for (line, macros) in [
+            (
+                ".",
+                vec![".ab-order-macro", ".se-order-macro", ".zz-order-macro"],
+            ),
+            (".se", vec![".se-order-macro"]),
+        ] {
+            let (palette, completer) = ordered(line);
+            assert_eq!(palette, completer, "{line:?}");
+            let split = palette.len() - macros.len();
+            let (commands, tail) = palette.split_at(split);
+            assert_eq!(tail, macros.as_slice(), "{line:?}: {palette:?}");
+            assert!(commands.len() > 1, "{line:?}: {palette:?}");
+            let mut sorted = commands.to_vec();
+            sorted.sort();
+            assert_eq!(commands, sorted.as_slice(), "{line:?}");
+            assert!(
+                commands.iter().all(|c| !c.ends_with("-order-macro")),
+                "{line:?}: {palette:?}"
+            );
+        }
+    }
+
     /// A session or an agent cannot be seated on a bare test context
     /// without a config directory, so those states are pinned at the
     /// shared table: the palette's command rows under a snapshot of the

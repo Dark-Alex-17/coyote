@@ -138,11 +138,11 @@ impl ReplCompleter {
     }
 }
 
-/// The commands offered for a typed command token, in the completer's
-/// order. The command palette draws from the same table, so what one
-/// offers the other offers too. A one-character filter (the bare sigil)
-/// admits everything; a longer one is narrowed to the names sharing its
-/// first two characters before the fuzzy match.
+/// The commands offered for a typed command token, sorted by name. The
+/// command palette draws from the same table, so what one offers the
+/// other offers too, in the same order. A one-character filter (the bare
+/// sigil) admits everything; a longer one is narrowed to the names
+/// sharing its first two characters before the fuzzy match.
 pub(crate) fn command_candidates(
     state: StateFlags,
     model_has_reasoning: bool,
@@ -159,11 +159,13 @@ pub(crate) fn command_candidates(
                 && (cmd.name != ".reasoning" || model_has_reasoning)
         })
         .collect();
-    fuzzy_filter(commands, |v| v.name, command_filter)
+    let mut commands = fuzzy_filter(commands, |v| v.name, command_filter);
+    commands.sort_by_key(|cmd| cmd.name);
+    commands
 }
 
 /// The enabled macros offered for a typed command token, as `.name`
-/// rows, narrowed the same way as `command_candidates`.
+/// rows, narrowed and sorted the same way as `command_candidates`.
 pub(crate) fn macro_candidates<D>(
     macros: Vec<(String, D)>,
     command_filter: &str,
@@ -176,7 +178,9 @@ pub(crate) fn macro_candidates<D>(
                 || name.starts_with(command_filter.get(..2).unwrap_or(command_filter))
         })
         .collect();
-    fuzzy_filter(macros, |(name, _)| name.as_str(), command_filter)
+    let mut macros = fuzzy_filter(macros, |(name, _)| name.as_str(), command_filter);
+    macros.sort_by(|(a, _), (b, _)| a.cmp(b));
+    macros
 }
 
 fn with_sigil(name: &str, sigil: char) -> String {
