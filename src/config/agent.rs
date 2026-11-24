@@ -1594,17 +1594,28 @@ fn load_agent_description(name: &str) -> String {
 }
 
 pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
-    if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
-        return config.variables;
+    try_load_agent_variables(name).unwrap_or_default()
+}
+
+/// The variables agent `name` declares in its config.yaml, else in its
+/// graph.yaml, else none. Unlike `load_agent_variables`, a definition file
+/// that exists but cannot be read or parsed is an error, so a caller can
+/// tell a broken agent from one that declares nothing.
+pub fn try_load_agent_variables(name: &str) -> Result<Vec<AgentVariable>> {
+    let config_path = paths::agent_config_file(name);
+    if config_path.exists() {
+        return Ok(AgentConfig::load(&config_path)?.variables);
     }
 
-    if let Ok(contents) = read_to_string(paths::agent_graph_file(name))
-        && let Ok(stub) = serde_yaml::from_str::<AgentVariablesStub>(&contents)
-    {
-        return stub.variables;
+    let graph_path = paths::agent_graph_file(name);
+    if !graph_path.exists() {
+        return Ok(Vec::new());
     }
-
-    Vec::new()
+    let contents = read_to_string(&graph_path)
+        .with_context(|| format!("Failed to read agent graph at '{}'", graph_path.display()))?;
+    let stub: AgentVariablesStub = serde_yaml::from_str(&contents)
+        .with_context(|| format!("Failed to load agent graph at '{}'", graph_path.display()))?;
+    Ok(stub.variables)
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {

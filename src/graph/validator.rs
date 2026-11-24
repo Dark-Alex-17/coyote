@@ -208,6 +208,15 @@ pub(crate) fn rag_driver_error(driver: &str) -> Option<String> {
         .map(|err| err.to_string())
 }
 
+/// Reported in place of every declared-variable check on `agent`: with its
+/// config.yaml unparsable, each key would otherwise read as undeclared.
+fn unparsable_config_error(agent: &str, err: &anyhow::Error) -> String {
+    format!(
+        "config.yaml of agent '{agent}' does not parse, so its declared variables are unknown: \
+         {err:#}"
+    )
+}
+
 impl GraphValidator {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -300,10 +309,16 @@ impl GraphValidator {
             return;
         }
 
-        let declared: Vec<String> = config::load_agent_variables(name)
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
+        let declared: Vec<String> = match config::try_load_agent_variables(name) {
+            Ok(declared) => declared.into_iter().map(|v| v.name).collect(),
+            Err(err) => {
+                result.error(ValidationError::new(format!(
+                    "session.chat.agent '{name}': {}",
+                    unparsable_config_error(name, &err)
+                )));
+                return;
+            }
+        };
         for key in block.chat.variables.keys() {
             if declared.iter().any(|d| d == key) {
                 continue;
@@ -823,8 +838,23 @@ impl GraphValidator {
                     ));
                 }
                 if let Some(inputs) = &a.inputs {
-                    let declared =
-                        (has_config && !has_graph).then(|| config::load_agent_variables(&a.agent));
+                    let declared = if has_config && !has_graph {
+                        match config::try_load_agent_variables(&a.agent) {
+                            Ok(declared) => Some(declared),
+                            Err(err) => {
+                                result.error(ValidationError::with_node(
+                                    node_id,
+                                    format!(
+                                        "agent node '{node_id}': {}",
+                                        unparsable_config_error(&a.agent, &err)
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     for body in
                         super::agent_inputs_errors(&a.agent, declared.as_deref(), inputs.keys())
                     {
@@ -2351,6 +2381,27 @@ mod tests {
             ]
         );
         assert!(result.errors[0].message.is_ascii());
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_variables_on_an_unparsable_config_report_the_parse_error_once() {
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
+        materialize_config_agent_with("helper", "name: [unclosed\n");
+        let graph = session_graph(delegating_session_block(
+            "helper",
+            &[("tone", "x"), ("pace", "y")],
+        ));
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [format!(
+                "session.chat.agent 'helper': {}",
+                unparsable_config_body("helper")
+            )]
+        );
     }
 
     #[test]
@@ -5199,7 +5250,7 @@ mod tests {
     }
 
     fn materialize_config_only_agent(name: &str) {
-        materialize_config_agent_with(name, "");
+        materialize_config_agent_with(name, &format!("name: {name}\n"));
     }
 
     fn materialize_graph_agent(name: &str) {
@@ -5261,6 +5312,40 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(result.is_valid(), "{:?}", result.errors);
+    }
+
+    /// The error body for agent `name` whose config.yaml is `name: [unclosed`.
+    fn unparsable_config_body(name: &str) -> String {
+        format!(
+            "config.yaml of agent '{name}' does not parse, so its declared variables are unknown: \
+             Failed to load agent config at '{}': name: invalid type: sequence, expected a \
+             string at line 1 column 7",
+            paths::agent_config_file(name).display()
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_on_an_unparsable_config_report_the_parse_error_once() {
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
+        materialize_config_agent_with("plain-agent", "name: [unclosed\n");
+        let node = agent_node_with_inputs(
+            "a",
+            "plain-agent",
+            &[("project_dir", "{{x}}"), ("worktree", "{{x}}")],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [format!(
+                "agent node 'a': {}",
+                unparsable_config_body("plain-agent")
+            )]
+        );
+        assert_eq!(result.errors[0].node_id.as_deref(), Some("a"));
     }
 
     #[test]
