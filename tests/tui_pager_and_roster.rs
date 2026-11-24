@@ -4870,7 +4870,9 @@ mod footer_counts_help_popup_completion_and_scroll {
         write_spawning_family(&dir, &boss, &kid, &grandkid);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        let idle = footer(&flipped_frame(&mut pty));
+        let (_, idle_frame) =
+            frame_until(&mut pty, Duration::from_secs(20), |f| f.contains("agents"));
+        let idle = footer(&idle_frame);
         assert!(idle.contains("agents0"), "idle footer: {idle:?}");
 
         pty.send(b".agent boss\r").unwrap();
