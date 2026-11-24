@@ -41,8 +41,10 @@ pub(crate) const PROPAGATION_NODE_TABLE_VERSION: u64 = 1;
 
 pub(crate) const PROPAGATION_NODE_TABLE_FILE: &str = "propagation-nodes.json";
 /// The shortest gap between two rounds of path requests for the configured propagation
-/// nodes.
-pub(crate) const CONFIGURED_NODE_ASK_GAP: Duration = Duration::from_secs(60);
+/// nodes, and how often a round runs while one is not filed: six path-request waits, so a
+/// listed node that never answers costs one request per 30 s, not one per post.
+pub(crate) const CONFIGURED_NODE_ASK_GAP: Duration =
+    Duration::from_secs(crate::mesh::announce::PATH_REQUEST_TIMEOUT.as_secs() * 6);
 
 /// `propagation-nodes.json` whole: the version first, then the nodes.
 #[derive(Serialize, Deserialize)]
@@ -565,6 +567,12 @@ impl ConfiguredPropagationNodes {
         }
         *last_round = Some(now);
         Some(ResolvingRound(&self.resolving))
+    }
+
+    /// Forgets when the latest round began, as `CONFIGURED_NODE_ASK_GAP` passing does.
+    #[cfg(test)]
+    pub(crate) fn forget_last_round(&self) {
+        *self.last_round.lock() = None;
     }
 
     /// Whether `hash` is unresolved for the first time in this run, so it is logged once.
@@ -1472,5 +1480,56 @@ mod tests {
 
         assert!(configured.first_telling(&unresolved));
         assert!(!configured.first_telling(&unresolved));
+    }
+
+    /// An announce for a configured hash files it whenever it arrives, outside any round
+    /// of path requests: a plain announce, or a path response for a node not on file (a
+    /// sibling session's request answered through the same rnsd). A path response never
+    /// revives the configured node's aged-out record.
+    #[test]
+    fn an_announce_for_a_configured_node_files_it_outside_a_request() {
+        let table = PropagationNodeTable::new();
+        let pn = desc("propagation");
+        let key = pn.address_hash.to_hex_string();
+        table.pin(std::slice::from_ref(&key));
+        let now = SystemTime::now();
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, true, now));
+        assert!(
+            table.holds(&key, now),
+            "a path response for a node not on file"
+        );
+
+        let aged = now + PROPAGATION_NODE_TTL + Duration::from_secs(1);
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, true, aged));
+        assert!(!table.holds(&key, aged), "a path response never revives it");
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, aged));
+        assert!(table.holds(&key, aged), "its own announce does");
+    }
+
+    /// A configured node that does not answer is asked for at most once per 30 s, six
+    /// path-request waits, and asked for again once that has passed.
+    #[test]
+    fn a_configured_node_is_asked_for_again_every_thirty_seconds() {
+        assert_eq!(CONFIGURED_NODE_ASK_GAP, Duration::from_secs(30));
+        let table = PropagationNodeTable::new();
+        table.observe(node(true), 1, SystemTime::now());
+        let configured = ConfiguredPropagationNodes::new(vec!["ab".repeat(16)]);
+        assert_eq!(
+            configured.missing(&table, SystemTime::now()).len(),
+            1,
+            "strangers filed"
+        );
+        let t0 = Instant::now();
+        drop(configured.begin_round(t0).expect("the first round"));
+        assert!(
+            configured
+                .begin_round(t0 + Duration::from_secs(29))
+                .is_none()
+        );
+        assert!(
+            configured
+                .begin_round(t0 + Duration::from_secs(30))
+                .is_some()
+        );
     }
 }

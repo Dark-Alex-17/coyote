@@ -65,7 +65,9 @@ pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
 };
-pub(crate) use propagation_nodes::{NodePurpose, PROPAGATION_NODE_TTL, PropagationNodeRecord};
+pub(crate) use propagation_nodes::{
+    CONFIGURED_NODE_ASK_GAP, NodePurpose, PROPAGATION_NODE_TTL, PropagationNodeRecord,
+};
 pub(crate) use request::{RequestOptions, redact_hashes, short};
 pub(crate) use routes::with_progress;
 

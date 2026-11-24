@@ -10827,7 +10827,8 @@ fn the_configured_propagation_nodes_key_is_described_on_the_deployment_and_confi
         "To skip that wait of up to an hour, list the node's destination hash under [`mesh.propagation_nodes`](Mesh-Configuration#propagation_nodes)",
         "the path response carries the node's announce, which files the node as if it had been heard, and the join-time sync then runs",
         "is logged once per run and not filed",
-        "`(configured, not resolved yet)`",
+        "`(configured, not resolved yet; asking again every 30 s)`",
+        "At join, and again every 30 s while a listed node is not filed, whatever strangers' nodes are, Coyote sends a path request for each listed hash it does not hold",
     ] {
         assert!(
             nodes.contains(needle),
@@ -11161,6 +11162,24 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
     assert!(
         status.contains(needle),
         "Mesh-Commands.md's `.mesh status` section does not say {needle:?}"
+    );
+}
+
+/// The commands page says a failed sync is printed once per node, as
+/// `SyncSchedule::tell_failure` keeps it.
+#[test]
+fn the_commands_page_says_a_sync_failure_once_per_node() {
+    let idle = read(repo_root().join("src/mesh/idle.rs"));
+    assert!(
+        idle.contains("fn tell_failure(&mut self, node: &str, key: String) -> bool"),
+        "src/mesh/idle.rs no longer keeps the failures told per node"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    let needle = "a sync that failed prints `[mesh:propagation] sync from <node8> failed: <reason>` once per node, however the syncs alternate between nodes";
+    assert!(
+        commands.contains(needle),
+        "Mesh-Commands.md does not say {needle:?}"
     );
 }
 

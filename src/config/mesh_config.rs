@@ -134,7 +134,7 @@ pub struct MeshConfig {
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,
     /// Destination hashes of propagation nodes this node asks the mesh for by path request
-    /// at join, and whenever its table holds none at a post or a sync, so it need not wait
+    /// at join, and every 30 s while one is not filed, so it need not wait
     /// for their next announce: a team relay that is also a propagation node, or a first
     /// run before the node's hourly announce. These are pinned: never evicted from the
     /// node table and not counted against its cap of 32 other nodes, and while one is

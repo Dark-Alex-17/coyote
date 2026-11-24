@@ -13845,7 +13845,10 @@ fn propagation_node_rows(
     for (i, hash) in unresolved.into_iter().enumerate() {
         rows.push((
             format!("propagation_nodes[{}]", filed.len() + i),
-            format!("{hash} (configured, not resolved yet)"),
+            format!(
+                "{hash} (configured, not resolved yet; asking again every {} s)",
+                crate::mesh::CONFIGURED_NODE_ASK_GAP.as_secs()
+            ),
         ));
     }
     rows
@@ -18379,7 +18382,7 @@ mod tests {
             rows[2],
             (
                 "propagation_nodes[2]".to_string(),
-                format!("{unresolved_hex} (configured, not resolved yet)")
+                format!("{unresolved_hex} (configured, not resolved yet; asking again every 30 s)")
             ),
             "a configured hash not filed is listed and flagged"
         );
@@ -18387,7 +18390,7 @@ mod tests {
             propagation_node_rows(Vec::new(), std::slice::from_ref(&unresolved_hex), now),
             vec![(
                 "propagation_nodes[0]".to_string(),
-                format!("{unresolved_hex} (configured, not resolved yet)")
+                format!("{unresolved_hex} (configured, not resolved yet; asking again every 30 s)")
             )],
             "with nothing filed the configured hash still shows, in place of none heard yet"
         );

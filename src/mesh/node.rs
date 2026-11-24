@@ -62,8 +62,8 @@ use crate::mesh::propagation::{
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::{
-    ConfiguredPropagationNodes, NodePurpose, PROPAGATION_NODE_TABLE_FILE, PersistTrigger,
-    PropagationNodeTable,
+    CONFIGURED_NODE_ASK_GAP, ConfiguredPropagationNodes, NodePurpose, PROPAGATION_NODE_TABLE_FILE,
+    PersistTrigger, PropagationNodeTable,
 };
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(all(test, unix))]
@@ -2073,9 +2073,11 @@ impl MeshRuntime {
     }
 
     /// The propagation node a post goes to (`select_for_posting`), or a fetch asks
-    /// (`select`). When none is filed, one round of path requests for the configured
-    /// nodes the table lacks starts in the background, so the next post or sync finds
-    /// one, and the error is returned at once: no caller waits on the mesh for it.
+    /// (`select`). While any configured node is not filed, whatever else is, one round of
+    /// path requests for the ones the table lacks starts in the background (at most one
+    /// per `CONFIGURED_NODE_ASK_GAP`), so the next post or sync finds it: on a public hub
+    /// strangers' nodes are filed and would otherwise mask a pin that has not answered
+    /// yet. Nothing waits on the round: this pick is made from the table as it stands.
     pub(crate) async fn propagation_node_for(
         &self,
         purpose: NodePurpose,
@@ -2084,10 +2086,8 @@ impl MeshRuntime {
             NodePurpose::Posting => self.propagation_nodes.select_for_posting(),
             NodePurpose::Fetching => self.propagation_nodes.select(),
         };
-        if selected.is_err() {
-            self.resolve_configured_propagation_nodes_in_background(|| {})
-                .await;
-        }
+        self.resolve_configured_propagation_nodes_in_background(|| {})
+            .await;
         selected
     }
 
@@ -5171,6 +5171,36 @@ async fn request_path_to_node<E>(
 /// once per run and not filed. Whether a node was filed; `false` at once while another
 /// round is out or one began within `CONFIGURED_NODE_ASK_GAP`, and as soon as `cancel`
 /// fires.
+/// Asks for the configured propagation nodes the table lacks at join and then every
+/// `every` while any is not filed, whatever else is filed: a first path request can go
+/// unanswered (a sibling session on the same rnsd asked within the same moment, or the
+/// node was briefly unreachable), and no other trigger is sure to come within the hour.
+/// A round that files one starts a sync. Ends with the node.
+async fn ask_for_configured_nodes(
+    slot: Weak<MeshSlot>,
+    runtime: Weak<MeshRuntime>,
+    cancel: CancellationToken,
+    every: Duration,
+) {
+    loop {
+        let Some(node) = runtime.upgrade() else {
+            return;
+        };
+        let slot = slot.clone();
+        node.resolve_configured_propagation_nodes_in_background(move || {
+            if let Some(slot) = slot.upgrade() {
+                slot.request_sync();
+            }
+        })
+        .await;
+        drop(node);
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = sleep(every) => {}
+        }
+    }
+}
+
 async fn resolve_configured_nodes(
     transport: &Transport,
     configured: &ConfiguredPropagationNodes,
@@ -5690,19 +5720,12 @@ impl MeshSlot {
         )));
         self.request_sync();
         // `install` cannot wait on the transport lock the round needs, so a task starts it.
-        let (slot, joined) = (Arc::downgrade(self), Arc::downgrade(&runtime));
-        tokio::spawn(async move {
-            let Some(runtime) = joined.upgrade() else {
-                return;
-            };
-            runtime
-                .resolve_configured_propagation_nodes_in_background(move || {
-                    if let Some(slot) = slot.upgrade() {
-                        slot.request_sync();
-                    }
-                })
-                .await;
-        });
+        runtime.register_task(tokio::spawn(ask_for_configured_nodes(
+            Arc::downgrade(self),
+            Arc::downgrade(&runtime),
+            runtime.cancellation_token(),
+            CONFIGURED_NODE_ASK_GAP,
+        )));
         Ok(())
     }
 
@@ -21750,8 +21773,102 @@ mod tests {
             }
         }
 
+        /// On a public hub strangers' nodes are filed while the configured one is not: a
+        /// pick still asks for the configured node, which, once it answers, is filed and is
+        /// then the only node posted to and fetched from (the sibling-start race, where the
+        /// first path request went unanswered).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_pick_with_only_strangers_filed_asks_for_the_configured_node() {
+            use crate::mesh::propagation::{
+                PropagationNode, pn_announce_app_data, propagation_node_destination,
+            };
+
+            let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            node.transport
+                .set_destination_announce_app_data(
+                    &node.dest,
+                    Some(pn_announce_app_data(true, 0, 256)),
+                )
+                .await;
+            let hex = node.desc.address_hash.to_hex_string();
+            let tmp = TempDir::new("node-configured-pn-strangers");
+            let runtime = start_with_configured(&tmp, node.port, std::slice::from_ref(&hex)).await;
+            let stranger_desc = propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            );
+            let stranger =
+                PropagationNode::from_announce(&stranger_desc, &pn_announce_app_data(true, 0, 256))
+                    .unwrap();
+            runtime
+                .propagation_nodes()
+                .observe(stranger, 1, SystemTime::now());
+
+            for purpose in [NodePurpose::Posting, NodePurpose::Fetching] {
+                let picked = runtime.propagation_node_for(purpose).await.unwrap();
+                assert_eq!(
+                    picked.destination.address_hash, stranger_desc.address_hash,
+                    "the configured node is not filed yet: {purpose:?}"
+                );
+            }
+            wait_until("the configured node to be filed", || {
+                runtime.propagation_nodes().holds(&hex, SystemTime::now())
+            })
+            .await;
+            for purpose in [NodePurpose::Posting, NodePurpose::Fetching] {
+                let picked = runtime.propagation_node_for(purpose).await.unwrap();
+                assert_eq!(
+                    picked.destination.address_hash.to_hex_string(),
+                    hex,
+                    "once filed the configured node is the only target: {purpose:?}"
+                );
+            }
+
+            stop(&runtime).await;
+            node.stop().await;
+        }
+
+        /// A configured node whose first path request went unanswered is asked for again
+        /// a period later with nothing typed and nothing posted, and filed when it answers.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_configured_node_that_did_not_answer_is_asked_for_again() {
+            use crate::mesh::propagation::pn_announce_app_data;
+
+            let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let hex = node.desc.address_hash.to_hex_string();
+            let tmp = TempDir::new("node-configured-pn-asked-again");
+            let runtime = start_with_configured(&tmp, node.port, std::slice::from_ref(&hex)).await;
+            let cancel = CancellationToken::new();
+            let every = Duration::from_millis(500);
+            let asking = tokio::spawn(ask_for_configured_nodes(
+                Weak::new(),
+                Arc::downgrade(&runtime),
+                cancel.clone(),
+                every,
+            ));
+            // Its path response carries no propagation node's announce yet: not filed.
+            sleep(PATH_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            assert!(!runtime.propagation_nodes().holds(&hex, SystemTime::now()));
+
+            node.transport
+                .set_destination_announce_app_data(
+                    &node.dest,
+                    Some(pn_announce_app_data(true, 0, 256)),
+                )
+                .await;
+            runtime.configured_propagation_nodes.forget_last_round();
+            wait_until("the configured node to be filed on a later round", || {
+                runtime.propagation_nodes().holds(&hex, SystemTime::now())
+            })
+            .await;
+
+            cancel.cancel();
+            asking.await.unwrap();
+            stop(&runtime).await;
+            node.stop().await;
+        }
+
         /// Every post path and the idle sync pick their node through
-        /// `propagation_node_for`, so each asks for the configured nodes when none is
+        /// `propagation_node_for`, so each asks for the configured nodes while one is not
         /// filed; only the farewell, sent while the node leaves, picks without asking,
         /// beside the helper itself.
         #[test]

@@ -39,6 +39,9 @@ pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 /// body or filled a page. The last case keeps this wait while fetches deliver something
 /// and doubles it from here while they do not.
 pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
+
+/// How many nodes the sync remembers failures of, so the prompt line is said once a run.
+const FAILURES_TOLD: usize = 64;
 /// How often the automatic sync logs that one propagation node stays silent: no link up
 /// to it, or no answer to the list request. The prompt line is shown only on the first
 /// silence of a run.
@@ -285,7 +288,11 @@ pub(crate) struct SyncSchedule {
     pending: bool,
     stopped: bool,
     backoff: Option<Duration>,
-    last_failure: Option<String>,
+    /// The last failure said for each node, so a node that keeps failing the same way is
+    /// said once however the syncs alternate between nodes, and again when it fails
+    /// another way; a fetch from a node that succeeds forgets its. At most
+    /// `FAILURES_TOLD` nodes are kept.
+    told_failures: BTreeMap<String, String>,
     /// When each node's silence was last logged, keyed by lower-hex destination hash.
     /// Entries older than `SILENCE_LOG_PERIOD` are dropped before each insert, so the map
     /// holds at most the nodes that went silent within the last period.
@@ -305,7 +312,7 @@ impl SyncSchedule {
             pending: false,
             stopped: false,
             backoff: None,
-            last_failure: None,
+            told_failures: BTreeMap::new(),
             silence_logged: BTreeMap::new(),
         }
     }
@@ -414,7 +421,7 @@ impl SyncSchedule {
                 } else {
                     self.retry_backed_off(now);
                 }
-                self.last_failure = None;
+                self.told_failures.remove(&node);
                 (report.received > 0).then(|| synced_line(report))
             }
             Err(FetchError::NoPropagationNode) => {
@@ -453,18 +460,30 @@ impl SyncSchedule {
                 } else {
                     text.clone()
                 };
-                if self.last_failure.as_deref() == Some(key.as_str()) {
-                    None
-                } else {
-                    self.last_failure = Some(key);
-                    Some(text)
-                }
+                self.tell_failure(&node, key).then_some(text)
             }
         };
         if std::mem::take(&mut self.pending) {
             self.due_at = Some(now);
         }
         line
+    }
+
+    /// Whether the failure `key` from `node` differs from the last one said for that
+    /// node, noting it if so. Past `FAILURES_TOLD` nodes a new node's failure is still
+    /// said, and not kept.
+    fn tell_failure(&mut self, node: &str, key: String) -> bool {
+        if let Some(told) = self.told_failures.get_mut(node) {
+            if *told == key {
+                return false;
+            }
+            *told = key;
+            return true;
+        }
+        if self.told_failures.len() < FAILURES_TOLD {
+            self.told_failures.insert(node.to_string(), key);
+        }
+        true
     }
 
     fn log_silence(&mut self, node: &str, err: &FetchError, now: Instant) {
@@ -1423,6 +1442,33 @@ mod tests {
                 .is_some(),
             "a success in between makes the failure news again"
         );
+    }
+
+    /// Two strangers' nodes that each fail the same way, picked by turns, are each said
+    /// once, not on every turn; a success from one makes its next failure news.
+    #[test]
+    fn a_failure_is_said_once_per_node_however_the_picks_alternate() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(300, true);
+        let first = "e4cfe9b4".repeat(4);
+        let second = "38557f0a".repeat(4);
+        let fail = |schedule: &mut SyncSchedule, node: &str| {
+            schedule.started(node.to_string());
+            schedule.finished(&link_failure("the link did not come up"), now)
+        };
+        assert!(fail(&mut schedule, &first).is_some());
+        assert!(fail(&mut schedule, &second).is_some());
+        for _ in 0..3 {
+            assert_eq!(fail(&mut schedule, &first), None, "said once per node");
+            assert_eq!(fail(&mut schedule, &second), None, "said once per node");
+        }
+        schedule.started(first.clone());
+        assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), now), None);
+        assert!(
+            fail(&mut schedule, &first).is_some(),
+            "a success makes that node's failure news again"
+        );
+        assert_eq!(fail(&mut schedule, &second), None);
     }
 
     #[test]
