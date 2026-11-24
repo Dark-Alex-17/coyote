@@ -111,10 +111,57 @@ pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
 /// may not pass them.
 pub(crate) const RESERVED_STATE_KEYS: [&str; 2] = ["initial_prompt", "previous_turns"];
 
+/// What is wrong with an agent node's `inputs:` keys, one message body per
+/// problem, without the location prefix. The validator reports them all and
+/// the runtime the first, so both check in this order: reserved keys, then,
+/// for a config agent (`config_declared` holds its declared variables), an
+/// empty map or keys it does not declare. A reserved key is reported only as
+/// reserved.
+pub(crate) fn agent_inputs_errors<'a>(
+    agent: &str,
+    config_declared: Option<&[AgentVariable]>,
+    keys: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let keys: Vec<&String> = keys.into_iter().collect();
+    let mut errors: Vec<String> = RESERVED_STATE_KEYS
+        .into_iter()
+        .filter(|reserved| keys.iter().any(|key| key == reserved))
+        .map(|key| {
+            let seeded_from = if key == "initial_prompt" {
+                " from `prompt:`"
+            } else {
+                ""
+            };
+            format!("`inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})")
+        })
+        .collect();
+    let Some(declared) = config_declared else {
+        return errors;
+    };
+    if keys.is_empty() {
+        errors.push(format!(
+            "`inputs:` is empty and agent '{agent}' has no graph.yaml; {CONFIG_INPUTS_RULE}"
+        ));
+    }
+    let unreserved = keys
+        .into_iter()
+        .filter(|key| !RESERVED_STATE_KEYS.contains(&key.as_str()));
+    let undeclared = undeclared_config_inputs(declared, unreserved);
+    if !undeclared.is_empty() {
+        errors.push(format!(
+            "`inputs` names variable(s) agent '{agent}' does not declare: {}; {CONFIG_INPUTS_RULE}",
+            undeclared.join(", ")
+        ));
+    }
+    errors
+}
+
+const CONFIG_INPUTS_RULE: &str = "a config agent takes only its declared variables as `inputs:`";
+
 /// The agent-node `inputs` keys a config agent (config.yaml, no graph.yaml)
 /// refuses, sorted: it has no graph state, so an input can only be seated as
 /// one of its declared variables.
-pub(crate) fn undeclared_config_inputs<'a>(
+fn undeclared_config_inputs<'a>(
     declared: &[AgentVariable],
     keys: impl IntoIterator<Item = &'a String>,
 ) -> Vec<String> {
@@ -191,6 +238,29 @@ mod tests {
         );
         assert!(undeclared_config_inputs(&declared, &keys[1..2]).is_empty());
         assert_eq!(undeclared_config_inputs(&[], &keys[1..2]), ["project_dir"]);
+    }
+
+    #[test]
+    fn a_reserved_key_on_a_config_agent_is_reported_as_reserved_only() {
+        let declared = [AgentVariable {
+            name: "project_dir".to_string(),
+            description: String::new(),
+            default: None,
+            value: String::new(),
+        }];
+        let keys = ["initial_prompt", "worktree"].map(String::from);
+
+        assert_eq!(
+            agent_inputs_errors("plain", Some(&declared), &keys),
+            [
+                "`inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                    .to_string(),
+                format!(
+                    "`inputs` names variable(s) agent 'plain' does not declare: worktree; \
+                     {CONFIG_INPUTS_RULE}"
+                ),
+            ]
+        );
     }
 
     #[test]
