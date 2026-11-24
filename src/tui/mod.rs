@@ -1739,7 +1739,6 @@ impl App {
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
     }
 
-    /// The pager on the root thread with the thread picker open over it.
     fn open_threads(&mut self) {
         self.open_pager(Pager::root());
         self.open_thread_picker();

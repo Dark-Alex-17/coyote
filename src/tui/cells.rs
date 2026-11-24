@@ -1672,7 +1672,6 @@ const WORDMARK: [&str; 5] = [
     r"        |__/             ",
 ];
 
-/// Columns the wordmark takes.
 pub(super) const WORDMARK_WIDTH: usize = 25;
 
 /// Columns the bright band of the startup sweep spans.

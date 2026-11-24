@@ -1336,7 +1336,6 @@ mod tests {
         Rect::new(0, 0, 40, height)
     }
 
-    /// Appends `lines` lines of output to the tool row at `index`.
     fn grow_tool(transcript: &mut Transcript, index: usize, call_id: &str, lines: usize) {
         let tail = transcript
             .cell_mut(index)
@@ -1355,7 +1354,6 @@ mod tests {
         }
     }
 
-    /// Ends the call of the open tool row at `index` and closes the row.
     fn finish_and_close(transcript: &mut Transcript, index: usize) {
         finish_tool(transcript, index);
         transcript.cell_mut(index).unwrap().toggle();
@@ -1602,7 +1600,6 @@ mod tests {
         );
     }
 
-    /// Paging up through a long resumed history reaches its very first
     /// Ctrl+Down with nothing focused picks a row in view, not the oldest
     /// saved call far above, so the next frame lays out only what it shows.
     #[test]
