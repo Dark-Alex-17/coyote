@@ -3070,10 +3070,12 @@ updated_at: 2026-01-02T03:04:05Z
     }
 
     fn removal_logged(name: &str, arm: &str) -> bool {
+        // Anchored on the root's own path component: the temp dirs above it
+        // carry the test's pid, so a bare `<pid>-<start>` substring can match
+        // a different root's message through its parent path.
+        let leaf = format!("{}{name} ({arm}", std::path::MAIN_SEPARATOR);
         info_snapshot().iter().any(|message| {
-            message.contains("Removed child session directory")
-                && message.contains(name)
-                && message.contains(arm)
+            message.starts_with("Removed child session directory") && message.contains(&leaf)
         })
     }
 
