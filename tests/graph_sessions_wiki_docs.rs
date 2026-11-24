@@ -566,12 +566,13 @@ fn with_placeholders(literal: &str) -> String {
         .replace("{declared_text}", "declared: a, b, c")
 }
 
-/// The literals of a `pub const NAME: [&str; N] = [...]` in `source`.
+/// The literals of a `const NAME: [&str; N] = [...]` in `source`, whatever
+/// its visibility.
 fn const_str_array(source: &str, name: &str) -> Vec<String> {
-    let head = format!("pub const {name}: [&str; ");
+    let head = format!("const {name}: [&str; ");
     let start = source
         .find(&head)
-        .unwrap_or_else(|| panic!("src/graph/validator.rs declares {name}"));
+        .unwrap_or_else(|| panic!("the source declares {name}"));
     let body = &source[start..];
     let end = body
         .find("];")
@@ -3311,10 +3312,21 @@ fn inputs_section_quotes_the_shared_inputs_errors() {
     };
     let reserved = "`inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})";
     quoted(&bodies, reserved);
-    quoted(&bodies, " from `prompt:`");
-    let fragments = [
-        "`inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)".to_string(),
-        "`inputs.previous_turns` is reserved (the dispatcher seeds it)".to_string(),
+    let seeded_from = quoted(&bodies, " from `prompt:`");
+    let mut fragments: Vec<String> = const_str_array(&graph, "RESERVED_STATE_KEYS")
+        .into_iter()
+        .map(|key| {
+            let seeded = if key == "initial_prompt" {
+                seeded_from.as_str()
+            } else {
+                ""
+            };
+            reserved
+                .replace("{key}", &key)
+                .replace("{seeded_from}", seeded)
+        })
+        .collect();
+    fragments.extend([
         quoted(
             &bodies,
             "`inputs:` is empty and agent '{agent}' has no graph.yaml; {CONFIG_INPUTS_RULE}",
@@ -3327,7 +3339,7 @@ fn inputs_section_quotes_the_shared_inputs_errors() {
             &unparsable,
             "config.yaml of agent '{agent}' does not parse, so its declared variables are unknown: {err:#}",
         ),
-    ];
+    ]);
     for (label, source, prefix) in [
         (
             "validator.rs",
@@ -3368,6 +3380,84 @@ fn inputs_section_quotes_the_shared_inputs_errors() {
         assert!(
             !flat_page.contains(stale),
             "{SENTINEL_PAGE} still says {stale:?}"
+        );
+    }
+}
+
+/// The `///` doc comment directly above `head` in `source`, flattened.
+fn doc_comment(source: &str, head: &str) -> String {
+    let start = source
+        .find(head)
+        .unwrap_or_else(|| panic!("the source defines {head}"));
+    let mut lines: Vec<&str> = source[..start]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .take_while(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches("///"))
+        .collect();
+    lines.reverse();
+    flat(&lines.join(" "))
+}
+
+/// The `inputs:` subsection states how a child's variables are seated: it
+/// inherits the parent's, declared inputs override them, and a resume
+/// re-resolves them in the order `resolve_resumed_variables` documents and
+/// re-renders the instructions from them.
+#[test]
+fn inputs_section_states_inheritance_and_the_resume_order() {
+    let agents = src(&["function", "agents.rs"]);
+    let doc = doc_comment(&agents, "\nfn resolve_resumed_variables(");
+    let order = doc
+        .split_once("the order is: ")
+        .and_then(|(_, rest)| rest.split_once(", the last resort"))
+        .map(|(order, _)| format!("the order is: {order}"))
+        .unwrap_or_else(|| panic!("the resolve_resumed_variables doc names the order: {doc}"));
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let inputs = flat(&section(SENTINEL_PAGE, &page, INPUTS_HEADING));
+    for needle in [
+        "A child inherits the variables its parent runs with",
+        "overriding the inherited value",
+        order.as_str(),
+        "is read as all explicit",
+        "its instructions are re-rendered from the re-resolved values",
+    ] {
+        assert!(
+            inputs.contains(needle),
+            "the inputs section does not say {needle:?}"
+        );
+    }
+    assert!(
+        !inputs.contains("nothing about `inputs` persists past the child's executor start"),
+        "the inputs section still says no part of `inputs` outlives the child's start"
+    );
+}
+
+/// The `inputs:` comment on the agent node in graph.example.yaml teaches
+/// the variable side too: inheritance, seating and the resume override.
+#[test]
+fn graph_example_inputs_comment_covers_variables_and_resume() {
+    let example = read(repo_root().join("graph.example.yaml"));
+    let start = example
+        .find("    # inputs:")
+        .expect("graph.example.yaml has a commented `inputs:` on its agent node");
+    let text: Vec<&str> = example[start..]
+        .lines()
+        .map(str::trim_start)
+        .take_while(|line| line.starts_with('#'))
+        .filter_map(|line| line[1..].split_once('#').map(|(_, text)| text))
+        .collect();
+    let comment = flat(&text.join(" "));
+    for needle in [
+        "A child inherits the variables its parent runs with",
+        "is also seated as that variable",
+        "the inputs win over the values the session stored",
+    ] {
+        assert!(
+            comment.contains(needle),
+            "the graph.example.yaml `inputs:` comment does not say {needle:?}:\n{comment}"
         );
     }
 }

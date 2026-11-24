@@ -427,11 +427,14 @@ nodes:
     #                          # becomes a string. `initial_prompt` (always seeded from
     #                          # `prompt:`) and `previous_turns` (seeded under a session)
     #                          # are reserved and rejected as input keys.
+    #                          # A child inherits the variables its parent runs with.
     #                          # A key the child declares under `variables:` is also
-    #                          # seated as that variable (its LLM_AGENT_VAR_* env, and
-    #                          # what its own children inherit). On a child resumed on
-    #                          # its `agent_session`, the inputs win over the values the
-    #                          # session stored. A config agent (no
+    #                          # seated as that variable, overriding the inherited value
+    #                          # (its LLM_AGENT_VAR_* env, and what its own children
+    #                          # inherit). On a child resumed on its `agent_session`,
+    #                          # the inputs win over the values the session stored, and
+    #                          # its instructions are re-rendered from them.
+    #                          # A config agent (no
     #                          # graph.yaml) has no graph state, so it takes only its
     #                          # declared variables as `inputs:`; any other key, or an
     #                          # empty map, is a load-time error. `inputs` values count

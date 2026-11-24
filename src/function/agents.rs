@@ -1781,11 +1781,11 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
     keys
 }
 
-/// The declared variables a resumed child is seated with. Per variable:
-/// this run's explicit value, else the stored explicit one, else the
-/// inherited one, else the declared default, else the stored value, the
-/// last resort for a variable nothing else gives. One that none of them
-/// gives is left out.
+/// The declared variables a resumed child is seated with. Per variable,
+/// the order is: this run's explicit value, then the stored explicit
+/// value, then the inherited value, then the declared default, then the
+/// stored value, the last resort for a variable nothing else gives. One
+/// that none of them gives is left out.
 fn resolve_resumed_variables(
     declared: &[AgentVariable],
     explicit: &AgentVariables,
