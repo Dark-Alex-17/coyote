@@ -13,8 +13,9 @@ use std::{env, fs, iter, process};
 use super::fake_llm::{FakeLlm, Reply};
 use super::pty::{Pty, detached, strip_ansi};
 
-/// Covers the keyboard-enhancement probe's two-second wait in a test that
-/// leaves it unanswered (see `Pty::leave_keyboard_probe_unanswered`).
+/// The default bound for a pty wait, sized for a loaded host. One case it
+/// covers is the keyboard-enhancement probe's two-second wait in a test
+/// that leaves it unanswered (`Pty::leave_keyboard_probe_unanswered`).
 pub const PTY_DEADLINE: Duration = Duration::from_secs(20);
 /// A pseudo-terminal never answers a cursor-position query, and the plain
 /// REPL sends three before each prompt reads a key (its own row resync,
@@ -176,9 +177,10 @@ pub fn spawn_repl_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, s
 
 /// Waits for the plain REPL to draw `prompt` at or after raw offset
 /// `since`, then settles so reedline is reading keys in raw mode, and
-/// returns the raw offset after the settle. `since` must be taken after
-/// the previous command's output was seen: the echo of the typed line can
-/// carry the prompt text too.
+/// returns the raw offset after the settle. `since` must be no later than
+/// the start of the output that precedes the prompt, or a prompt read in
+/// the same chunk as that output is skipped; it must also be past the echo
+/// of the typed line, which repaints the prompt text with every key.
 pub fn wait_for_repl_prompt(pty: &mut Pty, prompt: &str, since: usize) -> usize {
     pty.wait_for_after(prompt, since, REPL_PROMPT_DEADLINE)
         .unwrap_or_else(|err| panic!("the REPL prompt {prompt:?} was not drawn: {err}"));

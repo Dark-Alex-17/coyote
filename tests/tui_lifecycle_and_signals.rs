@@ -1528,7 +1528,8 @@ mod binary_exit {
         repl.send(b"markdown please m9d\r").unwrap();
         repl.wait_for_after("fenced_f7p", from, PTY_DEADLINE)
             .unwrap();
-        let replied = repl.raw().len();
+        let replied = find(repl.raw(), b"fenced_f7p", from)
+            .expect("the reply was seen in the stripped transcript but not in the raw bytes");
         wait_for_repl_prompt(&mut repl, "fake-model)>", replied);
         let repl_rows = text_rows(&repl.raw()[from..]);
         repl.send(b"\x04").unwrap();

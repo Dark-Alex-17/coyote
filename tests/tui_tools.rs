@@ -655,11 +655,11 @@ mod binary_tools {
         pty.read_for(Duration::from_millis(400));
         pty.send(b"\x1b[B").unwrap();
         pty.read_for(Duration::from_millis(400));
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
-        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap().trim(),
             "1",
@@ -673,7 +673,7 @@ mod binary_tools {
         );
         assert_eq!(fake.served(), 2, "{transcript}");
 
-        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+        wait_for_repl_prompt(&mut pty, "fake-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -842,6 +842,7 @@ mod binary_tools {
         // Backspace takes the `y` back; Enter then answers with the default.
         pty.send(b"\x7f").unwrap();
         pty.read_for(Duration::from_millis(300));
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         let settled = wait_for_squeezed(
             &mut pty,
@@ -862,8 +863,7 @@ mod binary_tools {
             "the plain REPL entered the alternate screen:\n{settled}"
         );
 
-        let declined = pty.raw().len();
-        wait_for_repl_prompt(&mut pty, "dry-model)>", declined);
+        wait_for_repl_prompt(&mut pty, "dry-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -911,11 +911,11 @@ mod binary_tools {
         pty.read_for(Duration::from_millis(400));
         pty.send(TYPED_CUSTOM_ANSWER.as_bytes()).unwrap();
         pty.read_for(Duration::from_millis(400));
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
-        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
             TYPED_CUSTOM_ANSWER,
@@ -946,7 +946,7 @@ mod binary_tools {
          {handed:?}"
         );
 
-        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+        wait_for_repl_prompt(&mut pty, "fake-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1260,11 +1260,11 @@ def run(out: str) -> str:
         );
         pty.send(b"typed-e0d").unwrap();
         pty.read_for(Duration::from_millis(300));
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done e0d", "the reply after the tool");
-        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
             "[typed-e0d]",
@@ -1272,7 +1272,7 @@ def run(out: str) -> str:
         );
         assert_eq!(fake.served(), 2, "{transcript}");
 
-        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+        wait_for_repl_prompt(&mut pty, "fake-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1394,17 +1394,17 @@ def run(out: str) -> str:
                 "[{ui}] a tool's checkbox question offers the custom row:\n{asked}"
             );
             pty.read_for(HOTKEY_GAP);
+            let answered = pty.raw().len();
             pty.send(b"\x1b").unwrap();
             wait_for_file(&mut pty, &out, "the tool's recorded answer");
             wait_for_squeezed(&mut pty, "fixture done c3b", "the reply after the tool");
-            let replied = pty.raw().len();
             assert_eq!(
                 fs::read_to_string(&out).unwrap(),
                 "cancelled",
                 "[{ui}] Esc on the checkbox question did not reach the tool as a cancel"
             );
             if ui == "repl" {
-                wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+                wait_for_repl_prompt(&mut pty, "fake-model)>", answered);
                 pty.send(b".exit\r").unwrap();
             } else {
                 pty.read_for(Duration::from_millis(300));
@@ -1990,11 +1990,11 @@ def run(out: str) -> str:
         pty.read_for(Duration::from_millis(400));
         pty.send(b"  ").unwrap();
         pty.read_for(Duration::from_millis(400));
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
-        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
             "cancelled",
@@ -2007,7 +2007,7 @@ def run(out: str) -> str:
         );
         assert_eq!(fake.served(), 2, "{transcript}");
 
-        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+        wait_for_repl_prompt(&mut pty, "fake-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

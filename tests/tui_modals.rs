@@ -840,6 +840,7 @@ mod binary_menus {
         );
         assert_eq!(fake.served(), 1, "[{stdin}] {shown}");
 
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
@@ -859,8 +860,7 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{transcript}"
         );
 
-        let replied = pty.raw().len();
-        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+        wait_for_repl_prompt(&mut pty, "fake-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -923,6 +923,7 @@ mod binary_menus {
             "the keystrokes typed ahead of `Continue?` changed the macros directory"
         );
 
+        let answered = pty.raw().len();
         pty.send(b"\r").unwrap();
         let settled = wait_for_squeezed(
             &mut pty,
@@ -943,8 +944,7 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{settled}"
         );
 
-        let declined = pty.raw().len();
-        wait_for_repl_prompt(&mut pty, "dry-model)>", declined);
+        wait_for_repl_prompt(&mut pty, "dry-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1337,7 +1337,8 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{info}"
         );
 
-        let shown = pty.raw().len();
+        let shown = find(pty.raw(), b"config_file", info_at)
+            .expect("`config_file` was seen in the stripped transcript but not in the raw bytes");
         wait_for_repl_prompt(&mut pty, "vars-agent-p3r>>", shown);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
@@ -1645,13 +1646,13 @@ mod binary_menus {
         );
         pty.read_for(Duration::from_millis(300));
 
+        let answered = pty.raw().len();
         pty.send(b"hush-value-r2p\r").unwrap();
         wait_for_squeezed(
             &mut pty,
             "Secret 'vault-secret-r2p' added to the vault",
             "the plain REPL's `.vault add` confirmation",
         );
-        let added = pty.raw().len();
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         assert!(
             !since.contains("hush-value-r2p"),
@@ -1670,12 +1671,13 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{since}"
         );
 
-        let get_at = wait_for_repl_prompt(&mut pty, "dry-model)>", added);
+        let get_at = wait_for_repl_prompt(&mut pty, "dry-model)>", answered);
         pty.send(b".vault get vault-secret-r2p\r").unwrap();
         pty.wait_for_after("hush-value-r2p", get_at, PTY_DEADLINE)
             .expect("`.vault get` did not print the value the prompt collected");
 
-        let got = pty.raw().len();
+        let got = find(pty.raw(), b"hush-value-r2p", get_at)
+            .expect("the value was seen in the stripped transcript but not in the raw bytes");
         wait_for_repl_prompt(&mut pty, "dry-model)>", got);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
@@ -3535,7 +3537,8 @@ mod binary_menus {
                 ".set ui tui entered the alternate screen:\n{since}"
             );
 
-            let refused = pty.raw().len();
+            let refused = find(pty.raw(), b"Unknown key", from)
+                .expect("the refusal was seen in the stripped transcript but not in the raw bytes");
             wait_for_repl_prompt(&mut pty, "dry-model)>", refused);
             pty.send(b"\x04").unwrap();
             let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
@@ -4006,17 +4009,18 @@ mod binary_menus {
         pty.wait_for_after(INIT_RAG_QUESTION, before, PTY_DEADLINE)
             .expect("`.agent <name>` in the plain REPL did not ask `init RAG?`");
         pty.read_for(Duration::from_millis(500));
+        let canceled = pty.raw().len();
         pty.send(b"\x1b").unwrap();
         pty.wait_for_after(CANCELED_BY_USER, before, PTY_DEADLINE)
             .expect("Esc on `init RAG?` in the plain REPL did not print the cancel error");
-        let canceled = pty.raw().len();
         let info_at = wait_for_repl_prompt(&mut pty, "dry-model)>", canceled);
         pty.send(b".info agent\r").unwrap();
         pty.wait_for_after("Error: No agent", info_at, PTY_DEADLINE)
             .expect(
                 "`.info agent` after Esc on `init RAG?` did not report that no agent is active",
             );
-        let answered = pty.raw().len();
+        let answered = find(pty.raw(), b"No agent", info_at)
+            .expect("the error was seen in the stripped transcript but not in the raw bytes");
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
         assert!(
@@ -5137,6 +5141,7 @@ mod binary_wizards {
         // each in a debug build, so the absolute temp path alone would eat most
         // of the wait; the binary runs in `dir`, where the bare file name names
         // the same document.
+        let sent = pty.raw().len();
         pty.send(b".file 'doc.catstdinfile' -- summarize\r")
             .unwrap();
         let transcript = wait_for_squeezed(
@@ -5144,7 +5149,8 @@ mod binary_wizards {
             "loaded document reply r9f",
             "the reply after the file loader (is the loader waiting on the terminal's stdin?)",
         );
-        let replied = pty.raw().len();
+        let replied = find(pty.raw(), b"r9f", sent)
+            .expect("the reply was seen in the stripped transcript but not in the raw bytes");
         let took = started.elapsed();
         assert_eq!(
             fake.served(),
@@ -6271,7 +6277,8 @@ mod binary_wizards {
         pty.send(b".info\r").unwrap();
         pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
             .expect("`.info` after the cancelled question never rendered");
-        let shown = pty.raw().len();
+        let shown = find(pty.raw(), b"log_path", info_at)
+            .expect("`log_path` was seen in the stripped transcript but not in the raw bytes");
         wait_for_repl_prompt(&mut pty, ")> ", shown);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();

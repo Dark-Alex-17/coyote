@@ -15,20 +15,25 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use common::pty::strip_ansi;
 use common::tui_harness::{
-    TempDirGuard, WAIT_WRAPPER, exit_code, fresh_config_dir, spawn_repl_under,
+    PTY_DEADLINE, TempDirGuard, WAIT_WRAPPER, exit_code, fresh_config_dir, spawn_repl_under,
     wait_for_repl_prompt, write_config,
 };
 use serial_test::serial;
 
 const EDITORS: [&str; 3] = ["visual", "editor", "configured"];
 
+/// Each editor prints this to the terminal as it exits, so the test can
+/// look for the prompt the REPL redraws after it.
+const EDITOR_RAN: &str = "editor-ran-e5d";
+
 fn write_editor(dir: &Path, name: &str) -> String {
     let path = dir.join(format!("{name}.sh"));
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\necho {name} >> '{}'\n",
+            "#!/bin/sh\necho {name} >> '{}'\necho {EDITOR_RAN}\n",
             dir.join("editor-ran").display()
         ),
     )
@@ -68,7 +73,14 @@ fn editors_run(config_editor: bool, visual: bool, editor: bool) -> Vec<String> {
     while !marker.exists() && Instant::now() < deadline {
         repl.read_for(Duration::from_millis(100));
     }
-    let edited = repl.raw().len();
+    assert!(
+        marker.exists(),
+        "`.edit config` ran no editor:\n{}",
+        strip_ansi(&String::from_utf8_lossy(repl.raw()))
+    );
+    let edited = repl
+        .wait_for_raw(EDITOR_RAN.as_bytes(), 0, PTY_DEADLINE)
+        .expect("the editor exited without printing to the terminal");
     wait_for_repl_prompt(&mut repl, "dry-model)>", edited);
     repl.send(b"\x04").unwrap();
     let text = repl
