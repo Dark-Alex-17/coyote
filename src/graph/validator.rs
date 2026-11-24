@@ -849,7 +849,7 @@ impl GraphValidator {
                                         unparsable_config_error(&a.agent, &err)
                                     ),
                                 ));
-                                continue;
+                                None
                             }
                         }
                     } else {
@@ -5346,6 +5346,32 @@ mod tests {
             )]
         );
         assert_eq!(result.errors[0].node_id.as_deref(), Some("a"));
+    }
+
+    /// The reserved-key check needs no declared variables, so a config.yaml
+    /// that does not parse still has its reserved keys reported.
+    #[test]
+    #[serial]
+    fn agent_inputs_on_an_unparsable_config_still_report_a_reserved_key() {
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
+        materialize_config_agent_with("plain-agent", "name: [unclosed\n");
+        let node = agent_node_with_inputs(
+            "a",
+            "plain-agent",
+            &[("project_dir", "{{x}}"), ("previous_turns", "{{x}}")],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                format!("agent node 'a': {}", unparsable_config_body("plain-agent")),
+                "agent node 'a': `inputs.previous_turns` is reserved (the dispatcher seeds it)"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]

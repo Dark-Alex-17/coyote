@@ -1822,6 +1822,17 @@ struct ResumedVariables {
     handed_down: Option<AgentVariables>,
 }
 
+/// The keys of `explicit` that name a declared variable. A graph agent's
+/// node inputs may also carry plain state keys, which are no variable.
+fn declared_keys<'a>(
+    declared: &'a [AgentVariable],
+    explicit: &'a AgentVariables,
+) -> impl Iterator<Item = &'a String> {
+    explicit
+        .keys()
+        .filter(|key| declared.iter().any(|variable| variable.name == **key))
+}
+
 /// Resolves a resumed `session`'s variables for an agent declaring
 /// `declared`, refusing a declared variable left without a value the way
 /// a fresh seat does.
@@ -1841,7 +1852,7 @@ fn resume_variables(
         inherited,
     );
     let seated = Agent::init_agent_variables(declared, Some(&resolved), no_interaction, false)?;
-    for key in explicit.keys() {
+    for key in declared_keys(declared, explicit) {
         if !explicit_keys.contains(key) {
             explicit_keys.push(key.clone());
         }
@@ -1872,7 +1883,11 @@ fn reseat_agent_session_variables(
         return Ok(false);
     };
     if session.is_empty() {
-        session.set_explicit_variable_keys(explicit.keys().cloned().collect());
+        session.set_explicit_variable_keys(
+            declared_keys(agent.defined_variables(), explicit)
+                .cloned()
+                .collect(),
+        );
         return Ok(false);
     }
     let resumed = resume_variables(
@@ -5012,6 +5027,134 @@ mod tests {
         let (system, users) = system_and_users(&output);
         assert!(system.starts_with("Say loud to them"), "{system}");
         assert_eq!(users, ["earlier", "hi"], "{output}");
+    }
+
+    /// A stored default is no answer the node gave, so when the node leaves
+    /// the key out the value the parent hands down replaces it.
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_child_seats_an_inherited_value_over_a_stored_default() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_graph_child_resumed_inherited");
+        write_config_agent_with_variables(&agent_name);
+        let _session = crate::testing::EnvVarGuard::set(
+            crate::utils::normalize_env_name(&format!("{agent_name}_agent_session")),
+            "teammate",
+        );
+        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            "model: test-seeded:test-chat\n\
+             agent_variables:\n\
+             \x20 tone: calm\n\
+             \x20 who: them\n\
+             explicit_variable_keys: []\n\
+             agent_instructions: Say calm to them\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: Say calm to them\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "tone".to_string(),
+            "loud".to_string(),
+        )]));
+        let inputs = HashMap::from([("who".to_string(), json!("you"))]);
+
+        let output = run_async(run_agent_for_graph(
+            &mut ctx,
+            &agent_name,
+            "hi",
+            Some(inputs),
+        ))
+        .unwrap();
+
+        let (system, _) = system_and_users(&output);
+        assert!(system.starts_with("Say loud to you"), "{system}");
+    }
+
+    /// A first run on an `agent_session` records the node inputs that name
+    /// declared variables as the session's explicit keys; a graph agent's
+    /// other inputs are state keys, not variables.
+    #[test]
+    fn a_first_agent_session_run_records_the_declared_node_inputs_as_explicit() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            variables: vec![AgentVariable {
+                name: "build_lock".to_string(),
+                description: String::new(),
+                default: None,
+                value: String::new(),
+            }],
+            ..AgentConfig::default()
+        }));
+        ctx.session = Some(Session::default());
+        let inputs = AgentVariables::from([
+            ("build_lock".to_string(), "from-inputs".to_string()),
+            ("topic".to_string(), "state only".to_string()),
+        ]);
+
+        assert!(!reseat_agent_session_variables(&mut ctx, &inputs).unwrap());
+
+        assert_eq!(
+            ctx.session.as_ref().unwrap().explicit_variable_keys(),
+            ["build_lock"]
+        );
+    }
+
+    /// A resumed `agent_session` child hands its own children what a fresh
+    /// seat would: the inherited variables overlaid with its explicit ones.
+    #[test]
+    fn a_resumed_agent_session_child_hands_down_the_inherited_map_overlaid_with_its_explicit_values()
+     {
+        let declared = ["tone", "who"].map(|name| AgentVariable {
+            name: name.to_string(),
+            description: String::new(),
+            default: Some("calm".to_string()),
+            value: String::new(),
+        });
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            variables: declared.to_vec(),
+            ..AgentConfig::default()
+        }));
+        ctx.session = Some(
+            serde_yaml::from_str(
+                "model: test-seeded:test-chat\n\
+                 agent_variables:\n\
+                 \x20 tone: calm\n\
+                 \x20 who: stored\n\
+                 explicit_variable_keys:\n\
+                 \x20 - who\n\
+                 messages:\n\
+                 \x20 - role: user\n\
+                 \x20   content: earlier\n",
+            )
+            .unwrap(),
+        );
+        ctx.agent_variables = Some(AgentVariables::from([
+            ("tone".to_string(), "loud".to_string()),
+            ("project_dir".to_string(), "/wt".to_string()),
+        ]));
+        let inputs = AgentVariables::from([("tone".to_string(), "quiet".to_string())]);
+
+        assert!(reseat_agent_session_variables(&mut ctx, &inputs).unwrap());
+
+        assert_eq!(
+            ctx.agent_variables,
+            Some(AgentVariables::from([
+                ("tone".to_string(), "quiet".to_string()),
+                ("who".to_string(), "stored".to_string()),
+                ("project_dir".to_string(), "/wt".to_string()),
+            ]))
+        );
     }
 
     /// The other half of the inheritance rule: `handle_spawn` builds its

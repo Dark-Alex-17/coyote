@@ -241,6 +241,29 @@ mod tests {
     }
 
     #[test]
+    fn a_reserved_key_on_a_config_agent_is_reported_as_reserved_only() {
+        let declared = [AgentVariable {
+            name: "project_dir".to_string(),
+            description: String::new(),
+            default: None,
+            value: String::new(),
+        }];
+        let keys = ["initial_prompt", "worktree"].map(String::from);
+
+        assert_eq!(
+            agent_inputs_errors("plain", Some(&declared), &keys),
+            [
+                "`inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                    .to_string(),
+                format!(
+                    "`inputs` names variable(s) agent 'plain' does not declare: worktree; \
+                     {CONFIG_INPUTS_RULE}"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn shipped_gates_match_the_script_fallback_error_contract() {
         let prefix = script_fallback_error("verify_x", "");
         assert!(prefix.starts_with("script 'verify_"), "{prefix}");

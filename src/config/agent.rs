@@ -2924,7 +2924,8 @@ nodes: {}
             };
             let name = dir.file_name().unwrap().to_string_lossy().to_string();
             let stub: AgentVariablesStub =
-                serde_yaml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+                serde_yaml::from_str(&fs::read_to_string(&file).unwrap())
+                    .unwrap_or_else(|err| panic!("{}: {err}", file.display()));
             let declares = stub.variables.iter().any(|v| v.name == "project_dir");
             let exempt = EXEMPT.iter().any(|(exempt, _)| *exempt == name);
             assert!(
