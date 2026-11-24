@@ -10843,6 +10843,7 @@ fn the_configured_propagation_nodes_key_is_described_on_the_deployment_and_confi
         &format!("`mesh.propagation_nodes[<i>] is '<value>', {refusal}`"),
         "## `propagation_nodes`",
         "`(configured, 2 hop(s), 3m ago)`",
+        "`(configured, not resolved yet; asking again every 30 s)`",
     ] {
         assert!(
             configuration.contains(needle),
@@ -11171,16 +11172,20 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
 fn the_commands_page_says_a_sync_failure_once_per_node() {
     let idle = read(repo_root().join("src/mesh/idle.rs"));
     assert!(
-        idle.contains("fn tell_failure(&mut self, node: &str, key: String) -> bool"),
+        idle.contains("fn tell_failure("),
         "src/mesh/idle.rs no longer keeps the failures told per node"
     );
     let Some(wiki) = wiki_dir() else { return };
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
-    let needle = "a sync that failed prints `[mesh:propagation] sync from <node8> failed: <reason>` once per node, however the syncs alternate between nodes";
-    assert!(
-        commands.contains(needle),
-        "Mesh-Commands.md does not say {needle:?}"
-    );
+    for needle in [
+        "a sync that failed prints `[mesh:propagation] sync from <node8> failed: <reason>` once per node, however the syncs alternate between nodes",
+        "not again until that node fails another way or a sync from it succeeds",
+    ] {
+        assert!(
+            commands.contains(needle),
+            "Mesh-Commands.md does not say {needle:?}"
+        );
+    }
 }
 
 /// The route part of "Moving between networks" and the commands page quote the stale

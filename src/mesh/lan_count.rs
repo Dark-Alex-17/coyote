@@ -66,6 +66,15 @@ pub(crate) struct LanReadings {
     pub relay_online: bool,
 }
 
+/// What a quick read did: skipped its call while another read was asking rnsd, or made
+/// one that reached rnsd or did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuickRead {
+    Skipped,
+    Reached,
+    Failed,
+}
+
 /// One read of the local rnsd: its AutoInterfaces' summed count, `None` when it runs
 /// none, and whether any of its TCP client interfaces is online.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -419,22 +428,51 @@ impl RnsdLanReader {
     }
 
     /// `read` for a command the user waits on: one call on `QUICK_RPC_BUDGET`, and the
-    /// last read's result without a call while another read is asking rnsd.
+    /// latest reading that reached rnsd without a call while another read is asking it
+    /// (`UNKNOWN` when none has yet).
     pub(crate) async fn read_quick(&self) -> RnsdReading {
-        self.read_with(ReadEffort::Quick).await
+        self.read_quick_outcome().await.0
+    }
+
+    /// `read_quick`, saying whether it made a call and whether that call reached rnsd.
+    pub(crate) async fn read_quick_outcome(&self) -> (RnsdReading, QuickRead) {
+        let Ok(target) = self.target.try_lock() else {
+            return (
+                self.reading_seen().unwrap_or(RnsdReading::UNKNOWN),
+                QuickRead::Skipped,
+            );
+        };
+        let before = self.reads_answered();
+        let reading = self.read_holding(target, ReadEffort::Quick).await;
+        let reached = self.reads_answered() > before;
+        (
+            reading,
+            if reached {
+                QuickRead::Reached
+            } else {
+                QuickRead::Failed
+            },
+        )
     }
 
     async fn read_with(&self, effort: ReadEffort) -> RnsdReading {
+        match effort {
+            ReadEffort::Patient => {
+                let target = self.target.lock().await;
+                self.read_holding(target, effort).await
+            }
+            ReadEffort::Quick => self.read_quick().await,
+        }
+    }
+
+    async fn read_holding(
+        &self,
+        mut target: tokio::sync::MutexGuard<'_, RpcTarget>,
+        effort: ReadEffort,
+    ) -> RnsdReading {
         let (attempts, budget) = match effort {
             ReadEffort::Patient => (RPC_ATTEMPTS, RPC_BUDGET),
             ReadEffort::Quick => (1, QUICK_RPC_BUDGET),
-        };
-        let mut target = match effort {
-            ReadEffort::Patient => self.target.lock().await,
-            ReadEffort::Quick => match self.target.try_lock() {
-                Ok(target) => target,
-                Err(_) => return *self.last.lock(),
-            },
         };
         self.resolve(&mut target);
         let RpcTarget::Ready { dir, endpoint, key } = &*target else {
@@ -1204,6 +1242,30 @@ mod tests {
         assert_eq!(patient.await.unwrap().lan, Some(LanReading::Count(1)));
         assert_eq!(reader.read_quick().await.lan, Some(LanReading::Count(0)));
         assert_eq!(source.calls(), 3);
+    }
+
+    /// A quick read that finds the join read still asking rnsd, before any read has
+    /// reached it, says the reading is unknown and that it skipped its call; it never
+    /// hands back a default that reads as no LAN.
+    #[tokio::test]
+    async fn a_quick_read_during_the_first_read_is_unknown_and_says_it_skipped() {
+        let dir = keyed_dir("lan-count-quick-before-any");
+        let source = Scripted::new([Ok(vec![auto(0)])]);
+        let reader = Arc::new(reader_at(&dir.path, source.clone()));
+        let held = source.gate.lock().await;
+        let patient = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.read().await }
+        });
+        while source.calls() < 1 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            reader.read_quick_outcome().await,
+            (RnsdReading::UNKNOWN, QuickRead::Skipped)
+        );
+        drop(held);
+        assert_eq!(patient.await.unwrap().lan, Some(LanReading::Count(0)));
     }
 
     #[tokio::test]

@@ -291,7 +291,7 @@ pub(crate) struct SyncSchedule {
     /// The last failure said for each node, so a node that keeps failing the same way is
     /// said once however the syncs alternate between nodes, and again when it fails
     /// another way; a fetch from a node that succeeds forgets its. At most
-    /// `FAILURES_TOLD` nodes are kept.
+    /// `FAILURES_TOLD` nodes are kept, one making room for the next.
     told_failures: BTreeMap<String, String>,
     /// When each node's silence was last logged, keyed by lower-hex destination hash.
     /// Entries older than `SILENCE_LOG_PERIOD` are dropped before each insert, so the map
@@ -470,8 +470,7 @@ impl SyncSchedule {
     }
 
     /// Whether the failure `key` from `node` differs from the last one said for that
-    /// node, noting it if so. Past `FAILURES_TOLD` nodes a new node's failure is still
-    /// said, and not kept.
+    /// node, noting it if so. Past `FAILURES_TOLD` nodes one is let go to keep the next.
     fn tell_failure(&mut self, node: &str, key: String) -> bool {
         if let Some(told) = self.told_failures.get_mut(node) {
             if *told == key {
@@ -480,9 +479,10 @@ impl SyncSchedule {
             *told = key;
             return true;
         }
-        if self.told_failures.len() < FAILURES_TOLD {
-            self.told_failures.insert(node.to_string(), key);
+        if self.told_failures.len() >= FAILURES_TOLD {
+            self.told_failures.pop_first();
         }
+        self.told_failures.insert(node.to_string(), key);
         true
     }
 

@@ -37,7 +37,8 @@ use crate::mesh::knock::{
 };
 use crate::mesh::knocks::KnockCache;
 use crate::mesh::lan_count::{
-    LanReadings, ReadEffort, RnsdLanReader, RnsdLocator, RnsdReading, lan_readings,
+    LanReading, LanReadings, QuickRead, ReadEffort, RnsdLanReader, RnsdLocator, RnsdReading,
+    lan_readings,
 };
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
@@ -1984,7 +1985,7 @@ impl MeshRuntime {
         &self,
         now: SystemTime,
         asked: &str,
-        quick_reached: Option<bool>,
+        quick: Option<QuickRead>,
     ) -> Option<&'static str> {
         let interfaces = self.interface_states();
         let reading = self.rnsd_lan.as_ref().map(RnsdLanReader::reading_seen);
@@ -1996,13 +1997,23 @@ impl MeshRuntime {
         debug!(
             "Mesh silent-LAN note for {asked}: knows_peers {known}, on_relay {relayed}, has_lan {has_lan}; rnsd {}{}; {}",
             match reading {
-                None => "not attached",
-                Some(None) => "never reached (read as no relay and a LAN)",
-                Some(Some(_)) => "reading held",
+                None => "not attached".to_string(),
+                Some(None) => "never reached (read as no relay and a LAN)".to_string(),
+                Some(Some(seen)) => format!(
+                    "read relay_online {}, LAN {}",
+                    seen.relay_online,
+                    match seen.lan {
+                        None => "none (no AutoInterface)".to_string(),
+                        Some(LanReading::Count(hosts)) => format!("{hosts} host(s)"),
+                        Some(LanReading::Unknown) => "an AutoInterface with no count".to_string(),
+                    }
+                ),
             },
-            match quick_reached {
-                Some(true) => ", the quick read reached it",
-                Some(false) => ", the quick read did not reach it",
+            match quick {
+                Some(QuickRead::Reached) => ", the quick read reached it",
+                Some(QuickRead::Failed) => ", the quick read did not reach it",
+                Some(QuickRead::Skipped) =>
+                    ", the quick read was skipped: another read was asking it",
                 None => "",
             },
             if note.is_some() { "shown" } else { "not shown" }
@@ -2014,15 +2025,11 @@ impl MeshRuntime {
     /// one call on the short budget. A quick read that does not reach rnsd leaves the
     /// latest reading that did, the patient read at join or a later one, to decide.
     pub(crate) async fn silent_lan_note_now(&self, now: SystemTime) -> Option<&'static str> {
-        let quick_reached = match self.rnsd_lan.as_ref() {
-            Some(reader) => {
-                let before = reader.reads_answered();
-                let _ = self.lan_readings(ReadEffort::Quick).await;
-                Some(reader.reads_answered() > before)
-            }
+        let quick = match self.rnsd_lan.as_ref() {
+            Some(reader) => Some(reader.read_quick_outcome().await.1),
             None => None,
         };
-        self.silent_lan_note_for(now, "an empty people list", quick_reached)
+        self.silent_lan_note_for(now, "an empty people list", quick)
     }
 
     /// One patient read of the local rnsd, so its relay state is known before anyone asks;
@@ -5203,15 +5210,6 @@ async fn request_path_to_node<E>(
     Ok(true)
 }
 
-/// Asks the mesh for a path to each configured propagation node `table` does not hold and
-/// files the announce each path response carries through
-/// `PropagationNodeTable::file_configured`, by the path-response rules (a node not on
-/// file is filed, an aged-out record stays aged out until the node announces),
-/// waiting up to `PATH_REQUEST_TIMEOUT` for them all. A hash answered by an
-/// announce that is not a usable propagation node's, or not answered at all, is logged
-/// once per run and not filed. Whether a node was filed; `false` at once while another
-/// round is out or one began within `CONFIGURED_NODE_ASK_GAP`, and as soon as `cancel`
-/// fires.
 /// Asks for the configured propagation nodes the table lacks at join and then every
 /// `every` while any is not filed, whatever else is filed: a first path request can go
 /// unanswered (a sibling session on the same rnsd asked within the same moment, or the
@@ -5234,14 +5232,36 @@ async fn ask_for_configured_nodes(
             }
         })
         .await;
+        let configured = node.configured_propagation_nodes.clone();
         drop(node);
         tokio::select! {
             () = cancel.cancelled() => return,
             () = sleep(every) => {}
         }
+        // A round stamps its start inside the task it spawned, a moment after this one
+        // began, and a post may have begun one since: the tick waits out the gap from the
+        // latest stamp, looking again at most every `every`, so it is never refused by it.
+        while let Some(left) = configured
+            .until_next_round(Instant::now())
+            .filter(|left| !left.is_zero())
+        {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = sleep(left.min(every)) => {}
+            }
+        }
     }
 }
 
+/// Asks the mesh for a path to each configured propagation node `table` does not hold and
+/// files the announce each path response carries through
+/// `PropagationNodeTable::file_configured`, by the path-response rules (a node not on
+/// file is filed, an aged-out record stays aged out until the node announces),
+/// waiting up to `PATH_REQUEST_TIMEOUT` for them all. A hash answered by an
+/// announce that is not a usable propagation node's, or not answered at all, is logged
+/// once per run and not filed. Whether a node was filed; `false` at once while another
+/// round is out or one began within `CONFIGURED_NODE_ASK_GAP`, and as soon as `cancel`
+/// fires.
 async fn resolve_configured_nodes(
     transport: &Transport,
     configured: &ConfiguredPropagationNodes,
@@ -5296,11 +5316,15 @@ async fn resolve_configured_nodes(
                 );
                 filed = true;
             }
-            Ok(false) => debug!(
-                "Mesh configured propagation node {} answered its path request, but its record \
-                 has aged out and a path response does not renew it; it waits for its next announce",
-                short(&hash)
-            ),
+            Ok(false) => {
+                if configured.first_telling(&format!("aged out {hash}")) {
+                    debug!(
+                        "Mesh configured propagation node {} answered its path request, but its record \
+                         has aged out and a path response does not renew it; it waits for its next announce",
+                        short(&hash)
+                    );
+                }
+            }
             Err(PropagationNodeError::NotAPropagationNode) => {
                 if configured.first_telling(&hash) {
                     info!(
@@ -21891,13 +21915,23 @@ mod tests {
                 .propagation_nodes()
                 .observe(stranger, 1, SystemTime::now());
 
-            for purpose in [NodePurpose::Posting, NodePurpose::Fetching] {
-                let picked = runtime.propagation_node_for(purpose).await.unwrap();
+            // Both picks are read before the round that may file the configured node.
+            let table = runtime.propagation_nodes();
+            for picked in [table.select_for_posting(), table.select()] {
                 assert_eq!(
-                    picked.destination.address_hash, stranger_desc.address_hash,
-                    "the configured node is not filed yet: {purpose:?}"
+                    picked.unwrap().destination.address_hash,
+                    stranger_desc.address_hash,
+                    "the configured node is not filed yet"
                 );
             }
+            let picked = runtime
+                .propagation_node_for(NodePurpose::Posting)
+                .await
+                .unwrap();
+            assert_eq!(
+                picked.destination.address_hash, stranger_desc.address_hash,
+                "this pick is made from the table as it stands"
+            );
             wait_until("the configured node to be filed", || {
                 runtime.propagation_nodes().holds(&hex, SystemTime::now())
             })
@@ -21915,44 +21949,56 @@ mod tests {
             node.stop().await;
         }
 
-        /// A configured node whose first path request went unanswered is asked for again
-        /// a period later with nothing typed and nothing posted, and filed when it answers.
+        /// A configured node whose path request went unanswered is asked for again by the
+        /// node's own timer, with nothing typed and nothing posted, once the gap since the
+        /// latest round has passed, and not before it.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_configured_node_that_did_not_answer_is_asked_for_again() {
-            use crate::mesh::propagation::pn_announce_app_data;
-
-            let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
-            let hex = node.desc.address_hash.to_hex_string();
+            install_log_collector();
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let silent = crate::mesh::propagation::propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            )
+            .address_hash
+            .to_hex_string();
             let tmp = TempDir::new("node-configured-pn-asked-again");
-            let runtime = start_with_configured(&tmp, node.port, std::slice::from_ref(&hex)).await;
+            let runtime =
+                start_with_configured(&tmp, relay.port, std::slice::from_ref(&silent)).await;
+            let asked = format!(
+                "Mesh asking for a path to configured propagation node {}",
+                short(&silent)
+            );
+            let asks = || {
+                debug_snapshot()
+                    .iter()
+                    .filter(|line| line.ends_with(&asked))
+                    .count()
+            };
             let cancel = CancellationToken::new();
-            let every = Duration::from_millis(500);
             let asking = tokio::spawn(ask_for_configured_nodes(
                 Weak::new(),
                 Arc::downgrade(&runtime),
                 cancel.clone(),
-                every,
+                Duration::from_millis(200),
             ));
-            // Its path response carries no propagation node's announce yet: not filed.
-            sleep(PATH_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
-            assert!(!runtime.propagation_nodes().holds(&hex, SystemTime::now()));
+            wait_until("the first round to begin", || asks() == 1).await;
+            wait_until("the first round to end", || {
+                !runtime.configured_propagation_nodes.is_resolving()
+            })
+            .await;
+            sleep(Duration::from_secs(1)).await;
+            assert_eq!(asks(), 1, "not again within the gap");
 
-            node.transport
-                .set_destination_announce_app_data(
-                    &node.dest,
-                    Some(pn_announce_app_data(true, 0, 256)),
-                )
-                .await;
             runtime.configured_propagation_nodes.forget_last_round();
-            wait_until("the configured node to be filed on a later round", || {
-                runtime.propagation_nodes().holds(&hex, SystemTime::now())
+            wait_until("the timer to ask again once the gap has passed", || {
+                asks() == 2
             })
             .await;
 
             cancel.cancel();
             asking.await.unwrap();
             stop(&runtime).await;
-            node.stop().await;
+            relay.stop().await;
         }
 
         /// Every post path and the idle sync pick their node through

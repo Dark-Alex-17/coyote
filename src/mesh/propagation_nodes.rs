@@ -569,6 +569,20 @@ impl ConfiguredPropagationNodes {
         Some(ResolvingRound(&self.resolving))
     }
 
+    /// How long from `now` until a round may begin, as far as the gap goes: `None` when
+    /// none has begun, zero once the gap since the latest one has passed.
+    pub(crate) fn until_next_round(&self, now: Instant) -> Option<Duration> {
+        self.last_round
+            .lock()
+            .map(|last| (last + CONFIGURED_NODE_ASK_GAP).saturating_duration_since(now))
+    }
+
+    /// Whether a round of path requests is out now.
+    #[cfg(test)]
+    pub(crate) fn is_resolving(&self) -> bool {
+        self.resolving.load(Ordering::Acquire)
+    }
+
     /// Forgets when the latest round began, as `CONFIGURED_NODE_ASK_GAP` passing does.
     #[cfg(test)]
     pub(crate) fn forget_last_round(&self) {
@@ -1525,6 +1539,16 @@ mod tests {
             configured
                 .begin_round(t0 + Duration::from_secs(29))
                 .is_none()
+        );
+        assert_eq!(
+            configured.until_next_round(t0 + Duration::from_secs(29)),
+            Some(Duration::from_secs(1)),
+            "the timer waits out the gap from the round's own stamp"
+        );
+        assert_eq!(
+            ConfiguredPropagationNodes::default().until_next_round(t0),
+            None,
+            "no round has begun"
         );
         assert!(
             configured
