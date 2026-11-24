@@ -1396,7 +1396,9 @@ def _pr_view(state, target, field):
     cmd = os.environ.get("ARCHITECT_GH_VIEW_CMD")
     if cmd:
         return sh(["bash", "-c", cmd, "_", str(target), field], timeout=GH_CALL_SECS)
-    return sh(["gh", "pr", "view", str(target), "--json", field, "--jq", f".{field}"], cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
+    fields = field.split(",")
+    jq = f".{field}" if len(fields) == 1 else "[" + ",".join(f".{f}" for f in fields) + "] | join(\" \")"
+    return sh(["gh", "pr", "view", str(target), "--json", field, "--jq", jq], cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
 
 
 def _blockers_done(task, tasks):
@@ -1652,7 +1654,7 @@ def _delegation_text(state, task, kind, fix_items=(), fix_note="", project_dir=N
         L += ["", f"## FIX ROUND {n}",
               f"This is a fix round on {task['id']} (artifact re-entry: the task's branch, commits and prior report are your context).",
               fix_note or "", "### Findings to address (verbatim)"] + [f"- {f}" for f in fix_items] + \
-             ["", "### Your prior report (verbatim)", tail(prior, 8000) or "(none recorded)"]
+             ["", "### Your prior report (verbatim)", trim_items(prior, 8000) or "(none recorded)"]
         if m := SISYPHUS_RUN_RE.search(prior):
             L += ["", f"Sisyphus run id: {m.group(1)}"]
     if kind == "hygiene" or (kind == "fix" and task.get("type") == "hygiene"):
@@ -1831,7 +1833,9 @@ def route_delegate(state):
         # the criteria stay fixed across rounds; only the latest report rides along, for the reviewer to check against
         criteria = (state.get("hygiene_criteria") or "").split("\n" + HYGIENE_REPORT_LABEL)[0]
         report = os.path.join(state.get("run_dir", ""), "reports", f"{task['id']}-r{n + 1}.md")
-        u["hygiene_criteria"] = f"{criteria}\n{HYGIENE_REPORT_LABEL}, saved at {report}:\n{trim_items(text, 4000)}"
+        u["hygiene_criteria"] = (f"{criteria}\n{HYGIENE_REPORT_LABEL}, saved at {report}. The re-review reads only this round's "
+                                 "report, so its `HYGIENE:` heading must list every kept item in the diff, not only what this "
+                                 f"round changed:\n{trim_items(text, 4000)}")
         u["verify_scope"] = "hygiene"
     else:
         u["verify_scope"] = "task"
@@ -1955,7 +1959,7 @@ def verify_gate(state):
                 over = f" ({dropped} more dropped by the cap)" if dropped else ""
                 ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
     u["verification_commands_json"] = cmds
-    u["debris_exclude"] = state.get("debris_exclude") or _planning_exclude(state, code)
+    u["debris_exclude"] = _debris_exclude(state, code)
     rl.append({"round": n, "head": head, "scope": scope, "started": now_iso()})
     u["round_log"] = rounds_log
     u["verify_unit"] = unit
@@ -1979,6 +1983,10 @@ def _code_tree_dirty(state, code):
         if rel != "." and rel != ".." and not rel.startswith(".." + os.sep):
             pathspec = ["--", ".", f":(exclude,literal){rel}"]
     return bool(git_out(code, "status", "--porcelain", "--untracked-files=normal", *pathspec))
+
+
+def _debris_exclude(state, code):
+    return state.get("debris_exclude") or _planning_exclude(state, code)
 
 
 def _planning_exclude(state, code):
@@ -5119,8 +5127,10 @@ def hygiene_create(state):
                                plan=state.get("plan_path", ""), tasks=group_tasks)
     ledger_lines = ledger_out.strip() if ok else "(collect_ledger_lines unavailable: " + tail(ledger_out, 120) + ")"
     agents_dir = os.path.join(os.environ.get("LLM_ROOT_DIR", os.path.expanduser("~/.config/coyote")), "agents")
-    excludes = "".join(f" --exclude {shlex.quote(d)}" for d in json.loads(_planning_exclude(state, code) or "[]"))
-    lint_cmd = f"python3 {agents_dir}/.shared/debris.py{excludes} {code} {base}"
+    preset = _debris_exclude(state, code).strip()
+    dirs = json.loads(preset) if preset.startswith("[") else [preset] if preset else []
+    excludes = "".join(f" --exclude {shlex.quote(d)}" for d in dirs)
+    lint_cmd = f"python3 {shlex.quote(os.path.join(agents_dir, '.shared', 'debris.py'))}{excludes} {shlex.quote(code)} {shlex.quote(base)}"
     criteria = HYGIENE_CRITERIA.format(scope=scope_word, SCOPE=scope_word.upper(), lint_cmd=lint_cmd)
     slug = "run-hygiene" if (is_single(state) or MULTI_IS_GROUPS) else f"run-hygiene-{unit['id']}".lower()
     body = ("## What\n\nRun-closing hygiene pass over the " + scope_word + " diff " + base + "..HEAD.\n\n## Acceptance criteria\n\n"
@@ -5262,33 +5272,39 @@ def open_pr(state):
     # when set, the gate runs the value through `bash -c` (the checks and reviews ones through `/bin/sh -c`) instead of
     # the `gh` call. Positional args: comment gets the PR number and body, head the PR number, perm the reviewer login
     # (it prints the permission word), rerun the run id, resolve the review thread id and reply body, view the PR or
-    # branch and the JSON field. With no rerun seam, a set checks seam skips `gh run rerun`. Both batteries and the
-    # Rust wrapper strip inherited ones.
+    # branch and the JSON field (or comma-separated fields, printed space-separated on one line). With no rerun seam,
+    # a set checks seam skips `gh run rerun`. Both batteries and the Rust wrapper strip inherited ones.
     cmd = os.environ.get("ARCHITECT_GH_CREATE_CMD")
     if cmd:
         rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS)
     else:
         rc, out = sh(["gh", "pr", "create", "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", state.get("pr_body_path", "")], cwd=code, timeout=GH_CALL_SECS)
     m = PR_URL_RE.search(out or "")
-    if rc != 0 or not m:
-        # the create may have landed before the call failed
-        vrc, vout = _pr_view(state, branch, "url")
-        m = PR_URL_RE.search(vout or "") if vrc == 0 else None
+    created = rc == 0 and m is not None
+    if not created:
+        # the create may have landed before the call failed; only an open PR onto this base counts as that create.
+        # One read keeps the create plus this lookup inside the node's timeout.
+        vrc, vout = _pr_view(state, branch, "url,state,baseRefName")
+        words = (vout or "").split() if vrc == 0 else []
+        m = PR_URL_RE.search(words[0]) if len(words) == 3 and words[1].upper() == "OPEN" and words[2] == base else None
         if not m:
             unit = state.get("closeout_unit") or "run"
-            retry = _cap_continues(state, f"pr_create_failed:{unit}") < PR_CREATE_RETRIES
-            ledger(state, u, f"pr: gh pr create failed and {branch} has no PR: {tail(out, 300)}")
+            retried = _cap_continues(state, f"pr_create_failed:{unit}")
+            groups = " Finishing ends the run with the remaining PR groups unopened." if MULTI_IS_GROUPS and not is_single(state) else ""
+            ledger(state, u, f"pr: gh pr create failed and {branch} has no open PR onto {base}: {tail(out, 300)}")
             return raise_escalation(state, u, escalation(
-                "pr_create_failed", f"Opening the draft PR from {branch} -> {base} failed and the branch has no PR. Retry, or finish "
-                                    "without a PR?",
-                [option("Retry opening the PR", recommended=retry), option("Finish without a PR (recorded as a follow-up)", recommended=not retry)],
+                "pr_create_failed", f"Opening the draft PR from {branch} -> {base} failed and the branch has no open PR onto {base} "
+                                    f"(retried {retried} of {PR_CREATE_RETRIES}).{groups} Retry, or finish without a PR?",
+                [option("Retry opening the PR", recommended=retried < PR_CREATE_RETRIES),
+                 option("Finish without a PR (recorded as a follow-up)", recommended=retried >= PR_CREATE_RETRIES)],
                 evidence=tail(out, 2000), data={"unit": unit, "branch": branch, "base": base}))
-        ledger(state, u, f"pr: gh pr create failed ({tail(out, 300)}), but {branch} already has a PR -> adopted")
+        ledger(state, u, f"pr: gh pr create failed ({tail(out, 300)}), but {branch} already has open PR #{m.group(2)} onto {base} -> adopted")
     u.update({"pr_number": m.group(2), "pr_url": m.group(0), "ci_polls": 0, "ci_poll_fails": 0, "ci_rounds": 0, "ci_started_at": int(time.time())})
     prs = dict(as_dict(state.get("pr_numbers")))
     prs[state.get("closeout_unit") or "run"] = m.group(2)
     u["pr_numbers"] = prs
-    ledger(state, u, f"pr: draft PR #{m.group(2)} opened from {branch} -> {base}: {m.group(0)}")
+    if created:
+        ledger(state, u, f"pr: draft PR #{m.group(2)} opened from {branch} -> {base}: {m.group(0)}")
     snapshot(state, u, "pr_opened")
     u["_next"] = "pr_round_comments"
     return u
