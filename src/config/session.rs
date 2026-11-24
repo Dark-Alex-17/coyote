@@ -407,6 +407,12 @@ pub struct Session {
     role_name: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     agent_variables: AgentVariables,
+    /// The `agent_variables` keys a child's spawner gave explicitly (spawn
+    /// `variables`, agent-node `inputs:`) rather than leaving to inheritance
+    /// or a default. `None` is a session stored before they were recorded,
+    /// read as every stored key explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    explicit_variable_keys: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     agent_instructions: String,
 
@@ -1100,6 +1106,27 @@ impl Session {
 
     pub fn agent_variables(&self) -> &AgentVariables {
         &self.agent_variables
+    }
+
+    /// The stored variables' keys that were given explicitly; every stored
+    /// key for a session that never recorded them.
+    pub fn explicit_variable_keys(&self) -> Vec<String> {
+        match &self.explicit_variable_keys {
+            Some(keys) => keys.clone(),
+            None => self.agent_variables.keys().cloned().collect(),
+        }
+    }
+
+    pub fn set_explicit_variable_keys(&mut self, keys: Vec<String>) {
+        self.explicit_variable_keys = Some(keys);
+        self.dirty = true;
+    }
+
+    /// Re-seats the stored variables a resumed child runs with, keeping the
+    /// prompt it was stored under.
+    pub fn set_agent_variables(&mut self, variables: AgentVariables) {
+        self.agent_variables = variables;
+        self.dirty = true;
     }
 
     pub fn agent_instructions(&self) -> &str {
