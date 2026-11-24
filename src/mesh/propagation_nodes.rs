@@ -578,13 +578,13 @@ impl ConfiguredPropagationNodes {
     }
 
     /// Whether a round of path requests is out now.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn is_resolving(&self) -> bool {
         self.resolving.load(Ordering::Acquire)
     }
 
     /// Forgets when the latest round began, as `CONFIGURED_NODE_ASK_GAP` passing does.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn forget_last_round(&self) {
         *self.last_round.lock() = None;
     }
