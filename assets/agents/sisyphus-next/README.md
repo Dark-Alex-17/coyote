@@ -482,9 +482,10 @@ its own config and cache dirs.
 With `SISYPHUS_NEXT_STAGING_DIR` set to the upstream staging tree, the wrapper also checks
 the census above against a live `diff -u` per file; without it that test prints a notice
 and passes.
-`audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
-(`yq --version` names it); the wrapper skips both of those tests when a different `yq`
-(or none) is on `PATH`. The wrapper also sweeps every bundled agent's `graph.yaml` and
+`audit_graph.py`, `smoke_test.py` and `check_session_block.sh` need the Go `yq` by
+mikefarah (`yq --version` names it); the wrapper skips the tests that run them when a
+different `yq` (or none) is on `PATH`, and fails them instead when
+`SISYPHUS_NEXT_REQUIRE_YQ` is set. The wrapper also sweeps every bundled agent's `graph.yaml` and
 `config.yaml` for a `spawnable_agents` entry, a `session.chat.agent` value or an `agent:`
 key naming `sisyphus-next` or `architect-next`, and every `instructions.md` and
 `config.yaml` for prose containing either name, pinning the candidate status above.

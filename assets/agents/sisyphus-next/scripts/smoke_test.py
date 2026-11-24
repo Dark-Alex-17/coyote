@@ -5720,12 +5720,15 @@ def read_yaml(path):
 
 
 def child_declares_project_dir(agent):
+    """Whether `agent` declares a project_dir variable, as (declares, error); declares is None when unreadable."""
     for name in ("graph.yaml", "config.yaml"):
         path = os.path.join(AGENTS_ROOT, agent, name)
         if os.path.isfile(path):
-            doc, _ = read_yaml(path)
-            return None if doc is None else any(v.get("name") == "project_dir" for v in doc.get("variables") or [])
-    return None
+            doc, error = read_yaml(path)
+            if doc is None:
+                return None, error
+            return any(isinstance(v, dict) and v.get("name") == "project_dir" for v in doc.get("variables") or []), ""
+    return None, f"no graph.yaml or config.yaml under {os.path.join(AGENTS_ROOT, agent)}"
 
 
 _seat_graph, _seat_error = read_yaml(os.path.join(HERE, "..", "graph.yaml"))
@@ -5733,9 +5736,10 @@ check("graph.yaml: read through mikefarah yq", _seat_graph is not None, _seat_er
 _seat_nodes = (_seat_graph or {}).get("nodes") or {}
 _seat_input = "{{project_dir}}"
 # A child that declares project_dir and gets no input keeps the root run's checkout.
-_declares = {n: child_declares_project_dir(v.get("agent", "")) for n, v in _seat_nodes.items() if v.get("type") == "agent"}
+_seat_reads = {n: child_declares_project_dir(v.get("agent", "")) for n, v in _seat_nodes.items() if v.get("type") == "agent"}
+_declares = {n: d for n, (d, _) in _seat_reads.items()}
 _unseated = sorted(n for n, d in _declares.items() if d and (_seat_nodes[n].get("inputs") or {}).get("project_dir") != _seat_input)
-_unread = sorted(n for n, d in _declares.items() if d is None)
+_unread = {n: e for n, (d, e) in sorted(_seat_reads.items()) if d is None}
 check("graph: every agent node whose child declares project_dir passes it through inputs",
       _declares and not _unseated and not _unread, {"unseated": _unseated, "child agent unreadable": _unread})
 check("graph: run_step seats step-runner in the checkout under work",
