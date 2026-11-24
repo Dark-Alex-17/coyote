@@ -170,7 +170,7 @@ fn handle_add(cli: &Cli, name: &str, vault: &Vault) -> Result<()> {
 /// widget nothing can answer; `remedy` names the flag that skips it.
 #[expect(
     clippy::disallowed_methods,
-    reason = "a CLI flow (-e, --mcp); the process never reaches a UI"
+    reason = "the --mcp flow; the process never reaches a UI"
 )]
 fn confirm_on_the_terminal(
     action: fmt::Arguments<'_>,
@@ -328,7 +328,7 @@ fn build_remote(cli: &Cli, transport: McpTransportType, has_command: bool) -> Re
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "a CLI flow (-e, --mcp); the process never reaches a UI"
+    reason = "the --mcp flow; the process never reaches a UI"
 )]
 fn provision_secrets(cli: &Cli, server: &str, vault: &Vault) -> Result<()> {
     let mut sources: Vec<&str> = Vec::new();

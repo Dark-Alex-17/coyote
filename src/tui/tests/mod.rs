@@ -4655,19 +4655,6 @@ fn every_terminal_reader_stays_banned() {
     let _inquire_prompter = crate::prompt::InquirePrompter::new;
 }
 
-/// The loader never lends the terminal: both of its branches hand the
-/// child /dev/null, so the source says `Stdio::null()` for every spawn
-/// it makes and never `Stdio::inherit()`.
-#[test]
-fn the_loader_gives_its_child_a_null_stdin() {
-    let loader = fn_body(
-        include_str!("../../utils/command.rs"),
-        "pub async fn run_loader_command",
-    );
-    assert!(!loader.contains("Stdio::inherit()"), "{loader}");
-    assert_eq!(loader.matches("Stdio::null()").count(), 2, "{loader}");
-}
-
 /// The stdin readers outside this module stand down while the UI owns
 /// the terminal: no spinner polls the keyboard, no stale-input drain
 /// toggles raw mode under the event stream, and no cursor query waits

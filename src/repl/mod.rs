@@ -2296,7 +2296,7 @@ fn try_extract_shell_command(line: &str) -> Option<&str> {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "calls run_command, which lends the terminal under the TUI"
+    reason = "calls run_command, which borrows the terminal from the TUI"
 )]
 fn handle_shell_passthrough(cmd: &str) -> Result<()> {
     if cmd.is_empty() {

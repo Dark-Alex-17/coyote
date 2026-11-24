@@ -85,7 +85,7 @@ pub fn detect_shell() -> Shell {
 /// runs with the terminal lent to it.
 #[expect(
     clippy::disallowed_methods,
-    reason = "lends the terminal to the TUI when crate::tui::active()"
+    reason = "under the TUI the child runs with the terminal lent to it (crate::tui::active())"
 )]
 pub fn run_command<T: AsRef<OsStr>>(
     cmd: &str,

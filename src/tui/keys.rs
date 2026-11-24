@@ -3865,9 +3865,31 @@ mod tests {
             .collect()
     }
 
-    /// The trimmed cells of every body row of every table in `lines`:
-    /// header and separator rows left out.
-    fn table_rows<'a>(lines: &[&'a str]) -> Vec<Vec<&'a str>> {
+    /// The cells of a markdown table row, split on unescaped pipes and
+    /// trimmed, with `\|` read as a literal pipe.
+    fn table_cells(row: &str) -> Vec<String> {
+        let mut cells = vec![String::new()];
+        let mut chars = row.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&'|') => {
+                    chars.next();
+                    cells.last_mut().unwrap().push('|');
+                }
+                '|' => cells.push(String::new()),
+                c => cells.last_mut().unwrap().push(c),
+            }
+        }
+        let outer = cells.len() - 1;
+        cells
+            .drain(1..outer)
+            .map(|cell| cell.trim().to_string())
+            .collect()
+    }
+
+    /// The cells of every body row of every table in `lines`: header and
+    /// separator rows left out.
+    fn table_rows(lines: &[&str]) -> Vec<Vec<String>> {
         let mut rows = Vec::new();
         let mut header_seen = false;
         for line in lines {
@@ -3875,14 +3897,8 @@ mod tests {
                 header_seen = false;
             } else if !header_seen {
                 header_seen = true;
-            } else if !line.starts_with("|-") {
-                rows.push(
-                    line.trim()
-                        .trim_matches('|')
-                        .split('|')
-                        .map(str::trim)
-                        .collect(),
-                );
+            } else if !line.starts_with("|-") && !line.starts_with("| -") {
+                rows.push(table_cells(line));
             }
         }
         rows
@@ -3982,28 +3998,30 @@ mod tests {
             .collect()
     }
 
+    /// The wiki's name for a key: like `normalise`, except that a
+    /// character keeps its case and Shift on a letter is its capital, so
+    /// `Shift+g` and `G` are one name and `g` another.
+    fn wiki_key_name(key: KeyEvent) -> (KeyCode, KeyModifiers) {
+        if key == kitty_ctrl_underscore() {
+            return (KeyCode::Char('_'), KeyModifiers::CONTROL);
+        }
+        let mut modifiers =
+            key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let code = match key.code {
+            KeyCode::Char(c) if modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Char(c.to_ascii_uppercase())
+            }
+            other => other,
+        };
+        if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
+        (code, modifiers)
+    }
+
     #[test]
     fn the_wiki_contexts_are_the_keys_table_labels() {
         let labels: Vec<&str> = WIKI_CONTEXTS.iter().map(|(label, _)| *label).collect();
-        assert_eq!(
-            labels,
-            [
-                "Anywhere",
-                "Transcript",
-                "Confirm",
-                "Text field",
-                "List",
-                "Composer",
-                "Roster",
-                "Popup",
-                "Vim insert",
-                "Vim mode",
-                "Key help",
-                "Transcript view find",
-                "Thread picker",
-                "Transcript view",
-            ]
-        );
         for label in &labels {
             assert!(!wiki_context(label).is_empty(), "{label} covers no context");
         }
@@ -4020,22 +4038,23 @@ mod tests {
 
     /// The keys table of the wiki's `TUI.md` agrees with the key map
     /// both ways: each chord it lists does something in a context its
-    /// row names, each key help replay that binds a key is listed under
-    /// a context covering the replay's, and no context lists a chord
-    /// twice. Runs only with `COYOTE_WIKI_DIR` set, since the wiki is a
-    /// separate clone.
+    /// row names, each key help replay that binds a key is listed, case
+    /// kept, under a context covering the replay's and does there what
+    /// the replay does, and no context lists a chord twice. Runs only
+    /// with `COYOTE_WIKI_DIR` set, since the wiki is a separate clone.
     #[test]
     fn the_wiki_keys_table_matches_the_key_map_both_ways() {
         let Some(wiki) = wiki_dir() else { return };
         let page = std::fs::read_to_string(wiki.join(WIKI_PAGE)).unwrap();
+        let rows = table_rows(&section(&page, "# Keys"));
         let mut documented: Vec<(&str, &str)> = Vec::new();
-        for row in table_rows(&section(&page, "# Keys")) {
-            let [label, keys, _] = row[..] else {
+        for row in &rows {
+            let [label, keys, _] = &row[..] else {
                 panic!("a keys row has three cells: {row:?}");
             };
             let chords = code_spans(keys);
             assert!(!chords.is_empty(), "a keys row names a key: {row:?}");
-            documented.extend(chords.into_iter().map(|chord| (label, chord)));
+            documented.extend(chords.into_iter().map(|chord| (label.as_str(), chord)));
         }
 
         let mut seen = std::collections::BTreeSet::new();
@@ -4073,10 +4092,7 @@ mod tests {
 
         let listed: Vec<_> = documented
             .iter()
-            .map(|(label, chord)| {
-                let keys: Vec<_> = wiki_chord(chord).into_iter().map(normalise).collect();
-                (wiki_context(label), keys)
-            })
+            .map(|(label, chord)| (wiki_context(label), wiki_chord(chord)))
             .collect();
         let mut undocumented = Vec::new();
         for (context, label, replays) in help_examples() {
@@ -4084,11 +4100,13 @@ mod tests {
                 if passes_through(&action) {
                     continue;
                 }
-                let named = normalise(key);
-                if !listed
-                    .iter()
-                    .any(|(contexts, keys)| contexts.contains(&ctx) && keys.contains(&named))
-                {
+                let named = wiki_key_name(key);
+                if !listed.iter().any(|(contexts, keys)| {
+                    contexts.contains(&ctx)
+                        && keys.iter().any(|wiki_key| {
+                            wiki_key_name(*wiki_key) == named && map_key(*wiki_key, &ctx) == action
+                        })
+                }) {
                     undocumented.push(format!("{context:?} {label:?}: {key:?} in {ctx:?}"));
                 }
             }

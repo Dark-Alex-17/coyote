@@ -822,7 +822,7 @@ async fn start_interactive(ctx: RequestContext) -> Result<()> {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "a CLI flow (-e, --mcp); the process never reaches a UI"
+    reason = "the -e flow; the process never reaches a UI"
 )]
 async fn shell_execute(
     ctx: &mut RequestContext,

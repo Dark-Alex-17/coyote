@@ -4219,7 +4219,7 @@ impl RequestContext {
     /// Opens the config in the editor; returns the reminder to show after.
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub fn edit_config(&self) -> Result<String> {
         let config_path = paths::config_file();
@@ -4236,7 +4236,7 @@ impl RequestContext {
     /// after.
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub fn edit_mcp_config(&self) -> Result<String> {
         let mcp_path = paths::mcp_config_file();
@@ -4318,7 +4318,7 @@ impl RequestContext {
 
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub fn edit_session(&mut self, app: &AppConfig) -> Result<()> {
         let (name, scope) = match &self.session {
@@ -4351,7 +4351,7 @@ impl RequestContext {
     /// it has none; returns the reminder to show after.
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub fn edit_agent_config(&self, app: &AppConfig) -> Result<String> {
         let agent_name = match &self.agent {
@@ -4386,7 +4386,7 @@ impl RequestContext {
 
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub fn new_macro(&self, app: &AppConfig, name: &str) -> Result<()> {
         if RESERVED_MACRO_NAMES.contains(&name) {
@@ -7101,7 +7101,7 @@ impl RequestContext {
 
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         crate::tui::ensure_terminal_lendable()?;
@@ -7119,7 +7119,7 @@ impl RequestContext {
     /// returns the confirmation to show after.
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<String> {
         paths::validate_skill_name(name)?;
@@ -7732,7 +7732,7 @@ impl RequestContext {
 
     #[expect(
         clippy::disallowed_methods,
-        reason = "calls edit_file, which lends the terminal under the TUI"
+        reason = "calls edit_file, which borrows the terminal from the TUI"
     )]
     pub async fn edit_rag_docs(&mut self, abort_signal: AbortSignal) -> Result<()> {
         let mut rag = match self.rag.clone() {
