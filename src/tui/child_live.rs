@@ -6,6 +6,7 @@
 use super::FULL_OUTPUT_BUDGET;
 use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow, ToolStatus};
 use super::sink::{AgentOutcome, ChildNodeState};
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,8 @@ pub(crate) struct ChildThread {
     /// The agent that spawned this one; None for a child of the root turn.
     parent: Option<String>,
     parent_session: Option<String>,
+    /// The wall-clock time the UI saw it start.
+    started_at: DateTime<Utc>,
     /// How the child ended; None while it runs.
     outcome: Option<AgentOutcome>,
     rows: Vec<Cell>,
@@ -152,6 +155,15 @@ fn settle_folded_calls(calls: &mut [FoldedCall], error: &str, now: Instant) -> i
         .sum()
 }
 
+/// A child that keeps a session, as the thread pop-up lists it.
+pub(super) struct LiveSession<'a> {
+    pub(super) session_id: &'a str,
+    pub(super) agent: &'a str,
+    /// How it ended; None while it runs.
+    pub(super) outcome: Option<&'a AgentOutcome>,
+    pub(super) started_at: DateTime<Utc>,
+}
+
 /// Every live child thread by agent id, in the order the children
 /// started, and which child each session id names.
 #[derive(Default)]
@@ -181,19 +193,22 @@ impl ChildLive {
             .is_some_and(|id| id == agent_id)
     }
 
-    /// Each child that keeps a session, in start order: its session id,
-    /// its agent's name and how it ended, None while it runs.
-    pub(super) fn sessions(&self) -> impl Iterator<Item = (&str, &str, Option<&AgentOutcome>)> {
+    /// Each child that keeps a session, in start order.
+    pub(super) fn sessions(&self) -> impl Iterator<Item = LiveSession<'_>> {
         self.threads.values().filter_map(|thread| {
-            let session_id = thread.session_id.as_deref()?;
-            Some((session_id, thread.name.as_str(), thread.outcome.as_ref()))
+            Some(LiveSession {
+                session_id: thread.session_id.as_deref()?,
+                agent: &thread.name,
+                outcome: thread.outcome.as_ref(),
+                started_at: thread.started_at,
+            })
         })
     }
 
     /// Opens the thread of an agent that just started, at any depth, with
-    /// the agent that spawned it. Only a started agent gets one, so an
-    /// agent node's events, which no thread leads to, are dropped instead
-    /// of piling up.
+    /// the agent that spawned it and the wall-clock time it started at.
+    /// Only a started agent gets one, so an agent node's events, which no
+    /// thread leads to, are dropped instead of piling up.
     pub(super) fn agent_started(
         &mut self,
         agent_id: String,
@@ -201,6 +216,7 @@ impl ChildLive {
         session_id: Option<String>,
         parent: Option<String>,
         parent_session: Option<String>,
+        started_at: DateTime<Utc>,
     ) {
         if let Some(session_id) = &session_id {
             self.sessions.insert(session_id.clone(), agent_id.clone());
@@ -210,6 +226,7 @@ impl ChildLive {
         thread.session_id = session_id;
         thread.parent = parent;
         thread.parent_session = parent_session;
+        thread.started_at = started_at;
         thread.outcome = None;
     }
 

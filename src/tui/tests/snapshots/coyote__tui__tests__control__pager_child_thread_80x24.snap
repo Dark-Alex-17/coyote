@@ -2,7 +2,7 @@
 source: src/tui/tests/control.rs
 expression: "&frame"
 ---
-"Thread: reviewer (read-only) reviewer-x7x                                  1-5/5"
+"Thread: main > reviewer (read-only) reviewer-x7x                           1-5/5"
 "Read-only. Tool calls show live; replies show up at the child's next checkpoint."
 "                                                                                "
 "> review it                                                                     "

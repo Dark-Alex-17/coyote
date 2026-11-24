@@ -2214,7 +2214,7 @@ def run(out: str) -> str:
         pty.send(b"\t").unwrap();
         let picker = repainted_frame_showing(
             &mut pty,
-            "Threads  Enter = open  Esc = back",
+            "Enter open  Esc back",
             "Tab did not open the picker",
         );
         pty.send(b"\x1b").unwrap();
@@ -2225,7 +2225,7 @@ def run(out: str) -> str:
             "Esc did not go back to the pager",
         );
         assert!(
-            !squeezed(&back).contains(&squeezed("Threads  Enter = open  Esc = back")),
+            !squeezed(&back).contains(&squeezed("Enter open  Esc back")),
             "Esc left the picker up:\n{back}"
         );
         pty.send(b"\x1b").unwrap();

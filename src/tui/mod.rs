@@ -36,6 +36,7 @@ mod run_now;
 mod sink;
 mod terminal;
 mod theme;
+mod thread_tree;
 mod throbber;
 mod todo;
 mod transcript;
@@ -1246,7 +1247,7 @@ impl App {
             }
             TermInput::Mouse(mouse) => {
                 match self.layer() {
-                    Layer::Overlay(OverlayKind::Pager(PagerMode::Browse))
+                    Layer::Overlay(OverlayKind::Pager(PagerMode::Browse | PagerMode::Picker))
                         if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
                     {
                         if let (Some(Overlay::Pager(pager)), Some(area)) =
@@ -1620,6 +1621,9 @@ impl App {
             Action::PagerFindSubmit => self.with_pager(Pager::submit_find),
             Action::PagerFindCancel => self.with_pager(Pager::cancel_find),
             Action::ThreadPickerMove(delta) => self.with_pager(|pager| pager.move_picker(delta)),
+            Action::ThreadPickerUnfold => self.with_pager(Pager::unfold_picked),
+            Action::ThreadPickerFold => self.with_pager(Pager::fold_picked),
+            Action::ThreadPickerToggle => self.with_pager(Pager::toggle_picked),
             Action::CloseThreadPicker => self.with_pager(Pager::close_picker),
             Action::PagerFocusPrev => {
                 if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
@@ -1742,9 +1746,10 @@ impl App {
     }
 
     /// Takes the overlay's place. Over the tasks pop-up, or in place of a
-    /// pager opened from it, the pager keeps the pop-up to give back.
+    /// pager opened from it, the pager keeps the pop-up to give back. In
+    /// place of another pager it keeps the thread pop-up's folds too.
     fn open_pager(&mut self, mut pager: Pager) {
-        pager.set_tasks(match self.overlay.take() {
+        let tasks = match self.overlay.take() {
             Some(Overlay::Tasks(roster)) => Some(roster),
             Some(Overlay::Pager(mut previous)) => {
                 // A child's thread giving way to another thread, or to
@@ -1752,10 +1757,12 @@ impl App {
                 if !previous.shows_root() {
                     self.child_live.release_full_output_caches();
                 }
+                pager.set_folds(previous.take_folds());
                 previous.take_tasks()
             }
             Some(Overlay::Help(_)) | None => None,
-        });
+        };
+        pager.set_tasks(tasks);
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
     }
 
@@ -1932,6 +1939,7 @@ impl App {
                     session_id,
                     parent_agent_id,
                     parent_session_id,
+                    chrono::Utc::now(),
                 );
                 self.child_rows_changed(&agent_id);
                 // Only the root turn's own children get a row here; a

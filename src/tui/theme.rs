@@ -58,6 +58,24 @@ const LIGHT_PALETTE: Palette = Palette {
     faded: (0x56, 0x60, 0x7a),
 };
 
+/// The colours a sub-session's state is drawn in.
+struct ThreadPalette {
+    running: Rgb,
+    completed: Rgb,
+    failed: Rgb,
+}
+
+const DARK_THREADS: ThreadPalette = ThreadPalette {
+    running: (0xff, 0xa6, 0x57),
+    completed: (0x7e, 0xe7, 0x87),
+    failed: (0xff, 0x7b, 0x72),
+};
+const LIGHT_THREADS: ThreadPalette = ThreadPalette {
+    running: (0x9a, 0x4f, 0x00),
+    completed: (0x11, 0x63, 0x29),
+    failed: (0xb3, 0x26, 0x1e),
+};
+
 /// How a list's columns and its highlighted row are painted.
 pub(super) struct RowStyles {
     pub(super) name: Style,
@@ -231,6 +249,11 @@ pub(super) struct Theme {
     pub(super) surface_chrome: Style,
     /// Text that steps back from what is around it; dim under `NO_COLOR`.
     pub(super) faded: Style,
+    /// A sub-session's name and state in the thread pop-up, by state; a
+    /// cancelled or crashed one is drawn as failed.
+    pub(super) thread_running: Style,
+    pub(super) thread_completed: Style,
+    pub(super) thread_failed: Style,
 }
 
 impl Theme {
@@ -255,6 +278,14 @@ impl Theme {
         } else {
             Style::new().fg(rgb(palette.faded))
         };
+        let threads = if light { &LIGHT_THREADS } else { &DARK_THREADS };
+        let thread = |colour: Rgb| {
+            if no_color {
+                Style::new()
+            } else {
+                Style::new().fg(rgb(colour))
+            }
+        };
         Self {
             rule: paint(BOLD, if light { RULE_LIGHT } else { RULE_DARK }),
             hint_key: paint(ITALIC.add_modifier(Modifier::BOLD), HIGHLIGHT),
@@ -278,6 +309,9 @@ impl Theme {
             surface_raised: surface(palette.raised),
             surface_chrome: surface(palette.chrome),
             faded,
+            thread_running: thread(threads.running),
+            thread_completed: thread(threads.completed),
+            thread_failed: thread(threads.failed),
         }
     }
 }
@@ -347,6 +381,31 @@ mod tests {
                 assert!(matches!(style.bg, Some(Color::Indexed(_))), "{style:?}");
             }
             assert!(matches!(theme.faded.fg, Some(Color::Indexed(_))));
+        }
+    }
+
+    /// The thread states take their side's colours, and none at all
+    /// under `NO_COLOR`.
+    #[test]
+    fn thread_states_take_their_sides_colours_and_none_under_no_color() {
+        let rgb = |(r, g, b): Rgb| Color::Rgb(r, g, b);
+        let truecolor = renderer(true);
+        for (light, threads) in [(false, &DARK_THREADS), (true, &LIGHT_THREADS)] {
+            let theme = Theme::new(truecolor.markdown_render(), false, light);
+            assert_eq!(theme.thread_running, Style::new().fg(rgb(threads.running)));
+            assert_eq!(
+                theme.thread_completed,
+                Style::new().fg(rgb(threads.completed))
+            );
+            assert_eq!(theme.thread_failed, Style::new().fg(rgb(threads.failed)));
+            let plain = Theme::new(truecolor.markdown_render(), true, light);
+            for style in [
+                plain.thread_running,
+                plain.thread_completed,
+                plain.thread_failed,
+            ] {
+                assert_eq!(style, Style::new());
+            }
         }
     }
 

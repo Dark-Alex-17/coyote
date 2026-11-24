@@ -572,7 +572,8 @@ fn the_picker_lists_from_the_root_the_turn_resolves() {
         .app
         .handle_msg(UiMsg::ChildSessionRootResolved(Arc::clone(&root)));
     let frame = harness.draw();
-    assert!(frame.contains("reviewer  reviewer-x7x  running"), "{frame}");
+    assert!(frame.contains("reviewer  running"), "{frame}");
+    assert!(frame.contains("reviewer-x7x"), "{frame}");
     assert!(!frame.contains("No child sessions yet"), "{frame}");
 }
 

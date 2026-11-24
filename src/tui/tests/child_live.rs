@@ -663,7 +663,8 @@ fn the_picker_lists_a_finished_child_known_only_from_its_start() {
         press_ctrl(&mut harness, 't');
         harness.press(KeyCode::Tab);
         let frame = harness.draw();
-        assert!(frame.contains("planner  sess_5d6e  completed"), "{frame}");
+        assert!(frame.contains("planner  completed"), "{frame}");
+        assert!(frame.contains("sess_5d6e"), "{frame}");
         assert!(!frame.contains("No child sessions yet"), "{frame}");
     });
 }
@@ -694,11 +695,8 @@ fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() 
         harness.draw();
         harness.press(KeyCode::Char('t'));
         let frame = harness.draw();
-        assert!(
-            frame.contains("Threads  Enter = open  Esc = back"),
-            "{frame}"
-        );
-        assert!(frame.contains("planner  sess_5d6e  completed"), "{frame}");
+        assert!(frame.contains("Enter open  Esc back"), "{frame}");
+        assert!(frame.contains("planner  completed"), "{frame}");
         harness.press(KeyCode::Esc);
         assert!(harness.app.pager().is_some_and(Pager::shows_root));
         harness.press(KeyCode::Char('q'));
@@ -713,11 +711,8 @@ fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() 
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(harness.app.composer_text(), "");
         let frame = harness.draw();
-        assert!(
-            frame.contains("Threads  Enter = open  Esc = back"),
-            "{frame}"
-        );
-        assert!(frame.contains("planner  sess_5d6e  completed"), "{frame}");
+        assert!(frame.contains("Enter open  Esc back"), "{frame}");
+        assert!(frame.contains("planner  completed"), "{frame}");
     });
 }
 
@@ -850,11 +845,11 @@ fn a_reopened_grandchild_thread_draws_its_call_once() {
     });
 }
 
-/// With a child root that lists none of them, the picker lists a live
-/// grandchild right after its parent rather than after every child.
+/// With a child root that lists none of them, the picker nests a live
+/// grandchild under its parent, ahead of the parent's later sibling.
 #[test]
 #[serial]
-fn the_picker_lists_a_live_grandchild_after_its_parent() {
+fn the_picker_nests_a_live_grandchild_under_its_parent() {
     run_async(async {
         let _guard = TestConfigDirGuard::new("tui-picker-grandchild");
         let mut ctx = chat_ctx();
@@ -879,8 +874,14 @@ fn the_picker_lists_a_live_grandchild_after_its_parent() {
                 .find(label)
                 .unwrap_or_else(|| panic!("no {label} row: {frame}"))
         };
-        assert!(at("planner  sess_5d6e") < at("coder  sess_9c0d"), "{frame}");
-        assert!(at("coder  sess_9c0d") < at("other  sess_7a8b"), "{frame}");
+        assert!(
+            at("\u{25BE} planner  running") < at("      coder  running"),
+            "{frame}"
+        );
+        assert!(
+            at("      coder  running") < at("    other  running"),
+            "{frame}"
+        );
     });
 }
 
@@ -901,6 +902,7 @@ fn nested_live() -> ChildLive {
             Some(session_id.to_string()),
             parent.map(|(agent, _): (&str, &str)| agent.to_string()),
             parent.map(|(_, session): (&str, &str)| session.to_string()),
+            chrono::Utc::now(),
         );
     }
     live
@@ -946,6 +948,150 @@ fn ancestry_follows_parents_and_stops_at_a_loop() {
         Some("sess_5d6e".to_string()),
         Some(GREAT_GRANDCHILD.to_string()),
         Some("sess_3f4a".to_string()),
+        chrono::Utc::now(),
     );
     assert_eq!(live.ancestry(GREAT_GRANDCHILD), [AGENT, GRANDCHILD]);
+}
+
+/// A harness with a child root and the nested children started, the
+/// threads pop-up open on the root thread.
+fn nested_picker(start: u64) -> Harness {
+    let mut ctx = chat_ctx();
+    ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start }));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    started_nested(&mut harness);
+    press_ctrl(&mut harness, 't');
+    harness.press(KeyCode::Tab);
+    harness
+}
+
+fn title(harness: &mut Harness) -> String {
+    harness
+        .draw()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Right and l step down to a thread three levels deep, which Enter
+/// opens under its path. Left and h step back up and fold, Space folds
+/// and unfolds, and the folds outlast the pop-up closing and the thread
+/// changing; Enter on a hidden thread opens the folded one hiding it.
+#[test]
+#[serial]
+fn the_thread_popup_keys_fold_step_and_open_a_thread_three_levels_down() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-tree-keys");
+        let mut harness = nested_picker(21);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Char('l'));
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Char('l'));
+        harness.press(KeyCode::Enter);
+        assert_eq!(
+            harness.app.pager().and_then(Pager::child_session),
+            Some("sess_3f4a")
+        );
+        let top = title(&mut harness);
+        assert!(
+            top.contains("Thread: main > planner > coder > tester (read-only) sess_3f4a"),
+            "{top}"
+        );
+
+        harness.press(KeyCode::Tab);
+        harness.press(KeyCode::Char('h'));
+        harness.press(KeyCode::Left);
+        let frame = harness.draw();
+        assert!(frame.contains("\u{25B8} coder"), "{frame}");
+        assert!(!frame.contains("tester  running"), "{frame}");
+        harness.press(KeyCode::Char('h'));
+        harness.press(KeyCode::Char(' '));
+        let frame = harness.draw();
+        assert!(frame.contains("\u{25B8} planner"), "{frame}");
+        assert!(!frame.contains("coder  running"), "{frame}");
+        harness.press(KeyCode::Char(' '));
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Tab);
+        let frame = harness.draw();
+        assert!(frame.contains("\u{25BE} planner"), "{frame}");
+        assert!(frame.contains("\u{25B8} coder"), "{frame}");
+        assert!(!frame.contains("tester  running"), "{frame}");
+
+        harness.press(KeyCode::Enter);
+        assert_eq!(
+            harness.app.pager().and_then(Pager::child_session),
+            Some("sess_9c0d")
+        );
+        let top = title(&mut harness);
+        assert!(
+            top.contains("Thread: main > planner > coder (read-only)"),
+            "{top}"
+        );
+        harness.press(KeyCode::Tab);
+        let frame = harness.draw();
+        assert!(frame.contains("\u{25B8} coder"), "{frame}");
+    });
+}
+
+/// Where `needle` starts on screen.
+fn screen_at(harness: &Harness, needle: &str) -> (u16, u16) {
+    let buffer = harness.terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        let symbols: Vec<&str> = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        let text: String = symbols.concat();
+        if let Some(at) = text.find(needle) {
+            let x = symbols
+                .iter()
+                .scan(0, |end, symbol| {
+                    *end += symbol.len();
+                    Some(*end)
+                })
+                .position(|end| end > at)
+                .unwrap();
+            return (u16::try_from(x).unwrap(), y);
+        }
+    }
+    panic!("{needle:?} is not on screen:\n{buffer:?}");
+}
+
+fn click(harness: &mut Harness, (column, row): (u16, u16)) {
+    harness.app.handle_input(TermInput::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }));
+}
+
+/// A click on a thread's fold arrow folds it; a click on a row's name
+/// highlights the row, which Enter then opens.
+#[test]
+#[serial]
+fn a_click_folds_at_the_arrow_and_highlights_elsewhere_on_the_row() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-tree-clicks");
+        let mut harness = nested_picker(22);
+        harness.draw();
+        let arrow = screen_at(&harness, "\u{25BE} coder");
+        click(&mut harness, arrow);
+        let frame = harness.draw();
+        assert!(frame.contains("\u{25B8} coder"), "{frame}");
+        assert!(!frame.contains("tester  running"), "{frame}");
+        let (column, row) = screen_at(&harness, "coder  running");
+        click(&mut harness, (column + 2, row));
+        let frame = harness.draw();
+        assert!(
+            frame.contains("\u{25B8} coder"),
+            "a click on the name folded: {frame}"
+        );
+        harness.press(KeyCode::Enter);
+        assert_eq!(
+            harness.app.pager().and_then(Pager::child_session),
+            Some("sess_9c0d")
+        );
+    });
 }

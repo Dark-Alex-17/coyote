@@ -1,10 +1,11 @@
 use super::cells::{Cell, LineCache, ToolStatus};
-use super::pager::{Pager, ThreadRow};
+use super::pager::Pager;
 use super::redirect::FdRedirect;
 use super::rewind::{is_undo, rewind_barrier, undo_opener};
 use super::roster::{RosterRow, RosterSources};
 use super::run_now::{CommandOutput, run_now};
 use super::sink::UiMsg;
+use super::thread_tree::{ThreadNode, ThreadTree};
 use super::{App, CONTROL_TASK_WAIT, Overlay, TurnStatus, cells, pager, render};
 use crate::config::RequestContext;
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
@@ -614,7 +615,8 @@ impl App {
         if self.pager().is_some_and(Pager::shows_root) {
             cells::release_full_output_caches(self.transcript.cells_for_layout().0);
         }
-        self.open_pager(Pager::child(session_id.clone(), agent, file.clone()));
+        let crumbs = self.thread_tree().0.crumbs(&session_id);
+        self.open_pager(Pager::child(session_id.clone(), agent, file.clone()).with_crumbs(crumbs));
         self.read_open_child(session_id, file);
     }
 
@@ -636,8 +638,13 @@ impl App {
         });
     }
 
-    pub(super) fn open_thread_picker(&mut self) {
-        let mut rows = vec![ThreadRow::root()];
+    /// Every thread of the session as a tree, from the child-session
+    /// root's listing and the children the UI saw start that it does not
+    /// list yet, with why the listing failed if it did. With no root
+    /// there is no file to open a child from, so the tree is the main
+    /// thread alone.
+    fn thread_tree(&self) -> (ThreadTree, Option<String>) {
+        let mut threads = Vec::new();
         let note = match self.child_root.as_deref() {
             None => None,
             Some(root) => match root.list_children() {
@@ -648,8 +655,8 @@ impl App {
                         .map(ChildMeta::stamp)
                         .collect();
                     let alive = ProcessStamp::alive_set(&running);
-                    rows.extend(children.iter().map(|meta| {
-                        ThreadRow::child(
+                    threads.extend(children.iter().map(|meta| {
+                        ThreadNode::child(
                             meta,
                             meta.effective_status_with(|stamp| alive.contains(stamp)),
                         )
@@ -662,54 +669,36 @@ impl App {
                 }
             },
         };
-        // A child the root does not list yet is still known from its start,
-        // and is listed after its spawner's row and that spawner's earlier
-        // children when the spawner is listed. With no root there is no
-        // file to open it from, so it is left out.
         if self.child_root.is_some() {
             let live = &self.child_live;
-            for (session_id, agent, outcome) in self.child_live.sessions() {
-                if rows
-                    .iter()
-                    .any(|row| row.session_id.as_deref() == Some(session_id))
-                {
-                    continue;
-                }
-                let row = ThreadRow::live(session_id, agent, outcome);
-                let slot = live.parent_of_session(session_id).and_then(|parent| {
-                    let at = rows
-                        .iter()
-                        .position(|row| row.session_id.as_deref() == Some(parent))?
-                        + 1;
-                    let siblings = rows[at..]
-                        .iter()
-                        .take_while(|row| {
-                            row.session_id
-                                .as_deref()
-                                .and_then(|id| live.parent_of_session(id))
-                                == Some(parent)
-                        })
-                        .count();
-                    Some(at + siblings)
-                });
-                match slot {
-                    Some(at) => rows.insert(at, row),
-                    None => rows.push(row),
-                }
-            }
+            threads.extend(live.sessions().map(|session| {
+                ThreadNode::live(
+                    session.session_id,
+                    session.agent,
+                    session.outcome,
+                    live.parent_of_session(session.session_id),
+                    session.started_at,
+                )
+            }));
         }
-        let note = note.or_else(|| (rows.len() == 1).then(|| "No child sessions yet".to_string()));
+        (ThreadTree::new(threads), note)
+    }
+
+    pub(super) fn open_thread_picker(&mut self) {
+        let (tree, note) = self.thread_tree();
+        let note = note.or_else(|| (tree.len() == 1).then(|| "No child sessions yet".to_string()));
+        let now = chrono::Local::now();
         if let Some(pager) = self.pager_mut() {
-            pager.open_picker(rows, note);
+            pager.open_picker(tree, note, now.with_timezone(&chrono::Utc), *now.offset());
         }
     }
 
     pub(super) fn choose_thread(&mut self) {
-        let Some(row) = self.pager_mut().and_then(Pager::take_picked) else {
+        let Some(thread) = self.pager_mut().and_then(Pager::take_picked) else {
             return;
         };
-        match row.session_id {
-            Some(session_id) => self.open_child(session_id, row.agent),
+        match thread.session_id {
+            Some(session_id) => self.open_child(session_id, thread.agent),
             None => self.open_pager(Pager::root()),
         }
     }

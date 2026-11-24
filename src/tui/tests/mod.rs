@@ -5730,10 +5730,7 @@ fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
         assert_eq!(harness.app.composer_text(), "");
         let frame = harness.draw();
-        assert!(
-            frame.contains("Threads  Enter = open  Esc = back"),
-            "{line}: {frame}"
-        );
+        assert!(frame.contains("Enter open  Esc back"), "{line}: {frame}");
         assert!(frame.contains("No child sessions yet"), "{line}: {frame}");
         harness.press(KeyCode::Esc);
         harness.press(KeyCode::Char('q'));
@@ -5746,10 +5743,7 @@ fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
         harness.type_text(line);
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
         assert!(harness.app.queued.is_empty(), "{line}");
-        assert!(
-            harness.draw().contains("Threads  Enter = open  Esc = back"),
-            "{line}"
-        );
+        assert!(harness.draw().contains("Enter open  Esc back"), "{line}");
     }
 }
 

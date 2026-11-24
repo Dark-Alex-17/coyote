@@ -288,6 +288,13 @@ pub(crate) enum Action {
     OpenThreadPicker,
     /// Move the thread picker's highlight by this many rows.
     ThreadPickerMove(i32),
+    /// Unfold the highlighted thread, or step to its first child when it
+    /// is open already.
+    ThreadPickerUnfold,
+    /// Fold the highlighted thread, or step to its parent when it is
+    /// folded already or has no children.
+    ThreadPickerFold,
+    ThreadPickerToggle,
     ThreadPickerChoose,
     CloseThreadPicker,
     /// Move the focus between the foldable rows of a child's thread.
@@ -630,7 +637,22 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(PagerFind, "Backspace", "Delete a character"),
         row(PagerFind, "Esc / Ctrl+C", "Cancel the find"),
         row(ThreadPicker, "j / k / Up / Down", "Move the highlight"),
-        row(ThreadPicker, "Enter", "Open the thread"),
+        row(
+            ThreadPicker,
+            "l / Right",
+            "Unfold the thread, or go to its first child when open",
+        ),
+        row(
+            ThreadPicker,
+            "h / Left",
+            "Fold the thread, or go to its parent when folded or childless",
+        ),
+        row(
+            ThreadPicker,
+            "Space",
+            "Fold or unfold the thread; a click on its arrow does the same",
+        ),
+        row(ThreadPicker, "Enter", "Open the thread, at any depth"),
         row(
             ThreadPicker,
             "q / Esc / Tab / Ctrl+C / Ctrl+D",
@@ -934,6 +956,11 @@ fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) 
             KeyCode::Down => Action::ThreadPickerMove(1),
             KeyCode::Char('k') if !ctrl => Action::ThreadPickerMove(-1),
             KeyCode::Char('j') if !ctrl => Action::ThreadPickerMove(1),
+            KeyCode::Right => Action::ThreadPickerUnfold,
+            KeyCode::Left => Action::ThreadPickerFold,
+            KeyCode::Char('l') if !ctrl => Action::ThreadPickerUnfold,
+            KeyCode::Char('h') if !ctrl => Action::ThreadPickerFold,
+            KeyCode::Char(' ') if !ctrl => Action::ThreadPickerToggle,
             KeyCode::Enter => Action::ThreadPickerChoose,
             _ => Action::Nothing,
         },
@@ -2294,6 +2321,22 @@ mod tests {
             (plain(KeyCode::Enter), picker, Action::ThreadPickerChoose),
             (plain(KeyCode::Esc), picker, Action::CloseThreadPicker),
             (plain(KeyCode::Tab), picker, Action::CloseThreadPicker),
+            (plain(KeyCode::Right), picker, Action::ThreadPickerUnfold),
+            (
+                plain(KeyCode::Char('l')),
+                picker,
+                Action::ThreadPickerUnfold,
+            ),
+            (plain(KeyCode::Left), picker, Action::ThreadPickerFold),
+            (plain(KeyCode::Char('h')), picker, Action::ThreadPickerFold),
+            (
+                plain(KeyCode::Char(' ')),
+                picker,
+                Action::ThreadPickerToggle,
+            ),
+            (ctrl('l'), picker, Action::ScheduleFrame),
+            (ctrl('h'), picker, Action::Nothing),
+            (plain(KeyCode::Char(' ')), browse, Action::PagerPage(1)),
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
@@ -3170,6 +3213,31 @@ mod tests {
                     (plain(KeyCode::Up), PICKER, Action::ThreadPickerMove(-1)),
                     (plain(KeyCode::Down), PICKER, Action::ThreadPickerMove(1)),
                 ],
+            ),
+            (
+                H::ThreadPicker,
+                "l / Right",
+                vec![
+                    (letter('l'), PICKER, Action::ThreadPickerUnfold),
+                    (plain(KeyCode::Right), PICKER, Action::ThreadPickerUnfold),
+                ],
+            ),
+            (
+                H::ThreadPicker,
+                "h / Left",
+                vec![
+                    (letter('h'), PICKER, Action::ThreadPickerFold),
+                    (plain(KeyCode::Left), PICKER, Action::ThreadPickerFold),
+                ],
+            ),
+            (
+                H::ThreadPicker,
+                "Space",
+                vec![(
+                    plain(KeyCode::Char(' ')),
+                    PICKER,
+                    Action::ThreadPickerToggle,
+                )],
             ),
             (
                 H::ThreadPicker,
