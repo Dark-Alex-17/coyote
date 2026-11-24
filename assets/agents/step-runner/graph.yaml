@@ -31,10 +31,10 @@ enabled_skills:
 variables:
   - name: project_dir
     description: |
-      Absolute path to the project directory. Defaults to "." (the directory
-      coyote was invoked from). A value given here reaches the coder
-      sub-agent as its project_dir; without one, both resolve it from the
-      invocation directory.
+      Path to the project directory; relative paths resolve against the
+      invocation directory. Defaults to ".". resolve_step makes it absolute,
+      and that path reaches the coder and code-reviewer sub-agents as their
+      project_dir.
     default: '.'
   - name: plans_dir
     description: |
@@ -306,6 +306,8 @@ nodes:
 
       ### Fix loop status (empty on first attempt)
       {{fix_instructions}}
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 3600
     state_updates:
       coder_result: '{{output}}'
@@ -501,6 +503,8 @@ nodes:
 
       Review the changed files against the step plan's acceptance criteria.
       Preserve severity tags in your findings.
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1200
     max_attempts: 2
     state_updates:
