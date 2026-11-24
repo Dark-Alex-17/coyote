@@ -2297,18 +2297,18 @@ fn sessions_configuration_table_names_the_child_sessions_knob() {
     }
 }
 
-/// The spawn seam's extra variable is read from `spawned_agent_hook_extras`
+/// The child's session variable is read from `agent_extras` in `src/hooks.rs`
 /// and must appear on every `agent.*` row of Hooks.md and in the
 /// Environment-Variables.md table; the base `COYOTE_SESSION_ID` row says
 /// what it holds inside a child.
 #[test]
 fn hook_pages_carry_the_child_session_variable() {
-    let agents = src(&["function", "agents.rs"]);
-    let extras = fn_body(&agents, "fn spawned_agent_hook_extras(");
+    let hooks_rs = src(&["hooks.rs"]);
+    let extras = fn_body(&hooks_rs, "fn agent_extras(");
     let var = string_literals(&extras)
         .into_iter()
         .find(|literal| literal.ends_with("_SESSION_ID"))
-        .expect("spawned_agent_hook_extras pushes a session id variable");
+        .expect("agent_extras pushes a session id variable");
     assert_eq!(var, "COYOTE_AGENT_SESSION_ID");
 
     let events = agent_events();
