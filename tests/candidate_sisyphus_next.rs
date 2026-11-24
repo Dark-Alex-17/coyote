@@ -1455,13 +1455,19 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("adversary").join("scripts"),
         &agents.join("adversary").join("scripts"),
     );
-    // the red-gate rows render the coder's own end_failure template
-    fs::create_dir_all(agents.join("coder")).unwrap();
-    fs::copy(
-        agents_dir().join("coder").join("graph.yaml"),
-        agents.join("coder").join("graph.yaml"),
-    )
-    .unwrap();
+    // the red-gate rows render the coder's own end_failure template, and the
+    // seating rows read every child agent's declared variables
+    for entry in fs::read_dir(agents_dir()).unwrap() {
+        let agent = entry.unwrap().path();
+        for name in ["graph.yaml", "config.yaml"] {
+            let manifest = agent.join(name);
+            if manifest.is_file() {
+                let dest = agents.join(agent.file_name().unwrap());
+                fs::create_dir_all(&dest).unwrap();
+                fs::copy(&manifest, dest.join(name)).unwrap();
+            }
+        }
+    }
     let copy = agents.join(CANDIDATE);
     copy_tree(&candidate_dir(), &copy);
     copy
@@ -3295,7 +3301,7 @@ fn gauntlet_sentinels_are_column_zero_whole_lines_first_match_wins() {
 /// reach the coder, review-gauntlet and step-runner children by inheritance
 /// alone; their `inputs:` lines also carry the default. This pins that
 /// census: exactly those three nodes carry it, and no other agent node
-/// carries `inputs:` at all.
+/// carries a `build_lock` input.
 #[test]
 fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -3325,8 +3331,8 @@ fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
                 seen.push(id);
             }
             None => assert!(
-                node.get("inputs").is_none(),
-                "{id} ({agent}) is outside the recorded build_lock inputs census and must not carry inputs: {node:?}"
+                node["inputs"].get("build_lock").is_none(),
+                "{id} ({agent}) is outside the recorded build_lock inputs census and must not carry a build_lock input: {node:?}"
             ),
         }
     }

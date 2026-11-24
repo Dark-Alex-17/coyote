@@ -980,6 +980,8 @@ nodes:
       in THEIR slice, and check your inbox after each search round and before
       finalizing. End with an optional "Anomalies:" line for anything outside
       this task's scope that someone should know.
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1800
     max_attempts: 2
     state_updates:
@@ -1012,6 +1014,8 @@ nodes:
       follow, the conventions in force, and the call sites that matter. End with
       an optional "Anomalies:" line for anything outside this task's scope that
       someone should know.
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1800
     max_attempts: 2
     state_updates:
@@ -1046,6 +1050,8 @@ nodes:
       Context: this answers a question raised while implementing the following
       task in {{project_dir}}; prefer official docs and cite sources.
       Task: {{current_task}}
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1800
     max_attempts: 2
     state_updates:
@@ -1167,6 +1173,8 @@ nodes:
       {{context_pack}}
 
       Return your analysis with a concrete recommendation.
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1800
     max_attempts: 2
     state_updates:
@@ -1192,6 +1200,8 @@ nodes:
       Scan for deepening opportunities weighted by git hot spots in
       {{project_dir}}, report the candidates, and refine the strongest one into an
       implementation-ready interface proposal.
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 3600
     max_attempts: 1
     state_updates:
@@ -1310,6 +1320,8 @@ nodes:
       End your reply with EXACTLY one line:
       CONSULT: ANSWER <option number or text>   (confident, within the task's scope)
       CONSULT: DEFER <one-line reason>          (owner's call)
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1800
     max_attempts: 1
     state_updates:
@@ -1872,6 +1884,8 @@ nodes:
       {{last_coder_error}}
 
       Project directory: {{project_dir}}
+    inputs:
+      project_dir: '{{project_dir}}'
     timeout: 1800
     max_attempts: 2
     state_updates:
@@ -2538,6 +2552,7 @@ nodes:
       {{brief}}
     inputs:
       build_lock: '{{build_lock}}'
+      project_dir: '{{project_dir}}'
     timeout: 0
     max_attempts: 1
     state_updates:

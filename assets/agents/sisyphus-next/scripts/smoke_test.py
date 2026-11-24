@@ -5699,6 +5699,50 @@ check("baseline floor: empty while carried test failures are pending",
 _floor_input = "\n      baseline_floor: '{{coder_baseline_floor}}'"
 check("baseline floor: run_coder passes it as the coder's baseline_floor", _floor_input in node_block("run_coder"))
 
+
+# ---------------------------------------------------------------- child agents seated in the checkout under work
+AGENTS_ROOT = os.path.join(HERE, "..", "..")
+
+
+def read_yaml(path):
+    """The YAML document at `path` through mikefarah yq, as (doc, error); doc is None when it cannot be read."""
+    try:
+        p = subprocess.run(["yq", "-o=json", ".", path], capture_output=True, text=True)
+    except OSError as e:
+        return None, f"yq not runnable: {e}"
+    if p.returncode != 0:
+        return None, f"yq failed to read {path} (exit {p.returncode}): {p.stderr.strip()}"
+    try:
+        doc = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        return None, f"yq output is not JSON: {e}"
+    return (doc, "") if isinstance(doc, dict) else (None, f"yq output is not a mapping: {p.stdout[:200]}")
+
+
+def child_declares_project_dir(agent):
+    for name in ("graph.yaml", "config.yaml"):
+        path = os.path.join(AGENTS_ROOT, agent, name)
+        if os.path.isfile(path):
+            doc, _ = read_yaml(path)
+            return None if doc is None else any(v.get("name") == "project_dir" for v in doc.get("variables") or [])
+    return None
+
+
+_seat_graph, _seat_error = read_yaml(os.path.join(HERE, "..", "graph.yaml"))
+check("graph.yaml: read through mikefarah yq", _seat_graph is not None, _seat_error)
+_seat_nodes = (_seat_graph or {}).get("nodes") or {}
+_seat_input = "{{project_dir}}"
+# A child that declares project_dir and gets no input keeps the root run's checkout.
+_declares = {n: child_declares_project_dir(v.get("agent", "")) for n, v in _seat_nodes.items() if v.get("type") == "agent"}
+_unseated = sorted(n for n, d in _declares.items() if d and (_seat_nodes[n].get("inputs") or {}).get("project_dir") != _seat_input)
+_unread = sorted(n for n, d in _declares.items() if d is None)
+check("graph: every agent node whose child declares project_dir passes it through inputs",
+      _declares and not _unseated and not _unread, {"unseated": _unseated, "child agent unreadable": _unread})
+check("graph: run_step seats step-runner in the checkout under work",
+      _declares.get("run_step") is True
+      and (_seat_nodes.get("run_step", {}).get("inputs") or {}).get("project_dir") == _seat_input,
+      _seat_nodes.get("run_step", {}).get("inputs"))
+
 # ---------------------------------------------------------------- pipeline size: small or standard, escalated by red gates
 @contextlib.contextmanager
 def scenario(name):
