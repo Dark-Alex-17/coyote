@@ -189,9 +189,10 @@ coyote -a step-runner --agent-variable build_lock 'flock -w 240 /tmp/coyote-carg
 ```
 
 **Invoke from the project root, or pass `project_dir`.** A `project_dir`
-given to step-runner (`--agent-variable project_dir <path>`) reaches the
-spawned coder as its own `project_dir`; without one, both resolve it from
-the invocation directory.
+given to step-runner (`--agent-variable project_dir <path>`, default `.`)
+is made absolute by `resolve_step`, and `implement` and
+`independent_review` pass that path to the coder and code-reviewer through
+`inputs: project_dir`, so both read the same checkout.
 
 ## Tuning
 
