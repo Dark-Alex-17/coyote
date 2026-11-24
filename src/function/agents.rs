@@ -4465,8 +4465,10 @@ mod tests {
     }
 
     /// With the app knob off no child is seated, so neither session key
-    /// reaches the hooks: not the spawn seam's `COYOTE_AGENT_SESSION_ID`,
-    /// and not the base `COYOTE_SESSION_ID`, since the child has no session.
+    /// reaches the hooks: not `COYOTE_AGENT_SESSION_ID`, which
+    /// `hooks::agent_extras` sets only when the agent events carry a session
+    /// id, and not the base `COYOTE_SESSION_ID`, since the child has no
+    /// session.
     #[test]
     #[serial]
     fn unseated_spawn_hooks_carry_no_session_keys() {
