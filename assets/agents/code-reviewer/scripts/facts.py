@@ -37,7 +37,7 @@ spec = (state.get("diff_spec") or "auto").strip()
 notes = []
 # project_dir_json is the path as a JSON string literal, for templates that
 # embed it in a JSON object the model copies verbatim.
-out = {"project_dir": proj, "project_dir_json": json.dumps(proj)}
+out = {"project_dir": proj, "project_dir_json": json.dumps(proj, ensure_ascii=False)}
 # Plain text from git's own differ whatever the user's diff config (no
 # colour, external driver or textconv), with paths root-relative when
 # project_dir is a subdirectory and a fixed a/ b/ prefix pair.
