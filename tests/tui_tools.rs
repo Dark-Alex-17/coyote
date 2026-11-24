@@ -622,9 +622,7 @@ mod binary_tools {
         let (fake, out) = list_tool_turn(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let asked_at = pty.raw().len();
+        let asked_at = wait_for_repl_prompt(&mut pty, "fake-model)>", 0);
         pty.send(b"call the list tool\r").unwrap();
         pty.wait_for_after("q7l-q", asked_at, PTY_DEADLINE)
             .expect("the tool's list question never reached the terminal");
@@ -661,6 +659,7 @@ mod binary_tools {
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap().trim(),
             "1",
@@ -674,7 +673,7 @@ mod binary_tools {
         );
         assert_eq!(fake.served(), 2, "{transcript}");
 
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -799,8 +798,7 @@ mod binary_tools {
         let macros_dir = dir.join("macros");
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         // The built-in macros are seeded on startup; the question must not
         // touch them from here on.
         let files_before = walk(&macros_dir);
@@ -864,7 +862,8 @@ mod binary_tools {
             "the plain REPL entered the alternate screen:\n{settled}"
         );
 
-        pty.read_for(Duration::from_millis(300));
+        let declined = pty.raw().len();
+        wait_for_repl_prompt(&mut pty, "dry-model)>", declined);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -896,9 +895,7 @@ mod binary_tools {
         let (fake, out) = list_tool_turn(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let asked_at = pty.raw().len();
+        let asked_at = wait_for_repl_prompt(&mut pty, "fake-model)>", 0);
         pty.send(b"call the list tool\r").unwrap();
         pty.wait_for_after("Other (custom)", asked_at, PTY_DEADLINE)
             .expect("the tool's list question never offered the custom row");
@@ -918,6 +915,7 @@ mod binary_tools {
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
             TYPED_CUSTOM_ANSWER,
@@ -948,7 +946,7 @@ mod binary_tools {
          {handed:?}"
         );
 
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1150,7 +1148,7 @@ def run(out: str) -> str:
         let (repo, local_before) = two_mcp_conflicts(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+        pty.wait_for("dry-model)>", REPL_PROMPT_DEADLINE).unwrap();
         pty.resize(60, 140).unwrap();
         pty.read_for(Duration::from_millis(300));
         let install_at = pty.raw().len();
@@ -1167,6 +1165,7 @@ def run(out: str) -> str:
         pty.read_for(Duration::from_millis(600));
         let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
         let first_is_server = asked.contains("Conflict on MCP server 'bundle-k7s-server'");
+        let cancelled = pty.raw().len();
         pty.send(b"\x1b").unwrap();
         wait_for_squeezed(
             &mut pty,
@@ -1184,6 +1183,7 @@ def run(out: str) -> str:
                 .replace("SWAP", "bundle-k7s-second")
         };
         assert_both_kept_local_after_one_esc(&dir, &local_before, &since);
+        wait_for_repl_prompt(&mut pty, "dry-model)>", cancelled);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1241,9 +1241,7 @@ def run(out: str) -> str:
         let (fake, out) = empty_default_turn(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let asked_at = pty.raw().len();
+        let asked_at = wait_for_repl_prompt(&mut pty, "fake-model)>", 0);
         pty.send(b"call the label tool\r").unwrap();
         pty.wait_for_after("Label e0d-q", asked_at, PTY_DEADLINE)
             .expect("the tool's Input question never reached the terminal");
@@ -1266,6 +1264,7 @@ def run(out: str) -> str:
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done e0d", "the reply after the tool");
+        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
             "[typed-e0d]",
@@ -1273,7 +1272,7 @@ def run(out: str) -> str:
         );
         assert_eq!(fake.served(), 2, "{transcript}");
 
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1369,13 +1368,13 @@ def run(out: str) -> str:
                 "/dev/tty",
                 &format!(" --{ui}"),
             );
-            if ui == "repl" {
-                pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+            let asked_at = if ui == "repl" {
+                wait_for_repl_prompt(&mut pty, "fake-model)>", 0)
             } else {
                 pty.wait_for("no session", PTY_DEADLINE).unwrap();
-            }
-            pty.read_for(Duration::from_millis(300));
-            let asked_at = pty.raw().len();
+                pty.read_for(Duration::from_millis(300));
+                pty.raw().len()
+            };
             pty.send(b"call the checkbox tool\r").unwrap();
             if ui == "repl" {
                 pty.wait_for_after("beta-c3b", asked_at, PTY_DEADLINE)
@@ -1398,18 +1397,19 @@ def run(out: str) -> str:
             pty.send(b"\x1b").unwrap();
             wait_for_file(&mut pty, &out, "the tool's recorded answer");
             wait_for_squeezed(&mut pty, "fixture done c3b", "the reply after the tool");
+            let replied = pty.raw().len();
             assert_eq!(
                 fs::read_to_string(&out).unwrap(),
                 "cancelled",
                 "[{ui}] Esc on the checkbox question did not reach the tool as a cancel"
             );
-            pty.read_for(Duration::from_millis(300));
-            pty.send(if ui == "repl" {
-                b".exit\r" as &[u8]
+            if ui == "repl" {
+                wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
+                pty.send(b".exit\r").unwrap();
             } else {
-                b"\x04"
-            })
-            .unwrap();
+                pty.read_for(Duration::from_millis(300));
+                pty.send(b"\x04").unwrap();
+            }
             let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
             assert_eq!(exit_code(&transcript), 0, "[{ui}] {transcript}");
             assert_tty_restored(&transcript);
@@ -1540,8 +1540,7 @@ def run(out: str) -> str:
         write_agent_with_documents(&dir, "docs-agent-r7q");
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         let files_before = walk(&dir);
         let before = pty.raw().len();
         pty.send(b".agent docs-agent-r7q\r").unwrap();
@@ -1568,9 +1567,7 @@ def run(out: str) -> str:
 
         let answered_at = pty.raw().len();
         pty.send(b"n\r").unwrap();
-        pty.wait_for_after("docs-agent-r7q", answered_at, PTY_DEADLINE)
-            .expect("the agent prompt never came back after `n`");
-        pty.read_for(Duration::from_millis(500));
+        wait_for_repl_prompt(&mut pty, "docs-agent-r7q>>", answered_at);
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         let written = new_files_named(&dir, &files_before, "/rags/");
         assert!(
@@ -1831,8 +1828,7 @@ def run(out: str) -> str:
         write_dry_run_config_with_embeddings(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         let files_before = walk(&dir);
         let before = pty.raw().len();
         pty.send(b".rag new-rag-r2p\r").unwrap();
@@ -1859,8 +1855,7 @@ def run(out: str) -> str:
 
         let esc_at = pty.raw().len();
         pty.send(b"\x1b").unwrap();
-        pty.wait_for_after("dry-model)>", esc_at, PTY_DEADLINE)
-            .expect("Esc on the inquire select did not bring the prompt back");
+        wait_for_repl_prompt(&mut pty, "dry-model)>", esc_at);
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         for footprint in ["r2p", "/rags/"] {
             let written = new_files_named(&dir, &files_before, footprint);
@@ -1870,7 +1865,6 @@ def run(out: str) -> str:
             );
         }
 
-        pty.read_for(Duration::from_millis(300));
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1980,9 +1974,7 @@ def run(out: str) -> str:
         let (fake, out) = list_tool_turn(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let asked_at = pty.raw().len();
+        let asked_at = wait_for_repl_prompt(&mut pty, "fake-model)>", 0);
         pty.send(b"call the list tool\r").unwrap();
         pty.wait_for_after("Other (custom)", asked_at, PTY_DEADLINE)
             .expect("the tool's list question never offered the custom row");
@@ -2002,6 +1994,7 @@ def run(out: str) -> str:
         wait_for_file(&mut pty, &out, "the tool's recorded answer");
         let transcript =
             wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+        let replied = pty.raw().len();
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
             "cancelled",
@@ -2014,7 +2007,7 @@ def run(out: str) -> str:
         );
         assert_eq!(fake.served(), 2, "{transcript}");
 
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

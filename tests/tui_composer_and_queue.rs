@@ -1115,16 +1115,6 @@ mod key_help_and_chords {
     const HELP_MARK: &str = "Suspend to the shell";
     /// The roster's legend.
     const ROSTER_MARK: &str = "Esc = close";
-    /// A pseudo-terminal never answers a cursor-position query, and the plain
-    /// REPL sends three before each prompt reads a key (its own row resync,
-    /// then reedline's anchor and drift checks), each waiting out crossterm's
-    /// 2 s. The first prompt also pays the background-colour probe, so it
-    /// lands about 12 s after spawn on a loaded host, and the next prompt
-    /// 6 s after a command's output. Keys typed in that gap meet a cooked
-    /// terminal, which turns their Enter into a line feed that reedline
-    /// takes as a newline in the buffer, so a case types only once the
-    /// prompt is drawn.
-    const REPL_PROMPT_DEADLINE: Duration = Duration::from_secs(45);
 
     /// xterm's encodings of F1-F12.
     const FUNCTION_KEYS: [&[u8]; 12] = [
@@ -1280,9 +1270,7 @@ mod key_help_and_chords {
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
-        pty.wait_for("dry-model)>", REPL_PROMPT_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let at = pty.raw().len();
+        let at = wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         pty.send(b".keys\r").unwrap();
         pty.wait_for_after("Unknown command", at, REPL_PROMPT_DEADLINE)
             .expect("the REPL did not refuse .keys as an unknown command");
@@ -1296,9 +1284,7 @@ mod key_help_and_chords {
             "the REPL entered the alternate screen"
         );
         let refused = find(pty.raw(), b"Unknown command", at).unwrap();
-        pty.wait_for_after("dry-model)>", refused, REPL_PROMPT_DEADLINE)
-            .expect("the REPL did not draw its prompt again after refusing .keys");
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", refused);
         pty.send(b".exit\r").unwrap();
         let transcript = pty
             .wait_for("tty-probe-done", REPL_PROMPT_DEADLINE)

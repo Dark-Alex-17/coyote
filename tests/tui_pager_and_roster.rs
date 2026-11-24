@@ -1515,7 +1515,9 @@ mod transcript {
         const EXCHANGES: usize = 2_500;
         let dir = fresh_config_dir("big-dot-session");
         let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config_with(&dir, "");
+        // The exit dump of the whole history is not what this case checks,
+        // and on a loaded host its 5,000 messages outlast the quit deadline.
+        write_dry_run_config_with(&dir, "tui_dump_on_exit: false\n");
         write_session(&dir, "huge", EXCHANGES);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -5175,10 +5177,7 @@ mod footer_counts_help_popup_completion_and_scroll {
         write_dry_run_config(&dir);
         write_agent_with_variable(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-
-        let at = pty.raw().len();
+        let at = wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         pty.send(b".ag").unwrap();
         pty.read_for(Duration::from_millis(400));
         pty.send(b"\t").unwrap();
@@ -5188,7 +5187,9 @@ mod footer_counts_help_popup_completion_and_scroll {
             .wait_for_after(".agent", at, PTY_DEADLINE)
             .unwrap_or_default();
         pty.send(b"\r").unwrap();
-        pty.read_for(Duration::from_millis(2500));
+        let answered = pty
+            .wait_for_after("Usage: .agent", at, REPL_PROMPT_DEADLINE)
+            .is_ok();
         let out = strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..]));
         assert!(
             !out.contains("Unknown command"),
@@ -5200,8 +5201,13 @@ mod footer_counts_help_popup_completion_and_scroll {
             "the line never showed .agent after Tab:\n{tabbed}\nafter Enter:\n{out}\nraw: {:?}",
             String::from_utf8_lossy(&pty.raw()[at..])
         );
+        assert!(
+            answered,
+            ".agent with no name printed no usage line:\n{out}"
+        );
 
-        let at = pty.raw().len();
+        let usage = find(pty.raw(), b"Usage: .agent", at).unwrap();
+        let at = wait_for_repl_prompt(&mut pty, "dry-model)>", usage);
         pty.send(b".agent helper ").unwrap();
         pty.read_for(Duration::from_millis(400));
         pty.send(b"\t").unwrap();
@@ -5222,8 +5228,12 @@ mod footer_counts_help_popup_completion_and_scroll {
         );
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(400));
+        let interrupted = pty.raw().len();
         pty.send(b"\x03").unwrap();
-        pty.read_for(Duration::from_millis(600));
+        pty.wait_for_after("To exit, press Ctrl+D", interrupted, REPL_PROMPT_DEADLINE)
+            .expect("Ctrl+C did not print the exit hint");
+        let hint = find(pty.raw(), b"To exit, press Ctrl+D", interrupted).unwrap();
+        wait_for_repl_prompt(&mut pty, "dry-model)>", hint);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

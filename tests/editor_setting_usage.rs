@@ -16,7 +16,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::tui_harness::{
-    TempDirGuard, WAIT_WRAPPER, exit_code, fresh_config_dir, spawn_repl_under, write_config,
+    TempDirGuard, WAIT_WRAPPER, exit_code, fresh_config_dir, spawn_repl_under,
+    wait_for_repl_prompt, write_config,
 };
 use serial_test::serial;
 
@@ -60,16 +61,15 @@ fn editors_run(config_editor: bool, visual: bool, editor: bool) -> Vec<String> {
         env.push(("EDITOR", paths[1].as_str()));
     }
     let mut repl = spawn_repl_under(&dir, &env, WAIT_WRAPPER, "/dev/tty");
-    repl.wait_for("dry-model)>", Duration::from_secs(30))
-        .unwrap();
-    repl.read_for(Duration::from_millis(300));
+    wait_for_repl_prompt(&mut repl, "dry-model)>", 0);
     repl.send(b".edit config\r").unwrap();
     let marker = dir.join("editor-ran");
     let deadline = Instant::now() + Duration::from_secs(15);
     while !marker.exists() && Instant::now() < deadline {
         repl.read_for(Duration::from_millis(100));
     }
-    repl.read_for(Duration::from_millis(500));
+    let edited = repl.raw().len();
+    wait_for_repl_prompt(&mut repl, "dry-model)>", edited);
     repl.send(b"\x04").unwrap();
     let text = repl
         .wait_for("tty-probe-done", Duration::from_secs(30))

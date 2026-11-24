@@ -4832,11 +4832,11 @@ fn style_of(harness: &Harness, needle: &str) -> Style {
 }
 
 /// Hands `ctx` a config that differs from the one it has only in
-/// whether replies are highlighted.
-fn swap_highlight(ctx: &mut RequestContext, highlight: bool) {
+/// whether replies are shown as raw markdown.
+fn swap_raw_markdown(ctx: &mut RequestContext, raw_markdown: bool) {
     let mut state = (*ctx.app).clone();
     state.config = Arc::new(AppConfig {
-        highlight,
+        raw_markdown,
         ..(*ctx.app.config).clone()
     });
     ctx.app = Arc::new(state);
@@ -4844,7 +4844,10 @@ fn swap_highlight(ctx: &mut RequestContext, highlight: bool) {
 
 /// A new config brings a new renderer, and every view restyles what
 /// it already laid out: the transcript, the pager's root thread and
-/// a child's thread open in the pager.
+/// a child's thread open in the pager. The swap is to raw markdown,
+/// which changes the text itself: a highlight swap shows only as
+/// colour, and a `NO_COLOR` in the environment turns crossterm's
+/// colour off for the whole test process.
 #[test]
 #[serial]
 fn a_new_renderer_restyles_the_transcript_and_the_pager() {
@@ -4871,24 +4874,28 @@ fn a_new_renderer_restyles_the_transcript_and_the_pager() {
             .app
             .open_child("reviewer-c5s".to_string(), "reviewer".to_string());
         run_control_requests(&mut harness).await;
-        harness.draw();
-        let plain_child = style_of(&harness, "bold c5s");
+        let rendered = harness.draw();
+        assert!(!rendered.contains("**bold c5s**"), "{rendered}");
 
-        swap_highlight(&mut ctx, true);
+        swap_raw_markdown(&mut ctx, true);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.draw();
-        assert_ne!(style_of(&harness, "bold c5s"), plain_child);
+        let rendered = harness.draw();
+        assert!(rendered.contains("**bold c5s**"), "{rendered}");
+        harness.press(KeyCode::Char('q'));
+        let rendered = harness.draw();
+        assert!(rendered.contains("**bold t5s**"), "{rendered}");
+        press_ctrl(&mut harness, 't');
+        let rendered = harness.draw();
+        assert!(rendered.contains("**bold t5s**"), "{rendered}");
+
+        swap_raw_markdown(&mut ctx, false);
+        harness.app.sync_from_ctx(&mut ctx);
+        let rendered = harness.draw();
+        assert!(!rendered.contains("**bold t5s**"), "{rendered}");
+        assert_eq!(style_of(&harness, "bold t5s"), plain_root);
         harness.press(KeyCode::Char('q'));
         harness.draw();
-        assert_ne!(style_of(&harness, "bold t5s"), plain_transcript);
-        press_ctrl(&mut harness, 't');
-        harness.draw();
-        assert_ne!(style_of(&harness, "bold t5s"), plain_root);
-
-        swap_highlight(&mut ctx, false);
-        harness.app.sync_from_ctx(&mut ctx);
-        harness.draw();
-        assert_eq!(style_of(&harness, "bold t5s"), plain_root);
+        assert_eq!(style_of(&harness, "bold t5s"), plain_transcript);
     });
 }
 

@@ -437,7 +437,7 @@ mod palette_and_rewind {
         // Grown before the line editor starts reading: a resize mid-read is
         // a signal the editor repaints on, and the keys behind it are lost.
         pty.resize(100, 100).unwrap();
-        pty.wait_for(")> ", PTY_DEADLINE)
+        pty.wait_for(")> ", REPL_PROMPT_DEADLINE)
             .expect("the REPL prompt never appeared");
         pty.read_for(Duration::from_millis(500));
         let menu_at = pty.raw().len();

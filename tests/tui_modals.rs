@@ -827,9 +827,7 @@ mod binary_menus {
         write_tool(&dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, stdin);
 
-        pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let asked_at = pty.raw().len();
+        let asked_at = wait_for_repl_prompt(&mut pty, "fake-model)>", 0);
         pty.send(b"call the confirm tool\ry\r").unwrap();
         pty.wait_for_after("q9d-q", asked_at, PTY_DEADLINE)
             .expect("the tool's confirm question never reached the terminal");
@@ -861,7 +859,8 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{transcript}"
         );
 
-        pty.read_for(Duration::from_millis(300));
+        let replied = pty.raw().len();
+        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -901,8 +900,7 @@ mod binary_menus {
         let macros_dir = dir.join("macros");
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         let files_before = walk(&macros_dir);
         let before = pty.raw().len();
         pty.send(b".install macros\ry\r").unwrap();
@@ -945,7 +943,8 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{settled}"
         );
 
-        pty.read_for(Duration::from_millis(300));
+        let declined = pty.raw().len();
+        wait_for_repl_prompt(&mut pty, "dry-model)>", declined);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1295,9 +1294,7 @@ mod binary_menus {
         write_agent_needing_a_variable(&dir, "vars-agent-p3r");
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let before = pty.raw().len();
+        let before = wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         pty.send(b".agent vars-agent-p3r\r").unwrap();
         pty.wait_for_after("username", before, PTY_DEADLINE)
             .expect("`.agent` with an unset variable did not ask for it in the plain REPL");
@@ -1322,12 +1319,10 @@ mod binary_menus {
         );
         pty.read_for(Duration::from_millis(300));
 
+        let answered = pty.raw().len();
         pty.send(b"typed-user-p3r\r").unwrap();
         // The prompt comes back carrying the agent's name.
-        pty.wait_for_after("vars-agent-p3r>>", before, PTY_DEADLINE)
-            .expect("the prompt did not come back after the variable was answered");
-        pty.read_for(Duration::from_millis(300));
-        let info_at = pty.raw().len();
+        let info_at = wait_for_repl_prompt(&mut pty, "vars-agent-p3r>>", answered);
         pty.send(b".info agent\r").unwrap();
         pty.wait_for_after("config_file", info_at, PTY_DEADLINE)
             .expect("`.info agent` never rendered after the variable was answered");
@@ -1342,7 +1337,8 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{info}"
         );
 
-        pty.read_for(Duration::from_millis(300));
+        let shown = pty.raw().len();
+        wait_for_repl_prompt(&mut pty, "vars-agent-p3r>>", shown);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1621,9 +1617,7 @@ mod binary_menus {
         secure_vault_password_file(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let before = pty.raw().len();
+        let before = wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         pty.send(b".vault add vault-secret-r2p\r").unwrap();
         pty.wait_for_after("Enter the secret value:", before, PTY_DEADLINE)
             .expect("`.vault add` in the plain REPL did not ask for the value");
@@ -1657,6 +1651,7 @@ mod binary_menus {
             "Secret 'vault-secret-r2p' added to the vault",
             "the plain REPL's `.vault add` confirmation",
         );
+        let added = pty.raw().len();
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         assert!(
             !since.contains("hush-value-r2p"),
@@ -1675,19 +1670,13 @@ mod binary_menus {
             "the plain REPL entered the alternate screen:\n{since}"
         );
 
-        pty.wait_for_after(
-            "dry-model)>",
-            pty.raw().len().saturating_sub(64),
-            PTY_DEADLINE,
-        )
-        .expect("the prompt did not come back after the secret was added");
-        pty.read_for(Duration::from_millis(300));
-        let get_at = pty.raw().len();
+        let get_at = wait_for_repl_prompt(&mut pty, "dry-model)>", added);
         pty.send(b".vault get vault-secret-r2p\r").unwrap();
         pty.wait_for_after("hush-value-r2p", get_at, PTY_DEADLINE)
             .expect("`.vault get` did not print the value the prompt collected");
 
-        pty.read_for(Duration::from_millis(300));
+        let got = pty.raw().len();
+        wait_for_repl_prompt(&mut pty, "dry-model)>", got);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1886,7 +1875,7 @@ mod binary_menus {
         let locals = write_conflicting_local_roles(&dir, name);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+        pty.wait_for("dry-model)>", REPL_PROMPT_DEADLINE).unwrap();
         pty.resize(60, 200).unwrap();
         pty.read_for(Duration::from_millis(300));
         let install_at = pty.raw().len();
@@ -1965,9 +1954,7 @@ mod binary_menus {
         // The install goes on to print its MCP merge summary; `.exit` waits
         // for the prompt to come back so it is typed at the prompt, not
         // into the drain of stale input.
-        pty.wait_for_after("dry-model)>", answered_first, PTY_DEADLINE)
-            .expect("the prompt did not come back after the install");
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", answered_first);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -2288,8 +2275,9 @@ mod binary_menus {
         let files_before = walk(&dir);
 
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/null");
-        pty.wait_for(")> ", PTY_DEADLINE).unwrap();
+        pty.wait_for(")> ", REPL_PROMPT_DEADLINE).unwrap();
         pty.resize(60, 200).unwrap();
+        let mut cancelled = 0;
         for (command, question) in [
             (".rag".to_string(), "Select embedding model:".to_string()),
             (
@@ -2305,12 +2293,12 @@ mod binary_menus {
                 format!("Uninstall bundle '{installed}'?"),
             ),
         ] {
-            pty.read_for(Duration::from_millis(300));
-            let from = pty.raw().len();
+            let from = wait_for_repl_prompt(&mut pty, ")> ", cancelled);
             pty.send(format!("{command}\r").as_bytes()).unwrap();
             pty.wait_for_after(&question, from, PTY_DEADLINE)
                 .unwrap_or_else(|err| panic!("`{command}` did not ask `{question}`: {err}"));
             pty.read_for(Duration::from_millis(500));
+            cancelled = pty.raw().len();
             pty.send(b"\x1b").unwrap();
             pty.read_for(Duration::from_millis(1000));
             let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
@@ -2319,6 +2307,7 @@ mod binary_menus {
                 "`{command}` was refused instead of asked:\n{since}"
             );
         }
+        wait_for_repl_prompt(&mut pty, ")> ", cancelled);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -3377,7 +3366,7 @@ mod binary_menus {
                 find(pty.raw(), ENTER_ALT, 0).is_none(),
                 "{what} entered the alternate screen:\n{transcript}"
             );
-            pty.read_for(Duration::from_millis(500));
+            wait_for_repl_prompt(pty, "dry-model)>", 0);
             pty.send(b"\x04").unwrap();
             let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
             assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -3536,9 +3525,7 @@ mod binary_menus {
             write_dry_run_config(&dir);
             let mut pty = spawn_with_args(&dir, &[], &["--repl"]);
 
-            pty.wait_for("Welcome to", PTY_DEADLINE).unwrap();
-            pty.read_for(Duration::from_millis(500));
-            let from = pty.raw().len();
+            let from = wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
             pty.send(b".set ui tui\r").unwrap();
             let since = pty
                 .wait_for_after("Unknown key 'ui'", from, PTY_DEADLINE)
@@ -3548,7 +3535,8 @@ mod binary_menus {
                 ".set ui tui entered the alternate screen:\n{since}"
             );
 
-            pty.read_for(Duration::from_millis(300));
+            let refused = pty.raw().len();
+            wait_for_repl_prompt(&mut pty, "dry-model)>", refused);
             pty.send(b"\x04").unwrap();
             let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
             assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -3659,8 +3647,7 @@ mod binary_menus {
         let local_before = write_conflicting_local_mcp_server(&dir);
 
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/null");
-        pty.wait_for(")> ", PTY_DEADLINE).unwrap();
-        let from = pty.raw().len();
+        let from = wait_for_repl_prompt(&mut pty, ")> ", 0);
         // The line editor repaints the prompt once per typed key, about 100 ms
         // each in a debug build, so the absolute temp path alone would eat most
         // of the deadline; the binary runs in `dir`, where the relative path
@@ -3669,6 +3656,7 @@ mod binary_menus {
         pty.wait_for_after("Conflict on MCP server", from, PTY_DEADLINE)
             .unwrap_or_else(|err| panic!("`.install` at an MCP conflict did not ask: {err}"));
         pty.read_for(Duration::from_millis(500));
+        let cancelled = pty.raw().len();
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(1500));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
@@ -3676,6 +3664,7 @@ mod binary_menus {
             refusal_shape(&since).is_none(),
             "`.install` at an MCP conflict was refused:\n{since}"
         );
+        wait_for_repl_prompt(&mut pty, ")> ", cancelled);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -4010,8 +3999,7 @@ mod binary_menus {
         write_agent_with_documents(&dir, "docs-agent-e2r");
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         let files_before = walk(&dir);
         let before = pty.raw().len();
         pty.send(b".agent docs-agent-e2r\r").unwrap();
@@ -4021,10 +4009,14 @@ mod binary_menus {
         pty.send(b"\x1b").unwrap();
         pty.wait_for_after(CANCELED_BY_USER, before, PTY_DEADLINE)
             .expect("Esc on `init RAG?` in the plain REPL did not print the cancel error");
-        pty.read_for(Duration::from_millis(800));
-        let info_at = pty.raw().len();
+        let canceled = pty.raw().len();
+        let info_at = wait_for_repl_prompt(&mut pty, "dry-model)>", canceled);
         pty.send(b".info agent\r").unwrap();
-        pty.read_for(Duration::from_millis(2000));
+        pty.wait_for_after("Error: No agent", info_at, PTY_DEADLINE)
+            .expect(
+                "`.info agent` after Esc on `init RAG?` did not report that no agent is active",
+            );
+        let answered = pty.raw().len();
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
         assert!(
@@ -4037,6 +4029,7 @@ mod binary_menus {
             "Esc on `init RAG?` in the plain REPL still wrote a rag: {written:?}:\n{since}"
         );
 
+        wait_for_repl_prompt(&mut pty, "dry-model)>", answered);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -5138,8 +5131,7 @@ mod binary_wizards {
 
         // Type only once the line editor owns the terminal: input ahead of
         // the prompt is cooked-mode typeahead the editor discards.
-        pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "fake-model)>", 0);
         let started = std::time::Instant::now();
         // The line editor repaints the prompt once per typed key, about 100 ms
         // each in a debug build, so the absolute temp path alone would eat most
@@ -5152,6 +5144,7 @@ mod binary_wizards {
             "loaded document reply r9f",
             "the reply after the file loader (is the loader waiting on the terminal's stdin?)",
         );
+        let replied = pty.raw().len();
         let took = started.elapsed();
         assert_eq!(
             fake.served(),
@@ -5160,13 +5153,7 @@ mod binary_wizards {
         );
         // Let the reply finish printing and the prompt come back before
         // typing the next command.
-        pty.wait_for_after(
-            "fake-model)>",
-            pty.raw().len().saturating_sub(64),
-            PTY_DEADLINE,
-        )
-        .expect("the prompt did not come back after the reply");
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "fake-model)>", replied);
         let exit_started = std::time::Instant::now();
         pty.send(b".exit\r").unwrap();
         let transcript = pty
@@ -6058,8 +6045,7 @@ mod binary_wizards {
         write_dry_run_config_with_embeddings(&dir);
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
-        pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
+        wait_for_repl_prompt(&mut pty, "dry-model)>", 0);
         let files_before = walk(&dir);
         let before = pty.raw().len();
         pty.send(b".rag new-rag-r9e\r").unwrap();
@@ -6109,8 +6095,7 @@ mod binary_wizards {
 
         let esc_at = pty.raw().len();
         pty.send(b"\x1b").unwrap();
-        pty.wait_for_after("dry-model)>", esc_at, PTY_DEADLINE)
-            .expect("Esc on the inquire text prompt did not bring the prompt back");
+        wait_for_repl_prompt(&mut pty, "dry-model)>", esc_at);
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
         for footprint in ["r9e", "/rags/"] {
             let written = new_files_named(&dir, &files_before, footprint);
@@ -6119,7 +6104,6 @@ mod binary_wizards {
                 "the cancelled `.rag` still wrote {written:?}:\n{since}"
             );
         }
-        pty.read_for(Duration::from_millis(300));
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -6246,8 +6230,7 @@ mod binary_wizards {
         let obsolete = make_the_second_role_obsolete(&dir, &repo, name);
 
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
-        pty.wait_for(")> ", PTY_DEADLINE).unwrap();
-        let update_at = pty.raw().len();
+        let update_at = wait_for_repl_prompt(&mut pty, ")> ", 0);
         pty.send(format!(".install {name}\r").as_bytes()).unwrap();
         pty.wait_for_after("Obsolete file", update_at, PTY_DEADLINE)
             .expect("the REPL update did not ask about the obsolete file");
@@ -6257,6 +6240,7 @@ mod binary_wizards {
             asked.contains("keep") && !asked.contains("Other (custom)"),
             "the REPL question is not the closed keep/delete select:\n{asked}"
         );
+        let cancelled = pty.raw().len();
         pty.send(b"\x1b").unwrap();
         pty.wait_for_after(KEPT_OBSOLETE_NOTE, update_at, PTY_DEADLINE)
             .expect("the REPL did not print the kept-files note after Esc");
@@ -6283,10 +6267,12 @@ mod binary_wizards {
             "the plain REPL entered the alternate screen:\n{since}"
         );
 
-        let info_at = pty.raw().len();
+        let info_at = wait_for_repl_prompt(&mut pty, ")> ", cancelled);
         pty.send(b".info\r").unwrap();
         pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
             .expect("`.info` after the cancelled question never rendered");
+        let shown = pty.raw().len();
+        wait_for_repl_prompt(&mut pty, ")> ", shown);
         pty.send(b".exit\r").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

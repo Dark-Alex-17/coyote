@@ -16,6 +16,16 @@ use super::pty::{Pty, detached, strip_ansi};
 /// Covers the keyboard-enhancement probe's two-second wait in a test that
 /// leaves it unanswered (see `Pty::leave_keyboard_probe_unanswered`).
 pub const PTY_DEADLINE: Duration = Duration::from_secs(20);
+/// A pseudo-terminal never answers a cursor-position query, and the plain
+/// REPL sends three before each prompt reads a key (its own row resync,
+/// then reedline's anchor and drift checks), each waiting out crossterm's
+/// 2 s. The first prompt also pays the background-colour probe, so it
+/// lands about 12 s after spawn on a loaded host, and the next prompt
+/// 6 s after a command's output. Keys typed in that gap meet a cooked
+/// terminal, which turns their Enter into a line feed that reedline
+/// takes as a newline in the buffer, so a test types only once the
+/// prompt is drawn (see [`wait_for_repl_prompt`]).
+pub const REPL_PROMPT_DEADLINE: Duration = Duration::from_secs(45);
 /// Hotkeys on a modal count only once both the last keystroke and the
 /// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles
 /// both.
@@ -162,6 +172,18 @@ pub fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, st
 /// [`spawn_tui_under`] with `--repl`: the plain REPL on the same pty.
 pub fn spawn_repl_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
     spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, " --repl")
+}
+
+/// Waits for the plain REPL to draw `prompt` at or after raw offset
+/// `since`, then settles so reedline is reading keys in raw mode, and
+/// returns the raw offset after the settle. `since` must be taken after
+/// the previous command's output was seen: the echo of the typed line can
+/// carry the prompt text too.
+pub fn wait_for_repl_prompt(pty: &mut Pty, prompt: &str, since: usize) -> usize {
+    pty.wait_for_after(prompt, since, REPL_PROMPT_DEADLINE)
+        .unwrap_or_else(|err| panic!("the REPL prompt {prompt:?} was not drawn: {err}"));
+    pty.read_for(Duration::from_millis(300));
+    pty.raw().len()
 }
 
 /// [`spawn_tui_under`] for a copy of the binary living elsewhere (the
