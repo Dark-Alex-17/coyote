@@ -370,7 +370,6 @@ mod tests {
     use serial_test::serial;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::future::Future;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, str};
 
     fn test_ctx() -> RequestContext {
@@ -387,10 +386,7 @@ mod tests {
     /// containing a `shared` macro whose `description` names its source, and
     /// points the workspace/global dir env overrides at them for `f`.
     fn with_macro_load_envs<F: FnOnce()>(f: F) {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-macro-load-tests-{unique}"));
         let workspace_root = root.join("workspace");
         let workspace_macros = workspace_root.join("macros");

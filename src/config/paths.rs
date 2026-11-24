@@ -794,10 +794,7 @@ mod tests {
         use serial_test::serial;
 
         fn with_workspace_dir<F: FnOnce(&Path, &Path)>(f: F) {
-            let unique = time::SystemTime::now()
-                .duration_since(time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let unique = crate::testing::unique_dir_suffix();
             let root = env::temp_dir().join(format!("coyote-workspace-mcp-test-{unique}"));
             let ws_dir = root.join(WORKSPACE_COYOTE_DIR_NAME);
             fs::create_dir_all(&ws_dir).unwrap();
@@ -1037,10 +1034,7 @@ mod tests {
     }
 
     fn sidecar_temp_dir(label: &str) -> PathBuf {
-        let unique = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-{label}-test-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root

@@ -2526,8 +2526,6 @@ mod tests {
     use crate::testing::TempLocalVault;
     use serial_test::serial;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir {
         path: PathBuf,
@@ -2535,17 +2533,7 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            // Wall-clock nanos alone are not unique across parallel tests
-            // (coarse clocks hand the same tick to concurrent callers, so two
-            // tests would share a directory and overwrite each other's files);
-            // a process-wide counter makes every name distinct.
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let unique = format!("{nanos}-{seq}");
+            let unique = crate::testing::unique_dir_suffix();
             let path = env::temp_dir().join(format!("coyote-rag-{tag}-{unique}"));
             fs::create_dir_all(&path).unwrap();
             Self { path }

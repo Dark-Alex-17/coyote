@@ -22,7 +22,10 @@ fn fresh_config_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let tmp_dir = env::temp_dir().join(format!("coyote-macro-bracketing-{label}-{unique}"));
+    let tmp_dir = env::temp_dir().join(format!(
+        "coyote-macro-bracketing-{label}-{}-{unique}",
+        std::process::id()
+    ));
     fs::create_dir_all(&tmp_dir).unwrap();
     tmp_dir
 }

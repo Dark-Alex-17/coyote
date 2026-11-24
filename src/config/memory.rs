@@ -1002,13 +1002,9 @@ mod tests {
     use crate::testing::EnvVarGuard;
     use serial_test::serial;
     use std::{env, time};
-    use time::SystemTime;
 
     fn temp_root(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-memory-{label}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root

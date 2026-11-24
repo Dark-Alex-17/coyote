@@ -2278,8 +2278,8 @@ mod binary_menus {
 
         let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/null");
         pty.wait_for(")> ", REPL_PROMPT_DEADLINE).unwrap();
+        let mut cancelled = pty.raw().len();
         pty.resize(60, 200).unwrap();
-        let mut cancelled = 0;
         for (command, question) in [
             (".rag".to_string(), "Select embedding model:".to_string()),
             (
@@ -2287,7 +2287,11 @@ mod binary_menus {
                 "Enter the secret value:".to_string(),
             ),
             (
-                format!(".install {}", conflicting_repo.display()),
+                // The line editor repaints the prompt once per typed key,
+                // about 100 ms each in a debug build, so the absolute temp
+                // path alone would eat most of the deadline; the binary runs
+                // in `dir`, where the relative path names the same repository.
+                ".install ./bundle-conflict-src".to_string(),
                 "Conflict at".to_string(),
             ),
             (

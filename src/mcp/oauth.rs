@@ -668,13 +668,7 @@ fn extract_base_url(url: &str) -> Result<String> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::utils::get_env_name;
-    use std::{
-        env,
-        ffi::OsString,
-        fs,
-        path::PathBuf,
-        time::{self, SystemTime},
-    };
+    use std::{env, ffi::OsString, fs, path::PathBuf};
 
     pub(crate) fn with_temp_cache<F: FnOnce()>(f: F) {
         struct Restore {
@@ -694,10 +688,7 @@ pub(crate) mod test_support {
             }
         }
 
-        let unique = SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-mcp-oauth-test-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let env_key = get_env_name("cache_dir");

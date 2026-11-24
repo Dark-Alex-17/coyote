@@ -434,8 +434,6 @@ fn string_items(value: Option<&Value>) -> Vec<String> {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const VALID_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
 schemaVersion: "3"
@@ -473,14 +471,8 @@ capabilities:
 
     impl TempRoot {
         pub(super) fn new(label: &str) -> Self {
-            // The clock alone can collide between parallel tests sharing a label.
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = env::temp_dir().join(format!("coyote-kit-{label}-{nanos}-{seq}"));
+            let unique = crate::testing::unique_dir_suffix();
+            let root = env::temp_dir().join(format!("coyote-kit-{label}-{unique}"));
             fs::create_dir_all(&root).unwrap();
             Self(root)
         }

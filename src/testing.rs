@@ -218,6 +218,12 @@ impl Drop for AtomicFlagGuard {
     }
 }
 
+/// A temp-dir name suffix unique across processes, not just within one:
+/// nextest runs each test in its own process, so a clock-only name collides.
+pub(crate) fn unique_dir_suffix() -> String {
+    format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple())
+}
+
 /// Points the config dir and the workspace config dir at fresh temp
 /// directories for the guard's lifetime and removes them on drop, including
 /// on panic, so the developer's real `./.coyote/` never leaks into a test.
@@ -255,17 +261,16 @@ impl TestConfigDirGuard {
             "the guard's base dir must be absolute, got {}",
             base.display()
         );
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = unique_dir_suffix();
         let path = base.join(format!("coyote-{label}-{unique}"));
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(base).unwrap();
+        std::fs::create_dir(&path).unwrap();
         let workspace_root = base.join(format!("coyote-{label}-ws-{unique}"));
         let workspace_path = workspace_root.join(WORKSPACE_COYOTE_DIR_NAME);
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir(&workspace_root).unwrap();
+        std::fs::create_dir(&workspace_path).unwrap();
         let cache_root = base.join(format!("coyote-{label}-cache-{unique}"));
-        std::fs::create_dir_all(&cache_root).unwrap();
+        std::fs::create_dir(&cache_root).unwrap();
         Self {
             _env: EnvVarGuard::set(utils::get_env_name("config_dir"), &path),
             _workspace_env: EnvVarGuard::set(
@@ -315,12 +320,9 @@ pub(crate) struct CacheDirGuard {
 
 impl CacheDirGuard {
     pub(crate) fn new(label: &str) -> Self {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("coyote-cache-{label}-{unique}"));
-        std::fs::create_dir_all(&root).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("coyote-cache-{label}-{}", unique_dir_suffix()));
+        std::fs::create_dir(&root).unwrap();
         let env = EnvVarGuard::set(utils::get_env_name("cache_dir"), &root);
         Self { root, _env: env }
     }
@@ -340,12 +342,9 @@ pub(crate) struct ScratchDirGuard {
 
 impl ScratchDirGuard {
     pub(crate) fn new(label: &str) -> Self {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("coyote-scratch-{label}-{unique}"));
-        std::fs::create_dir_all(&path).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("coyote-scratch-{label}-{}", unique_dir_suffix()));
+        std::fs::create_dir(&path).unwrap();
         Self { path }
     }
 }
@@ -369,12 +368,9 @@ pub(crate) struct TempLocalVault {
 
 impl TempLocalVault {
     pub(crate) fn new(label: &str) -> Self {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("coyote-vault-{label}-{unique}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("coyote-vault-{label}-{}", unique_dir_suffix()));
+        std::fs::create_dir(&dir).unwrap();
         let password_file = dir.join("password");
         std::fs::write(&password_file, "correct horse battery staple").unwrap();
         #[cfg(unix)]

@@ -3165,10 +3165,7 @@ last_run:
     }
 
     fn unique_sessions_dir(label: &str) -> (PathBuf, PathBuf) {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let dir = std::env::temp_dir().join(format!("coyote-session-{label}-{unique}"));
         let sessions_dir = dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();

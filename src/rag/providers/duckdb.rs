@@ -844,7 +844,6 @@ mod tests {
     use crate::rag::provider::RagProvider;
     use crate::rag::{RagDocument, RagFile};
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
 
     struct TempDb {
@@ -853,10 +852,7 @@ mod tests {
 
     impl TempDb {
         fn new(tag: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let unique = crate::testing::unique_dir_suffix();
             let path = env::temp_dir().join(format!("coyote-duckdb-{tag}-{unique}.duckdb"));
             Self { path }
         }

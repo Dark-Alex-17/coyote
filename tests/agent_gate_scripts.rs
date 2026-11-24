@@ -101,7 +101,10 @@ fn fixture_dir(label: &str) -> TempDirGuard {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = env::temp_dir().join(format!("coyote-gate-scripts-{label}-{unique}"));
+    let dir = env::temp_dir().join(format!(
+        "coyote-gate-scripts-{label}-{}-{unique}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join(".coyote-project.json"),

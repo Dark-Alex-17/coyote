@@ -1385,10 +1385,7 @@ mod tests {
 
     impl HooksDirGuard {
         fn new(label: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let unique = testing::unique_dir_suffix();
             let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
             Self {
                 _env: testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &root),
@@ -1443,10 +1440,7 @@ mod tests {
     }
 
     fn fresh_payload_dir(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = testing::unique_dir_suffix();
         let dir = env::temp_dir().join(format!("coyote-{label}-{unique}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir

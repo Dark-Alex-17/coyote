@@ -1319,7 +1319,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::str;
-    use std::time::UNIX_EPOCH;
 
     use super::*;
     use crate::client::access_token::{distrust_access_token, get_access_token};
@@ -1334,7 +1333,7 @@ mod tests {
     use crate::testing::AtomicFlagGuard;
     use crate::utils::{HEADLESS, get_env_name};
     use serial_test::serial;
-    use std::{env, time::SystemTime};
+    use std::env;
 
     fn with_temp_cache<F: FnOnce()>(f: F) {
         struct Restore {
@@ -1354,10 +1353,7 @@ mod tests {
             }
         }
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-client-oauth-test-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let env_key = get_env_name("cache_dir");

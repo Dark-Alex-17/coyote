@@ -739,10 +739,7 @@ mod tests {
 
     impl TempDir {
         fn new(label: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let unique = crate::testing::unique_dir_suffix();
             let dir = env::temp_dir().join(format!("coyote-vault-password-{label}-{unique}"));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
