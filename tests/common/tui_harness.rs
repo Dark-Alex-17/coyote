@@ -1783,7 +1783,9 @@ pub fn fake_exchange(pty: &mut Pty, prompt: &str, reply: &str) {
 /// asks whether the new session should incorporate the last question and
 /// answer: that Confirm is answered `n` past the idle gate. Returns once
 /// a fully repainted footer carries the name (an incremental repaint
-/// skips the cells the old footer shared with the new one).
+/// skips the cells the old footer shared with the new one) and the
+/// composer is idle again; the footer can take the name a frame before
+/// the composer settles.
 pub fn start_session(pty: &mut Pty, name: &str) {
     static TOGGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let at = pty.raw().len();
@@ -1804,18 +1806,21 @@ pub fn start_session(pty: &mut Pty, name: &str) {
         let odd = TOGGLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
         let frame = repainted_frame_after_resize(pty, 60, if odd { 100 } else { 101 });
         let flat = squeezed(&frame);
-        if flat.contains(&token) {
-            assert!(
-                !flat.contains(&question) && shows_placeholder(&flat),
-                "the session question is still up or the composer is not idle after `.session {name}`:\n{frame}"
-            );
+        let named = flat.contains(&token);
+        if named && !flat.contains(&question) && shows_placeholder(&flat) {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the footer's `{name}` session token never appeared:\n{}",
-            since(pty, at)
-        );
+        if std::time::Instant::now() >= deadline {
+            if named {
+                panic!(
+                    "the session question is still up or the composer is not idle after `.session {name}`:\n{frame}"
+                );
+            }
+            panic!(
+                "the footer's `{name}` session token never appeared:\n{}",
+                since(pty, at)
+            );
+        }
     }
     pty.read_for(Duration::from_millis(400));
 }
