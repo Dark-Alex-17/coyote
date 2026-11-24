@@ -995,16 +995,16 @@ fn spawned_review_lanes_are_seated_in_the_worktree_under_review() {
 }
 
 /// The spawn variables are a JSON object the model copies verbatim, so a
-/// checkout path holding a quote, a backslash or a newline must reach the
-/// spawned lane unchanged rather than break or extend that object. facts.py
-/// takes the path as given, so it need not exist.
+/// checkout path holding a quote, a backslash, a newline or a non-ASCII
+/// letter must reach the spawned lane unchanged rather than break or extend
+/// that object. facts.py takes the path as given, so it need not exist.
 #[test]
 fn spawn_variables_carry_an_awkward_project_dir_intact() {
     if !python_available() {
         return;
     }
     let dir = temp_dir("awkward");
-    let awkward = s(&dir.0.join("say \"hi\" \\ there\nnext"));
+    let awkward = s(&dir.0.join("say \"hi\" \\ there\nnext").join("jos\u{e9}"));
     let mut state = json!({
         "project_dir": s(&dir.0),
         "project_dir_in": awkward,
@@ -1070,13 +1070,15 @@ fn step_runner_agents_are_seated_in_the_resolved_project_dir() {
     let doc = agent_doc("step-runner/graph.yaml");
     let mut seated = 0;
     for (id, node) in doc["nodes"].as_mapping().unwrap() {
-        let declares = node["type"].as_str() == Some("agent")
-            && declares_project_dir(node["agent"].as_str().unwrap());
-        if !declares {
+        if node["type"].as_str() != Some("agent") {
             continue;
         }
         seated += 1;
         let id = id.as_str().unwrap();
+        assert!(
+            declares_project_dir(node["agent"].as_str().unwrap()),
+            "step-runner {id}: the child agent declares no project_dir to seat"
+        );
         assert_eq!(
             node["inputs"]["project_dir"].as_str(),
             Some("{{project_dir}}"),
