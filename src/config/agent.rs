@@ -2886,4 +2886,49 @@ nodes: {}
             }
         }
     }
+
+    /// `agent__spawn` refuses an undeclared variable, so a lane that never
+    /// declared `project_dir` could not be pointed at the project its
+    /// spawner works in. Every bundled agent declares it unless listed here
+    /// with the reason it has no project to read.
+    #[test]
+    fn bundled_agents_declare_project_dir_unless_exempt() {
+        const EXEMPT: [(&str, &str); 5] = [
+            ("deep-research", "researches the web and its own corpus"),
+            ("demo", "a showcase agent with no project to read"),
+            ("report-writer", "polishes findings handed to it"),
+            ("sql", "works against a database DSN"),
+            ("whetstone", "edits the review suite bundle, not a project"),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let mut agents = Vec::new();
+        for entry in fs::read_dir(&root).unwrap() {
+            let dir = entry.unwrap().path();
+            let Some(file) = ["config.yaml", "graph.yaml"]
+                .into_iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.exists())
+            else {
+                continue;
+            };
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let stub: AgentVariablesStub =
+                serde_yaml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            let declares = stub.variables.iter().any(|v| v.name == "project_dir");
+            let exempt = EXEMPT.iter().any(|(exempt, _)| *exempt == name);
+            assert!(
+                declares || exempt,
+                "bundled agent '{name}' does not declare a `project_dir` variable, so a spawner \
+                 cannot pass it its project; declare it, or add '{name}' to the exemption list \
+                 with a reason"
+            );
+            agents.push(name);
+        }
+        for (name, _) in EXEMPT {
+            assert!(
+                agents.iter().any(|agent| agent == name),
+                "exempt agent '{name}' is no longer bundled; drop it from the exemption list"
+            );
+        }
+    }
 }

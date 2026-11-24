@@ -99,7 +99,8 @@ fn validate_spawn_variables(
     }
     if declared.is_empty() {
         return Err(format!(
-            "Agent '{agent_name}' declares no variables; remove the 'variables' argument."
+            "Agent '{agent_name}' declares no variables; remove the 'variables' argument, or \
+             declare them under the `variables:` of agent '{agent_name}' to receive them."
         ));
     }
 
@@ -109,7 +110,9 @@ fn validate_spawn_variables(
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "Unknown variable(s) {unknown:?} for agent '{agent_name}'. Declared variables: {declared_list}"
+        "Unknown variable(s) {unknown:?} for agent '{agent_name}'. Declared variables: \
+         {declared_list}. A child receives only the variables it declares: to pass another, \
+         declare it under the `variables:` of agent '{agent_name}'."
     ))
 }
 
@@ -16369,8 +16372,12 @@ mod tests {
         let provided = AgentVariables::from([("typo".to_string(), "x".to_string())]);
 
         let err = validate_spawn_variables("coder", &declared, &provided).unwrap_err();
-        assert!(err.contains("typo"));
-        assert!(err.contains("pr (PR number)"));
+        assert_eq!(
+            err,
+            "Unknown variable(s) [\"typo\"] for agent 'coder'. Declared variables: pr (PR number). \
+             A child receives only the variables it declares: to pass another, declare it under \
+             the `variables:` of agent 'coder'."
+        );
     }
 
     #[test]
@@ -16379,7 +16386,11 @@ mod tests {
 
         let err = validate_spawn_variables("coder", &[], &provided).unwrap_err();
 
-        assert!(err.contains("declares no variables"));
+        assert_eq!(
+            err,
+            "Agent 'coder' declares no variables; remove the 'variables' argument, or declare \
+             them under the `variables:` of agent 'coder' to receive them."
+        );
     }
 
     #[test]
