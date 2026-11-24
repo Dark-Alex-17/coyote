@@ -4153,7 +4153,8 @@ mod tests {
 
     /// Both session keys name the child's own session: `COYOTE_SESSION_ID`
     /// because the child is seated on a session named after the id, and
-    /// `COYOTE_AGENT_SESSION_ID` because the spawn seam adds it.
+    /// `COYOTE_AGENT_SESSION_ID` because the agent events carry the id and
+    /// `hooks::agent_extras` turns it into that variable.
     fn assert_session_envs(capture: &hooks::test_sink::Capture, session_id: &str) {
         assert_eq!(
             capture
