@@ -379,7 +379,6 @@ impl PendingPrompt {
         self.question_fits_rows(width, self.question_cap(width, height))
     }
 
-    /// Whether `rows` of the pane hold the whole question.
     pub(super) fn question_fits_rows(&self, width: u16, rows: u16) -> bool {
         row_count(self.question_lines(width).len()) <= rows
     }

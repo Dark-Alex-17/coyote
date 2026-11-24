@@ -172,7 +172,6 @@ impl ChildLive {
         self.threads.get_mut(self.sessions.get(session_id)?)
     }
 
-    /// Whether `session_id` is the session of child `agent_id`.
     pub(super) fn session_is_of(&self, session_id: &str, agent_id: &str) -> bool {
         self.sessions
             .get(session_id)

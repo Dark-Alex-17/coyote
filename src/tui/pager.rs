@@ -404,7 +404,6 @@ impl ChildView {
         }
     }
 
-    /// The rows merged afresh with `live`.
     fn merge(&mut self, live: &[Cell]) {
         self.rows = merged_rows(self.entries.as_deref().unwrap_or_default(), live);
     }
@@ -681,7 +680,6 @@ impl Pager {
         matches!(self.thread, Thread::Root)
     }
 
-    /// The session of the child on show.
     pub(super) fn child_session(&self) -> Option<&str> {
         match &self.thread {
             Thread::Root => None,

@@ -4,7 +4,6 @@
 use crate::utils::SPINNER_FRAMES;
 use std::time::{Duration, Instant};
 
-/// How long each frame shows.
 pub(super) const THROBBER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The frame showing at `now` for a throbber that started at `origin`.
@@ -36,7 +35,6 @@ impl Tick {
         frame_at(self.origin, self.now)
     }
 
-    /// How long something that started at `since` has run.
     pub(super) fn elapsed(self, since: Instant) -> Duration {
         self.now.saturating_duration_since(since)
     }
