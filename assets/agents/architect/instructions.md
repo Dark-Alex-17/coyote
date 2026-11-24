@@ -372,13 +372,15 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
 
    ## EXPECTED OUTCOME
 <!-- when:pr_strategy=single -->
-   Every acceptance criterion met; build + full test suite green in {{project_dir}}; the work
+   Every acceptance criterion met; targeted and impacted tests green in {{project_dir}} (the run's
+   final-tier review runs the full suite once); the work
    committed and pushed to the EXISTING run branch feat/PLAN-<slug> (already checked out). Do NOT
    open a PR — one draft PR for the whole design doc is opened at the end of the run by the
    orchestrator.
 <!-- end -->
 <!-- when:pr_strategy=multi -->
-   Every acceptance criterion met; build + full test suite green in {{project_dir}}; the work
+   Every acceptance criterion met; targeted and impacted tests green in {{project_dir}} (the run's
+   final-tier review runs the full suite once); the work
    committed and pushed to the EXISTING group branch feat/PLAN-<slug>-g<N> (already checked out).
    Do NOT open a PR — the orchestrator opens one draft PR per PR group at the group's close-out.
 <!-- end -->
@@ -446,8 +448,9 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
    "
    ```
 
-   The spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so Sisyphus forwards
-   it to its coder/step-runner and review gates (`""` is an accepted value and runs them bare).
+   The spawn also passes `--variables {"build_lock": "{{build_lock}}", "finalize_owner": "parent"}` so Sisyphus forwards
+   it to its coder/step-runner and review gates (`""` is an accepted value and runs them bare),
+   and leaves the single full-suite run to this run's final-tier review.
 
    Record the returned `session_id` in the task's todo item immediately.
 
@@ -493,7 +496,7 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      Forced lanes: adversary<, probe — add probe when the task changed consumer-facing surface and the plan carries a local-run recipe>
      Plan / acceptance criteria: <the task's acceptance criteria, pasted verbatim>
      Local-run recipe / usage suites: <from the plan, when present>"
-     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}
+     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]", "verification_tier": "round"}
      <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
      ```
 
@@ -571,7 +574,7 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      <paste the task index.md body + the relevant PLAN-<slug>.md section VERBATIM>
      <paste the plan's ## Quality bar section VERBATIM — recorded dropped practices are
      conformance facts, not divergences>"
-     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}
+     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]", "verification_tier": "round"}
      <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
      ```
 
@@ -697,7 +700,7 @@ every batch member belongs to the group in flight.
   ({{project_dir}}/.worktrees/task-NNN) and the branch with the task branch. Sisyphus commits and
   pushes the TASK branch. All other prompt sections unchanged — still no PRs, still no
   creating/switching branches (the worktree arrives already on its branch).
-- Spawn each batch member with `--variables {"parallel": "1", "build_lock": "{{build_lock}}", "project_dir":
+- Spawn each batch member with `--variables {"parallel": "1", "build_lock": "{{build_lock}}", "finalize_owner": "parent", "project_dir":
   "{{project_dir}}/.worktrees/task-NNN"}` — the `parallel` variable renders the parallel-batch
   teamwork protocol into that Sisyphus's instructions (roster contract, scope-breach stop,
   worktree-removable discipline). A sequential or standalone Sisyphus is spawned WITHOUT it and
@@ -727,8 +730,10 @@ every batch member belongs to the group in flight.
 **Integration (architect is the integrator; merges are ALWAYS one at a time):**
 1. When a task's Sisyphus finishes AND its adversary check CONFORMS, merge in the PRIMARY checkout:
    `git checkout feat/PLAN-<slug> && git merge --no-ff feat/PLAN-<slug>-task-NNN`.
-2. Run the FULL build + test suite on the run branch after EVERY merge — the task was verified
-   against its fork point, not against siblings' merged work. A post-merge failure is an
+2. Run the build plus the merged tasks' targeted and impacted tests (their coders' `Tier:` lines)
+   on the run branch after EVERY merge -- the task was verified against its fork point, not
+   against siblings' merged work; CI on the pushed run branch and the final-tier review cover the
+   rest. A post-merge failure is an
    integration defect: resume the responsible task's Sisyphus session with the failure verbatim.
 3. Merge conflict → abort the merge, resume that task's Sisyphus session with the conflict
    verbatim (it rebases its task branch onto the current run branch, re-verifies, re-pushes), then
@@ -806,9 +811,10 @@ these substitutions:
 
 At the current group's close-out (and, for steps 6-9, after the last group's):
 <!-- end -->
-1. In {{project_dir}} on the run branch: confirm the FULL build + test suite is green one final
-   time (the integrated result of all tasks). Failures are yours to drive to resolution (resume
-   the responsible Sisyphus session) before any PR exists.
+1. In {{project_dir}} on the run branch: confirm the build and every merged task's targeted and
+   impacted tests are green on the integrated result of all tasks (the full suite and lint run
+   once, at the step-3 final-tier review). Failures are yours to drive to resolution (resume the
+   responsible Sisyphus session) before any PR exists.
 2. **Run-closing design retrospective.** Per-task reviews judge each slice; only the whole run
    shows whether its design hangs together. First judge whether the run is a large body of work:
    a new module or subsystem, several modules changed together, a new abstraction or protocol, a
@@ -909,9 +915,11 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
      reasons the code-review skill sanctions (the glyph is the point, or the line must name the
      needles); such a line is marked with the lint's `debris-exempt` token and its `HYGIENE:`
      entry states which reason applies; the token is what lets the run-wide lint exit 0 once
-     every surviving hit is justified. Then run the full suite.
-   Verification: run the review gauntlet (Phase E step 4 template) on the hygiene task's own
-   commits -- `Diff: <hygiene BASE SHA>..HEAD` -- with these two criteria pasted literally as
+     every surviving hit is justified. The final-tier review below runs the full suite.
+   Verification: run the review gauntlet (Phase E step 4 template, but with
+   `"verification_tier": "final"`: this is the run's single full-suite, formatter and lint run,
+   on the tree the PR will carry, and it blocks without a green full-suite record) on the hygiene
+   task's own commits -- `Diff: <hygiene BASE SHA>..HEAD` -- with these two criteria pasted literally as
    the plan, introduced by the sentence "These two are the ONLY criteria:": "Behaviour
    unchanged: the full build and test suite is green and no production code
    path changed other than removal of unreachable code and lapsed scaffolding; a `debris-exempt`
@@ -931,7 +939,7 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
    Route findings per the Phase E rules
    (resume the SAME Sisyphus session, then a FRESH gauntlet run). Copy the `HYGIENE:` items into
    the hygiene task's `log.md` and mark it complete per Phase E step 5.
-4. **Roll up follow-ups, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
+4. **Roll up follow-ups once the final-tier review passed, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
    `feat/PLAN-<slug>` -> {{base_branch}}. Every "Follow-ups:" line from the completed tasks'
    `log.md` files -- findings tagged `(deferred by quality bar)` ride this rollup unchanged -- and
    every `rejected-finding:` line reach the body through `assemble_pr_body` below (the tool is

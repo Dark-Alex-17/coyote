@@ -72,6 +72,9 @@ variables:
   - name: review_cadence
     description: "When the post-coder review passes run: 'task' (default - this Sisyphus runs the review gauntlet / independent reviewers on its own work, today's behavior) or 'batch' (set by a parent orchestrator running micro-granularity tasks: this Sisyphus runs coder verification only - build + tests green, debt/decision bookkeeping - and the orchestrator runs the full review panel once over the whole batch of micro-tasks). Never set 'batch' for a standalone run."
     default: 'task'
+  - name: finalize_owner
+    description: "Who runs the final verification tier (the single full-suite, formatter and lint run before finishing or pushing): 'self' (default) or 'parent' (set by a parent orchestrator that runs it over the integrated work; every review this Sisyphus runs then stays at the round tier)."
+    default: 'self'
 
 mcp_servers:
   - ddg-search
