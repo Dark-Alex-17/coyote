@@ -1122,8 +1122,10 @@ impl Session {
         self.dirty = true;
     }
 
-    /// Re-seats the stored variables a resumed child runs with, keeping the
-    /// prompt it was stored under.
+    /// Re-seats the stored variables a resumed child runs with. The prompt
+    /// is left as stored; a caller whose values differ from the stored ones
+    /// re-renders the instructions and re-adopts them with
+    /// `readopt_agent_prompt`.
     pub fn set_agent_variables(&mut self, variables: AgentVariables) {
         self.agent_variables = variables;
         self.dirty = true;

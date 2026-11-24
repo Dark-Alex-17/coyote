@@ -1248,23 +1248,21 @@ pub async fn run_agent_for_graph(
         child_ctx
             .use_session(app_config.as_ref(), Some(&session), child_abort.clone())
             .await?;
-        reseat_agent_session_variables(&mut child_ctx, &node_inputs)?;
+        let variables_changed = reseat_agent_session_variables(&mut child_ctx, &node_inputs)?;
         sync_agent_functions_to_ctx(&mut child_ctx)?;
         // A resumed session speaks with the System row it was stored under,
         // and that row carries the roster of the run that stored it. Peer
         // ids are minted per run, so whenever this run seats a teammate or
         // the stored row names one, the prompt and the row are re-adopted
-        // from the agent, whose appendix is this run's roster or nothing;
-        // the session keeps the variables it was resumed with.
+        // from the agent, whose appendix is this run's roster or nothing.
+        // Re-seated variables re-adopt them too, so the row names this
+        // run's values.
         let stored_roster = child_ctx
             .session
             .as_ref()
             .is_some_and(|session| roster_line(session.agent_instructions()).is_some());
-        if (seats_a_teammate || stored_roster)
-            && let (Some(session), Some(agent)) =
-                (child_ctx.session.as_mut(), child_ctx.agent.as_ref())
-        {
-            session.readopt_agent_prompt(agent);
+        if seats_a_teammate || stored_roster || variables_changed {
+            readopt_child_prompt(&mut child_ctx, variables_changed)?;
         }
     } else {
         prepare_child_runtime(&mut child_ctx, &agent_mcp_servers).await?;
@@ -1864,17 +1862,18 @@ fn resume_variables(
 /// Re-seats the variables of the `agent_session` an agent node's child
 /// was given: a stored one is resolved with this run's node inputs as the
 /// explicit values, a new one records those inputs as its explicit keys.
+/// Returns whether the stored session now runs with different values.
 fn reseat_agent_session_variables(
     child_ctx: &mut RequestContext,
     explicit: &AgentVariables,
-) -> Result<()> {
+) -> Result<bool> {
     let (Some(agent), Some(session)) = (child_ctx.agent.as_mut(), child_ctx.session.as_mut())
     else {
-        return Ok(());
+        return Ok(false);
     };
     if session.is_empty() {
         session.set_explicit_variable_keys(explicit.keys().cloned().collect());
-        return Ok(());
+        return Ok(false);
     }
     let resumed = resume_variables(
         agent.defined_variables(),
@@ -1883,10 +1882,29 @@ fn reseat_agent_session_variables(
         child_ctx.agent_variables.as_ref(),
         child_ctx.info_flag,
     )?;
+    let changed = resumed.seated != *session.agent_variables();
     agent.set_session_variables(resumed.seated.clone());
     session.set_agent_variables(resumed.seated);
     session.set_explicit_variable_keys(resumed.explicit_keys);
     child_ctx.agent_variables = resumed.handed_down;
+    Ok(changed)
+}
+
+/// Re-adopts a resumed child session's prompt and System row from its
+/// agent. With `rerender`, the dynamic instructions the session was
+/// resumed with are first rendered again from the agent's current
+/// variables.
+fn readopt_child_prompt(child_ctx: &mut RequestContext, rerender: bool) -> Result<()> {
+    let tool_timeout = child_ctx.app.config.tool_timeout;
+    let info_flag = child_ctx.info_flag;
+    let (Some(session), Some(agent)) = (child_ctx.session.as_mut(), child_ctx.agent.as_mut())
+    else {
+        return Ok(());
+    };
+    if rerender && !info_flag {
+        agent.update_session_dynamic_instructions(None, tool_timeout)?;
+    }
+    session.readopt_agent_prompt(agent);
     Ok(())
 }
 
@@ -2166,6 +2184,7 @@ async fn resume_child_session(
 
     session.set_owner_only(true);
     session.set_save_session(Some(true));
+    let variables_changed = resumed.seated != *session.agent_variables();
     session.set_agent_variables(resumed.seated.clone());
     session.set_explicit_variable_keys(resumed.explicit_keys);
     if let Some(agent) = child_ctx.agent.as_mut() {
@@ -2173,6 +2192,17 @@ async fn resume_child_session(
     }
     child_ctx.agent_variables = resumed.handed_down;
     child_ctx.session = Some(session);
+    // The sidecar already says running, so a failed render must mark it
+    // failed or a retry is refused until the spawner exits.
+    if variables_changed && let Err(error) = readopt_child_prompt(child_ctx, true) {
+        finish_child_meta(
+            Some(root),
+            Some(id),
+            ChildStatus::Failed,
+            Some(format!("{error:#}")),
+        );
+        return Err(error);
+    }
     // checkpoint_session_to_disk already logged a failed write-back, and the
     // stored copy stays the resume record until the child's next checkpoint.
     let _ = child_ctx.checkpoint_session_to_disk(app_config.dry_run);
@@ -4934,6 +4964,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, "from-inputs");
+    }
+
+    /// A node input that re-seats a resumed `agent_session` variable
+    /// re-renders the prompt from it: the System row the child is sent
+    /// names the input, not the value the session was stored under.
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_child_re_renders_its_prompt_from_the_node_inputs() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_graph_child_resumed_prompt");
+        write_config_agent_with_variables(&agent_name);
+        let _session = crate::testing::EnvVarGuard::set(
+            crate::utils::normalize_env_name(&format!("{agent_name}_agent_session")),
+            "teammate",
+        );
+        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            "model: test-seeded:test-chat\n\
+             agent_variables:\n\
+             \x20 tone: calm\n\
+             \x20 who: them\n\
+             agent_instructions: Say calm to them\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: Say calm to them\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+        let inputs = HashMap::from([("tone".to_string(), json!("loud"))]);
+
+        let output = run_async(run_agent_for_graph(
+            &mut ctx,
+            &agent_name,
+            "hi",
+            Some(inputs),
+        ))
+        .unwrap();
+
+        let (system, users) = system_and_users(&output);
+        assert!(system.starts_with("Say loud to them"), "{system}");
+        assert_eq!(users, ["earlier", "hi"], "{output}");
     }
 
     /// The other half of the inheritance rule: `handle_spawn` builds its
@@ -7848,6 +7926,41 @@ mod tests {
         assert_eq!(tone, "loud");
         assert_eq!(handed_down, ctx.agent_variables);
         assert_eq!(explicit, serde_yaml::Value::Sequence(Vec::new()));
+    }
+
+    /// A resume that re-seats a variable re-renders the prompt from it, so
+    /// the instructions and the stored System row name the new value rather
+    /// than the one the session was stored under.
+    #[test]
+    #[serial]
+    fn resume_re_renders_the_prompt_from_the_re_seated_variables() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_re_renders_prompt");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "tone".to_string(),
+            "loud".to_string(),
+        )]));
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        assert!(
+            session.agent_instructions().starts_with("Say loud to them"),
+            "{}",
+            session.agent_instructions()
+        );
+        let head = &session.messages()[0];
+        assert!(head.role.is_system(), "{head:?}");
+        assert!(
+            head.content.to_text().starts_with("Say loud to them"),
+            "{head:?}"
+        );
     }
 
     /// A value given at spawn is the spawner's answer and outlives a resume
@@ -15477,6 +15590,9 @@ mod tests {
             paths::agent_sessions_dir(&agent_name).join("teammate.yaml"),
             format!(
                 "model: test-seeded:test-chat\n\
+                 agent_variables:\n\
+                 \x20 tone: loud\n\
+                 \x20 who: them\n\
                  agent_instructions: {stored:?}\n\
                  messages:\n\
                  \x20 - role: system\n\
