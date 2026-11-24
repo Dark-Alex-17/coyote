@@ -1095,3 +1095,319 @@ fn a_click_folds_at_the_arrow_and_highlights_elsewhere_on_the_row() {
         );
     });
 }
+
+/// Thirty lines, more than a folded row's tail shows.
+fn long_output() -> String {
+    (0..30).map(|n| format!("out-line-{n:02}\n")).collect()
+}
+
+/// Calls `call-x1` of `agent_id` and ends it ok, under graph node `node`
+/// when that is given. A call that `prints` streams `long_output` as it
+/// runs; one that does not, like a built-in tool, leaves its output to
+/// the saved session.
+fn long_call(harness: &mut Harness, agent_id: &str, node: Option<&str>, prints: bool) {
+    child_tool_of(harness, agent_id, node, "call-x1", "execute_command");
+    if prints {
+        harness.app.handle_msg(UiMsg::ChildToolOutput {
+            agent_id: agent_id.to_string(),
+            node: node.map(str::to_string),
+            call_id: "call-x1".to_string(),
+            chunk: long_output().into_bytes(),
+        });
+    }
+    child_tool_done_of(harness, agent_id, node, "call-x1", true);
+}
+
+/// Opens a child's thread as the thread pop-up does and gives it a read
+/// of its saved session holding `call-x1` with `long_output`.
+fn open_saved(harness: &mut Harness, session_id: &str, agent: &str) {
+    harness
+        .app
+        .open_child(session_id.to_string(), agent.to_string());
+    let Some(ControlRequest::LoadChild {
+        session_id,
+        generation,
+        ..
+    }) = harness.app.take_control_requests().pop()
+    else {
+        panic!("opening the child asks for a read");
+    };
+    harness.app.handle_msg(UiMsg::ChildLoaded {
+        session_id,
+        generation,
+        result: Ok(vec![
+            ChildEntry::User("build it".to_string()),
+            ChildEntry::Tool {
+                call_id: "call-x1".to_string(),
+                name: "execute_command".to_string(),
+                args: "{\"path\":\"src/lib.rs\"}".to_string(),
+                output: long_output(),
+            },
+        ]),
+    });
+}
+
+/// Every page of the thread on show, from its top.
+fn whole_thread(harness: &mut Harness) -> String {
+    harness.press(KeyCode::Home);
+    let mut seen = String::new();
+    for _ in 0..6 {
+        seen.push_str(&harness.draw());
+        harness.press(KeyCode::PageDown);
+    }
+    harness.press(KeyCode::Home);
+    seen
+}
+
+fn shows_every_line(text: &str) -> bool {
+    (0..30).all(|n| text.contains(&format!("out-line-{n:02}")))
+}
+
+/// The only foldable row of the thread on show, whose header follows its
+/// arrow with `header`: Ctrl+Down and Ctrl+Up focus it, Enter opens it
+/// on its whole output and closes it, and a click opens it.
+fn assert_the_row_folds(harness: &mut Harness, header: &str) {
+    let folded = format!("{}{header}", cells::COLLAPSED_ARROW);
+    let open = format!("{}{header}", cells::EXPANDED_ARROW);
+    let thread = whole_thread(harness);
+    assert!(!thread.contains("out-line-00"), "{thread}");
+
+    harness
+        .app
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    harness.draw();
+    assert!(row_modifier(harness, &folded).contains(Modifier::REVERSED));
+    harness
+        .app
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    harness.draw();
+    assert!(row_modifier(harness, &folded).contains(Modifier::REVERSED));
+
+    harness.press(KeyCode::Enter);
+    let thread = whole_thread(harness);
+    assert!(shows_every_line(&thread), "{thread}");
+    harness.draw();
+    assert!(row_modifier(harness, &open).contains(Modifier::REVERSED));
+    harness.press(KeyCode::Enter);
+    let thread = whole_thread(harness);
+    assert!(!thread.contains("out-line-00"), "{thread}");
+
+    harness.draw();
+    let row = screen_row(harness, &folded);
+    click(harness, (4, row));
+    let thread = whole_thread(harness);
+    assert!(shows_every_line(&thread), "{thread}");
+}
+
+fn thread_harness(start: u64) -> Harness {
+    let mut ctx = chat_ctx();
+    ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start }));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    started_nested(&mut harness);
+    harness
+}
+
+/// A live row of a child's and of a grandchild's thread folds and opens
+/// on its whole output, its call also in the saved session: the output
+/// it printed as it ran, or the one saved when it printed nothing live.
+#[test]
+#[serial]
+fn a_live_row_folds_in_a_child_and_a_grandchild_thread() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-live-row-folds");
+        for prints in [true, false] {
+            for (agent_id, session_id, name) in [
+                (AGENT, "sess_5d6e", "planner"),
+                (GRANDCHILD, "sess_9c0d", "coder"),
+            ] {
+                let mut harness = thread_harness(31);
+                long_call(&mut harness, agent_id, None, prints);
+                open_saved(&mut harness, session_id, name);
+                assert_the_row_folds(&mut harness, "execute_command(");
+            }
+        }
+    });
+}
+
+/// A row read back from the saved session alone folds and opens the
+/// same, in a child's and in a grandchild's thread.
+#[test]
+#[serial]
+fn a_recorded_row_folds_in_a_child_and_a_grandchild_thread() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-recorded-row-folds");
+        for (session_id, name) in [("sess_5d6e", "planner"), ("sess_9c0d", "coder")] {
+            let mut harness = thread_harness(32);
+            open_saved(&mut harness, session_id, name);
+            assert_the_row_folds(&mut harness, "execute_command(");
+        }
+    });
+}
+
+/// A finished child the roster does not list loses its live thread; its
+/// saved rows still fold and open.
+#[test]
+#[serial]
+fn a_finished_childs_saved_row_folds_once_its_live_thread_is_gone() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-pruned-row-folds");
+        let mut harness = thread_harness(33);
+        long_call(&mut harness, AGENT, None, false);
+        for agent_id in [GREAT_GRANDCHILD, GRANDCHILD, AGENT] {
+            harness.app.handle_msg(UiMsg::AgentFinished {
+                agent_id: agent_id.to_string(),
+                outcome: AgentOutcome::Completed,
+            });
+        }
+        assert!(harness.app.child_live.by_agent(AGENT).is_none());
+        open_saved(&mut harness, "sess_5d6e", "planner");
+        assert_the_row_folds(&mut harness, "execute_command(");
+    });
+}
+
+/// A graph child's node row folds and opens on its call's whole output,
+/// printed live or only saved.
+#[test]
+#[serial]
+fn a_graph_childs_node_row_folds() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-node-row-folds");
+        for prints in [true, false] {
+            let mut harness = thread_harness(34);
+            child_node(&mut harness, "plan", ChildNodeState::Started);
+            long_call(&mut harness, AGENT, Some("plan"), prints);
+            child_node(
+                &mut harness,
+                "plan",
+                ChildNodeState::Completed {
+                    duration_ms: Some(10),
+                    route: None,
+                },
+            );
+            open_saved(&mut harness, "sess_5d6e", "planner");
+            assert_the_row_folds(&mut harness, "node plan");
+        }
+    });
+}
+
+/// A provider may repeat a call id; a node row holding two such calls
+/// gives each its own saved output.
+#[test]
+#[serial]
+fn a_node_row_whose_calls_share_an_id_gets_each_saved_output() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-node-repeated-ids");
+        let mut harness = thread_harness(37);
+        child_node(&mut harness, "plan", ChildNodeState::Started);
+        for _ in 0..2 {
+            child_tool_of(&mut harness, AGENT, Some("plan"), "call-x1", "read_file");
+            child_tool_done_of(&mut harness, AGENT, Some("plan"), "call-x1", true);
+        }
+        harness
+            .app
+            .open_child("sess_5d6e".to_string(), "planner".to_string());
+        let Some(ControlRequest::LoadChild {
+            session_id,
+            generation,
+            ..
+        }) = harness.app.take_control_requests().pop()
+        else {
+            panic!("opening the child asks for a read");
+        };
+        let saved = |output: &str| ChildEntry::Tool {
+            call_id: "call-x1".to_string(),
+            name: "read_file".to_string(),
+            args: "{}".to_string(),
+            output: output.to_string(),
+        };
+        harness.app.handle_msg(UiMsg::ChildLoaded {
+            session_id,
+            generation,
+            result: Ok(vec![saved("first-saved-out"), saved("second-saved-out")]),
+        });
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        harness.press(KeyCode::Enter);
+        let thread = whole_thread(&mut harness);
+        assert!(thread.contains("first-saved-out"), "{thread}");
+        assert!(thread.contains("second-saved-out"), "{thread}");
+    });
+}
+
+/// Alt+C over a child's thread hands the loop its focused row's whole
+/// output to copy; with no row focused there is nothing to copy.
+#[test]
+#[serial]
+fn alt_c_in_a_child_thread_copies_its_focused_rows_whole_output() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-alt-c");
+        let mut harness = thread_harness(35);
+        long_call(&mut harness, GRANDCHILD, None, false);
+        open_saved(&mut harness, "sess_9c0d", "coder");
+        harness.draw();
+        assert_eq!(harness.app.handle_key(alt(KeyCode::Char('c'))), None);
+
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        harness.draw();
+        assert_eq!(
+            harness.app.handle_key(alt(KeyCode::Char('c'))),
+            Some(Command::Copy {
+                text: long_output(),
+                from: "execute_command".to_string(),
+                dropped: 0,
+            })
+        );
+    });
+}
+
+/// A find over a child's thread whose match is in a folded row opens
+/// that row and lands on the match.
+#[test]
+#[serial]
+fn a_find_in_a_child_thread_opens_the_folded_row_holding_the_match() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-find-folded");
+        let mut harness = thread_harness(36);
+        long_call(&mut harness, AGENT, None, true);
+        open_saved(&mut harness, "sess_5d6e", "planner");
+        assert!(!harness.draw().contains("out-line-03"));
+
+        harness.press(KeyCode::Char('/'));
+        harness.type_text("OUT-line-03");
+        harness.press(KeyCode::Enter);
+        let frame = harness.draw();
+        let top = frame.lines().nth(1).unwrap_or_default();
+        assert!(top.contains("out-line-03"), "{frame}");
+        assert!(shows_every_line(&whole_thread(&mut harness)));
+    });
+}
+
+/// A grandchild's thread, titled with its path, with its call open.
+#[test]
+#[serial]
+fn a_grandchild_thread_with_an_open_call_draws_its_output_under_its_path() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-open-call-snapshot");
+        let mut harness = thread_harness(37);
+        child_tool_of(&mut harness, GRANDCHILD, None, "call-x1", "execute_command");
+        harness.app.handle_msg(UiMsg::ChildToolOutput {
+            agent_id: GRANDCHILD.to_string(),
+            node: None,
+            call_id: "call-x1".to_string(),
+            chunk: b"Compiling coyote v0.10.3\nFinished dev profile in 2.1s\n".to_vec(),
+        });
+        child_tool_done_of(&mut harness, GRANDCHILD, None, "call-x1", true);
+        open_saved(&mut harness, "sess_9c0d", "coder");
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        harness.press(KeyCode::Enter);
+        insta::assert_snapshot!("child_thread_expanded_tool_80x24", harness.draw());
+        harness.resize(40, 20);
+        insta::assert_snapshot!("child_thread_expanded_tool_40x20", harness.draw());
+    });
+}

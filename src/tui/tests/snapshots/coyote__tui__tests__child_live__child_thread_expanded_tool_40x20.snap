@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/child_live.rs
+expression: harness.draw()
+---
+"Thread: ... > coder (ro) sess_9c0d 1-8/8"
+"Read-only. Tool calls show live; replies"
+"show up at the child's next checkpoint. "
+"                                        "
+"> build it                              "
+"                                        "
+"▾ execute_command({"path":"s...)  0s  ok"
+"  Compiling coyote v0.10.3              "
+"  Finished dev profile in 2.1s          "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"q close  Tab threads  / find  n/N  j/k  "

@@ -1121,10 +1121,14 @@ impl App {
     }
 
     /// The target row's whole output for the loop to put on the
-    /// clipboard, or a notice saying why there is none.
+    /// clipboard, or a notice saying why there is none. Over a child's
+    /// thread the target is that thread's focused row.
     fn copy_tool_output(&mut self) -> Option<Command> {
-        let copied = cells::copy_target(self.transcript.cells(), self.transcript.focus())
-            .and_then(Cell::copied_output);
+        let copied = match self.pager().filter(|pager| !pager.shows_root()) {
+            Some(pager) => pager.focused_child_cell(&self.child_live),
+            None => cells::copy_target(self.transcript.cells(), self.transcript.focus()),
+        }
+        .and_then(Cell::copied_output);
         let notice = match copied {
             None => "No tool call to copy: focus one with Ctrl+Up or a click".to_string(),
             Some(copied) if copied.text.is_empty() => {
@@ -2042,6 +2046,9 @@ impl App {
             } => {
                 if let Err(err) = &result {
                     warn!("Failed to read the session of child {session_id}: {err}");
+                }
+                if let Ok(entries) = &result {
+                    self.child_live.fill_saved_output(&session_id, entries);
                 }
                 let again = self
                     .pager_mut()

@@ -5,6 +5,7 @@
 
 use super::FULL_OUTPUT_BUDGET;
 use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow, ToolStatus};
+use super::pager::ChildEntry;
 use super::sink::{AgentOutcome, ChildNodeState};
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -455,6 +456,61 @@ impl ChildLive {
         };
         let text = cells::append_output(tail, chunk);
         let grew = tail.full.push(&text);
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+    }
+
+    /// Gives each call of `session_id`'s thread that printed nothing as it
+    /// ran the output its saved session holds. Only a tool run as a
+    /// process prints as it runs; a built-in one returns its result whole,
+    /// so its live row has nothing to open on until the session is read.
+    /// The nth saved call with an id goes to the nth call carrying that id
+    /// across the rows, so a provider that repeats ids still fills each
+    /// call's own tail, even when one row holds several of them.
+    pub(super) fn fill_saved_output(&mut self, session_id: &str, entries: &[ChildEntry]) {
+        let Some(thread) = self.by_session_mut(session_id) else {
+            return;
+        };
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut grew = 0;
+        for entry in entries {
+            let ChildEntry::Tool {
+                call_id, output, ..
+            } = entry
+            else {
+                continue;
+            };
+            if call_id.is_empty() {
+                continue;
+            }
+            let nth = seen.entry(call_id).or_default();
+            let at = *nth;
+            *nth += 1;
+            if output.is_empty() {
+                continue;
+            }
+            let mut left = at;
+            let Some(cell) = thread.rows.iter_mut().find(|cell| {
+                let here = cell.calls_with_id(call_id);
+                if left < here {
+                    return true;
+                }
+                left -= here;
+                false
+            }) else {
+                continue;
+            };
+            cell.forget_wrapped_lines();
+            let Some(tail) = cell.nth_output_for(call_id, left) else {
+                continue;
+            };
+            // A call that printed, or whose output the budget took, keeps
+            // what it has.
+            if !tail.full.text().is_empty() || tail.full.dropped() > 0 {
+                continue;
+            }
+            let text = cells::append_output(tail, output.as_bytes());
+            grew += tail.full.push(&text) + tail.full.settle();
+        }
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 

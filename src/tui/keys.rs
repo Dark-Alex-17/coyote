@@ -627,6 +627,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Enter",
             "Open or close the focused row of a child thread; a click opens or closes any",
         ),
+        row(
+            Pager,
+            "Alt+C",
+            "Copy the whole output of a child thread's focused row",
+        ),
         row(Pager, "Mouse wheel", "Scroll"),
         row(
             Pager,
@@ -934,6 +939,7 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
 /// and `n` by the key as typed or by Shift.
 fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let upper = key.modifiers.contains(KeyModifiers::SHIFT)
         || matches!(key.code, KeyCode::Char(c) if c.is_ascii_uppercase());
     match mode {
@@ -972,6 +978,7 @@ fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) 
             _ if ctrl => Action::Nothing,
             KeyCode::Char('q') => Action::ClosePager,
             KeyCode::Enter if child_thread => Action::PagerToggleFocused,
+            KeyCode::Char('c') if alt && child_thread => Action::CopyToolOutput,
             KeyCode::Down | KeyCode::Char('j') => Action::PagerScroll(1),
             KeyCode::Up | KeyCode::Char('k') => Action::PagerScroll(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => Action::PagerPage(1),
@@ -3174,6 +3181,15 @@ mod tests {
                     Action::PagerToggleFocused,
                 )],
             ),
+            (
+                H::Pager,
+                "Alt+C",
+                vec![(
+                    alt(KeyCode::Char('c')),
+                    CHILD_BROWSE,
+                    Action::CopyToolOutput,
+                )],
+            ),
             (H::Pager, "Mouse wheel", vec![]),
             (
                 H::Pager,
@@ -3863,7 +3879,8 @@ mod tests {
 
     /// Alt+M switches the mouse mode whatever is open, typing fields and
     /// the pager's find included; Alt+C copies wherever the transcript
-    /// keys reach, and the overlays that cover the transcript keep it.
+    /// keys reach and over a child's thread, and the other overlays that
+    /// cover the transcript keep it.
     #[test]
     fn alt_m_toggles_the_mouse_everywhere_and_alt_c_copies_from_the_transcript() {
         let alt_m = press(KeyCode::Char('m'), KeyModifiers::ALT);
@@ -3884,6 +3901,7 @@ mod tests {
         for ctx in [BROWSE, PICKER, HELP, ROSTER] {
             assert_eq!(map_key(alt_c, &ctx), Action::Nothing, "{ctx:?}");
         }
+        assert_eq!(map_key(alt_c, &CHILD_BROWSE), Action::CopyToolOutput);
         assert_eq!(map_key(alt_c, &FIND), Action::PagerFindChar('c'));
     }
 

@@ -781,6 +781,16 @@ impl Pager {
         }
     }
 
+    /// The focused row of the child on show, which Alt+C copies from.
+    pub(super) fn focused_child_cell<'a>(&'a self, live: &'a ChildLive) -> Option<&'a Cell> {
+        let Thread::Child(view) = &self.thread else {
+            return None;
+        };
+        let cells = live_rows(live, &view.session_id);
+        let focus = view.focused_row(cells)?;
+        view.cell(view.rows[focus], cells)
+    }
+
     /// A left click at `column`, `row` of a pager drawn over `area`: on a
     /// foldable row of the child on show, focuses it and opens or closes
     /// it. With the threads pop-up up, a click on a thread's fold arrow
@@ -982,7 +992,8 @@ impl Pager {
     }
 
     /// Jumps to the next match (or the previous one) of the last text
-    /// searched for.
+    /// searched for. Over a child's thread the text is laid out again,
+    /// since the match can sit in a folded row that the find opens.
     pub(super) fn find_next(&mut self, forward: bool) {
         if self.query.is_empty() {
             self.missed = false;
@@ -990,6 +1001,9 @@ impl Pager {
         }
         self.jump = Some(Jump::Match { forward });
         self.follow = false;
+        if let Thread::Child(_) = self.thread {
+            self.laid_out = None;
+        }
     }
 
     /// Opens the threads pop-up on `tree`, its run times counted to `now`
@@ -1122,10 +1136,71 @@ impl Pager {
         {
             return Arc::clone(text);
         }
-        let text = Arc::new(self.lay_out(cells, revisions, live, width, renderer));
+        let mut text = self.lay_out(cells, revisions, live, width, renderer);
+        if self.open_folded_match(&text, live) {
+            text = self.lay_out(cells, revisions, live, width, renderer);
+        }
+        let text = Arc::new(text);
         self.reanchor(&text);
         self.laid_out = Some((width, generation, Arc::clone(&text)));
         text
+    }
+
+    /// With a find under way over a child's thread, opens the folded row
+    /// whose output holds the next match when that comes before the next
+    /// match already on show, so the find lands inside it. Returns whether
+    /// a row was opened.
+    fn open_folded_match(&mut self, text: &PagerText, live: &mut ChildLive) -> bool {
+        let Some(Jump::Match { forward }) = self.jump else {
+            return false;
+        };
+        let total = text.len();
+        if total == 0 || self.query.is_empty() {
+            return false;
+        }
+        let origin = self.find_origin(total, forward) % total;
+        let distance = |line: usize| {
+            if forward {
+                (line + total - origin) % total
+            } else {
+                (origin + total - line) % total
+            }
+        };
+        let shown = self.find(text, forward).map(distance);
+        let needle = self.query.to_lowercase();
+        let Thread::Child(view) = &mut self.thread else {
+            return false;
+        };
+        let cells = live_rows(live, &view.session_id);
+        let folded = view
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|&(_, &row)| {
+                view.cell(row, cells).is_some_and(|cell| {
+                    cell.collapsible()
+                        && !cell.expanded()
+                        && cell
+                            .copied_output()
+                            .is_some_and(|output| output.text.to_lowercase().contains(&needle))
+                })
+            })
+            .filter_map(|(index, &row)| Some((distance(text.cell_start(index)?), row)))
+            .filter(|&(away, _)| shown.is_none_or(|shown| away < shown))
+            .min_by_key(|&(away, _)| away);
+        let Some((_, row)) = folded else {
+            return false;
+        };
+        let cells = live
+            .by_session_mut(&view.session_id)
+            .map_or(&mut [][..], ChildThread::rows_mut);
+        match view.cell_mut(row, cells) {
+            Some(cell) => {
+                cell.toggle();
+                true
+            }
+            None => false,
+        }
     }
 
     /// A highlighted match the new text no longer has on its line is
@@ -1333,12 +1408,7 @@ impl Pager {
             return None;
         }
         let needle = self.query.to_lowercase();
-        let origin = match (self.matched, forward) {
-            (Some(line), true) => line + 1,
-            (Some(line), false) => line + total - 1,
-            (None, true) => self.top,
-            (None, false) => self.top + total - 1,
-        };
+        let origin = self.find_origin(total, forward);
         (0..total)
             .map(|step| {
                 if forward {
@@ -1348,6 +1418,18 @@ impl Pager {
                 }
             })
             .find(|&index| holds(text.line(index), &needle))
+    }
+
+    /// The line a find over `total` lines starts from, past `total` when
+    /// it wraps: after the current match (or before it), or else the top
+    /// of the view.
+    fn find_origin(&self, total: usize, forward: bool) -> usize {
+        match (self.matched, forward) {
+            (Some(line), true) => line + 1,
+            (Some(line), false) => line + total - 1,
+            (None, true) => self.top,
+            (None, false) => self.top + total - 1,
+        }
     }
 
     /// The thread's name for a title `width` columns wide; a child's is

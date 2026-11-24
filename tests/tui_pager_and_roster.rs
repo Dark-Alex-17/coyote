@@ -3362,6 +3362,63 @@ mod binary_threads {
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
     }
 
+    /// Once the kid has saved its rounds, Ctrl+Down and Enter in its open
+    /// thread open its gated call on what the call returned, which the
+    /// tool wrote to its output file rather than printed as it ran. The
+    /// fake model gives every call one id, so the gated call heads the
+    /// thread in the mark call's place.
+    #[test]
+    #[serial]
+    fn the_kids_thread_opens_a_finished_call_on_its_saved_output() {
+        let scene = scene("thr-open-row", kid_in_a_blocking_tool, "");
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+        wait_for_file(
+            &mut pty,
+            &scene.dir.join("kid.gated"),
+            "the kid's gate tool",
+        );
+
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"\t").unwrap();
+        repainted_frame_showing(&mut pty, "Threads", "Tab did not open the picker");
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\r").unwrap();
+        fs::write(&scene.kid_gate, "").unwrap();
+        let (saved, thread) = frame_until(&mut pty, Duration::from_secs(20), |frame| {
+            squeezed(frame).contains("kiddonez4p")
+        });
+        assert!(
+            saved,
+            "the kid's thread did not read back its saved reply:\n{thread}\nlog: {}",
+            scene.log.display()
+        );
+
+        pty.send(b"\x1b[1;5B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\r").unwrap();
+        let (opened, open) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
+            frame
+                .lines()
+                .skip_while(|line| !line.contains("\u{25BE} kid_gate("))
+                .take(3)
+                .any(|line| line.contains("kid gate open k2g"))
+        });
+        assert!(
+            opened,
+            "Enter on the focused gated call does not show its output:\n{open}"
+        );
+        pty.send(b"q").unwrap();
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
     /// The kid as a graph agent: node `scout` calls the mark tool, node
     /// `waiter` the gated one.
     fn write_graph_kid(dir: &Path) {

@@ -864,8 +864,14 @@ impl Cell {
 
     /// Whether `output_for(call_id)` finds somewhere in this cell.
     pub(super) fn takes_output_of(&self, call_id: &str) -> bool {
+        self.calls_with_id(call_id) > 0
+    }
+
+    /// How many calls in this cell carry `call_id`: a provider may repeat
+    /// an id, so a job, agent or node row can hold more than one.
+    pub(super) fn calls_with_id(&self, call_id: &str) -> usize {
         match self {
-            Cell::Tool { call_id: id, .. } => id == call_id,
+            Cell::Tool { call_id: id, .. } => usize::from(id == call_id),
             Cell::Job {
                 row: TaskRow { calls, .. },
                 ..
@@ -877,12 +883,39 @@ impl Cell {
             | Cell::Node {
                 row: TaskRow { calls, .. },
                 ..
-            } => calls.iter().any(|call| call.call_id == call_id),
-            _ => false,
+            } => calls.iter().filter(|call| call.call_id == call_id).count(),
+            _ => 0,
         }
     }
 
-    fn expanded(&self) -> bool {
+    /// The output tail of the `nth` call in this cell carrying `call_id`,
+    /// in call order.
+    pub(super) fn nth_output_for(&mut self, call_id: &str, nth: usize) -> Option<&mut OutputTail> {
+        match self {
+            Cell::Tool {
+                call_id: id, tail, ..
+            } if id == call_id && nth == 0 => Some(tail),
+            Cell::Job {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Node {
+                row: TaskRow { calls, .. },
+                ..
+            } => calls
+                .iter_mut()
+                .filter(|call| call.call_id == call_id)
+                .nth(nth)
+                .map(|call| &mut call.tail),
+            _ => None,
+        }
+    }
+
+    pub(super) fn expanded(&self) -> bool {
         match self {
             Cell::Tool { expanded, .. }
             | Cell::Job {
