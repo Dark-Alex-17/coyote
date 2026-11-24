@@ -1,7 +1,8 @@
 //! Real-process checks of the pty harness itself (`tests/common/pty.rs`):
 //! the child a spawn drives inherits no descriptor the test runner holds,
-//! and both halves of the pair are close-on-exec from the moment they are
-//! opened. The children are `sh` and `bash`; no coyote binary is involved,
+//! both halves of the pair are close-on-exec from the moment they are
+//! opened, and the harness answers the keyboard-enhancement probe and no
+//! other query. The children are `sh` and `bash`; no coyote binary is involved,
 //! so the file pins no config or cache dir. The cases run one at a time:
 //! each spawn forks a session leader and takes a controlling tty, and a
 //! fork landing between another test's `openpty` and its `exec` has
@@ -132,6 +133,40 @@ fn the_pty_pair_is_close_on_exec_on_both_sides() {
         "the master lost FD_CLOEXEC across the spawn"
     );
     pty.wait_for("spawned-ok", PTY_DEADLINE).unwrap();
+}
+
+/// The harness answers crossterm's keyboard-enhancement probe, the flags
+/// query followed by a device-attributes query, with device attributes
+/// alone, and answers nothing else: neither a bare device-attributes
+/// query nor a lone flags query. The child reads in raw mode with a one
+/// second read timeout and reports what came back after each query.
+#[test]
+#[serial]
+fn the_harness_answers_only_the_keyboard_probe() {
+    let script = r#"stty raw -echo min 0 time 10
+printf '\033[?u\033[c'
+printf 'probe=%s|' "$(dd bs=1 count=9 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+printf '\033[c'
+printf 'bare=%s|' "$(dd bs=1 count=9 2>/dev/null | wc -c | tr -d ' ')"
+printf '\033[?u'
+printf 'flags=%s|' "$(dd bs=1 count=9 2>/dev/null | wc -c | tr -d ' ')"
+printf 'replies-done'"#;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script);
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let transcript = pty.wait_for("replies-done", PTY_DEADLINE).unwrap();
+    assert!(
+        transcript.contains("probe=1b5b3f36323b323263|"),
+        "the probe did not get the device-attributes reply:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("bare=0|"),
+        "a bare device-attributes query got a reply:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("flags=0|"),
+        "a lone flags query got a reply:\n{transcript}"
+    );
 }
 
 /// The `tui_*.rs` suites directly under `tests/`; the harness itself,
