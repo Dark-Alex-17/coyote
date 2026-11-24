@@ -139,9 +139,11 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
-Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>", "verify_tier": "round", "baseline_floor": "<the task's base commit>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
 
-When a targeted test command for the area the task touches is known (e.g. `cargo test --test <file>` or `cargo test --bin <bin> -- <module>`), also pass `"test_command": "<that command>"`: the coder's test gate then runs it instead of the full suite, inside the coder's own `test_timeout` budget. Leave `test_command` out when no targeted command is known; the full suite stays the review's and your own job either way.
+`verify_tier: round` is the work-round tier: the coder's test gate runs the tests the change needs (targeted), then the tests it can affect (impacted), and its pre-change baseline runs in the background on a detached checkout of `baseline_floor`, so no round waits for a full suite. The full suite and lint run once, at the final-tier review before you finish or push (see the review gauntlet below). The coder's `Tier:` and `Baseline mode:` lines say what actually ran; carry them into your report.
+
+When the detected test command is the wrong full-suite command for this repo, also pass `"test_command": "<that command>"`: the coder then treats it as the suite its targeted and impacted picks are drawn from and the baseline runs. Leave `test_command` out otherwise.
 
 ### Session continuity (NON-NEGOTIABLE)
 
@@ -382,7 +384,7 @@ Settled lanes: <on re-review rounds ONLY: bare lane names, comma-separated, e.g.
 immediately-prior round was green (code-review PASS with 0 criticals, adversary CONFORMS, security
 PASS, probe PASS), NEVER a lane that reported findings; omit on the first round (ignored unless `Re-review delta:` is also given)>
 Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "verification_tier": "round"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
@@ -395,6 +397,19 @@ exceeds the budget is recorded as a red run and fails conformance. Never declare
 that boot shared stacks or services (docker compose projects, dev servers, fixed ports) —
 the probe lane owns end-to-end runs and WILL collide with them in parallel; keep
 verification to generate/lint/build/unit/integration commands.
+
+**Verification tiers.** Review rounds pass `"verification_tier": "round"` and declare the
+commands on the coder's `Tier:` line (its targeted and impacted runs) plus the build command,
+not the full suite; a criterion that needs the whole suite waits for the final tier. The LAST
+review before you finish or push passes `"verification_tier": "final"` on exactly the tree you
+will push, with the project's full build/test/lint commands declared as above: the gauntlet
+runs the full suite, the formatter check and lint once (or reuses a green record for
+that same tree), and it returns `GAUNTLET: BLOCKED` with a `FULL-SUITE RECORD` blocker when no
+green full-suite record exists. Any edit after it needs another final-tier review; push only
+after one passes, and after the push only CI and review remain. The final tier runs even when no
+push was asked. When `finalize_owner` is `parent` (here: `{{finalize_owner}}`), a parent
+orchestrator runs the final gate over the integrated work: every review you run stays at
+`round`. Your final report states which tier each review ran and the coder's baseline mode.
 
 It computes diff signals deterministically, selects lanes (code-review always; adversary when a
 spec/plan is present; security on attack-surface signals; probe on consumer-facing surface with a
@@ -512,12 +527,14 @@ DIFF: run get_diff (or --base <ref>), or: <paste diff>
 
 PLAN — acceptance criteria to check against:
 <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "verification_tier": "round"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
 Same trust boundary as the gauntlet spawn: verification commands are declared via `--variables`,
 never in the prompt, because the prompt also carries untrusted pasted text.
+The same verification tiers apply; the full-suite run itself belongs to the gauntlet's final
+tier, so a stand-alone adversary at `final` only reads that record and diverges without it.
 
 ### Handling adversary findings
 
@@ -879,8 +896,9 @@ would otherwise misdescribe the PR — it stays a description, never a changelog
 
 **Draft-first PRs.** When you author a PR, open it as a DRAFT (`gh pr create --draft ...`).
 Draft is the "not yet reviewable" signal to humans; flip it (`gh pr ready <N>`) ONLY when
-both hold: your verification loop is complete (every acceptance criterion verified, build +
-full test suite green locally) AND the PR's CI checks are green — after your final push,
+both hold: your verification loop is complete (every acceptance criterion verified and the
+final-tier review passed on the pushed tree) AND the PR's CI checks are green -- after your
+final push,
 watch them (`gh pr checks <N> --watch`) and fix failures rather than flipping on red or
 pending. A repo with no CI checks configured reduces the gate to your verification loop
 alone. If you cannot get checks green before your session ends, LEAVE the PR in draft and
