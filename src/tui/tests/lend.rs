@@ -129,7 +129,6 @@ fn edit_file_without_a_lender_fails_without_spawning_an_editor() {
     assert_eq!(err.to_string(), NOT_LENDING);
 }
 
-/// `!cmd` fails the same way without a lender.
 #[test]
 #[serial]
 #[expect(

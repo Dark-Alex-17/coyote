@@ -783,7 +783,6 @@ fn reading_commands_entered_during_a_turn_run_now() {
     assert!(!harness.draw().contains("pending:"));
 }
 
-/// A command that switches what the turn runs on still waits for it.
 #[test]
 fn an_agent_switch_entered_during_a_turn_still_waits() {
     let mut harness = Harness::standalone(80, 24);
@@ -1833,7 +1832,6 @@ fn teardown_keys_do_nothing_new_and_the_strip_says_leaving() {
     assert!(rendered.contains("Leaving..."), "{rendered}");
 }
 
-/// A child agent's tool hooks leave the root's status row alone.
 #[test]
 fn only_root_tool_hooks_drive_the_status_row() {
     let (tx, mut rx) = unbounded_channel();
@@ -6085,7 +6083,6 @@ fn ui_comments_carry_no_planning_vocabulary() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = rust_files(&root.join("src/tui"));
     files.extend(rust_files(&root.join("tests/common")));
-    // Every UI suite: each `tui_*.rs` under `tests/`.
     let mut suites: Vec<_> = rust_files(&root.join("tests"))
         .into_iter()
         .filter(|path| {

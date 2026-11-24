@@ -1326,7 +1326,6 @@ fn enter_on_a_question_answers_it_through_the_modal() {
     assert!(!queue.has_pending());
 }
 
-/// A question with no options is asked for free text.
 #[test]
 #[serial]
 fn a_question_without_options_takes_typed_text() {
