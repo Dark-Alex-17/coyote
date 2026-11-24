@@ -187,6 +187,7 @@ impl Widget for HelpView<'_> {
         help.last_total = total;
         help.top = help.top.min(help.bottom());
         Clear.render(area, buf);
+        buf.set_style(area, self.theme.surface_raised);
         if body.is_empty() {
             block.render(area, buf);
             return;

@@ -317,6 +317,7 @@ impl Widget for RosterPopup<'_> {
             .title_bottom(Line::styled(hint, DIM));
         let inner = block.inner(area);
         Clear.render(area, buf);
+        buf.set_style(area, self.theme.surface_raised);
         block.render(area, buf);
         RosterView {
             state: self.state,

@@ -93,7 +93,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use terminal::MOUSE_CAPTURE_DEFAULT;
-use theme::{ChromeKind, DIM, Theme, chrome_style, field_background};
+use theme::{ChromeKind, DIM, Theme, chrome_style};
 use throbber::{THROBBER_INTERVAL, Tick};
 use todo::TodoPanel;
 use tokio::task::JoinSet;
@@ -539,18 +539,20 @@ impl App {
         footer: FooterInfo,
     ) -> Result<Self> {
         let options = config.render_options()?;
-        let background = field_background(&config, &options);
-        let renderer = Renderer::new(options)?;
+        let mut renderer = Renderer::new(options)?;
         let theme = Theme::new(
             renderer.markdown_render(),
             renderer.no_color,
             config.light_theme(),
         );
+        renderer.faded = theme.faded;
+        let mut composer = Composer::new(config.command_prefix);
+        composer.set_placeholder_style(theme.faded);
         let history_file = history_file(&config, footer.session.as_deref());
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
             todo: TodoPanel::default(),
-            composer: Composer::new(background, config.command_prefix),
+            composer,
             pasted_images: Vec::new(),
             stashed_pasted_images: Vec::new(),
             queued: Vec::new(),
@@ -614,11 +616,20 @@ impl App {
     #[cfg(test)]
     fn set_no_color(&mut self, no_color: bool) {
         self.renderer.no_color = no_color;
-        self.theme = Theme::new(
+        let theme = Theme::new(
             self.renderer.markdown_render(),
             no_color,
             self.config.light_theme(),
         );
+        self.set_theme(theme);
+    }
+
+    /// Swaps in a theme built with the current renderer; the cells and the
+    /// composer's placeholder take its faded style from here.
+    fn set_theme(&mut self, theme: Theme) {
+        self.renderer.faded = theme.faded;
+        self.composer.set_placeholder_style(theme.faded);
+        self.theme = theme;
     }
 
     /// Starts the welcome wordmark's sweep from the next frame drawn, while
@@ -691,18 +702,16 @@ impl App {
         self.palette_snapshot = PaletteSnapshot::from_ctx(ctx);
         if !Arc::ptr_eq(&self.config, &ctx.app.config) {
             let config = &ctx.app.config;
-            match config.render_options().and_then(|options| {
-                let background = field_background(config, &options);
-                Renderer::new(options).map(|renderer| (renderer, background))
-            }) {
-                Ok((mut renderer, background)) => {
+            match config.render_options().and_then(Renderer::new) {
+                Ok(mut renderer) => {
                     renderer.no_color = self.renderer.no_color;
-                    self.theme = Theme::new(
+                    let theme = Theme::new(
                         renderer.markdown_render(),
                         renderer.no_color,
                         config.light_theme(),
                     );
                     self.renderer = renderer;
+                    self.set_theme(theme);
                     self.transcript.forget_layout();
                     self.child_live.forget_layout();
                     for prompt in &mut self.prompts {
@@ -711,7 +720,6 @@ impl App {
                     if let Some(pager) = self.pager_mut() {
                         pager.forget_layout();
                     }
-                    self.composer.set_background(background);
                 }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }
@@ -2151,7 +2159,14 @@ impl App {
                 &mut self.renderer,
             );
             pager.settle(&text, Pager::text_rows(area.height));
-            frame.render_widget(PagerView { pager, text: &text }, area);
+            frame.render_widget(
+                PagerView {
+                    pager,
+                    text: &text,
+                    theme: &self.theme,
+                },
+                area,
+            );
             return;
         }
         // The roster is read on every frame it is up: the tasks move on
@@ -2171,6 +2186,17 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(area);
+        // The regions' backgrounds go down first; the widgets over them set
+        // only their foregrounds, so the fill shows through.
+        for (region, surface) in [
+            (upper, self.theme.surface_base),
+            (rule, self.theme.surface_base),
+            (status, self.theme.surface_chrome),
+            (bottom, self.theme.surface_raised),
+            (footer, self.theme.surface_chrome),
+        ] {
+            frame.buffer_mut().set_style(region, surface);
+        }
 
         // The todo panel shares the transcript's rows: beside it on a
         // wide frame, in its place on a narrow one.

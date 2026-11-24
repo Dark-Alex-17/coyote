@@ -10,7 +10,7 @@ use crate::repl::{CommandSpan, classify_command, placeholder_ending_at, placehol
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_segmentation::UnicodeSegmentation;
@@ -33,30 +33,36 @@ fn placeholder(prefix: CommandPrefix) -> String {
 
 pub(super) struct Composer {
     textarea: TextArea<'static>,
-    background: Color,
     prefix: CommandPrefix,
+    /// The theme's faded style, set each time the App builds a theme.
+    placeholder_style: Style,
 }
 
 impl Composer {
-    pub(super) fn new(background: Color, prefix: CommandPrefix) -> Self {
+    pub(super) fn new(prefix: CommandPrefix) -> Self {
         Self {
-            textarea: Self::textarea(Vec::new(), prefix),
-            background,
+            textarea: Self::textarea(Vec::new(), prefix, DIM),
             prefix,
+            placeholder_style: DIM,
         }
     }
 
-    fn textarea(lines: Vec<String>, prefix: CommandPrefix) -> TextArea<'static> {
+    fn textarea(
+        lines: Vec<String>,
+        prefix: CommandPrefix,
+        placeholder_style: Style,
+    ) -> TextArea<'static> {
         let mut textarea = TextArea::new(lines);
         textarea.set_cursor_line_style(Style::new());
         textarea.set_wrap_mode(WrapMode::WordOrGlyph);
         textarea.set_placeholder_text(placeholder(prefix));
-        textarea.set_placeholder_style(DIM);
+        textarea.set_placeholder_style(placeholder_style);
         textarea
     }
 
-    pub(super) fn set_background(&mut self, background: Color) {
-        self.background = background;
+    pub(super) fn set_placeholder_style(&mut self, style: Style) {
+        self.placeholder_style = style;
+        self.textarea.set_placeholder_style(style);
     }
 
     pub(super) fn set_command_prefix(&mut self, prefix: CommandPrefix) {
@@ -70,13 +76,17 @@ impl Composer {
 
     /// Replaces the draft and puts the cursor after its last character.
     pub(super) fn set_text(&mut self, text: &str) {
-        self.textarea = Self::textarea(text.split('\n').map(str::to_string).collect(), self.prefix);
+        self.textarea = Self::textarea(
+            text.split('\n').map(str::to_string).collect(),
+            self.prefix,
+            self.placeholder_style,
+        );
         self.textarea.move_cursor(CursorMove::Bottom);
         self.textarea.move_cursor(CursorMove::End);
     }
 
     pub(super) fn clear(&mut self) {
-        self.textarea = Self::textarea(Vec::new(), self.prefix);
+        self.textarea = Self::textarea(Vec::new(), self.prefix, self.placeholder_style);
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -398,7 +408,6 @@ impl Widget for ComposerView<'_> {
         if inner.is_empty() {
             return;
         }
-        buf.set_style(inner, self.theme.surface(self.composer.background));
         (&self.composer.textarea).render(inner, buf);
         if let Some(span) = &self.command {
             self.paint_command(span, inner, buf);
@@ -409,20 +418,21 @@ impl Widget for ComposerView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
     use ratatui::symbols::line::HORIZONTAL;
 
     const AREA: Rect = Rect::new(0, 0, 20, 5);
-    const BACKGROUND: Color = Color::Indexed(236);
     const KNOWN_COLOR: Color = Color::Green;
     const UNKNOWN_COLOR: Color = Color::Red;
 
     fn render(text: &str, prefix: CommandPrefix, extra_known: &[&str], no_color: bool) -> Buffer {
-        let mut composer = Composer::new(BACKGROUND, prefix);
+        let theme = Theme::fallback(no_color);
+        let mut composer = Composer::new(prefix);
+        composer.set_placeholder_style(theme.faded);
         composer.set_text(text);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(prefix, extra_known, &Theme::fallback(no_color), false)
+            .view(prefix, extra_known, &theme, false)
             .render(AREA, &mut buf);
         buf
     }
@@ -469,12 +479,12 @@ mod tests {
 
     #[test]
     fn the_placeholder_names_the_configured_sigil() {
-        let composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let composer = Composer::new(CommandPrefix::Dot);
         assert_eq!(
             composer.textarea.placeholder_text(),
             "Type a prompt or a .command; Enter sends"
         );
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Slash);
+        let mut composer = Composer::new(CommandPrefix::Slash);
         assert_eq!(
             composer.textarea.placeholder_text(),
             "Type a prompt or a /command; Enter sends"
@@ -487,32 +497,30 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_is_dim_with_and_without_colour() {
+    fn the_placeholder_is_faded_with_and_without_colour() {
         for no_color in [false, true] {
+            let faded = Theme::fallback(no_color).faded;
             let buf = render("", CommandPrefix::Dot, &[], no_color);
             let row: String = (1..AREA.width).map(|x| buf[(x, 1)].symbol()).collect();
             assert!(row.starts_with("Type a prompt"), "{no_color}: {row:?}");
             assert!(
-                (1..5).all(|x| buf[(x, 1)].modifier.contains(Modifier::DIM)),
+                (1..5).all(|x| buf[(x, 1)].modifier.contains(Modifier::DIM) == no_color),
                 "{no_color}: {:?}",
                 first_row(&buf)
             );
-            assert_eq!(buf[(1, 1)].fg, Color::Reset);
+            assert_eq!(buf[(1, 1)].fg, faded.fg.unwrap_or(Color::Reset));
         }
     }
 
     #[test]
-    fn the_rules_and_the_surface_frame_the_field() {
+    fn the_rules_frame_the_field() {
         let buf = render("hi", CommandPrefix::Dot, &[], false);
         for y in [0, AREA.height - 1] {
             assert_eq!(buf[(0, y)].symbol(), HORIZONTAL);
             assert_eq!(buf[(19, y)].symbol(), HORIZONTAL);
             assert!(buf[(0, y)].modifier.contains(Modifier::BOLD));
             assert!(!buf[(0, y)].modifier.contains(Modifier::DIM));
-            assert_eq!(buf[(0, y)].bg, Color::Reset);
         }
-        assert_eq!(buf[(0, 1)].bg, BACKGROUND);
-        assert_eq!(buf[(19, 3)].bg, BACKGROUND);
     }
 
     #[test]
@@ -525,7 +533,7 @@ mod tests {
 
     #[test]
     fn a_draft_scrolled_past_its_first_line_shows_no_command() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text(&[".info x", "a", "b", "c", "d", "e"].join("\n"));
         let mut buf = Buffer::empty(AREA);
         composer
@@ -537,7 +545,7 @@ mod tests {
 
     #[test]
     fn normal_mode_titles_the_rule() {
-        let composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let composer = Composer::new(CommandPrefix::Dot);
         let mut buf = Buffer::empty(AREA);
         composer
             .view(CommandPrefix::Dot, &[], &Theme::fallback(false), true)
@@ -549,7 +557,7 @@ mod tests {
 
     #[test]
     fn the_vi_edits_move_and_delete_in_the_draft() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("one two\nthree");
         composer.move_cursor(ViMotion::Up);
         composer.move_cursor(ViMotion::Head);
@@ -576,7 +584,7 @@ mod tests {
 
     #[test]
     fn dollar_lands_on_the_last_character_so_x_deletes_it() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("one two");
         composer.move_cursor(ViMotion::Head);
         composer.move_cursor(ViMotion::End);
@@ -588,7 +596,7 @@ mod tests {
 
     #[test]
     fn l_stops_on_the_last_character() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("ab\ncd");
         composer.move_cursor(ViMotion::Up);
         composer.move_cursor(ViMotion::Head);
@@ -600,7 +608,7 @@ mod tests {
 
     #[test]
     fn j_and_k_onto_a_shorter_line_land_on_its_last_character() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("one two\nab\nthree four");
         composer.move_cursor(ViMotion::Up);
         composer.move_cursor(ViMotion::Up);
@@ -616,7 +624,7 @@ mod tests {
 
     #[test]
     fn a_at_the_last_character_appends_on_the_same_line() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("ab\ncd");
         composer.move_cursor(ViMotion::Up);
         composer.move_cursor(ViMotion::End);
@@ -631,7 +639,7 @@ mod tests {
 
     #[test]
     fn x_at_the_end_of_a_line_deletes_the_last_character_and_keeps_the_lines() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("ab\ncd");
         // Past the end, as insert mode leaves the cursor; `k` would clamp.
         composer.textarea.move_cursor(CursorMove::Up);
@@ -643,7 +651,7 @@ mod tests {
 
     #[test]
     fn x_on_an_empty_line_is_a_no_op() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("\ncd");
         composer.move_cursor(ViMotion::Up);
         composer.delete_next_char();
@@ -653,7 +661,7 @@ mod tests {
 
     #[test]
     fn deleting_a_line_takes_only_that_line() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("one\n\nthree");
         composer.move_cursor(ViMotion::Up);
         composer.delete_line();
@@ -676,7 +684,7 @@ mod tests {
 
     #[test]
     fn the_rows_follow_the_draft_between_the_bounds_plus_the_rules() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         assert_eq!(composer.rows(80), MIN_ROWS + RULE_ROWS);
         composer.set_text(&["x"; 5].join("\n"));
         assert_eq!(composer.rows(80), 5 + RULE_ROWS);
@@ -688,7 +696,7 @@ mod tests {
     /// field grows to show, a word too long for a row broken across it.
     #[test]
     fn a_long_line_wraps_and_the_field_grows_with_it() {
-        let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
         composer.set_text(text);
         assert_eq!(composer.rows(20), 4 + RULE_ROWS);
@@ -746,7 +754,7 @@ mod tests {
             "\u{4e2d}\u{6587}\u{5b57}\u{4e2d}\u{6587}\u{5b57}\u{4e2d}\u{6587}\u{5b57}\u{4e2d}\u{6587}",
         ];
         for line in lines {
-            let mut composer = Composer::new(BACKGROUND, CommandPrefix::Dot);
+            let mut composer = Composer::new(CommandPrefix::Dot);
             composer.set_text(line);
             let area = Rect::new(0, 0, 20, 14);
             let mut buf = Buffer::empty(area);

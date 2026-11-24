@@ -974,7 +974,6 @@ mod tests {
     use super::*;
     use crate::config::CommandPrefix;
     use crate::tui::composer::Composer;
-    use ratatui::style::Color;
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -3435,7 +3434,7 @@ mod tests {
     /// A draft primed with something to undo and to paste, its cursor
     /// inside a word mid-way down.
     fn primed_composer() -> Composer {
-        let mut composer = Composer::new(Color::Reset, CommandPrefix::Dot);
+        let mut composer = Composer::new(CommandPrefix::Dot);
         composer.set_text("one two three\n\nfour five six\nseven eight nine\n\nten eleven");
         composer.move_cursor(ViMotion::Up);
         composer.move_cursor(ViMotion::Up);

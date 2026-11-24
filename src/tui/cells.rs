@@ -2,7 +2,7 @@
 //! and the rules for how a tool, job or agent row collapses to one line.
 
 use super::render::{self, RenderCache, Renderer};
-use super::theme::{SWEEP_HIGHLIGHT, ToolHeaderStyles, logo_style};
+use super::theme::{SWEEP_HIGHLIGHT, ToolHeaderStyles, logo_style, notice_style};
 use super::throbber::{self, Tick};
 use super::{
     ChromeKind, DIM, FULL_OUTPUT_LIMIT, LATE_OUTPUT_LIMIT, TOOL_OUTPUT_TAIL, chrome_style,
@@ -1016,6 +1016,7 @@ impl Cell {
         renderer: &mut Renderer,
     ) -> Cow<'_, [Line<'static>]> {
         let no_color = renderer.no_color;
+        let faded = renderer.faded;
         let tick = Some(renderer.tick);
         Cow::Borrowed(match self {
             Cell::User {
@@ -1031,7 +1032,7 @@ impl Cell {
                 )
             }),
             Cell::User { text, cache, .. } => cache.get(width, || {
-                render::plain_lines(&format!("> {text} (sent mid-turn)"), width, DIM)
+                render::plain_lines(&format!("> {text} (sent mid-turn)"), width, faded)
             }),
             Cell::Assistant {
                 source,
@@ -1051,7 +1052,7 @@ impl Cell {
                 ));
             }
             Cell::Notice { kind, text, cache } => {
-                let style = chrome_style(ChromeKind::Notice(*kind), no_color);
+                let style = notice_style(*kind, faded, no_color);
                 cache.get(width, || render::plain_lines(text, width, style))
             }
             Cell::Error { text, cache } => cache.get(width, || {
@@ -1066,7 +1067,7 @@ impl Cell {
                 // The header is the typed line; scrubbed like a User
                 // cell's, so a pasted escape cannot paint through it.
                 let header = render::plain_text(&format!("> {name}"));
-                let mut lines = vec![Line::from(Span::styled(header, DIM))];
+                let mut lines = vec![Line::from(Span::styled(header, faded))];
                 if !output.is_empty() {
                     lines.extend(render::preformatted_lines(output));
                 }

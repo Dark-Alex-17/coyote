@@ -4,9 +4,8 @@
 //! is loaded. Under `NO_COLOR` every style keeps its attributes and loses
 //! its colours.
 
-use crate::config::AppConfig;
 use crate::events::NoticeKind;
-use crate::render::{MarkdownRender, RenderOptions};
+use crate::render::MarkdownRender;
 use crate::utils::{tool_dim_color, tool_fn_color, tool_key_color};
 use ratatui::backend::FromCrossterm;
 use ratatui::style::{Color, Modifier, Style};
@@ -34,11 +33,30 @@ const QUEUED_HEADER: Color = Color::LightBlue;
 /// The footer's ` . ` between its fields, apart from the dim queued
 /// lines above the composer.
 const FOOTER_SEPARATOR: Color = Color::DarkGray;
-/// How far each channel of the theme's background moves towards the text
-/// so the composer's field reads as its own surface.
-const SURFACE_NUDGE: u8 = 12;
-const DARK_FALLBACK: Color = Color::Indexed(236);
-const LIGHT_FALLBACK: Color = Color::Indexed(254);
+
+type Rgb = (u8, u8, u8);
+
+/// The regions' backgrounds and the faded text drawn over them.
+struct Palette {
+    base: Rgb,
+    raised: Rgb,
+    chrome: Rgb,
+    faded: Rgb,
+}
+
+/// One blue-grey hue; the light palette mirrors the dark one's lightness.
+const DARK_PALETTE: Palette = Palette {
+    base: (0x1e, 0x22, 0x30),
+    raised: (0x2a, 0x30, 0x42),
+    chrome: (0x16, 0x19, 0x22),
+    faded: (0x9a, 0xa5, 0xbf),
+};
+const LIGHT_PALETTE: Palette = Palette {
+    base: (0xec, 0xef, 0xf5),
+    raised: (0xdd, 0xe2, 0xec),
+    chrome: (0xf6, 0xf7, 0xfa),
+    faded: (0x56, 0x60, 0x7a),
+};
 
 /// How a list's columns and its highlighted row are painted.
 pub(super) struct RowStyles {
@@ -89,6 +107,17 @@ pub(super) fn chrome_style(kind: ChromeKind, no_color: bool) -> Style {
     }
 }
 
+/// A notice row's style: a warning or a routing line as the chrome draws
+/// it, every other notice in `faded`.
+pub(super) fn notice_style(kind: NoticeKind, faded: Style, no_color: bool) -> Style {
+    match kind {
+        NoticeKind::ToolWarning | NoticeKind::Routing => {
+            chrome_style(ChromeKind::Notice(kind), no_color)
+        }
+        _ => faded,
+    }
+}
+
 /// A tool row's header in the colours of the REPL's `Call <tool>` line:
 /// the name as the REPL paints it, the arrow, arguments and state in its
 /// muted colour, a failure in the error colour, a running row's throbber
@@ -113,31 +142,6 @@ impl ToolHeaderStyles {
             throbber: paint(Style::new(), tool_fn),
         }
     }
-}
-
-/// The field's fill: the transcript theme's background nudged a step
-/// towards the text, which only an RGB-capable terminal can show; every
-/// other case gets a fixed grey on the theme's side of the scale.
-pub(super) fn field_background(config: &AppConfig, options: &RenderOptions) -> Color {
-    let light = config.light_theme();
-    let fallback = if light { LIGHT_FALLBACK } else { DARK_FALLBACK };
-    if !options.truecolor {
-        return fallback;
-    }
-    let Some(settings) = options.theme.as_ref().map(|theme| &theme.settings) else {
-        return fallback;
-    };
-    let Some(base) = settings.background.or(settings.line_highlight) else {
-        return fallback;
-    };
-    let nudge = |channel: u8| {
-        if light {
-            channel.saturating_sub(SURFACE_NUDGE)
-        } else {
-            channel.saturating_add(SURFACE_NUDGE)
-        }
-    };
-    Color::Rgb(nudge(base.r), nudge(base.g), nudge(base.b))
 }
 
 /// The greeting's wordmark colour: the heading colour; the wordmark adds
@@ -217,7 +221,16 @@ pub(super) struct Theme {
     pub(super) known_command: Style,
     pub(super) unknown_command: Style,
     pub(super) palette: RowStyles,
-    no_color: bool,
+    /// The background of the transcript and the rule under it.
+    pub(super) surface_base: Style,
+    /// The background of the composer, the bands above it, a question
+    /// and the pop-ups.
+    pub(super) surface_raised: Style,
+    /// The background of the status row, the footer and the pager's title
+    /// and hint rows.
+    pub(super) surface_chrome: Style,
+    /// Text that steps back from what is around it; dim under `NO_COLOR`.
+    pub(super) faded: Style,
 }
 
 impl Theme {
@@ -226,20 +239,33 @@ impl Theme {
             if no_color { style } else { style.fg(colour) }
         };
         let heading = from_markdown(markdown.heading_color(), HEADING_FALLBACK);
-        let tool_dim = from_repl(tool_dim_color(), markdown);
         let tool_fn = from_repl(tool_fn_color(), markdown);
         let tool_key = from_repl(tool_key_color(), markdown);
+        let palette = if light { &LIGHT_PALETTE } else { &DARK_PALETTE };
+        let rgb = |(r, g, b): Rgb| Color::from_crossterm(markdown.rgb_color(r, g, b));
+        let surface = |colour: Rgb| {
+            if no_color {
+                Style::new()
+            } else {
+                Style::new().bg(rgb(colour))
+            }
+        };
+        let faded = if no_color {
+            DIM
+        } else {
+            Style::new().fg(rgb(palette.faded))
+        };
         Self {
             rule: paint(BOLD, if light { RULE_LIGHT } else { RULE_DARK }),
             hint_key: paint(ITALIC.add_modifier(Modifier::BOLD), HIGHLIGHT),
-            hint_label: paint(ITALIC, tool_dim),
+            hint_label: ITALIC.patch(faded),
             status_runtime: paint(DIM, tool_fn),
             throbber: paint(Style::new(), tool_fn),
             status_key: paint(DIM, HIGHLIGHT),
             footer_field: paint(DIM, tool_key),
             footer_separator: paint(DIM, FOOTER_SEPARATOR),
             queued_header: paint(Style::new(), QUEUED_HEADER),
-            queued_text: DIM,
+            queued_text: faded,
             todo_done: paint(DIM, TODO_DONE),
             todo_open: paint(Style::new(), TODO_OPEN),
             heading: paint(BOLD, heading),
@@ -248,16 +274,10 @@ impl Theme {
             known_command: paint(BOLD, KNOWN_COMMAND),
             unknown_command: paint(BOLD, UNKNOWN_COMMAND),
             palette: if no_color { PLAIN_ROWS } else { PALETTE_ROWS },
-            no_color,
-        }
-    }
-
-    /// The composer field's fill; none under `NO_COLOR`.
-    pub(super) fn surface(&self, background: Color) -> Style {
-        if self.no_color {
-            Style::new()
-        } else {
-            Style::new().bg(background)
+            surface_base: surface(palette.base),
+            surface_raised: surface(palette.raised),
+            surface_chrome: surface(palette.chrome),
+            faded,
         }
     }
 }
@@ -266,7 +286,8 @@ impl Theme {
 impl Theme {
     /// The theme a config without a markdown theme gets.
     pub(super) fn fallback(no_color: bool) -> Self {
-        let renderer = super::Renderer::new(RenderOptions::default()).expect("a plain renderer");
+        let renderer = super::Renderer::new(crate::render::RenderOptions::default())
+            .expect("a plain renderer");
         Self::new(renderer.markdown_render(), no_color, false)
     }
 }
@@ -274,24 +295,25 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntect::highlighting::{Color as SyntectColor, Theme as SyntectTheme, ThemeSettings};
+    use crate::render::RenderOptions;
+
+    fn renderer(truecolor: bool) -> super::super::Renderer {
+        let options = RenderOptions {
+            truecolor,
+            ..RenderOptions::default()
+        };
+        super::super::Renderer::new(options).expect("a plain renderer")
+    }
 
     #[test]
     fn an_rgb_repl_colour_becomes_a_palette_entry_without_truecolor() {
-        let render = |truecolor: bool| {
-            let options = RenderOptions {
-                truecolor,
-                ..RenderOptions::default()
-            };
-            super::super::Renderer::new(options).expect("a plain renderer")
-        };
         let rgb = nu_ansi_term::Color::Rgb(122, 120, 111);
-        let plain = render(false);
+        let plain = renderer(false);
         assert!(matches!(
             from_repl(rgb, plain.markdown_render()),
             Color::Indexed(_)
         ));
-        let truecolor = render(true);
+        let truecolor = renderer(true);
         assert_eq!(
             from_repl(rgb, truecolor.markdown_render()),
             Color::Rgb(122, 120, 111)
@@ -303,34 +325,63 @@ mod tests {
         );
     }
 
+    /// The surfaces and the faded text take the palette of the theme's
+    /// side, and a terminal without truecolor gets palette entries.
     #[test]
-    fn the_background_follows_the_theme_only_under_truecolor() {
-        let dark = AppConfig::default();
-        let light = AppConfig {
-            theme: Some("light".to_string()),
-            ..Default::default()
-        };
-        let plain = RenderOptions::new(None, None, false, false, false);
-        assert_eq!(field_background(&dark, &plain), DARK_FALLBACK);
-        assert_eq!(field_background(&light, &plain), LIGHT_FALLBACK);
+    fn the_surfaces_follow_the_palette_only_under_truecolor() {
+        let rgb = |(r, g, b): Rgb| Color::Rgb(r, g, b);
+        for (light, palette) in [(false, &DARK_PALETTE), (true, &LIGHT_PALETTE)] {
+            let truecolor = renderer(true);
+            let theme = Theme::new(truecolor.markdown_render(), false, light);
+            assert_eq!(theme.surface_base, Style::new().bg(rgb(palette.base)));
+            assert_eq!(theme.surface_raised, Style::new().bg(rgb(palette.raised)));
+            assert_eq!(theme.surface_chrome, Style::new().bg(rgb(palette.chrome)));
+            assert_eq!(theme.faded, Style::new().fg(rgb(palette.faded)));
+            let plain = renderer(false);
+            let theme = Theme::new(plain.markdown_render(), false, light);
+            for style in [
+                theme.surface_base,
+                theme.surface_raised,
+                theme.surface_chrome,
+            ] {
+                assert!(matches!(style.bg, Some(Color::Indexed(_))), "{style:?}");
+            }
+            assert!(matches!(theme.faded.fg, Some(Color::Indexed(_))));
+        }
+    }
 
-        let theme = SyntectTheme {
-            settings: ThemeSettings {
-                background: Some(SyntectColor {
-                    r: 30,
-                    g: 31,
-                    b: 32,
-                    a: 255,
-                }),
-                ..ThemeSettings::default()
-            },
-            ..SyntectTheme::default()
+    /// WCAG 2 relative luminance.
+    fn luminance((r, g, b): Rgb) -> f64 {
+        let linear = |channel: u8| {
+            let c = f64::from(channel) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
         };
-        let mut themed = RenderOptions::new(Some(theme), None, false, false, false);
-        assert_eq!(field_background(&dark, &themed), DARK_FALLBACK);
-        themed.truecolor = true;
-        assert_eq!(field_background(&dark, &themed), Color::Rgb(42, 43, 44));
-        assert_eq!(field_background(&light, &themed), Color::Rgb(18, 19, 20));
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+
+    fn contrast(a: Rgb, b: Rgb) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Faded text stays readable at the WCAG AA ratio for body text on
+    /// the surfaces it is drawn on.
+    #[test]
+    fn faded_text_meets_the_aa_contrast_on_the_base_and_the_raised_surface() {
+        for palette in [&DARK_PALETTE, &LIGHT_PALETTE] {
+            for surface in [palette.base, palette.raised] {
+                let ratio = contrast(palette.faded, surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{:?} on {surface:?}: {ratio:.2}",
+                    palette.faded
+                );
+            }
+        }
     }
 
     /// With no markdown theme loaded the chrome still has colours, and
@@ -345,14 +396,12 @@ mod tests {
         let pairs = [
             (coloured.rule, plain.rule),
             (coloured.hint_key, plain.hint_key),
-            (coloured.hint_label, plain.hint_label),
             (coloured.status_runtime, plain.status_runtime),
             (coloured.throbber, plain.throbber),
             (coloured.status_key, plain.status_key),
             (coloured.footer_field, plain.footer_field),
             (coloured.footer_separator, plain.footer_separator),
             (coloured.queued_header, plain.queued_header),
-            (coloured.queued_text, plain.queued_text),
             (coloured.todo_done, plain.todo_done),
             (coloured.todo_open, plain.todo_open),
             (coloured.heading, plain.heading),
@@ -365,9 +414,28 @@ mod tests {
             assert_eq!((plain.fg, plain.bg), (None, None), "{plain:?}");
             assert_eq!(plain.add_modifier, coloured.add_modifier, "{coloured:?}");
         }
-        assert_eq!(plain.surface(DARK_FALLBACK), Style::new());
-        assert_eq!(coloured.surface(DARK_FALLBACK).bg, Some(DARK_FALLBACK));
-        let renderer = super::super::Renderer::new(RenderOptions::default()).unwrap();
+        assert!(coloured.faded.fg.is_some());
+        assert_eq!(coloured.faded.add_modifier, Modifier::empty());
+        assert_eq!(coloured.hint_label, ITALIC.fg(coloured.faded.fg.unwrap()));
+        assert_eq!(coloured.queued_text, coloured.faded);
+        assert_eq!(plain.faded, DIM);
+        assert_eq!(plain.hint_label, ITALIC.add_modifier(Modifier::DIM));
+        assert_eq!(plain.queued_text, DIM);
+        for surface in [
+            coloured.surface_base,
+            coloured.surface_raised,
+            coloured.surface_chrome,
+        ] {
+            assert!(surface.bg.is_some(), "{surface:?}");
+        }
+        for surface in [
+            plain.surface_base,
+            plain.surface_raised,
+            plain.surface_chrome,
+        ] {
+            assert_eq!(surface, Style::new());
+        }
+        let renderer = renderer(false);
         let markdown = renderer.markdown_render();
         assert_eq!(
             logo_style(markdown, false),

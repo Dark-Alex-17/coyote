@@ -1155,14 +1155,19 @@ fn mid_turn_transcript(harness: &mut Harness) -> String {
 }
 
 #[test]
-fn the_mid_turn_cell_is_dim_with_a_marker() {
+fn the_mid_turn_cell_is_faded_with_a_marker() {
     let mut harness = Harness::standalone(80, 24);
     harness.app.set_no_color(false);
     let frame = mid_turn_transcript(&mut harness);
     insta::assert_snapshot!("mid_turn_cell_80x24", &frame);
     let row = screen_row(&harness, "> follow-up k4e-m (sent mid-turn)");
+    let faded = harness.app.theme.faded.fg.unwrap();
     let buffer = harness.terminal.backend().buffer();
-    assert!(buffer[(0, row)].modifier.contains(Modifier::DIM), "{frame}");
+    assert_eq!(buffer[(0, row)].fg, faded, "{frame}");
+    assert!(
+        !buffer[(0, row)].modifier.contains(Modifier::DIM),
+        "{frame}"
+    );
     assert!(
         !buffer[(0, row)].modifier.contains(Modifier::BOLD),
         "{frame}"
@@ -1178,8 +1183,12 @@ fn the_mid_turn_cell_is_dim_with_a_marker() {
     );
     let placeholder = &buffer[(1, COMPOSER_TEXT_ROW)];
     assert_eq!(placeholder.symbol(), "T", "{frame}");
-    assert!(placeholder.modifier.contains(Modifier::DIM), "{frame}");
-    assert_eq!(placeholder.bg, Color::Indexed(236), "{frame}");
+    assert_eq!(placeholder.fg, faded, "{frame}");
+    assert_eq!(
+        Some(placeholder.bg),
+        harness.app.theme.surface_raised.bg,
+        "{frame}"
+    );
 }
 
 #[test]
@@ -2198,14 +2207,20 @@ fn the_chrome_parts_are_told_apart_by_colour() {
 }
 
 /// Under `NO_COLOR` the same parts lose every colour and keep the
-/// attributes they are drawn with in colour.
+/// attributes they are drawn with in colour; faded text is dimmed instead.
 #[test]
 fn no_color_strips_the_chrome_colours_and_keeps_the_attributes() {
     let coloured = chrome_styles(false);
     let plain = chrome_styles(true);
     for ((name, (_, modifier)), (_, (fg, plain_modifier))) in coloured.iter().zip(&plain) {
         assert_eq!(*fg, Color::Reset, "{name}");
-        assert_eq!(plain_modifier, modifier, "{name}");
+        let faded = matches!(*name, "hint label" | "queued text");
+        let expected = if faded {
+            *modifier | Modifier::DIM
+        } else {
+            *modifier
+        };
+        assert_eq!(*plain_modifier, expected, "{name}");
     }
 }
 
@@ -3461,7 +3476,10 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
             "{frame}"
         );
         assert!(buffer[(0, row)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buffer[(0, row)].bg, Color::Reset);
+        assert_eq!(
+            Some(buffer[(0, row)].bg),
+            harness.app.theme.surface_raised.bg
+        );
     }
     assert_eq!(
         buffer[(0, COMPOSER_RULE_ROW)].fg,
@@ -3472,8 +3490,9 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
         "{frame}"
     );
     assert_eq!(composer_cell(&harness, 11), (Color::Reset, false));
-    assert_eq!(buffer[(0, COMPOSER_TEXT_ROW)].bg, Color::Indexed(236));
-    assert_eq!(buffer[(79, COMPOSER_TEXT_ROW + 2)].bg, Color::Indexed(236));
+    let raised = harness.app.theme.surface_raised.bg;
+    assert_eq!(Some(buffer[(0, COMPOSER_TEXT_ROW)].bg), raised);
+    assert_eq!(Some(buffer[(79, COMPOSER_TEXT_ROW + 2)].bg), raised);
 }
 
 /// The rows of the last drawn frame that are a full-width rule.
@@ -3545,6 +3564,102 @@ fn no_color_keeps_the_command_bold_without_colour_or_surface() {
     );
     let buffer = harness.terminal.backend().buffer();
     assert!((0..80).all(|x| buffer[(x, COMPOSER_TEXT_ROW)].bg == Color::Reset));
+}
+
+/// The background of column 0 on each row of the last frame drawn.
+fn row_backgrounds(harness: &Harness) -> Vec<Color> {
+    let buffer = harness.terminal.backend().buffer();
+    (0..buffer.area().height)
+        .map(|y| buffer[(0, y)].bg)
+        .collect()
+}
+
+/// An idle frame on the dark or light theme after a command and a turn
+/// with a line sent mid-turn, so the transcript holds both faded headers.
+fn surface_frame(width: u16, height: u16, light: bool, no_color: bool) -> (Harness, String) {
+    let config = Arc::new(AppConfig {
+        theme: light.then(|| "light".to_string()),
+        ..(*plain_config()).clone()
+    });
+    let footer = FooterInfo {
+        model: "openai:test-model".to_string(),
+        ..FooterInfo::default()
+    };
+    let mut harness = Harness::new(width, height, config, footer);
+    harness.app.set_no_color(no_color);
+    harness.app.begin_turn(".info", true);
+    harness.app.end_turn(
+        true,
+        &TurnOutcome {
+            captured: "model    openai:test-model\n".to_string(),
+            ..TurnOutcome::default()
+        },
+    );
+    let frame = mid_turn_transcript(&mut harness);
+    (harness, frame)
+}
+
+/// Each region sits on its own surface: the transcript and the rule under
+/// it on the base, the status row and the footer on the chrome, the
+/// composer with its two rules on the raised one. The echoed command and
+/// the line sent mid-turn take the faded colour.
+#[test]
+fn each_region_is_drawn_on_its_theme_surface() {
+    for (width, height) in [(80, 24), (40, 20)] {
+        for light in [false, true] {
+            let (harness, frame) = surface_frame(width, height, light, false);
+            if !light {
+                assert_welcome_snapshot(&format!("surface_colours_{width}x{height}"), &frame);
+            }
+            let theme = &harness.app.theme;
+            let [base, raised, chrome] = [
+                theme.surface_base,
+                theme.surface_raised,
+                theme.surface_chrome,
+            ]
+            .map(|surface| surface.bg.expect("a coloured surface"));
+            let rules = full_rules(&harness);
+            let [rule, composer_top, composer_bottom] = rules[..] else {
+                panic!("three rules expected: {rules:?}\n{frame}");
+            };
+            let footer = height - 1;
+            assert_eq!(composer_bottom + 1, footer, "{frame}");
+            let expected: Vec<Color> = (0..height)
+                .map(|y| match y {
+                    y if y == rule + 1 || y == footer => chrome,
+                    y if (composer_top..=composer_bottom).contains(&y) => raised,
+                    _ => base,
+                })
+                .collect();
+            assert_eq!(row_backgrounds(&harness), expected, "{light}: {frame}");
+            let buffer = harness.terminal.backend().buffer();
+            for y in 0..height {
+                assert!(
+                    (0..width).all(|x| buffer[(x, y)].bg == expected[usize::from(y)]),
+                    "{light} row {y}: {frame}"
+                );
+            }
+            let faded = theme.faded.fg;
+            for needle in ["> .info", "> follow-up"] {
+                assert_eq!(Some(style_at(&harness, needle).0), faded, "{needle}");
+            }
+        }
+    }
+}
+
+/// Under `NO_COLOR` no region is filled.
+#[test]
+fn no_color_fills_no_region() {
+    for (width, height) in [(80, 24), (40, 20)] {
+        let (harness, frame) = surface_frame(width, height, false, true);
+        let buffer = harness.terminal.backend().buffer();
+        for y in 0..height {
+            assert!(
+                (0..width).all(|x| buffer[(x, y)].bg == Color::Reset),
+                "row {y}: {frame}"
+            );
+        }
+    }
 }
 
 /// The textarea draws its cursor as a reversed cell; after the draft

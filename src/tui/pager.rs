@@ -12,6 +12,7 @@ use super::keys::PagerMode;
 use super::render::{self, Renderer};
 use super::roster::RosterState;
 use super::sink::AgentOutcome;
+use super::theme::Theme;
 use super::{ChromeKind, DIM, chrome_style};
 use crate::client::{Message, MessageContent, MessageContentPart, MessageRole};
 use crate::config::child_sessions::{ChildMeta, EffectiveStatus};
@@ -1305,6 +1306,7 @@ pub(super) fn keep_tail(text: &str, width: usize) -> String {
 pub(super) struct PagerView<'a> {
     pub(super) pager: &'a Pager,
     pub(super) text: &'a PagerText,
+    pub(super) theme: &'a Theme,
 }
 
 impl Widget for PagerView<'_> {
@@ -1325,8 +1327,12 @@ impl Widget for PagerView<'_> {
         };
         let start = pager.top.min(total);
         let end = (start + rows).min(total);
+        buf.set_style(area, self.theme.surface_base);
         if chrome {
             let title = Rect::new(area.x, area.y, area.width, 1);
+            let hint = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+            buf.set_style(title, self.theme.surface_chrome);
+            buf.set_style(hint, self.theme.surface_chrome);
             let position = format!("{}-{end}/{total}", (start + 1).min(end));
             // The name gives way to the position, which is what moves.
             let name_width = area
@@ -1341,7 +1347,6 @@ impl Widget for PagerView<'_> {
             Paragraph::new(Line::from(Span::styled(position, DIM)))
                 .right_aligned()
                 .render(title, buf);
-            let hint = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
             Paragraph::new(pager.hint(area.width)).render(hint, buf);
         }
         let visible: Vec<Line<'static>> = (start..end)
@@ -1356,6 +1361,7 @@ impl Widget for PagerView<'_> {
         }
         if let Some(picker) = &pager.picker {
             Clear.render(body, buf);
+            buf.set_style(body, self.theme.surface_base);
             let mut rows_area =
                 render_header(Line::from(Span::styled(PICKER_HEADER, DIM)), body, buf);
             if let Some(note) = &picker.note {
@@ -1484,7 +1490,15 @@ mod tests {
                     renderer,
                 );
                 pager.settle(&text, Pager::text_rows(area.height));
-                frame.render_widget(PagerView { pager, text: &text }, area);
+                let theme = Theme::fallback(renderer.no_color);
+                frame.render_widget(
+                    PagerView {
+                        pager,
+                        text: &text,
+                        theme: &theme,
+                    },
+                    area,
+                );
             })
             .unwrap();
         terminal
@@ -2524,6 +2538,7 @@ mod tests {
             PagerView {
                 pager: &pager,
                 text: &text,
+                theme: &Theme::fallback(renderer.no_color),
             }
             .render(area, &mut buf);
         }

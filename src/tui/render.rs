@@ -270,6 +270,9 @@ pub(crate) struct Renderer {
     /// `NO_COLOR` at start: the UI's own colours are dropped while the
     /// attributes stay. Tests flip it through `App::set_no_color`.
     pub(super) no_color: bool,
+    /// What faded text in the cells is drawn with: the theme's, which the
+    /// App sets each time it builds one.
+    pub(super) faded: Style,
     /// The instant the frame being laid out is drawn for: what a running
     /// row's throbber and elapsed time read. The App sets it each frame.
     pub(super) tick: Tick,
@@ -291,6 +294,7 @@ impl Renderer {
             markdown,
             wrap_cap,
             no_color: *crate::utils::NO_COLOR,
+            faded: super::theme::DIM,
             tick: Tick { origin: now, now },
         })
     }
