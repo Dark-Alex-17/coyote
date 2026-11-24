@@ -419,7 +419,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "variables".to_string(),
                         JsonSchema {
                             type_value: Some("object".to_string()),
-                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides, per key, the values inherited from the parent (the variables the parent was started or spawned with; its declared defaults are not passed on). String values only. On a `session_id` resume the values must equal the stored ones (omitted = stored); a mismatch is refused. Discover an agent's declared variables via `agent__list_available`.".into()),
+                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides, per key, the values inherited from the parent (the variables the parent was started or spawned with; its declared defaults are not passed on). String values only. A key the agent does not declare is refused; declare it under the agent's `variables:` to receive it. On a `session_id` resume a value given explicitly at an earlier spawn must equal the stored one (omitted = stored); a mismatch is refused. Inherited values and declared defaults re-resolve on resume, and a value for any other declared key is accepted. Discover an agent's declared variables via `agent__list_available`.".into()),
                             ..Default::default()
                         },
                     ),
@@ -7305,10 +7305,13 @@ mod tests {
             "{description}"
         );
         let variables = properties["variables"].description.as_deref().unwrap();
-        assert!(
-            variables.contains("must equal the stored ones"),
-            "{variables}"
-        );
+        for phrase in [
+            "A key the agent does not declare is refused; declare it under the agent's `variables:` to receive it.",
+            "On a `session_id` resume a value given explicitly at an earlier spawn must equal the stored one (omitted = stored); a mismatch is refused.",
+            "Inherited values and declared defaults re-resolve on resume, and a value for any other declared key is accepted.",
+        ] {
+            assert!(variables.contains(phrase), "{variables}");
+        }
         assert!(!variables.contains("take precedence"), "{variables}");
         assert_eq!(
             declaration.parameters.required.as_deref(),

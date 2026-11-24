@@ -35,7 +35,10 @@
 //! `src/function/agents.rs`. The wait tools on Background-Jobs.md and
 //! Agents.md are read against `handle_wait` and the `job__start` message in
 //! `src/function/jobs.rs` and the spawn instructions in
-//! `src/config/prompts.rs`.
+//! `src/config/prompts.rs`. The agent-node `inputs:` section is read against
+//! the shared message bodies in `src/graph/mod.rs`, the unparsable-config
+//! message in `src/graph/validator.rs` and the runtime prefix in
+//! `src/function/agents.rs`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -105,6 +108,8 @@ const CARRY_BULLET_LEAD: &str = "- **`carry`:**";
 /// The lead of the script Environment note on what `previous_turns` does
 /// to the state size.
 const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
+/// The Graph-Agents.md subsection that documents an agent node's `inputs:`.
+const INPUTS_HEADING: &str = "### Passing state into a child agent (inputs)";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3280,4 +3285,89 @@ fn paragraph_stops_at_a_blank_line_or_the_next_bullet() {
         paragraph("page", page, "Under a session,"),
         "Under a session, the key is seeded\nbefore any node runs."
     );
+}
+
+/// The `inputs:` subsection quotes the agent-node `inputs:` errors the
+/// runtime and the validator share, with both location prefixes, and no
+/// longer teaches that `inputs:` needs a graph agent.
+#[test]
+fn inputs_section_quotes_the_shared_inputs_errors() {
+    let graph = src(&["graph", "mod.rs"]);
+    let validator = src(&["graph", "validator.rs"]);
+    let agents = src(&["function", "agents.rs"]);
+    let rule = const_str(&graph, "CONFIG_INPUTS_RULE");
+    let bodies = string_literals(&fn_body(&graph, "pub(crate) fn agent_inputs_errors<'a>("));
+    let unparsable = string_literals(&fn_body(&validator, "fn unparsable_config_error("));
+    let quoted = |literals: &[String], literal: &str| -> String {
+        assert!(
+            literals.iter().any(|l| l == literal),
+            "no inputs message in the code is {literal:?}"
+        );
+        literal
+            .replace("{agent}", "<name>")
+            .replace("{CONFIG_INPUTS_RULE}", &rule)
+            .replace("{}", "<keys>")
+            .replace("{err:#}", "<error>")
+    };
+    let reserved = "`inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})";
+    quoted(&bodies, reserved);
+    quoted(&bodies, " from `prompt:`");
+    let fragments = [
+        "`inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)".to_string(),
+        "`inputs.previous_turns` is reserved (the dispatcher seeds it)".to_string(),
+        quoted(
+            &bodies,
+            "`inputs:` is empty and agent '{agent}' has no graph.yaml; {CONFIG_INPUTS_RULE}",
+        ),
+        quoted(
+            &bodies,
+            "`inputs` names variable(s) agent '{agent}' does not declare: {}; {CONFIG_INPUTS_RULE}",
+        ),
+        quoted(
+            &unparsable,
+            "config.yaml of agent '{agent}' does not parse, so its declared variables are unknown: {err:#}",
+        ),
+    ];
+    for (label, source, prefix) in [
+        (
+            "validator.rs",
+            &validator,
+            "\"agent node '{node_id}': {body}\"",
+        ),
+        ("agents.rs", &agents, "\"agent '{agent_name}': {body}\""),
+    ] {
+        assert!(
+            source.contains(prefix),
+            "{label} no longer prefixes the inputs errors with {prefix}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let inputs = flat(&section(SENTINEL_PAGE, &page, INPUTS_HEADING));
+    for fragment in &fragments {
+        assert!(
+            inputs.contains(fragment.as_str()),
+            "the inputs section does not quote {fragment:?}"
+        );
+    }
+    for prefix in ["agent node '<id>': ", "agent '<name>': "] {
+        assert!(
+            inputs.contains(prefix),
+            "the inputs section does not name the {prefix:?} prefix"
+        );
+    }
+    let flat_page = flat(&page);
+    for stale in [
+        "requires agent '<name>' to be a graph agent",
+        "only when the child is a GRAPH agent",
+        "Only valid when `agent` names a graph agent",
+        "the only thing an agent node hands to a config-only child",
+        "Passing state into a child graph agent",
+    ] {
+        assert!(
+            !flat_page.contains(stale),
+            "{SENTINEL_PAGE} still says {stale:?}"
+        );
+    }
 }
