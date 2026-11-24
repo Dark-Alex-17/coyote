@@ -5264,7 +5264,7 @@ mod footer_counts_help_popup_completion_and_scroll {
         pty.read_for(Duration::from_millis(400));
         let from = pty.raw().len();
         pty.send(CTRL_L).unwrap();
-        pty.read_for(Duration::from_millis(600));
+        read_repaint(pty, from, Duration::from_millis(600));
         let frame = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
         let rows = visible_rows(&frame);
         assert!(

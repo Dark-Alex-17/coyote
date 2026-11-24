@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
 use super::fake_llm::{FakeLlm, Reply};
@@ -1314,8 +1314,24 @@ pub fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
     pty.read_for(Duration::from_millis(500));
     let from = pty.raw().len();
     pty.resize(rows, cols).unwrap();
-    pty.read_for(Duration::from_millis(800));
+    read_repaint(pty, from, Duration::from_millis(800));
     strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
+}
+
+/// How long a forced repaint may take to start before the frame is read
+/// as it stands. A loaded runner can hold the repaint past the settle
+/// window, which would otherwise read an empty frame.
+pub const REPAINT_START_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Reads until the child writes anything past `from`, or until
+/// [`REPAINT_START_DEADLINE`] lapses, then for `settle`, so a repaint that
+/// starts late is still read whole.
+pub fn read_repaint(pty: &mut Pty, from: usize, settle: Duration) {
+    let deadline = Instant::now() + REPAINT_START_DEADLINE;
+    while pty.raw().len() == from && Instant::now() < deadline {
+        pty.read_for(Duration::from_millis(50));
+    }
+    pty.read_for(settle);
 }
 
 /// A full repaint at 100 columns: the height flips between 30 and 32 rows
