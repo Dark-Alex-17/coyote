@@ -497,7 +497,7 @@ impl Widget for PromptModal<'_> {
         }
         let prompt = self.prompt;
         let [top, origin, question, middle, bottom, hint] = prompt.areas(area, *buf.area());
-        let rule = self.theme.rule.patch(DIM);
+        let rule = self.theme.rule;
         for row in [top, bottom] {
             Block::new()
                 .borders(Borders::TOP)

@@ -541,7 +541,11 @@ impl App {
         let options = config.render_options()?;
         let background = field_background(&config, &options);
         let renderer = Renderer::new(options)?;
-        let theme = Theme::new(renderer.markdown_render(), renderer.no_color);
+        let theme = Theme::new(
+            renderer.markdown_render(),
+            renderer.no_color,
+            config.light_theme(),
+        );
         let history_file = history_file(&config, footer.session.as_deref());
         Ok(Self {
             transcript: Transcript::new(footer.model.clone(), config.command_prefix),
@@ -610,7 +614,11 @@ impl App {
     #[cfg(test)]
     fn set_no_color(&mut self, no_color: bool) {
         self.renderer.no_color = no_color;
-        self.theme = Theme::new(self.renderer.markdown_render(), no_color);
+        self.theme = Theme::new(
+            self.renderer.markdown_render(),
+            no_color,
+            self.config.light_theme(),
+        );
     }
 
     /// Starts the welcome wordmark's sweep from the next frame drawn, while
@@ -689,7 +697,11 @@ impl App {
             }) {
                 Ok((mut renderer, background)) => {
                     renderer.no_color = self.renderer.no_color;
-                    self.theme = Theme::new(renderer.markdown_render(), renderer.no_color);
+                    self.theme = Theme::new(
+                        renderer.markdown_render(),
+                        renderer.no_color,
+                        config.light_theme(),
+                    );
                     self.renderer = renderer;
                     self.transcript.forget_layout();
                     self.child_live.forget_layout();

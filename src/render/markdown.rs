@@ -830,11 +830,6 @@ impl MarkdownRender {
         self.styles.heading.0
     }
 
-    /// The theme's horizontal rule colour, `Reset` when no theme is loaded.
-    pub(crate) fn hrule_color(&self) -> Color {
-        self.styles.hrule
-    }
-
     /// An RGB colour as this terminal can show it: unchanged under
     /// truecolor, the nearest 256-colour palette entry otherwise.
     pub(crate) fn rgb_color(&self, r: u8, g: u8, b: u8) -> Color {

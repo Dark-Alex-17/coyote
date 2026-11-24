@@ -3460,7 +3460,7 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
             ratatui::symbols::line::HORIZONTAL.repeat(80),
             "{frame}"
         );
-        assert!(buffer[(0, row)].modifier.contains(Modifier::DIM));
+        assert!(buffer[(0, row)].modifier.contains(Modifier::BOLD));
         assert_eq!(buffer[(0, row)].bg, Color::Reset);
     }
     assert_eq!(
@@ -3474,6 +3474,62 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
     assert_eq!(composer_cell(&harness, 11), (Color::Reset, false));
     assert_eq!(buffer[(0, COMPOSER_TEXT_ROW)].bg, Color::Indexed(236));
     assert_eq!(buffer[(79, COMPOSER_TEXT_ROW + 2)].bg, Color::Indexed(236));
+}
+
+/// The rows of the last drawn frame that are a full-width rule.
+fn full_rules(harness: &Harness) -> Vec<u16> {
+    let width = harness.terminal.backend().buffer().area().width;
+    let height = harness.terminal.backend().buffer().area().height;
+    let rule = ratatui::symbols::line::HORIZONTAL.repeat(usize::from(width));
+    (0..height)
+        .filter(|&y| row_text(harness, y) == rule)
+        .collect()
+}
+
+/// The three rules a turn draws, above and below the Working row and
+/// under the composer, share one bold token: white on a dark theme,
+/// black on a light one, uncoloured and still bold under `NO_COLOR`.
+#[test]
+fn every_separator_rule_is_bold_in_the_rule_colour() {
+    for (width, height) in [(80, 24), (40, 20)] {
+        for (light, no_color, colour) in [
+            (false, false, Color::White),
+            (true, false, Color::Black),
+            (false, true, Color::Reset),
+        ] {
+            let config = Arc::new(AppConfig {
+                theme: light.then(|| "light".to_string()),
+                ..(*plain_config()).clone()
+            });
+            let footer = FooterInfo {
+                model: "openai:test-model".to_string(),
+                ..FooterInfo::default()
+            };
+            let mut harness = Harness::new(width, height, config, footer);
+            harness.app.set_no_color(no_color);
+            harness.app.begin_turn("read it", false);
+            let frame = harness.draw();
+            if !light && !no_color {
+                assert_welcome_snapshot(&format!("separator_rules_{width}x{height}"), &frame);
+            }
+            let rows = full_rules(&harness);
+            assert_eq!(rows.len(), 3, "{frame}");
+            let working = (0..height)
+                .find(|&y| row_text(&harness, y).contains("Working"))
+                .expect("a Working row");
+            assert_eq!(rows[0] + 1, working, "{frame}");
+            assert_eq!(rows[1], working + 1, "{frame}");
+            let buffer = harness.terminal.backend().buffer();
+            for row in rows {
+                for x in [0, width - 1] {
+                    let cell = &buffer[(x, row)];
+                    assert_eq!(cell.fg, colour, "{light} {no_color} row {row}");
+                    assert!(cell.modifier.contains(Modifier::BOLD), "row {row}");
+                    assert!(!cell.modifier.contains(Modifier::DIM), "row {row}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

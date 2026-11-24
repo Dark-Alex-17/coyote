@@ -389,7 +389,7 @@ impl Widget for ComposerView<'_> {
         }
         let mut rule = Block::new()
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(self.theme.rule.patch(DIM));
+            .border_style(self.theme.rule);
         if self.vi_normal {
             rule = rule.title(NORMAL_TAG);
         }
@@ -507,7 +507,8 @@ mod tests {
         for y in [0, AREA.height - 1] {
             assert_eq!(buf[(0, y)].symbol(), HORIZONTAL);
             assert_eq!(buf[(19, y)].symbol(), HORIZONTAL);
-            assert!(buf[(0, y)].modifier.contains(Modifier::DIM));
+            assert!(buf[(0, y)].modifier.contains(Modifier::BOLD));
+            assert!(!buf[(0, y)].modifier.contains(Modifier::DIM));
             assert_eq!(buf[(0, y)].bg, Color::Reset);
         }
         assert_eq!(buf[(0, 1)].bg, BACKGROUND);

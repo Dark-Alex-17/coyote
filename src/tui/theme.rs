@@ -21,7 +21,10 @@ pub(super) const SWEEP_HIGHLIGHT: Color = Color::White;
 const KNOWN_COMMAND: Color = Color::Green;
 const UNKNOWN_COMMAND: Color = Color::Red;
 const HEADING_FALLBACK: Color = Color::Yellow;
-const RULE_FALLBACK: Color = Color::DarkGray;
+/// The separator rules: the brightest the terminal draws on each side of
+/// the scale, in bold, so the regions they part read apart at a glance.
+const RULE_DARK: Color = Color::White;
+const RULE_LIGHT: Color = Color::Black;
 /// The todo panel's own colours, kept apart from the hint and status
 /// rows' so its items never read as either.
 const TODO_OPEN: Color = Color::LightGreen;
@@ -187,7 +190,8 @@ fn from_markdown(colour: crossterm::style::Color, fallback: Color) -> Color {
 /// Every style the chrome draws with, built with the renderer so a theme
 /// change or a `NO_COLOR` switch reaches both.
 pub(super) struct Theme {
-    /// The row between the transcript and the status row.
+    /// Every separator rule: the one between the transcript and the status
+    /// row, the composer's two and a question's two.
     pub(super) rule: Style,
     pub(super) hint_key: Style,
     pub(super) hint_label: Style,
@@ -217,17 +221,16 @@ pub(super) struct Theme {
 }
 
 impl Theme {
-    pub(super) fn new(markdown: &MarkdownRender, no_color: bool) -> Self {
+    pub(super) fn new(markdown: &MarkdownRender, no_color: bool, light: bool) -> Self {
         let paint = |style: Style, colour: Color| {
             if no_color { style } else { style.fg(colour) }
         };
         let heading = from_markdown(markdown.heading_color(), HEADING_FALLBACK);
-        let rule = from_markdown(markdown.hrule_color(), RULE_FALLBACK);
         let tool_dim = from_repl(tool_dim_color(), markdown);
         let tool_fn = from_repl(tool_fn_color(), markdown);
         let tool_key = from_repl(tool_key_color(), markdown);
         Self {
-            rule: paint(Style::new(), rule),
+            rule: paint(BOLD, if light { RULE_LIGHT } else { RULE_DARK }),
             hint_key: paint(ITALIC.add_modifier(Modifier::BOLD), HIGHLIGHT),
             hint_label: paint(ITALIC, tool_dim),
             status_runtime: paint(DIM, tool_fn),
@@ -264,7 +267,7 @@ impl Theme {
     /// The theme a config without a markdown theme gets.
     pub(super) fn fallback(no_color: bool) -> Self {
         let renderer = super::Renderer::new(RenderOptions::default()).expect("a plain renderer");
-        Self::new(renderer.markdown_render(), no_color)
+        Self::new(renderer.markdown_render(), no_color, false)
     }
 }
 
@@ -336,7 +339,7 @@ mod tests {
     fn no_color_drops_every_colour_and_keeps_the_attributes() {
         let coloured = Theme::fallback(false);
         let plain = Theme::fallback(true);
-        assert_eq!(coloured.rule.fg, Some(RULE_FALLBACK));
+        assert_eq!(coloured.rule, BOLD.fg(RULE_DARK));
         assert_eq!(coloured.heading.fg, Some(HEADING_FALLBACK));
         assert_eq!(coloured.hint_key.fg, Some(HIGHLIGHT));
         let pairs = [

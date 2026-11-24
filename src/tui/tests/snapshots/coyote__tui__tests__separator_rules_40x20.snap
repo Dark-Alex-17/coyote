@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/mod.rs
+expression: frame
+---
+"> read it                               "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"⠋ Working . 0s  Esc to interrupt        "
+"────────────────────────────────────────"
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"openai:test-model . no sess mouse scroll"
