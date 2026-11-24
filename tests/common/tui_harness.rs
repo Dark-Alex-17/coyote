@@ -978,6 +978,13 @@ pub fn cargo_installed_binary(dir: &Path) -> PathBuf {
 /// never released. Markers and screen are compared with all whitespace
 /// removed, so a marker may be written as natural text even though the
 /// modal wraps it.
+///
+/// The painter writes only the cells that changed, so a modal that
+/// replaces one with the same options and legend sends only its new text,
+/// minus any letters that already sat in the same cells. When the stream
+/// has not shown every marker after [`MODAL_REPAINT_AFTER`], a repaint in
+/// place is read as well; a test whose modal paints in one go never
+/// triggers one, so its stream is unchanged.
 pub fn wait_for_the_modal(
     pty: &mut Pty,
     before: usize,
@@ -985,18 +992,27 @@ pub fn wait_for_the_modal(
     modal_markers: &[&str],
 ) -> String {
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let mut next_repaint = Instant::now() + MODAL_REPAINT_AFTER;
     let markers: Vec<String> = modal_markers
         .iter()
         .map(|marker| squeezed(marker))
         .collect();
+    let shows_the_modal = |text: &str| {
+        let flat = squeezed(text);
+        markers.iter().all(|marker| flat.contains(marker.as_str())) && flat.contains("Esc=cancel")
+    };
     let modal = loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
-        let flat = squeezed(&since);
-        if markers.iter().all(|marker| flat.contains(marker.as_str()))
-            && flat.contains("Esc=cancel")
-        {
+        if shows_the_modal(&since) {
             break since;
+        }
+        if Instant::now() >= next_repaint {
+            let frame = repainted_in_place(pty);
+            if shows_the_modal(&frame) {
+                break frame;
+            }
+            next_repaint = Instant::now() + MODAL_REPAINT_AFTER;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1332,6 +1348,24 @@ pub fn read_repaint(pty: &mut Pty, from: usize, settle: Duration) {
         pty.read_for(Duration::from_millis(50));
     }
     pty.read_for(settle);
+}
+
+/// How long [`wait_for_the_modal`] reads the stream alone before it also
+/// reads a repaint in place.
+pub const MODAL_REPAINT_AFTER: Duration = Duration::from_secs(3);
+
+/// A full repaint at the size the pty has now: one row taller and back,
+/// since a resize to the current size is a no-op. Returns the stripped
+/// frame painted after the size is restored.
+pub fn repainted_in_place(pty: &mut Pty) -> String {
+    let (rows, cols) = pty.size().unwrap();
+    let grown = pty.raw().len();
+    pty.resize(rows + 1, cols).unwrap();
+    read_repaint(pty, grown, Duration::from_millis(300));
+    let from = pty.raw().len();
+    pty.resize(rows, cols).unwrap();
+    read_repaint(pty, from, Duration::from_millis(800));
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
 }
 
 /// A full repaint at 100 columns: the height flips between 30 and 32 rows
