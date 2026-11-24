@@ -871,13 +871,25 @@ impl GraphValidator {
                 }
                 if let Some(inputs) = &a.inputs {
                     if has_config && !has_graph {
-                        result.error(ValidationError::with_node(
-                            node_id,
-                            format!(
-                                "agent node '{node_id}': `inputs:` requires agent '{}' to be a graph agent (no graph.yaml found)",
-                                a.agent
-                            ),
-                        ));
+                        if inputs.is_empty() {
+                            result.error(ValidationError::with_node(
+                                node_id,
+                                format!(
+                                    "agent node '{node_id}': `inputs:` is empty and agent '{}' has no graph.yaml; a config agent takes only its declared variables as `inputs:`",
+                                    a.agent
+                                ),
+                            ));
+                        }
+                        let declared = config::load_agent_variables(&a.agent);
+                        for key in super::undeclared_config_inputs(&declared, inputs.keys()) {
+                            result.error(ValidationError::with_node(
+                                node_id,
+                                format!(
+                                    "agent node '{node_id}': `inputs.{key}` is not a variable agent '{}' declares; a config agent takes only its declared variables as `inputs:`",
+                                    a.agent
+                                ),
+                            ));
+                        }
                     }
                     for key in super::RESERVED_STATE_KEYS {
                         if !inputs.contains_key(key) {
@@ -5335,11 +5347,10 @@ mod tests {
         node
     }
 
-    fn inputs_requires_graph_agent_error(result: &ValidationResult, node_id: &str) -> bool {
+    fn config_agent_inputs_error(result: &ValidationResult, node_id: &str) -> bool {
         result.errors.iter().any(|e| {
-            e.message.contains("`inputs:` requires agent")
-                && e.message
-                    .contains("to be a graph agent (no graph.yaml found)")
+            e.message
+                .ends_with("a config agent takes only its declared variables as `inputs:`")
                 && e.node_id.as_deref() == Some(node_id)
         })
     }
@@ -5354,14 +5365,64 @@ mod tests {
 
         let result = validator().validate(&graph);
 
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "agent node 'a': `inputs.x` is not a variable agent 'plain-agent' declares; a config agent takes only its declared variables as `inputs:`"
+            ]
+        );
+        assert_eq!(result.errors[0].node_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_declared_by_config_agent_pass() {
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
+        materialize_config_agent_with(
+            "plain-agent",
+            "name: plain-agent\nvariables:\n  - name: project_dir\n    description: d\n",
+        );
+        let node = agent_node_with_inputs("a", "plain-agent", &[("project_dir", "{{x}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_undeclared_by_config_agent_error_per_key() {
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
+        materialize_config_agent_with(
+            "plain-agent",
+            "name: plain-agent\nvariables:\n  - name: project_dir\n    description: d\n",
+        );
+        let node = agent_node_with_inputs(
+            "a",
+            "plain-agent",
+            &[
+                ("project_dir", "{{x}}"),
+                ("worktree", "{{x}}"),
+                ("cadence", "{{x}}"),
+            ],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "agent node 'a': `inputs.cadence` is not a variable agent 'plain-agent' declares; a config agent takes only its declared variables as `inputs:`",
+                "agent node 'a': `inputs.worktree` is not a variable agent 'plain-agent' declares; a config agent takes only its declared variables as `inputs:`",
+            ]
+        );
         assert!(
-            result.errors.iter().any(|e| {
-                e.message
-                    == "agent node 'a': `inputs:` requires agent 'plain-agent' to be a graph agent (no graph.yaml found)"
-                    && e.node_id.as_deref() == Some("a")
-            }),
-            "{:?}",
-            result.errors
+            result
+                .errors
+                .iter()
+                .all(|e| e.node_id.as_deref() == Some("a"))
         );
     }
 
@@ -5376,7 +5437,7 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(
-            inputs_requires_graph_agent_error(&result, "a"),
+            config_agent_inputs_error(&result, "a"),
             "{:?}",
             result.errors
         );
@@ -5393,7 +5454,7 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(result.is_valid(), "{:?}", result.errors);
-        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+        assert!(!config_agent_inputs_error(&result, "a"));
     }
 
     #[test]
@@ -5434,7 +5495,7 @@ mod tests {
             "{:?}",
             result.errors
         );
-        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+        assert!(!config_agent_inputs_error(&result, "a"));
     }
 
     #[test]
@@ -5460,7 +5521,7 @@ mod tests {
             "{:?}",
             result.errors
         );
-        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+        assert!(!config_agent_inputs_error(&result, "a"));
     }
 
     #[test]
@@ -5486,7 +5547,7 @@ mod tests {
             "{:?}",
             result.errors
         );
-        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+        assert!(!config_agent_inputs_error(&result, "a"));
     }
 
     #[test]
@@ -5520,7 +5581,7 @@ mod tests {
                 result.errors
             );
         }
-        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+        assert!(!config_agent_inputs_error(&result, "a"));
     }
 
     #[test]

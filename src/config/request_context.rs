@@ -8482,7 +8482,6 @@ impl RequestContext {
         if validator_warned_about_memory {
             self.graph_chat_fc_warned = true;
         }
-        self.agent_variables = None;
 
         Ok(())
     }
@@ -8632,6 +8631,9 @@ impl RequestContext {
             self.auto_continue_paused = None;
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
+            // The values the agent was started with stay seated for its
+            // children; leaving the agent ends that inheritance.
+            self.agent_variables = None;
             self.rag.take();
             // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
             // cached under `RagKey::Agent(<agent name>)`, and leaving that key behind
@@ -14046,6 +14048,8 @@ mod tests {
             format!("name: {agent_name}\ninstructions: hi\n"),
         )
         .unwrap();
+        let started_with = AgentVariables::from([("pr".to_string(), "7".to_string())]);
+        ctx.agent_variables = Some(started_with.clone());
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -14058,12 +14062,14 @@ mod tests {
             });
 
         assert!(ctx.agent.is_some());
+        assert_eq!(ctx.agent_variables.as_ref(), Some(&started_with));
         ctx.set_last_graph_branch(graph::route::Branch::Chat, false);
         ctx.graph_chat_fc_warned = true;
 
         ctx.exit_agent(&app).unwrap();
 
         assert!(ctx.agent.is_none());
+        assert!(ctx.agent_variables.is_none());
         assert!(ctx.rag.is_none());
         assert_eq!(ctx.rag_key, None);
         assert_eq!(ctx.last_graph_branch, None);
