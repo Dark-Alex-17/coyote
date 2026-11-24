@@ -411,10 +411,11 @@ fn a_dry_run_turn_streams_into_the_transcript() {
     });
 }
 
-/// Under the test harness `print!` is diverted into libtest's own
-/// buffer before it reaches fd 1, so the command's text cannot be seen
-/// here; the pty test on the binary pins that. This pins the turn's
-/// shape: it runs the REPL command, ends clean and leaves one cell.
+/// Under libtest's capture `print!` is diverted into its own buffer
+/// before it reaches fd 1, so the command's text may not be seen here
+/// (with `--nocapture`, as nextest runs, it is); the pty test on the
+/// binary pins the text. This pins the turn's shape: it runs the REPL
+/// command, ends clean and leaves one cell.
 #[test]
 #[serial]
 fn a_command_turn_becomes_one_preformatted_cell() {
@@ -448,6 +449,8 @@ fn a_command_turn_becomes_one_preformatted_cell() {
         };
         assert_eq!(name, ".info");
         assert!(harness.app.turn.is_none());
+        // Tall enough for the whole listing when the capture lets it in.
+        harness.resize(80, 200);
         let rendered = harness.draw();
         assert!(rendered.contains("> .info"), "{rendered}");
     });

@@ -23,4 +23,5 @@ binary(editor_setting_usage) | binary(prompt_protocol) | binary(pty_hygiene)
 | binary(tui_lifecycle_and_signals) | binary(tui_modals) | binary(tui_pager_and_roster)
 | binary(tui_palette_and_rewind) | binary(tui_tools) | binary(tui_usage_probe)
 """
+test-group = "pty"
 retries = 1

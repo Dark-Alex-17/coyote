@@ -77,11 +77,15 @@ gnu ABI rather than the msvc one the release builds use, so it is a type check a
 The msvc target cannot be built from Linux: its dependency build scripts need a C compiler that
 targets Windows. The `windows-latest` CI leg is where the msvc build and the Windows tests run.
 
-On macOS, with `mingw-w64` from Homebrew, bindgen also needs the mingw sysroot:
+On macOS, with `mingw-w64` from Homebrew, bindgen also needs the mingw sysroot; export it before running the
+command above:
 
 ```shell
-BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="--sysroot=$(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32 -I$(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32/include"
+export BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="--sysroot=$(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32 -I$(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32/include"
 ```
+
+The gnu build takes several gigabytes; a separate `CARGO_TARGET_DIR` (for example `target/gnu-check`) keeps it from
+invalidating the host build.
 
 ### Snapshot tests
 The TUI's frame tests are [insta](https://insta.rs) snapshots under `src/tui/snapshots/` and `src/tui/tests/snapshots/`. A changed frame fails the

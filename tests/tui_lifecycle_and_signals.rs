@@ -281,18 +281,15 @@ mod binary_lifecycle {
         );
 
         // The harness answers the keyboard-enhancement probe as a terminal
-        // without the protocol, so the flags are not expected here; if they
-        // are pushed, the push follows alt-screen entry and the pop precedes
-        // leaving it.
+        // without the protocol, so no flags may be pushed.
         assert!(
             find(raw, b"\x1b[?u", 0).is_some(),
             "the keyboard-enhancement support probe (CSI ? u) was never sent"
         );
-        if let Some(push) = find_keyboard_push(raw, 0) {
-            let pop = rfind_keyboard_pop(raw).expect("flags pushed but never popped");
-            assert!(enter_alt < push, "flags pushed before alt-screen entry");
-            assert!(push < pop && pop < leave_alt, "flags popped after leaving");
-        }
+        assert!(
+            find_keyboard_push(raw, 0).is_none(),
+            "flags were pushed although the probe was answered without the protocol"
+        );
     }
 
     /// SIGHUP runs the same leave path as SIGTERM.
@@ -2462,6 +2459,9 @@ mod suspend_and_signals {
         };
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
+        let enter_alt =
+            find(pty.raw(), ENTER_ALT, 0).expect("the alternate screen was never entered");
+        assert!(enter_alt < push, "flags pushed before alt-screen entry");
         let leave_alt = rfind(pty.raw(), LEAVE_ALT).expect("the alternate screen was never left");
         let pop = rfind_keyboard_pop(pty.raw()).expect("flags pushed but never popped");
         // `quit_at` is the stream length when the chord was sent; the pop may

@@ -270,6 +270,7 @@ impl Pty {
             Ok(n) => {
                 self.raw.extend_from_slice(&buf[..n]);
                 self.answer_keyboard_probe()
+                    .map_err(|_| closed_early(needle, text))
             }
             // Linux reports a hung-up slave as EIO rather than EOF.
             Err(err) if err.raw_os_error() == Some(libc::EIO) => Err(closed_early(needle, text)),
