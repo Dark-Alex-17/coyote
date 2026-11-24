@@ -18,7 +18,6 @@ import datetime
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -3717,7 +3716,7 @@ u_hx = gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(t
                                        unit_base_sha=CODE_BASE, run_branch="feat/PLAN-widgets"))
 os.environ["LLM_ROOT_DIR"] = ROOT
 check("hygiene_create: every path in the lint command is shell-quoted",
-      u_hx.get("hygiene_lint_cmd", "").startswith(f"python3 {shlex.quote(os.path.join(SPACED_ROOT, 'agents', '.shared', 'debris.py'))} "),
+      u_hx.get("hygiene_lint_cmd", "").startswith(f"python3 {gates.shlex.quote(os.path.join(SPACED_ROOT, 'agents', '.shared', 'debris.py'))} "),
       u_hx.get("hygiene_lint_cmd"))
 check("hygiene_create: no units -> pr_summary (single)", gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=ts_f, hygiene_units=[]))["_next"] == "pr_summary")
 check("hygiene_create: no units -> stack_gate_final (multi)", MULTI_IS_GROUPS or gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=ts_f, hygiene_units=[], pr_strategy="multi"))["_next"] == "stack_gate_final")

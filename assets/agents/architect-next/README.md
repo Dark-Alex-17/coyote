@@ -130,11 +130,11 @@ scripts/gates.py:5080:        "file:line, at most 25 per run so iterate); identi
 scripts/gates.py:5089:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
-scripts/smoke_test.py:115:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
-scripts/smoke_test.py:174:`make run`
-scripts/smoke_test.py:1518:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:2299:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
-scripts/smoke_test.py:3085:u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", ...)
+scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
+scripts/smoke_test.py:173:`make run`
+scripts/smoke_test.py:1517:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:2298:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
+scripts/smoke_test.py:3084:u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:792` is the alternation of the executable-criterion
