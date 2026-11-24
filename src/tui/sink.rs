@@ -108,10 +108,14 @@ pub(crate) enum UiMsg {
     JobCancelled {
         job_id: String,
     },
+    /// The parent fields name the spawning agent and are `None` for a
+    /// direct child of the root turn.
     AgentStarted {
         agent_id: String,
         name: String,
         session_id: Option<String>,
+        parent_agent_id: Option<String>,
+        parent_session_id: Option<String>,
     },
     AgentFinished {
         agent_id: String,
@@ -467,17 +471,22 @@ impl EventSink for TuiSink {
             Event::JobCancelled { job_id, .. } => self.send(UiMsg::JobCancelled {
                 job_id: job_id.clone(),
             }),
-            // `agent.started` is fired with the child's own context, so a
-            // direct child of the root turn arrives at depth one.
+            // `agent.started` is fired with the child's own context, so any
+            // spawned agent arrives at depth one or more; depth zero is the
+            // root turn's own agent, which the transcript does not list.
             Event::AgentStarted {
                 origin,
                 agent_id,
                 name,
                 session_id,
-            } if origin.depth == 1 => self.send(UiMsg::AgentStarted {
+                parent_agent_id,
+                parent_session_id,
+            } if origin.depth >= 1 => self.send(UiMsg::AgentStarted {
                 agent_id: plain(agent_id),
                 name: plain_opt(name).unwrap_or_default(),
                 session_id: plain_opt(session_id),
+                parent_agent_id: plain_opt(parent_agent_id),
+                parent_session_id: plain_opt(parent_session_id),
             }),
             Event::AgentFinished {
                 agent_id, outcome, ..
@@ -901,27 +910,32 @@ mod tests {
         assert_eq!(errors, vec![cut.to_string(), cut.to_string()]);
     }
 
-    /// `agent.started` fires with the child's context, so the root's
-    /// direct children arrive at depth one and deeper ones are dropped;
-    /// an agent's end is matched by id whatever its depth.
+    /// `agent.started` fires with the child's context, so every spawned
+    /// agent arrives at depth one or more with its spawner named; the root
+    /// turn's own agent at depth zero is dropped. An agent's end is
+    /// matched by id whatever its depth.
     #[test]
-    fn agent_hooks_reach_the_transcript_for_direct_children() {
+    fn agent_hooks_reach_the_transcript_at_any_spawn_depth() {
         let (sink, mut rx) = sink();
         let child = |depth: usize| Origin {
             agent_id: Some("agent_coder_1a2b".to_string()),
             depth,
             node: None,
         };
-        let started = |origin: Origin| Event::AgentStarted {
+        let started = |origin: Origin, agent_id: &str, parent: Option<&str>| Event::AgentStarted {
             origin,
-            agent_id: "agent_coder_1a2b".to_string(),
+            agent_id: agent_id.to_string(),
             name: Some("coder".to_string()),
-            session_id: Some("sess_coder_1a2b".to_string()),
+            session_id: Some(format!("sess_{agent_id}")),
+            parent_agent_id: parent.map(str::to_string),
+            parent_session_id: parent.map(|parent| format!("sess_{parent}")),
         };
-        sink.on_event(&started(child(2)));
-        sink.on_event(&started(Origin::detached()));
+        sink.on_event(&started(child(0), "top_coder", None));
+        sink.on_event(&started(Origin::detached(), "agent_coder_1a2b", None));
         assert!(drain(&mut rx).is_empty());
-        sink.on_event(&started(child(1)));
+        sink.on_event(&started(child(1), "agent_coder_1a2b", None));
+        sink.on_event(&started(child(2), "agent_grand", Some("agent_coder_1a2b")));
+        sink.on_event(&started(child(3), "agent_great", Some("agent_grand")));
         sink.on_event(&agent_finished(
             "agent_coder_1a2b",
             AgentOutcome::Failed("boom".to_string()),
@@ -940,23 +954,48 @@ mod tests {
         let msgs = drain(&mut rx);
         assert!(matches!(
             &msgs[0],
-            UiMsg::AgentStarted { agent_id, name, session_id: Some(session_id) }
-                if agent_id == "agent_coder_1a2b" && name == "coder" && session_id == "sess_coder_1a2b"
+            UiMsg::AgentStarted {
+                agent_id,
+                name,
+                session_id: Some(session_id),
+                parent_agent_id: None,
+                parent_session_id: None,
+            } if agent_id == "agent_coder_1a2b" && name == "coder" && session_id == "sess_agent_coder_1a2b"
         ));
         assert!(matches!(
             &msgs[1],
+            UiMsg::AgentStarted {
+                agent_id,
+                parent_agent_id: Some(parent),
+                parent_session_id: Some(parent_session),
+                ..
+            } if agent_id == "agent_grand"
+                && parent == "agent_coder_1a2b"
+                && parent_session == "sess_agent_coder_1a2b"
+        ));
+        assert!(matches!(
+            &msgs[2],
+            UiMsg::AgentStarted {
+                agent_id,
+                parent_agent_id: Some(parent),
+                parent_session_id: Some(parent_session),
+                ..
+            } if agent_id == "agent_great" && parent == "agent_grand" && parent_session == "sess_agent_grand"
+        ));
+        assert!(matches!(
+            &msgs[3],
             UiMsg::AgentFinished { agent_id, outcome: AgentOutcome::Failed(error) }
                 if agent_id == "agent_coder_1a2b" && error == "boom"
         ));
         assert!(matches!(
-            &msgs[2],
+            &msgs[4],
             UiMsg::AgentFinished { agent_id, outcome: AgentOutcome::Interrupted } if agent_id == "agent_b"
         ));
         assert!(matches!(
-            &msgs[3],
+            &msgs[5],
             UiMsg::AgentFinished { agent_id, outcome: AgentOutcome::Completed } if agent_id == "agent_c"
         ));
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 6);
     }
 
     #[test]

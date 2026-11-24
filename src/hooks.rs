@@ -645,6 +645,7 @@ fn hook_spec(event: &Event) -> Option<HookSpec> {
             agent_id,
             name,
             session_id,
+            ..
         } => (
             HookEvent::AgentStarted,
             agent_extras(agent_id, name.as_deref(), session_id.as_deref()),
@@ -2833,6 +2834,8 @@ mod tests {
                 agent_id: "agent_1".to_string(),
                 name: Some("coder".to_string()),
                 session_id: Some("sess_1".to_string()),
+                parent_agent_id: Some("agent_0".to_string()),
+                parent_session_id: Some("sess_0".to_string()),
             }),
             (
                 HookEvent::AgentStarted,

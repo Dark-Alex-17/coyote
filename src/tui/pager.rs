@@ -1725,6 +1725,8 @@ mod tests {
             REVIEWER.to_string(),
             "reviewer".to_string(),
             Some("reviewer-a1".to_string()),
+            None,
+            None,
         );
         live.tool_started(
             REVIEWER,
@@ -1896,6 +1898,8 @@ mod tests {
             REVIEWER.to_string(),
             "reviewer".to_string(),
             Some("reviewer-a1".to_string()),
+            None,
+            None,
         );
         for name in ["fs_read", "fs_grep", "fs_read"] {
             live.tool_started(
@@ -1937,6 +1941,8 @@ mod tests {
             PLANNER.to_string(),
             "planner".to_string(),
             Some("planner-b2".to_string()),
+            None,
+            None,
         );
         live.node(
             PLANNER,
@@ -2040,6 +2046,8 @@ mod tests {
             PLANNER.to_string(),
             "planner".to_string(),
             Some("planner-b2".to_string()),
+            None,
+            None,
         );
         live.node(
             PLANNER,

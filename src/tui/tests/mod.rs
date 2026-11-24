@@ -2751,6 +2751,8 @@ fn an_agent_takes_its_spawn_calls_row_and_folds_the_collect_in() {
         agent_id: "agent_coder_1a2b3c4d".to_string(),
         name: "coder".to_string(),
         session_id: None,
+        parent_agent_id: None,
+        parent_session_id: None,
     });
     finish_tool(&mut harness, "call-1", true, None);
     narrate(
@@ -3030,6 +3032,8 @@ fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
         agent_id: "agent_coder_1a2b3c4d".to_string(),
         name: "coder".to_string(),
         session_id: None,
+        parent_agent_id: None,
+        parent_session_id: None,
     });
     harness.app.handle_msg(UiMsg::JobFinished {
         job_id: "job_other".to_string(),

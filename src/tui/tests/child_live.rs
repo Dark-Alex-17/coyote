@@ -1,21 +1,68 @@
 use super::*;
 use crate::tui::cells::{FoldedCall, NodeStatus};
-use crate::tui::child_live::{CHILD_ROW_LIMIT, ChildThread};
+use crate::tui::child_live::{CHILD_ROW_LIMIT, ChildLive, ChildThread};
+use crate::tui::pager::ChildEntry;
 use crate::tui::sink::ChildNodeState;
 
 const AGENT: &str = "agent_graph_5d6e";
+const GRANDCHILD: &str = "agent_coder_9c0d";
+const GREAT_GRANDCHILD: &str = "agent_tester_3f4a";
 
 fn started(harness: &mut Harness) {
+    started_as(harness, AGENT, "planner", "sess_5d6e", None);
+}
+
+/// Starts `agent_id`, spawned by `parent` (its agent and session ids)
+/// or by the root turn when that is None.
+fn started_as(
+    harness: &mut Harness,
+    agent_id: &str,
+    name: &str,
+    session_id: &str,
+    parent: Option<(&str, &str)>,
+) {
     harness.app.handle_msg(UiMsg::AgentStarted {
-        agent_id: AGENT.to_string(),
-        name: "planner".to_string(),
-        session_id: Some("sess_5d6e".to_string()),
+        agent_id: agent_id.to_string(),
+        name: name.to_string(),
+        session_id: Some(session_id.to_string()),
+        parent_agent_id: parent.map(|(agent, _)| agent.to_string()),
+        parent_session_id: parent.map(|(_, session)| session.to_string()),
     });
 }
 
+/// The child, its grandchild and great-grandchild, each spawned by the
+/// one before.
+fn started_nested(harness: &mut Harness) {
+    started(harness);
+    started_as(
+        harness,
+        GRANDCHILD,
+        "coder",
+        "sess_9c0d",
+        Some((AGENT, "sess_5d6e")),
+    );
+    started_as(
+        harness,
+        GREAT_GRANDCHILD,
+        "tester",
+        "sess_3f4a",
+        Some((GRANDCHILD, "sess_9c0d")),
+    );
+}
+
 fn child_tool(harness: &mut Harness, node: Option<&str>, call_id: &str, name: &str) {
+    child_tool_of(harness, AGENT, node, call_id, name);
+}
+
+fn child_tool_of(
+    harness: &mut Harness,
+    agent_id: &str,
+    node: Option<&str>,
+    call_id: &str,
+    name: &str,
+) {
     harness.app.handle_msg(UiMsg::ChildToolStarted {
-        agent_id: AGENT.to_string(),
+        agent_id: agent_id.to_string(),
         node: node.map(str::to_string),
         call_id: call_id.to_string(),
         name: name.to_string(),
@@ -24,8 +71,18 @@ fn child_tool(harness: &mut Harness, node: Option<&str>, call_id: &str, name: &s
 }
 
 fn child_tool_done(harness: &mut Harness, node: Option<&str>, call_id: &str, ok: bool) {
+    child_tool_done_of(harness, AGENT, node, call_id, ok);
+}
+
+fn child_tool_done_of(
+    harness: &mut Harness,
+    agent_id: &str,
+    node: Option<&str>,
+    call_id: &str,
+    ok: bool,
+) {
     harness.app.handle_msg(UiMsg::ChildToolFinished {
-        agent_id: AGENT.to_string(),
+        agent_id: agent_id.to_string(),
         node: node.map(str::to_string),
         call_id: call_id.to_string(),
         name: "fs_read".to_string(),
@@ -356,8 +413,8 @@ fn a_childs_output_reaches_its_calls_tail() {
     );
 }
 
-/// Events of an agent the UI never saw start (a grandchild, an agent
-/// node) open no thread.
+/// Events of an agent the UI never saw start, such as an agent node,
+/// open no thread.
 #[test]
 fn events_of_an_unstarted_agent_open_no_thread() {
     let mut harness = Harness::standalone(80, 24);
@@ -377,6 +434,8 @@ fn a_finished_unlisted_child_is_forgotten() {
         agent_id: "agent_other_7a8b".to_string(),
         name: "other".to_string(),
         session_id: None,
+        parent_agent_id: None,
+        parent_session_id: None,
     });
     assert!(harness.app.child_live.by_agent(AGENT).is_some());
 
@@ -409,10 +468,14 @@ fn a_child_keeps_only_its_newest_rows() {
 
 /// Opens the started child's thread with no read of its session yet.
 fn open_thread(harness: &mut Harness) {
+    open_thread_of(harness, "sess_5d6e", "planner");
+}
+
+fn open_thread_of(harness: &mut Harness, session_id: &str, agent: &str) {
     harness.app.open_pager(Pager::child(
-        "sess_5d6e".to_string(),
-        "planner".to_string(),
-        PathBuf::from("/nonexistent/sess_5d6e.yaml"),
+        session_id.to_string(),
+        agent.to_string(),
+        PathBuf::from(format!("/nonexistent/{session_id}.yaml")),
     ));
 }
 
@@ -669,4 +732,220 @@ fn without_a_child_root_the_picker_leaves_out_a_child_known_only_from_its_start(
     let frame = harness.draw();
     assert!(!frame.contains("sess_5d6e"), "{frame}");
     assert!(frame.contains("No child sessions yet"), "{frame}");
+}
+
+fn agent_rows(harness: &Harness) -> Vec<&str> {
+    harness
+        .app
+        .transcript
+        .cells()
+        .iter()
+        .filter_map(|cell| match cell {
+            Cell::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A grandchild's and a great-grandchild's calls show live in their own
+/// threads and turn ok when they finish; only the direct child has a row
+/// in the main transcript, and a deeper agent's end leaves it alone.
+#[test]
+fn nested_agents_stream_their_calls_into_their_own_threads() {
+    let mut harness = Harness::standalone(80, 24);
+    started_nested(&mut harness);
+    assert_eq!(agent_rows(&harness), [AGENT]);
+    assert_eq!(
+        harness.app.child_live.ancestry(GREAT_GRANDCHILD),
+        [AGENT, GRANDCHILD]
+    );
+    assert!(harness.app.child_live.ancestry(AGENT).is_empty());
+
+    for (agent_id, session_id, name) in [
+        (GRANDCHILD, "sess_9c0d", "coder"),
+        (GREAT_GRANDCHILD, "sess_3f4a", "tester"),
+    ] {
+        open_thread_of(&mut harness, session_id, name);
+        harness.render();
+        harness.app.frame_drawn();
+        child_tool_of(&mut harness, agent_id, None, "call-n1", "fs_read");
+        assert!(harness.app.frames.due_at().is_some(), "{agent_id}");
+        let frame = harness.draw();
+        assert!(
+            SPINNER_FRAMES
+                .iter()
+                .any(|spinner| frame.contains(&format!("}})  {spinner} running 0s"))),
+            "{agent_id}: {frame}"
+        );
+        child_tool_done_of(&mut harness, agent_id, None, "call-n1", true);
+        let frame = harness.draw();
+        assert!(frame.contains("})  0s  ok"), "{agent_id}: {frame}");
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.pager().is_none(), "{agent_id}");
+    }
+
+    harness.app.handle_msg(UiMsg::AgentFinished {
+        agent_id: GREAT_GRANDCHILD.to_string(),
+        outcome: AgentOutcome::Completed,
+    });
+    assert_eq!(agent_rows(&harness), [AGENT]);
+    assert!(matches!(
+        harness
+            .app
+            .transcript
+            .cells()
+            .iter()
+            .find(|cell| matches!(cell, Cell::Agent { .. })),
+        Some(Cell::Agent {
+            row: TaskRow {
+                status: AgentStatus::Running { .. },
+                ..
+            },
+            ..
+        })
+    ));
+}
+
+/// A grandchild's thread opened, closed and opened again, each time with
+/// its saved session read back, draws its call once.
+#[test]
+#[serial]
+fn a_reopened_grandchild_thread_draws_its_call_once() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-grandchild-reopened");
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 19 }));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        started_nested(&mut harness);
+        child_tool_of(&mut harness, GRANDCHILD, None, "call-g1", "fs_read");
+        child_tool_done_of(&mut harness, GRANDCHILD, None, "call-g1", true);
+
+        for pass in 0..2 {
+            harness
+                .app
+                .open_child("sess_9c0d".to_string(), "coder".to_string());
+            let Some(ControlRequest::LoadChild {
+                session_id,
+                generation,
+                ..
+            }) = harness.app.take_control_requests().pop()
+            else {
+                panic!("opening the grandchild asks for a read");
+            };
+            harness.app.handle_msg(UiMsg::ChildLoaded {
+                session_id,
+                generation,
+                result: Ok(vec![ChildEntry::Tool {
+                    call_id: "call-g1".to_string(),
+                    name: "fs_read".to_string(),
+                    args: "{\"path\":\"src/lib.rs\"}".to_string(),
+                    output: "fn main() {}\n".to_string(),
+                }]),
+            });
+            let frame = harness.draw();
+            assert_eq!(frame.matches("fs_read(").count(), 1, "pass {pass}: {frame}");
+            harness.press(KeyCode::Char('q'));
+        }
+    });
+}
+
+/// With a child root that lists none of them, the picker lists a live
+/// grandchild right after its parent rather than after every child.
+#[test]
+#[serial]
+fn the_picker_lists_a_live_grandchild_after_its_parent() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-picker-grandchild");
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 20 }));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        started(&mut harness);
+        started_as(&mut harness, "agent_other_7a8b", "other", "sess_7a8b", None);
+        started_as(
+            &mut harness,
+            GRANDCHILD,
+            "coder",
+            "sess_9c0d",
+            Some((AGENT, "sess_5d6e")),
+        );
+
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Tab);
+        let frame = harness.draw();
+        let at = |label: &str| {
+            frame
+                .find(label)
+                .unwrap_or_else(|| panic!("no {label} row: {frame}"))
+        };
+        assert!(at("planner  sess_5d6e") < at("coder  sess_9c0d"), "{frame}");
+        assert!(at("coder  sess_9c0d") < at("other  sess_7a8b"), "{frame}");
+    });
+}
+
+fn nested_live() -> ChildLive {
+    let mut live = ChildLive::default();
+    for (agent_id, session_id, parent) in [
+        (AGENT, "sess_5d6e", None),
+        (GRANDCHILD, "sess_9c0d", Some((AGENT, "sess_5d6e"))),
+        (
+            GREAT_GRANDCHILD,
+            "sess_3f4a",
+            Some((GRANDCHILD, "sess_9c0d")),
+        ),
+    ] {
+        live.agent_started(
+            agent_id.to_string(),
+            String::new(),
+            Some(session_id.to_string()),
+            parent.map(|(agent, _): (&str, &str)| agent.to_string()),
+            parent.map(|(_, session): (&str, &str)| session.to_string()),
+        );
+    }
+    live
+}
+
+/// A finished deeper agent outlives the roster's list while an ancestor
+/// runs or is listed, and goes once neither holds.
+#[test]
+fn a_finished_grandchild_lives_while_an_ancestor_is_running_or_listed() {
+    let mut live = nested_live();
+    let now = Instant::now();
+    for agent_id in [GREAT_GRANDCHILD, GRANDCHILD] {
+        live.agent_finished(agent_id, &AgentOutcome::Completed, now);
+    }
+    live.retain_listed(|_| false);
+    assert!(live.by_agent(GREAT_GRANDCHILD).is_some());
+
+    live.agent_finished(AGENT, &AgentOutcome::Completed, now);
+    live.retain_listed(|id| id == AGENT);
+    for agent_id in [AGENT, GRANDCHILD, GREAT_GRANDCHILD] {
+        assert!(live.by_agent(agent_id).is_some(), "{agent_id}");
+    }
+
+    live.retain_listed(|_| false);
+    for agent_id in [AGENT, GRANDCHILD, GREAT_GRANDCHILD] {
+        assert!(live.by_agent(agent_id).is_none(), "{agent_id}");
+    }
+    assert!(live.by_session("sess_9c0d").is_none());
+}
+
+/// The parent links read back by agent and by session, and a loop in
+/// them does not hang the ancestry walk.
+#[test]
+fn ancestry_follows_parents_and_stops_at_a_loop() {
+    let mut live = nested_live();
+    assert_eq!(live.parent(GREAT_GRANDCHILD), Some(GRANDCHILD));
+    assert_eq!(live.parent_of_session("sess_3f4a"), Some("sess_9c0d"));
+    assert_eq!(live.parent_of_session("sess_5d6e"), None);
+
+    live.agent_started(
+        AGENT.to_string(),
+        String::new(),
+        Some("sess_5d6e".to_string()),
+        Some(GREAT_GRANDCHILD.to_string()),
+        Some("sess_3f4a".to_string()),
+    );
+    assert_eq!(live.ancestry(GREAT_GRANDCHILD), [AGENT, GRANDCHILD]);
 }

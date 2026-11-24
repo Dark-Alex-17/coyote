@@ -121,11 +121,15 @@ pub enum Event {
         ok: bool,
         error: Option<String>,
     },
+    /// `parent_agent_id` and `parent_session_id` name the spawning agent;
+    /// both are `None` for a child of the root turn.
     AgentStarted {
         origin: Origin,
         agent_id: String,
         name: Option<String>,
         session_id: Option<String>,
+        parent_agent_id: Option<String>,
+        parent_session_id: Option<String>,
     },
     AgentFinished {
         origin: Origin,

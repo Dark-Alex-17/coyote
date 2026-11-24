@@ -8,7 +8,7 @@ use super::cells::{self, Cell, FoldedCall, NodeStatus, TaskRow, ToolStatus};
 use super::sink::{AgentOutcome, ChildNodeState};
 use indexmap::IndexMap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// The most rows one child keeps; the oldest goes first.
@@ -39,6 +39,9 @@ pub(super) fn call_summary(name: &str, args: Option<&Value>) -> String {
 pub(crate) struct ChildThread {
     name: String,
     session_id: Option<String>,
+    /// The agent that spawned this one; None for a child of the root turn.
+    parent: Option<String>,
+    parent_session: Option<String>,
     /// How the child ended; None while it runs.
     outcome: Option<AgentOutcome>,
     rows: Vec<Cell>,
@@ -187,14 +190,17 @@ impl ChildLive {
         })
     }
 
-    /// Opens the thread of a child that just started. Only a started
-    /// child gets one, so a grandchild's or an agent node's events, which
-    /// no roster row leads to, are dropped instead of piling up.
+    /// Opens the thread of an agent that just started, at any depth, with
+    /// the agent that spawned it. Only a started agent gets one, so an
+    /// agent node's events, which no thread leads to, are dropped instead
+    /// of piling up.
     pub(super) fn agent_started(
         &mut self,
         agent_id: String,
         name: String,
         session_id: Option<String>,
+        parent: Option<String>,
+        parent_session: Option<String>,
     ) {
         if let Some(session_id) = &session_id {
             self.sessions.insert(session_id.clone(), agent_id.clone());
@@ -202,7 +208,36 @@ impl ChildLive {
         let thread = self.threads.entry(agent_id).or_default();
         thread.name = name;
         thread.session_id = session_id;
+        thread.parent = parent;
+        thread.parent_session = parent_session;
         thread.outcome = None;
+    }
+
+    pub(super) fn parent(&self, agent_id: &str) -> Option<&str> {
+        self.threads.get(agent_id)?.parent.as_deref()
+    }
+
+    /// The session of the agent that spawned the one keeping `session_id`;
+    /// None for a child of the root turn or a session no thread keeps.
+    pub(super) fn parent_of_session(&self, session_id: &str) -> Option<&str> {
+        self.by_session(session_id)?.parent_session.as_deref()
+    }
+
+    /// The agents above `agent_id`, root-most first, without `agent_id`
+    /// itself. The walk ends at an agent with no thread, as its own parent
+    /// is unknown, and at a link back into the chain.
+    pub(super) fn ancestry(&self, agent_id: &str) -> Vec<&str> {
+        let mut chain: Vec<&str> = Vec::new();
+        let mut next = self.parent(agent_id);
+        while let Some(parent) = next {
+            if parent == agent_id || chain.contains(&parent) {
+                break;
+            }
+            chain.push(parent);
+            next = self.parent(parent);
+        }
+        chain.reverse();
+        chain
     }
 
     /// The child ended: whatever it left running is settled as failed,
@@ -237,13 +272,33 @@ impl ChildLive {
         }
     }
 
-    /// Drops the thread of every finished child `listed` no longer names,
-    /// with the output it held. A running child is kept even while the
-    /// roster has yet to list it.
+    /// Drops, with the output it held, the thread of every finished agent
+    /// when `listed` names neither it nor any of its ancestors and none of
+    /// them still runs. The roster lists only direct children, so a deeper
+    /// agent is kept through its ancestors. A running agent is kept even
+    /// while the roster has yet to list it.
     pub(super) fn retain_listed(&mut self, listed: impl Fn(&str) -> bool) {
+        let running = |agent_id: &str| {
+            self.threads
+                .get(agent_id)
+                .is_some_and(|thread| thread.outcome.is_none())
+        };
+        let kept: HashSet<String> = self
+            .threads
+            .keys()
+            .filter(|agent_id| {
+                running(agent_id)
+                    || listed(agent_id)
+                    || self
+                        .ancestry(agent_id)
+                        .into_iter()
+                        .any(|ancestor| listed(ancestor) || running(ancestor))
+            })
+            .cloned()
+            .collect();
         let mut freed = 0;
         self.threads.retain(|agent_id, thread| {
-            let keep = thread.outcome.is_none() || listed(agent_id);
+            let keep = kept.contains(agent_id);
             if !keep {
                 freed += thread
                     .rows

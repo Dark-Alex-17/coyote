@@ -1921,23 +1921,35 @@ impl App {
                 agent_id,
                 name,
                 session_id,
+                parent_agent_id,
+                parent_session_id,
             } => {
                 self.prune_child_threads();
-                self.child_live
-                    .agent_started(agent_id.clone(), name.clone(), session_id);
-                self.child_rows_changed(&agent_id);
-                self.transcript.start_row(
-                    self.turn_first_cell(),
-                    Cell::Agent {
-                        agent_id,
-                        name,
-                        row: TaskRow::new(AgentStatus::Running {
-                            since: self.clock.now(),
-                        }),
-                        cache: LineCache::default(),
-                    },
-                    "agent__spawn",
+                let direct_child = parent_agent_id.is_none();
+                self.child_live.agent_started(
+                    agent_id.clone(),
+                    name.clone(),
+                    session_id,
+                    parent_agent_id,
+                    parent_session_id,
                 );
+                self.child_rows_changed(&agent_id);
+                // Only the root turn's own children get a row here; a
+                // deeper agent is opened from the thread picker.
+                if direct_child {
+                    self.transcript.start_row(
+                        self.turn_first_cell(),
+                        Cell::Agent {
+                            agent_id,
+                            name,
+                            row: TaskRow::new(AgentStatus::Running {
+                                since: self.clock.now(),
+                            }),
+                            cache: LineCache::default(),
+                        },
+                        "agent__spawn",
+                    );
+                }
             }
             UiMsg::AgentFinished { agent_id, outcome } => {
                 self.child_live

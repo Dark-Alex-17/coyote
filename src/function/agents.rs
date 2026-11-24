@@ -2385,26 +2385,26 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         return Err(error);
     }
 
+    // Names the spawner's own child session; stays empty for any other
+    // session a spawner may hold (the REPL root's, however it is named, or
+    // a temp one).
+    let spawner_session_id = ctx
+        .session
+        .as_ref()
+        .filter(|_| ctx.self_agent_id.is_some())
+        .map(Session::name)
+        .filter(|name| child_sessions::parse_session_id(name).is_some())
+        .map(str::to_string);
     let session_id = match (resumed_session_id, root) {
         (Some(id), _) => Some(id),
         (None, Some(root)) if seat_session => {
             let session_id = child_sessions::new_session_id(&agent_name);
-            // Names the spawner's own child session; stays empty for any
-            // other session a spawner may hold (the REPL root's, however it
-            // is named, or a temp one).
-            let spawner_session_id = ctx
-                .session
-                .as_ref()
-                .filter(|_| ctx.self_agent_id.is_some())
-                .map(Session::name)
-                .filter(|name| child_sessions::parse_session_id(name).is_some())
-                .map(str::to_string);
             let meta = ChildMeta::new_running(
                 &session_id,
                 &agent_name,
                 &agent_id,
                 ProcessStamp::current(),
-                spawner_session_id,
+                spawner_session_id.clone(),
                 ctx.self_agent_id.clone(),
                 &prompt,
                 task_id,
@@ -2443,6 +2443,8 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
             agent_id: agent_id.clone(),
             name: Some(agent_name.clone()),
             session_id: session_id.clone(),
+            parent_agent_id: ctx.self_agent_id.clone(),
+            parent_session_id: spawner_session_id,
         },
     );
 

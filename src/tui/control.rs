@@ -662,16 +662,39 @@ impl App {
                 }
             },
         };
-        // A child the root does not list yet is still known from its start.
-        // With no root there is no file to open it from, so it is left out.
+        // A child the root does not list yet is still known from its start,
+        // and is listed after its spawner's row and that spawner's earlier
+        // children when the spawner is listed. With no root there is no
+        // file to open it from, so it is left out.
         if self.child_root.is_some() {
-            let listed = rows.len();
+            let live = &self.child_live;
             for (session_id, agent, outcome) in self.child_live.sessions() {
-                if !rows[..listed]
+                if rows
                     .iter()
                     .any(|row| row.session_id.as_deref() == Some(session_id))
                 {
-                    rows.push(ThreadRow::live(session_id, agent, outcome));
+                    continue;
+                }
+                let row = ThreadRow::live(session_id, agent, outcome);
+                let slot = live.parent_of_session(session_id).and_then(|parent| {
+                    let at = rows
+                        .iter()
+                        .position(|row| row.session_id.as_deref() == Some(parent))?
+                        + 1;
+                    let siblings = rows[at..]
+                        .iter()
+                        .take_while(|row| {
+                            row.session_id
+                                .as_deref()
+                                .and_then(|id| live.parent_of_session(id))
+                                == Some(parent)
+                        })
+                        .count();
+                    Some(at + siblings)
+                });
+                match slot {
+                    Some(at) => rows.insert(at, row),
+                    None => rows.push(row),
                 }
             }
         }

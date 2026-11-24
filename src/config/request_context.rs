@@ -7078,6 +7078,8 @@ impl RequestContext {
                 agent_id: id,
                 name: None,
                 session_id: None,
+                parent_agent_id: None,
+                parent_session_id: None,
             },
         );
     }

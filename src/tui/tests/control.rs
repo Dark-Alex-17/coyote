@@ -756,6 +756,8 @@ fn a_return_settles_the_rows_of_tasks_the_supervisor_dropped() {
             agent_id: "agent-v2d".to_string(),
             name: "reviewer".to_string(),
             session_id: None,
+            parent_agent_id: None,
+            parent_session_id: None,
         });
         harness.app.sync_from_ctx(&mut ctx);
         let running: Vec<bool> = harness
