@@ -35,9 +35,10 @@ every item. Load `delegation-protocol` and `parallel-research` before spawning s
 A retrospective judges shape, and shape is invisible in hunks. Read the change whole:
 
 1. List what changed:
-   `execute_command --command "git -C {{project_dir}} diff --name-only <base>..HEAD"`
-   (for `worktree`: `git -C {{project_dir}} status --porcelain`). Add
-   `git -C {{project_dir}} log --oneline <base>..HEAD` to see how the work was sliced.
+   `get_changed_files --base <base>` (for `worktree`: `--base HEAD`; new untracked files do
+   not show there, so also `fs_ls` the directories the change touched). Add
+   `get_log --base <base>` to see how the work was sliced, and `get_diff --base <base> --path
+   <file>` to locate a file's hunks before reading it whole.
 2. Read every changed file IN FULL, not just its hunks.
 3. Follow the seams the change introduced or leaned on: read the modules it calls into and the
    callers that call it, far enough to see whether the new interface fits them.

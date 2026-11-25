@@ -11,8 +11,10 @@ Three things it is deliberately **not**:
 1. **Not a gate.** The review stack ([`review-gauntlet`](../review-gauntlet/README.md) and its
    lanes) judges a change pass/fail, lane by lane, on diff signals. The retrospective reads the
    finished change once and returns refactor items, never a verdict; nothing waits on it.
-2. **Not an implementer.** It never edits files. The caller adopts or declines each item and
-   implements the adopted ones itself, under its normal review gates.
+2. **Not an implementer.** It never edits files: its tools are the read-only file tools plus
+   three fixed git views (`get_changed_files`, `get_diff`, `get_log`), and it has no shell. The
+   caller adopts or declines each item and implements the adopted ones itself, under its normal
+   review gates.
 3. **Not interactive.** It never asks the user and never stops for a pick.
 
 ## When callers spawn it
