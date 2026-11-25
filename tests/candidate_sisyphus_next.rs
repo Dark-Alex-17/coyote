@@ -1701,6 +1701,64 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
     run_smoke_sabotages(&python, &sabotages);
 }
 
+/// Each design-retrospective guard, removed from a scratch copy, turns its
+/// smoke row red: the large run's way to `run_retrospective`, the adopted
+/// path into one refactor round, the one leading code-fence line read past,
+/// the skip when no run base resolves, the one not-triaged follow-up a
+/// REFACTORS reply keeps when its triage fails or decides nothing, and no
+/// retrospective once the PR is out.
+#[test]
+#[ignore = "six smoke battery runs take about ten minutes; run with -- --ignored"] // TASK-916
+fn retrospective_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    run_smoke_sabotages(
+        &python,
+        &[
+            (
+                "retro-large-run",
+                "        u[\"_next\"] = \"run_retrospective\"\n",
+                "        u[\"_next\"] = \"observability_gate\"\n",
+                "retro_size_route: large -> run_retrospective with the project, the run diff and \
+                 the task; ledgered",
+            ),
+            (
+                "retro-adopted",
+                "    if adopted:\n        u[\"fix_items\"] = adopted\n",
+                "    if False:\n        u[\"fix_items\"] = adopted\n",
+                "retro_route: adopted items -> compose_fix with fix_source retrospective, \
+                 retro_done set",
+            ),
+            (
+                "retro-fence",
+                "    if lines and lines[0].startswith(\"```\"):\n",
+                "    if False:\n",
+                "retro_route: a reply opening with one code-fence line is read past the fence",
+            ),
+            (
+                "retro-no-base",
+                "        if base:\n            u[\"retro_diff_stat\"]",
+                "        if True:\n            u[\"retro_diff_stat\"]",
+                "retrospective: no run base and no base commit -> not run, observability_gate, \
+                 never a worktree diff",
+            ),
+            (
+                "retro-untriaged",
+                " and not (triaged and (adopted or declined or later)):\n",
+                " and False:\n",
+                "retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up \
+                 pointing at the saved report",
+            ),
+            (
+                "retro-after-publish",
+                "    elif (truthy(state.get(\"pr_published\")) or truthy(state.get(\"ci_fix_active\"))\n          or as_int(state.get(\"pr_review_rounds\")) > 0):\n",
+                "    elif False:\n",
+                "retrospective: a PASS after the PR is out (published, CI fix, PR-review round) \
+                 never starts it",
+            ),
+        ],
+    );
+}
+
 /// The guards behind the CI reading, the flip, the subtask list and the
 /// escalation faults: the all-pass test behind a green CI reading, the
 /// `CI_NO_CHECKS_SECS` window, the re-read behind a confirmed flip, the
