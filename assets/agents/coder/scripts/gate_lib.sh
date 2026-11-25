@@ -131,6 +131,37 @@ gate_test_command_for_run() {
 # "(+K more)". Prepend it to a filter that uses gate_cap.
 GATE_JQ_CAP='def gate_cap($sep): if length > 20 then (.[:20] | join($sep)) + $sep + "(+\(length - 20) more)" else join($sep) end;'
 
+# GATE_JQ_VERDICT defines the jq filter gate_test_verdict, which reads
+# {rc, signal, red, same_command, cur, base, base_rc, hash, base_hash} (the
+# run's exit code, whether a test target died of a signal, whether the
+# baseline is red, whether the run used the baseline's own command, the
+# failing ids of the run and of the baseline, both exit codes and both
+# failure hashes) and prints whether the run passes against the baseline.
+# A nonzero run passes only against a red baseline and without a signal.
+# A different command (a narrower selection) proves nothing by its exit code
+# or output hash, so it passes only when it names failing tests and every
+# one is a baseline failure. The baseline's own command must also exit with
+# the baseline's code, and when neither run named a test, its failure output
+# must hash alike (an empty baseline hash matches nothing).
+GATE_JQ_VERDICT='def gate_test_verdict:
+  if .rc == 0 then true
+  elif .signal or (.red | not) then false
+  elif (.same_command | not) then (.cur | length) > 0 and (.cur - .base) == []
+  elif .rc != .base_rc then false
+  elif (.base | length) > 0 then (.cur | length) > 0 and (.cur - .base) == []
+  else (.cur | length) == 0 and .base_hash != "" and .hash == .base_hash
+  end;'
+
+# gate_verify_tier prints the tier the verify_tier variable names: `round`,
+# or `full` for anything else.
+gate_verify_tier() {
+  if [[ "${LLM_AGENT_VAR_VERIFY_TIER:-}" == "round" ]]; then
+    printf 'round'
+  else
+    printf 'full'
+  fi
+}
+
 # gate_plain_text prints file `file` without carriage returns or ANSI escape
 # sequences (colour, cursor and charset switches).
 gate_plain_text() {
@@ -348,6 +379,43 @@ gate_failure_hash() {
   fi
 }
 
+# gate_red_against_record judges the red run of `cmd` (as the gates run it)
+# that exited `rc` with output file `out` against stored baseline record
+# file `record`, through gate_test_verdict, and prints
+# {pass, cur, base, base_status, reason}: the run's failing ids, the
+# baseline's, the baseline's status and why the run's failures cannot be
+# identified (empty when they can).
+gate_red_against_record() {
+  local out=$1 rc=$2 record=$3 cmd=$4 signal=0 hash reason
+  if gate_killed_by_signal "$out"; then
+    signal=1
+  fi
+  hash=$(gate_failure_hash "$out")
+  reason=$(gate_unidentified_reason "$out")
+  gate_failing_tests "$out" | jq -Rsc \
+    --slurpfile r "$record" \
+    --argjson rc "$rc" \
+    --argjson signal "$signal" \
+    --arg cmd "$cmd" \
+    --arg hash "$hash" \
+    --arg reason "$reason" \
+    "$GATE_JQ_VERDICT"'
+    $r[0] as $b
+    | (split("\n") | map(select(. != "")) | unique) as $cur
+    | {
+        rc: $rc,
+        signal: ($signal == 1),
+        red: ($b.status == "red"),
+        same_command: ($b.command == $cmd),
+        cur: $cur,
+        base: ($b.failures // [] | unique),
+        base_rc: ($b.exit_code // 0),
+        hash: $hash,
+        base_hash: ($b.failure_hash // "")
+      }
+    | {pass: gate_test_verdict, cur, base, base_status: $b.status, reason: $reason}'
+}
+
 # gate_has_sha256 succeeds when gate_sha256 has a tool to hash with.
 gate_has_sha256() {
   command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1
@@ -361,6 +429,39 @@ gate_sha256() {
   else
     shasum -a 256 | awk '{print $1}'
   fi
+}
+
+# gate_baseline_stores prints the baseline record directories of the git work
+# tree holding directory `dir`, one per line: first
+# <git-common-dir>/coyote-baselines, the one records are written to and that
+# every linked worktree shares, then, when it differs, the per-worktree
+# `--git-path coyote-baselines` older runs wrote to, which is only read.
+# Fails when git cannot name the common dir.
+gate_baseline_stores() {
+  local dir=$1 common legacy
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) && [[ -n "$common" ]] || return 1
+  common=$(gate_posix_path "$common")
+  [[ "$common" == /* ]] || common="$dir/$common"
+  common="$common/coyote-baselines"
+  printf '%s\n' "$common"
+  legacy=$(git -C "$dir" rev-parse --git-path coyote-baselines 2>/dev/null) && [[ -n "$legacy" ]] || return 0
+  legacy=$(gate_posix_path "$legacy")
+  [[ "$legacy" == /* ]] || legacy="$dir/$legacy"
+  [[ "$legacy" == "$common" ]] || printf '%s\n' "$legacy"
+}
+
+# gate_baseline_record prints the record file for key `key` in the first of
+# the newline-separated directories `stores` (as gate_baseline_stores prints
+# them) that holds one, or else the path it is written to in the first.
+gate_baseline_record() {
+  local key=$1 stores=$2 store
+  while IFS= read -r store; do
+    if [[ -n "$store" && -e "$store/tests-$key.json" ]]; then
+      printf '%s' "$store/tests-$key.json"
+      return 0
+    fi
+  done <<<"$stores"
+  printf '%s' "${stores%%$'\n'*}/tests-$key.json"
 }
 
 # run_gate_until runs `cmd` through run_gate inside `dir`, writing its

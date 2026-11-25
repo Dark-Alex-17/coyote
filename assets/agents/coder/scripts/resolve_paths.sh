@@ -32,8 +32,11 @@ fi
 
 jq -nc \
   --arg pd "$resolved" \
-  '{
+  '(env.LLM_AGENT_VAR_VERIFY_TIER // "") as $tier
+  | {
     "project_dir": $pd,
     "project_dir_defaulted": (env.PROJECT_DIR_DEFAULTED == "true"),
     "_next": "analyze_request"
-  }'
+  }
+  + (if $tier == "" or $tier == "round" or $tier == "full" then {}
+    else {"tests_tier": ("full (verify_tier \"" + $tier + "\" is neither round nor full, so the full tier ran)")} end)'
