@@ -1505,13 +1505,14 @@ mod rewind_macros_and_queue_drain {
             assert_composer_takes_keys(&mut pty, settled_at, &format!("pass {pass}"));
         }
 
-        // The palette state was rebuilt, not disabled: `.` at column 0 opens it.
+        // The palette state was rebuilt, not disabled: `.` at column 0 opens it
+        // on the commands A-Z, `.agent` first.
         pty.send(b".").unwrap();
         pty.read_for(Duration::from_millis(500));
         let frame = repainted_frame_after_resize(&mut pty, 40, 101);
         let flat = squeezed(&frame);
         assert!(
-            flat.contains("Showsysteminfo") && flat.contains("more)"),
+            flat.contains("Useanagent") && flat.contains("more)"),
             "after two editor passes `.` no longer opens the palette:\n{frame}"
         );
         pty.send(b"\x1b").unwrap();
