@@ -214,7 +214,8 @@ fn drain(fd: RawFd, shared: Arc<Shared>, mut hooks: DrainHooks) {
 
 /// Windows reads with a blocking call outside the lock, so a drain thread
 /// not yet run, or bytes read but not yet pushed, can send output written
-/// before `finish` to the late callback. Overlapped-pipe fix: TASK-936.
+/// before `finish` to the late callback; an overlapped pipe would close
+/// that gap.
 #[cfg(windows)]
 fn drain(read_end: PipeEnd, shared: Arc<Shared>, mut hooks: DrainHooks) {
     let mut reader = std::fs::File::from(read_end);
