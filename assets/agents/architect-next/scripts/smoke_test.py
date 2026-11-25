@@ -3922,6 +3922,15 @@ def _integrate_blocked_amendments():
         u.get("_next"), u.get("follow_ups"))
 
 
+def _integrate_stale_amendments():
+    reseal = gates.integrate_route(_retro_large(integration_amended=False, integration_amendments=["Split the API"]))
+    u = gates.integrate_route(_retro_large(retro_done=True, integration_amended=True, integration_amendments=["Split the API"],
+                                           follow_ups=[], last_node_output="integrate_findings failed"))
+    return (reseal.get("integration_amendments") == [] and u["_next"] == "hygiene_create"
+            and not any("amendment not applied" in f for f in u["follow_ups"])), (reseal.get("integration_amendments"),
+                                                                                    u.get("follow_ups"))
+
+
 def _integrate_follow_up_dedup():
     u = gates.integrate_route(_retro_large(retro_done=True, follow_ups=["(integration) flaky test"],
                                            integration_follow_ups=["flaky test"]))
@@ -3942,6 +3951,8 @@ guarded("retro_route: adopting re-arms the whole integration step, the one amend
 guarded("retro_route: the snapshot is taken last, holding the report, follow-ups and ledger lines", _retro_snapshot_last)
 guarded("retro_route: in micro mode the refactor task is its own batch, so it closes into a batch gauntlet", _retro_micro_batch)
 guarded("integrate_route: amendments past the one re-seal become follow-ups, never dropped", _integrate_blocked_amendments)
+guarded("integrate_route: the re-seal consumes its amendments; a failed integrate pass never turns stale ones into "
+        "follow-ups", _integrate_stale_amendments)
 guarded("integrate_route: an integration follow-up already listed is not listed twice", _integrate_follow_up_dedup)
 guarded("_parse_report: a FOLLOW-UPS bullet starting with Design retrospective stays in FOLLOW-UPS", _parse_report_retro_follow_up)
 

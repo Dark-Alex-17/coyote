@@ -5049,7 +5049,8 @@ def integrate_route(state):
     u = {}
     harvest_anomalies(state, u, "integrate_findings")
     out = state.get("last_node_output")
-    if not (isinstance(out, str) and out.lstrip().startswith("{") and isinstance(state.get("retro_large"), bool)):
+    judged = isinstance(out, str) and out.lstrip().startswith("{")
+    if not (judged and isinstance(state.get("retro_large"), bool)):
         u.update({"retro_large": False, "retro_large_reason": RETRO_UNJUDGED})
     note_script_error(state, u, "integrate_findings")
     fus = list(as_list(state.get("follow_ups")))
@@ -5060,13 +5061,13 @@ def integrate_route(state):
     u["follow_ups"] = fus
     amends = [a for a in as_list(state.get("integration_amendments")) if isinstance(a, str) and a.strip()]
     if amends and not truthy(state.get("integration_amended")):
-        u["integration_amended"] = True
+        u.update({"integration_amended": True, "integration_amendments": []})
         queue_amendments(u, "rework", [f"Integration finding: {a}" for a in amends])
         u["after_reseal"] = "phase_f"
         ledger(state, u, f"integrate: {len(amends)} plan amendment(s) -> amend_plan (re-seal)")
         u["_next"] = "amend_plan"
         return u
-    if amends:
+    if amends and judged:
         u["follow_ups"] = fus + [line for line in (f"(integration) amendment not applied: {a}" for a in amends) if line not in fus]
         ledger(state, u, f"integrate: {len(amends)} plan amendment(s) after this Phase F's one re-seal -> follow-ups")
     return _after_integration(state, u)
