@@ -5538,8 +5538,10 @@ fn harness_with_tasks(
 }
 
 /// The rows of the open tasks pop-up's frame: the top border with the
-/// title and the bottom border with the keys, by index into `rows`.
-fn tasks_box(rows: &[&str]) -> (usize, usize) {
+/// title and the bottom border with the keys, by index into `rows`, and
+/// the column of its left border. Each row of a drawn frame opens with a
+/// quote, which is not a column.
+fn tasks_box(rows: &[&str]) -> (usize, usize, u16) {
     let top = rows
         .iter()
         .position(|row| row.contains("\u{250c}Tasks"))
@@ -5547,14 +5549,18 @@ fn tasks_box(rows: &[&str]) -> (usize, usize) {
     let bottom = (top..rows.len())
         .find(|&y| rows[y].contains('\u{2514}'))
         .unwrap_or_else(|| panic!("no bottom border:\n{}", rows.join("\n")));
-    (top, bottom)
+    let left = rows[top]
+        .chars()
+        .position(|c| c == '\u{250c}')
+        .expect("the top border has its corner");
+    (top, bottom, u16::try_from(left - 1).unwrap())
 }
 
 /// The tasks pop-up sits in the transcript's rows like the key help:
 /// the title on its top border, the keys ending in `Esc = close` on its
-/// bottom one, as tall as its rows and centred, with the rows below
-/// the status row as they were. A narrow frame puts `Esc = close`
-/// first so the border's cut keeps it.
+/// bottom one, as tall as its rows and centred, as wide as the threads
+/// pop-up, with the rows below the status row as they were. A narrow
+/// frame puts `Esc = close` first so the border's cut keeps it.
 #[test]
 #[serial]
 fn the_tasks_popup_is_framed_over_the_transcript_wide_and_narrow() {
@@ -5562,16 +5568,16 @@ fn the_tasks_popup_is_framed_over_the_transcript_wide_and_narrow() {
         let mut ctx = chat_ctx();
         let (mut harness, _reply) = harness_with_tasks(&mut ctx);
         harness.app.set_no_color(false);
-        for (width, height, name) in [(80, 24, "tasks_popup_80x24"), (40, 20, "tasks_popup_40x20")]
-        {
+        for (width, height, popup_width) in [(80, 24, 60), (40, 20, 38)] {
             harness.resize(width, height);
             let closed: Vec<String> = harness.draw().lines().map(str::to_string).collect();
             harness.app.handle_key(alt(KeyCode::Char('t')));
             let frame = harness.draw();
             let open: Vec<&str> = frame.lines().collect();
-            let (top, bottom) = tasks_box(&open);
+            let (top, bottom, left) = tasks_box(&open);
             assert_eq!(bottom - top, 4, "three rows inside the border:\n{frame}");
             assert!(open[bottom].contains("Esc = close"), "{frame}");
+            assert_eq!(left, (width - popup_width) / 2, "{frame}");
             if width == 40 {
                 assert!(open[bottom].contains("\u{2514}Esc = close"), "{frame}");
                 for row in &open[top + 1..top + 3] {
@@ -5588,11 +5594,11 @@ fn the_tasks_popup_is_framed_over_the_transcript_wide_and_narrow() {
             let space_below = rule - bottom - 1;
             assert!(space_above.abs_diff(space_below) <= 1, "{frame}");
             assert_eq!(open[first_below..], closed[first_below..], "{frame}");
-            let title = &harness.terminal.backend().buffer()[(2, u16::try_from(top).unwrap())];
+            let title =
+                &harness.terminal.backend().buffer()[(left + 1, u16::try_from(top).unwrap())];
             assert_eq!(title.symbol(), "T");
             assert!(title.modifier.contains(Modifier::BOLD), "{title:?}");
             assert_ne!(title.fg, Color::Reset, "{title:?}");
-            assert_welcome_snapshot(name, &frame);
             assert_eq!(harness.press(KeyCode::Esc), None);
             assert!(harness.app.roster().is_none());
         }
@@ -5610,9 +5616,12 @@ fn the_tasks_popup_drops_its_colours_under_no_color() {
         harness.app.set_no_color(true);
         harness.app.handle_key(alt(KeyCode::Char('t')));
         let frame = harness.draw();
-        assert_welcome_snapshot("tasks_popup_80x24", &frame);
         let open: Vec<&str> = frame.lines().collect();
-        let (top, bottom) = tasks_box(&open);
+        let (top, bottom, left) = tasks_box(&open);
+        assert!(
+            open[top + 1].contains("planner") && open[top + 1].contains("running"),
+            "{frame}"
+        );
         let top = u16::try_from(top).unwrap();
         let bottom = u16::try_from(bottom).unwrap();
         let buffer = harness.terminal.backend().buffer();
@@ -5626,9 +5635,17 @@ fn the_tasks_popup_drops_its_colours_under_no_color() {
                 );
             }
         }
-        assert!(buffer[(2, top)].modifier.contains(Modifier::BOLD));
-        assert!(buffer[(2, top + 1)].modifier.contains(Modifier::REVERSED));
-        assert!(!buffer[(2, top + 2)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(left + 1, top)].modifier.contains(Modifier::BOLD));
+        assert!(
+            buffer[(left + 1, top + 1)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(left + 1, top + 2)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     });
 }
 
@@ -5668,7 +5685,7 @@ fn closing_a_thread_opened_from_the_tasks_popup_returns_to_it() {
         assert_eq!(focused(&harness).as_deref(), Some("agent_reviewer_1a2b"));
         let frame = harness.draw();
         let open: Vec<&str> = frame.lines().collect();
-        let (_, bottom) = tasks_box(&open);
+        let (_, bottom, _) = tasks_box(&open);
         assert!(open[bottom].contains("Esc = close"), "{frame}");
 
         harness.app.handle_input(wheel(MouseEventKind::ScrollUp));
@@ -5689,6 +5706,92 @@ fn closing_a_thread_opened_from_the_tasks_popup_returns_to_it() {
         let (reply, _answer) = mpsc::channel();
         harness.app.enqueue_prompt(confirm_request(None), reply);
         assert!(harness.app.overlay.is_none());
+    });
+}
+
+/// The tasks pop-up nests each agent's tasks under it through the child
+/// supervisors, and its keys and clicks fold the tree: Left folds an open
+/// task and steps up from a leaf, Right unfolds and then steps to the
+/// first child, Space toggles, a click on an arrow folds and a click
+/// elsewhere on a row selects it.
+#[test]
+#[serial]
+fn the_tasks_popup_folds_its_nested_tasks_by_key_and_by_click() {
+    run_async(async {
+        let mut ctx = chat_ctx();
+        let review_sup = supervisor();
+        review_sup
+            .write()
+            .register(agent_named("agent_file_3c4d", "file-check", None))
+            .unwrap();
+        let lead_sup = supervisor();
+        lead_sup
+            .write()
+            .register(crate::supervisor::AgentHandle {
+                child_supervisor: Some(review_sup),
+                ..agent_named("agent_review_2b3c", "review", None)
+            })
+            .unwrap();
+        lead_sup.write().register(running_job("job-n4q")).unwrap();
+        let tasks = supervisor();
+        tasks
+            .write()
+            .register(crate::supervisor::AgentHandle {
+                child_supervisor: Some(lead_sup),
+                ..agent_named("agent_lead_1a2b", "lead", None)
+            })
+            .unwrap();
+        ctx.supervisor = Some(tasks);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        let focused = |harness: &Harness| harness.app.focused_task().map(|task| task.id);
+        let shows = |harness: &mut Harness, name: &str| {
+            let frame = harness.draw();
+            let (top, bottom, _) = tasks_box(&frame.lines().collect::<Vec<_>>());
+            frame
+                .lines()
+                .take(bottom)
+                .skip(top)
+                .any(|row| row.contains(name))
+        };
+
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+        assert!(shows(&mut harness, "file-check"));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_lead_1a2b"));
+        harness.press(KeyCode::Left);
+        assert!(!shows(&mut harness, "review"));
+        harness.press(KeyCode::Right);
+        assert!(shows(&mut harness, "file-check"));
+        harness.press(KeyCode::Char('l'));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_review_2b3c"));
+        harness.press(KeyCode::Char('l'));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_file_3c4d"));
+        harness.press(KeyCode::Char('h'));
+        assert_eq!(focused(&harness).as_deref(), Some("agent_review_2b3c"));
+        harness.press(KeyCode::Char('h'));
+        assert!(!shows(&mut harness, "file-check"));
+        harness.press(KeyCode::Char(' '));
+        assert!(shows(&mut harness, "file-check"));
+
+        let frame = harness.draw();
+        let rows: Vec<&str> = frame.lines().collect();
+        let lead = rows.iter().position(|row| row.contains("lead")).unwrap();
+        let arrow = rows[lead].chars().position(|c| c == '\u{25be}').unwrap() - 1;
+        let job = rows.iter().position(|row| row.contains("job-n4q")).unwrap();
+        let click = |harness: &mut Harness, column: usize, row: usize| {
+            harness.app.handle_input(TermInput::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: u16::try_from(column).unwrap(),
+                row: u16::try_from(row).unwrap(),
+                modifiers: KeyModifiers::NONE,
+            }));
+        };
+        click(&mut harness, arrow + 12, job);
+        assert_eq!(focused(&harness).as_deref(), Some("job-n4q"));
+        assert!(shows(&mut harness, "file-check"), "a click off the arrow");
+        click(&mut harness, arrow, lead);
+        assert_eq!(focused(&harness).as_deref(), Some("agent_lead_1a2b"));
+        assert!(!shows(&mut harness, "review"), "a click on the arrow");
     });
 }
 
@@ -6019,6 +6122,7 @@ fn finished_agent(id: &str) -> crate::supervisor::AgentHandle {
         session_id: None,
         child_session_root: None,
         succeeded: Default::default(),
+        started_at: std::time::Instant::now(),
     }
 }
 

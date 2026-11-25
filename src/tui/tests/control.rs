@@ -47,6 +47,7 @@ fn register_stuck_agent(ctx: &mut RequestContext) {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         })
         .unwrap();
     ctx.supervisor = Some(supervisor);
@@ -272,13 +273,14 @@ fn a_tool_report_queued_before_the_turn_ends_beats_the_sweep() {
     ));
 }
 
-/// `x` cancels through the same `job__cancel` and `agent__cancel`
-/// the model calls, mid-turn included: the control context reaches
-/// the supervisor the running turn has. The rows go from the roster
-/// and the outcome lands in the transcript.
+/// `x` cancels a running job through the same `job__cancel` the model
+/// calls, mid-turn included: the control context reaches the
+/// supervisor the running turn has. The row goes from the roster and
+/// the outcome lands in the transcript. On a finished agent `x` sends
+/// no cancel: it is refused with a notice and the agent stays listed.
 #[test]
 #[serial]
-fn x_cancels_the_focused_task_through_the_public_cancel_tools() {
+fn x_cancels_a_running_job_and_refuses_a_finished_agent() {
     run_async(async {
         let _guard = TestConfigDirGuard::new("tui-roster-cancel");
         let mut ctx = chat_ctx();
@@ -294,21 +296,33 @@ fn x_cancels_the_focused_task_through_the_public_cancel_tools() {
         let frame = harness.draw();
         assert!(frame.contains("agent-x7x"), "{frame}");
         assert!(frame.contains("job-x7x"), "{frame}");
-        harness.press(KeyCode::Down);
         harness.press(KeyCode::Char('x'));
         run_control_requests(&mut harness).await;
         assert!(!tasks.read().has_job("job-x7x"));
         let frame = harness.draw();
-        assert!(!frame.contains("job-x7x  running"), "{frame}");
+        assert!(
+            !frame
+                .lines()
+                .any(|line| line.contains("job-x7x") && line.contains("running")),
+            "{frame}"
+        );
 
-        harness.press(KeyCode::Up);
+        assert_eq!(
+            harness.app.focused_task().map(|task| task.id),
+            None,
+            "the cancelled row took the focus with it"
+        );
+        harness.press(KeyCode::Down);
         harness.press(KeyCode::Char('x'));
-        run_control_requests(&mut harness).await;
-        assert!(!tasks.read().has_agent("agent-x7x"));
+        assert!(harness.app.take_control_requests().is_empty());
+        assert!(tasks.read().has_agent("agent-x7x"));
         harness.press(KeyCode::Esc);
         let frame = harness.draw();
         assert!(frame.contains("Cancelled job-x7x"), "{frame}");
-        assert!(frame.contains("Cancelled agent 'reviewer'"), "{frame}");
+        assert!(
+            frame.contains("Task agent-x7x has finished; there is nothing to cancel"),
+            "{frame}"
+        );
     });
 }
 

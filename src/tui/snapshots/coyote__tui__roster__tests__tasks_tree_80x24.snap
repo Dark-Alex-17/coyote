@@ -1,10 +1,7 @@
 ---
 source: src/tui/roster.rs
-expression: terminal.backend().to_string()
+expression: text(&terminal)
 ---
-"agent reviewer         agent_reviewer_1a2b3c4d  ⠋ running                       "
-"job   execute_command  job_5e6f7a8b             failed                          "
-"ask   reviewer         Ship the fix to main?  +1 line                           "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -12,13 +9,16 @@ expression: terminal.backend().to_string()
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
-"                                                                                "
+"          ┌Tasks─────────────────────────────────────────────────────┐          "
+"          │▾ lead  ⠋ running  02:59:05  5m 0s  agent_lead_1a2b3c4d   │          "
+"          │  ▾ review  ⠋ running  03:00:45  3m 20s  ...eview_2b3c4d5e│          "
+"          │      execute_command  ⠋ running  03:03:02  1m 3s         │          "
+"          │      file-review  finished  03:01:35  agent_file_3c4d5e6f│          "
+"          │  planner  finished  02:49:05  agent_old_5e6f7a8b         │          "
+"          │  build  completed  02:55:45  job_7a8b9c0d                │          "
+"          │  fetch  failed  02:57:25  job_6f7a8b9c                   │          "
+"          │  ask review  Ship the fix to main?  +1 line              │          "
+"          └Esc = close  j/k = move  h/l = fold  x = cancel  o = open─┘          "
 "                                                                                "
 "                                                                                "
 "                                                                                "

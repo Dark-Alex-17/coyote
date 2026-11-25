@@ -2601,6 +2601,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         session_id: session_id.clone(),
         child_session_root: root.clone(),
         succeeded,
+        started_at: std::time::Instant::now(),
     };
 
     let registered = match ctx.supervisor.as_ref() {
@@ -11725,6 +11726,7 @@ mod tests {
             session_id: Some(sid.to_string()),
             child_session_root: Some(root),
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()
@@ -13984,6 +13986,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()
@@ -14035,6 +14038,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()
@@ -14546,6 +14550,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15637,6 +15642,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15696,6 +15702,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15759,6 +15766,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15834,6 +15842,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15884,6 +15893,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15951,6 +15961,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16656,6 +16667,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -17507,6 +17519,7 @@ mod tests {
                     session_id: None,
                     child_session_root: None,
                     succeeded: Default::default(),
+                    started_at: std::time::Instant::now(),
                 })
                 .unwrap();
             let queue = Arc::clone(&ctx.notification_queue);
@@ -17696,6 +17709,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Arc::new(OnceLock::from(false)),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()

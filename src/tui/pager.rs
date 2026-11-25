@@ -13,7 +13,7 @@ use super::keys::PagerMode;
 use super::render::{self, Renderer};
 use super::roster::RosterState;
 use super::theme::Theme;
-use super::thread_tree::{ThreadNode, ThreadTree};
+use super::thread_tree::{ThreadNode, ThreadTree, popup_area, toggle_fold, window_start};
 use super::{ChromeKind, DIM, chrome_style};
 use crate::client::{Message, MessageContent, MessageContentPart, MessageRole};
 use crate::config::{RequestContext, Session};
@@ -40,10 +40,6 @@ const PICKER_TITLE: &str = "Threads";
 const PICKER_HINT: &str = "j/k move  h/l fold  Enter open  Esc back";
 /// The legend of a pop-up too narrow for `PICKER_HINT`.
 const PICKER_SHORT_HINT: &str = "Enter open  Esc back";
-/// The threads pop-up's width: three quarters of the frame within these
-/// bounds, and never past a column's margin on each side.
-const PICKER_MIN_WIDTH: u16 = 60;
-const PICKER_MAX_WIDTH: u16 = 100;
 const CHECKPOINT_NOTE: &str =
     "Read-only. Tool calls show live; replies show up at the child's next checkpoint.";
 const ROOT_THREAD: &str = "root thread";
@@ -330,36 +326,9 @@ fn text_area(area: Rect) -> Rect {
 }
 
 /// The threads pop-up over a pager drawn in `area`, `rows` rows tall
-/// plus its border, centred over the text and kept a cell clear of its
-/// edges.
+/// plus its border, centred over the text.
 fn picker_area(area: Rect, rows: usize) -> Rect {
-    let body = text_area(area);
-    let room = body.inner(MARGIN);
-    let width = u16::try_from(u32::from(area.width) * 3 / 4)
-        .unwrap_or(u16::MAX)
-        .clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
-        .min(area.width.saturating_sub(2));
-    let height = u16::try_from(rows.saturating_add(2))
-        .unwrap_or(u16::MAX)
-        .min(room.height);
-    Rect::new(
-        body.x + (body.width.saturating_sub(width)) / 2,
-        room.y + (room.height - height) / 2,
-        width,
-        height,
-    )
-}
-
-/// The first row shown in a window `height` rows tall that keeps row
-/// `highlight` in view.
-fn picker_window(highlight: usize, height: usize) -> usize {
-    highlight.saturating_sub(height.saturating_sub(1))
-}
-
-fn toggle(folds: &mut HashSet<String>, key: &str) {
-    if !folds.remove(key) {
-        folds.insert(key.to_string());
-    }
+    popup_area(text_area(area), rows)
 }
 
 /// One child entry's lines, with what they were laid out from.
@@ -851,14 +820,14 @@ impl Pager {
         let shown = picker.tree.visible(&self.folds);
         let highlighted = picker.highlighted(&self.folds);
         let at = shown.iter().position(|&at| at == highlighted).unwrap_or(0);
-        let index = picker_window(at, usize::from(rows.height)) + usize::from(row - rows.y);
+        let index = window_start(at, usize::from(rows.height)) + usize::from(row - rows.y);
         let Some(&clicked) = shown.get(index) else {
             return;
         };
         picker.select(clicked);
         let arrow = usize::from(column - rows.x).checked_sub(picker.tree.arrow_column(clicked));
         if picker.tree.has_children(clicked) && arrow.is_some_and(|offset| offset < 2) {
-            toggle(&mut self.folds, picker.tree.key(clicked));
+            toggle_fold(&mut self.folds, picker.tree.key(clicked));
         }
     }
 
@@ -1084,7 +1053,7 @@ impl Pager {
         };
         let at = picker.highlighted(&self.folds);
         if picker.tree.has_children(at) {
-            toggle(&mut self.folds, picker.tree.key(at));
+            toggle_fold(&mut self.folds, picker.tree.key(at));
         }
     }
 
@@ -1632,7 +1601,7 @@ impl Widget for PickerPopup<'_> {
         let shown = picker.tree.visible(self.folds);
         let highlighted = picker.highlighted(self.folds);
         let at = shown.iter().position(|&at| at == highlighted).unwrap_or(0);
-        let start = picker_window(at, usize::from(inner.height));
+        let start = window_start(at, usize::from(inner.height));
         let width = usize::from(inner.width);
         let lines: Vec<Line<'static>> = shown
             .iter()

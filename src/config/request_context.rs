@@ -12590,6 +12590,7 @@ mod tests {
                     session_id: None,
                     child_session_root: None,
                     succeeded: Default::default(),
+                    started_at: std::time::Instant::now(),
                 };
                 let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
                 old_sup.write().register(handle).unwrap();
@@ -17987,6 +17988,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -35157,6 +35159,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         })
         .unwrap();
         sup.register(make_running_job(job_sig.clone())).unwrap();

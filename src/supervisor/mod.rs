@@ -49,6 +49,8 @@ pub struct AgentHandle {
     /// The agent's outcome, kept here because its completion notification
     /// can be drained before anyone asks.
     pub succeeded: Arc<OnceLock<bool>>,
+    /// When the handle was made, which the tasks pop-up shows as its start.
+    pub started_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +133,12 @@ pub struct TaskRow {
     pub kind: TaskKind,
     /// The agent name or the job's tool.
     pub name: String,
-    /// Agents do not record a start time.
     pub started_at: Option<Instant>,
     pub status: TaskRowStatus,
     pub session_id: Option<String>,
+    /// The agent whose own supervisor runs the task; None for a task of
+    /// the supervisor the listing started from.
+    pub parent_id: Option<String>,
 }
 
 impl From<AgentHandle> for TaskHandle {
@@ -390,9 +394,10 @@ impl Supervisor {
                     id: agent.id.clone(),
                     kind: TaskKind::Agent,
                     name: agent.agent_name.clone(),
-                    started_at: None,
+                    started_at: Some(agent.started_at),
                     status: handle.status(),
                     session_id: agent.session_id.clone(),
+                    parent_id: None,
                 },
                 TaskHandle::Job(job) => TaskRow {
                     id: job.id.clone(),
@@ -401,11 +406,32 @@ impl Supervisor {
                     started_at: Some(job.started_at),
                     status: handle.status(),
                     session_id: None,
+                    parent_id: None,
                 },
             })
             .collect();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         rows
+    }
+
+    /// Every task here and under every agent's child supervisor below,
+    /// each with the agent it sits under.
+    pub fn task_tree_snapshot(&self) -> Vec<TaskRow> {
+        let mut rows = Vec::new();
+        self.collect_task_tree(None, &mut rows);
+        rows
+    }
+
+    fn collect_task_tree(&self, parent_id: Option<&str>, rows: &mut Vec<TaskRow>) {
+        rows.extend(self.task_snapshot().into_iter().map(|row| TaskRow {
+            parent_id: parent_id.map(str::to_string),
+            ..row
+        }));
+        for agent in self.agents() {
+            if let Some(child_sup) = agent.child_supervisor.as_ref() {
+                child_sup.read().collect_task_tree(Some(&agent.id), rows);
+            }
+        }
     }
 
     /// How many agents and how many jobs are `Running`, as `task_snapshot`
@@ -499,6 +525,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: Instant::now(),
         }
     }
 
@@ -571,6 +598,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: Instant::now(),
         };
         let mut sup = Supervisor::new(1, 3);
         sup.register(running_handle).unwrap();
@@ -614,6 +642,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: Instant::now(),
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(running_handle).unwrap();
@@ -652,6 +681,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: Instant::now(),
         };
         let mut child_sup = Supervisor::new(4, 3);
         child_sup.register(grandchild).unwrap();
@@ -743,7 +773,7 @@ mod tests {
         assert_eq!(rows[0].id, "a_snap");
         assert_eq!(rows[0].kind, TaskKind::Agent);
         assert_eq!(rows[0].name, "explore");
-        assert_eq!(rows[0].started_at, None);
+        assert!(rows[0].started_at.is_some());
         assert_eq!(rows[0].session_id.as_deref(), Some("sess_x7x"));
         // make_handle drops its runtime, so the agent task is already over.
         assert_eq!(rows[0].status, TaskRowStatus::Finished);
@@ -832,6 +862,45 @@ mod tests {
         sup.register(child).unwrap();
 
         assert_eq!(sup.running_counts(), (2, 1));
+    }
+
+    /// The tree listing reaches every child supervisor and names the
+    /// agent each task sits under; the flat listing stays one level.
+    #[test]
+    fn task_tree_snapshot_gives_each_task_the_agent_it_sits_under() {
+        let mut grandchild_sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+        grandchild_sup
+            .register(make_handle("a_grandchild", "explore", 3))
+            .unwrap();
+        let mut child_sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+        let mut middle = make_handle("a_middle", "explore", 2);
+        middle.child_supervisor = Some(Arc::new(RwLock::new(grandchild_sup)));
+        child_sup.register(middle).unwrap();
+        child_sup
+            .register(make_job("j_middle", create_abort_signal()))
+            .unwrap();
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+        let mut top = make_handle("a_top", "explore", 1);
+        top.child_supervisor = Some(Arc::new(RwLock::new(child_sup)));
+        sup.register(top).unwrap();
+
+        let mut rows: Vec<(String, Option<String>)> = sup
+            .task_tree_snapshot()
+            .into_iter()
+            .map(|row| (row.id, row.parent_id))
+            .collect();
+        rows.sort();
+        let some = |id: &str| Some(id.to_string());
+        assert_eq!(
+            rows,
+            [
+                ("a_grandchild".to_string(), some("a_middle")),
+                ("a_middle".to_string(), some("a_top")),
+                ("a_top".to_string(), None),
+                ("j_middle".to_string(), some("a_top")),
+            ]
+        );
+        assert_eq!(sup.task_snapshot().len(), 1);
     }
 
     #[test]

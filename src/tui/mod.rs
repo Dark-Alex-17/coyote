@@ -1260,6 +1260,13 @@ impl App {
                             pager.click(&mut self.child_live, mouse.column, mouse.row, area);
                         }
                     }
+                    Layer::Overlay(OverlayKind::Tasks)
+                        if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                    {
+                        if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
+                            roster.click(mouse.column, mouse.row);
+                        }
+                    }
                     Layer::Overlay(_) => {
                         let delta = match mouse.kind {
                             MouseEventKind::ScrollUp => -WHEEL_LINES,
@@ -1549,7 +1556,9 @@ impl App {
             Action::ToggleRoster => {
                 self.overlay = match self.overlay {
                     Some(Overlay::Tasks(_)) => None,
-                    _ => Some(Overlay::Tasks(RosterState::new(self.roster_sources.rows()))),
+                    _ => Some(Overlay::Tasks(RosterState::new(
+                        self.roster_sources.rows(self.tick(), chrono::Utc::now()),
+                    ))),
                 };
                 None
             }
@@ -1590,9 +1599,27 @@ impl App {
                 }
                 None
             }
+            Action::RosterUnfold => {
+                if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
+                    roster.unfold();
+                }
+                None
+            }
+            Action::RosterFold => {
+                if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
+                    roster.fold();
+                }
+                None
+            }
+            Action::RosterToggle => {
+                if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
+                    roster.toggle();
+                }
+                None
+            }
             Action::RosterAnswer => {
                 if let Some(RosterRow::Escalation(ask)) =
-                    self.roster().and_then(RosterState::focused).cloned()
+                    self.roster().and_then(RosterState::focused)
                 {
                     self.ask_escalation(ask);
                 }
@@ -2198,8 +2225,12 @@ impl App {
         }
         // The roster is read on every frame it is up: the tasks move on
         // whether or not the context is in hand.
+        let wall = chrono::Local::now();
         if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
-            roster.refresh(self.roster_sources.rows());
+            roster.refresh(
+                self.roster_sources
+                    .rows(self.renderer.tick, wall.with_timezone(&chrono::Utc)),
+            );
         }
         if let Some(prompt) = self.prompts.front_mut() {
             prompt.layout_question(area.width, &mut self.renderer);
@@ -2258,15 +2289,19 @@ impl App {
         }
         match self.overlay.as_mut() {
             Some(Overlay::Help(help)) => frame.render_widget(help.view(&self.theme), upper),
-            Some(Overlay::Tasks(roster)) => frame.render_widget(
-                RosterPopup {
-                    state: roster,
-                    theme: &self.theme,
-                    no_color: self.renderer.no_color,
-                    tick: self.renderer.tick,
-                },
-                upper,
-            ),
+            Some(Overlay::Tasks(roster)) => {
+                roster.set_area(upper);
+                frame.render_widget(
+                    RosterPopup {
+                        state: roster,
+                        theme: &self.theme,
+                        no_color: self.renderer.no_color,
+                        now: wall.with_timezone(&chrono::Utc),
+                        offset: *wall.offset(),
+                    },
+                    upper,
+                );
+            }
             Some(Overlay::Pager(_)) | None => {}
         }
 

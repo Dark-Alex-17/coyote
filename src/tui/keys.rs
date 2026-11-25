@@ -264,6 +264,13 @@ pub(crate) enum Action {
     OpenThreads,
     /// Move the roster's highlight by this many rows, down when positive.
     RosterMove(i32),
+    /// Unfold the roster's highlighted task, or step to its first child
+    /// when it is open already.
+    RosterUnfold,
+    /// Fold the roster's highlighted task, or step to its parent when it
+    /// is folded already or has no children.
+    RosterFold,
+    RosterToggle,
     /// Ask the question on the roster's highlighted row in the modal.
     RosterAnswer,
     OpenPager,
@@ -587,7 +594,22 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "j / k / Up / Down / Tab / Shift+Tab",
             "Move between the rows",
         ),
-        row(Roster, "x", "Cancel the highlighted task"),
+        row(
+            Roster,
+            "l / Right",
+            "Unfold the task, or go to its first child when open",
+        ),
+        row(
+            Roster,
+            "h / Left",
+            "Fold the task, or go to its parent when folded or childless",
+        ),
+        row(
+            Roster,
+            "Space",
+            "Fold or unfold the task; a click on its arrow does the same",
+        ),
+        row(Roster, "x", "Cancel the highlighted task while it runs"),
         row(
             Roster,
             "o",
@@ -932,6 +954,9 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
         _ if ctrl || alt => Action::Nothing,
         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Action::RosterMove(-1),
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Action::RosterMove(1),
+        KeyCode::Right | KeyCode::Char('l') => Action::RosterUnfold,
+        KeyCode::Left | KeyCode::Char('h') => Action::RosterFold,
+        KeyCode::Char(' ') => Action::RosterToggle,
         KeyCode::Enter => Action::RosterAnswer,
         KeyCode::Char('x') => Action::RosterCancel,
         KeyCode::Char('o') => Action::RosterOpen,
@@ -2203,7 +2228,12 @@ mod tests {
             (ctrl('x'), roster, Action::Nothing),
             (ctrl('o'), roster, Action::Nothing),
             (plain(KeyCode::PageUp), roster, Action::Nothing),
-            (plain(KeyCode::Left), roster, Action::Nothing),
+            (plain(KeyCode::Left), roster, Action::RosterFold),
+            (plain(KeyCode::Char('h')), roster, Action::RosterFold),
+            (plain(KeyCode::Right), roster, Action::RosterUnfold),
+            (plain(KeyCode::Char('l')), roster, Action::RosterUnfold),
+            (plain(KeyCode::Char(' ')), roster, Action::RosterToggle),
+            (plain(KeyCode::Char(' ')), running, Action::RosterToggle),
             (plain(KeyCode::Home), roster, Action::Nothing),
             (
                 press(KeyCode::Up, KeyModifiers::ALT),
@@ -3027,6 +3057,27 @@ mod tests {
                     (plain(KeyCode::Tab), ROSTER, Action::RosterMove(1)),
                     (plain(KeyCode::BackTab), ROSTER, Action::RosterMove(-1)),
                 ],
+            ),
+            (
+                H::Roster,
+                "l / Right",
+                vec![
+                    (letter('l'), ROSTER, Action::RosterUnfold),
+                    (plain(KeyCode::Right), ROSTER, Action::RosterUnfold),
+                ],
+            ),
+            (
+                H::Roster,
+                "h / Left",
+                vec![
+                    (letter('h'), ROSTER, Action::RosterFold),
+                    (plain(KeyCode::Left), ROSTER, Action::RosterFold),
+                ],
+            ),
+            (
+                H::Roster,
+                "Space",
+                vec![(plain(KeyCode::Char(' ')), ROSTER, Action::RosterToggle)],
             ),
             (
                 H::Roster,

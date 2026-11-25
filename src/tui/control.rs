@@ -11,7 +11,7 @@ use crate::config::RequestContext;
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
 use crate::events::NoticeKind;
 use crate::repl::{EXIT_CANCEL_WAIT, run_repl_command};
-use crate::supervisor::{TaskKind, TaskRow};
+use crate::supervisor::{TaskKind, TaskRow, TaskRowStatus};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{AbortSignal, wait_abort_signal};
 use anyhow::Result;
@@ -535,19 +535,30 @@ impl App {
 
     pub(super) fn focused_task(&self) -> Option<TaskRow> {
         match self.roster()?.focused() {
-            Some(RosterRow::Task(task)) => Some(task.clone()),
+            Some(RosterRow::Task(node)) => Some(node.task),
             _ => None,
         }
     }
 
+    /// Cancels the highlighted task while it runs; one that has finished
+    /// is left alone, with a notice saying so.
     pub(super) fn cancel_focused_task(&mut self) {
-        if let Some(task) = self.focused_task() {
-            self.queue_control(ControlRequest::Cancel {
-                id: task.id,
-                kind: task.kind,
-                child_root: self.child_root.clone(),
-            });
+        let Some(task) = self.focused_task() else {
+            return;
+        };
+        if task.status != TaskRowStatus::Running {
+            self.transcript.push_notice(
+                self.notice_merge_from(),
+                NoticeKind::ToolWarning,
+                format!("Task {} has finished; there is nothing to cancel", task.id),
+            );
+            return;
         }
+        self.queue_control(ControlRequest::Cancel {
+            id: task.id,
+            kind: task.kind,
+            child_root: self.child_root.clone(),
+        });
     }
 
     /// Shows the highlighted task in the pager: an agent's own session,

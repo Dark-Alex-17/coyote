@@ -2044,6 +2044,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();

@@ -5991,6 +5991,7 @@ local_hello() {\n\
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             })
             .unwrap();
     }
@@ -9654,6 +9655,7 @@ local_hello() {\n\
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         })
         .unwrap();
         let supervisor = RwLock::new(sup);
@@ -9755,6 +9757,7 @@ local_hello() {\n\
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             })
             .unwrap();
         abort
@@ -9992,6 +9995,7 @@ local_hello() {\n\
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -10717,6 +10721,7 @@ local_hello() {\n\
                     session_id: None,
                     child_session_root: None,
                     succeeded: Default::default(),
+                    started_at: std::time::Instant::now(),
                 })
                 .unwrap();
             // The parent's own task is already finished, so the only live
@@ -10748,6 +10753,7 @@ local_hello() {\n\
                     session_id: None,
                     child_session_root: None,
                     succeeded: Default::default(),
+                    started_at: std::time::Instant::now(),
                 })
                 .unwrap();
             assert_eq!(
@@ -11047,6 +11053,7 @@ local_hello() {\n\
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         })
         .unwrap();
         (Arc::new(RwLock::new(sup)), child_signal)

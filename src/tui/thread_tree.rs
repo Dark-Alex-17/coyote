@@ -1,16 +1,18 @@
-//! The thread pop-up's tree: the main thread at the top and every child
-//! session under the session that spawned it, at any depth. The tree is
-//! built from the child-session sidecars and the children the UI saw
-//! start, flattened through the folds the pager keeps, and drawn a row
-//! per thread.
+//! The tree the thread and tasks pop-ups show: items nested under the
+//! item that started them, at any depth, flattened through the folds the
+//! pop-up keeps and drawn a row per item. The thread pop-up's items are
+//! the main thread at the top and every child session under the session
+//! that spawned it.
 
 use super::cells::{COLLAPSED_ARROW, EXPANDED_ARROW, elapsed_text};
+use super::help::MARGIN;
 use super::pager::keep_tail;
 use super::render;
 use super::sink::AgentOutcome;
 use super::theme::Theme;
 use crate::config::child_sessions::{ChildMeta, EffectiveStatus};
 use chrono::{DateTime, FixedOffset, Utc};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::collections::{HashMap, HashSet};
@@ -20,10 +22,318 @@ use unicode_width::UnicodeWidthStr;
 pub(super) const MAIN_THREAD: &str = "main";
 /// The fold key of the main thread; a session id is never empty.
 const MAIN_KEY: &str = "";
-/// The fewest columns a cut session id is shown in; with less room it
-/// is left out.
+/// The fewest columns a cut id is shown in; with less room it is left
+/// out.
 const ID_MIN: usize = 8;
 const GAP: &str = "  ";
+/// A tree pop-up's width: three quarters of the frame within these
+/// bounds, and never past a column's margin on each side.
+const POPUP_MIN_WIDTH: u16 = 60;
+const POPUP_MAX_WIDTH: u16 = 100;
+
+/// A tree pop-up `rows` rows tall plus its border, centred over `body`,
+/// which spans the frame's width, and kept a cell clear of its edges.
+pub(super) fn popup_area(body: Rect, rows: usize) -> Rect {
+    let room = body.inner(MARGIN);
+    let width = u16::try_from(u32::from(body.width) * 3 / 4)
+        .unwrap_or(u16::MAX)
+        .clamp(POPUP_MIN_WIDTH, POPUP_MAX_WIDTH)
+        .min(body.width.saturating_sub(2));
+    let height = u16::try_from(rows.saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(room.height);
+    Rect::new(
+        body.x + (body.width.saturating_sub(width)) / 2,
+        room.y + (room.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// The first row shown in a window `height` rows tall that keeps row
+/// `highlight` in view.
+pub(super) fn window_start(highlight: usize, height: usize) -> usize {
+    highlight.saturating_sub(height.saturating_sub(1))
+}
+
+pub(super) fn toggle_fold(folds: &mut HashSet<String>, key: &str) {
+    if !folds.remove(key) {
+        folds.insert(key.to_string());
+    }
+}
+
+/// Which colour a row's state is drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatusClass {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl StatusClass {
+    fn style(self, theme: &Theme) -> Style {
+        match self {
+            StatusClass::Running => theme.thread_running,
+            StatusClass::Completed => theme.thread_completed,
+            StatusClass::Failed => theme.thread_failed,
+        }
+    }
+}
+
+/// What a tree row is drawn and placed from.
+pub(super) trait TreeItem {
+    /// Unique among the items; folds and the highlight are kept by it.
+    fn key(&self) -> &str;
+    /// The key of the item this one sits under; None for the top.
+    fn parent_key(&self) -> Option<&str>;
+    fn label(&self) -> &str;
+    /// The state's word and colour; None for a row without a state.
+    fn status(&self) -> Option<(&'static str, StatusClass)>;
+    fn started(&self) -> Option<DateTime<Utc>>;
+    /// When a finished item ended, if that is known.
+    fn ended(&self) -> Option<DateTime<Utc>>;
+    /// Shown faded at the end of the row, and cut first.
+    fn id(&self) -> Option<&str>;
+    /// Drawn in the throbber's style just before the state's word.
+    fn throbber(&self) -> Option<&str> {
+        None
+    }
+
+    fn running(&self) -> bool {
+        matches!(self.status(), Some((_, StatusClass::Running)))
+    }
+}
+
+/// Items as a tree. An item whose parent is not among them, or whose
+/// parent links lead back to it, sits under the root, or at the top
+/// when there is none. Siblings list the running first, then by start
+/// time, oldest first, and those with no start time last.
+pub(super) struct Tree<T> {
+    nodes: Vec<T>,
+    parents: Vec<Option<usize>>,
+    children: Vec<Vec<usize>>,
+    top: Vec<usize>,
+}
+
+impl<T: TreeItem> Tree<T> {
+    /// The tree of `items` under `root`, which is index 0 when given; an
+    /// item whose key is taken already is dropped.
+    pub(super) fn build(root: Option<T>, items: Vec<T>) -> Self {
+        let has_root = root.is_some();
+        let mut nodes: Vec<T> = root.into_iter().collect();
+        let mut index: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(at, node)| (node.key().to_string(), at))
+            .collect();
+        for item in items {
+            if index.contains_key(item.key()) {
+                continue;
+            }
+            index.insert(item.key().to_string(), nodes.len());
+            nodes.push(item);
+        }
+        let first = usize::from(has_root);
+        let fallback = has_root.then_some(0);
+        let linked: Vec<Option<usize>> = nodes
+            .iter()
+            .enumerate()
+            .map(|(at, node)| {
+                node.parent_key()
+                    .and_then(|parent| index.get(parent).copied())
+                    .filter(|&parent| at >= first && parent != at)
+            })
+            .collect();
+        let mut parents = vec![None; nodes.len()];
+        for at in first..nodes.len() {
+            let mut up = linked[at];
+            let mut steps = 0;
+            while let Some(step) = up {
+                if step == at || steps >= nodes.len() {
+                    break;
+                }
+                up = linked[step];
+                steps += 1;
+            }
+            parents[at] = if up.is_none() {
+                linked[at].or(fallback)
+            } else {
+                fallback
+            };
+        }
+        let mut children = vec![Vec::new(); nodes.len()];
+        let mut top = Vec::new();
+        for (at, parent) in parents.iter().enumerate() {
+            match parent {
+                Some(parent) => children[*parent].push(at),
+                None => top.push(at),
+            }
+        }
+        let order = |at: &usize| {
+            let node = &nodes[*at];
+            (
+                !node.running(),
+                node.started().is_none(),
+                node.started(),
+                node.key().to_string(),
+            )
+        };
+        for siblings in &mut children {
+            siblings.sort_by_key(order);
+        }
+        if !has_root {
+            top.sort_by_key(order);
+        }
+        Self {
+            nodes,
+            parents,
+            children,
+            top,
+        }
+    }
+
+    /// How many items there are, the root among them.
+    pub(super) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub(super) fn node(&self, at: usize) -> &T {
+        &self.nodes[at]
+    }
+
+    pub(super) fn key(&self, at: usize) -> &str {
+        self.nodes[at].key()
+    }
+
+    pub(super) fn find(&self, key: &str) -> Option<usize> {
+        self.nodes.iter().position(|node| node.key() == key)
+    }
+
+    pub(super) fn parent(&self, at: usize) -> Option<usize> {
+        self.parents[at]
+    }
+
+    pub(super) fn first_child(&self, at: usize) -> Option<usize> {
+        self.children[at].first().copied()
+    }
+
+    pub(super) fn depth(&self, at: usize) -> usize {
+        std::iter::successors(self.parents[at], |&up| self.parents[up]).count()
+    }
+
+    /// The items on show in order, each under its parent; a folded item
+    /// hides everything below it.
+    pub(super) fn visible(&self, folds: &HashSet<String>) -> Vec<usize> {
+        let mut shown = Vec::with_capacity(self.nodes.len());
+        let mut stack: Vec<usize> = self.top.iter().rev().copied().collect();
+        while let Some(at) = stack.pop() {
+            shown.push(at);
+            if !folds.contains(self.key(at)) {
+                stack.extend(self.children[at].iter().rev());
+            }
+        }
+        shown
+    }
+
+    /// The item `key` names, or its nearest ancestor on show when a fold
+    /// hides it.
+    pub(super) fn shown_at(&self, key: &str, folds: &HashSet<String>) -> Option<usize> {
+        let at = self.find(key)?;
+        let hidden_by = std::iter::successors(self.parents[at], |&up| self.parents[up])
+            .filter(|&up| folds.contains(self.key(up)))
+            .last();
+        Some(hidden_by.unwrap_or(at))
+    }
+
+    /// Where the fold arrow of row `at` starts, in columns from the left.
+    pub(super) fn arrow_column(&self, at: usize) -> usize {
+        2 * self.depth(at)
+    }
+
+    pub(super) fn has_children(&self, at: usize) -> bool {
+        !self.children[at].is_empty()
+    }
+
+    /// Item `at` as a row `width` columns wide: indent, fold arrow, name
+    /// and state in the state's colour, the times and the id. Short of
+    /// room the id loses its start and then goes, and then the start time
+    /// and the run time go; the arrow, name and state stay.
+    pub(super) fn line(
+        &self,
+        at: usize,
+        folds: &HashSet<String>,
+        width: usize,
+        now: DateTime<Utc>,
+        offset: FixedOffset,
+        theme: &Theme,
+    ) -> Line<'static> {
+        let node = &self.nodes[at];
+        let arrow = match (self.has_children(at), folds.contains(node.key())) {
+            (false, _) => GAP,
+            (true, true) => COLLAPSED_ARROW,
+            (true, false) => EXPANDED_ARROW,
+        };
+        let status = node.status();
+        let style = status.map_or(theme.heading, |(_, class)| class.style(theme));
+        let mut spans = vec![
+            Span::raw(" ".repeat(self.arrow_column(at))),
+            Span::raw(arrow),
+            Span::styled(render::plain_text(node.label()), style),
+        ];
+        if let Some((word, _)) = status {
+            spans.push(Span::raw(GAP));
+            if let Some(frame) = node.throbber() {
+                spans.push(Span::styled(format!("{frame} "), theme.throbber));
+            }
+            spans.push(Span::styled(word, style));
+        }
+        let used: usize = spans.iter().map(|span| span.content.width()).sum();
+        let room = width.saturating_sub(used);
+        let mut times = times(node, now, offset);
+        let id = node.id().map(render::plain_text);
+        let times_width =
+            |times: &[String]| -> usize { times.iter().map(|time| GAP.len() + time.width()).sum() };
+        let id_room = room.saturating_sub(times_width(&times) + GAP.len());
+        let id = id.filter(|id| id.width() <= id_room || id_room >= ID_MIN);
+        if id.is_none() {
+            while times_width(&times) > room {
+                times.remove(0);
+            }
+        }
+        for time in times {
+            spans.push(Span::raw(GAP));
+            spans.push(Span::raw(time));
+        }
+        if let Some(id) = id {
+            spans.push(Span::raw(GAP));
+            spans.push(Span::styled(keep_tail(&id, id_room), theme.faded));
+        }
+        Line::from(spans)
+    }
+}
+
+/// The start time, then the time the item has run or ran for.
+fn times(node: &impl TreeItem, now: DateTime<Utc>, offset: FixedOffset) -> Vec<String> {
+    let Some(started) = node.started() else {
+        return Vec::new();
+    };
+    let mut times = vec![
+        started
+            .with_timezone(&offset)
+            .format("%H:%M:%S")
+            .to_string(),
+    ];
+    let end = if node.running() {
+        Some(now)
+    } else {
+        node.ended()
+    };
+    if let Some(end) = end {
+        let ran = (end - started).to_std().unwrap_or_default();
+        times.push(elapsed_text(ran));
+    }
+    times
+}
 
 fn status_word(status: EffectiveStatus) -> &'static str {
     match status {
@@ -35,12 +345,12 @@ fn status_word(status: EffectiveStatus) -> &'static str {
     }
 }
 
-fn status_style(status: EffectiveStatus, theme: &Theme) -> Style {
+fn status_class(status: EffectiveStatus) -> StatusClass {
     match status {
-        EffectiveStatus::Running => theme.thread_running,
-        EffectiveStatus::Completed => theme.thread_completed,
+        EffectiveStatus::Running => StatusClass::Running,
+        EffectiveStatus::Completed => StatusClass::Completed,
         EffectiveStatus::Failed | EffectiveStatus::Cancelled | EffectiveStatus::Crashed => {
-            theme.thread_failed
+            StatusClass::Failed
         }
     }
 }
@@ -117,153 +427,48 @@ impl ThreadNode {
             ended: None,
         }
     }
+}
 
+impl TreeItem for ThreadNode {
     fn key(&self) -> &str {
         self.session_id.as_deref().unwrap_or(MAIN_KEY)
     }
 
-    /// The spawn time, then the time it has run or ran for.
-    fn times(&self, now: DateTime<Utc>, offset: FixedOffset) -> Vec<String> {
-        let Some(started) = self.started else {
-            return Vec::new();
-        };
-        let mut times = vec![
-            started
-                .with_timezone(&offset)
-                .format("%H:%M:%S")
-                .to_string(),
-        ];
-        let end = match self.status {
-            Some(EffectiveStatus::Running) => Some(now),
-            _ => self.ended,
-        };
-        if let Some(end) = end {
-            let ran = (end - started).to_std().unwrap_or_default();
-            times.push(elapsed_text(ran));
-        }
-        times
+    fn parent_key(&self) -> Option<&str> {
+        self.parent_session.as_deref()
+    }
+
+    fn label(&self) -> &str {
+        &self.agent
+    }
+
+    fn status(&self) -> Option<(&'static str, StatusClass)> {
+        self.status
+            .map(|status| (status_word(status), status_class(status)))
+    }
+
+    fn started(&self) -> Option<DateTime<Utc>> {
+        self.started
+    }
+
+    fn ended(&self) -> Option<DateTime<Utc>> {
+        self.ended
+    }
+
+    fn id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 }
 
-/// The threads as a tree, the main thread at index 0. A child whose
-/// spawner is not among them, or whose spawner links lead back to it,
-/// hangs under the main thread. Siblings list the running first, then
-/// by spawn time, oldest first.
-pub(super) struct ThreadTree {
-    nodes: Vec<ThreadNode>,
-    parents: Vec<Option<usize>>,
-    children: Vec<Vec<usize>>,
-}
+/// The threads, the main thread at index 0 and a child of an unknown
+/// spawner under it.
+pub(super) type ThreadTree = Tree<ThreadNode>;
 
 impl ThreadTree {
     /// The tree of `threads`; a session listed twice keeps its first
     /// entry.
     pub(super) fn new(threads: Vec<ThreadNode>) -> Self {
-        let mut nodes = vec![ThreadNode::main()];
-        let mut index: HashMap<String, usize> = HashMap::new();
-        for thread in threads {
-            let Some(session_id) = thread.session_id.clone() else {
-                continue;
-            };
-            if index.contains_key(&session_id) {
-                continue;
-            }
-            index.insert(session_id, nodes.len());
-            nodes.push(thread);
-        }
-        let linked: Vec<usize> = nodes
-            .iter()
-            .map(|node| {
-                node.parent_session
-                    .as_deref()
-                    .and_then(|parent| index.get(parent).copied())
-                    .unwrap_or(0)
-            })
-            .collect();
-        let mut parents = vec![None; nodes.len()];
-        for at in 1..nodes.len() {
-            let mut up = linked[at];
-            let mut steps = 0;
-            while up != 0 && up != at && steps < nodes.len() {
-                up = linked[up];
-                steps += 1;
-            }
-            parents[at] = Some(if up == 0 { linked[at] } else { 0 });
-        }
-        let mut children = vec![Vec::new(); nodes.len()];
-        for (at, parent) in parents.iter().enumerate() {
-            if let Some(parent) = parent {
-                children[*parent].push(at);
-            }
-        }
-        for siblings in &mut children {
-            siblings.sort_by_key(|&at| {
-                let node = &nodes[at];
-                (
-                    node.status != Some(EffectiveStatus::Running),
-                    node.started,
-                    node.session_id.clone(),
-                )
-            });
-        }
-        Self {
-            nodes,
-            parents,
-            children,
-        }
-    }
-
-    /// How many threads there are, the main thread among them.
-    pub(super) fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    pub(super) fn node(&self, at: usize) -> &ThreadNode {
-        &self.nodes[at]
-    }
-
-    pub(super) fn key(&self, at: usize) -> &str {
-        self.nodes[at].key()
-    }
-
-    pub(super) fn find(&self, key: &str) -> Option<usize> {
-        self.nodes.iter().position(|node| node.key() == key)
-    }
-
-    pub(super) fn parent(&self, at: usize) -> Option<usize> {
-        self.parents[at]
-    }
-
-    pub(super) fn first_child(&self, at: usize) -> Option<usize> {
-        self.children[at].first().copied()
-    }
-
-    pub(super) fn depth(&self, at: usize) -> usize {
-        std::iter::successors(self.parents[at], |&up| self.parents[up]).count()
-    }
-
-    /// The threads on show in order, each under its parent; a folded
-    /// thread hides everything below it.
-    pub(super) fn visible(&self, folds: &HashSet<String>) -> Vec<usize> {
-        let mut shown = Vec::with_capacity(self.nodes.len());
-        let mut stack = vec![0];
-        while let Some(at) = stack.pop() {
-            shown.push(at);
-            if !folds.contains(self.key(at)) {
-                stack.extend(self.children[at].iter().rev());
-            }
-        }
-        shown
-    }
-
-    /// The thread `key` names, or its nearest ancestor on show when a
-    /// fold hides it.
-    pub(super) fn shown_at(&self, key: &str, folds: &HashSet<String>) -> Option<usize> {
-        let at = self.find(key)?;
-        let hidden_by = std::iter::successors(self.parents[at], |&up| self.parents[up])
-            .filter(|&up| folds.contains(self.key(up)))
-            .last();
-        Some(hidden_by.unwrap_or(at))
+        Tree::build(Some(ThreadNode::main()), threads)
     }
 
     /// The names of the threads above `session_id`, the main thread
@@ -278,72 +483,6 @@ impl ThreadTree {
                 .collect();
         crumbs.reverse();
         crumbs
-    }
-
-    /// Where the fold arrow of row `at` starts, in columns from the left.
-    pub(super) fn arrow_column(&self, at: usize) -> usize {
-        2 * self.depth(at)
-    }
-
-    pub(super) fn has_children(&self, at: usize) -> bool {
-        !self.children[at].is_empty()
-    }
-
-    /// Thread `at` as a row `width` columns wide: indent, fold arrow,
-    /// name and state in the state's colour, the times and the session
-    /// id. Short of room the id loses its start and then goes, and then
-    /// the spawn time and the run time go; the arrow, name and state
-    /// stay.
-    pub(super) fn line(
-        &self,
-        at: usize,
-        folds: &HashSet<String>,
-        width: usize,
-        now: DateTime<Utc>,
-        offset: FixedOffset,
-        theme: &Theme,
-    ) -> Line<'static> {
-        let node = &self.nodes[at];
-        let arrow = match (self.has_children(at), folds.contains(node.key())) {
-            (false, _) => GAP,
-            (true, true) => COLLAPSED_ARROW,
-            (true, false) => EXPANDED_ARROW,
-        };
-        let style = node
-            .status
-            .map_or(theme.heading, |status| status_style(status, theme));
-        let name = render::plain_text(&node.agent);
-        let mut spans = vec![
-            Span::raw(" ".repeat(self.arrow_column(at))),
-            Span::raw(arrow),
-            Span::styled(name, style),
-        ];
-        if let Some(status) = node.status {
-            spans.push(Span::raw(GAP));
-            spans.push(Span::styled(status_word(status), style));
-        }
-        let used: usize = spans.iter().map(|span| span.content.width()).sum();
-        let room = width.saturating_sub(used);
-        let mut times = node.times(now, offset);
-        let id = node.session_id.as_deref().map(render::plain_text);
-        let times_width =
-            |times: &[String]| -> usize { times.iter().map(|time| GAP.len() + time.width()).sum() };
-        let id_room = room.saturating_sub(times_width(&times) + GAP.len());
-        let id = id.filter(|id| id.width() <= id_room || id_room >= ID_MIN);
-        if id.is_none() {
-            while times_width(&times) > room {
-                times.remove(0);
-            }
-        }
-        for time in times {
-            spans.push(Span::raw(GAP));
-            spans.push(Span::raw(time));
-        }
-        if let Some(id) = id {
-            spans.push(Span::raw(GAP));
-            spans.push(Span::styled(keep_tail(&id, id_room), theme.faded));
-        }
-        Line::from(spans)
     }
 }
 
@@ -366,7 +505,7 @@ mod tests {
         )
     }
 
-    fn keys(tree: &ThreadTree, rows: &[usize]) -> Vec<String> {
+    fn keys<T: TreeItem>(tree: &Tree<T>, rows: &[usize]) -> Vec<String> {
         rows.iter().map(|&at| tree.key(at).to_string()).collect()
     }
 
@@ -448,6 +587,82 @@ mod tests {
             tree.line(1, &HashSet::new(), 100, at(5), offset, &theme)
                 .to_string()
                 .contains("05:04:05")
+        );
+    }
+
+    struct Item {
+        key: &'static str,
+        parent: Option<&'static str>,
+        started: Option<u32>,
+        running: bool,
+    }
+
+    impl TreeItem for Item {
+        fn key(&self) -> &str {
+            self.key
+        }
+
+        fn parent_key(&self) -> Option<&str> {
+            self.parent
+        }
+
+        fn label(&self) -> &str {
+            self.key
+        }
+
+        fn status(&self) -> Option<(&'static str, StatusClass)> {
+            Some(if self.running {
+                ("running", StatusClass::Running)
+            } else {
+                ("finished", StatusClass::Completed)
+            })
+        }
+
+        fn started(&self) -> Option<DateTime<Utc>> {
+            self.started.map(at)
+        }
+
+        fn ended(&self) -> Option<DateTime<Utc>> {
+            None
+        }
+
+        fn id(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// Without a root the items with no known parent are the top rows,
+    /// sorted like siblings, and an item with no start time goes last in
+    /// its group.
+    #[test]
+    fn a_tree_without_a_root_lists_its_orphans_at_the_top() {
+        let item = |key, parent, started, running| Item {
+            key,
+            parent,
+            started,
+            running,
+        };
+        let tree = Tree::build(
+            None,
+            vec![
+                item("unstarted", None, None, true),
+                item("done", None, Some(1), false),
+                item("late", None, Some(9), true),
+                item("early", None, Some(2), true),
+                item("under", Some("late"), Some(10), true),
+                item("lost", Some("gone"), Some(3), false),
+            ],
+        );
+        assert_eq!(
+            keys(&tree, &tree.visible(&HashSet::new())),
+            ["early", "late", "under", "unstarted", "done", "lost"]
+        );
+        assert_eq!(tree.parent(tree.find("under").unwrap()), tree.find("late"));
+        assert_eq!(tree.depth(tree.find("early").unwrap()), 0);
+        let folds: HashSet<String> = ["late".to_string()].into();
+        assert_eq!(
+            keys(&tree, &tree.visible(&folds)),
+            ["early", "late", "unstarted", "done", "lost"]
         );
     }
 }
