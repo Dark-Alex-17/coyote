@@ -313,7 +313,7 @@ def walk(combo, gates, graph, world, log):
                     "retro_large": True, "retro_large_reason": "a new widget service other code builds on", "anomalies": [],
                     "last_node_output": '{"retro_large": true}'}
         if nid == "run_retrospective":
-            return {"retro_result": "DESIGN_RETROSPECTIVE: CLEAN\n\n## Choices I would make again\n- one owner per widget seam\n"}
+            return {"retro_result": "DESIGN_RETROSPECTIVE: CLEAN\n"}
         if nid == "retro_triage":
             return {"retro_adopted": [], "retro_declined": [], "retro_follow_ups": [], "anomalies": []}
         if nid == "pr_summary":

@@ -3734,7 +3734,7 @@ check("hygiene_create: chain base unresolvable -> escalation hygiene_base_missin
 
 # ---------------------------------------------------------------- design retrospective: once per run, never blocking
 RETRO_JUDGED = '{"integration_amendments": []}'
-RETRO_CLEAN = "DESIGN_RETROSPECTIVE: CLEAN\n\n## Choices I would make again\n- one owner per seam\n"
+RETRO_CLEAN = "DESIGN_RETROSPECTIVE: CLEAN\n"
 RETRO_REFACTORS = "DESIGN_RETROSPECTIVE: REFACTORS 2\n\n## Refactor items\n\n1. **One table**\n2. **One owner**\n"
 
 
