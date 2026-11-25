@@ -1270,6 +1270,12 @@ u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS_HYG, curren
 check("compose_delegation: a fix round on the hygiene task carries the HYGIENE BRIEF too",
       "## FIX ROUND" in u["delegation_prompt"] and "## HYGIENE BRIEF" in u["delegation_prompt"] and "Sweep the RUN" in u["delegation_prompt"],
       u["delegation_prompt"][-600:])
+_hb = gates._hygiene_brief(base_state(), "abc1234", "run", "", "lint", "")
+check("hygiene brief: comment hygiene over the run's final diff per the Final-diff pass, before the hits, reported beside HYGIENE:",
+      "Run comment hygiene over the run's final diff per the comment-discipline skill's `## Final-diff pass`" in _hb
+      and "every comment the same abc1234..HEAD diff adds" in _hb and "comment needs no `HYGIENE:` row" in _hb
+      and "`Comment hygiene:` line beside the `HYGIENE:` list" in _hb
+      and _hb.index("debris-exempt") < _hb.index("Run comment hygiene") < _hb.index("For each hit"), _hb)
 REPORT_OK = ("Done.\nCommits: 1a2b3c4d5e6f\nHEAD SHA: 1a2b3c4d5e6f\n\nFOLLOW-UPS:\n- Provision the WIDGET_SECRET in vault (post-merge)\n\n"
              "Debt left behind:\n- src/a.go:12 #[allow(dead_code)] owner TASK-999\n\nDebris exemptions:\n- src/b.go:3 -- the glyph is the point\n\n"
              "Design decisions:\n- introduced a WidgetStore interface in src/a.go\n- ASK -- should the worker share the store?\n\nSisyphus run id: 20260101T000000-0badf00d\n")

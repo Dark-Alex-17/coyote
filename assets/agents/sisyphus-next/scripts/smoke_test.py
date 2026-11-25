@@ -1564,8 +1564,8 @@ check("bookkeeping_route: decisions in README -> coder round", u["_next"] == "co
 
 # ---------------------------------------------------------------- review (B10/B11)
 check("review_gate: batch cadence skips the panel", gates.review_gate(base_state(review_cadence="batch"))["_next"] == "whetstone_gate")
-check("review_gate: trivial single file no spec -> skip with note", gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False))["_next"] == "whetstone_gate")
-check("review_gate: trivial but spec -> gauntlet", gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=True))["_next"] == "build_gauntlet_prompt")
+check("review_gate: trivial single file no spec -> skip with note", gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False, comment_hygiene_done=True))["_next"] == "whetstone_gate")
+check("review_gate: trivial but spec -> gauntlet", gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=True, comment_hygiene_done=True))["_next"] == "build_gauntlet_prompt")
 check("review_gate: default -> gauntlet", gates.review_gate(base_state(intent="implementation"))["_next"] == "build_gauntlet_prompt")
 u = gates.build_gauntlet_prompt(base_state(spec_text="AC", quality_rigor="poc", consumer_surface=True))
 gp = u["gauntlet_prompt"]
@@ -3687,11 +3687,15 @@ check("subtasks: after the last subtask -> one final whole-task review from the 
       st["_next"] == "review_gate" and st.get("final_review") is True and st["base_sha"] == SUB_BASE
       and st.get("round_heads") == [] and st.get("review_rounds") == 0 and st.get("lane_block_streak") == {}, st.get("_next"))
 sub_step(st, "review_gate")
+hygiene_first = st["_next"]
+st["comment_hygiene_done"] = True
+sub_step(st, "review_gate")
 routed = st["_next"]
 sub_step(st, "build_gauntlet_prompt")
 gp = st["gauntlet_prompt"]
-check("subtasks: the final review checks every parent criterion over the whole task diff",
-      routed == "build_gauntlet_prompt" and "PARENT-AC-1" in gp and "PARENT-AC-2" in gp and f"Diff: {SUB_BASE}" in gp
+check("subtasks: the final review runs comment hygiene once, then checks every parent criterion over the whole task diff",
+      hygiene_first == "comment_hygiene" and routed == "build_gauntlet_prompt"
+      and "PARENT-AC-1" in gp and "PARENT-AC-2" in gp and f"Diff: {SUB_BASE}" in gp
       and "Subtask " not in gp and "the whole task, all 5 subtasks" in gp, gp)
 st["gauntlet_result"] = BLOCKED_REPLY
 sub_step(st, "route_gauntlet")
@@ -3711,7 +3715,8 @@ ro = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, base_sha=HEAD_NOW, subt
 check("subtasks: the final review never takes the read-only skip (the same clean tree skips mid-run)",
       gates.review_gate(dict(ro, final_review=True))["_next"] == "build_gauntlet_prompt" and gates.review_gate(ro)["_next"] == "next_subtask")
 check("subtasks: a trivial multi-subtask run never skips its final whole-task review",
-      gates.review_gate(dict(ro, final_review=True, intent="trivial", changed_files=["a"]))["_next"] == "build_gauntlet_prompt")
+      gates.review_gate(dict(ro, final_review=True, intent="trivial", changed_files=["a"], comment_hygiene_done=True))["_next"]
+      == "build_gauntlet_prompt")
 for kind, ans in (("yellow_findings", "Accept it (recorded)"), ("review_incomplete", KIND_OPTIONS["review_incomplete"][1]),
                   ("lane_stuck", "Accept the findings unresolved and proceed"), ("probe_gap", "Surface the gap and proceed")):
     mid = gates.apply_answer(base_state(escalation=kind_esc(kind), last_answer=ans, subtasks=SUBS7, subtask_index=2))
@@ -6703,7 +6708,8 @@ with scenario("base: a passing push check after a base sync -> ci_poll with the 
     check(name, u.get("_next") == "ci_poll" and u.get("base_sync_active") is False and u.get("ci_polls") == 0
           and u.get("base_integrated") == 1 and (u.get("base_facts") or {}).get("decision") == "integrated"
           and green.get("_next") == "base_check" and not os.path.exists(_BASE_READY), (u, green.get("_next")))
-_sync_review = gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False, base_sync_active=True))
+_sync_review = gates.review_gate(base_state(intent="trivial", changed_files=["a"], has_spec=False, base_sync_active=True,
+                                            comment_hygiene_done=True))
 check("base: review_gate never takes the trivial skip during a base sync", _sync_review["_next"] == "build_gauntlet_prompt")
 with scenario("base: a PR head that lacks the base tip reads moved even when local HEAD has merged it; without a PR "
               "head the same tree reads fresh") as name:
@@ -7265,6 +7271,83 @@ with scenario("failure locations: a shared dir without the parser makes the red 
     check(name, _cu["_next"] == "compose_fix" and not _cu.get("carried_failures")
           and "unclassified: failure locator unavailable" in _cu.get("last_coder_error", ""),
           (_cu.get("_next"), _cu.get("last_coder_error")))
+
+# ---------------------------------------------------------------- comment hygiene over the final diff
+HYG = os.path.join(TMP, "hygiene")
+os.makedirs(os.path.join(HYG, "plans", "steps"))
+for _a in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "init")):
+    subprocess.run(["git", "-C", HYG, *_a], check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+HYG_BASE = subprocess.run(["git", "-C", HYG, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+open(os.path.join(HYG, "app.py"), "w").write("# returns the total\ndef total(xs):\n    return sum(xs)\n")
+open(os.path.join(HYG, "plans", "steps", "01-step.md"), "w").write("# planning note kept out\n")
+_ch_subs = [{"title": "a", "outcome": "a", "acceptance_criteria": ["x"]},
+            {"title": "b", "outcome": "b", "acceptance_criteria": ["y"]}]
+
+
+def hyg_state(**over):
+    return base_state(**{"project_dir": HYG, "git_root": HYG, "base_sha": HYG_BASE, "intent": "implementation",
+                         "changed_files": ["app.py"], **over})
+
+
+_hg = gates.review_gate(hyg_state())
+check("comment hygiene: the last review of a single-task run goes to comment_hygiene with the whole-task diff, "
+      "untracked files in and the plans dir out",
+      _hg.get("_next") == "comment_hygiene" and "+# returns the total" in _hg.get("comment_diff", "")
+      and "planning note" not in _hg.get("comment_diff", ""), (_hg.get("_next"), _hg.get("comment_diff")))
+_hg = gates.review_gate(hyg_state(subtasks=_ch_subs, subtask_index=2, final_review=True))
+check("comment hygiene: the final whole-task review of a multi-subtask run goes to comment_hygiene",
+      _hg.get("_next") == "comment_hygiene", _hg.get("_next"))
+_hg = gates.review_gate(hyg_state(subtasks=_ch_subs, subtask_index=0, subtask_changed_files=["app.py"]))
+check("comment hygiene: a subtask review does not run it", _hg.get("_next") != "comment_hygiene", _hg.get("_next"))
+_hg = gates.review_gate(hyg_state(comment_hygiene_done=True))
+check("comment hygiene: once done, review_gate goes on to the gauntlet",
+      _hg.get("_next") == "build_gauntlet_prompt", _hg.get("_next"))
+_hg = gates.review_gate(hyg_state(changed_files=[]))
+check("comment hygiene: a task that changed no files skips it", _hg.get("_next") != "comment_hygiene", _hg.get("_next"))
+_hb = [gates.review_gate(hyg_state(review_cadence="batch", subtasks=_ch_subs, subtask_index=2, final_review=True,
+                                   **done)) for done in ({}, {"comment_hygiene_done": True})]
+check("comment hygiene: batch cadence runs it at the last review, then skips the panel",
+      [h.get("_next") for h in _hb] == ["comment_hygiene", "whetstone_gate"], [h.get("_next") for h in _hb])
+_hb = gates.review_gate(hyg_state(review_cadence="batch", subtasks=_ch_subs, subtask_index=0))
+check("comment hygiene: batch cadence does not run it in a subtask", _hb.get("_next") == "next_subtask", _hb.get("_next"))
+_ht = gates.review_gate(hyg_state(intent="trivial", has_spec=False))
+check("comment hygiene: a trivial single-file change runs it before the trivial skip", _ht.get("_next") == "comment_hygiene", _ht)
+
+_HYG_CUTS = ["app.py:1 -- cut", "lib.py:9 -- reduce to: Keeps the cache warm across restarts.", "lib.py:20 -- cut"]
+_hyg_line = "Comment hygiene: 7 added comments read, 2 cut, 1 reduced"
+with scenario("comment_hygiene_route: cuts -> one coder round through compose_fix with the counts line") as name:
+    _hr = gates.comment_hygiene_route(hyg_state(comment_cuts=_HYG_CUTS, comment_read=7, anomalies=["odd file"],
+                                                last_node_output=json.dumps({"comment_cuts": _HYG_CUTS})))
+    check(name, _hr.get("_next") == "compose_fix" and _hr.get("fix_source") == "comment_hygiene"
+          and _hr.get("fix_items") == _HYG_CUTS and _hr.get("comment_hygiene_done") is True
+          and _hr.get("comment_hygiene_line") == _hyg_line and any(_hyg_line in d for d in _hr.get("decisions", []))
+          and any("odd file" in a for a in _hr.get("anomalies_log", [])), _hr)
+with scenario("comment_hygiene_route: nothing to cut -> back to review_gate, no coder round") as name:
+    _hr = gates.comment_hygiene_route(hyg_state(comment_cuts=[], comment_read=4,
+                                                last_node_output='{"comment_cuts": []}'))
+    check(name, _hr.get("_next") == "review_gate" and _hr.get("comment_hygiene_done") is True
+          and "fix_source" not in _hr
+          and _hr.get("comment_hygiene_line") == "Comment hygiene: 4 added comments read, 0 cut, 0 reduced", _hr)
+with scenario("comment_hygiene_route: a fault fails open -> review_gate, ledgered, and listed under skipped "
+              "reviews") as name:
+    _hr = gates.comment_hygiene_route(hyg_state(last_node_output="LLM node structured-extraction failed: boom",
+                                                skipped_reviews=["earlier"]))
+    check(name, _hr.get("_next") == "review_gate" and _hr.get("comment_hygiene_done") is True
+          and not _hr.get("comment_hygiene_line") and _hr.get("skipped_reviews", [])[:1] == ["earlier"]
+          and any("comment hygiene" in s for s in _hr.get("skipped_reviews", [])[1:])
+          and any(d.startswith("fallback: comment_hygiene:") for d in _hr.get("decisions", [])), _hr)
+with scenario("compose_fix: comment_hygiene cuts framed as the final-diff pass, one item per line, no code change") as name:
+    _hf = gates.compose_fix(base_state(fix_source="comment_hygiene", fix_items=_HYG_CUTS))
+    check(name, _hf["fix_instructions"].startswith("Comment hygiene over the final diff (comment-discipline's Final-diff "
+                                                   "pass): cut or reduce each comment below as stated; change no code:")
+          and all(f"- {c}" in _hf["fix_instructions"].splitlines() for c in _HYG_CUTS)
+          and _hf["_next"] == "render_coder_prompt", _hf["fix_instructions"])
+with scenario("final_report: carries the Comment hygiene line, and none when the pass did not report one") as name:
+    _hrep = gates.final_report(base_state(comment_hygiene_line=_hyg_line))["report"]
+    check(name, f"- {_hyg_line}" in _hrep.splitlines()
+          and "Comment hygiene:" not in gates.final_report(base_state())["report"], _hrep)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
