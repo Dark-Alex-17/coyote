@@ -202,7 +202,12 @@ see the coder's [Verify tiers](../coder/README.md#verify-tiers)), with
 so the coder's base suite stays anchored there. Each coder lap runs only the
 targeted and impacted tests its change can break; the full suite and lint run
 once per step, at this graph's own format/lint, build and test gates, which
-act as the step's finalize gate. `verify_tests` reuses a finalize record
+act as the step's finalize gate. Before them, `verify_format_lint` cancels
+the base suite jobs the coder left running for this worktree
+(`.shared/base_suite.py cancel`: their process groups are killed and their
+worktrees removed) and names them at the top of `format_output`: these gates
+fail any red suite, so they never need that base, and a job holding
+`build_lock` would make them wait. `verify_tests` reuses a finalize record
 (`.shared/verify_record.py`) for the worktree tree whose every test result is
 green with exit 0 instead of running the suite again, saying so in
 `tests_output`. A record green only because its failures matched the base

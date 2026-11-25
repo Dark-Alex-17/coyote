@@ -42,15 +42,18 @@ fi
 # order, targeted then impacted, under one shared deadline. A red command is
 # judged against the base suite (reused, awaited, or re-run at the base on
 # demand) and the run stops at the first red that is not pre-existing. The
-# full suite and lint are left to the finalize gate.
+# full suite and lint are left to the finalize gate. A selected command
+# holding a carriage return or line feed is dropped: one could forge a line
+# of the report.
 if [[ "$tier" == "round" ]]; then
   shared="$(dirname "$0")/../../.shared"
   started=$SECONDS
   floor=${LLM_AGENT_VAR_BASELINE_FLOOR:-}
+  pinned_base=$(printf '%s' "$state" | jq -r '.baseline_base // "" | strings')
   budget=$deadline
   (( budget > 0 )) || budget=3300
   selection=$(printf '%s' "$state" | jq -c '
-    def picked: if type == "array" then map(strings | select(test("\\S"))) else [] end;
+    def picked: if type == "array" then map(strings | select(test("\\S")) | select(test("[\\r\\n]") | not)) else [] end;
     {
       targeted: (.targeted | picked),
       impacted: (.impacted | picked),
@@ -90,11 +93,17 @@ if [[ "$tier" == "round" ]]; then
 
   # base_start starts the base suite job or attaches to it, printing the
   # start JSON; it fails when there is nothing to start. Callers set
-  # job_started themselves: this runs in a command substitution.
+  # job_started themselves: this runs in a command substitution. The base
+  # baseline_tests fixed wins over one derived again from HEAD now.
   base_start() {
     [[ -z "$no_base_why" ]] || return 1
-    python3 "$shared/base_suite.py" start --root "$project_dir" --cmd "$cmd" \
-      --floor "$floor" --timeout "$deadline" 2>/dev/null
+    if [[ -n "$pinned_base" ]]; then
+      python3 "$shared/base_suite.py" start --root "$project_dir" --cmd "$cmd" \
+        --base "$pinned_base" --timeout "$deadline" 2>/dev/null
+    else
+      python3 "$shared/base_suite.py" start --root "$project_dir" --cmd "$cmd" \
+        --floor "$floor" --timeout "$deadline" 2>/dev/null
+    fi
   }
 
   # round_left prints the whole seconds left of the shared budget less a

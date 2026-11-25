@@ -321,18 +321,21 @@ paths are dropped and counted in that line.
   `DEFERRED: full suite runs at the final gate`. The verdict counts it as PARTIAL unless at least
   one recorded run is green, the same rule as an `ENVIRONMENT:` reason, so beside a green targeted
   run it still CONFORMS.
-- `final`: this review is the final gate. `run_checks` runs no command, declared or not: it looks
-  up the finalize record of the reviewed tree (`.shared/verify_record.py`, written by
-  `.shared/finalize_gate.sh`) and puts its results into `exec_results`, each with
-  `source: "finalize record <tree> @
-  <recorded_at>"`, pre-existing failures as a pre-existing baseline and other reds as blocking. A
-  green one proves the criteria it covers like any recorded run. No record for the tree (none, or
-  only one for another tree) or a red one forces DIVERGES with a `FULL-SUITE RECORD MISSING: ...`
-  or `FULL-SUITE RECORD RED: ...` line under the header and as the first run complaint, whatever
+- `final`: this review is the final gate. `run_checks` looks up the finalize record of the
+  reviewed tree (`.shared/verify_record.py`, written by `.shared/finalize_gate.sh`) and puts its
+  results first in `exec_results`, each with `source: "finalize record <tree> @ <recorded_at>"`,
+  pre-existing failures as a pre-existing baseline and other reds as blocking; the full suite is
+  never run again. The declared `verification_commands` still run after them, so a caller
+  declares only what the finalize gate does not cover (a run-wide lint, say), never the full
+  suite. A green record run proves the criteria it covers like any recorded run. No record for
+  the tree (none, or only one for another tree, or one that decides nothing because a step timed
+  out or the suite could not be judged) or a red one forces DIVERGES with a
+  `FULL-SUITE RECORD MISSING: ...` or `FULL-SUITE RECORD RED: ...` line under the header and as
+  the first run complaint, whatever
   the criteria say; that holds for a directly spawned adversary too. A record whose only failures
   the finalize gate matched to the base suite is green. A `DEFERRED:` reason always counts as
-  PARTIAL here. `carried_failures` are not matched at this tier, since the record keeps only the
-  tail of each output.
+  PARTIAL here. `carried_failures` are matched against the declared runs only, since the record
+  keeps only the tail of each output.
 
 The reviewed tree is `review_tree` (default `''`) when the caller names one: `review-gauntlet`
 forwards the tree `signals` recorded before its lanes, so a test file the probe lane writes

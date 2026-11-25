@@ -287,19 +287,33 @@ when every verdict is `green`, `pre-existing` or `not_run`; a finalize record
 also needs a `test` result that is `green` or `pre-existing`. An unreadable
 record counts as missing.
 
-`.shared/finalize_gate.sh DIR [WRITER]` is the finalize gate a caller runs
-before it reports done. It runs the detected fmt command (and puts back any
-file fmt changed that was clean before it ran, leaving the run's own edits
-as fmt left them), check (`BUILD_CMD` or the detected one), lint (exit 127,
-a missing linter, counts as not run) and the full test command, each under
+`.shared/finalize_gate.sh DIR [WRITER [FLOOR]]` is the finalize gate a
+caller runs before it reports done. It runs the detected fmt command, then
+puts back the exact earlier bytes of every file fmt rewrote; one that belongs
+to the change (the diff from FLOOR, else from the judging base, to the
+worktree, plus untracked files) makes the fmt result red with its path. Then
+check (`BUILD_CMD` or the detected one), lint (exit 127, a missing linter,
+is `unavailable` and never green) and the full test command, each under
 `build_lock` and killed after `TEST_TIMEOUT` seconds (default 1800). A red
-suite is compared with the base suite record for HEAD or the nearest commit
-on its first-parent chain (at most 50 back), awaiting a running job until
-its own deadline and re-running the full suite at the base when the job
-died. It writes the finalize record and prints
+suite is compared with the base suite record at FLOOR when one is given (run
+there on demand when missing); without, with the record for HEAD or the
+nearest commit on its first-parent chain (at most 50 back) when no merge and
+no commit older than the record separates it from HEAD. A running job is
+awaited until its own deadline and the full suite is re-run at the base when
+the job died. It writes the finalize record, unless a step timed out or the
+status is `unavailable` (a record that decides nothing reads as missing), and prints
 `{status: green|red|unavailable, tree, items}`; `unavailable` means nothing
 new failed but the suite could not be shown green (no test command, or no
 base to compare a red suite with).
+
+Each base suite run gets its own 0700 worktree under
+`coyote-baselines/worktrees/` and never sees the agent's `LLM_AGENT_VAR_*`
+variables (neither does any gate command run through `run_gate_until`). A
+job counts as alive only while its pid exists and its heartbeat is under
+five minutes old; a lazy re-run at the base takes the same job claim, and a
+run whose worktree vanished stores no record. `base_suite.py cancel --root
+DIR` kills every live job started from DIR's worktree and removes its
+worktree; step-runner calls it before its own gates.
 
 ## Tuning
 

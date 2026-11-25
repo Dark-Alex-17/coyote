@@ -317,17 +317,32 @@ in the run's verification, and is forwarded to the adversary lane through
   (`.shared/verify_record.py`) and reuses it as it stands, green or red. On a
   miss it runs `.shared/finalize_gate.sh` there (fmt, check, lint, then the
   full suite under the build_lock prefix, each killed after 3300s), which writes the
-  record. The verdict gate then needs a green record for the recorded tree:
+  record. A record that decides nothing (a step timed out, or the suite could
+  not be judged) is a miss, and so is one that accepted pre-existing failures
+  against another base than `baseline_floor`. The verdict gate then needs a
+  green record for the recorded tree:
   otherwise it blocks with a `FULL-SUITE RECORD MISSING|RED|UNAVAILABLE:
   <detail>` line and a BLOCKED `full-suite` row, even when every lane is
   green. MISSING covers a check that never finished and a record for another
   tree; UNAVAILABLE is a red suite with no base suite record to tell new
-  failures from old ones, or no test command. The gate's fmt step rewrites
-  the changed files in place, so when it leaves a tree other than the
-  recorded one the check reports RED naming the rewritten paths: the lanes
-  then review files the author did not submit. The recorded tree also goes
+  failures from old ones, or no test command. The gate's fmt step never
+  changes the tree: every file it rewrites gets its submitted bytes back, and
+  a rewritten file that belongs to the change (the diff from `baseline_floor`,
+  else from the base the suite is judged against, plus untracked files) turns
+  the fmt result RED with its path, since it was committed or submitted
+  unformatted. Should a gate still leave a tree other than the recorded one,
+  the check reports RED naming the changed paths. The recorded tree also goes
   to the adversary lane as `review_tree`, so it looks up the same record
   even after the probe lane writes its tests.
+
+`baseline_floor` (default empty, final tier only) is the commit the run
+started from. With it, a red full suite is judged only against the base suite
+record at that commit, and when there is none the suite runs there on demand
+(the record's `baseline_mode` says `lazy`). Without it, the nearest base
+record on HEAD's first-parent chain counts only when no merge commit lies
+between it and HEAD and every commit in between was made after the record:
+otherwise the record could belong to an earlier task whose regressions would
+pass as pre-existing.
 
 Any other value blocks as a `PIPELINE-FAULT`.
 

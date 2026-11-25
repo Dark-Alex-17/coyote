@@ -29,7 +29,7 @@ const CACHE: &str = r#"{"type":"unknown","build":"","test":"","check":"","lint":
 
 /// Every variable the coder scripts read, cleared so the host's own run
 /// cannot leak into a pin.
-const CLEARED: [&str; 16] = [
+const CLEARED: [&str; 17] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -38,6 +38,7 @@ const CLEARED: [&str; 16] = [
     "BUILD_CMD",
     "TEST_CMD",
     "TEST_TIMEOUT",
+    "BUILD_TIMEOUT",
     "COYOTE_GATE_OUTPUT_MAX_BYTES",
     "LLM_AGENT_VAR_BUILD_LOCK",
     "LLM_AGENT_VAR_PROJECT_DIR",
@@ -121,6 +122,7 @@ fn kill_group(pgid: i64) {
         .output();
 }
 
+#[cfg(unix)]
 fn alive(pid: i64) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -136,14 +138,13 @@ fn own_process_group(command: &mut Command) -> &mut Command {
     command.process_group(0)
 }
 
-#[cfg(not(unix))]
-fn own_process_group(command: &mut Command) -> &mut Command {
-    command
-}
-
 /// Runs git in `dir` without the host's system or global config, so a
 /// fixture commit has an author and never tries to sign.
 fn git(dir: &Path, args: &[&str]) -> String {
+    git_env(dir, args, &[])
+}
+
+fn git_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
     let output = Command::new("git")
         .args([
             "-c",
@@ -163,6 +164,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .envs(envs.iter().copied())
         .output()
         .expect("spawn git");
     assert!(
@@ -194,6 +196,18 @@ fn commit_file(dir: &Path, file: &str) -> String {
     fs::write(dir.join(file), file).unwrap();
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-q", "-m", file]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+/// Commits `file` with a committer date long before any record a pin takes.
+fn commit_file_dated_2001(dir: &Path, file: &str) -> String {
+    fs::write(dir.join(file), file).unwrap();
+    git(dir, &["add", "-A"]);
+    git_env(
+        dir,
+        &["commit", "-q", "-m", file],
+        &[("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")],
+    );
     git(dir, &["rev-parse", "HEAD"])
 }
 
@@ -244,9 +258,15 @@ fn shared_py(script: &str, args: &[&str]) -> (Option<i32>, Value) {
 }
 
 fn finalize(dir: &Path, envs: &[(&str, &str)]) -> Value {
+    finalize_with(dir, &[], envs)
+}
+
+/// Runs the finalize gate on `dir` with `extra` after DIR (WRITER, FLOOR).
+fn finalize_with(dir: &Path, extra: &[&str], envs: &[(&str, &str)]) -> Value {
     let output = scrubbed(&bash_program().expect("bash resolved by tools_missing"))
         .arg(asset(".shared/finalize_gate.sh"))
         .arg(dir)
+        .args(extra)
         .current_dir(dir)
         .envs(envs.iter().copied())
         .output()
@@ -738,7 +758,11 @@ fn verify_tier_defaults_to_full_and_declares_the_round_route() {
         .iter()
         .map(|t| t.as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["fs_cat", "fs_ls", "execute_command"]);
+    assert_eq!(
+        tools,
+        ["fs_cat", "fs_ls", "fs_grep", "fs_glob", "ast_grep"],
+        "select_checks only reads the repository"
+    );
     let required: Vec<&str> = select["output_schema"]["required"]
         .as_sequence()
         .unwrap()
@@ -935,6 +959,7 @@ fn round_red_run_while_pending_waits_and_classifies_pre_existing() {
 
 /// A job killed before it stored a record is never restarted: only the red
 /// command is re-run at the base, and the report says the job was killed.
+#[cfg(unix)]
 #[test]
 fn round_killed_job_reruns_only_the_red_command_at_the_base() {
     if tools_missing() {
@@ -1017,6 +1042,7 @@ fn round_deadline_while_pending_leaves_red_unclassified() {
 
 /// The job keeps running after the node that started it has exited, and a
 /// kill of that node's whole process group does not reach it.
+#[cfg(unix)]
 #[test]
 fn round_base_job_outlives_the_node_that_started_it() {
     if tools_missing() {
@@ -1057,6 +1083,7 @@ fn round_base_job_outlives_the_node_that_started_it() {
 
 /// A finished job leaves no base worktree behind, and a sweep after a dead
 /// job removes the one it left.
+#[cfg(unix)]
 #[test]
 fn round_base_worktrees_are_removed_and_swept_after_a_dead_job() {
     if tools_missing() {
@@ -1072,6 +1099,8 @@ fn round_base_worktrees_are_removed_and_swept_after_a_dead_job() {
     });
     let worktree = str_field(&job_status(&dir, &key), "worktree").to_string();
     assert!(worktree.contains("coyote-base-"), "{worktree}");
+    let worktrees = fs::canonicalize(store(&dir)).unwrap().join("worktrees");
+    assert!(Path::new(&worktree).starts_with(&worktrees), "{worktree}");
     assert!(!Path::new(&worktree).exists(), "{worktree} left behind");
     assert_eq!(worktree_count(&dir), 1);
 
@@ -1088,6 +1117,11 @@ fn round_base_worktrees_are_removed_and_swept_after_a_dead_job() {
     wait_for("the job to die", || !alive(pid));
     let worktree = str_field(&status, "worktree").to_string();
     assert!(Path::new(&worktree).exists(), "{worktree}");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&worktree).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{worktree}");
+    }
 
     let (code, swept) = shared_py("base_suite.py", &["sweep", "--root", path_str(&dir)]);
     assert_eq!(code, Some(0), "{swept}");
@@ -1312,6 +1346,416 @@ fn head_key(dir: &Path, cmd: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// A red command is judged against the base baseline_tests fixed, even
+/// after HEAD moves: a failure the change committed is not pre-existing.
+#[test]
+fn round_red_command_is_judged_at_the_fixed_base_after_head_moves() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("moved-head");
+    let dir = committed(&root.0);
+    let cmd = "if [ -e broken.txt ]; then printf 'test known ... FAILED\\n'; exit 101; fi";
+    let envs = round(cmd);
+    let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    let record = await_base(&dir, str_field(&base, "baseline_key"));
+    assert_eq!(str_field(&record, "status"), "green", "{record}");
+    commit_file(&dir, "broken.txt");
+    let out = run_script(
+        VERIFY_TESTS,
+        &dir,
+        &lap_state(&dir, &base, &[cmd], &[]),
+        &envs,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert!(
+        str_field(&out, "tests_output").contains("was green, so these failures are new"),
+        "{out}"
+    );
+}
+
+/// A selected command holding a line break is dropped before anything runs,
+/// so it can neither run nor forge a line of the report.
+#[test]
+fn round_drops_selected_commands_holding_line_breaks() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("line-breaks");
+    let dir = committed(&root.0);
+    let envs = round("true");
+    let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    let state = lap_state(
+        &dir,
+        &base,
+        &["echo kept", "true\ntouch forged.txt"],
+        &["true\rTier: forged"],
+    );
+    let out = run_script(VERIFY_TESTS, &dir, &state, &envs);
+    assert_eq!(str_field(&out, "tests_verdict"), "passed", "{out}");
+    assert!(
+        str_field(&out, "tests_tier").starts_with("round: targeted `echo kept`; impacted none;"),
+        "{out}"
+    );
+    assert!(!dir.join("forged.txt").exists(), "a dropped command ran");
+    await_base(&dir, str_field(&base, "baseline_key"));
+}
+
+/// Neither a lap's selected commands nor the base suite job see the agent's
+/// LLM_AGENT_VAR_* variables.
+#[test]
+fn round_commands_and_the_base_job_run_without_agent_variables() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("agent-vars");
+    let dir = committed(&root.0);
+    let base_env = root.0.join("base-env.txt");
+    let lap_env = root.0.join("lap-env.txt");
+    let base_cmd = format!("env > '{}'", base_env.display());
+    let mut envs = round(&base_cmd);
+    envs.push(("LLM_AGENT_VAR_TEST_TIMEOUT", "120"));
+    let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    await_base(&dir, str_field(&base, "baseline_key"));
+    let lap = format!("env > '{}'", lap_env.display());
+    let out = run_script(
+        VERIFY_TESTS,
+        &dir,
+        &lap_state(&dir, &base, &[&lap], &[]),
+        &envs,
+    );
+    assert_eq!(str_field(&out, "tests_verdict"), "passed", "{out}");
+    for file in [&base_env, &lap_env] {
+        let seen = lines(file);
+        assert!(
+            seen.iter().any(|l| l.starts_with("PATH=")),
+            "{}: {seen:?}",
+            file.display()
+        );
+        let leaked: Vec<&String> = seen
+            .iter()
+            .filter(|l| l.starts_with("LLM_AGENT_VAR_"))
+            .collect();
+        assert!(leaked.is_empty(), "{}: {leaked:?}", file.display());
+    }
+}
+
+fn utc_now() -> String {
+    let output = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn epoch_in(secs: u64) -> String {
+    (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + secs)
+        .to_string()
+}
+
+/// A job whose pid exists but whose heartbeat went stale is dead, so a
+/// reused pid never keeps a job alive; a fresh heartbeat does.
+#[test]
+fn base_job_with_a_stale_heartbeat_is_not_alive() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("stale-heartbeat");
+    let dir = committed(&root.0);
+    let key = "0123456789abcdef";
+    let job = store(&dir).join("jobs").join(key);
+    fs::create_dir_all(&job).unwrap();
+    let status = |heartbeat: &str| {
+        json!({
+            "version": 1, "key": key, "base": git(&dir, &["rev-parse", "HEAD"]),
+            "state": "running", "pid": std::process::id(), "pgid": null, "cmd_pgid": null,
+            "timeout": 0, "started_at": heartbeat, "heartbeat_at": heartbeat,
+            "worktree": null, "error": "",
+        })
+    };
+    let await_job = |secs: u64| {
+        shared_py(
+            "base_suite.py",
+            &[
+                "await",
+                "--root",
+                path_str(&dir),
+                "--key",
+                key,
+                "--until",
+                &epoch_in(secs),
+            ],
+        )
+    };
+
+    fs::write(job.join("status.json"), status(&utc_now()).to_string()).unwrap();
+    let (code, out) = await_job(1);
+    assert_eq!(code, Some(4), "a live job with a fresh heartbeat: {out}");
+
+    fs::write(
+        job.join("status.json"),
+        status("2001-01-01T00:00:00Z").to_string(),
+    )
+    .unwrap();
+    let (code, out) = await_job(30);
+    assert_eq!(code, Some(3), "{out}");
+    assert_eq!(str_field(&out, "state"), "killed", "{out}");
+}
+
+/// Two lazy runs of one command at one base share the job claim: the
+/// command runs once and both get its record.
+#[test]
+fn concurrent_lazy_runs_at_one_base_run_the_command_once() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("lazy-claim");
+    let dir = committed(&root.0);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    let runs = root.0.join("runs.txt");
+    let cmd = format!("echo ran >> '{}'; sleep 2", runs.display());
+    let spawn = || {
+        scrubbed(Path::new("python3"))
+            .arg(asset(".shared/base_suite.py"))
+            .args([
+                "run",
+                "--root",
+                path_str(&dir),
+                "--base",
+                &head,
+                "--cmd",
+                &cmd,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn python3")
+    };
+    let first = spawn();
+    let second = spawn();
+    let outs: Vec<Value> = [first, second]
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            parse("base_suite.py run", &output)
+        })
+        .collect();
+    assert_eq!(outs[0]["record"], outs[1]["record"], "{outs:?}");
+    assert_eq!(lines(&runs).len(), 1, "the command ran more than once");
+}
+
+/// A run whose worktree vanished stores no record, and a symlinked
+/// worktrees directory is refused.
+#[cfg(unix)]
+#[test]
+fn base_run_stores_nothing_from_a_vanished_or_symlinked_worktree() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("vanished");
+    let dir = committed(&root.0);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    let run = |cmd: &str| {
+        shared_py(
+            "base_suite.py",
+            &[
+                "run",
+                "--root",
+                path_str(&dir),
+                "--base",
+                &head,
+                "--cmd",
+                cmd,
+            ],
+        )
+    };
+    let records = || -> usize {
+        fs::read_dir(store(&dir))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("tests-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    let (code, out) = run("rm -rf \"$PWD\"");
+    assert_eq!(code, Some(3), "{out}");
+    assert!(
+        str_field(&out, "error").contains("vanished during the run, so no record was stored"),
+        "{out}"
+    );
+    assert_eq!(records(), 0);
+
+    let elsewhere = root.0.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let worktrees = store(&dir).join("worktrees");
+    let _ = fs::remove_dir_all(&worktrees);
+    std::os::unix::fs::symlink(&elsewhere, &worktrees).unwrap();
+    let (code, out) = run("true");
+    assert_eq!(code, Some(3), "{out}");
+    assert!(str_field(&out, "error").contains("is a symlink"), "{out}");
+    assert_eq!(records(), 0);
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+/// base_suite.py imports and kills nothing where the platform has no
+/// process groups.
+#[test]
+fn base_suite_imports_without_process_groups() {
+    if tools_missing() {
+        return;
+    }
+    let program = "import json, os, signal, sys\n\
+        for name in ('getpgid', 'killpg'):\n    delattr(os, name)\n\
+        del signal.SIGKILL\n\
+        sys.path.insert(0, sys.argv[1])\n\
+        import base_suite\n\
+        base_suite.kill_group(999999999)\n\
+        print(json.dumps(base_suite.own_group()))";
+    let output = scrubbed(Path::new("python3"))
+        .args(["-B", "-c", program])
+        .arg(asset(".shared"))
+        .output()
+        .expect("spawn python3");
+    assert_eq!(
+        parse("base_suite import", &output),
+        Value::Null,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// cancel kills the live base suite jobs started from this worktree and
+/// removes their worktrees, leaving another worktree's job alone;
+/// step-runner's format gate calls it first and says so.
+#[cfg(unix)]
+#[test]
+fn base_suite_cancel_stops_this_worktrees_jobs_before_the_step_gates() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("cancel");
+    let dir = committed(&root.0);
+    let linked = root.0.join("linked");
+    git(
+        &dir,
+        &["worktree", "add", "-q", "--detach", path_str(&linked)],
+    );
+    let started = |at: &Path, cmd: &str| {
+        let out = run_script(BASELINE, at, &project_state(at), &round(cmd));
+        let key = str_field(&out, "baseline_key").to_string();
+        wait_for("the base command to start", || {
+            job_status(&dir, &key)["cmd_pgid"].is_i64()
+        });
+        key
+    };
+    let ours = started(&dir, "sleep 30");
+    let theirs = started(&linked, "sleep 31");
+    let status = job_status(&dir, &ours);
+    let pid = status["pid"].as_i64().unwrap();
+    let worktree = str_field(&status, "worktree").to_string();
+    assert!(Path::new(&worktree).exists(), "{worktree}");
+
+    let gate = run_script(
+        "step-runner/scripts/verify_format_lint.sh",
+        &dir,
+        &project_state(&dir),
+        &[("FORMAT_CMD", ""), ("LINT_CMD", "")],
+    );
+    assert!(
+        str_field(&gate, "format_output").starts_with(&format!(
+            "Cancelled the coder's base suite jobs for this worktree before the step gates: {ours}\n\n"
+        )),
+        "{gate}"
+    );
+    assert_eq!(str_field(&job_status(&dir, &ours), "state"), "cancelled");
+    wait_for("the cancelled job to die", || !alive(pid));
+    assert!(!Path::new(&worktree).exists(), "{worktree} left behind");
+    assert_eq!(str_field(&job_status(&dir, &theirs), "state"), "running");
+
+    let (code, again) = shared_py("base_suite.py", &["cancel", "--root", path_str(&dir)]);
+    assert_eq!(code, Some(0), "{again}");
+    assert_eq!(again["cancelled"], json!([]), "{again}");
+}
+
+/// impact_facts names the changed paths, the test files mentioning a
+/// changed file's stem, the test files beside it, the full test command with
+/// the base suite, and the previous lap.
+#[test]
+fn impact_facts_reports_every_section_for_a_changed_source_file() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("impact-facts");
+    let dir = committed(&root.0);
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(dir.join("tests/uses.txt"), "checks the widget output\n").unwrap();
+    fs::write(dir.join("src/beside_test.txt"), "sits next to it\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "tests"]);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    fs::write(dir.join("src/widget.txt"), "edited\n").unwrap();
+    let state = json!({
+        "project_dir": path_str(&dir),
+        "baseline_base": head,
+        "baseline_key": "0123456789abcdef",
+        "baseline_mode": "background (pending)",
+        "tests_tier": "round: targeted `a`",
+        "targeted": ["run a"],
+        "impacted": [],
+        "reason": "pinned",
+        "tests_verdict": "passed",
+    });
+    let out = run_py(
+        "coder/scripts/impact_facts.py",
+        &dir,
+        &state,
+        &[("TEST_CMD", "run-suite")],
+    );
+    assert_eq!(str_field(&out, "_next"), "select_checks", "{out}");
+    let facts = str_field(&out, "impact_facts");
+    let sections: Vec<&str> = facts.split("\n\n").collect();
+    assert_eq!(sections.len(), 5, "{facts}");
+    assert_eq!(
+        sections[0],
+        format!(
+            "Changed paths since {} (tests marked [test]):\n  src/widget.txt",
+            &head[..12]
+        )
+    );
+    assert_eq!(
+        sections[1],
+        "Test files mentioning `widget` (stem of src/widget.txt):\n  tests/uses.txt"
+    );
+    assert_eq!(sections[2], "Test files in src/:\n  src/beside_test.txt");
+    let suite: Vec<&str> = sections[3].lines().collect();
+    assert_eq!(suite[0], "Full test command and base suite:", "{facts}");
+    assert_eq!(suite[1], "  command: run-suite", "{facts}");
+    assert!(
+        suite[2].starts_with("  runs in: ") && suite[2].ends_with("/proj"),
+        "{facts}"
+    );
+    assert_eq!(
+        &suite[3..],
+        [
+            "  baseline mode: background (pending)",
+            "  base suite has not finished, duration unknown"
+        ],
+        "{facts}"
+    );
+    assert_eq!(
+        sections[4],
+        "Previous lap's selection and result:\n  targeted: [\"run a\"]\n  impacted: []\n  reason: pinned\n  result: passed"
+    );
+}
+
 /// A job status or base record that cannot be read gives a lazy or no
 /// baseline, and an unreadable verification record counts as missing;
 /// none of them ever passes a red run.
@@ -1373,7 +1817,8 @@ fn round_unreadable_status_or_record_is_never_green() {
 
 /// A finalize record is green only when a test result is green or
 /// pre-existing: green fmt, check and lint with the suite not run, or with
-/// no test result at all, read as red.
+/// no test result at all, are never green and read as missing, since such a
+/// record decides nothing.
 #[test]
 fn finalize_record_without_a_passing_test_result_is_not_green() {
     if tools_missing() {
@@ -1390,8 +1835,12 @@ fn finalize_record_without_a_passing_test_result_is_not_green() {
     for results in [json!(not_run), json!(checks)] {
         let path = write_record(&dir, "finalize", &results);
         let lookup = lookup_record(&dir, "finalize");
-        assert_eq!(lookup["path"], json!(path), "{lookup}");
-        assert_eq!(str_field(&lookup, "status"), "red", "{results}: {lookup}");
+        assert_eq!(lookup["path"], Value::Null, "{lookup}");
+        assert_eq!(
+            str_field(&lookup, "status"),
+            "missing",
+            "{results}: {lookup}"
+        );
         assert_eq!(
             record_py(IS_GREEN, &path, "finalize"),
             json!(false),
@@ -1500,7 +1949,9 @@ fn full_tier_is_unchanged() {
 }
 
 /// The finalize gate accepts the failures the base suite already had,
-/// fails a new one, and is unavailable with no base to compare with.
+/// fails a new one, and is unavailable with no base to compare with. Down
+/// the first-parent chain a base record counts only while every commit
+/// since it was made after it; a floor names the base exactly.
 #[test]
 fn finalize_gate_judges_the_full_suite_against_the_base() {
     if tools_missing() {
@@ -1508,6 +1959,7 @@ fn finalize_gate_judges_the_full_suite_against_the_base() {
     }
     let root = temp_dir("finalize");
     let dir = committed(&root.0);
+    let floor = git(&dir, &["rev-parse", "HEAD"]);
     let cmd = "if [ -e new.txt ]; then printf 'test fresh ... FAILED\\n'; fi; printf 'test known ... FAILED\\n'; exit 101";
     let sync = run_script(BASELINE, &dir, &project_state(&dir), &[("TEST_CMD", cmd)]);
     assert_eq!(str_field(&sync, "baseline_status"), "red", "{sync}");
@@ -1554,6 +2006,15 @@ fn finalize_gate_judges_the_full_suite_against_the_base() {
         "green",
         "the parent's record: {out}"
     );
+    let floored = finalize_with(&dir, &["verify-tiers", &floor], &envs);
+    assert_eq!(str_field(&floored, "status"), "green", "{floored}");
+    assert!(
+        str_field(&test_item(&floored), "note").ends_with(&format!(
+            "(judged against the base suite at {}, reused)",
+            &floor[..7]
+        )),
+        "{floored}"
+    );
 
     let other = [
         ("TEST_CMD", "printf 'test other ... FAILED\\n'; exit 1"),
@@ -1562,9 +2023,272 @@ fn finalize_gate_judges_the_full_suite_against_the_base() {
     let out = finalize(&dir, &other);
     assert_eq!(str_field(&out, "status"), "unavailable", "{out}");
     assert_eq!(str_field(&test_item(&out), "verdict"), "red", "{out}");
+
+    commit_file_dated_2001(&dir, "older.txt");
+    let out = finalize(&dir, &envs);
+    assert_eq!(str_field(&out, "status"), "unavailable", "{out}");
+    assert!(
+        str_field(&test_item(&out), "note").contains(
+            "is older than the base record there, so the record may not be this run's base"
+        ),
+        "{out}"
+    );
 }
 
 const RUN_CHECKS: &str = "adversary/scripts/run_checks.py";
+
+/// Seeds the detection cache of `dir` with `fmt` and `lint` commands.
+fn detect_commands(dir: &Path, fmt: &str, lint: &str) {
+    let cache = json!({
+        "type": "unknown", "build": "", "test": "", "check": "", "lint": lint, "fmt": fmt,
+    });
+    fs::write(dir.join(".coyote-project.json"), cache.to_string()).unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "detected commands"]);
+}
+
+fn item<'a>(out: &'a Value, role: &str) -> &'a Value {
+    out["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["role"] == role)
+        .unwrap_or_else(|| panic!("no {role} item: {out}"))
+}
+
+/// A misformatted file committed in the change turns fmt red with its path,
+/// and gets its committed bytes back; a file outside the change that fmt
+/// rewrote is restored and only noted.
+#[test]
+fn finalize_gate_fails_a_committed_misformatted_file_and_restores_it() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-fmt");
+    let dir = committed(&root.0);
+    detect_commands(
+        &dir,
+        "for f in src/*.txt; do tr a-z A-Z < \"$f\" > \"$f.t\" && mv \"$f.t\" \"$f\"; done",
+        "",
+    );
+    let floor = git(&dir, &["rev-parse", "HEAD"]);
+    commit_file(&dir, "src/committed.txt");
+    let tree = worktree_tree(&dir);
+    let out = finalize_with(&dir, &["verify-tiers", &floor], &[("TEST_CMD", "true")]);
+    assert_eq!(str_field(&out, "status"), "red", "{out}");
+    let fmt = item(&out, "fmt");
+    assert_eq!(str_field(fmt, "verdict"), "red", "{out}");
+    assert_eq!(
+        str_field(fmt, "note"),
+        "fmt rewrote files in the change, so they are not formatted: src/committed.txt; each was \
+         restored to its submitted bytes; restored files outside the change fmt rewrote: src/widget.txt",
+        "{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("src/committed.txt")).unwrap(),
+        "src/committed.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("src/widget.txt")).unwrap(),
+        "widget\n"
+    );
+    assert_eq!(worktree_tree(&dir), tree);
+    assert_eq!(str_field(&out, "tree"), tree, "{out}");
+    assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+}
+
+/// A detected lint runs once and lands in the record; a failing lint makes
+/// the gate red and blocks the final-tier gauntlet; a lint command that is
+/// missing (exit 127) is unavailable, never green.
+#[test]
+fn finalize_gate_runs_a_detected_lint_once_and_never_passes_a_red_or_missing_one() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-lint");
+    let dir = committed(&root.0);
+    let runs = root.0.join("lint-runs.txt");
+    let lint = format!(
+        "echo ran >> '{}'; if [ -e lint-bad.txt ]; then exit 3; fi",
+        runs.display()
+    );
+    detect_commands(&dir, "", &lint);
+    let envs = [("TEST_CMD", "true")];
+
+    let out = finalize(&dir, &envs);
+    assert_eq!(str_field(&out, "status"), "green", "{out}");
+    assert_eq!(str_field(item(&out, "lint"), "verdict"), "green", "{out}");
+    assert_eq!(lines(&runs).len(), 1, "the lint did not run exactly once");
+    let recorded = finalize_lookup(&dir);
+    let lint_result = recorded["record"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["role"] == "lint")
+        .cloned()
+        .unwrap_or_else(|| panic!("no lint result: {recorded}"));
+    assert_eq!(str_field(&lint_result, "cmd"), lint, "{recorded}");
+    assert_eq!(str_field(&lint_result, "verdict"), "green", "{recorded}");
+
+    fs::write(dir.join("lint-bad.txt"), "bad").unwrap();
+    let before = worktree_tree(&dir);
+    let state = json!({"project_dir": path_str(&dir), "review_tree_before": before});
+    let red = run_script(FINALIZE_CHECK, &dir, &state, &envs);
+    assert_eq!(
+        str_field(&red["full_suite_record"], "status"),
+        "red",
+        "{red}"
+    );
+    assert_eq!(lines(&runs).len(), 2);
+    let mut lanes = green_lanes(&dir, &before, "final");
+    lanes["full_suite_record"] = red["full_suite_record"].clone();
+    let (verdict, report) = gauntlet_gate(&dir, &lanes);
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(report.contains(&format!("lint `{lint}` red")), "{report}");
+
+    fs::remove_file(dir.join("lint-bad.txt")).unwrap();
+    detect_commands(&dir, "", "no-such-lint-command-anywhere");
+    let missing = finalize(&dir, &envs);
+    assert_eq!(str_field(&missing, "status"), "red", "{missing}");
+    let lint_item = item(&missing, "lint");
+    assert_eq!(str_field(lint_item, "verdict"), "unavailable", "{missing}");
+    assert_eq!(lint_item["exit"], 127, "{missing}");
+    let lookup = finalize_lookup(&dir);
+    assert_eq!(str_field(&lookup, "status"), "red", "{lookup}");
+}
+
+/// A gate whose step timed out, or whose suite could not be judged, writes
+/// no record; a stored record like that reads as missing, so finalize_check
+/// runs the gate again instead of trusting it.
+#[test]
+fn finalize_gate_writes_no_record_that_decides_nothing() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-undecided");
+    let dir = committed(&root.0);
+    let slow = finalize(&dir, &[("TEST_CMD", "sleep 5"), ("TEST_TIMEOUT", "1")]);
+    assert_eq!(str_field(&slow, "status"), "red", "{slow}");
+    assert_eq!(str_field(item(&slow, "test"), "verdict"), "timed_out");
+    assert_eq!(str_field(&finalize_lookup(&dir), "status"), "missing");
+    assert_eq!(stored_records(&dir), 0, "a timed-out gate wrote a record");
+
+    let odd = finalize(
+        &dir,
+        &[("TEST_CMD", "printf 'test odd ... FAILED\\n'; exit 1")],
+    );
+    assert_eq!(str_field(&odd, "status"), "unavailable", "{odd}");
+    assert_eq!(str_field(&finalize_lookup(&dir), "status"), "missing");
+    assert_eq!(
+        stored_records(&dir),
+        0,
+        "an unavailable gate wrote a record"
+    );
+
+    write_finalize(
+        &dir,
+        test_result(
+            "run-suite",
+            1,
+            "red",
+            "not classified: no base suite record",
+        ),
+    );
+    assert_eq!(str_field(&finalize_lookup(&dir), "status"), "missing");
+    let runs = root.0.join("suite-runs.txt");
+    let suite = format!("echo ran >> '{}'", runs.display());
+    let state = json!({"project_dir": path_str(&dir), "review_tree_before": worktree_tree(&dir)});
+    let checked = run_script(FINALIZE_CHECK, &dir, &state, &[("TEST_CMD", &suite)]);
+    assert_eq!(
+        str_field(&checked["full_suite_record"], "status"),
+        "green",
+        "{checked}"
+    );
+    assert_eq!(lines(&runs).len(), 1, "the undecided record was trusted");
+}
+
+/// How many verification records the store of `dir`'s repository holds.
+fn stored_records(dir: &Path) -> usize {
+    let common = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    fs::read_dir(Path::new(&common).join("coyote-verification"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// A test the run's first commit broke is red at the second commit's base
+/// too. With the floor at the run's start the final gate judges the suite
+/// against the green suite there, run on demand, and stays red; without it
+/// the second commit's base record would pass the failure as pre-existing.
+#[test]
+fn finalize_gate_with_a_floor_keeps_an_earlier_commits_regression_red() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-floor");
+    let dir = committed(&root.0);
+    let floor = git(&dir, &["rev-parse", "HEAD"]);
+    let cmd = "if [ -e broken.txt ]; then printf 'test known ... FAILED\\n'; exit 101; fi";
+    let first = commit_file(&dir, "broken.txt");
+    let (code, base) = shared_py(
+        "base_suite.py",
+        &[
+            "run",
+            "--root",
+            path_str(&dir),
+            "--base",
+            &first,
+            "--cmd",
+            cmd,
+        ],
+    );
+    assert_eq!(code, Some(0), "{base}");
+    commit_file(&dir, "second.txt");
+    let envs = [("TEST_CMD", cmd), ("TEST_TIMEOUT", "60")];
+    let test_note = |out: &Value| -> String {
+        out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["role"] == "test")
+            .map(|i| str_field(i, "note").to_string())
+            .unwrap_or_else(|| panic!("no test item: {out}"))
+    };
+
+    let chained = finalize(&dir, &envs);
+    assert_eq!(str_field(&chained, "status"), "green", "{chained}");
+
+    let state = json!({
+        "project_dir": path_str(&dir),
+        "review_tree_before": worktree_tree(&dir),
+        "baseline_floor": floor,
+    });
+    let checked = run_script(FINALIZE_CHECK, &dir, &state, &envs);
+    let record = &checked["full_suite_record"];
+    assert_eq!(str_field(record, "status"), "red", "{checked}");
+    assert!(
+        str_field(record, "detail").contains(&format!(
+            "the base suite was green, so these failures are new (judged against the base suite at {}, lazy (no base suite record or job at {}))",
+            &floor[..7],
+            &floor[..7]
+        )),
+        "{checked}"
+    );
+    assert_eq!(str_field(&finalize_lookup(&dir), "status"), "red");
+
+    let floored = finalize_with(&dir, &["verify-tiers", &floor], &envs);
+    assert_eq!(str_field(&floored, "status"), "red", "{floored}");
+    assert!(
+        test_note(&floored).ends_with(&format!(
+            "(judged against the base suite at {}, reused)",
+            &floor[..7]
+        )),
+        "{floored}"
+    );
+}
+
 const ADVERSARY_VERDICT: &str = "adversary/scripts/verdict.py";
 const GAUNTLET_GATE: &str = "review-gauntlet/scripts/verdict_gate.py";
 const FINALIZE_CHECK: &str = "review-gauntlet/scripts/finalize_check.sh";
@@ -1693,7 +2417,7 @@ fn report_line(report: &str, n: usize) -> &str {
 }
 
 /// At the final tier a worktree tree with no finalize record diverges, even
-/// with every criterion met, and nothing declared runs.
+/// with every criterion met and the declared command run green.
 #[test]
 fn final_tier_adversary_without_a_finalize_record_diverges_with_every_criterion_met() {
     if tools_missing() {
@@ -1701,8 +2425,8 @@ fn final_tier_adversary_without_a_finalize_record_diverges_with_every_criterion_
     }
     let root = temp_dir("adversary-no-record");
     let dir = committed(&root.0);
-    let checks = adversary_checks(&dir, "final", &["touch sentinel.txt"]);
     let tree = worktree_tree(&dir);
+    let checks = adversary_checks(&dir, "final", &["true"]);
     assert_eq!(checks["full_suite_record"]["status"], "missing", "{checks}");
     let line = str_field(&checks["full_suite_record"], "line");
     assert_eq!(
@@ -1710,7 +2434,8 @@ fn final_tier_adversary_without_a_finalize_record_diverges_with_every_criterion_
         format!("FULL-SUITE RECORD MISSING: no finalize record for the worktree tree {tree}"),
         "{checks}"
     );
-    assert!(!dir.join("sentinel.txt").exists(), "a declared command ran");
+    assert_eq!(checks["exec_results"][0]["cmd"], "true", "{checks}");
+    assert_eq!(checks["exec_results"][0]["exit"], 0, "{checks}");
 
     let met = verdict_of("MET", "the recorded run exits 0", "");
     let report = adversary_report(&dir, &checks, met.clone(), "final");
@@ -1885,20 +2610,26 @@ fn final_tier_adversary_diverges_on_a_regression_and_passes_pre_existing_failure
 }
 
 /// A green record is the execution evidence: its runs reach exec_results
-/// naming the record, and the declared command does not run; at the empty
-/// tier the same declaration does run.
+/// first, naming the record, and the suite it holds does not run again. The
+/// declared commands, which a caller keeps to what the finalize gate does
+/// not cover, still run after them.
 #[test]
-fn final_tier_adversary_cites_a_green_record_without_running_the_command() {
+fn final_tier_adversary_cites_a_green_record_and_still_runs_the_declared_commands() {
     if tools_missing() {
         return;
     }
     let root = temp_dir("adversary-green");
     let dir = committed(&root.0);
     let sentinel = "touch sentinel.txt";
+    let lint = "touch lint-ran.txt";
     write_finalize(&dir, test_result(sentinel, 0, "green", ""));
     let record = finalize_lookup(&dir)["record"].clone();
-    let checks = adversary_checks(&dir, "final", &[sentinel]);
+    let checks = adversary_checks(&dir, "final", &[lint]);
     assert!(!dir.join("sentinel.txt").exists(), "the full command ran");
+    assert!(
+        dir.join("lint-ran.txt").exists(),
+        "the declared command did not run"
+    );
     let run = &checks["exec_results"][0];
     assert_eq!(str_field(run, "cmd"), sentinel, "{checks}");
     assert_eq!(run["exit"], 0, "{checks}");
@@ -1909,6 +2640,15 @@ fn final_tier_adversary_cites_a_green_record_without_running_the_command() {
             str_field(&record, "tree"),
             str_field(&record, "recorded_at")
         ),
+        "{checks}"
+    );
+    let declared = &checks["exec_results"][1];
+    assert_eq!(str_field(declared, "cmd"), lint, "{checks}");
+    assert_eq!(declared["exit"], 0, "{checks}");
+    assert!(declared.get("source").is_none(), "{checks}");
+    assert_eq!(
+        checks["exec_results"].as_array().unwrap().len(),
+        2,
         "{checks}"
     );
     assert!(
@@ -2158,8 +2898,8 @@ fn final_tier_gauntlet_runs_the_finalize_gate_once_and_blocks_without_a_green_re
     assert!(script.contains("DEADLINE_SECS=3300\n"), "{script}");
 }
 
-/// A finalize gate whose fmt step rewrites a reviewed file is reported red
-/// with the rewritten path, not hidden behind a record for another tree.
+/// A finalize gate whose fmt step rewrites a reviewed file reports fmt red
+/// with the rewritten path, and the reviewed tree keeps its bytes.
 #[test]
 fn final_tier_gauntlet_reports_a_tree_the_finalize_gate_rewrote() {
     if tools_missing() {
@@ -2178,11 +2918,15 @@ fn final_tier_gauntlet_reports_a_tree_the_finalize_gate_rewrote() {
     let out = run_script(FINALIZE_CHECK, &dir, &state, &[("TEST_CMD", "true")]);
     let record = &out["full_suite_record"];
     assert_eq!(str_field(record, "status"), "red", "{out}");
-    assert_ne!(str_field(record, "tree"), before, "{out}");
+    assert_eq!(str_field(record, "tree"), before, "{out}");
+    assert_eq!(
+        fs::read_to_string(dir.join("src/widget.txt")).unwrap(),
+        "unformatted\n"
+    );
     assert!(
-        str_field(record, "detail").contains(&format!(
-            "; the gate rewrote the reviewed tree {before}: src/widget.txt; format the change and review again"
-        )),
+        str_field(record, "detail").contains(
+            "(fmt rewrote files in the change, so they are not formatted: src/widget.txt;"
+        ),
         "{out}"
     );
 

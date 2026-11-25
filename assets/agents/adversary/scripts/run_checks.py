@@ -157,8 +157,10 @@ carried; so does every record the deadline leaves no time to match.
 Verification tier: `verification_tier` is '' (the default), `round` or
 `final`; any other value executes nothing and records a PIPELINE-FAULT. A
 non-empty tier adds `tier_note`, the facts the criterion checks and the
-holistic pass are given about it. At `final` no command runs at all: the
-finalize record of the reviewed tree becomes `exec_results`. With
+holistic pass are given about it. At `final` the finalize record of the
+reviewed tree is read beside the declared commands, which still run (the
+caller declares only what the finalize gate does not cover, such as a
+run-wide lint), and its runs come first in `exec_results`. With
 `review_tree` set, that is the record for exactly that tree
 (`verify_record.lookup_exact`) and no `debris_exclude` match applies; with it
 empty, the fallback is the worktree tree as it stands (`verify_record.lookup`,
@@ -169,7 +171,8 @@ pre-existing baseline and its other reds as a regression (or not-run when
 the gate could not classify them). `full_suite_record` gets {status:
 green|red|missing, tree, line}; verdict.py forces DIVERGES on its
 `FULL-SUITE RECORD MISSING|RED: <detail>` line unless it is green. Carried
-failures are not matched at this tier: the record keeps only output tails.
+failures are matched only against the declared runs at this tier: the
+record keeps only output tails.
 """
 
 import hashlib
@@ -229,11 +232,11 @@ TIER_NOTES = {
         "gate`; the deterministic verdict counts it as PARTIAL unless a recorded run is green."
     ),
     "final": (
-        "\n\nVerification tier: final. This review is the final gate. The runs above come from the "
-        "finalize record of the reviewed tree (each names it in `source`) and were not run again; "
-        "they are recorded runs like any other, so a green one proves a criterion it covers, cited "
-        "as that record's run. Nothing is deferred at this tier: a `DEFERRED:` reason counts as "
-        "PARTIAL."
+        "\n\nVerification tier: final. This review is the final gate. The runs above that name a "
+        "finalize record in `source` come from the finalize record of the reviewed tree and were "
+        "not run again; the others are the declared commands, run now. All are recorded runs like "
+        "any other, so a green one proves a criterion it covers, cited as that run. Nothing is "
+        "deferred at this tier: a `DEFERRED:` reason counts as PARTIAL."
     ),
 }
 SNAPSHOT_IDENTITY = {
@@ -986,7 +989,8 @@ def failing_results(record, passing):
 
 def finalize_record_runs(state):
     """exec_results and full_suite_record from the finalize record of the reviewed tree, at
-    the final tier. Nothing runs: the finalize gate already ran the full suite on this tree.
+    the final tier. Nothing here runs: the finalize gate already ran the full suite on this
+    tree.
 
     The reviewed tree is `review_tree` when the caller recorded one before lanes running
     beside this one could write files, else the worktree tree as it stands now."""
@@ -1005,7 +1009,7 @@ def finalize_record_runs(state):
     def missing(tree, detail):
         line = f"{FULL_SUITE_PREFIX}MISSING: {detail}"
         return {
-            "exec_results": f"{line}; nothing runs at the final tier, the finalize gate writes this record",
+            "exec_results": f"{line}; the finalize gate writes this record",
             "full_suite_record": {"status": "missing", "tree": tree, "line": line},
         }
 
@@ -1064,13 +1068,13 @@ def main():
         print(tiered(tier, pipeline_fault_record(state, f"PIPELINE-FAULT: build_lock declaration invalid: {e}")))
         return
     carried, carried_error = declared_carried(state.get("carried_failures"))
-    if tier == "final":
-        out = finalize_record_runs(state)
-        if carried_error:
-            out["carried_error"] = carried_error
-        print(tiered(tier, out))
-        return
+    recorded = finalize_record_runs(state) if tier == "final" else None
     if not cmds:
+        if recorded is not None:
+            if carried_error:
+                recorded["carried_error"] = carried_error
+            print(tiered(tier, recorded))
+            return
         print(
             tiered(
                 tier,
@@ -1124,6 +1128,9 @@ def main():
     finally:
         shutil.rmtree(work, ignore_errors=True)
     out = {"exec_results": results}
+    if recorded is not None:
+        runs = recorded["exec_results"] if isinstance(recorded["exec_results"], list) else []
+        out = {"exec_results": runs + results, "full_suite_record": recorded["full_suite_record"]}
     if carried_error:
         out["carried_error"] = carried_error
     print(tiered(tier, out))

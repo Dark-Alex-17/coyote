@@ -14,6 +14,19 @@ fi
 
 project_dir=$(echo "$state" | jq -r '.project_dir // "."')
 project_dir=$(resolve_gate_dir "$project_dir")
+
+# The coder's background base suite jobs for this worktree are cancelled
+# first: the step gates fail any red suite, so they never need that base,
+# and a job holding build_lock would make them wait for it.
+cancel_note=''
+if command -v python3 >/dev/null 2>&1; then
+  cancelled=$(python3 "$(dirname "$0")/../../.shared/base_suite.py" cancel --root "$project_dir" 2>/dev/null |
+    jq -r '.cancelled // [] | join(", ")' 2>/dev/null) || cancelled=''
+  if [[ -n "$cancelled" ]]; then
+    cancel_note="Cancelled the coder's base suite jobs for this worktree before the step gates: $cancelled"$'\n\n'
+  fi
+fi
+
 project_info=$(detect_project "$project_dir")
 project_type=$(echo "$project_info" | jq -r '.type // "unknown"')
 
@@ -24,13 +37,13 @@ fi
 if [[ "$format_cmd" == "null" ]]; then format_cmd=""; fi
 
 if [[ -z "$format_cmd" ]]; then
-  format_output="(GATE NOT RUN: no format command configured or detected for project type '$project_type'. This is NOT evidence that formatting is clean. Set FORMAT_CMD to enable.)"
+  format_output="${cancel_note}(GATE NOT RUN: no format command configured or detected for project type '$project_type'. This is NOT evidence that formatting is clean. Set FORMAT_CMD to enable.)"
 else
   fmt_rc=0
   fmt_out=$(cd "$project_dir" && run_gate "$format_cmd" 2>&1) || fmt_rc=$?
   fmt_out=$(trim_output "$fmt_out")
   format_cmd=$(gate_ran "$format_cmd")
-  format_output="Ran: $format_cmd
+  format_output="${cancel_note}Ran: $format_cmd
 Exit code: $fmt_rc
 
 $fmt_out"
