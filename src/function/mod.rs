@@ -332,7 +332,7 @@ pub async fn eval_tool_calls(
     for (idx, call) in calls.into_iter().enumerate() {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
-            loop_warning_sink(JSON_OUTPUT.load(Ordering::SeqCst)).println(muted_warning_text(
+            OutputSink::diagnostic().println(muted_warning_text(
                 format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str(),
             ));
             indexed_results.push((idx, ToolResult::new(call, json!(dup_msg))));
@@ -683,7 +683,7 @@ impl Functions {
             .context("failed to write merged mcp.json")?;
 
         if !added.is_empty() {
-            mcp_merge_sink(JSON_OUTPUT.load(Ordering::SeqCst))
+            OutputSink::diagnostic()
                 .println(format_args!("  + new MCP servers: {}", added.join(", ")));
         }
 
@@ -1546,7 +1546,7 @@ impl ToolCall {
             && ctx.current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            call_log_sink(JSON_OUTPUT.load(Ordering::SeqCst)).println(format_call_log(
+            OutputSink::chatter().println(format_call_log(
                 cmd_name,
                 &[json_data.to_string()],
                 &json_data,
@@ -1662,8 +1662,7 @@ impl ToolCall {
             && current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            call_log_sink(JSON_OUTPUT.load(Ordering::SeqCst))
-                .println(format_call_log(&cmd_name, &cmd_args, &json_data));
+            OutputSink::chatter().println(format_call_log(&cmd_name, &cmd_args, &json_data));
         }
 
         hooks::fire(
@@ -2795,7 +2794,7 @@ pub fn run_llm_function(
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
 
-    let relay = tool_stdout_relay_sink(JSON_OUTPUT.load(Ordering::SeqCst));
+    let relay = OutputSink::diagnostic();
     let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
@@ -3086,22 +3085,6 @@ impl ToolCallTracker {
     }
 }
 
-fn call_log_sink(json_output: bool) -> OutputSink {
-    OutputSink::pick(json_output, OutputSink::Suppressed)
-}
-
-fn loop_warning_sink(json_output: bool) -> OutputSink {
-    OutputSink::pick(json_output, OutputSink::Stderr)
-}
-
-fn tool_stdout_relay_sink(json_output: bool) -> OutputSink {
-    OutputSink::pick(json_output, OutputSink::Stderr)
-}
-
-fn mcp_merge_sink(json_output: bool) -> OutputSink {
-    OutputSink::pick(json_output, OutputSink::Stderr)
-}
-
 fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &Value) -> String {
     if *NO_COLOR {
         return format!("Call {cmd_name} {}", cmd_args.join(" "));
@@ -3166,30 +3149,6 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
     use std::{mem, process};
-
-    #[test]
-    fn the_tool_call_log_is_suppressed_under_json() {
-        assert_eq!(call_log_sink(false), OutputSink::Stdout);
-        assert_eq!(call_log_sink(true), OutputSink::Suppressed);
-    }
-
-    #[test]
-    fn the_loop_warning_moves_to_stderr_under_json() {
-        assert_eq!(loop_warning_sink(false), OutputSink::Stdout);
-        assert_eq!(loop_warning_sink(true), OutputSink::Stderr);
-    }
-
-    #[test]
-    fn the_tool_stdout_relay_moves_to_stderr_under_json() {
-        assert_eq!(tool_stdout_relay_sink(false), OutputSink::Stdout);
-        assert_eq!(tool_stdout_relay_sink(true), OutputSink::Stderr);
-    }
-
-    #[test]
-    fn the_mcp_merge_line_moves_to_stderr_under_json() {
-        assert_eq!(mcp_merge_sink(false), OutputSink::Stdout);
-        assert_eq!(mcp_merge_sink(true), OutputSink::Stderr);
-    }
 
     #[test]
     fn dedupe_tool_files_prefers_sh_over_py_over_ts() {

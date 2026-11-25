@@ -66,6 +66,10 @@ pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
 pub static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
+pub fn json_output() -> bool {
+    JSON_OUTPUT.load(Ordering::SeqCst)
+}
+
 /// Where a human-facing line goes. Under `--json` stdout carries only the
 /// final report, so a line that would print there moves to stderr or is
 /// dropped instead.
@@ -79,6 +83,16 @@ pub enum OutputSink {
 impl OutputSink {
     pub fn pick(json_output: bool, when_json: OutputSink) -> Self {
         if json_output { when_json } else { Self::Stdout }
+    }
+
+    /// For warnings and progress the user should still see under `--json`.
+    pub fn diagnostic() -> Self {
+        Self::pick(json_output(), Self::Stderr)
+    }
+
+    /// For lines that only narrate a run and are dropped under `--json`.
+    pub fn chatter() -> Self {
+        Self::pick(json_output(), Self::Suppressed)
     }
 
     pub fn println(self, line: impl Display) {
@@ -393,24 +407,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn without_json_every_sink_is_stdout() {
-        for when_json in [
-            OutputSink::Stdout,
-            OutputSink::Stderr,
-            OutputSink::Suppressed,
-        ] {
-            assert_eq!(OutputSink::pick(false, when_json), OutputSink::Stdout);
-        }
-    }
-
-    #[test]
-    fn under_json_the_requested_sink_wins() {
-        for when_json in [
-            OutputSink::Stdout,
-            OutputSink::Stderr,
-            OutputSink::Suppressed,
-        ] {
-            assert_eq!(OutputSink::pick(true, when_json), when_json);
+    fn pick_is_stdout_without_json_and_the_requested_sink_under_it() {
+        let cases = [
+            (false, OutputSink::Stdout, OutputSink::Stdout),
+            (false, OutputSink::Stderr, OutputSink::Stdout),
+            (false, OutputSink::Suppressed, OutputSink::Stdout),
+            (true, OutputSink::Stdout, OutputSink::Stdout),
+            (true, OutputSink::Stderr, OutputSink::Stderr),
+            (true, OutputSink::Suppressed, OutputSink::Suppressed),
+        ];
+        for (json_output, when_json, expected) in cases {
+            assert_eq!(
+                OutputSink::pick(json_output, when_json),
+                expected,
+                "json_output {json_output}, when_json {when_json:?}"
+            );
         }
     }
 

@@ -448,7 +448,7 @@ async fn run(
         let name = &skills[0];
         paths::validate_skill_name(name)?;
         if !paths::has_skill(name) {
-            if JSON_OUTPUT.load(Ordering::SeqCst) {
+            if json_output() {
                 bail!("Skill '{name}' is not installed");
             }
             let app = Arc::clone(&ctx.app.config);
@@ -679,7 +679,7 @@ async fn run(
     ctx.top_level_agent_started();
     match is_repl {
         false => {
-            let json_output = JSON_OUTPUT.load(Ordering::SeqCst);
+            let json_output = json_output();
             if json_output {
                 ctx.render_mode = RenderMode::Silent;
             }
@@ -776,7 +776,7 @@ async fn start_directive_inner(
         ctx.before_chat_completion(&input)?;
         let graph::dispatch::ChildGraphRun { result, last_run } =
             graph::run_active_agent_graph(ctx, &input, abort_signal.clone()).await?;
-        if !JSON_OUTPUT.load(Ordering::SeqCst) {
+        if !json_output() {
             app.print_markdown(&result.output)?;
         }
         ctx.record_graph_run(app.as_ref(), &input, &result.output, last_run)?;

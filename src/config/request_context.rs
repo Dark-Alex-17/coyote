@@ -54,9 +54,8 @@ use crate::supervisor::notification::NotificationQueue;
 use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
-    AbortSignal, JSON_OUTPUT, OutputSink, UserInterrupt, abortable_run_with_spinner,
-    create_abort_signal, edit_file, estimate_token_length, fuzzy_filter, get_env_name, now,
-    render_prompt, temp_file,
+    AbortSignal, OutputSink, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
+    edit_file, estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -6967,8 +6966,7 @@ impl RequestContext {
             bail!("Loaded skill '{name}' but failed to refresh tool scope: {e}");
         }
 
-        skill_loaded_sink(JSON_OUTPUT.load(std::sync::atomic::Ordering::SeqCst))
-            .println(format_args!("✓ Loaded skill '{name}'."));
+        OutputSink::diagnostic().println(format_args!("✓ Loaded skill '{name}'."));
         report_withheld_tools(&warnings, true);
         Ok(())
     }
@@ -8257,10 +8255,6 @@ fn compose_summarization_request(prompt: &str, prior_summary: &str, chunk: &str)
     }
 }
 
-fn skill_loaded_sink(json_output: bool) -> OutputSink {
-    OutputSink::pick(json_output, OutputSink::Stderr)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::mcp_factory::McpFactory;
@@ -8298,12 +8292,6 @@ mod tests {
     use std::process::Command;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use std::{env, mem};
-
-    #[test]
-    fn the_skill_loaded_line_moves_to_stderr_under_json() {
-        assert_eq!(skill_loaded_sink(false), OutputSink::Stdout);
-        assert_eq!(skill_loaded_sink(true), OutputSink::Stderr);
-    }
 
     // `list_client_names` / `list_all_models` cache the first AppConfig they
     // see in process-wide OnceLocks. Several tests reach them through configs

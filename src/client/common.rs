@@ -22,7 +22,6 @@ use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::LazyLock;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -732,7 +731,7 @@ pub async fn call_chat_completions(
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
                 }
-                if print && !JSON_OUTPUT.load(Ordering::SeqCst) {
+                if print && !json_output() {
                     ctx.app.config.print_markdown(&text)?;
                 }
             }

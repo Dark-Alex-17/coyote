@@ -2427,12 +2427,8 @@ where
     Ok(resolved)
 }
 
-fn rag_progress_sink(json_output: bool) -> OutputSink {
-    OutputSink::pick(json_output, OutputSink::Stderr)
-}
-
 fn rag_progress() -> OutputSink {
-    rag_progress_sink(JSON_OUTPUT.load(std::sync::atomic::Ordering::SeqCst))
+    OutputSink::diagnostic()
 }
 
 #[cfg(test)]
@@ -2444,12 +2440,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn rag_progress_moves_to_stderr_under_json() {
-        assert_eq!(rag_progress_sink(false), OutputSink::Stdout);
-        assert_eq!(rag_progress_sink(true), OutputSink::Stderr);
-    }
 
     struct TempDir {
         path: PathBuf,
