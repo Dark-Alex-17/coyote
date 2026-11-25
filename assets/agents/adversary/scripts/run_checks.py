@@ -158,9 +158,12 @@ Verification tier: `verification_tier` is '' (the default), `round` or
 `final`; any other value executes nothing and records a PIPELINE-FAULT. A
 non-empty tier adds `tier_note`, the facts the criterion checks and the
 holistic pass are given about it. At `final` no command runs at all: the
-finalize record of the worktree tree (`.shared/verify_record.py lookup
---tier finalize`, a tree differing only under `debris_exclude` matching too)
-becomes `exec_results`, one record per result that ran, each with `source:
+finalize record of the reviewed tree becomes `exec_results`. With
+`review_tree` set, that is the record for exactly that tree
+(`verify_record.lookup_exact`) and no `debris_exclude` match applies; with it
+empty, the fallback is the worktree tree as it stands (`verify_record.lookup`,
+a tree differing only under `debris_exclude` matching too). There is one
+run per record result that ran, each with `source:
 "finalize record <tree> @ <recorded_at>"`, its pre-existing failures as a
 pre-existing baseline and its other reds as a regression (or not-run when
 the gate could not classify them). `full_suite_record` gets {status:
@@ -227,7 +230,7 @@ TIER_NOTES = {
     ),
     "final": (
         "\n\nVerification tier: final. This review is the final gate. The runs above come from the "
-        "finalize record of this worktree tree (each names it in `source`) and were not run again; "
+        "finalize record of the reviewed tree (each names it in `source`) and were not run again; "
         "they are recorded runs like any other, so a green one proves a criterion it covers, cited "
         "as that record's run. Nothing is deferred at this tier: a `DEFERRED:` reason counts as "
         "PARTIAL."
@@ -1010,11 +1013,10 @@ def finalize_record_runs(state):
     review_tree = review_tree.strip() if isinstance(review_tree, str) else ""
     if review_tree:
         try:
-            path = verify_record.record_path(proj, review_tree, "finalize")
+            _, record = verify_record.lookup_exact(proj, "finalize", review_tree)
         except (OSError, RuntimeError, subprocess.SubprocessError):
             return missing(review_tree, "git could not locate the verification record store")
-        record = verify_record._read(path, "finalize")
-        if record is None or record["tree"] != review_tree:
+        if record is None:
             return missing(review_tree, f"no finalize record for the reviewed tree {review_tree}")
     else:
         tree = verify_record.worktree_tree(proj)

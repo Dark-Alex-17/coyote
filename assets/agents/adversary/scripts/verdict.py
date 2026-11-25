@@ -39,7 +39,9 @@ An INSPECTED verdict whose no_test_reason starts with DEFERRED_PREFIX (a
 criterion only the whole suite can prove, left to the final gate) is held to
 the same rule, and at the final verification tier it is always PARTIAL:
 that tier is the final gate. At the final tier the
-finalize record run_checks.py looked up for the worktree tree must be green;
+finalize record run_checks.py read must be green: the record for exactly
+`review_tree` when that is set (no `debris_exclude` match applies), else the
+worktree lookup, where a tree differing only under `debris_exclude` matches;
 a missing, other-tree or red record forces DIVERGES with its
 `FULL-SUITE RECORD MISSING|RED: <detail>` line under the header and as the
 first run complaint.
@@ -285,7 +287,8 @@ def demote_unexecuted(verdicts, exec_results, criteria, request, tier=""):
 
 def full_suite_line(state):
     """The FULL-SUITE RECORD line that forces DIVERGES at the final tier, or "" when the
-    finalize record run_checks.py found for the worktree tree is green."""
+    finalize record run_checks.py found is green: exactly `review_tree`'s when that is set,
+    else the worktree lookup's."""
     if state.get("verification_tier") != "final":
         return ""
     record = state.get("full_suite_record")
