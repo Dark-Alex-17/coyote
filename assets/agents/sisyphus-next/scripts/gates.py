@@ -3743,16 +3743,28 @@ def _design_ask(asks, adopted=()):
 def review_gate(state):
     u = {}
     if not _subtask_phase(state) and not truthy(state.get("comment_hygiene_done")) and as_list(state.get("changed_files")):
-        diff, truncated = _whole_task_diff(state)
-        if diff:
-            u["comment_diff"], u["comment_diff_truncated"] = diff, truncated
+        hyg = _whole_task_diff(state)
+        skipped = list(as_list(state.get("skipped_reviews")))
+        if hyg["unread"]:
+            skipped.append("comment hygiene: the truncated diff dropped the start of these files and the pass was not "
+                           "asked to read them, so their added comments were not read for keep/cut/reduce: "
+                           + ", ".join(hyg["unread"]))
+            u["skipped_reviews"] = skipped
+        if hyg["diff"]:
+            u["comment_diff"], u["comment_diff_truncated"] = hyg["diff"], hyg["truncated"]
             u["_next"] = "comment_hygiene"
             return u
         u["comment_hygiene_done"] = True
-        ledger(state, u, "comment hygiene: the whole-task diff came back empty although files changed; the review "
-                         "goes ahead without the pass")
-        u["skipped_reviews"] = list(as_list(state.get("skipped_reviews"))) + [
-            "comment hygiene: the whole-task diff could not be read, so added comments were not read for keep/cut/reduce"]
+        if hyg["error"]:
+            ledger(state, u, f"comment hygiene: git diff failed ({hyg['error']}); the review goes ahead without the pass")
+            skipped.append("comment hygiene: the whole-task diff could not be read, so added comments were not read "
+                           "for keep/cut/reduce")
+        else:
+            ledger(state, u, "comment hygiene: the whole-task diff came back empty although files changed; the review "
+                             "goes ahead without the pass")
+            skipped.append("comment hygiene: the whole-task diff came back empty, so added comments were not read for "
+                           "keep/cut/reduce")
+        u["skipped_reviews"] = skipped
     cadence = var(state, "review_cadence", "task")
     if cadence == "batch":
         u["review_skipped_note"] = ("review cadence batch: no gauntlet / reviewer / observability pass on this task; "
@@ -3789,24 +3801,57 @@ def review_gate(state):
 
 
 COMMENT_DIFF_CAP = 30000
+COMMENT_HYGIENE_FILES_CAP = 20
 
 
 def _whole_task_diff(state):
-    """The diff from the review base to the worktree as it stands, untracked files included, plans dir excluded, and
-    whether the cap dropped its start.
+    """The diff from the review base to the worktree as it stands, untracked files included, plans dir excluded, as
+    {"diff", "truncated", "error", "unread"}; `error` is the head of git's stderr when the diff failed.
 
-    A truncated diff opens with a marker naming the files whose headers fell in the dropped part, so the node reads
-    them from disk instead."""
+    A truncated diff opens with a marker naming the first COMMENT_HYGIENE_FILES_CAP files whose headers fell in the
+    dropped part, each with its added-line ranges, so the node reads only those lines from disk and leaves older
+    comments alone. The files past the cap, or all of them when the ranges cannot be read, land in `unread`."""
     root = state.get("git_root") or state.get("project_dir") or "."
     tree = _worktree_tree(root)
-    code, out, _ = git(root, "diff", "--no-color", "--no-ext-diff", "-U3", state.get("base_sha") or "HEAD",
-                       *([tree] if tree else []), "--", ".", *_plans_exclude(state, root), timeout=120)
-    out = out if code == 0 else ""
+    spec = (state.get("base_sha") or "HEAD", *([tree] if tree else []), "--", ".", *_plans_exclude(state, root))
+    code, out, err = git(root, "diff", "--no-color", "--no-ext-diff", "-U3", *spec, timeout=120)
+    if code != 0:
+        return {"diff": "", "truncated": False, "error": err.strip()[:200] or f"exit {code}", "unread": []}
     if len(out) <= COMMENT_DIFF_CAP:
-        return out, False
-    dropped = re.findall(r"(?m)^diff --git a/.* b/(.*)$", out[:-COMMENT_DIFF_CAP])
-    return (f"[diff truncated: the start was dropped; read these files with the tools: {', '.join(dropped)}]\n"
-            + out[-COMMENT_DIFF_CAP:]), True
+        return {"diff": out, "truncated": False, "error": "", "unread": []}
+    dropped = list(_hunk_ranges(out[:-COMMENT_DIFF_CAP]))
+    code, exact, _ = git(root, "diff", "--no-color", "--no-ext-diff", "-U0", *spec, timeout=120)
+    if code == 0:
+        ranges = _hunk_ranges(exact)
+        added = [f for f in dropped if ranges.get(f)]
+        named, unread = added[:COMMENT_HYGIENE_FILES_CAP], added[COMMENT_HYGIENE_FILES_CAP:]
+    else:
+        ranges, named, unread = {}, [], dropped
+    listed = "; ".join(f"{f}: " + ", ".join(f"+{s}" if n == 1 else f"+{s}-{s + n - 1}" for s, n in ranges[f])
+                       for f in named) or "none"
+    marker = (f"[diff truncated: the start was dropped; read only these added lines (new-file line numbers) with "
+              f"the tools: {listed}]\n")
+    return {"diff": marker + out[-COMMENT_DIFF_CAP:], "truncated": True, "error": "", "unread": unread}
+
+
+def _hunk_ranges(diff):
+    """Each file the diff writes to, in diff order, mapped to the (start, count) of its hunks' new side that add
+    lines; a deleted file is left out."""
+    files, cur, in_header = {}, None, False
+    for l in diff.splitlines():
+        if l.startswith("diff --git "):
+            cur, in_header = None, True
+        elif in_header and l.startswith("+++ "):
+            # read only inside the file header: an added line "++ b/x" also starts with "+++ b/"
+            cur = l[6:] if l.startswith("+++ b/") else None
+            if cur is not None:
+                files.setdefault(cur, [])
+        elif l.startswith("@@"):
+            in_header = False
+            m = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", l)
+            if cur is not None and m and m.group(2) != "0":
+                files[cur].append((int(m.group(1)), int(m.group(2) or 1)))
+    return files
 
 
 def comment_hygiene_route(state):

@@ -132,9 +132,9 @@ scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1532:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:2313:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
-scripts/smoke_test.py:3099:u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", ...)
+scripts/smoke_test.py:1535:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:2316:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
+scripts/smoke_test.py:3102:u = AA("probe_gap", "Supply the recipe (type it); amend the plan and re-run the probe once: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:792` is the alternation of the executable-criterion

@@ -7359,31 +7359,84 @@ with scenario("comment hygiene: a re-entered run keeps comment_hygiene_done, so 
           and _hg.get("_next") == "build_gauntlet_prompt", (_hre.get("comment_hygiene_done"), _hg.get("_next")))
 with scenario("comment hygiene: an empty whole-task diff with changed files fails open from review_gate without "
               "the llm") as name:
-    _hg = gates.review_gate(hyg_state(base_sha="0" * 40, skipped_reviews=["earlier"]))
+    _hg = gates.review_gate(hyg_state(base_sha=gates._worktree_tree(HYG), skipped_reviews=["earlier"]))
     check(name, _hg.get("_next") == "build_gauntlet_prompt" and _hg.get("comment_hygiene_done") is True
           and not _hg.get("comment_diff") and _hg.get("skipped_reviews", [])[:1] == ["earlier"]
           and any("comment hygiene" in s for s in _hg.get("skipped_reviews", [])[1:])
-          and any(d.startswith("comment hygiene:") for d in _hg.get("decisions", [])), _hg)
+          and any(d.startswith("comment hygiene: the whole-task diff came back empty") for d in _hg.get("decisions", [])),
+          _hg)
+with scenario("comment hygiene: a failed git diff ledgers as a failure with git's stderr, not as an empty diff") as name:
+    _hg = gates.review_gate(hyg_state(base_sha="0" * 40, skipped_reviews=["earlier"]))
+    _hd = [d for d in _hg.get("decisions", []) if d.startswith("comment hygiene:")]
+    check(name, _hg.get("_next") == "build_gauntlet_prompt" and _hg.get("comment_hygiene_done") is True
+          and len(_hd) == 1 and _hd[0].startswith("comment hygiene: git diff failed (") and "0000000" in _hd[0]
+          and "empty" not in _hd[0] and any("could not be read" in s for s in _hg.get("skipped_reviews", [])[1:]),
+          _hd)
+
+
+def hyg_repo(path, committed=()):
+    """A temp repo whose one commit holds the (name, text) pairs in `committed`; returns that commit."""
+    os.makedirs(path)
+    for _n, _t in committed:
+        open(os.path.join(path, _n), "w").write(_t)
+    for _a in (("init", "-q"), ("add", "-A"), ("commit", "-q", "--allow-empty", "-m", "init")):
+        subprocess.run(["git", "-C", path, *_a], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    return subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+
+# a filler past COMMENT_DIFF_CAP that sorts last, so every file before it falls in the dropped start
+_HYG_FILLER = ("y" * 20 + "\n") * 2000
 HYG_BIG = os.path.join(TMP, "hygiene-big")
-os.makedirs(HYG_BIG)
-for _a in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "init")):
-    subprocess.run(["git", "-C", HYG_BIG, *_a], check=True, capture_output=True,
-                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+HYG_BIG_BASE = hyg_repo(HYG_BIG)
 open(os.path.join(HYG_BIG, "a_big.txt"), "w").write("x" * 20 + "\n" + ("y" * 20 + "\n") * 2000)
 open(os.path.join(HYG_BIG, "b.py"), "w").write("# kept\nx = 1\n")
 with scenario("comment hygiene: a truncated diff names the files whose start was dropped, and the counts line "
               "says so") as name:
     _hg = gates.review_gate(hyg_state(project_dir=HYG_BIG, git_root=HYG_BIG, changed_files=["a_big.txt", "b.py"],
-                                      base_sha=subprocess.run(["git", "-C", HYG_BIG, "rev-parse", "HEAD"],
-                                                              capture_output=True, text=True).stdout.strip()))
+                                      base_sha=HYG_BIG_BASE))
     _hr = gates.comment_hygiene_route(hyg_state(comment_cuts=[], comment_read=1, last_node_output="{}",
                                                 comment_diff_truncated=_hg.get("comment_diff_truncated")))
     check(name, _hg.get("_next") == "comment_hygiene" and _hg.get("comment_diff", "").startswith(
-              "[diff truncated: the start was dropped; read these files with the tools: a_big.txt]\n")
+              "[diff truncated: the start was dropped; ") and "a_big.txt" in _hg["comment_diff"].split("\n", 1)[0]
           and "+# kept" in _hg.get("comment_diff", "")
           and _hr.get("comment_hygiene_line") == "Comment hygiene: 1 added comments read, 0 cut, 0 reduced (diff truncated)",
           (_hg.get("comment_diff", "")[:200], _hr.get("comment_hygiene_line")))
+with scenario("comment hygiene: the truncation marker gives each dropped file its added-line ranges") as name:
+    _hm = gates.review_gate(hyg_state(project_dir=HYG_BIG, git_root=HYG_BIG, changed_files=["a_big.txt", "b.py"],
+                                      base_sha=HYG_BIG_BASE)).get("comment_diff", "").split("\n", 1)[0]
+    check(name, _hm == "[diff truncated: the start was dropped; read only these added lines (new-file line numbers) "
+                      "with the tools: a_big.txt: +1-2001]", _hm)
+HYG_MOD = os.path.join(TMP, "hygiene-mod")
+HYG_MOD_BASE = hyg_repo(HYG_MOD, (("a_mod.txt", "".join(f"line {i}\n" for i in range(1, 2001))),
+                                  ("d_gone.txt", "# gone\n" * 10)))
+open(os.path.join(HYG_MOD, "a_mod.txt"), "w").write(
+    "".join(f"# changed {i}\n" if 500 <= i <= 502 else f"line {i}\n" for i in range(1, 2001)))
+os.remove(os.path.join(HYG_MOD, "d_gone.txt"))
+open(os.path.join(HYG_MOD, "z_big.txt"), "w").write(_HYG_FILLER)
+_hmod = gates.review_gate(hyg_state(project_dir=HYG_MOD, git_root=HYG_MOD, base_sha=HYG_MOD_BASE,
+                                    changed_files=["a_mod.txt", "d_gone.txt", "z_big.txt"]))
+_hmod_marker = _hmod.get("comment_diff", "").split("\n", 1)[0]
+with scenario("comment hygiene: a dropped file changed in one region is named with that region's lines only, not "
+              "the whole file") as name:
+    check(name, "a_mod.txt: +500-502" in _hmod_marker and "a_mod.txt: +1" not in _hmod_marker, _hmod_marker)
+with scenario("comment hygiene: a file the diff deletes is not named in the truncation marker") as name:
+    check(name, _hmod_marker.startswith("[diff truncated:") and "d_gone.txt" not in _hmod_marker, _hmod_marker)
+HYG_CAP = os.path.join(TMP, "hygiene-cap")
+HYG_CAP_BASE = hyg_repo(HYG_CAP)
+for _i in range(22):
+    open(os.path.join(HYG_CAP, f"f{_i:02}.txt"), "w").write("# note\nx = 1\n")
+open(os.path.join(HYG_CAP, "z_big.txt"), "w").write(_HYG_FILLER)
+with scenario("comment hygiene: dropped files past the cap are not named and land in skipped_reviews") as name:
+    _hc = gates.review_gate(hyg_state(project_dir=HYG_CAP, git_root=HYG_CAP, base_sha=HYG_CAP_BASE,
+                                      changed_files=["f00.txt"], skipped_reviews=["earlier"]))
+    _hcm = _hc.get("comment_diff", "").split("\n", 1)[0]
+    _hcs = _hc.get("skipped_reviews", [])
+    check(name, _hc.get("_next") == "comment_hygiene" and "f19.txt: +1-2" in _hcm
+          and "f20.txt" not in _hcm and "f21.txt" not in _hcm and _hcs[:1] == ["earlier"] and len(_hcs) == 2
+          and _hcs[1].startswith("comment hygiene:") and _hcs[1].endswith(": f20.txt, f21.txt, z_big.txt"),
+          (_hcm[-120:], _hcs))
 with scenario("comment_hygiene_route: counts a reduce by its `reduce to:` text, whatever separator precedes it") as name:
     _hr = gates.comment_hygiene_route(hyg_state(comment_cuts=["a.py:3 reduce to: Keeps the order stable."],
                                                 comment_read=2, last_node_output="{}"))

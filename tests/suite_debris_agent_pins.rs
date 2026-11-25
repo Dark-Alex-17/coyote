@@ -249,7 +249,8 @@ fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
     let section = &sisyphus[pass..batch];
     for anchor in [
         "`comment-discipline`'s `## Final-diff pass`",
-        "git diff --no-color --no-ext-diff <base>..HEAD -- :/ \":(top,literal,exclude)<plans dir>\"",
+        "`git add -N <new files>`",
+        "git diff --no-color --no-ext-diff <base> -- :/ \":(top,literal,exclude)<plans dir>\"",
         "resume the SAME coder session",
         "before the first review of the finished work",
         "`Comment hygiene:` line",
