@@ -464,9 +464,12 @@ there, with the reason in the report.
 
 `retro_size` judges whether the task is a large body of work and gives a one-line reason; the
 examples in its instructions prompt judgement and are not a threshold. `retro_size_route` sends
-a large task to `run_retrospective` (the `design-retrospective` agent over `<run base>..HEAD`,
-`timeout: 3600`, one attempt) and anything else, a missing judgement included, to
+a large task to `run_retrospective` (the `design-retrospective` agent, `timeout: 3600`, one
+attempt) and anything else, a missing judgement included, to
 `observability_gate` with the reason noted.
+Its prompt gives the bare run base as `Diff:`, which the agent's tools diff against the working
+tree, so an uncommitted change is reviewed too; a dirty tree adds a `Tree state:` line naming
+`get_diff --base <run base>` and `get_changed_files --base <run base>`.
 
 `retro_triage` adopts, declines or defers each item; `retro_route` routes on that and on the
 agent's first line (`DESIGN_RETROSPECTIVE: REFACTORS <n>` or `DESIGN_RETROSPECTIVE: CLEAN`).
@@ -474,8 +477,9 @@ Each decline is ledgered as `retro-declined: <item> -- <reason>` and deferred it
 follow-ups. Adopted items go to `compose_fix` as one coder round (`fix_source: retrospective`),
 which runs the normal gates and a fresh review round; its green review finds `retro_done` set
 and goes on to `observability_gate`. With the review rounds already spent, adopted items become
-follow-ups instead. A failed triage of a REFACTORS reply keeps the items as one follow-up that
-points at the saved report. One leading code-fence line before the first line is skipped; any
+follow-ups instead. A REFACTORS reply whose triage fails or decides none of its items keeps
+them as one follow-up that points at the saved report. One leading code-fence line before the
+first line is skipped; any
 other text before it is a fault. A CLEAN result or a fault goes on to `observability_gate`.
 The retrospective itself never blocks completion; an adopted refactor round runs under the
 normal gates and can escalate like any fix round. The run report's `Design retrospective:`
