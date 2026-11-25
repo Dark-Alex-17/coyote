@@ -1,7 +1,7 @@
 ---
 description: Calibrate comment density and style to the repository's existing conventions before writing code, and cut the comments that do not earn their keep from a finished diff. Detects the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you already read for pattern matching, or from a declared policy in workspace instructions, then dictates when a comment is warranted. Default when signal is weak - write NO comment. The final-diff pass is the closing judgement read orchestrators run before their last review. Complements ai-slop-remover (which bans comments that restate code in every register).
 ---
-You are about to write or modify code. LLMs systematically over-comment — narrating every block, restating signatures, banner-ing sections — and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling. Across every register, one test governs each comment you write: it must **earn its keep**. If the code already tells the reader, the comment doesn't get written — don't add comments you don't need; make the code tell them instead.
+You are about to write or modify code. LLMs systematically over-comment (narrating every block, restating signatures, banner-ing sections), and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling. Across every register, one test governs each comment you write: the rule below.
 
 ## The rule: a comment earns its keep
 
@@ -70,7 +70,7 @@ Mixed signals (e.g. doc comments everywhere + narrated private code) → combine
 
 Writing-time discipline slips: a long run adds comments one at a time, and each looks harmless in
 its own hunk. An orchestrator closing a task or a run therefore reads the FINISHED diff once more,
-before its last review, and cuts what slipped through.
+before its first review of the finished work, and cuts what slipped through.
 
 1. Take the whole diff from the work's base commit to HEAD, with the run's own plan files
    excluded.

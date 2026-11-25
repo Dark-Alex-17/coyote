@@ -405,8 +405,8 @@ Each smell reads *what it is → how to fix*; match against the diff only:
 
 Implementation debris: text that made sense while the change was being built and means nothing
 to the next reader. Check this section on EVERY diff regardless of where the review stopped: it
-is cheap and mostly mechanical. Each rule reads trigger, then the decidable check, then severity.
-Rules tagged `[convention]` fold with rigor at `poc`/`prototype`; the untagged rule does not, on
+is mostly cheap and mechanical. Each rule reads trigger, then the decidable check, then severity.
+Rules tagged `[convention]` fold with rigor at `poc`/`prototype`; the untagged rules do not, on
 purpose.
 
 The review gauntlet's `debris` lint enforces the glyph set and the vocabulary set mechanically on
@@ -419,7 +419,8 @@ calls the reviewer makes.
   comments). Check each one in its code context against `comment-discipline`'s rule: it earns
   its keep when it adds context the code cannot show (intent, an invariant, an external
   constraint such as a spec clause or an upstream bug), documents behaviour used elsewhere in the
-  codebase that is not visible here, or records the decision behind a choice. It fails when it
+  codebase that is not visible here, or gives the reason for a choice (why this approach over the
+  obvious one, in a sentence beside the code it explains). It fails when it
   restates what easily read code already says, repeats a name or a signature, or narrates the
   plan or the implementation ("now we handle the retry case", "this round adds"). The repo's own
   standards come first: a comment matching a comment-heavy register or a declared policy passes.
@@ -474,7 +475,8 @@ calls the reviewer makes.
   CONTRIBUTING.md, README.md or a code comment. Check: does the text record a decision or an
   evidence ledger rather than explain the code or guide a contributor? Those records belong in
   the plan file or the task log. CONTRIBUTING changes must be contributor guidance (how to
-  build, test, contribute). 🟡 `[convention]`.
+  build, test, contribute). A one-sentence why beside the code it explains is a comment, not a
+  record (see Comment hygiene). 🟡 `[convention]`.
 
 ## 8. Design and structure
 

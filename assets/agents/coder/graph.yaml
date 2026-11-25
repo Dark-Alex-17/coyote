@@ -369,14 +369,12 @@ nodes:
          downstream consumer of your report.
       7. Comments say what the code cannot: intent, an invariant, a
          non-obvious consequence, an external constraint, a
-         behaviour that lives elsewhere in the codebase, or the decision
-         behind a choice.
+         behaviour that lives elsewhere in the codebase, or the reason for
+         a choice (why this approach over the obvious one, in a sentence).
          A comment that restates easily read code is not written: code
          strives to be self-documenting, and the repo's own commenting
-         standards come first (`comment-discipline`). The orchestrator
-         reads every comment you added once more over the final diff and
-         has you cut the ones that do not earn their keep.
-         Never paraphrase the code or narrate the plan. Human register: plain sentences,
+         standards come first (`comment-discipline`). Never narrate the
+         plan. Human register: plain sentences,
          ASCII punctuation only (banned: em/en dashes, ellipsis characters,
          arrows, section signs, multiplication and comparison symbols,
          curly quotes, and the rarer look-alikes: horizontal bar,
@@ -414,7 +412,9 @@ nodes:
          change or not written.
       9. Decisions have a home: records of what was decided or checked go
          in the plan file or the task log, never in CONTRIBUTING, README or
-         code comments. A CONTRIBUTING change must be contributor guidance.
+         code comments. A one-sentence why beside the code it explains is a
+         comment (rule 7), not a record. A CONTRIBUTING change must be
+         contributor guidance.
       10. Names a stranger can read: do not carry a plan's coinage or
           acronym into a module, type or function name. If the plan's name
           only makes sense with the plan open, pick a descriptive one and
