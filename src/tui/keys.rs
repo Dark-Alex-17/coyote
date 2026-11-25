@@ -196,9 +196,6 @@ pub(crate) enum Action {
     OpenEditor,
     /// Repaint from scratch.
     ScheduleFrame,
-    /// Switch mouse reports on (the wheel scrolls) or off (the terminal
-    /// selects text).
-    ToggleMouse,
     /// Put the focused tool row's whole output on the clipboard.
     CopyToolOutput,
     /// Read the clipboard into the composer: its text, or a placeholder
@@ -393,8 +390,8 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(Anywhere, "Ctrl+L", "Redraw the screen"),
         row(
             Anywhere,
-            "Alt+M",
-            "Mouse on: the wheel scrolls; off: the terminal selects text",
+            "Shift+drag / Option+drag",
+            "Select with the terminal instead (Option in iTerm2)",
         ),
         row(Transcript, "Ctrl+X", "Show or hide the todo panel"),
         row(Transcript, "PgUp / PgDn", "Scroll the transcript a page"),
@@ -705,7 +702,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     // protocol Ctrl+Shift+C arrives as an uppercase `C`.
     let code = lowercase(key.code);
     let searching = ctx.popup == Some(PopupKind::HistorySearch);
-    // Job control, repaint and the mouse mode are the terminal's, not the
+    // Job control and repaint are the terminal's, not the
     // modal's: they work the same whatever is on screen. So do the keys
     // that only move the view or copy from it: a question waiting below
     // does not stop the user reading what came before it. Keys that act on
@@ -713,7 +710,6 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     match code {
         KeyCode::Char('z') if ctrl => return Action::Suspend,
         KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
-        KeyCode::Char('m') if alt && !ctrl => return Action::ToggleMouse,
         _ => {}
     }
     let modal = match ctx.layer() {
@@ -2265,11 +2261,6 @@ mod tests {
             (ctrl('t'), running, Action::OpenPager),
             (ctrl('z'), roster, Action::Suspend),
             (
-                press(KeyCode::Char('m'), KeyModifiers::ALT),
-                roster,
-                Action::ToggleMouse,
-            ),
-            (
                 plain(KeyCode::Char('x')),
                 IDLE,
                 Action::ComposerInput(plain(KeyCode::Char('x'))),
@@ -2611,16 +2602,7 @@ mod tests {
                     (ctrl('l'), HELP, Action::ScheduleFrame),
                 ],
             ),
-            (
-                H::Anywhere,
-                "Alt+M",
-                vec![
-                    (alt(KeyCode::Char('m')), TYPING, Action::ToggleMouse),
-                    (alt(KeyCode::Char('m')), INPUT, Action::ToggleMouse),
-                    (alt(KeyCode::Char('m')), BROWSE, Action::ToggleMouse),
-                    (alt(KeyCode::Char('m')), HELP, Action::ToggleMouse),
-                ],
-            ),
+            (H::Anywhere, "Shift+drag / Option+drag", vec![]),
             (
                 H::Transcript,
                 "Ctrl+X",
@@ -3378,6 +3360,12 @@ mod tests {
         ]
     }
 
+    /// The rows that name a mouse gesture rather than a key, so they
+    /// replay nothing; the app's tests pin them.
+    fn is_mouse_row(keys: &str) -> bool {
+        matches!(keys, "Mouse wheel" | "Shift+drag / Option+drag")
+    }
+
     /// Typing handed on to a field, a filter or the composer, or a key
     /// swallowed: what an unbound key produces.
     fn passes_through(action: &Action) -> bool {
@@ -3537,8 +3525,8 @@ mod tests {
             assert_eq!((row.context, row.keys), (*context, *keys), "{row:?}");
             assert_eq!(
                 replays.is_empty(),
-                row.keys == "Mouse wheel",
-                "{row:?}: only a mouse wheel row replays no key"
+                is_mouse_row(row.keys),
+                "{row:?}: only a mouse row replays no key"
             );
             if row.context != HelpContext::ComposerEditing && !replays.is_empty() {
                 assert!(
@@ -3571,7 +3559,7 @@ mod tests {
     #[test]
     fn every_help_label_names_the_keys_its_row_replays() {
         for (row, (_, _, replays)) in KEY_HELP.iter().zip(help_examples()) {
-            if row.keys == "Mouse wheel" {
+            if is_mouse_row(row.keys) {
                 continue;
             }
             let named = label_keys(row.keys);
@@ -3951,21 +3939,10 @@ mod tests {
         }
     }
 
-    /// Alt+M switches the mouse mode whatever is open, typing fields and
-    /// the pager's find included; Alt+C copies wherever the transcript
-    /// keys reach and over a child's thread, and the other overlays that
-    /// cover the transcript keep it.
+    /// Alt+C copies wherever the transcript keys reach and over a child's
+    /// thread, and the other overlays that cover the transcript keep it.
     #[test]
-    fn alt_m_toggles_the_mouse_everywhere_and_alt_c_copies_from_the_transcript() {
-        let alt_m = press(KeyCode::Char('m'), KeyModifiers::ALT);
-        let shifted_alt_m = press(KeyCode::Char('M'), KeyModifiers::ALT | KeyModifiers::SHIFT);
-        for ctx in [
-            IDLE, TYPING, RUNNING, VI_NORMAL, CONFIRM, INPUT, PASSWORD, SELECT, SEARCH, ROSTER,
-            BROWSE, FIND, PICKER, HELP,
-        ] {
-            assert_eq!(map_key(alt_m, &ctx), Action::ToggleMouse, "{ctx:?}");
-            assert_eq!(map_key(shifted_alt_m, &ctx), Action::ToggleMouse, "{ctx:?}");
-        }
+    fn alt_c_copies_from_the_transcript() {
         let alt_c = press(KeyCode::Char('c'), KeyModifiers::ALT);
         for ctx in [
             IDLE, TYPING, FOCUSED, RUNNING, VI_NORMAL, CONFIRM, INPUT, PASSWORD, SELECT, SEARCH,

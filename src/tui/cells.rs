@@ -604,7 +604,7 @@ pub(super) const COLLAPSED_ARROW: &str = "\u{25B8} ";
 pub(super) const EXPANDED_ARROW: &str = "\u{25BE} ";
 /// How far an open tool row's narration and output sit in from its
 /// header.
-const BODY_INDENT: &str = "  ";
+pub(super) const BODY_INDENT: &str = "  ";
 
 /// The fewest argument characters a header keeps when the row is too
 /// narrow for `SHORT_ARGS_BUDGET`, the `...` included.

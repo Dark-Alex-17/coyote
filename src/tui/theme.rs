@@ -42,6 +42,7 @@ struct Palette {
     raised: Rgb,
     chrome: Rgb,
     faded: Rgb,
+    selection: Rgb,
 }
 
 /// One blue-grey hue; the light palette mirrors the dark one's lightness.
@@ -50,12 +51,14 @@ const DARK_PALETTE: Palette = Palette {
     raised: (0x2a, 0x30, 0x42),
     chrome: (0x16, 0x19, 0x22),
     faded: (0x9a, 0xa5, 0xbf),
+    selection: (0x3b, 0x4a, 0x6b),
 };
 const LIGHT_PALETTE: Palette = Palette {
     base: (0xec, 0xef, 0xf5),
     raised: (0xdd, 0xe2, 0xec),
     chrome: (0xf6, 0xf7, 0xfa),
     faded: (0x56, 0x60, 0x7a),
+    selection: (0xc5, 0xd3, 0xec),
 };
 
 /// The colours a sub-session's state is drawn in.
@@ -254,6 +257,8 @@ pub(super) struct Theme {
     pub(super) thread_running: Style,
     pub(super) thread_completed: Style,
     pub(super) thread_failed: Style,
+    /// Text selected with the mouse; reversed under `NO_COLOR`.
+    pub(super) selection: Style,
 }
 
 impl Theme {
@@ -312,6 +317,11 @@ impl Theme {
             thread_running: thread(threads.running),
             thread_completed: thread(threads.completed),
             thread_failed: thread(threads.failed),
+            selection: if no_color {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new().bg(rgb(palette.selection))
+            },
         }
     }
 }
@@ -371,6 +381,7 @@ mod tests {
             assert_eq!(theme.surface_raised, Style::new().bg(rgb(palette.raised)));
             assert_eq!(theme.surface_chrome, Style::new().bg(rgb(palette.chrome)));
             assert_eq!(theme.faded, Style::new().fg(rgb(palette.faded)));
+            assert_eq!(theme.selection, Style::new().bg(rgb(palette.selection)));
             let plain = renderer(false);
             let theme = Theme::new(plain.markdown_render(), false, light);
             for style in [

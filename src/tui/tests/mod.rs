@@ -3405,6 +3405,12 @@ fn the_mouse_scrolls_the_view_and_opens_the_row_it_clicks() {
             .handle_input(mouse(MouseEventKind::Down(MouseButton::Left), 4, row))
             .is_none()
     );
+    assert!(
+        harness
+            .app
+            .handle_input(mouse(MouseEventKind::Up(MouseButton::Left), 4, row))
+            .is_none()
+    );
     assert!(harness.app.transcript.focused());
     assert!(matches!(
         &harness.app.transcript.cells()[1],
@@ -6137,8 +6143,7 @@ fn footer_counts(harness: &mut Harness) -> String {
     let frame = harness.draw();
     let footer = frame.lines().last().unwrap_or_default();
     let start = footer.find("agents").expect("the footer has its counts");
-    let end = footer.find("mouse").expect("the footer has the mouse mode");
-    footer[start..end].trim().to_string()
+    footer[start..].trim_end_matches('"').trim().to_string()
 }
 
 /// The turn holds the context while it runs, so the footer counts

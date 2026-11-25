@@ -351,10 +351,10 @@ fn dot_keys_with_an_argument_or_a_second_line_does_not_open_the_help() {
     );
 }
 
-/// Paging through the key help reaches the mouse switch and the copy
-/// chord, each with its description.
+/// Paging through the key help reaches the terminal's own selection and
+/// the copy chord, each with its description.
 #[test]
-fn the_key_help_lists_the_mouse_switch_and_the_copy_chord() {
+fn the_key_help_lists_the_terminal_selection_and_the_copy_chord() {
     let mut harness = Harness::standalone(80, 24);
     harness.press(KeyCode::Char('?'));
     let frame = harness.draw();
@@ -364,7 +364,10 @@ fn the_key_help_lists_the_mouse_switch_and_the_copy_chord() {
     );
     let help = squeezed(&help_pages(&mut harness).join("\n"));
     for (chord, row) in [
-        ("Alt+M", "Alt+M Mouse on: the wheel scrolls"),
+        (
+            "Shift+drag",
+            "Shift+drag / Option+drag Select with the terminal instead",
+        ),
         ("Alt+C", "Alt+C Copy the focused tool call"),
     ] {
         assert!(

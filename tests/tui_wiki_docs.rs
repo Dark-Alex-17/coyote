@@ -816,26 +816,14 @@ fn tui_page_quotes_the_code() {
     let footer_text = fn_body(
         tui,
         "fn parts(&self, (agents, jobs): (usize, usize)) -> Vec<String> {",
-    ) + &fn_body(
-        tui,
-        "fn footer_right(mouse_capture: bool, usage: &str, theme: &Theme) -> Line<'static> {",
-    );
+    ) + &fn_body(tui, "fn footer_right(usage: &str) -> Line<'static> {");
     let mut footer: Vec<String> = string_literals(&footer_text)
         .iter()
         .filter(|literal| literal.chars().any(char::is_alphabetic))
         .map(|literal| literal.replace("{agents}", "<n>").replace("{jobs}", "<n>"))
         .collect();
     footer.sort();
-    assert_eq!(
-        footer,
-        [
-            "agents <n>",
-            "jobs <n>",
-            "mouse scroll",
-            "mouse select",
-            "no session"
-        ]
-    );
+    assert_eq!(footer, ["agents <n>", "jobs <n>", "no session"]);
     let bottom = src(&["tui", "bottom_pane.rs"]);
     let search = const_str(&bottom, "SEARCH_LABEL");
     let rewind = literal_with(rewind_code, "Rewind stops at the last ");
@@ -862,7 +850,7 @@ fn tui_page_quotes_the_code() {
         .map(str::trim);
     assert_eq!(suspend, Some("#[cfg(unix)]"), "suspend is unix-only");
     assert!(src(&["tui", "terminal.rs"]).contains("WriteConsoleW"));
-    assert!(src(&["tui", "terminal.rs"]).contains("EnableMouseCapture"));
+    assert!(src(&["tui", "terminal.rs"]).contains("\\x1b[?1000h\\x1b[?1002h\\x1b[?1006h"));
     assert!(src(&["config", "input.rs"]).contains("left the group with setsid"));
     let editor = fn_body(&src(&["config", "app_config.rs"]), "pub fn editor(&self)");
     assert!(editor.contains("env::var(\"VISUAL\")") && editor.contains("env::var(\"EDITOR\")"));

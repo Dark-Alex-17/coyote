@@ -5,6 +5,7 @@ mod stream;
 pub use inquire::prompt_theme;
 
 pub use self::markdown::{MarkdownRender, RenderOptions};
+pub(crate) use self::markdown::{SOFT_BREAK_SPACE, SOFT_BREAK_WORD, broke_at_space};
 use self::stream::{markdown_stream, raw_stream};
 
 use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, error_text, pretty_error};

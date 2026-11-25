@@ -286,12 +286,25 @@ fn render_markdown_line(
     styles: &MarkdownStyles,
     wrap_width: Option<u16>,
 ) -> String {
+    render_marked_markdown_line(line, kind, styles, wrap_width, false)
+}
+
+/// `render_markdown_line`, with each row a list item or a quote wraps
+/// onto led by a soft-break mark when `soft_breaks` is set.
+fn render_marked_markdown_line(
+    line: &str,
+    kind: LineKind,
+    styles: &MarkdownStyles,
+    wrap_width: Option<u16>,
+    soft_breaks: bool,
+) -> String {
+    let wrap = wrap_width.map(|width| (width, soft_breaks));
     match kind {
         LineKind::Heading(level) => render_heading(line, level, styles),
-        LineKind::Blockquote => render_blockquote(line, styles, wrap_width),
-        LineKind::BulletItem => render_bullet(line, styles, wrap_width),
-        LineKind::NumberedItem => render_numbered(line, styles, wrap_width),
-        LineKind::TaskItem(checked) => render_task(line, checked, styles, wrap_width),
+        LineKind::Blockquote => render_blockquote(line, styles, wrap),
+        LineKind::BulletItem => render_bullet(line, styles, wrap),
+        LineKind::NumberedItem => render_numbered(line, styles, wrap),
+        LineKind::TaskItem(checked) => render_task(line, checked, styles, wrap),
         LineKind::HorizontalRule => render_hrule(styles),
         LineKind::TableRow | LineKind::TableSeparator => apply_inline(line, styles),
         LineKind::Paragraph => apply_inline(line, styles),
@@ -308,13 +321,49 @@ fn kind_pre_wraps(kind: LineKind) -> bool {
     )
 }
 
-fn wrap_styled_content(styled: &str, effective_width: usize) -> Vec<String> {
+/// Leads a row a wrap continued, when the renderer is asked to mark soft
+/// breaks: the first where the wrap took out a space, the second where it
+/// broke inside a word. Both are Unicode noncharacters, which text meant
+/// for display never holds (private-use code points do: icon fonts draw
+/// them), and the TUI strips them from its input before rendering.
+pub(crate) const SOFT_BREAK_SPACE: char = '\u{FDD0}';
+pub(crate) const SOFT_BREAK_WORD: char = '\u{FDD1}';
+
+/// Whether textwrap took out whitespace before `piece`, a row it cut from
+/// `source`. A row it copied rather than borrowed (one it indented) counts
+/// as a break at whitespace.
+pub(crate) fn broke_at_space(source: &str, piece: &str) -> bool {
+    let offset = (piece.as_ptr() as usize).wrapping_sub(source.as_ptr() as usize);
+    source
+        .get(..offset)
+        .is_none_or(|before| before.ends_with(char::is_whitespace))
+}
+
+fn soft_break_mark(source: &str, piece: &str) -> char {
+    if broke_at_space(source, piece) {
+        SOFT_BREAK_SPACE
+    } else {
+        SOFT_BREAK_WORD
+    }
+}
+
+fn wrap_styled_content(styled: &str, effective_width: usize, soft_breaks: bool) -> Vec<String> {
     let effective_width = effective_width.max(1);
-    let wrapped: Vec<String> = textwrap::wrap(styled, effective_width)
-        .into_iter()
-        .map(|c| c.into_owned())
+    let pieces = textwrap::wrap(styled, effective_width);
+    let marks: Vec<Option<char>> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| (soft_breaks && i > 0).then(|| soft_break_mark(styled, piece)))
         .collect();
-    reflow_ansi_state(wrapped)
+    let wrapped = reflow_ansi_state(pieces.into_iter().map(|c| c.into_owned()).collect());
+    wrapped
+        .into_iter()
+        .zip(marks)
+        .map(|(line, mark)| match mark {
+            Some(mark) => format!("{mark}{line}"),
+            None => line,
+        })
+        .collect()
 }
 
 fn apply_base_style(styled: &str, fg: Color, bold: bool) -> String {
@@ -494,21 +543,21 @@ fn render_heading(line: &str, level: u8, styles: &MarkdownStyles) -> String {
     format!("{indent}{}", apply_base_style(&body, color, true))
 }
 
-fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
+fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap: Option<(u16, bool)>) -> String {
     let (indent, rest) = split_indent(line);
     let content = rest.trim_start_matches('>').trim_start();
     let prefix = "│ ".with(styles.blockquote).to_string();
 
     let styled = apply_base_style(&apply_inline(content, styles), styles.blockquote, false);
 
-    let Some(wrap_width) = wrap_width else {
+    let Some((wrap_width, soft_breaks)) = wrap else {
         return format!("{indent}{prefix}{styled}");
     };
 
     let prefix_width = 2;
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
-    let wrapped = wrap_styled_content(&styled, effective_width);
+    let wrapped = wrap_styled_content(&styled, effective_width, soft_breaks);
     if wrapped.is_empty() {
         return format!("{indent}{prefix}");
     }
@@ -524,12 +573,12 @@ fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16
     out
 }
 
-fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
+fn render_bullet(line: &str, styles: &MarkdownStyles, wrap: Option<(u16, bool)>) -> String {
     let (indent, rest) = split_indent(line);
     let content = rest.get(2..).unwrap_or("");
     let bullet = "•".with(styles.list_bullet).to_string();
 
-    let Some(wrap_width) = wrap_width else {
+    let Some((wrap_width, soft_breaks)) = wrap else {
         return format!("{indent}{bullet} {}", apply_inline(content, styles));
     };
 
@@ -537,7 +586,7 @@ fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let styled = apply_inline(content, styles);
-    let wrapped = wrap_styled_content(&styled, effective_width);
+    let wrapped = wrap_styled_content(&styled, effective_width, soft_breaks);
     if wrapped.is_empty() {
         return format!("{indent}{bullet} ");
     }
@@ -558,7 +607,7 @@ fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -
     out
 }
 
-fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
+fn render_numbered(line: &str, styles: &MarkdownStyles, wrap: Option<(u16, bool)>) -> String {
     let (indent, rest) = split_indent(line);
     let Some(dot_pos) = rest.find('.') else {
         return format!("{indent}{}", apply_inline(rest, styles));
@@ -567,7 +616,7 @@ fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>)
     let after = rest[dot_pos + 1..].trim_start();
     let styled_dot = ".".with(styles.list_bullet).to_string();
 
-    let Some(wrap_width) = wrap_width else {
+    let Some((wrap_width, soft_breaks)) = wrap else {
         return format!(
             "{indent}{number}{styled_dot} {}",
             apply_inline(after, styles)
@@ -578,7 +627,7 @@ fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>)
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let styled = apply_inline(after, styles);
-    let wrapped = wrap_styled_content(&styled, effective_width);
+    let wrapped = wrap_styled_content(&styled, effective_width, soft_breaks);
     if wrapped.is_empty() {
         return format!("{indent}{number}{styled_dot} ");
     }
@@ -603,7 +652,7 @@ fn render_task(
     line: &str,
     checked: bool,
     styles: &MarkdownStyles,
-    wrap_width: Option<u16>,
+    wrap: Option<(u16, bool)>,
 ) -> String {
     let (indent, rest) = split_indent(line);
     let after_bullet = rest.get(2..).unwrap_or("");
@@ -611,7 +660,7 @@ fn render_task(
     let glyph = if checked { "[✓]" } else { "[ ]" };
     let styled_brackets = glyph.with(styles.list_bullet).to_string();
 
-    let Some(wrap_width) = wrap_width else {
+    let Some((wrap_width, soft_breaks)) = wrap else {
         return format!(
             "{indent}{styled_brackets} {}",
             apply_inline(after_brackets, styles)
@@ -622,7 +671,7 @@ fn render_task(
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let styled = apply_inline(after_brackets, styles);
-    let wrapped = wrap_styled_content(&styled, effective_width);
+    let wrapped = wrap_styled_content(&styled, effective_width, soft_breaks);
     if wrapped.is_empty() {
         return format!("{indent}{styled_brackets} ");
     }
@@ -765,6 +814,7 @@ pub struct MarkdownRender {
     code_syntax: Option<SyntaxReference>,
     prev_line_type: LineType,
     wrap_width: Option<u16>,
+    soft_breaks: bool,
     styles: MarkdownStyles,
     table_state: Option<TableState>,
 }
@@ -813,6 +863,7 @@ impl MarkdownRender {
             code_syntax: None,
             prev_line_type: line_type,
             wrap_width,
+            soft_breaks: false,
             styles,
             table_state: None,
             options,
@@ -823,6 +874,13 @@ impl MarkdownRender {
     /// wrapping off. Tables and lists are laid out to this width too.
     pub fn set_wrap_width(&mut self, width: Option<u16>) {
         self.wrap_width = width;
+    }
+
+    /// Leads every row a wrap continues with [`SOFT_BREAK_SPACE`] or
+    /// [`SOFT_BREAK_WORD`], so a reader of the output can join the rows
+    /// back into their source line. Tables are not marked.
+    pub(crate) fn mark_soft_breaks(&mut self) {
+        self.soft_breaks = true;
     }
 
     /// The theme's heading colour, `Reset` when no theme is loaded.
@@ -971,7 +1029,13 @@ impl MarkdownRender {
     }
 
     fn render_rich_markdown_line(&self, line: &str, kind: LineKind) -> String {
-        let styled = render_markdown_line(line, kind, &self.styles, self.wrap_width);
+        let styled = render_marked_markdown_line(
+            line,
+            kind,
+            &self.styles,
+            self.wrap_width,
+            self.soft_breaks,
+        );
         if kind_pre_wraps(kind) {
             styled
         } else {
@@ -1102,7 +1166,7 @@ impl MarkdownRender {
             if is_code && !self.options.wrap_code {
                 return line;
             }
-            wrap(&line, width as usize)
+            wrap(&line, width as usize, self.soft_breaks)
         } else {
             line
         }
@@ -1119,12 +1183,23 @@ impl MarkdownRender {
     }
 }
 
-fn wrap(text: &str, width: usize) -> String {
+fn wrap(text: &str, width: usize, soft_breaks: bool) -> String {
     let indent: usize = text.chars().take_while(|c| *c == ' ').count();
+    let body = &text[indent..];
     let wrap_options = textwrap::Options::new(width)
         .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
         .initial_indent(&text[0..indent]);
-    textwrap::wrap(&text[indent..], wrap_options).join("\n")
+    let mut out = String::with_capacity(text.len());
+    for (i, piece) in textwrap::wrap(body, wrap_options).iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            if soft_breaks {
+                out.push(soft_break_mark(body, piece));
+            }
+        }
+        out.push_str(piece);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]

@@ -12,6 +12,7 @@ use super::help::MARGIN;
 use super::keys::PagerMode;
 use super::render::{self, Renderer};
 use super::roster::RosterState;
+use super::selection::{self, Pos};
 use super::theme::Theme;
 use super::thread_tree::{ThreadNode, ThreadTree, popup_area, toggle_fold, window_start};
 use super::{ChromeKind, DIM, chrome_style};
@@ -899,6 +900,58 @@ impl Pager {
             .saturating_add_signed(isize::try_from(delta).unwrap_or(0));
         self.follow = false;
         self.scrolled = true;
+    }
+
+    /// The rows of text in a pager drawn over `area`.
+    pub(super) fn body(area: Rect) -> Rect {
+        text_area(area)
+    }
+
+    /// The line and column of the last frame's text at screen cell
+    /// `column`, `row` of a pager drawn over `area`; the space under the
+    /// last line counts as the last line's end.
+    pub(super) fn pos_at(&self, column: u16, row: u16, area: Rect) -> Option<Pos> {
+        let body = text_area(area);
+        let (_, _, text) = self.laid_out.as_ref()?;
+        if text.len() == 0 || !body.contains(Position::new(column, row)) {
+            return None;
+        }
+        let line = self.top + usize::from(row - body.y);
+        let column = usize::from(column - body.x);
+        Some(if line < text.len() {
+            Pos::new(0, line, column)
+        } else {
+            Pos::new(0, text.len() - 1, usize::MAX)
+        })
+    }
+
+    /// Lines `first..=last` of the last frame's text as the selection
+    /// copies them.
+    pub(super) fn selection_rows(&self, first: usize, last: usize) -> Vec<selection::Row> {
+        let Some((_, _, text)) = self.laid_out.as_ref() else {
+            return Vec::new();
+        };
+        let empty = Line::default();
+        selection::rows(
+            (first..=last.min(text.len().saturating_sub(1)))
+                .map(|index| (Pos::new(0, index, 0), text.line(index).unwrap_or(&empty))),
+        )
+    }
+
+    /// Paints the lines on show in a pager drawn over `area` that fall
+    /// inside `range`.
+    pub(super) fn paint_selection(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        range: (Pos, Pos),
+        style: Style,
+    ) {
+        let body = text_area(area).intersection(*buf.area());
+        for y in body.top()..body.bottom() {
+            let key = (0, self.top + usize::from(y - body.y));
+            selection::paint_row(buf, body, y, key, range, style);
+        }
     }
 
     pub(super) fn page(&mut self, direction: i32) {

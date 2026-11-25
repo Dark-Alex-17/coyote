@@ -20,65 +20,404 @@ fn copy(text: &str, from: &str) -> Option<Command> {
     })
 }
 
+fn selected(text: &str) -> Option<Command> {
+    copy(text, "the selection")
+}
+
+fn mouse_at(
+    harness: &mut Harness,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+) -> Option<Command> {
+    harness.app.handle_input(TermInput::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }))
+}
+
+fn left_click(harness: &mut Harness, at: (u16, u16)) -> Option<Command> {
+    mouse_at(harness, MouseEventKind::Down(MouseButton::Left), at);
+    mouse_at(harness, MouseEventKind::Up(MouseButton::Left), at)
+}
+
+fn left_drag(harness: &mut Harness, from: (u16, u16), to: (u16, u16)) -> Option<Command> {
+    mouse_at(harness, MouseEventKind::Down(MouseButton::Left), from);
+    mouse_at(harness, MouseEventKind::Drag(MouseButton::Left), to);
+    mouse_at(harness, MouseEventKind::Up(MouseButton::Left), to)
+}
+
+/// The first screen row of the last frame that holds `needle`.
+fn row_with(harness: &Harness, needle: &str) -> u16 {
+    let buffer = harness.terminal.backend().buffer();
+    (0..buffer.area.height)
+        .find(|&y| {
+            let text: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            text.contains(needle)
+        })
+        .unwrap_or_else(|| panic!("no row holds {needle:?}:\n{buffer:?}"))
+}
+
+/// A finished tool row opened from the keyboard, its focus cleared.
+fn opened_tool(harness: &mut Harness, output: &str) {
+    harness.app.begin_turn("look", false);
+    finished_tool(harness, "call-1", "fs_read", output);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.app.handle_key(ctrl(KeyCode::Up));
+    harness.press(KeyCode::Enter);
+    harness.draw();
+}
+
+const PARAGRAPH: &str = "The quick brown fox jumps over the lazy dog and keeps running \
+    across the field until the light goes down behind the hills.";
+
+fn replied(harness: &mut Harness, reply: &str) {
+    harness.app.begin_turn("tell me", false);
+    harness.app.handle_msg(UiMsg::TextDelta(reply.to_string()));
+    harness.app.handle_msg(UiMsg::StreamDone);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.draw();
+}
+
+/// A drag over an open tool row's output copies the text under it with
+/// no indent, and the release leaves the composer alone.
 #[test]
-fn alt_m_flips_the_mouse_mode_the_footer_shows() {
+fn a_drag_over_tool_output_copies_it_without_the_indent() {
     let mut harness = Harness::standalone(80, 24);
-    let frame = harness.draw();
-    assert!(frame.contains("mouse scroll\""), "{frame}");
-
+    opened_tool(&mut harness, "alpha one\nbeta two\n");
+    let alpha = row_with(&harness, "alpha one");
+    let beta = row_with(&harness, "beta two");
     assert_eq!(
-        harness.app.handle_key(alt_char('m')),
-        Some(Command::SetMouseCapture(false))
+        left_drag(&mut harness, (0, alpha), (5, beta)),
+        selected("alpha one\nbeta")
     );
-    let frame = harness.draw();
-    assert!(frame.contains("mouse select\""), "{frame}");
+    assert_eq!(harness.app.composer_text(), "");
+}
 
+/// The copy goes out as an OSC 52 request when there is no system
+/// clipboard, the text whole.
+#[test]
+fn a_dragged_selection_reaches_the_terminal_as_osc52() {
+    let mut harness = Harness::standalone(80, 24);
+    opened_tool(&mut harness, "alpha one\nbeta two\n");
+    let alpha = row_with(&harness, "alpha one");
+    let beta = row_with(&harness, "beta two");
+    let Some(Command::Copy { text, .. }) = left_drag(&mut harness, (0, alpha), (5, beta)) else {
+        panic!("the drag copied nothing");
+    };
+    let mut written = Vec::new();
+    let outcome = copy_to_clipboard_with(&mut written, &text, |_| false);
+    assert_eq!(outcome, CopyOutcome::Osc52 { kept_lines: None });
+    assert_eq!(written, b"\x1b]52;c;YWxwaGEgb25lCmJldGE=\x07");
+}
+
+/// A double click copies the word under it; a triple click the whole
+/// wrapped line, its rows joined back with the spaces the wrap took.
+#[test]
+fn a_double_click_copies_a_word_and_a_triple_click_the_wrapped_line() {
+    let mut harness = Harness::standalone(60, 24);
+    replied(&mut harness, PARAGRAPH);
+    let first = row_with(&harness, "The quick brown");
+    let second = row_with(&harness, "the hills.");
+    assert!(second > first, "the paragraph did not wrap");
+    let brown = (10, first);
+    assert_eq!(left_click(&mut harness, brown), None);
+    assert_eq!(left_click(&mut harness, brown), selected("brown"));
+
+    harness.clock.advance(Duration::from_secs(1));
+    let at = (2, second);
+    assert_eq!(left_click(&mut harness, at), None);
+    left_click(&mut harness, at);
+    assert_eq!(left_click(&mut harness, at), selected(PARAGRAPH));
+}
+
+/// Presses further apart than the double-click window are two clicks.
+#[test]
+fn presses_out_of_the_window_copy_nothing() {
+    let mut harness = Harness::standalone(60, 24);
+    replied(&mut harness, PARAGRAPH);
+    let brown = (10, row_with(&harness, "The quick brown"));
+    left_click(&mut harness, brown);
+    harness.clock.advance(Duration::from_millis(401));
+    assert_eq!(left_click(&mut harness, brown), None);
+}
+
+/// A drag held on the transcript's top row scrolls it a line per drag
+/// event, and the copy reaches the lines that came into view.
+#[test]
+fn a_drag_at_the_top_edge_scrolls_and_extends_the_selection() {
+    let mut harness = Harness::standalone(80, 24);
+    counted_turn(&mut harness, 60);
+    harness.app.handle_key(ctrl(KeyCode::Up));
+    harness.press(KeyCode::Enter);
+    harness.draw();
+    harness.app.transcript.scroll_to_bottom();
+    harness.draw();
+    let last = row_with(&harness, "count 60");
+    let top_text: String = {
+        let buffer = harness.terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect()
+    };
+    let top: usize = top_text.trim()["count ".len()..].parse().unwrap();
+    mouse_at(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (79, last),
+    );
+    for _ in 0..3 {
+        mouse_at(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            (2, 0),
+        );
+        harness.draw();
+    }
+    let Some(Command::Copy { text, .. }) =
+        mouse_at(&mut harness, MouseEventKind::Up(MouseButton::Left), (2, 0))
+    else {
+        panic!("the drag copied nothing");
+    };
+    let first = format!("count {:02}", top - 3);
+    assert!(
+        text.starts_with(&first),
+        "{text:?} does not start at {first}"
+    );
+    assert!(text.ends_with("count 60"), "{text:?}");
+}
+
+/// A press and release on one cell of a tool row's header folds it, as
+/// before, and copies nothing.
+#[test]
+fn a_click_on_a_tool_row_still_folds_it() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("look", false);
+    finished_tool(&mut harness, "call-1", "fs_read", "alpha one\n");
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.draw();
+    let header = row_with(&harness, "\u{25B8} fs_read(");
+    assert_eq!(left_click(&mut harness, (4, header)), None);
+    assert!(harness.draw().contains("alpha one"));
+    harness.clock.advance(Duration::from_secs(1));
+    let header = row_with(&harness, "\u{25BE} fs_read(");
+    assert_eq!(left_click(&mut harness, (4, header)), None);
+    assert!(!harness.draw().contains("alpha one"));
+}
+
+/// A release on a tool row's header folds nothing when the press was
+/// made off the transcript.
+#[test]
+fn a_release_without_a_press_on_the_row_folds_nothing() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("look", false);
+    finished_tool(&mut harness, "call-1", "fs_read", "alpha one\n");
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.draw();
+    let header = row_with(&harness, "\u{25B8} fs_read(");
+    assert_eq!(left_drag(&mut harness, (2, 22), (4, header)), None);
+    assert!(!harness.draw().contains("alpha one"));
+}
+
+/// With history on hand and the composer focused, the wheel scrolls the
+/// transcript and never walks the history.
+#[test]
+fn the_wheel_scrolls_the_transcript_and_never_recalls_history() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.history.push("an older line");
+    counted_turn(&mut harness, 60);
+    harness.app.handle_key(ctrl(KeyCode::Up));
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Esc);
+    harness.draw();
+    for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollUp] {
+        assert_eq!(mouse_at(&mut harness, kind, (2, 22)), None);
+    }
+    harness.draw();
+    assert!(harness.app.transcript.scrolled());
+    assert_eq!(harness.app.composer_text(), "");
+    mouse_at(&mut harness, MouseEventKind::ScrollDown, (2, 22));
+    mouse_at(&mut harness, MouseEventKind::ScrollDown, (2, 22));
+    harness.draw();
+    assert!(!harness.app.transcript.scrolled());
+    assert_eq!(harness.app.composer_text(), "");
+}
+
+/// A drag over a thread view copies its text the same way; its rows
+/// carry no indent.
+#[test]
+fn a_drag_over_the_thread_view_copies_its_text() {
+    let mut harness = Harness::standalone(80, 24);
+    opened_tool(&mut harness, "alpha one\nbeta two\n");
     harness.app.handle_key(ctrl(KeyCode::Char('t')));
+    harness.draw();
+    let alpha = row_with(&harness, "alpha one");
+    let beta = row_with(&harness, "beta two");
     assert_eq!(
-        harness.app.handle_key(alt_char('m')),
-        Some(Command::SetMouseCapture(true)),
-        "the pager does not take Alt+M"
+        left_drag(&mut harness, (0, alpha), (3, beta)),
+        selected("alpha one\nbeta")
     );
+}
+
+/// The selected cells take the selection background; Esc clears the
+/// selection and does nothing else, and the next key works as usual.
+#[test]
+fn a_selection_is_drawn_on_its_background_until_a_key_clears_it() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    opened_tool(&mut harness, "alpha one\nbeta two\n");
+    let alpha = row_with(&harness, "alpha one");
+    let beta = row_with(&harness, "beta two");
+    left_drag(&mut harness, (2, alpha), (5, beta));
+    let frame = harness.draw();
+    insta::assert_snapshot!("selection_80x24", frame);
+    let selection = harness.app.theme.selection.bg;
+    assert!(selection.is_some());
+    let buffer = harness.terminal.backend().buffer();
+    for x in 2..80 {
+        assert_eq!(buffer[(x, alpha)].bg, selection.unwrap(), "column {x}");
+    }
+    for x in 0..6 {
+        assert_eq!(buffer[(x, beta)].bg, selection.unwrap(), "column {x}");
+    }
+    assert_ne!(buffer[(6, beta)].bg, selection.unwrap());
+    assert_ne!(buffer[(0, alpha)].bg, selection.unwrap());
+
+    assert_eq!(harness.press(KeyCode::Esc), None);
+    harness.draw();
+    let buffer = harness.terminal.backend().buffer();
+    assert_ne!(buffer[(3, alpha)].bg, selection.unwrap());
+    assert!(
+        !harness.app.transcript.focused(),
+        "Esc cleared the selection but left the focus"
+    );
+}
+
+/// An Esc pressed over a selection during a turn clears it and still
+/// interrupts the turn: one press, not two.
+#[test]
+fn esc_during_a_turn_clears_the_selection_and_interrupts() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("tell me", false);
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("alpha one\n\nbeta two".to_string()));
+    harness.draw();
+    let alpha = row_with(&harness, "alpha one");
+    assert_eq!(
+        left_drag(&mut harness, (0, alpha), (4, alpha)),
+        selected("alpha")
+    );
+    assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+    assert_eq!(harness.app.selection.current(), None);
+}
+
+/// With nothing but a selection for it to clear, an Esc clears it and
+/// does nothing else.
+#[test]
+fn esc_with_only_a_selection_just_clears_it() {
+    let mut harness = Harness::standalone(80, 24);
+    replied(&mut harness, "alpha one");
+    let alpha = row_with(&harness, "alpha one");
+    left_drag(&mut harness, (0, alpha), (4, alpha));
+    assert!(harness.app.selection.current().is_some());
+    assert_eq!(harness.press(KeyCode::Esc), None);
+    assert_eq!(harness.app.selection.current(), None);
+    assert_eq!(
+        harness.app.last_esc, None,
+        "the Esc counted towards a rewind"
+    );
+}
+
+/// A tool output row that nearly fills the width, followed by a short
+/// line, is two lines of output: the copy keeps the newline.
+#[test]
+fn copying_tool_output_keeps_a_real_newline_after_a_nearly_full_row() {
+    let mut harness = Harness::standalone(40, 24);
+    let full = format!("{} {}", "x".repeat(20), "y".repeat(14));
+    opened_tool(&mut harness, &format!("{full}\ntail\n"));
+    let first = row_with(&harness, &full);
+    let tail = row_with(&harness, "tail");
+    assert_eq!(tail, first + 1);
+    assert_eq!(
+        left_drag(&mut harness, (0, first), (39, tail)),
+        selected(&format!("{full}\ntail"))
+    );
+}
+
+/// A reply line wrapped over several rows copies back as the one line
+/// it was, with the spaces the wrap took out and no newline.
+#[test]
+fn copying_soft_wrapped_prose_rejoins_it_without_a_newline() {
+    let mut harness = Harness::standalone(40, 24);
+    replied(&mut harness, PARAGRAPH);
+    let first = row_with(&harness, "The quick brown");
+    let last = row_with(&harness, "hills.");
+    assert!(last > first + 1, "the paragraph did not wrap");
+    assert_eq!(
+        left_drag(&mut harness, (0, first), (39, last)),
+        selected(PARAGRAPH)
+    );
+}
+
+/// A wrapped list item copies back as one line: the hanging indent its
+/// continuation rows repeat is left out.
+#[test]
+fn copying_a_wrapped_list_item_leaves_out_its_hanging_indent() {
+    let mut harness = Harness::standalone(40, 24);
+    replied(&mut harness, &format!("- {PARAGRAPH}"));
+    let first = row_with(&harness, "The quick brown");
+    let last = row_with(&harness, "hills.");
+    assert!(last > first + 1, "the item did not wrap");
+    assert_eq!(
+        left_drag(&mut harness, (0, first), (39, last)),
+        selected(&format!("\u{2022} {PARAGRAPH}"))
+    );
+}
+
+/// A wrapped quote keeps its bar on the first row only once copied.
+#[test]
+fn copying_a_wrapped_quote_leaves_out_the_repeated_bar() {
+    let mut harness = Harness::standalone(40, 24);
+    replied(&mut harness, &format!("> {PARAGRAPH}"));
+    let first = row_with(&harness, "The quick brown");
+    let last = row_with(&harness, "hills.");
+    assert!(last > first + 1, "the quote did not wrap");
+    assert_eq!(
+        left_drag(&mut harness, (0, first), (39, last)),
+        selected(&format!("\u{2502} {PARAGRAPH}"))
+    );
+}
+
+/// Under `NO_COLOR` the selection is reversed instead.
+#[test]
+fn under_no_color_a_selection_is_reversed() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(true);
+    opened_tool(&mut harness, "alpha one\nbeta two\n");
+    let alpha = row_with(&harness, "alpha one");
+    let beta = row_with(&harness, "beta two");
+    left_drag(&mut harness, (2, alpha), (5, beta));
+    harness.draw();
+    let buffer = harness.terminal.backend().buffer();
+    assert!(buffer[(3, alpha)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(buffer[(3, alpha)].bg, Color::Reset);
+    assert!(!buffer[(3, beta + 1)].modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn the_footer_names_no_mouse_mode_and_alt_m_does_nothing() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.handle_key(ctrl(KeyCode::Char('t')));
+    assert_eq!(harness.app.handle_key(alt_char('m')), None);
     harness
         .app
         .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     let frame = harness.draw();
-    assert!(frame.contains("mouse scroll\""), "{frame}");
-}
-
-/// At 40 columns the left half gives way: the model's start and the
-/// whole mouse mode both stay.
-#[test]
-fn a_narrow_footer_keeps_the_mouse_mode_whole() {
-    let mut harness = Harness::standalone(40, 20);
-    harness.app.handle_key(alt_char('m'));
-    let frame = harness.draw();
-    let footer = frame.lines().rfind(|line| !line.is_empty()).unwrap();
-    assert!(footer.starts_with("\"openai:test-model"), "{frame}");
-    assert!(footer.ends_with(" mouse select\""), "{frame}");
-}
-
-#[test]
-fn a_failed_mouse_switch_puts_the_footer_back_and_says_so() {
-    let mut harness = Harness::standalone(80, 24);
-    assert_eq!(
-        harness.app.handle_key(alt_char('m')),
-        Some(Command::SetMouseCapture(false))
-    );
-    harness
-        .app
-        .mouse_capture_failed(true, &std::io::Error::other("tty gone"));
-    let frame = harness.draw();
-    assert!(frame.contains("mouse scroll\""), "{frame}");
-    assert!(
-        frame.contains("Could not switch the mouse mode: tty gone"),
-        "{frame}"
-    );
-    assert_eq!(
-        harness.app.handle_key(alt_char('m')),
-        Some(Command::SetMouseCapture(false)),
-        "the next Alt+M starts from the mode the terminal is in"
-    );
+    assert!(!frame.contains("mouse"), "{frame}");
 }
 
 #[test]

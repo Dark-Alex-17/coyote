@@ -7,7 +7,9 @@
 
 use super::throbber::Tick;
 use crate::config::is_format_char;
-use crate::render::{MarkdownRender, RenderOptions};
+use crate::render::{
+    MarkdownRender, RenderOptions, SOFT_BREAK_SPACE, SOFT_BREAK_WORD, broke_at_space,
+};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::style::{Color, Modifier, Style};
@@ -186,34 +188,62 @@ fn styled_lines(ansi: &str) -> Vec<Line<'static>> {
     }
 }
 
-/// Wraps each line of `text` to `width` columns; escape sequences do not
-/// count towards the width.
-fn wrap_lines(text: &str, width: u16) -> String {
-    let width = usize::from(width.max(1));
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let pieces = textwrap::wrap(line, width);
-        for (j, piece) in pieces.iter().enumerate() {
-            if j > 0 {
-                out.push('\n');
-            }
-            out.push_str(piece);
-        }
-    }
-    out
+/// The underline colours of a wrap mark: the row joins the one above with
+/// a space, or with nothing.
+const JOIN_WITH_SPACE: Color = Color::Indexed(1);
+const JOIN_WITH_NOTHING: Color = Color::Indexed(0);
+
+/// The empty span that leads a row a wrap continued. It draws nothing (it
+/// has no text, and sets no underline for its colour to show on); the
+/// colour records whether the wrap took out a space, so a copy can join
+/// the row back onto the one above. A row without one starts a line.
+pub(super) fn wrap_mark(at_space: bool) -> Span<'static> {
+    let join = if at_space {
+        JOIN_WITH_SPACE
+    } else {
+        JOIN_WITH_NOTHING
+    };
+    Span::styled("", Style::new().underline_color(join))
 }
 
-/// Plain text wrapped to `width`, every span in `style`. The text is
-/// scrubbed first: whatever is drawn this way (a user line, a notice, an
-/// error, a question) carries no escape or format character to the cell.
+pub(super) fn is_wrap_mark(span: &Span) -> bool {
+    span.content.is_empty()
+        && matches!(
+            span.style.underline_color,
+            Some(JOIN_WITH_SPACE | JOIN_WITH_NOTHING)
+        )
+}
+
+/// What joins `line` to the row above it, when a wrap continued it.
+pub(super) fn wrap_join(line: &Line) -> Option<&'static str> {
+    line.spans
+        .iter()
+        .find(|span| is_wrap_mark(span))
+        .map(|span| match span.style.underline_color {
+            Some(JOIN_WITH_SPACE) => " ",
+            _ => "",
+        })
+}
+
+/// Plain text wrapped to `width`, every span in `style`, each row a wrap
+/// continued led by a [`wrap_mark`]. The text is scrubbed first: whatever
+/// is drawn this way (a user line, a notice, an error, a question) carries
+/// no escape or format character to the cell.
 pub(crate) fn plain_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
-    wrap_lines(&plain_text(text), width)
-        .split('\n')
-        .map(|line| Line::from(Span::styled(line.to_string(), style)))
-        .collect()
+    let text = plain_text(text);
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        for (i, piece) in textwrap::wrap(line, width).iter().enumerate() {
+            let content = Span::styled(piece.to_string(), style);
+            lines.push(if i == 0 {
+                Line::from(content)
+            } else {
+                Line::from(vec![wrap_mark(broke_at_space(line, piece)), content])
+            });
+        }
+    }
+    lines
 }
 
 /// Already-painted output (a command's table) parsed as-is: no wrapping,
@@ -223,9 +253,10 @@ pub(crate) fn preformatted_lines(output: &str) -> Vec<Line<'static>> {
 }
 
 /// Breaks every line wider than `width` at the column boundary, span
-/// styles kept, so nothing the view would clip goes unseen. A tool call's
-/// narration is approved on what is shown; a long argument must not hide
-/// its tail past the right edge.
+/// styles kept and each row after the first led by a [`wrap_mark`], so
+/// nothing the view would clip goes unseen. A tool call's narration is
+/// approved on what is shown; a long argument must not hide its tail past
+/// the right edge.
 pub(crate) fn hard_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let mut out = Vec::with_capacity(lines.len());
@@ -238,6 +269,10 @@ pub(crate) fn hard_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'stat
         let mut row: Vec<Span<'static>> = Vec::new();
         let mut used = 0;
         for span in spans {
+            if is_wrap_mark(&span) {
+                row.push(span);
+                continue;
+            }
             let mut piece = String::new();
             for c in span.content.chars() {
                 let columns = c.width().unwrap_or(0);
@@ -246,6 +281,7 @@ pub(crate) fn hard_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'stat
                         row.push(Span::styled(std::mem::take(&mut piece), span.style));
                     }
                     out.push(Line::from(std::mem::take(&mut row)).style(style));
+                    row.push(wrap_mark(false));
                     used = 0;
                 }
                 piece.push(c);
@@ -296,10 +332,11 @@ impl Renderer {
             .as_deref()
             .and_then(|value| value.parse::<u16>().ok());
         let now = Instant::now();
-        let markdown = MarkdownRender::init(RenderOptions {
+        let mut markdown = MarkdownRender::init(RenderOptions {
             wrap: None,
             ..options
         })?;
+        markdown.mark_soft_breaks();
         Ok(Self {
             markdown,
             wrap_cap,
@@ -318,13 +355,18 @@ impl Renderer {
     /// its painted output afterwards would break border rows mid-cell. Code
     /// lines follow the `wrap_code` option and are otherwise clipped by the
     /// view. A numeric `wrap` setting caps the width below the pane's, as
-    /// it caps the REPL's below the terminal's.
+    /// it caps the REPL's below the terminal's. Each row a wrap continued
+    /// is led by a [`wrap_mark`].
     pub(crate) fn markdown(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
         if source.is_empty() {
             return Vec::new();
         }
         let width = self.wrap_cap.map_or(width, |cap| width.min(cap));
         self.markdown.set_wrap_width(Some(width.max(1)));
+        // The soft-break characters mean a wrap only when the renderer
+        // put them there.
+        let source = source.replace([SOFT_BREAK_SPACE, SOFT_BREAK_WORD], "");
+        let source = source.as_str();
         let mut ansi = self.markdown.render(source);
         let pending_table = self.markdown.finalize();
         if !pending_table.is_empty() {
@@ -339,7 +381,38 @@ impl Renderer {
             self.markdown.render("```");
         }
         styled_lines(&sanitize_ansi(&ansi))
+            .into_iter()
+            .map(take_soft_break)
+            .collect()
     }
+}
+
+/// Swaps the soft-break character the markdown renderer put in a row it
+/// wrapped for a [`wrap_mark`] in the same place: after the hanging indent
+/// or quote bar the row repeats, so the copy can tell that prefix from text.
+fn take_soft_break(line: Line<'static>) -> Line<'static> {
+    let breaks = [SOFT_BREAK_SPACE, SOFT_BREAK_WORD];
+    if !line.spans.iter().any(|span| span.content.contains(breaks)) {
+        return line;
+    }
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    for span in line.spans {
+        let content = span.content.as_ref();
+        let Some((at, mark)) = content.char_indices().find(|(_, c)| breaks.contains(c)) else {
+            spans.push(span);
+            continue;
+        };
+        let before = &content[..at];
+        let after = content[at + mark.len_utf8()..].replace(breaks, "");
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), span.style));
+        }
+        spans.push(wrap_mark(mark == SOFT_BREAK_SPACE));
+        if !after.is_empty() {
+            spans.push(Span::styled(after, span.style));
+        }
+    }
+    Line { spans, ..line }
 }
 
 fn is_fence(line: &str) -> bool {
@@ -617,6 +690,25 @@ mod tests {
         );
     }
 
+    /// A reply's own characters never pass for a wrap: an icon-font glyph
+    /// in the private-use area is drawn, and a soft-break character in the
+    /// source is dropped instead of marking a row.
+    #[test]
+    fn a_replys_own_characters_never_mark_a_wrap() {
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let source = format!("icon \u{E000} here and {SOFT_BREAK_SPACE}x{SOFT_BREAK_WORD}y");
+        let lines = renderer.markdown(&source, 80);
+        let text: String = lines.iter().map(Line::to_string).collect();
+        assert!(text.contains("icon \u{E000} here and xy"), "{text:?}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !is_wrap_mark(span)),
+            "{lines:?}"
+        );
+    }
+
     /// The reset SGR 0 and 49 leave behind is no background at all, so the
     /// surface under the text shows; a background a tool painted stays.
     #[test]
@@ -750,6 +842,58 @@ mod tests {
             .collect();
         assert_eq!(styled, "ijklmnop");
         assert_eq!(hard_wrap(vec![Line::from("ab")], 0).len(), 2);
+    }
+
+    fn joins(lines: &[Line<'_>]) -> Vec<Option<&'static str>> {
+        lines.iter().map(wrap_join).collect()
+    }
+
+    /// Only the rows a wrap made are marked: with a space where it broke
+    /// at one, with nothing where it cut a word; a newline in the text
+    /// starts an unmarked row.
+    #[test]
+    fn plain_lines_marks_wrapped_rows_only() {
+        let lines = plain_lines("one two three\nfour", 8, Style::new());
+        let rows: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(rows, ["one two", "three", "four"]);
+        assert_eq!(joins(&lines), [None, Some(" "), None]);
+        let lines = plain_lines("abcdefghijkl", 5, Style::new());
+        assert_eq!(joins(&lines), [None, Some(""), Some("")]);
+    }
+
+    /// Every row a hard wrap cuts off joins back with nothing, and a mark
+    /// the line already had stays on its first row.
+    #[test]
+    fn hard_wrap_marks_continuations_without_a_space() {
+        let wrapped = hard_wrap(vec![Line::from("fits"), Line::from("abcdefgh")], 6);
+        let rows: Vec<String> = wrapped.iter().map(Line::to_string).collect();
+        assert_eq!(rows, ["fits", "abcdef", "gh"]);
+        assert_eq!(joins(&wrapped), [None, None, Some("")]);
+        let marked = Line::from(vec![wrap_mark(true), Span::raw("abcdefgh")]);
+        assert_eq!(joins(&hard_wrap(vec![marked], 6)), [Some(" "), Some("")]);
+    }
+
+    /// Prose and list items the renderer wraps come back marked, a word
+    /// too long for a row cut with no space, and the renderer's own
+    /// characters for the marks are gone. Source lines are never joined.
+    #[test]
+    fn markdown_prose_marks_soft_wraps() {
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let prose = renderer.markdown("one two three four five six", 10);
+        assert_eq!(joins(&prose), [None, Some(" "), Some(" ")], "{prose:?}");
+        let list = renderer.markdown("- alpha beta gamma delta", 12);
+        assert_eq!(joins(&list), [None, Some(" "), Some(" ")], "{list:?}");
+        let word = renderer.markdown(&"x".repeat(25), 10);
+        assert_eq!(joins(&word), [None, Some(""), Some("")], "{word:?}");
+        let quote = renderer.markdown("> first line\n> second", 40);
+        assert_eq!(joins(&quote), [None, None], "{quote:?}");
+        for line in prose.iter().chain(&list).chain(&word) {
+            let text = line.to_string();
+            assert!(
+                !text.contains([SOFT_BREAK_SPACE, SOFT_BREAK_WORD]),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

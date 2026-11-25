@@ -1,7 +1,7 @@
 //! Real-process checks of commands typed during a turn, the welcome
 //! screen and the footer, the elapsed time a long turn shows, and the mouse
-//! switch. Every module drives the binary through the shared pty harness in
-//! `common`, so the file is unix-only.
+//! reports. Every module drives the binary through the shared pty harness
+//! in `common`, so the file is unix-only.
 #![cfg(unix)]
 
 mod common;
@@ -178,8 +178,8 @@ mod mid_turn_commands {
 }
 
 mod welcome_and_footer {
-    //! The wordmark above the welcome card at each width, under NO_COLOR,
-    //! and the mouse mode on a narrow footer.
+    //! The wordmark above the welcome card at each width and under
+    //! NO_COLOR.
     use super::common::tui_harness::*;
     use serial_test::serial;
 
@@ -294,34 +294,6 @@ mod welcome_and_footer {
             colored.is_empty(),
             "NO_COLOR frame still sets colors: {colored:?}\n{frame}"
         );
-        quit_and_check(&mut pty);
-    }
-
-    /// On a narrow terminal the footer cuts its left side first, so the
-    /// mouse mode still shows whole, before and after Alt+M.
-    #[test]
-    #[serial]
-    fn a_narrow_footer_keeps_the_mouse_mode_whole() {
-        let dir = fresh_config_dir("narrow-footer-mouse");
-        let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
-        let mut pty = spawn_tui(&dir, &[]);
-        pty.wait_for("no session", PTY_DEADLINE).unwrap();
-
-        let narrow = repainted_frame_after_resize(&mut pty, 24, 44);
-        assert!(
-            narrow.contains("mouse scroll"),
-            "the mouse mode is cut at 44 columns:\n{narrow}"
-        );
-        pty.send(b"\x1bm").unwrap();
-        pty.read_for(std::time::Duration::from_millis(600));
-        let switched = repainted_frame_after_resize(&mut pty, 24, 45);
-        assert!(
-            switched.contains("mouse select"),
-            "after Alt+M the narrow footer does not show `mouse select` whole:\n{switched}"
-        );
-        pty.send(b"\x1bm").unwrap();
-        pty.read_for(std::time::Duration::from_millis(600));
         quit_and_check(&mut pty);
     }
 }
@@ -985,31 +957,22 @@ mod wait_race {
 }
 
 mod mouse {
-    //! A mouse handed to the terminal with `Alt+M` stays handed over when
-    //! the screen comes back from a `!` command.
+    //! Mouse reports, drags included, come back on when the screen comes
+    //! back from a `!` command.
     use std::time::Duration;
 
     use super::common::tui_harness::*;
     use serial_test::serial;
 
-    const ALT_M: &[u8] = b"\x1bm";
-
     #[test]
     #[serial]
-    fn the_mouse_stays_with_the_terminal_after_a_bang_command() {
+    fn the_mouse_reports_come_back_after_a_bang_command() {
         let dir = fresh_config_dir("mouse-after-bang");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.read_for(HOTKEY_GAP);
-        let off_at = pty.raw().len();
-        pty.send(ALT_M).unwrap();
-        pty.read_for(Duration::from_millis(500));
-        assert!(
-            find(pty.raw(), b"\x1b[?1000l", off_at).is_some(),
-            "Alt+M did not switch the mouse reports off"
-        );
 
         let bang_at = pty.raw().len();
         pty.send(b"!echo bang-mouse-m5b\r").unwrap();
@@ -1019,15 +982,12 @@ mod mouse {
         let re_entered = wait_for_re_entry(&mut pty, left);
         pty.read_for(Duration::from_millis(800));
         let back = String::from_utf8_lossy(&pty.raw()[re_entered..]).into_owned();
-        assert!(
-            !back.contains("\x1b[?1000h"),
-            "the return from `!` took the mouse back: {back:?}"
-        );
-        let frame = repainted_frame_after_resize(&mut pty, 24, 101);
-        assert!(
-            frame.contains("mouse select"),
-            "the footer no longer says `mouse select` after `!`:\n{frame}"
-        );
+        for mode in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h"] {
+            assert!(
+                back.contains(mode),
+                "the return from `!` did not ask for {mode:?}: {back:?}"
+            );
+        }
         quit_and_check(&mut pty);
     }
 }

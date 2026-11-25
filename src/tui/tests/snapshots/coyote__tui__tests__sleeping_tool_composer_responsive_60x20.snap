@@ -21,4 +21,4 @@ expression: rendered
 "                                                            "
 "                                                            "
 "────────────────────────────────────────────────────────────"
-"openai:test-model . no session . agents 0 . job mouse scroll"
+"openai:test-model . no session . agents 0 . jobs 0          "

@@ -10,6 +10,7 @@ use super::cells::{
 };
 use super::pager::{COMPRESSED_DIVIDER, ChildEntry, entry_summary};
 use super::render::{RenderCache, Renderer};
+use super::selection::{self, Pos};
 use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
 use crate::config::CommandPrefix;
 use crate::events::NoticeKind;
@@ -33,9 +34,10 @@ const UNLAID_ROWS: usize = 1;
 pub(super) const HISTORY_DIVIDER: &str = "--- previous conversation ---";
 
 /// The screen rows one cell took in the last frame, counted from the
-/// view's top row.
+/// view's top row, from row `from` of the cell on.
 struct RowSpan {
     cell: usize,
+    from: usize,
     first_row: u16,
     rows: u16,
 }
@@ -656,6 +658,74 @@ impl Transcript {
         }
     }
 
+    /// The area the last frame drew the transcript in.
+    pub(super) fn area(&self) -> Rect {
+        self.last_area
+    }
+
+    /// The row and column of the last frame at screen cell `column`,
+    /// `row`. The blank line under a cell counts as the row past its
+    /// last, and so does the space below the last cell. The greeting
+    /// alone is drawn centred, apart from this layout, so it has none.
+    pub(super) fn pos_at(&self, column: u16, row: u16) -> Option<Pos> {
+        if self.welcome_only() || !self.last_area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let row = row - self.last_area.y;
+        let column = usize::from(column - self.last_area.x);
+        let span = self
+            .last_layout
+            .iter()
+            .rev()
+            .find(|span| span.first_row <= row)
+            .or(self.last_layout.first())?;
+        let inside = usize::from(row.saturating_sub(span.first_row));
+        Some(if inside < usize::from(span.rows) {
+            Pos::new(span.cell, span.from + inside, column)
+        } else if row < span.first_row {
+            Pos::new(span.cell, span.from, 0)
+        } else {
+            Pos::new(span.cell, span.from + usize::from(span.rows), 0)
+        })
+    }
+
+    /// The rows of cells `first..=last` as the selection copies them, at
+    /// the width of the last frame.
+    pub(super) fn selection_rows(
+        &mut self,
+        first: usize,
+        last: usize,
+        renderer: &mut Renderer,
+    ) -> Vec<selection::Row> {
+        let width = self.last_area.width;
+        let last = last.min(self.cells.len().saturating_sub(1));
+        let mut lines = Vec::new();
+        for index in first..=last {
+            let cell_lines = self.cells[index].cached_lines(width, None, renderer);
+            lines.extend(
+                cell_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(row, line)| (Pos::new(index, row, 0), line.clone())),
+            );
+        }
+        selection::rows(lines.iter().map(|(pos, line)| (*pos, line)))
+    }
+
+    /// Paints the rows of the last frame that fall inside `range`.
+    pub(super) fn paint_selection(&self, buf: &mut Buffer, range: (Pos, Pos), style: Style) {
+        let area = self.last_area.intersection(*buf.area());
+        for span in &self.last_layout {
+            for inside in 0..span.rows {
+                let y = self.last_area.y + span.first_row + inside;
+                if y < area.bottom() {
+                    let key = (span.cell, span.from + usize::from(inside));
+                    selection::paint_row(buf, area, y, key, range, style);
+                }
+            }
+        }
+    }
+
     /// Lays the cells out for `area` and hands back the rows to draw.
     /// The scroll offset is clamped to what the transcript can show, and
     /// the rows each cell received are kept so a click can find its cell.
@@ -756,6 +826,7 @@ impl Transcript {
             }
             self.last_layout.push(RowSpan {
                 cell: index,
+                from,
                 first_row: u16::try_from(header + from - start).unwrap_or(u16::MAX),
                 rows: u16::try_from(to - from).unwrap_or(u16::MAX),
             });

@@ -100,6 +100,8 @@ pub(crate) fn classify(event: Event) -> TermInput {
                 MouseEventKind::ScrollUp
                     | MouseEventKind::ScrollDown
                     | MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
             ) =>
         {
             TermInput::Mouse(mouse)
@@ -207,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn only_wheel_notches_and_left_presses_reach_the_app() {
+    fn only_wheel_notches_and_the_left_button_reach_the_app() {
         let mouse = |kind: MouseEventKind| {
             Event::Mouse(MouseEvent {
                 kind,
@@ -220,6 +222,8 @@ mod tests {
             MouseEventKind::ScrollUp,
             MouseEventKind::ScrollDown,
             MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
         ] {
             assert!(
                 matches!(classify(mouse(kind)), TermInput::Mouse(m) if m.kind == kind),
@@ -228,9 +232,9 @@ mod tests {
         }
         for kind in [
             MouseEventKind::Down(MouseButton::Right),
-            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Right),
             MouseEventKind::Moved,
-            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Right),
             MouseEventKind::ScrollLeft,
         ] {
             assert_eq!(classify(mouse(kind)), TermInput::Ignored, "{kind:?}");

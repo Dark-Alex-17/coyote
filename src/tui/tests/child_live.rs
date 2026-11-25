@@ -574,12 +574,7 @@ fn the_fold_keys_work_in_a_child_thread_and_not_in_the_root_one() {
     assert!(!frame.contains("compiled k1"), "{frame}");
 
     let row = screen_row(&harness, "\u{25B8} execute_command(");
-    harness.app.handle_input(TermInput::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 4,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }));
+    click(&mut harness, (4, row));
     assert!(harness.draw().contains("compiled k1"));
 
     harness.press(KeyCode::Char('q'));
@@ -1059,12 +1054,14 @@ fn screen_at(harness: &Harness, needle: &str) -> (u16, u16) {
 }
 
 fn click(harness: &mut Harness, (column, row): (u16, u16)) {
-    harness.app.handle_input(TermInput::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }));
+    for button in [MouseEventKind::Down, MouseEventKind::Up] {
+        harness.app.handle_input(TermInput::Mouse(MouseEvent {
+            kind: button(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
 }
 
 /// A click on a thread's fold arrow folds it; a click on a row's name

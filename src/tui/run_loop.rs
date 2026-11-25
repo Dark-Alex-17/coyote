@@ -1227,12 +1227,6 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                         }
                         app.schedule_frame();
                     }
-                    Some(Command::SetMouseCapture(on)) => {
-                        if let Err(err) = screen.set_mouse_capture(on) {
-                            warn!("Failed to switch the mouse reports: {err}");
-                            app.mouse_capture_failed(!on, &err);
-                        }
-                    }
                     Some(Command::Copy {
                         text,
                         from,

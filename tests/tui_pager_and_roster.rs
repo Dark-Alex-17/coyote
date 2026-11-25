@@ -796,51 +796,42 @@ mod transcript {
     }
 
     // ---------------------------------------------------------------------
-    // Alt+M hands the mouse back to the terminal for its own selection and
-    // takes it again; the footer says which it is.
+    // Mouse capture is always on and asks for drags too, so the UI can
+    // select text itself; Alt+M no longer switches it off.
     // ---------------------------------------------------------------------
 
     const ALT_M: &[u8] = b"\x1bm";
 
     #[test]
     #[serial]
-    fn alt_m_switches_the_mouse_reports_off_and_on_again() {
+    fn mouse_capture_stays_on_and_reports_drags() {
         let (_guard, mut pty) = boot("mouse-toggle", &[]);
+        let raw = String::from_utf8_lossy(pty.raw()).into_owned();
+        for mode in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h"] {
+            assert!(raw.contains(mode), "the UI never asked for {mode:?}");
+        }
+        assert!(
+            !raw.contains("\x1b[?1003h"),
+            "the UI turned on any-motion tracking"
+        );
         let booted = ctrl_l_repaint(&mut pty);
         assert!(
-            booted.contains(&squeezed("mouse scroll")),
-            "the footer does not show the mouse scrolling on boot:\n{booted}"
+            !booted.contains("mouse"),
+            "the footer still names a mouse mode:\n{booted}"
         );
 
         let at = pty.raw().len();
         pty.read_for(HOTKEY_GAP);
         pty.send(ALT_M).unwrap();
         pty.read_for(Duration::from_millis(400));
-        let off = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
+        let after = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
         assert!(
-            off.contains("\x1b[?1000l"),
-            "Alt+M did not switch the mouse reports off: {off:?}"
+            !after.contains("\x1b[?1000l"),
+            "Alt+M switched the mouse reports off: {after:?}"
         );
-        let frame = ctrl_l_repaint(&mut pty);
-        assert!(
-            frame.contains(&squeezed("mouse select")),
-            "the footer does not show the terminal's selection:\n{frame}"
-        );
-
-        let at = pty.raw().len();
-        pty.read_for(HOTKEY_GAP);
-        pty.send(ALT_M).unwrap();
-        pty.read_for(Duration::from_millis(400));
-        let on = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
-        assert!(
-            on.contains("\x1b[?1000h"),
-            "a second Alt+M did not ask for mouse reports again: {on:?}"
-        );
-        let frame = ctrl_l_repaint(&mut pty);
-        assert!(
-            frame.contains(&squeezed("mouse scroll")),
-            "the footer does not show the mouse scrolling again:\n{frame}"
-        );
+        // Whatever the unbound chord left in the composer goes, so Ctrl+D
+        // quits rather than deleting.
+        pty.send(b"\x15").unwrap();
 
         quit(pty);
     }

@@ -33,6 +33,7 @@ mod rewind;
 mod roster;
 mod run_loop;
 mod run_now;
+mod selection;
 mod sink;
 mod terminal;
 mod theme;
@@ -60,7 +61,7 @@ use child_live::{ChildLive, ChildThread, ToolEnd};
 use command_timing::Timing;
 use composer::Composer;
 use control::{ControlRequest, cancel_report, is_plain_session_id};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use events::{Clock, FrameScheduler, TermInput};
 use help::Help;
 use history::ComposerHistory;
@@ -86,6 +87,7 @@ pub(crate) use render::plain_text;
 use rewind::opens_exchange;
 use roster::{RosterPopup, RosterRow, RosterSources, RosterState};
 pub use run_loop::{ensure_tty, run};
+use selection::{Pos, Region, Release, SelectionState};
 use sink::{AgentOutcome, LendJob, UiMsg};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -93,7 +95,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use terminal::MOUSE_CAPTURE_DEFAULT;
 use theme::{ChromeKind, DIM, Theme, chrome_style};
 use throbber::{THROBBER_INTERVAL, Tick};
 use todo::TodoPanel;
@@ -248,24 +249,30 @@ impl FooterInfo {
     }
 }
 
-/// The footer's right half: the mouse mode, then the usage line dimmed.
-fn footer_right(mouse_capture: bool, usage: &str, theme: &Theme) -> Line<'static> {
-    let mode = if mouse_capture {
-        "mouse scroll"
-    } else {
-        "mouse select"
-    };
-    let mut spans = vec![Span::styled(mode, theme.footer_field)];
+/// A press, drag or release of the left button: what selects text.
+fn is_left_button(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+    )
+}
+
+/// The footer's right half: the usage line dimmed.
+fn footer_right(usage: &str) -> Line<'static> {
     let usage = render::styled_line(usage);
-    if usage.width() > 0 {
-        spans.push(Span::styled(" . ", theme.footer_separator));
-        let base = usage.style.patch(DIM);
-        spans.extend(usage.spans.into_iter().map(|mut span| {
-            span.style = base.patch(span.style);
-            span
-        }));
-    }
-    Line::from(spans)
+    let base = usage.style.patch(DIM);
+    Line::from(
+        usage
+            .spans
+            .into_iter()
+            .map(|mut span| {
+                span.style = base.patch(span.style);
+                span
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// What is drawn over the transcript while open: Ctrl+T's full-screen
@@ -341,8 +348,6 @@ pub(crate) enum Command {
     Suspend,
     OpenEditor,
     Redraw,
-    /// Switch the terminal's mouse reports on or off.
-    SetMouseCapture(bool),
     /// Put a row's output on the clipboard; the notice of how it went
     /// names `from` and the `dropped` bytes the row no longer held.
     Copy {
@@ -427,9 +432,6 @@ pub(crate) struct App {
     committed_end: usize,
     footer: FooterInfo,
     usage: String,
-    /// Whether the terminal sends mouse reports: the wheel and clicks
-    /// reach the UI, and the terminal's own text selection does not work.
-    mouse_capture: bool,
     last_keystroke: Option<Instant>,
     /// When the front prompt became the front; what Enter on a text
     /// field is settled against, so typing the answer does not postpone
@@ -438,6 +440,7 @@ pub(crate) struct App {
     /// The area of the last frame drawn; what a modal's question cap and
     /// its clipped state are judged against between frames.
     frame_area: Option<Rect>,
+    selection: SelectionState,
     /// The rows the front prompt's question received in the last frame,
     /// None until it has been drawn.
     question_area: Option<Rect>,
@@ -566,8 +569,8 @@ impl App {
             committed_end: 0,
             footer,
             usage: String::new(),
-            mouse_capture: MOUSE_CAPTURE_DEFAULT,
             last_keystroke: None,
+            selection: SelectionState::default(),
             front_since: None,
             frame_area: None,
             question_area: None,
@@ -1147,15 +1150,133 @@ impl App {
         None
     }
 
-    /// Takes back an Alt+M the terminal never got, so the footer shows
-    /// the mode the terminal is still in.
-    pub(crate) fn mouse_capture_failed(&mut self, prev: bool, err: &std::io::Error) {
-        self.mouse_capture = prev;
-        self.transcript.push_notice(
-            self.notice_merge_from(),
-            NoticeKind::ToolWarning,
-            format!("Could not switch the mouse mode: {err}"),
-        );
+    /// A left-button press, drag or release over `region`. A press starts
+    /// a selection (a second or third on one cell takes the word or the
+    /// line), a drag moves its head and scrolls the region a line when
+    /// held on its top or bottom row, and the release copies it. A press
+    /// and release with no drag between is a click, which folds a row.
+    fn select_with_mouse(&mut self, region: Region, mouse: MouseEvent) -> Option<Command> {
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(_) => match self.selection_pos(region, at) {
+                Some(pos) => {
+                    let clicks = self.selection.press(region, pos, at, self.clock.now());
+                    if clicks > 1 {
+                        let rows = self.selection_rows(region, pos, pos);
+                        let (start, end) = if clicks == 2 {
+                            selection::word_at(&rows, pos)
+                        } else {
+                            selection::line_at(&rows, pos)
+                        };
+                        self.selection.widen(start, end);
+                    }
+                }
+                None => {
+                    self.selection.clear();
+                }
+            },
+            MouseEventKind::Drag(_) => {
+                if self.selection.current().map(|selection| selection.region) != Some(region) {
+                    return None;
+                }
+                if let Some(pos) = self.selection_pos(region, at) {
+                    self.selection.drag(pos);
+                }
+                let area = match region {
+                    Region::Transcript => self.transcript.area(),
+                    Region::Pager => self.frame_area.map(Pager::body).unwrap_or_default(),
+                };
+                let edge = if mouse.row <= area.top() {
+                    -1
+                } else if mouse.row + 1 >= area.bottom() {
+                    1
+                } else {
+                    0
+                };
+                if edge != 0 && self.selection.dragging() {
+                    match region {
+                        Region::Transcript => self.transcript.scroll_lines(edge),
+                        Region::Pager => {
+                            if let Some(pager) = self.pager_mut() {
+                                pager.scroll(edge);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                if self.selection.current().map(|selection| selection.region) == Some(region)
+                    && let Some(pos) = self.selection_pos(region, at)
+                {
+                    self.selection.drag(pos);
+                }
+                let selection = match self.selection.release() {
+                    Release::Copy(selection) => selection,
+                    Release::Click(pressed, pos)
+                        if pressed == region && self.selection_pos(region, at) == Some(pos) =>
+                    {
+                        match region {
+                            Region::Transcript => self.transcript.click(mouse.column, mouse.row),
+                            Region::Pager => {
+                                if let (Some(Overlay::Pager(pager)), Some(area)) =
+                                    (self.overlay.as_mut(), self.frame_area)
+                                {
+                                    pager.click(
+                                        &mut self.child_live,
+                                        mouse.column,
+                                        mouse.row,
+                                        area,
+                                    );
+                                }
+                            }
+                        }
+                        self.schedule_frame();
+                        return None;
+                    }
+                    Release::Click(..) | Release::Nothing => return None,
+                };
+                self.schedule_frame();
+                if selection.region != region {
+                    return None;
+                }
+                let (start, end) = selection.range();
+                let rows = self.selection_rows(region, start, end);
+                let text = selection::extract(&rows, start, end);
+                return (!text.is_empty()).then(|| Command::Copy {
+                    text,
+                    from: "the selection".to_string(),
+                    dropped: 0,
+                });
+            }
+        }
+        self.schedule_frame();
+        None
+    }
+
+    /// The selection position under screen cell `at` of `region`.
+    fn selection_pos(&self, region: Region, (column, row): (u16, u16)) -> Option<Pos> {
+        match region {
+            Region::Transcript => self.transcript.pos_at(column, row),
+            Region::Pager => self
+                .pager()
+                .zip(self.frame_area)
+                .and_then(|(pager, area)| pager.pos_at(column, row, area)),
+        }
+    }
+
+    /// The rows of `region` from `start`'s to `end`'s, as the copy reads
+    /// them.
+    fn selection_rows(&mut self, region: Region, start: Pos, end: Pos) -> Vec<selection::Row> {
+        match region {
+            Region::Transcript => {
+                self.transcript
+                    .selection_rows(start.cell, end.cell, &mut self.renderer)
+            }
+            Region::Pager => self
+                .pager()
+                .map(|pager| pager.selection_rows(start.row, end.row))
+                .unwrap_or_default(),
+        }
     }
 
     /// Takes the band's highlighted row: the palette's into the typed
@@ -1251,7 +1372,12 @@ impl App {
             }
             TermInput::Mouse(mouse) => {
                 match self.layer() {
-                    Layer::Overlay(OverlayKind::Pager(PagerMode::Browse | PagerMode::Picker))
+                    Layer::Overlay(OverlayKind::Pager(PagerMode::Browse))
+                        if is_left_button(mouse.kind) =>
+                    {
+                        return self.select_with_mouse(Region::Pager, mouse);
+                    }
+                    Layer::Overlay(OverlayKind::Pager(PagerMode::Picker))
                         if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
                     {
                         if let (Some(Overlay::Pager(pager)), Some(area)) =
@@ -1288,8 +1414,8 @@ impl App {
                         }
                         MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
                         MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            self.transcript.click(mouse.column, mouse.row)
+                        kind if is_left_button(kind) => {
+                            return self.select_with_mouse(Region::Transcript, mouse);
                         }
                         _ => return None,
                     },
@@ -1303,7 +1429,20 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         self.settle_welcome_sweep();
+        let cleared = self.selection.clear();
+        if cleared {
+            self.schedule_frame();
+        }
         let action = keys::map_key(key, &self.key_context());
+        // An Esc with nothing to do but clear the selection stops there;
+        // one that would interrupt, cancel or close goes on to do it.
+        if cleared
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && matches!(action, Action::IdleEsc | Action::Nothing)
+        {
+            return None;
+        }
         // Every key pressed while no question is up re-arms the idle gate,
         // the ignored ones included: an Enter tapped during a turn is a
         // keystroke the user is still making when the confirm appears. So
@@ -1377,10 +1516,6 @@ impl App {
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
             Action::ScheduleFrame => Some(Command::Redraw),
-            Action::ToggleMouse => {
-                self.mouse_capture = !self.mouse_capture;
-                Some(Command::SetMouseCapture(self.mouse_capture))
-            }
             Action::CopyToolOutput => self.copy_tool_output(),
             Action::PasteImage => Some(Command::PasteImage),
             Action::Answer(answer) => {
@@ -2221,6 +2356,16 @@ impl App {
                 },
                 area,
             );
+            if let Some(selection) = self.selection.shown()
+                && selection.region == Region::Pager
+            {
+                pager.paint_selection(
+                    frame.buffer_mut(),
+                    area,
+                    selection.range(),
+                    self.theme.selection,
+                );
+            }
             return;
         }
         // The roster is read on every frame it is up: the tasks move on
@@ -2284,6 +2429,15 @@ impl App {
         self.transcript.set_welcome_sweep(sweep);
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
+        if let Some(selection) = self.selection.shown()
+            && selection.region == Region::Transcript
+        {
+            self.transcript.paint_selection(
+                frame.buffer_mut(),
+                selection.range(),
+                self.theme.selection,
+            );
+        }
         if let Some(todo) = todo {
             frame.render_widget(self.todo.view(&self.theme), todo);
         }
@@ -2373,7 +2527,7 @@ impl App {
                 left: self
                     .footer
                     .line(self.roster_sources.running_counts(), &self.theme),
-                right: footer_right(self.mouse_capture, &self.usage, &self.theme),
+                right: footer_right(&self.usage),
             },
             footer,
         );
@@ -2431,8 +2585,7 @@ struct FooterBar {
 
 impl Widget for FooterBar {
     /// The right half is laid out first, so the left half is the one cut
-    /// short; within the right half the mouse mode comes first, so a long
-    /// usage line loses its end before the mode loses any of it.
+    /// short.
     fn render(self, area: Rect, buf: &mut Buffer) {
         let area = area.intersection(*buf.area());
         if area.is_empty() {
