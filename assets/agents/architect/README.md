@@ -117,7 +117,8 @@ history does not.
   scaffolding, opt-in-only tests, decisions written into CONTRIBUTING/README, non-ASCII punctuation
   or planning vocabulary in comments) and removes or justifies each hit; a kept lint hit carries the
   lint's `debris-exempt` token on its line so the run-wide lint goes green, and kept items land in
-  the PR's `## Hygiene pass` section.
+  the PR's `## Hygiene pass` section. The same task reads every comment the run added and cuts
+  comments that restate the code or narrate the plan.
 - **Run-closing design retrospective** -- before the hygiene pass, a run the architect judges to be
   a large body of work gets one higher-level design review of the whole run diff; adopted refactor items
   become one refactor task run like any other, each decline is logged with a reason, and the

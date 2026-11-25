@@ -39,6 +39,7 @@ enabled_skills:
   - parallel-research
   - verification-gates
   - oracle-protocol
+  - comment-discipline
 
 variables:
   # Mirror of sisyphus's variables: names AND defaults identical, so an
@@ -322,6 +323,13 @@ initial_state:
   bookkeeping_notes: ''
   # --- review ---
   review_skipped_note: ''
+  comment_hygiene_done: false
+  comment_diff: ''
+  comment_diff_truncated: false
+  comment_files: []
+  comment_cuts: []
+  comment_read: 0
+  comment_hygiene_line: ''
   gauntlet_prompt: ''
   gauntlet_result: ''
   gauntlet_verdict: ''
@@ -1987,8 +1995,72 @@ nodes:
   review_gate:
     id: review_gate
     type: script
-    description: batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; a subtask that changed no code skips its conformance review; else the gauntlet. A skipped subtask goes on to the next one.
+    description: Once per task, at the task's final whole-task review before its first round (never a subtask's), a task that changed files goes to comment_hygiene first, under every cadence; an empty or failed whole-task diff skips the pass with a skipped-review entry instead; then batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; a subtask that changed no code skips its conformance review; else the gauntlet. A skipped subtask goes on to the next one.
     script: scripts/review_gate.py
+    fallback: end_failure
+
+  comment_hygiene:
+    id: comment_hygiene
+    type: llm
+    description: The final-diff comment pass - keep, cut or reduce each comment the whole-task diff adds; a judgement read, never a pattern match.
+    instructions: |
+      Load the comment-discipline skill and run its Final-diff pass over the
+      diff below: the task's whole change from its base, plan files excluded.
+      Read every comment the diff adds or rewrites (code, doc, configuration and script
+      comments) beside the code it sits on, and decide keep, cut or reduce
+      against the skill's rule. A comment stays when it adds context the code
+      cannot show, documents behaviour used elsewhere, or gives the reason for
+      a choice in a sentence; one that restates easily read code, repeats a name or a
+      signature, or narrates the plan is cut; one sentence of real context
+      buried in narration is reduced to that sentence. The repo's own comment
+      standards come first: read sibling files with the tools when the diff
+      alone does not show them. This is a judgement read, not a pattern match.
+      When the diff opens with a `[diff truncated: ...]` marker, its start was
+      cut: the marker names files as `<file>: +12-40, +88`, the line ranges
+      that file's new version adds. fs_read each named file at those ranges
+      and judge only the comments on those lines the same way; comments
+      outside the listed ranges stay.
+      Comments the diff did not add stay. You read; you never edit files.
+
+      Output:
+      - comment_cuts: one entry per comment to change, `<file:line> -- cut` or
+        `<file:line> -- reduce to: <sentence>`, the line numbered in the new
+        file; empty when every added comment earns its keep.
+      - comment_read: how many added comments you read.
+      - anomalies: anything outside this step's job someone should know; empty
+        is the normal case.
+
+      Project directory: {{project_dir}}
+      Git root (diff and marker paths are relative to it): {{git_root}}
+    prompt: |
+      ## Whole-task diff
+      {{comment_diff}}
+    tools: [fs_read, fs_grep]
+    skills_enabled: true
+    enabled_skills: [comment-discipline]
+    max_iterations: 10
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        comment_cuts:
+          type: array
+          items: { type: string }
+        comment_read: { type: integer }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [comment_cuts, comment_read]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: comment_hygiene_route
+    next: comment_hygiene_route
+
+  comment_hygiene_route:
+    id: comment_hygiene_route
+    type: script
+    description: Once per task (comment_hygiene_done) - ledger the Comment hygiene line; cuts -> one coder round through compose_fix, none -> review_gate; a fault fails open with a skipped-review entry.
+    script: scripts/comment_hygiene_route.py
     fallback: end_failure
 
   build_gauntlet_prompt:

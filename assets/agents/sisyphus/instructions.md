@@ -315,6 +315,23 @@ Evidence required:
   BOTH lint rules, and you list each new use in your final report under
   a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
 
+### Comment hygiene over the final diff
+
+Once the implementation is complete, and before the first review of the finished work (the review
+gauntlet below, or the independent code review when the gauntlet is not installed; under batch
+cadence, before you report to the parent), run `comment-discipline`'s `## Final-diff pass` over the
+task's whole diff, committed or not: intent-to-add the task's new files (`git add -N <new files>`;
+.gitignore keeps artefacts out), then
+`git diff --no-color --no-ext-diff <base> -- :/ ":(top,literal,exclude)<plans dir>"`, the task's
+base commit against the working tree (drop the exclude when there is no plans dir inside the
+repo). Load `comment-discipline` and read every comment the diff adds beside the code it sits on.
+This is a judgement read, not a grep: decide keep, cut or reduce per comment. Hand the cut and
+reduce list (`<file:line> -- cut` or `<file:line> -- reduce to: <sentence>`) back to the coder:
+resume the SAME coder session, so its build and test gates run over the edits, and the review that
+follows gates them like any other change. Nothing to cut means no resume. Your final report carries
+`comment-discipline`'s `Comment hygiene:` line. A comment a later fix round adds is the code-review
+lane's `Comment hygiene` finding.
+
 <!-- when:review_cadence=batch -->
 ### Review cadence: batch (set by the parent orchestrator)
 
@@ -331,8 +348,8 @@ observability pass of your own on this task - doing so would review the same lin
 task scope and once more at batch scope. What you still do, unchanged: coder delegation with
 the full verification discipline (build + tests GREEN before you report - compile-atomicity is
 the floor the batch cadence rests on), the debt / decision / debris bookkeeping above, the
-`Design:` -> `Design decisions:` routing, and the final-report contract (FOLLOW-UPS, Debt left
-behind, Debris exemptions, Design decisions). Report the HEAD SHA of your last commit so the
+comment hygiene pass, the `Design:` -> `Design decisions:` routing, and the final-report contract
+(FOLLOW-UPS, Debt left behind, Debris exemptions, Design decisions, Comment hygiene). Report the HEAD SHA of your last commit so the
 orchestrator can anchor the batch delta. If the task's acceptance criteria are not executable
 commands, or the task touches more than one seam, STOP and report it as a plan defect - do not
 widen the task to compensate. Whetstone handling below still applies when human feedback was
@@ -936,6 +953,7 @@ did not set out to touch.
 - Writing files via `execute_command` (heredocs, `cat >`, `echo >`, `printf >`) → file corruption from shell parsing
 - Accepting `#[allow(dead_code)]` "for a later task" with no task named -> orphaned debt
 - Letting a coder write decisions or check-ledgers into CONTRIBUTING/README -> records with no owner
+- Finishing without the comment hygiene pass over the final diff -> comments that restate the code ship because every reviewer read past them
 
 ## Hard Blocks (NEVER violate)
 

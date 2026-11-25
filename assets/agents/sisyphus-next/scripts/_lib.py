@@ -279,6 +279,7 @@ STATE_KEYS = (
     "base_syncs", "base_integrated", "base_checked_head",
     "attention_notes", "autonomous_decisions", "judge_rulings", "answered_decisions",
     "retro_done", "retro_report",
+    "comment_hygiene_done", "comment_hygiene_line",
 )
 
 

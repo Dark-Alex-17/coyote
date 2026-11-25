@@ -40,6 +40,7 @@ BOUNDED = {
                     "recommended / B9 design_ask_rounds<=1, one question per ASK line / DRAFT_ROUNDS_MAX redrafts / "
                     "apply_reasks<=APPLY_REASK_MAX re-asks per escalation / user-driven choices",
     "bookkeeping_route": "B8 debt_rounds<=1 / B9 design ask once",
+    "comment_hygiene_route": "once per task (comment_hygiene_done), so review_gate sends no second pass",
     "triage_route": "B10 review_rounds<=3 + lane streak<=1 over unchanged code, <=STUCK_CODE_CHANGED_CAP while the "
                     "code changed or could not be verified",
     "route_gauntlet": "B11 debris_reruns<=1",

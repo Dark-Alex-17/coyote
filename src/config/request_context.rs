@@ -24343,6 +24343,8 @@ mod tests {
                             "ci_gate",
                             "ci_poll",
                             "ci_route",
+                            "comment_hygiene",
+                            "comment_hygiene_route",
                             "compose_brief",
                             "compose_fix",
                             "confirm_draft",
