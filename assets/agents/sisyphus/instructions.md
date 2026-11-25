@@ -320,12 +320,13 @@ Evidence required:
 Once the implementation is complete, and before the first review of the finished work (the review
 gauntlet below, or the independent code review when the gauntlet is not installed; under batch
 cadence, before you report to the parent), run `comment-discipline`'s `## Final-diff pass` over the
-task's whole diff:
-`git diff --no-color --no-ext-diff <base>..HEAD -- :/ ":(top,literal,exclude)<plans dir>"` from the
-task's base commit (drop the exclude when there is no plans dir inside the repo). Load
-`comment-discipline` and read every comment the diff adds beside the code it sits on. This is a
-judgement read, not a grep: decide keep, cut or reduce per comment. Hand the cut and reduce list
-(`<file:line> -- cut` or `<file:line> -- reduce to: <sentence>`) back to the coder:
+task's whole diff, committed or not: intent-to-add the task's new files (`git add -N <new files>`;
+.gitignore keeps artefacts out), then
+`git diff --no-color --no-ext-diff <base> -- :/ ":(top,literal,exclude)<plans dir>"`, the task's
+base commit against the working tree (drop the exclude when there is no plans dir inside the
+repo). Load `comment-discipline` and read every comment the diff adds beside the code it sits on.
+This is a judgement read, not a grep: decide keep, cut or reduce per comment. Hand the cut and
+reduce list (`<file:line> -- cut` or `<file:line> -- reduce to: <sentence>`) back to the coder:
 resume the SAME coder session, so its build and test gates run over the edits, and the review that
 follows gates them like any other change. Nothing to cut means no resume. Your final report carries
 `comment-discipline`'s `Comment hygiene:` line. A comment a later fix round adds is the code-review

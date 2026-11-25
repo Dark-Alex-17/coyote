@@ -71,8 +71,9 @@ Writing-time discipline slips: a long run adds comments one at a time, and each 
 its own hunk. An orchestrator closing a task or a run therefore reads the FINISHED diff once more,
 before its first review of the finished work, and cuts what slipped through.
 
-1. Take the whole diff from the work's base commit to HEAD, with the run's own plan files
-   excluded.
+1. Take the whole diff from the work's base commit to the working tree, with new files made visible
+   to the diff first (in git, mark them intent-to-add) so their comments are read, and the run's own
+   plan files excluded.
 2. Read every comment the diff adds or rewrites (code, doc, YAML and script comments) beside the
    code it sits on, and decide one of three outcomes against the rule above:
    - **keep**: it earns its keep, or it matches a register or declared policy the repo has;
