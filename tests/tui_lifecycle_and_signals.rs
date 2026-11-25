@@ -194,13 +194,16 @@ mod binary_lifecycle {
         assert_tty_restored(&transcript);
         let raw = pty.raw();
         let entered = find(raw, ENTER_ALT, 0).expect("the alternate screen was never entered");
-        let left = find(raw, LEAVE_ALT, entered).expect("the alternate screen was never left");
-        let message = find(raw, b"COYOTE_TUI_PANIC_AT_EXIT requested a panic", entered)
-            .expect("the exit panic's message never reached the terminal");
+        // The panic hook restores the terminal as the task panics, and the
+        // loop may draw once more and re-enter the screen before the exit
+        // leaves it for good; the restored terminal is after the last leave.
+        let left = rfind(raw, LEAVE_ALT)
+            .filter(|&left| left > entered)
+            .expect("the alternate screen was never left");
         assert!(
-            left < message,
-            "the panic message was printed while still on the alternate screen \
-         (leave at {left}, message at {message}):\n{transcript}"
+            find(raw, b"COYOTE_TUI_PANIC_AT_EXIT requested a panic", left).is_some(),
+            "the exit panic's message was not printed on the restored terminal \
+         (last leave at {left}):\n{transcript}"
         );
         // The captured panic line is printed once; the task error the exit
         // returns names the payload again on its own line, as any error would.
