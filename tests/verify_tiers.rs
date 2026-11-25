@@ -2122,6 +2122,43 @@ fn finalize_gate_does_not_report_an_untouched_nested_repository_as_rewritten() {
     );
 }
 
+/// A tracked submodule is also a directory path in `git status`, but when fmt
+/// dirtied it the gate is red and names it rather than skipping it.
+#[test]
+fn finalize_gate_fails_when_fmt_rewrites_a_tracked_submodule() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-fmt-submodule");
+    let dir = committed(&root.0);
+    let sub = dir.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-q"]);
+    fs::write(sub.join("inner.txt"), "inner\n").unwrap();
+    git(&sub, &["add", "-A"]);
+    git(&sub, &["commit", "-q", "-m", "inner"]);
+    let inner_head = git(&sub, &["rev-parse", "HEAD"]);
+    git(
+        &dir,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},sub", inner_head.trim()),
+        ],
+    );
+    detect_commands(
+        &dir,
+        "tr a-z A-Z < sub/inner.txt > sub/inner.t && mv sub/inner.t sub/inner.txt",
+        "",
+    );
+    assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+    let out = finalize(&dir, &[("TEST_CMD", "true")]);
+    let fmt = item(&out, "fmt");
+    assert_eq!(str_field(fmt, "verdict"), "red", "{out}");
+    assert!(str_field(fmt, "note").contains("sub"), "{out}");
+}
+
 /// A detected lint runs once and lands in the record; a failing lint makes
 /// the gate red and blocks the final-tier gauntlet; a lint command that is
 /// missing (exit 127) is unavailable, never green.
