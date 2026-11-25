@@ -108,6 +108,9 @@ notes="(none)"
 
 step_plan=$(head -c 24000 "$plan_file")
 handoff_path="$handoffs_dir/$(basename "$plan_file")"
+# The commit the step started from, handed to the coder as baseline_floor;
+# empty outside a git repository.
+baseline_floor=$(git -C "$project_dir" rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null) || baseline_floor=''
 
 # The three document bodies together can exceed the state budget, so they
 # reach jq through real files: on Windows the entire jq command line is
@@ -151,6 +154,7 @@ jq -nc \
   --rawfile no "$spill/no" \
   --arg hp "$handoff_path" \
   --arg br "$blocking_reason" \
+  --arg bf "$baseline_floor" \
   --arg nx "$next_node" \
   '{
     "project_dir": $pd,
@@ -166,5 +170,6 @@ jq -nc \
     "notes": $no,
     "handoff_path": $hp,
     "blocking_reason": $br,
+    "baseline_floor": $bf,
     "_next": $nx
   }'

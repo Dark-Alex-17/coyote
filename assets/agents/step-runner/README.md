@@ -194,6 +194,31 @@ is made absolute by `resolve_step`, and `implement` and
 `independent_review` pass that path to the coder and code-reviewer through
 `inputs: project_dir`, so both read the same checkout.
 
+## Verification tiers
+
+`implement` seats the coder at its round tier (`inputs: verify_tier: 'round'`,
+see the coder's [Verify tiers](../coder/README.md#verify-tiers)), with
+`baseline_floor` set to the HEAD `resolve_step` found when the step started,
+so the coder's base suite stays anchored there. Each coder lap runs only the
+targeted and impacted tests its change can break; the full suite and lint run
+once per step, at this graph's own format/lint, build and test gates, which
+act as the step's finalize gate. Before them, `verify_format_lint` cancels
+the base suite jobs the coder left running for this worktree
+(`.shared/base_suite.py cancel`: their process groups are killed and their
+worktrees removed) and names them at the top of `format_output`: these gates
+fail any red suite, so they never need that base, and a job holding
+`build_lock` would make them wait. `verify_tests` reuses a finalize record
+(`.shared/verify_record.py`) for the worktree tree whose every test result is
+green with exit 0 instead of running the suite again, saying so in
+`tests_output`. A record green only because its failures matched the base
+suite is not reused, since this gate fails any suite that exits non-zero.
+After a green run it writes one
+holding the build and lint gates that preceded it and the suite, so a
+final-tier review-gauntlet on the same tree reuses it too. A red run writes
+nothing: this gate compares no base suite, so its reds are not finalize
+results. `STEP_COMPLETE` reports `Tests: passed (full suite and lint at the
+step gate; the coder ran targeted and impacted tests per lap)`.
+
 ## Tuning
 
 `graph.yaml` `initial_state` exposes:

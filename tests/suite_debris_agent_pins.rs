@@ -83,7 +83,7 @@ fn sisyphus_prompt_pins_debris_rules() {
             "the lint's `debris-exempt` token",
             "under a `Debt left behind:` heading",
             "a `Debris exemptions:` heading",
-            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}"#,
+            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]""#,
             "`debris_exclude` is the repo-relative directory holding the run's own planning files",
             "the repo top itself, or it lies outside that repo",
             "A `debris_exclude` the lint cannot use (absolute, holding `..` or a glob, `.`, or malformed",
@@ -91,7 +91,7 @@ fn sisyphus_prompt_pins_debris_rules() {
     );
     assert_eq!(
         agent_file("sisyphus/instructions.md")
-            .matches(r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}"#)
+            .matches(r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]""#)
             .count(),
         2,
         "both the review-gauntlet spawn and the adversary fallback spawn pass debris_exclude"
@@ -118,14 +118,14 @@ fn architect_prompt_pins_debris_rules() {
             "paste the Sisyphus `HYGIENE:` list VERBATIM",
             "if Sisyphus reported a `Debt left behind:` list",
             "report's `Debris exemptions:` list",
-            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}"#,
+            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]""#,
             "`debris_exclude` takes the same `<plans rel>` the run-closing hygiene pass computes",
             "A `debris_exclude` the lint cannot use (absolute, holding `..` or a glob, `.`, or",
         ],
     );
     assert_eq!(
         agent_file("architect/instructions.md")
-            .matches(r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}"#)
+            .matches(r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]""#)
             .count(),
         2,
         "both the review-gauntlet spawn and the adversary fallback spawn pass debris_exclude"
@@ -176,6 +176,12 @@ fn usage_probe_architect_hygiene_pass_resolves_the_run_base_once_and_reads_lint_
     assert!(
         folded.contains("over `$base`, the RUN base, not the hygiene BASE SHA"),
         "the run-wide lint in verification_commands must name the RUN base, not the hygiene BASE SHA"
+    );
+    assert!(
+        folded.contains(
+            "to that spawn's `verification_commands` variable, and declare nothing else there: the full suite, formatter and lint come from the gauntlet's finalize record, while every declared command still runs at this tier"
+        ),
+        "the final-tier hygiene gauntlet declares only the run-wide lint, which still runs there"
     );
     // os.path.relpath against the git toplevel is what makes `<plans rel>` a
     // plain repo-relative literal the CLI accepts, on every platform.

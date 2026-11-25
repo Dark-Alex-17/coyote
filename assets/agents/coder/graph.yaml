@@ -83,6 +83,18 @@ variables:
       a non-merge commit made after the record. Empty (the default) never
       looks past HEAD.
     default: ''
+  - name: verify_tier
+    description: |
+      How much verification each fix-loop lap runs. `full` (the default)
+      takes the baseline synchronously on the untouched tree and runs the
+      whole test command every lap. `round` starts the base suite in the
+      background in a detached worktree of the base commit, has
+      select_checks pick the tests this lap's change can break, runs only
+      those, and leaves the full suite and lint to the finalize gate
+      (.shared/finalize_gate.sh); each lap writes a round verification
+      record keyed by the worktree tree. Any other value runs the full tier
+      and says so on the `Tier:` line.
+    default: full
 
 settings:
   max_loop_iterations: 20
@@ -120,8 +132,17 @@ initial_state:
   baseline_reused_from: ''
   baseline_note: No baseline was recorded.
   baseline_report: ''
+  baseline_mode: ''
+  baseline_key: ''
+  baseline_base: ''
+  impact_facts: ''
+  targeted: []
+  impacted: []
+  reason: ''
+  selection_output: ''
   build_verdict: not run
   tests_verdict: not run
+  tests_tier: full
   review_verdict: not run
   approval_reask: ''
 
@@ -269,7 +290,7 @@ nodes:
   baseline_tests:
     id: baseline_tests
     type: script
-    description: Run the test command once on the untouched tree, killed at test_timeout, and record which tests already fail (baseline_failures, baseline_failure_hash, baseline_exit_code) so verify_tests can tell pre-existing failures from new ones. Runs once per run, never after edits; always routes to implement, and a crash means no baseline.
+    description: Run the test command once on the untouched tree, killed at test_timeout, and record which tests already fail (baseline_failures, baseline_failure_hash, baseline_exit_code) so verify_tests can tell pre-existing failures from new ones. Runs once per run, never after edits; always routes to implement, and a crash means no baseline. In the round tier it returns at once instead, with the base suite started in the background in a detached worktree of the base commit (deferred until verify_tests under build_lock) and baseline_mode, baseline_key and baseline_base set.
     script: scripts/baseline_tests.sh
     timeout: 3600
     fallback: implement
@@ -502,15 +523,81 @@ nodes:
   verify_build:
     id: verify_build
     type: script
-    description: Run the project's check/build command in project_dir, killed at build_timeout. Routes to verify_tests on success, fix_loop_gate on failure, end_failure on a timeout.
+    description: Run the project's check/build command in project_dir, killed at build_timeout. Routes to verify_tests on success (impact_facts in the round tier), fix_loop_gate on failure, end_failure on a timeout.
     script: scripts/verify_build.sh
     timeout: 1800
     fallback: fix_loop_gate
 
+  impact_facts:
+    id: impact_facts
+    type: script
+    description: Round tier only. Gathers the facts select_checks chooses from (changed paths and which are tests, test files mentioning a changed file's stem, test files beside each changed file, the full test command and the base suite's duration, the previous lap's selection and result) into impact_facts. A crash goes to select_fault, which runs the full test command.
+    script: scripts/impact_facts.py
+    timeout: 120
+    fallback: select_fault
+    next: select_checks
+
+  select_checks:
+    id: select_checks
+    type: llm
+    description: Round tier only. Chooses the test commands this lap runs, targeted then impacted. A failure goes to select_fault.
+    instructions: |
+      You choose which tests verify a change before it goes to review. The
+      goal is the smallest set of test commands that would fail if this
+      change broke something. The full test suite and lint run later at the
+      finalize gate, so pick for signal, not completeness.
+
+      `targeted` holds commands that exercise the changed code itself;
+      `impacted` holds commands for code that depends on it. Each entry is
+      one shell command, run from the directory the facts name under
+      `runs in`; it may be the full test command when nothing narrower
+      covers the change. Targeted commands
+      run first and a failing one stops the run. When nothing testable
+      changed, return empty lists. `reason` says in one sentence why these
+      commands and not others.
+
+      Read the repository as needed to confirm a command selects what you
+      think it does. Never edit files.
+
+      Project directory: {{project_dir}}
+    prompt: |
+      ## What the change was supposed to do
+      {{plan_summary}}
+
+      ## Facts about the change
+      {{impact_facts}}
+    tools: [fs_cat, fs_ls, fs_grep, fs_glob, ast_grep]
+    max_iterations: 30
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        targeted:
+          type: array
+          items: { type: string }
+        impacted:
+          type: array
+          items: { type: string }
+        reason:
+          type: string
+      required: [targeted, impacted, reason]
+    state_updates:
+      selection_output: '{{output}}'
+    fallback: select_fault
+    next: verify_tests
+
+  select_fault:
+    id: select_fault
+    type: script
+    description: "Reached when impact_facts or select_checks dies. Selects the full test command as the only targeted command, with a reason quoting the error, and routes to verify_tests. A crash of this script fails the run closed."
+    script: scripts/select_fault.sh
+    timeout: 30
+    fallback: end_failure
+
   verify_tests:
     id: verify_tests
     type: script
-    description: Run test_command (or the detected test command) in project_dir, killed at test_timeout. Routes to self_review on pass, fix_loop_gate on failure, end_failure on a timeout. Against a red baseline a nonzero run passes when its exit code matches the baseline's and its failing tests are a subset of baseline_failures (or, when no test could be identified in either run, its failure output hashes alike); unidentified failures against an identified baseline fail.
+    description: Run test_command (or the detected test command) in project_dir, killed at test_timeout. Routes to self_review on pass, fix_loop_gate on failure, end_failure on a timeout. Against a red baseline a nonzero run passes when its exit code matches the baseline's and its failing tests are a subset of baseline_failures (or, when no test could be identified in either run, its failure output hashes alike); unidentified failures against an identified baseline fail. In the round tier it runs the selected targeted then impacted commands under one deadline, stops at the first red that is not pre-existing (judged against the base suite record, awaited or re-run at the base on demand), writes a round verification record for the worktree tree, and sets tests_tier; an empty selection is NOT RUN.
     script: scripts/verify_tests.sh
     timeout: 3600
     fallback: fix_loop_gate
@@ -664,6 +751,7 @@ nodes:
       Files created: {{files_to_create}}
       Build: {{build_verdict}}
       Tests: {{tests_verdict}}{{baseline_report}}
+      Tier: {{tests_tier}}
       Review: {{review_verdict}}
       Design: {{design_notes}}
 

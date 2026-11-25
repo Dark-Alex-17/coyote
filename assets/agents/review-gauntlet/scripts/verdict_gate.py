@@ -77,6 +77,13 @@ probe report names, `- other:` and `- deleted:` for the rest, and
 `- unavailable: <reason>` when either tree could not be computed or the list
 is capped. Without a probe lane nothing is written, so the report is the same
 as before the trees were recorded. The section never affects the verdict.
+
+At `verification_tier` final the gate also needs a green finalize record for
+the tree signals.py recorded before the lanes ran, as finalize_check.sh left
+it in full_suite_record: a missing, other-tree, red or unavailable record
+adds a `FULL-SUITE RECORD MISSING|RED|UNAVAILABLE: <detail>` blocker and a
+BLOCKED `full-suite` row, whatever the lanes said. An empty or `round` tier
+adds nothing, and any other value blocks as a PIPELINE-FAULT.
 """
 
 import json
@@ -214,6 +221,26 @@ def adversary_divergence_blockers(report):
 
 
 PROBE_TREE_ITEMS_MAX = 50
+TIERS = ("", "round", "final")
+FULL_SUITE_STATUSES = ("green", "red", "unavailable", "missing")
+
+
+def full_suite_check(state):
+    """(status, detail) of the finalize record for the tree recorded before the lanes."""
+    record = state.get("full_suite_record")
+    if not isinstance(record, dict) or record.get("status") not in FULL_SUITE_STATUSES:
+        return "missing", "the finalize check did not finish, so no record was looked up or written"
+    before = state.get("review_tree_before") or ""
+    if not before:
+        return "missing", state.get("review_tree_error") or "the worktree tree before the lanes was not recorded"
+    status = record["status"]
+    detail = record.get("detail") if isinstance(record.get("detail"), str) else ""
+    if record.get("tree") != before:
+        other = record.get("tree") or "no tree"
+        mismatch = f"the record is for {other}, not the reviewed tree {before}"
+        detail = f"{detail}; {mismatch}" if detail else mismatch
+        return ("missing" if status == "green" else status), detail
+    return status, detail
 
 
 def tree_change_lines(state, probe_report):
@@ -559,6 +586,20 @@ def main():
                 debris_incomplete = f"malformed debris_findings ({shape})"
                 blockers.append(f"debris: PIPELINE-FAULT -- {debris_incomplete} -- never a pass")
                 record("debris", "BLOCKED", f"malformed findings ({shape})")
+
+    tier = state.get("verification_tier") or ""
+    if tier not in TIERS:
+        blockers.append(
+            f"pipeline: PIPELINE-FAULT -- verification_tier {tier!r} is not '', round or final -- never a pass"
+        )
+        record("full-suite", "BLOCKED", "unknown verification_tier")
+    elif tier == "final":
+        status, detail = full_suite_check(state)
+        if status == "green":
+            record("full-suite", "GREEN", detail)
+        else:
+            blockers.append(f"FULL-SUITE RECORD {status.upper()}: {detail}")
+            record("full-suite", "BLOCKED", f"finalize record {status}")
 
     # retry_gate restores an exhausted lane's LAST report, which may be an
     # earlier clean verdict — an incomplete lane must block regardless of
