@@ -337,6 +337,8 @@ orchestrator can anchor the batch delta. If the task's acceptance criteria are n
 commands, or the task touches more than one seam, STOP and report it as a plan defect - do not
 widen the task to compensate. Whetstone handling below still applies when human feedback was
 addressed.
+The design retrospective, like the panel, belongs to the parent: it runs once over the whole
+batch, so you never spawn `design-retrospective` on this task.
 <!-- end -->
 <!-- when:review_cadence!=batch -->
 ### The review gauntlet (preferred): one spawn, every review lane, machine-parsed verdicts
@@ -633,6 +635,44 @@ This lane is ADVISORY: it always produces an artifact, never a blocking verdict.
 
 Do not block completion on observability findings — the failure mode is skipping the pass on applicable surface, not shipping without an alert. Threshold and paging decisions belong to humans; your job is to make them informed and cheap.
 <!-- end -->
+
+### Design retrospective (after a large body of work)
+
+After the review passes are green on a change YOU judge to be a large body of work, spawn
+`design-retrospective` ONCE to look at the design from a higher level: would the same choices be
+made again to prioritise maintainability, cleanliness and reuse, and is there a pattern that
+would clean the code up or close off a class of bugs? "Large" is your judgement, not a threshold.
+Examples: a new module or subsystem, several modules changed together, a new abstraction or
+protocol, a change other code will be built on. They are examples, not a list to match. Record
+under a `Design retrospective:` heading in your final report whether it ran, with ONE line on why
+the work did or did not count as large.
+
+Skip it under `review_cadence=batch` (the parent runs it over the whole batch) and when your
+brief says the parent orchestrator runs the run-closing retrospective.
+
+```
+agent__spawn --agent design-retrospective --prompt "Run-closing design retrospective.
+Project: <absolute repo path>
+Diff: <the task's base commit>..HEAD
+What the work set out to do: <the request or plan summary, verbatim>
+Plans dir: <the run's planning files, read as bookkeeping; omit when none>"
+--variables {"project_dir": "<absolute repo path>"}
+```
+
+Handling the result:
+- **Each refactor item is your call.** Adopt it, or decline it with a reason.
+- **Adopted** -> it becomes a todo item and is IMPLEMENTED in this run: resume the SAME coder
+  session with the adopted items pasted verbatim (a fresh coder only when its budget is spent),
+  then run a FRESH review gauntlet over the refactor commits under the normal gates.
+- **Declined** -> one line `retro-declined: <item> -- <reason>` in your final report. No bare
+  declines.
+- **Too large for this run** -> a FOLLOW-UPS line.
+- **Would restructure code outside the task's scope** -> put it to the user as a
+  `Design question:` (the same hard trigger as a coder's Tier 3 question), never self-answered.
+- **`DESIGN_RETROSPECTIVE: CLEAN`** -> note it under the heading and finish.
+- **The retrospective faults** -> note it and finish; never block completion on it.
+
+Run it ONCE per run: the refactor round it produced does not get a second retrospective.
 
 ### Continuous improvement (whetstone) — after addressing human review feedback
 

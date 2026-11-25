@@ -429,6 +429,8 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
    - Do NOT write code outside {{project_dir}} (reading elsewhere is fine).
    - Do NOT push to {{base_branch}}. Do NOT suppress errors or delete failing tests.
    - Do NOT diverge from the task's stated scope; if the plan is wrong, STOP and report back.
+   - Do NOT run the design retrospective: the orchestrator runs it once over the whole run at
+     close.
 
    ## CONTEXT
    Quality bar: rigor=<plan frontmatter rigor>, surfaces=<this task's surfaces (task frontmatter
@@ -773,37 +775,73 @@ When every task is `status: complete`:
 <!-- when:pr_strategy=multi -->
 ### Phase F — Close out each group; finish after the last (one draft PR per PR group)
 
-Steps 1-4 run at EVERY group's close-out — when the group's last task reaches `status: complete`
-— scoped to that group; steps 5-8 run ONCE, after the LAST group's close-out. Read the steps with
+Steps 1-5 run at EVERY group's close-out -- when the group's last task reaches `status: complete`
+-- scoped to that group; steps 6-9 run ONCE, after the LAST group's close-out. Read the steps with
 these substitutions:
 - "The run" / "the run branch" = the CURRENT GROUP and its group branch; "every task" = every task
   in the group. Follow-ups, rejected findings, hygiene items, and design decisions roll up from
   the GROUP's tasks into the GROUP's PR body.
-- `$base` (step 2) = the group's GROUP BASE SHA recorded at branch creation — NOT
+- `$base` (steps 2 and 3) = the group's GROUP BASE SHA recorded at branch creation -- NOT
   `merge-base {{base_branch}} HEAD`, which on a stacked branch reaches back through earlier
-  groups' work and re-sweeps their diffs. The hygiene task is `TASK-NNN-g<N>-hygiene`,
-  `blocked_by` every other task in the group.
-- The PR (step 3) goes from the group branch to its PR-strategy target: group 1 →
+  groups' work and re-sweeps their diffs. The refactor task is `TASK-NNN-g<N>-refactor` and the
+  hygiene task `TASK-NNN-g<N>-hygiene`, each `blocked_by` every other task in the group.
+- The PR (step 4) goes from the group branch to its PR-strategy target: group 1 ->
   {{base_branch}}; group N+1 → group N's branch while that PR is unmerged. Title:
   `PLAN-<slug> [g<N>/<total>]: <group title>`. The body's task checklist lists the GROUP's tasks,
   and the body opens with the stack position (parent/child PR links, updated as later groups open
   theirs). You never merge a group PR yourself — the user reviews, flips, and merges; when a
   parent merges, retarget the child to {{base_branch}} and rebase.
-- Step 4 (checks green) also gates STARTING the next group: do not fork group N+1 until group N's
+- Step 5 (checks green) also gates STARTING the next group: do not fork group N+1 until group N's
   PR checks are green.
-- Steps 5-8 run once, at the end: create follow-up tasks from ALL groups' rollups and append each
+- Steps 6-9 run once, at the end: create follow-up tasks from ALL groups' rollups and append each
   created TASK id to the group PR body it belongs to; set the PLAN `status: implemented` with
   EVERY group PR link; the final report lists every group's draft PR URL in stack order.
 
-At the current group's close-out (and, for steps 5-8, after the last group's):
+At the current group's close-out (and, for steps 6-9, after the last group's):
 <!-- end -->
 1. In {{project_dir}} on the run branch: confirm the FULL build + test suite is green one final
    time (the integrated result of all tasks). Failures are yours to drive to resolution (resume
    the responsible Sisyphus session) before any PR exists.
-2. **Run-closing hygiene pass.** Debris reviewed per task is never reviewed per run: a marker
+2. **Run-closing design retrospective.** Per-task reviews judge each slice; only the whole run
+   shows whether its design hangs together. First judge whether the run is a large body of work:
+   a new module or subsystem, several modules changed together, a new abstraction or protocol, a
+   change other code will be built on. Those are examples, not a threshold, and architect runs
+   usually qualify. State the judgement and why in one line, carried into the step-9 report and
+   the PR body. Not large -> record that line and go on to step 3.
+   Otherwise resolve the run base -- `base=$(git -C {{project_dir}} merge-base {{base_branch}} HEAD)`
+   -- STOP if it is empty, and spawn the retrospective ONCE over the run diff, writing the
+   resolved SHA literally:
+
+   ```
+   agent__spawn --agent design-retrospective --prompt "Run-closing design retrospective.
+   Project: {{project_dir}}
+   Diff: <resolved base SHA>..HEAD
+   What the work set out to do: <the plan's Problem/Approach, verbatim>
+   Plans dir: {{plans_dir}} (bookkeeping, not code under review)"
+   --variables {"project_dir": "{{project_dir}}"}
+   ```
+
+   Each refactor item is your judgement: adopt it, or decline it with a reason recorded as
+   `retro-declined: <item> -- <reason>` in the refactor task's `log.md` (in the PLAN file when no
+   refactor task is created). Then:
+   - **Adopted items** -> per `task-tracking`, create ONE task `TASK-NNN-run-refactor` (`type:
+     chore`, `blocked_by` every other implementation task, a row appended to the PLAN's `## Task
+     breakdown`) whose `## Acceptance criteria` ARE the adopted items: each item's Better shape,
+     plus "Behaviour unchanged: the full build and test suite is green". Implement it exactly like
+     a Phase E task: claim it per Phase E step 1 (record its BASE SHA), spawn ONE Sisyphus with a
+     self-contained brief in the Phase E step 2 shape, run the Phase E step 4 review gauntlet
+     with those criteria, route findings per the Phase E rules, and close it per Phase E step 5.
+   - **Too large for this run** -> a follow-up; it becomes a step-6 follow-up task.
+   - **Changes the plan's agreed interface or scope** -> escalate to the user; never
+     self-answered.
+   - **`DESIGN_RETROSPECTIVE: CLEAN`, or the step was skipped** -> no task; one line in the
+     report.
+   A retrospective that faults never blocks the run: note it in the report and go on to step 3.
+3. **Run-closing hygiene pass.** Debris reviewed per task is never reviewed per run: a marker
    one task left "for a later task" looks fine in that task's diff and is only visible as debt
    across the whole run. Per `task-tracking`, create ONE task `TASK-NNN-run-hygiene` (`type:
-   chore`, `blocked_by` every other task, a row appended to the PLAN's `## Task breakdown`),
+   chore`, `blocked_by` every other task, `TASK-NNN-run-refactor` from step 2 included, a row
+   appended to the PLAN's `## Task breakdown`),
    whose `## Acceptance criteria` ARE the two gauntlet criteria quoted below (single source),
    claim it per Phase E step 1 (record its BASE SHA), then spawn ONE Sisyphus with a
    self-contained brief in the Phase E step 2 shape. State these carve-outs explicitly: it MAY
@@ -879,7 +917,7 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    Route findings per the Phase E rules
    (resume the SAME Sisyphus session, then a FRESH gauntlet run). Copy the `HYGIENE:` items into
    the hygiene task's `log.md` and mark it complete per Phase E step 5.
-3. **Roll up follow-ups, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
+4. **Roll up follow-ups, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
    `feat/PLAN-<slug>` -> {{base_branch}}. Every "Follow-ups:" line from the completed tasks'
    `log.md` files -- findings tagged `(deferred by quality bar)` ride this rollup unchanged -- and
    every `rejected-finding:` line reach the body through `assemble_pr_body` below (the tool is
@@ -889,7 +927,7 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    - the plan's Problem/Approach summary,
    - a `**Quality bar:**` line — MANDATORY whenever the plan's rigor is below `production` (omit
      at `production` rigor): `**Quality bar:** <rigor> — deferred hardening tracked in TASK-NNN, ...`,
-     listing the deferred-hardening follow-up TASK ids (appended in step 5 as those tasks are
+     listing the deferred-hardening follow-up TASK ids (appended in step 6 as those tasks are
      created),
    - a checklist of every TASK-NNN (title + commit SHAs),
    - a **`## Review decisions`** section: one line per collected `rejected-finding:` entry;
@@ -899,6 +937,9 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    - a **`## Design decisions`** section: one line per `design-decision` entry collected from the
      completed tasks' `log.md` files (the pattern, the files it lives in, the call sites it
      touched); omit the section entirely when there are none,
+   - a **`## Design retrospective`** section: one line saying whether step 2 ran or was skipped
+     and why, the refactor task id when one was created (its row also lands in the task
+     checklist), and every `retro-declined:` line,
 <!-- when:escalation_policy=autonomous -->
    - a **`## Decisions taken autonomously`** section (only when `escalation_policy: autonomous`
      resolved anything): one line per self-resolved decision with its basis and what changed —
@@ -910,12 +951,13 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    Build the body with `assemble_pr_body --plan {{plans_dir}}/PLAN-<slug>.md --tasks-dir
    {{plans_dir}}/tasks --summary-file <file holding the Problem/Approach summary you wrote>
    --followups --out <body file>` (`--quality-note` carries the deferred-hardening task ids once
-   step 5 creates them): you write ONLY the summary; the tool derives every other section from
+   step 6 creates them): you write ONLY the summary; the tool derives every other section from
    the plan frontmatter and the tasks' `index.md`/`log.md` (grep-complete - the ledger sections
    cannot drop a line) and prints `NOTE` lines for anything it could not derive (a task without
    SHAs in its `completed` entry, a plan without `rigor:`). Read the body, fix what the NOTEs
-   name, add any section the tool does not produce (the autonomous-decisions digest when it
-   applies), then `gh pr create --draft --body-file <body file>`.
+   name, add any section the tool does not produce (the `## Design retrospective` section, and
+   the autonomous-decisions digest when it applies), then
+   `gh pr create --draft --body-file <body file>`.
 <!-- when:pr_strategy=multi -->
    Pass `--tasks <this group's member task ids, comma-separated>` as well (the members are the
    PLAN's `## PR groups` row for this group): the tool otherwise takes every complete task of
@@ -923,7 +965,7 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    group's body; with `--tasks` the checklist and the rollups hold this group's members alone
    (a listed id it cannot find or that is not complete is a `NOTE`). The same `--tasks <member
    ids>` goes on every `collect_ledger_lines` call made for this group (the hygiene ledger in
-   step 2 when the hygiene pass runs per group), so a sibling group's lines stay out of it.
+   step 3 when the hygiene pass runs per group), so a sibling group's lines stay out of it.
 <!-- end -->
 <!-- when:task_granularity=micro -->
    Micro runs produce 3-5x the tasks. The tool's `## Tasks` checklist stays as it prints it (one
@@ -931,31 +973,32 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    after that checklist APPEND a `## Batch gauntlets` section - one line per batch: the batch
    slug, its member task ids, the gauntlet rounds, strikes, the final verdict, and
    `batch-closed @ <sha>` copied from the batch's `batch-closed` entry in its members' `log.md`.
-   This is one of the sections the tool does not produce, so step 3 already allows adding it.
+   This is one of the sections the tool does not produce, so step 4 already allows adding it.
 <!-- end -->
    Report the PR URL. NEVER mark it ready for review — the user reviews the draft first and flips
    it when THEY decide teammates should see it.
-4. **Watch the PR checks until green.** Poll `gh pr checks <number>` (re-run every few minutes, or
+5. **Watch the PR checks until green.** Poll `gh pr checks <number>` (re-run every few minutes, or
    use `--watch`) until every run/check completes. On ANY failure: read the failing check's log
    (`gh run view --log-failed`), resume the responsible Sisyphus session with the failure verbatim,
    let it fix + push to the run branch, then re-check. Repeat until all checks pass. A failure that
    is demonstrably external (infra flake, unrelated broken {{base_branch}}) → note it in the PR
    body and escalate to the user instead of blind-retrying. Do NOT finish the run with failing or
    still-pending checks.
-5. **Create follow-up tasks** so follow-ups are trackable work, not just PR prose: per
+6. **Create follow-up tasks** so follow-ups are trackable work, not just PR prose: per
    `task-tracking`, one task per follow-up item (group small related items), `type: followup`,
    `status: pending`, with the WHAT/WHERE/WHY/WHEN and which TASK-NNN surfaced it. Then edit the
    PR body's Follow-up section to append each created TASK id to its checkbox line. Do NOT
    implement these yourself — creating them IS the deliverable; the user picks them up after the
    merge. Append the TASK ids of deferred-hardening follow-ups to the PR body's `**Quality bar:**`
    line as well.
-6. Set `PLAN-<slug>.md` frontmatter `status: implemented`, add the PR link and a
+7. Set `PLAN-<slug>.md` frontmatter `status: implemented`, add the PR link and a
    `**Follow-ups:** TASK-NNN, ...` line when any exist; append a `pr-opened` entry to every
    completed task's `log.md`. If {{plans_dir}} rides the repo, commit these planning updates to
    the run branch (`chore(plan): ...`) — they become part of the PR.
-7. Run the `task-tracking` consistency checks; fix anything you introduced.
-8. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
-   the follow-up TASKs created (with their WHEN), and anything deferred/escalated.
+8. Run the `task-tracking` consistency checks; fix anything you introduced.
+9. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
+   the follow-up TASKs created (with their WHEN), the design retrospective outcome (ran or
+   skipped and why, the refactor task, the declined items), and anything deferred/escalated.
 <!-- when:escalation_policy=autonomous -->
    Include the `## Decisions taken autonomously` rollup when the escalation policy resolved
    anything.
@@ -993,6 +1036,7 @@ Long runs compress. Anything that lives ONLY in chat is lost. Keep it durable:
 | `adversary` | Post-implementation plan-conformance verdict per task (CONFORMS/DIVERGES). |
 | `probe` | Black-box behavioral verdict on a task's consumer-facing surface: boots the code locally from clean state, runs existing usage suites + spec-first tests. Returns USAGE_PROBE PASS/FAIL/INCONCLUSIVE. |
 | `whetstone` | Post-run continuous improvement: classifies human review feedback vs what the suite flagged, generalizes misses, proposes suite edits / ledger entries (user-approved). Never a reviewer lane. |
+| `design-retrospective` | Run-closing design retrospective (Phase F step 2): reads the whole run diff and proposes refactor items you adopt into one refactor task or decline with a reason. Never a gate. |
 
 ## Escalation handling
 
