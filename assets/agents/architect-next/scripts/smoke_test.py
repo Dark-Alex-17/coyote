@@ -3883,6 +3883,16 @@ def _retro_rearm_integration():
                                                                              "integration_amendments")}
 
 
+def _retro_snapshot_last():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                       retro_follow_ups=["Rework the poller"], retro_done=True))
+    snap = json.loads(read_file(os.path.join(_retro_large()["run_dir"], "state.json")) or "{}")
+    tid = (u.get("tasks") or [{}])[-1].get("id", "?")
+    return (snap.get("retro_report") == u.get("retro_report") and any(tid in l for l in snap.get("retro_report") or [])
+            and "Design retrospective: Rework the poller" in (snap.get("follow_ups") or [])
+            and snap.get("decisions") == u.get("decisions")), snap.get("retro_report")
+
+
 def _retro_micro_batch():
     st = _retro_large(task_granularity="micro", retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
                       retro_follow_ups=[], retro_done=True)
@@ -3921,6 +3931,7 @@ def _parse_report_retro_follow_up():
 
 guarded("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up", _retro_triage_empty)
 guarded("retro_route: adopting re-arms the whole integration step, the one amendment round included", _retro_rearm_integration)
+guarded("retro_route: the snapshot is taken last, holding the report, follow-ups and ledger lines", _retro_snapshot_last)
 guarded("retro_route: in micro mode the refactor task is its own batch, so it closes into a batch gauntlet", _retro_micro_batch)
 guarded("integrate_route: amendments past the one re-seal become follow-ups, never dropped", _integrate_blocked_amendments)
 guarded("integrate_route: an integration follow-up already listed is not listed twice", _integrate_follow_up_dedup)

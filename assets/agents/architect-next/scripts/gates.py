@@ -5163,7 +5163,7 @@ def retro_route(state):
     lines = [f"retro-declined: {_whole_line(d.get('item'))} -- {_whole_line(d.get('reason')) or 'no reason stated'}" for d in declined]
     for line in lines:
         ledger(state, u, line)
-    task_line = "no refactor task"
+    task_line, tid = "no refactor task", ""
     if adopted and not (is_single(state) or MULTI_IS_GROUPS):
         later += adopted
         task_line = "per-task PRs have no unit to carry a refactor task, so the adopted items are follow-ups"
@@ -5185,7 +5185,6 @@ def retro_route(state):
                     "group": ref.get("group", ""), "unit": ref.get("unit", "run")}
             tasks.append(task)
             save_tasks(state, u, tasks)
-            snapshot(state, u, f"phase_f retro {tid}")
             for line in lines:
                 log_event(state, task, line)
             # the second Phase F pass judges integration afresh; retro_done keeps it from looping
@@ -5202,6 +5201,8 @@ def retro_route(state):
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Design retrospective: {f}" for f in later]
         report.append(f"- follow-ups: {len(later)} (listed under Deferred / follow-ups)")
     u["retro_report"] = report
+    if tid:
+        snapshot(state, u, f"phase_f retro {tid}")
     return u
 
 
