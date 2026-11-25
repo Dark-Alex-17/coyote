@@ -191,7 +191,8 @@ fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Va
         .env_remove("LLM_AGENT_VAR_TEST_COMMAND")
         .env_remove("LLM_AGENT_VAR_BUILD_TIMEOUT")
         .env_remove("LLM_AGENT_VAR_TEST_TIMEOUT")
-        .env_remove("LLM_AGENT_VAR_BASELINE_FLOOR");
+        .env_remove("LLM_AGENT_VAR_BASELINE_FLOOR")
+        .env_remove("LLM_AGENT_VAR_VERIFY_TIER");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -1260,10 +1261,9 @@ fn coder_graph_runs_the_baseline_once_before_implement() {
             .contains("{{baseline_note}}")
     );
     assert!(
-        nodes["end_success"]["output"]
-            .as_str()
-            .unwrap()
-            .contains("Tests: {{tests_verdict}}{{baseline_report}}\nReview: ")
+        nodes["end_success"]["output"].as_str().unwrap().contains(
+            "Tests: {{tests_verdict}}{{baseline_report}}\nTier: {{tests_tier}}\nReview: "
+        )
     );
     for key in [
         "baseline_status",
@@ -1445,22 +1445,28 @@ fn implement_worst_case_visits_stay_below_the_loop_cap() {
     );
 }
 
-/// With no report the `Tests:` line is followed by the `Review:` line; a
+/// With no report the `Tests:` line is followed by the `Tier:` line; a
 /// report lands on its own lines between them.
 #[test]
 fn end_success_renders_the_baseline_report_after_tests_passed() {
     let template = graph()["nodes"]["end_success"]["output"]
         .as_str()
         .unwrap()
-        .replace("{{tests_verdict}}", "passed");
+        .replace("{{tests_verdict}}", "passed")
+        .replace("{{tests_tier}}", "full");
     let plain = template.replace("{{baseline_report}}", "");
-    assert!(plain.contains("\nTests: passed\nReview: "), "{plain}");
+    assert!(
+        plain.contains("\nTests: passed\nTier: full\nReview: "),
+        "{plain}"
+    );
     let reported = template.replace(
         "{{baseline_report}}",
         "\nPre-existing failures: tests/a.py::one",
     );
     assert!(
-        reported.contains("Tests: passed\nPre-existing failures: tests/a.py::one\nReview: "),
+        reported.contains(
+            "Tests: passed\nPre-existing failures: tests/a.py::one\nTier: full\nReview: "
+        ),
         "{reported}"
     );
 }
@@ -2592,7 +2598,7 @@ fn end_success_renders_the_gate_and_review_verdicts() {
     assert!(!output.contains("Tests: passed"), "{output}");
     assert!(
         output.ends_with(
-            "\nBuild: {{build_verdict}}\nTests: {{tests_verdict}}{{baseline_report}}\nReview: {{review_verdict}}\nDesign: {{design_notes}}\n"
+            "\nBuild: {{build_verdict}}\nTests: {{tests_verdict}}{{baseline_report}}\nTier: {{tests_tier}}\nReview: {{review_verdict}}\nDesign: {{design_notes}}\n"
         ),
         "{output}"
     );

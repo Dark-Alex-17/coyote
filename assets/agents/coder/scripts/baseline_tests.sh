@@ -18,6 +18,8 @@ fi
 # reading the failing test ids on stdin. Every outcome goes on to implement:
 # with no red baseline, verify_tests keeps its plain exit-code verdict.
 # BASELINE_EXTRA, when set, is appended to the note as its own paragraph.
+# BASELINE_MODE, set only in the round tier, adds baseline_mode,
+# baseline_key and baseline_base.
 emit_baseline() {
   jq -Rsc "$GATE_JQ_CAP"'
     (split("\n") | map(select(. != "")) | unique) as $ids
@@ -39,7 +41,13 @@ emit_baseline() {
           end)
           + (if env.BASELINE_EXTRA == "" then "" else "\n\n" + env.BASELINE_EXTRA end)),
         "_next": "implement"
-      }'
+      }
+    + (if env.BASELINE_MODE == "" then {}
+      else {
+        "baseline_mode": env.BASELINE_MODE,
+        "baseline_key": env.BASELINE_KEY,
+        "baseline_base": env.BASELINE_BASE
+      } end)'
 }
 
 # store_baseline writes the BASELINE_* result, with the failing ids from file
@@ -87,6 +95,7 @@ valid_record() {
 }
 
 export BASELINE_STATUS=none BASELINE_EXIT=0 BASELINE_HASH='' BASELINE_NOTE='' BASELINE_REASON='' BASELINE_EXTRA='' BASELINE_REUSED_FROM=''
+export BASELINE_MODE='' BASELINE_KEY='' BASELINE_BASE=''
 
 project_dir=$(gate_workdir "$state")
 cmd=$(gate_test_command_for_run "$(gate_test_command "$project_dir")")
@@ -119,6 +128,58 @@ if [[ -z "$head" ]]; then
   printf '' | emit_baseline
   exit 0
 fi
+
+# Round tier: the base suite runs in the background in a detached worktree of
+# the base commit (.shared/base_suite.py), so this node returns at once and
+# edits already in the tree do not matter. Under build_lock the job waits
+# until verify_tests has run this lap's selected tests, so it never holds the
+# lock ahead of them.
+if [[ $(gate_verify_tier) == "round" ]]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    BASELINE_MODE=none
+    BASELINE_NOTE="python3 is not available to run the base suite, so no baseline was recorded and every failing test counts as this run's to fix."
+    printf '' | emit_baseline
+    exit 0
+  fi
+  if [[ -n "$(gate_prefix)" ]]; then
+    BASELINE_MODE="background (deferred: build_lock)"
+    BASELINE_STATUS=pending
+    BASELINE_NOTE="The baseline is pending: the base suite starts once this lap's selected tests release build_lock, and failures are classified against it when a test goes red."
+    printf '' | emit_baseline
+    exit 0
+  fi
+  started=$(python3 "$(dirname "$0")/../../.shared/base_suite.py" start --root "$workdir" --cmd "$cmd" \
+    --floor "${LLM_AGENT_VAR_BASELINE_FLOOR:-}" --timeout "$deadline" 2>/dev/null) || started='{}'
+  BASELINE_KEY=$(jq -r '.key // ""' <<<"$started")
+  BASELINE_BASE=$(jq -r '.base // ""' <<<"$started")
+  short_base=${BASELINE_BASE:0:7}
+  error=$(jq -r '.error // ""' <<<"$started")
+  case $(jq -r '.mode // ""' <<<"$started") in
+    reused)
+      BASELINE_MODE=reused
+      record=$(jq -r '.record' <<<"$started")
+      BASELINE_EXTRA="This baseline was recorded at $short_base ($(jq -r '.recorded_at // ""' "$record")) and reused; the suite was not run again."
+      reuse_record "$record"
+      exit 0
+      ;;
+    background)
+      BASELINE_MODE="background (pending)"
+      BASELINE_STATUS=pending
+      BASELINE_NOTE="The baseline is pending: the base suite runs in the background in a detached worktree at $short_base, and failures are classified against it when a test goes red."
+      ;;
+    lazy)
+      BASELINE_MODE=lazy
+      BASELINE_NOTE="The background base suite at $short_base did not finish ($error); a red test is re-run at the base when it needs classifying."
+      ;;
+    *)
+      BASELINE_MODE=none
+      BASELINE_NOTE="No baseline was recorded: ${error:-the base suite could not be started}. Every failing test counts as this run's to fix."
+      ;;
+  esac
+  printf '' | emit_baseline
+  exit 0
+fi
+
 if ! gate_has_sha256; then
   BASELINE_NOTE="Neither sha256sum nor shasum is available to key a stored baseline, so a pristine tree cannot be told from an edited one and no baseline was recorded."
   printf '' | emit_baseline
@@ -135,14 +196,13 @@ record_key() {
   printf '%s\n%s\n%s' "$1" "$rel_dir" "$cmd" | gate_sha256 | cut -c1-16
 }
 key=$(record_key "$head")
-if ! records_dir=$(git -C "$workdir" rev-parse --git-path coyote-baselines 2>/dev/null) || [[ -z "$records_dir" ]]; then
+if ! stores=$(gate_baseline_stores "$workdir"); then
   BASELINE_NOTE="git could not name a directory to keep the baseline in, so a pristine tree cannot be told from an edited one and no baseline was recorded."
   printf '' | emit_baseline
   exit 0
 fi
-records_dir=$(gate_posix_path "$records_dir")
-[[ "$records_dir" == /* ]] || records_dir="$workdir/$records_dir"
-record="$records_dir/tests-$key.json"
+records_dir=${stores%%$'\n'*}
+record=$(gate_baseline_record "$key" "$stores")
 short_head=${head:0:7}
 
 if [[ -e "$record" ]]; then
@@ -180,7 +240,7 @@ if [[ -n "$floor" ]] && floor=$(git -C "$workdir" rev-parse --verify -q "$floor^
   ancestor=''
   ancestor_record=''
   while IFS= read -r sha; do
-    candidate="$records_dir/tests-$(record_key "$sha").json"
+    candidate=$(gate_baseline_record "$(record_key "$sha")" "$stores")
     if [[ -e "$candidate" ]]; then
       ancestor=$sha
       ancestor_record=$candidate

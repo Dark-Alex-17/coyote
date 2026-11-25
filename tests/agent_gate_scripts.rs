@@ -6826,15 +6826,23 @@ fn a_failed_mktemp_d_stops_each_script_before_jq_and_names_its_cause() {
 /// Every `$var` a shipped script may hand to jq through `--arg` or
 /// `--argjson`, keyed by path under assets/agents. Each entry is bounded by
 /// something visible in the script: a fixed literal, a path, a `head -c` /
-/// `${x:0:N}` cut, a command string, a small integer (exit codes, attempt
+/// `${x:0:N}` cut, a command string, a git object id or digest, a small integer (exit codes, attempt
 /// counters, step numbers), or (`gate_error`) the engine's 8 KiB cap on
 /// SCRIPT_FALLBACK_ERROR_MAX_BYTES. Anything not listed here is presumed
 /// state-sized and must take the stdin or `--rawfile` route.
 const JQ_ARG_ALLOW_LIST: &[(&str, &[&str])] = &[
+    (
+        ".shared/finalize_gate.sh",
+        &["role", "cmd", "exit_code", "duration", "verdict", "tree"],
+    ),
     (".shared/utils.sh", &["s"]),
     (
         "coder/scripts/fix_loop_gate.sh",
         &["gate_error", "fix_attempts", "next_attempts"],
+    ),
+    (
+        "coder/scripts/gate_lib.sh",
+        &["rc", "signal", "cmd", "hash", "reason"],
     ),
     (
         "coder/scripts/implement_fault.sh",
@@ -6843,7 +6851,23 @@ const JQ_ARG_ALLOW_LIST: &[(&str, &[&str])] = &[
     ("coder/scripts/resolve_paths.sh", &["resolved"]),
     ("coder/scripts/route_review_result.sh", &["next_review"]),
     ("coder/scripts/verify_build.sh", &["cmd", "exit_code"]),
-    ("coder/scripts/verify_tests.sh", &["cmd", "exit_code"]),
+    (
+        "coder/scripts/verify_tests.sh",
+        &[
+            "cmd",
+            "exit_code",
+            "rc",
+            "base",
+            "i",
+            "role",
+            "c",
+            "duration",
+            "verdict",
+            "outcome",
+            "fail_rc",
+            "accepted_rc",
+        ],
+    ),
     ("librarian/scripts/final_format.sh", &["next"]),
     ("step-runner/scripts/check_handoff.sh", &["problems"]),
     (
