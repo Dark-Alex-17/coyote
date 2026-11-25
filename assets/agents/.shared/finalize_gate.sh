@@ -131,14 +131,19 @@ fi
 # restore_rewritten puts back the bytes every path fmt touched had before it
 # ran: dirty paths from the copies under $saved, clean tracked ones from the
 # index, and files fmt created are removed. Sets REWRITTEN to those paths.
-# Directories (a moved submodule, an untracked nested repository) hold no
-# bytes of their own and are skipped.
+# Untracked directories that were already dirty (a moved submodule, an
+# untracked nested repository) hold no bytes of their own and are skipped; a
+# tracked submodule fmt dirtied still counts as rewritten.
 restore_rewritten() {
   local path
   REWRITTEN=()
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
-    [[ -d "$top/$path" && ! -L "$top/$path" ]] && continue
+    if [[ -d "$top/$path" && ! -L "$top/$path" ]] &&
+      printf '%s\n' "$before" | grep -Fqx -- "$path" &&
+      ! git -C "$top" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+      continue
+    fi
     if printf '%s\n' "$before" | grep -Fqx -- "$path"; then
       if [[ -e "$saved/$path" || -L "$saved/$path" ]]; then
         if [[ -L "$top/$path" || -L "$saved/$path" ]] || ! cmp -s "$saved/$path" "$top/$path"; then
