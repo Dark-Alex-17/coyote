@@ -343,14 +343,17 @@ function Get-ConfigLinesWithoutTeamRelay {
 
 # Stopping the task ends only its cmd.exe; the rnsd and python it started keep running
 # with the config they read. The restart ends every process whose command line carries
-# this rnsd's `--config "<dir>"`, the whole tree, before starting the task again.
+# this rnsd's `--config "<dir>"`, the whole tree, before starting the task again. The
+# shell running the line is spared (run as `pwsh -Command "<line>"` its own command line
+# carries the same text), and a `'` in the dir is doubled for the single-quoted literal.
 function Get-RestartCommand {
-  return "Stop-ScheduledTask -TaskName '$TaskName'; Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('--config `"$script:RnsDir`"') } | ForEach-Object { taskkill.exe /PID `$_.ProcessId /T /F }; Start-ScheduledTask -TaskName '$TaskName'"
+  $dir = $script:RnsDir.Replace("'", "''")
+  return "Stop-ScheduledTask -TaskName '$TaskName'; Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('--config `"$dir`"') -and `$_.ProcessId -ne `$PID } | ForEach-Object { taskkill.exe /PID `$_.ProcessId /T /F }; Start-ScheduledTask -TaskName '$TaskName'"
 }
 
-# Every process on the host with its id and command line; replaced by the tests.
+# Every process on the host with its id, parent and command line; replaced by the tests.
 function Get-ProcessTable {
-  return @(Get-CimInstance Win32_Process | Select-Object ProcessId, CommandLine)
+  return @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CommandLine)
 }
 
 # Ends one process and every process under it; replaced by the tests.
@@ -370,12 +373,25 @@ function Select-RnsdProcessId {
     } | ForEach-Object { [int]$_.ProcessId } | Sort-Object -Unique)
 }
 
-# Once the task is stopped: ends the rnsd the task started, its whole process tree, so
-# the task started next is the only rnsd and reads the config as it is now.
+# Of those, the roots: the ones whose parent is not one of them. `taskkill /T` on a root
+# ends the processes under it, so no id is killed after its process already ended and
+# the id could have been handed to an unrelated process.
+function Select-RnsdRootProcessId {
+  param($Processes)
+  $ids = Select-RnsdProcessId $Processes
+  return @(@($Processes) | Where-Object {
+      $null -ne $_ -and $ids -contains [int]$_.ProcessId -and -not ($_.PSObject.Properties['ParentProcessId'] -and $ids -contains [int]$_.ParentProcessId)
+    } | ForEach-Object { [int]$_.ProcessId } | Sort-Object -Unique)
+}
+
+# Ends any rnsd running on this config, its whole process tree, so the task started next
+# is the only rnsd and reads the config as it is now. Returns how many trees it ended.
 function Invoke-RnsdTreeKill {
-  foreach ($id in (Select-RnsdProcessId (Get-ProcessTable))) {
+  $roots = @(Select-RnsdRootProcessId (Get-ProcessTable))
+  foreach ($id in $roots) {
     Invoke-TreeKill -ProcessId $id
   }
+  return $roots.Count
 }
 
 # -Relay on a config this script wrote: the [[Team Relay]] stanza replaces the one the file
@@ -929,9 +945,9 @@ function Install-Service {
       Write-Info "Restarting '$TaskName' so it dials the new [[Team Relay]]..."
       Stop-ScheduledTask -TaskName $TaskName
       # Stopping the task ends cmd.exe; the rnsd it started outlives it with the old config.
-      Invoke-RnsdTreeKill
+      Invoke-RnsdTreeKill | Out-Null
       if (-not (Wait-LoopbackPortClosed)) {
-        Write-Info "rnsd is still running from before: 127.0.0.1:$ListenPort stayed open for $StopWaitSeconds s after Stop-ScheduledTask, so '$TaskName' was not started again. Stop that rnsd with: Stop-Process -Id (Get-NetTCPConnection -LocalPort $ListenPort -State Listen).OwningProcess, then run: Start-ScheduledTask -TaskName '$TaskName'"
+        Write-Info "rnsd is still running from before: 127.0.0.1:$ListenPort stayed open for $StopWaitSeconds s after Stop-ScheduledTask, so '$TaskName' was not started again. End that rnsd and the processes under it with: taskkill.exe /PID (Get-NetTCPConnection -LocalPort $ListenPort -State Listen).OwningProcess /T /F, then run: Start-ScheduledTask -TaskName '$TaskName'"
         Write-Info "Logs: $script:LogFile"
         return
       }
@@ -943,6 +959,12 @@ function Install-Service {
       Write-Info "'$TaskName' is already running; not restarted"
     }
   } else {
+    # A task that was only stopped, not its process tree, leaves its rnsd running with the old
+    # config; started on top of it, the task would not be the rnsd that serves.
+    if ((Invoke-RnsdTreeKill) -gt 0) {
+      Write-Info "Ended an rnsd left running on $script:RnsDir by a stopped '$TaskName'"
+      Wait-LoopbackPortClosed | Out-Null
+    }
     Start-ScheduledTask -TaskName $TaskName
     Write-Info "Started '$TaskName'"
     $script:RnsdReload = 'started'

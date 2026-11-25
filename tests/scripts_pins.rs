@@ -185,10 +185,33 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
         stop < tree && tree < start,
         "the process tree is ended between the stop and the start: {relay_branch}"
     );
+    // Every Start-ScheduledTask the script runs itself comes after the tree kill: a task
+    // that is not running may still have left its rnsd running with the old config.
+    let service = ps1
+        .split("function Install-Service {")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction ").next())
+        .expect("mesh-relay.ps1 defines Install-Service");
+    let starts: Vec<usize> = service
+        .match_indices("    Start-ScheduledTask -TaskName $TaskName")
+        .map(|(at, _)| at)
+        .collect();
     assert_eq!(
-        ps1.matches("Invoke-RnsdTreeKill").count(),
+        starts.len(),
         2,
-        "Invoke-RnsdTreeKill is defined once and called only from the [[Team Relay]] restart"
+        "Install-Service starts the task in two places: {service}"
+    );
+    let mut from = 0;
+    for start in starts {
+        assert!(
+            service[from..start].contains("Invoke-RnsdTreeKill"),
+            "a Start-ScheduledTask in Install-Service is not preceded by the tree kill: {service}"
+        );
+        from = start + 1;
+    }
+    assert!(
+        ps1.contains("$dir = $script:RnsDir.Replace(\"'\", \"''\")"),
+        "the printed restart doubles a ' in the config dir for its single-quoted literal"
     );
     let restart = ps1
         .split("function Get-RestartCommand {")
@@ -198,6 +221,7 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
     for needle in [
         "Stop-ScheduledTask -TaskName '$TaskName'",
         "taskkill.exe /PID `$_.ProcessId /T /F",
+        "-and `$_.ProcessId -ne `$PID",
         "Start-ScheduledTask -TaskName '$TaskName'",
     ] {
         assert!(

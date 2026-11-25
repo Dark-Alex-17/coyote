@@ -75,13 +75,24 @@ function Get-ProcessTable {
   return $script:Processes
 }
 
+# taskkill /T /F: the process and every process under it end.
 function Invoke-TreeKill {
   [CmdletBinding(SupportsShouldProcess)]
   param([int]$ProcessId)
   Add-Call "Invoke-TreeKill $ProcessId"
   if ($PSCmdlet.ShouldProcess("$ProcessId")) {
-    $script:Processes = @($script:Processes | Where-Object { $_.ProcessId -ne $ProcessId })
+    $ended = @($ProcessId)
+    do {
+      $more = @($script:Processes | Where-Object { $ended -notcontains $_.ProcessId -and $ended -contains $_.ParentProcessId } | ForEach-Object { $_.ProcessId })
+      $ended += $more
+    } while ($more.Count -gt 0)
+    $script:Processes = @($script:Processes | Where-Object { $ended -notcontains $_.ProcessId })
   }
+}
+
+# The rnsd processes left on this config once the run is over, as the calls log's last line.
+function Add-RnsdProcessCall {
+  Add-Call "rnsd processes: $((Select-RnsdProcessId $script:Processes) -join ' ')"
 }
 
 # The processes the running task left: its cmd.exe, the rnsd launcher and the python it
@@ -90,12 +101,12 @@ function Invoke-TreeKill {
 function Initialize-RunningRnsdProcess {
   $config = "--config `"$script:RnsDir`""
   $script:Processes = @(
-    [pscustomobject]@{ ProcessId = 100; CommandLine = "cmd.exe /c set `"PYTHONUNBUFFERED=1`" && `"$script:RnsdCmd`" $config >> log 2>&1" },
-    [pscustomobject]@{ ProcessId = 101; CommandLine = "`"C:\venv\Scripts\rnsd.exe`" $config" },
-    [pscustomobject]@{ ProcessId = 102; CommandLine = "`"C:\Python312\python.exe`" `"C:\venv\Scripts\rnsd.exe`" $config" },
-    [pscustomobject]@{ ProcessId = 200; CommandLine = '"C:\other\rnsd.exe" --config "C:\other\.reticulum"' },
-    [pscustomobject]@{ ProcessId = $PID; CommandLine = "pwsh -File harness.ps1 $config" },
-    [pscustomobject]@{ ProcessId = 300; CommandLine = $null }
+    [pscustomobject]@{ ProcessId = 100; ParentProcessId = 50; CommandLine = "cmd.exe /c set `"PYTHONUNBUFFERED=1`" && `"$script:RnsdCmd`" $config >> log 2>&1" },
+    [pscustomobject]@{ ProcessId = 101; ParentProcessId = 100; CommandLine = "`"C:\venv\Scripts\rnsd.exe`" $config" },
+    [pscustomobject]@{ ProcessId = 102; ParentProcessId = 101; CommandLine = "`"C:\Python312\python.exe`" `"C:\venv\Scripts\rnsd.exe`" $config" },
+    [pscustomobject]@{ ProcessId = 200; ParentProcessId = 50; CommandLine = '"C:\other\rnsd.exe" --config "C:\other\.reticulum"' },
+    [pscustomobject]@{ ProcessId = $PID; ParentProcessId = 50; CommandLine = "pwsh -File harness.ps1 $config" },
+    [pscustomobject]@{ ProcessId = 300; ParentProcessId = 50; CommandLine = $null }
   )
 }
 
@@ -194,6 +205,11 @@ function Start-ScheduledTask {
     $task = Read-Store
     $task.State = 'Running'
     Write-Store $task
+    # The task's rnsd, reading the config as it is when the task starts.
+    $dials = 'no [[Team Relay]]'
+    if ((Test-Path -LiteralPath $script:RnsConfig) -and ([IO.File]::ReadAllText($script:RnsConfig) -match 'target_host = (\S+)')) { $dials = $Matches[1] }
+    $script:Processes = @($script:Processes) + @([pscustomobject]@{ ProcessId = 900; ParentProcessId = 50; CommandLine = "`"C:\venv\Scripts\rnsd.exe`" --config `"$script:RnsDir`"" })
+    Add-Call "rnsd 900 started, dialing $dials"
   }
 }
 
@@ -229,6 +245,7 @@ if ($Scenario -in @('own-config-rerun', 'foreign-config-rerun')) {
   $text = Get-ConfigText
   if ($Scenario -eq 'foreign-config-rerun') { $text = "# my own notes`n" + $text }
   [IO.File]::WriteAllText($script:RnsConfig, $text)
+  (Get-Item -LiteralPath $script:RnsConfig).LastWriteTimeUtc = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
   Write-Config
   exit 0
 }
@@ -269,6 +286,26 @@ switch ($Scenario) {
     Initialize-Store 'Running' '/c stale' 'MSFT_TaskLogonTrigger'
     $script:RelayAdded = $true
   }
+  'stale-ready-orphan-relay-added' {
+    Initialize-Store 'Ready' $desiredArguments 'MSFT_TaskLogonTrigger'
+    $script:RelayAdded = $true
+    Initialize-RunningRnsdProcess
+    $script:Processes = @($script:Processes | Where-Object { $_.ProcessId -ne 100 })
+  }
+  'relay-edit-restart' {
+    # A config this script wrote, then a run with -Relay: Write-Config edits it, and the
+    # service step restarts the running task.
+    Initialize-Store 'Running' $desiredArguments 'MSFT_TaskLogonTrigger'
+    Initialize-RunningRnsdProcess
+    $script:RelayHost = ''
+    $script:RelayPort = ''
+    New-Item -ItemType Directory -Force -Path $script:RnsDir | Out-Null
+    [IO.File]::WriteAllText($script:RnsConfig, (Get-ConfigText))
+    $script:RelayHost = 'relay.example'
+    $script:RelayPort = '4242'
+    Write-Config
+    Add-Call "config dials $(if ([IO.File]::ReadAllText($script:RnsConfig) -match 'target_host = (\S+)') { $Matches[1] } else { 'nothing' })"
+  }
   'unchanged-running-relay-added-port-stays-open' {
     Initialize-Store 'Running' $desiredArguments 'MSFT_TaskLogonTrigger'
     $script:RelayAdded = $true
@@ -281,4 +318,5 @@ switch ($Scenario) {
 
 Install-Service
 if ($script:RelayAdded) { Write-NextStep }
+Add-RnsdProcessCall
 exit 0

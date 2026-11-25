@@ -198,12 +198,29 @@ impl Drop for Scenario {
 }
 
 /// The restart the script prints: the task stopped, every process carrying its
-/// `--config "<dir>"` ended with its tree, the task started.
+/// `--config "<dir>"` but the shell running the line ended with its tree, the task started.
 fn restart_command(run: &Scenario) -> String {
     format!(
-        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('--config \"{}\"') }} | ForEach-Object {{ taskkill.exe /PID $_.ProcessId /T /F }}; Start-ScheduledTask -TaskName 'Coyote rnsd'",
+        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('--config \"{}\"') -and $_.ProcessId -ne $PID }} | ForEach-Object {{ taskkill.exe /PID $_.ProcessId /T /F }}; Start-ScheduledTask -TaskName 'Coyote rnsd'",
         run.dir.join(".reticulum").display()
     )
+}
+
+/// The rnsd processes left on the task's config when the run is over, and how each
+/// started rnsd dialed, from the harness's calls log.
+fn rnsd_outcome(run: &Scenario) -> (String, Vec<String>) {
+    let calls = run.calls();
+    let left = calls
+        .lines()
+        .rfind(|line| line.starts_with("rnsd processes:"))
+        .unwrap_or_default()
+        .to_owned();
+    let started = calls
+        .lines()
+        .filter(|line| line.starts_with("rnsd 900 started"))
+        .map(str::to_owned)
+        .collect();
+    (left, started)
 }
 
 fn changed_note(run: &Scenario) -> String {
@@ -233,22 +250,95 @@ fn the_relay_restart_ends_the_old_rnsd_process_tree_before_starting_the_task() {
         })
         .map(str::to_owned)
         .collect();
+    // Only the root of the tree is killed: /T ends the launcher and python under it, and
+    // no id is killed after its process already ended.
     assert_eq!(
         order,
         [
             "Stop-ScheduledTask 'Coyote rnsd'",
             "Invoke-TreeKill 100",
-            "Invoke-TreeKill 101",
-            "Invoke-TreeKill 102",
             "Start-ScheduledTask 'Coyote rnsd'",
         ],
         "{out}"
+    );
+    assert_eq!(
+        rnsd_outcome(&run).0,
+        "rnsd processes: 900",
+        "exactly one rnsd, the one the task started, is left: {out}"
     );
     let added = format!(
         "Added [[Team Relay]] -> relay.example:4242 to {} and restarted 'Coyote rnsd'.",
         run.dir.join(".reticulum").join("config").display()
     );
     assert!(run.stdout.contains(&added), "{out}");
+}
+
+/// A `-Relay` run on the config the script wrote, end to end: Write-Config adds the
+/// stanza, the restart ends the old rnsd's tree, and the one rnsd left is the task's new
+/// one, started after the edit and dialing the new target.
+#[test]
+fn a_relay_edit_and_the_restart_leave_one_rnsd_started_after_the_edit_dialing_the_new_target() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "relay-edit-restart");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    let calls = run.calls();
+    let edited = calls
+        .find("config dials relay.example")
+        .unwrap_or_else(|| panic!("the config was not edited: {out}"));
+    let started = calls
+        .find("rnsd 900 started")
+        .unwrap_or_else(|| panic!("no rnsd started: {out}"));
+    assert!(edited < started, "the rnsd started before the edit: {out}");
+    assert_eq!(
+        rnsd_outcome(&run),
+        (
+            "rnsd processes: 900".to_owned(),
+            vec!["rnsd 900 started, dialing relay.example".to_owned()]
+        ),
+        "{out}"
+    );
+    assert!(
+        run.stdout.contains(&format!(
+            "Added [[Team Relay]] -> relay.example:4242 to {} and restarted 'Coyote rnsd'.",
+            run.dir.join(".reticulum").join("config").display()
+        )),
+        "{out}"
+    );
+}
+
+/// A task stopped with Stop-ScheduledTask alone (the old advice) is Ready while its rnsd
+/// still runs the old config: the run ends that rnsd's tree before starting the task, so
+/// the task's rnsd is the only one.
+#[test]
+fn a_stopped_task_whose_rnsd_outlived_it_is_started_only_after_that_rnsd_is_ended() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "stale-ready-orphan-relay-added");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    let order: Vec<&str> = run
+        .calls()
+        .lines()
+        .filter(|line| {
+            line.starts_with("Invoke-TreeKill") || line.starts_with("Start-ScheduledTask")
+        })
+        .map(|line| {
+            if line.starts_with("Invoke-TreeKill") {
+                "kill"
+            } else {
+                "start"
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(order, ["kill", "start"], "{out}");
+    assert!(run.calls().contains("Invoke-TreeKill 101\n"), "{out}");
+    assert_eq!(rnsd_outcome(&run).0, "rnsd processes: 900", "{out}");
+    assert!(
+        run.stdout.contains("Ended an rnsd left running on "),
+        "{out}"
+    );
 }
 
 /// A plain re-run on the config the script wrote says so with `(already there)` and
@@ -260,6 +350,12 @@ fn a_rerun_on_the_scripts_own_config_says_already_there_and_prints_no_stanzas() 
     let out = run.transcript();
     assert_eq!(run.code, 0, "{out}");
     let config = run.dir.join(".reticulum").join("config");
+    // The harness dates the config it writes to 2000-01-01; a rewrite would move that.
+    let modified = fs::metadata(&config).unwrap().modified().unwrap();
+    assert!(
+        modified < UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+        "the re-run rewrote the config: {out}"
+    );
     assert!(
         run.stdout.contains(&format!(
             "[coyote-mesh] {} is the one this script wrote (already there); not touched",
@@ -441,7 +537,7 @@ fn a_relay_restart_whose_old_rnsd_keeps_the_port_says_so_and_claims_no_restart()
     assert!(run.call_count("Test-LoopbackPort") >= 1, "{out}");
     assert!(
         run.stdout.contains("rnsd is still running from before")
-            && run.stdout.contains("Stop-Process -Id (Get-NetTCPConnection -LocalPort 4242 -State Listen).OwningProcess")
+            && run.stdout.contains("End that rnsd and the processes under it with: taskkill.exe /PID (Get-NetTCPConnection -LocalPort 4242 -State Listen).OwningProcess /T /F")
             && run.stdout.contains("then run: Start-ScheduledTask -TaskName 'Coyote rnsd'"),
         "{out}"
     );
