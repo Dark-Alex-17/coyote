@@ -265,6 +265,11 @@ impl fmt::Display for PropagationError {
                 "The propagation node started to answer, but the answer had not finished arriving within {:.1}s",
                 after.as_secs_f64()
             ),
+            Self::Link(RequestError::LateLinkUnanswered { after, .. }) => write!(
+                f,
+                "The link to the propagation node came up late and the transfer was not confirmed within {} s; the propagation node may hold the message",
+                after.as_secs_f64().round()
+            ),
             Self::Link(err) => write!(f, "{err}"),
             Self::TransferFailed => {
                 write!(f, "The transfer to the propagation node did not complete")
@@ -285,6 +290,28 @@ impl fmt::Display for PropagationError {
 }
 
 impl std::error::Error for PropagationError {}
+
+impl PropagationError {
+    /// This error with the node's destination hash `hex`, where a link error's own text
+    /// spells it (`no known path to destination <hex>`), replaced by `label`, the node as
+    /// the user knows it: a propagation node is never named by its bare hash.
+    pub(crate) fn naming_node(self, hex: &str, label: &str) -> Self {
+        let rename = |text: String| {
+            text.replace(&format!("destination {hex}"), label)
+                .replace(hex, label)
+        };
+        match self {
+            Self::Link(RequestError::LinkNotOpened(text)) => {
+                Self::Link(RequestError::LinkNotOpened(rename(text)))
+            }
+            Self::Link(RequestError::LinkFailed(text)) => {
+                Self::Link(RequestError::LinkFailed(rename(text)))
+            }
+            Self::Link(RequestError::Send(text)) => Self::Link(RequestError::Send(rename(text))),
+            other => other,
+        }
+    }
+}
 
 impl From<RequestError> for PropagationError {
     fn from(err: RequestError) -> Self {
@@ -1231,6 +1258,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant as StdInstant;
     use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
+
+    /// A link error that spells the node's destination hash names the node by its label
+    /// instead; another error is left as it is.
+    #[test]
+    fn a_link_error_names_the_propagation_node_by_its_label_never_its_hash() {
+        let hex = "9af2fd9114dc43947dbcfb810276a19c";
+        let label = "propagation node 9af2fd91 (configured)";
+        let no_path = PropagationError::Link(RequestError::LinkNotOpened(format!(
+            "no known path to destination {hex}"
+        )))
+        .naming_node(hex, label);
+        assert_eq!(
+            no_path.to_string(),
+            "The mesh link failed: no known path to propagation node 9af2fd91 (configured)"
+        );
+        let no_link = PropagationError::Link(RequestError::LinkNotOpened(format!(
+            "no link to destination {hex}: the transport said no"
+        )))
+        .naming_node(hex, label);
+        assert!(!no_link.to_string().contains(hex), "{no_link}");
+        assert!(no_link.to_string().contains(label), "{no_link}");
+        assert_eq!(
+            PropagationError::TransferFailed.naming_node(hex, label),
+            PropagationError::TransferFailed
+        );
+    }
 
     /// A cost every mine reaches within a handful of nonces.
     const CHEAP_COST: u32 = 1;

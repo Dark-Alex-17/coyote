@@ -3,7 +3,9 @@
 //! and the host's interface addresses changing, as a move between networks does. Either
 //! leaves everyone who knew this session unable to reach it until it announces. The
 //! watch reads rnsd through the reader the LAN row uses, once per `UPSTREAM_POLL`, and
-//! keeps each transition with its interface and time in `InterfaceTransitions`.
+//! keeps each transition with its interface and time in `InterfaceTransitions`. What one
+//! network change does (several upstreams dropping and coming back, the addresses moving)
+//! is settled into one transition by `TransitionSettle` and greeted once.
 
 use crate::mesh::lan_count::{RnsdLanReader, RnsdTcpInterface};
 use crate::mesh::redact_hashes;
@@ -16,7 +18,21 @@ use std::time::{Duration, SystemTime};
 use tokio::time::{Interval, MissedTickBehavior, interval_at};
 
 /// How often the watch reads rnsd's interfaces and the host's addresses.
-pub(crate) const UPSTREAM_POLL: Duration = Duration::from_secs(30);
+pub(crate) const UPSTREAM_POLL: Duration = Duration::from_secs(10);
+
+/// The quiet a transition needs before it is greeted: a reconnect or address change seen
+/// within this of the last one belongs to the same transition.
+pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 10;
+
+/// `GREETING_DEBOUNCE_SECS` as a duration.
+pub(crate) const GREETING_DEBOUNCE: Duration = Duration::from_secs(GREETING_DEBOUNCE_SECS);
+
+/// How often the watch reads while a transition settles.
+pub(crate) const SETTLE_READ: Duration = Duration::from_secs(5);
+
+/// The longest a transition settles, from its first sighting: an upstream that keeps
+/// flapping is greeted after this however often it changes.
+pub(crate) const SETTLE_CAP: Duration = Duration::from_secs(60);
 
 /// The transitions kept, the oldest dropped first.
 const TRANSITIONS_KEPT: usize = 64;
@@ -65,7 +81,7 @@ fn network_fingerprint(
 /// What one poll found that the node greets for: the rnsd TCP interfaces that came back
 /// online, and the host interfaces whose addresses changed. One poll that finds both is
 /// one greeting.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct UpstreamChange {
     pub reconnected: Vec<String>,
     pub network_changed: Vec<String>,
@@ -74,6 +90,114 @@ pub(crate) struct UpstreamChange {
 impl UpstreamChange {
     pub(crate) fn is_empty(&self) -> bool {
         self.reconnected.is_empty() && self.network_changed.is_empty()
+    }
+
+    /// Adds `other`'s interfaces, each named once.
+    fn absorb(&mut self, other: UpstreamChange) {
+        for (into, from) in [
+            (&mut self.reconnected, other.reconnected),
+            (&mut self.network_changed, other.network_changed),
+        ] {
+            for name in from {
+                if !into.contains(&name) {
+                    into.push(name);
+                }
+            }
+        }
+    }
+}
+
+/// The transition the watch is settling: every change seen from its first sighting until
+/// `GREETING_DEBOUNCE` passes with nothing new, or `SETTLE_CAP` from the first sighting,
+/// greeted as one. One network change drops and brings back each of rnsd's upstreams on
+/// its own reconnect timer and moves the host's addresses; greeted per sighting, it would
+/// spend the hourly budget on its own.
+#[derive(Debug, Default)]
+pub(crate) struct TransitionSettle {
+    open: Option<Settling>,
+}
+
+#[derive(Debug)]
+struct Settling {
+    first: tokio::time::Instant,
+    last: tokio::time::Instant,
+    change: UpstreamChange,
+}
+
+impl TransitionSettle {
+    /// Whether a transition is settling, so the watch reads every `SETTLE_READ`.
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Folds one reading's `change`, read at `now`, in. A change that opens a transition
+    /// is a first sighting, which `opens` says. Returns the transition once it settled,
+    /// with its first sighting, and closes it.
+    pub(crate) fn observe(
+        &mut self,
+        change: &UpstreamChange,
+        now: tokio::time::Instant,
+    ) -> SettleStep {
+        let opens = !change.is_empty() && self.open.is_none();
+        if !change.is_empty() {
+            match &mut self.open {
+                Some(open) => {
+                    open.change.absorb(change.clone());
+                    open.last = now;
+                }
+                None => {
+                    self.open = Some(Settling {
+                        first: now,
+                        last: now,
+                        change: change.clone(),
+                    });
+                }
+            }
+        }
+        let settled = self.open.as_ref().is_some_and(|open| {
+            now.saturating_duration_since(open.last) >= GREETING_DEBOUNCE
+                || now.saturating_duration_since(open.first) >= SETTLE_CAP
+        });
+        let settled = if settled {
+            self.open.take().map(|open| (open.first, open.change))
+        } else {
+            None
+        };
+        SettleStep { opens, settled }
+    }
+}
+
+/// What one reading did to the transition being settled.
+#[derive(Debug, Default)]
+pub(crate) struct SettleStep {
+    /// The reading opened a transition: its change is the first sighting.
+    pub opens: bool,
+    /// The transition that settled, with its first sighting.
+    pub settled: Option<(tokio::time::Instant, UpstreamChange)>,
+}
+
+/// Whether each LAN interface reaches anyone, by the interface: an rnsd AutoInterface or
+/// an in-process `lan` channel. A LAN that goes from nobody to somebody has come back,
+/// and the routes the long way round may have a shorter one over it.
+#[derive(Debug, Default)]
+pub(crate) struct LanPresence {
+    seen: BTreeMap<String, u64>,
+}
+
+impl LanPresence {
+    /// Folds one reading of `counts` (interface, hosts it reaches; `None` unread) in and
+    /// returns the interfaces that reach someone now and reached nobody at the last
+    /// reading. An interface's first reading is no transition, and an unread one keeps
+    /// the last count.
+    pub(crate) fn observe(&mut self, counts: &[(String, Option<u64>)]) -> Vec<String> {
+        let mut gained = Vec::new();
+        for (name, count) in counts {
+            let Some(count) = count else { continue };
+            if self.seen.insert(name.clone(), *count) == Some(0) && *count > 0 {
+                gained.push(name.clone());
+            }
+        }
+        gained
     }
 }
 
@@ -203,6 +327,17 @@ impl UpstreamPoll {
     /// Waits for the next tick.
     pub(crate) async fn tick(&mut self) {
         self.ticks.tick().await;
+    }
+
+    /// Waits for the next read: `SETTLE_READ` while a transition settles, after which the
+    /// regular ticks restart a whole `UPSTREAM_POLL` on; the next tick otherwise.
+    pub(crate) async fn tick_for(&mut self, settling: bool) {
+        if settling {
+            tokio::time::sleep(SETTLE_READ).await;
+            self.ticks.reset();
+        } else {
+            self.tick().await;
+        }
     }
 
     /// One poll: one read of rnsd when there is one (serialised with every other read
@@ -691,5 +826,167 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn reconnect(name: &str) -> UpstreamChange {
+        UpstreamChange {
+            reconnected: vec![name.to_string()],
+            network_changed: Vec::new(),
+        }
+    }
+
+    const PN: &str = "TCPInterface[Propagation Node/192.168.0.84:4242]";
+    const HUB: &str = "TCPInterface[Public Hub/reticulum.nepamesh.com:4242]";
+
+    /// One network switch, as the hotspot test saw it: the addresses move, then Team
+    /// Relay, the propagation node and the public hub come back one read apart. Each read
+    /// lands within `GREETING_DEBOUNCE` of the last, so it is one transition, settled once
+    /// `GREETING_DEBOUNCE` passes with nothing new and holding every interface once; the
+    /// first sighting alone opens it. A second switch later is a transition of its own.
+    #[test]
+    fn the_changes_of_one_network_switch_settle_into_one_transition() {
+        let start = tokio::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut settle = TransitionSettle::default();
+        let first = settle.observe(
+            &UpstreamChange {
+                reconnected: Vec::new(),
+                network_changed: vec!["en0".to_string()],
+            },
+            at(0),
+        );
+        assert!(first.opens && first.settled.is_none() && settle.is_open());
+        for (secs, name) in [(5, RELAY), (10, PN), (15, HUB), (20, PN)] {
+            let step = settle.observe(&reconnect(name), at(secs));
+            assert!(!step.opens && step.settled.is_none(), "{name} at {secs} s");
+        }
+        assert!(
+            settle
+                .observe(&UpstreamChange::default(), at(25))
+                .settled
+                .is_none(),
+            "5 s of quiet is not yet the debounce"
+        );
+        let settled = settle.observe(&UpstreamChange::default(), at(30));
+        assert!(!settled.opens);
+        let (since, change) = settled.settled.expect("10 s of quiet settles it");
+        assert_eq!(since, at(0), "the first sighting");
+        assert_eq!(change.network_changed, ["en0"]);
+        assert_eq!(change.reconnected, [RELAY, PN, HUB], "each interface once");
+        assert!(!settle.is_open());
+        assert!(
+            settle
+                .observe(&UpstreamChange::default(), at(40))
+                .settled
+                .is_none(),
+            "nothing is settled twice"
+        );
+
+        let again = settle.observe(&reconnect(RELAY), at(600));
+        assert!(again.opens, "a later switch opens a transition of its own");
+        let (since, change) = settle
+            .observe(&UpstreamChange::default(), at(610))
+            .settled
+            .unwrap();
+        assert_eq!(
+            (since, change.reconnected),
+            (at(600), vec![RELAY.to_string()])
+        );
+    }
+
+    /// An upstream that keeps flapping, a change every read, is settled `SETTLE_CAP`
+    /// after its first sighting with everything seen until then.
+    #[test]
+    fn a_transition_that_keeps_changing_settles_at_the_cap() {
+        let start = tokio::time::Instant::now();
+        let mut settle = TransitionSettle::default();
+        let mut secs = 0;
+        let settled = loop {
+            let name = if secs % 10 == 0 { RELAY } else { HUB };
+            let step = settle.observe(&reconnect(name), start + Duration::from_secs(secs));
+            if let Some(settled) = step.settled {
+                break settled;
+            }
+            secs += 5;
+            assert!(secs <= 120, "never settled");
+        };
+        assert_eq!(Duration::from_secs(secs), SETTLE_CAP);
+        assert_eq!(settled.1.reconnected, [RELAY, HUB]);
+    }
+
+    /// Debouncing makes the hourly budget count transitions: three switches an hour,
+    /// each flapping three upstreams, take three greetings, under the cap of four.
+    #[test]
+    fn a_switch_flapping_three_upstreams_takes_one_greeting() {
+        let start = tokio::time::Instant::now();
+        let mut settle = TransitionSettle::default();
+        let mut greetings = 0;
+        for switch in 0..3u64 {
+            let base = switch * 1200;
+            for (offset, name) in [(0, RELAY), (5, PN), (10, HUB)] {
+                if settle
+                    .observe(&reconnect(name), start + Duration::from_secs(base + offset))
+                    .settled
+                    .is_some()
+                {
+                    greetings += 1;
+                }
+            }
+            for quiet in [15, 20, 25] {
+                if settle
+                    .observe(
+                        &UpstreamChange::default(),
+                        start + Duration::from_secs(base + quiet),
+                    )
+                    .settled
+                    .is_some()
+                {
+                    greetings += 1;
+                }
+            }
+        }
+        assert_eq!(greetings, 3);
+        assert!(greetings < crate::mesh::announce::RECONNECT_GREETINGS_PER_HOUR);
+    }
+
+    /// The reads run every `UPSTREAM_POLL`, and every `SETTLE_READ` while a transition
+    /// settles: a return home asked at the first sighting goes out within about 15 s of
+    /// the transition, and the debounce is read finely enough to merge what one switch
+    /// does.
+    #[test]
+    fn the_watch_reads_often_enough_for_the_debounce_and_return_home() {
+        assert_eq!(GREETING_DEBOUNCE_SECS, 10);
+        assert!(UPSTREAM_POLL <= Duration::from_secs(10));
+        assert!(SETTLE_READ < GREETING_DEBOUNCE);
+        assert!(SETTLE_CAP > GREETING_DEBOUNCE);
+    }
+
+    /// A LAN interface that goes from nobody to somebody has come back; its first reading,
+    /// an unread count, and a LAN that keeps its hosts or loses them are no such change.
+    #[test]
+    fn a_lan_that_reaches_hosts_again_is_seen_once() {
+        let mut presence = LanPresence::default();
+        let read = |count: Option<u64>| vec![("AutoInterface".to_string(), count)];
+        assert!(
+            presence.observe(&read(Some(0))).is_empty(),
+            "the first reading"
+        );
+        assert!(presence.observe(&read(None)).is_empty(), "unread");
+        assert_eq!(presence.observe(&read(Some(2))), ["AutoInterface"]);
+        assert!(
+            presence.observe(&read(Some(3))).is_empty(),
+            "still reaching hosts"
+        );
+        assert!(presence.observe(&read(Some(0))).is_empty(), "lost them");
+        assert_eq!(
+            presence.observe(&read(Some(1))),
+            ["AutoInterface"],
+            "back again"
+        );
+        let mut fresh = LanPresence::default();
+        assert!(
+            fresh.observe(&read(Some(4))).is_empty(),
+            "a LAN first read with hosts is no transition"
+        );
     }
 }

@@ -3858,6 +3858,10 @@ mod tests {
             },
             RequestError::NotRunning,
             RequestError::Shutdown,
+            RequestError::LateLinkUnanswered {
+                path: path.clone(),
+                after,
+            },
         ];
         failures.extend(
             [
@@ -3890,7 +3894,7 @@ mod tests {
         );
     }
 
-    const REQUEST_ERROR_VARIANTS: usize = 18;
+    const REQUEST_ERROR_VARIANTS: usize = 19;
 
     /// No wildcard arm: a new `RequestError` variant fails to compile here until it is
     /// numbered, `REQUEST_ERROR_VARIANTS` raised and a sample of it added to the sweep.
@@ -3914,6 +3918,7 @@ mod tests {
             RequestError::NotRunning => 15,
             RequestError::Shutdown => 16,
             RequestError::LinkDropped => 17,
+            RequestError::LateLinkUnanswered { .. } => 18,
         }
     }
 

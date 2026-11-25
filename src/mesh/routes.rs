@@ -219,6 +219,19 @@ pub(crate) fn return_home_candidates(
         .collect()
 }
 
+/// The `candidates` not in `asked_before`, each added to it: return home asks a
+/// destination once per transition however many interfaces come back in it.
+fn claim_unasked(
+    candidates: Vec<String>,
+    asked_before: &parking_lot::Mutex<HashSet<String>>,
+) -> Vec<String> {
+    let mut asked = asked_before.lock();
+    candidates
+        .into_iter()
+        .filter(|destination| asked.insert(destination.clone()))
+        .collect()
+}
+
 /// This node's memory of its own interfaces' state and of the paths a transition made
 /// suspect.
 #[derive(Default)]
@@ -617,7 +630,12 @@ impl Routes<'_> {
     /// shorter route over `returned` can answer; rnsd would answer the request from the
     /// long row otherwise. This node's own copy stays, so a link opened meanwhile still
     /// has a path. How many were asked for.
-    pub(crate) async fn return_home_rnsd(&self, returned: &str, wanted: &HashSet<String>) -> usize {
+    pub(crate) async fn return_home_rnsd(
+        &self,
+        returned: &str,
+        wanted: &HashSet<String>,
+        asked_before: &parking_lot::Mutex<HashSet<String>>,
+    ) -> usize {
         let Some(rows) = self.rnsd_rows().await else {
             return 0;
         };
@@ -625,7 +643,10 @@ impl Routes<'_> {
             .into_iter()
             .map(|row| (row.hash.to_hex_string(), row.interface, row.hops))
             .collect();
-        let candidates = return_home_candidates(&rows, returned, wanted);
+        let candidates = claim_unasked(
+            return_home_candidates(&rows, returned, wanted),
+            asked_before,
+        );
         let mut asked = 0;
         for destination in candidates {
             let Ok(hash) = AddressHash::new_from_hex_string(&destination) else {
@@ -648,10 +669,15 @@ impl Routes<'_> {
         &self,
         iface: AddressHash,
         wanted: &HashSet<String>,
+        asked_before: &parking_lot::Mutex<HashSet<String>>,
     ) -> usize {
         let rows = self.own_rows().await;
         let mut asked = 0;
-        for destination in return_home_candidates(&rows, &iface.to_hex_string(), wanted) {
+        let candidates = claim_unasked(
+            return_home_candidates(&rows, &iface.to_hex_string(), wanted),
+            asked_before,
+        );
+        for destination in candidates {
             let Ok(hash) = AddressHash::new_from_hex_string(&destination) else {
                 continue;
             };
@@ -754,6 +780,7 @@ impl Routes<'_> {
         // A first contact is a try made right after a path request that was actually
         // sent; a path's age is no evidence of one, as every announce refreshes it.
         let first_contact = first.asked;
+        let first_never_linked = matches!(failed, RequestError::LinkActivationTimeout { .. });
         let suspicion = facts.suspicion();
         let mut recovery = decide(failed, suspicion, first_contact);
         // One path request per call: a marked path already had its drop and ask.
@@ -801,6 +828,23 @@ impl Routes<'_> {
         {
             *retried_to = Some(who());
             *recently_seen = false;
+        }
+        // The first link never came up and the retry's did, so the request went out on
+        // it: a silence now may be the answer still on its way, not a session that never
+        // heard it.
+        if first_never_linked
+            && let Err(err) = &mut retried
+            && let Some(failed) = link_error(err)
+            && let RequestError::Timeout { path, after } = failed
+        {
+            debug!(
+                "Mesh request {path} to {dest8} went out on a link that came up late and was not answered within {:.1} s",
+                after.as_secs_f64()
+            );
+            *failed = RequestError::LateLinkUnanswered {
+                path: std::mem::take(path),
+                after: *after,
+            };
         }
         retried
     }
@@ -1320,6 +1364,151 @@ mod rnsd_tests {
             "No mesh link to Ann / laptop came up within 10 s. Far sessions (several hops, a public gateway) can take longer; try once more. `.mesh people list` shows when it was last heard."
         );
         assert!(!text.contains("may have left"), "{text}");
+    }
+
+    /// The first link never came up, the retry's did and carried the request, and no
+    /// answer followed: the silence is reported as a request that may have arrived, never
+    /// as the plain timeout a caller would store with a propagation node. A retry that
+    /// failed another way, or a first try that timed out on an active link, keeps its
+    /// error.
+    #[tokio::test]
+    async fn a_request_sent_on_the_retrys_late_link_and_unanswered_may_have_arrived() {
+        let unanswered = || RequestError::Timeout {
+            path: "/message".to_string(),
+            after: Duration::from_secs(30),
+        };
+        let run = recover(
+            "routes-recover-late-link",
+            Duration::from_secs(3600),
+            true,
+            Mark::No,
+            true,
+            Some(never_linked()),
+            Some(unanswered()),
+        )
+        .await;
+        assert_eq!(run.tries.len(), 2);
+        let err = run.outcome.unwrap_err();
+        assert_eq!(
+            err,
+            RequestError::LateLinkUnanswered {
+                path: "/message".to_string(),
+                after: Duration::from_secs(30),
+            }
+        );
+        assert!(!err.falls_back_to_store(), "never stored as well");
+        assert_eq!(
+            err.to_string(),
+            "The request went out on a mesh link that came up late, and no answer came within 30 s; it may have arrived"
+        );
+
+        let run = recover(
+            "routes-recover-late-link-dropped",
+            Duration::from_secs(3600),
+            true,
+            Mark::No,
+            true,
+            Some(never_linked()),
+            Some(RequestError::LinkDropped),
+        )
+        .await;
+        assert_eq!(run.outcome, Err(RequestError::LinkDropped));
+
+        let run = recover(
+            "routes-recover-first-timeout",
+            Duration::from_secs(3600),
+            true,
+            Mark::No,
+            true,
+            Some(unanswered()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            run.tries.len(),
+            1,
+            "a timeout on an active link is not retried"
+        );
+        assert_eq!(run.outcome, Err(unanswered()));
+    }
+
+    /// Return home after an interface came back: a trusted destination rnsd routes the
+    /// long way round, 3 hops over the Public Hub, has its row dropped and is asked for,
+    /// once per transition however many interfaces come back in it. A destination on the
+    /// interface that came back is not asked, and a new transition asks again.
+    #[tokio::test]
+    async fn return_home_asks_once_per_transition_for_a_destination_on_a_longer_path_elsewhere() {
+        let tmp = TempDir::new("routes-return-home");
+        let learned = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let rnsd = FakeRnsd::start(move |(verb, what)| match (verb.as_str(), what.as_str()) {
+            ("get", "path_table") => Value::Array(vec![map(vec![
+                ("hash", Value::Binary(destination().as_slice().to_vec())),
+                ("timestamp", Value::F64(learned)),
+                ("via", Value::Binary(vec![0x11; 16])),
+                ("hops", Value::from(3)),
+                ("expires", Value::F64(learned + 604_800.0)),
+                ("interface", Value::from(PUBLIC_HUB)),
+            ])]),
+            ("drop", "path") => Value::from(true),
+            ("get", "next_hop_if_name") => Value::from("None"),
+            other => panic!("unexpected request {other:?}"),
+        })
+        .await;
+        let reader = rnsd.reader(&tmp);
+        let transport = transport();
+        let transitions = InterfaceTransitions::default();
+        let book = RouteBook::default();
+        let routes = Routes {
+            transport: &transport,
+            rnsd: Some(&reader),
+            transitions: &transitions,
+            book: &book,
+        };
+        let drops = || {
+            rnsd.asked()
+                .iter()
+                .filter(|verb| *verb == &("drop".to_string(), "path".to_string()))
+                .count()
+        };
+        let wanted: HashSet<String> = [destination().to_hex_string()].into();
+        let asked = parking_lot::Mutex::new(HashSet::new());
+
+        assert_eq!(
+            routes.return_home_rnsd(TEAM_RELAY, &wanted, &asked).await,
+            1
+        );
+        assert_eq!(drops(), 1);
+        assert_eq!(
+            routes
+                .return_home_rnsd("TCPInterface[Propagation Node]", &wanted, &asked)
+                .await,
+            0,
+            "asked once in the transition"
+        );
+        assert_eq!(drops(), 1);
+
+        asked.lock().clear();
+        assert_eq!(
+            routes.return_home_rnsd(PUBLIC_HUB, &wanted, &asked).await,
+            0,
+            "the path already runs over the interface that came back"
+        );
+        assert_eq!(
+            routes
+                .return_home_rnsd(TEAM_RELAY, &HashSet::new(), &asked)
+                .await,
+            0,
+            "nothing the node wants"
+        );
+        assert_eq!(
+            routes.return_home_rnsd(TEAM_RELAY, &wanted, &asked).await,
+            1,
+            "a new transition asks again"
+        );
+        assert_eq!(drops(), 2);
     }
 
     /// A link that never came up over a sound path learned long ago is reported at once.

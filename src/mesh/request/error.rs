@@ -29,6 +29,10 @@ pub(crate) enum RequestError {
         recently_seen: bool,
         retried_to: Option<String>,
     },
+    /// The first try's link did not come up in time, the retry put the request on a link
+    /// that did, and no answer came within `after`: the request left this node late and
+    /// may have arrived, so it is not handed to a propagation node as well.
+    LateLinkUnanswered { path: String, after: Duration },
     /// This node's own wait ran out before the request left it: the link lock stayed
     /// held, or the transport did not take the request, within `after`.
     LocalTimeout { path: String, after: Duration },
@@ -160,6 +164,11 @@ impl fmt::Display for RequestError {
                 }
                 Ok(())
             }
+            Self::LateLinkUnanswered { after, .. } => write!(
+                f,
+                "The request went out on a mesh link that came up late, and no answer came within {} s; it may have arrived",
+                after.as_secs_f64().round()
+            ),
             Self::LocalTimeout { after, .. } => write!(
                 f,
                 "Your session could not hand the request to its own mesh link within {:.1}s",
@@ -281,6 +290,9 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
             retried_to: Some(_),
             ..
         } => "`.mesh people list` shows when it was last heard",
+        RequestError::LateLinkUnanswered { .. } => {
+            "Check for a reply (`.mesh messaging inbox`) before you send it again"
+        }
         RequestError::Timeout { .. }
         | RequestError::LinkActivationTimeout { .. }
         | RequestError::LocalTimeout { .. }

@@ -11742,6 +11742,57 @@ pub(crate) mod network {
             node.stop().await;
         }
 
+        /// The first link never came up and the retry's carried the message, unanswered:
+        /// the send says it may have arrived, names the session and where a reply shows,
+        /// and stores nothing with the propagation node, which would deliver it twice.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_sent_on_a_late_link_may_have_arrived_and_is_not_stored() {
+            let (pair, mut node) =
+                pair_with_propagation_node_trusting("request-peer-late-link", trusting_b).await;
+            pair.introduce_b_to_a().await;
+            let b_instance = pair.responder.desc.address_hash.to_hex_string();
+            pair.node_a
+                .fail_next_request(RequestError::LateLinkUnanswered {
+                    path: "/message".to_string(),
+                    after: Duration::from_secs(30),
+                });
+
+            let err = pair
+                .node_a
+                .send_peer_with(&b_instance, &hello(), peer_send_options())
+                .await
+                .unwrap_err();
+
+            let who = pair
+                .node_a
+                .owner_namer()
+                .who(pair.node_a.identity_at(&b_instance).as_deref(), &b_instance)
+                .to_string();
+            assert_eq!(
+                err,
+                SendError::MayHaveArrived {
+                    destination: b_instance.clone(),
+                    who: who.clone(),
+                    after: Duration::from_secs(30),
+                }
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Sent to {who} but no acknowledgement came within 30 s; it may have arrived - .mesh messaging inbox shows a reply"
+                )
+            );
+            assert_eq!(err.class(), "may_have_arrived");
+            assert!(
+                err.log_text().contains(short(&b_instance)) && !err.log_text().contains(&who),
+                "{}",
+                err.log_text()
+            );
+            node.nothing_else_received();
+            pair.stop_node_a().await;
+            node.stop().await;
+        }
+
         /// With no propagation node known, a stalled upload says nothing was queued
         /// rather than that the peer stayed silent.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

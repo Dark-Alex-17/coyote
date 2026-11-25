@@ -86,7 +86,8 @@ use crate::mesh::trust::{
     row_derives,
 };
 use crate::mesh::upstream::{
-    InterfaceTransitions, MoveGreeting, UpstreamChange, UpstreamPoll, host_addresses,
+    InterfaceTransitions, LanPresence, MoveGreeting, TransitionSettle, UpstreamChange,
+    UpstreamPoll, host_addresses,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
@@ -495,6 +496,48 @@ pub(crate) fn loopback_endpoint(endpoint: &str) -> bool {
             .is_some_and(|(host, _)| loopback_host(host))
 }
 
+/// Whether `host`, as a `private` interface names it, is this machine: its loopback, or
+/// one of `local_addresses`, the addresses of this host's own interfaces. A name other
+/// than `localhost` is never resolved, so it reads as another host.
+pub(crate) fn targets_this_host(host: &str, local_addresses: &[std::net::IpAddr]) -> bool {
+    if loopback_host(host) {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| local_addresses.contains(&ip))
+}
+
+/// Whether the node reads the local rnsd's interface stats (the LAN row, the upstream
+/// watch and its greeting, the silent-LAN inputs): it is attached to rnsd's shared
+/// instance (`attached`), or a `private` interface dials an rnsd on this host, whose
+/// TCP server that is. A `private` interface to another host greets through its own
+/// reconnects instead.
+fn reads_local_rnsd(
+    attached: bool,
+    interfaces: &[MeshInterface],
+    local_addresses: &[std::net::IpAddr],
+) -> bool {
+    attached
+        || interfaces.iter().any(|interface| {
+            matches!(interface, MeshInterface::Private { host, .. } if targets_this_host(host, local_addresses))
+        })
+}
+
+/// The addresses of this host's own interfaces, loopback included; empty when they
+/// cannot be read.
+fn own_addresses() -> Vec<std::net::IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces
+                .into_iter()
+                .map(|interface| interface.ip())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Maps the configured list 1:1; nothing is detected, defaulted, or substituted.
 fn plan_interfaces(interfaces: &[MeshInterface]) -> Vec<InterfacePlan> {
     interfaces
@@ -518,6 +561,9 @@ fn plan_interfaces(interfaces: &[MeshInterface]) -> Vec<InterfacePlan> {
 
 /// The shared instance the `local` entry names, which is also where rnsd binds its RPC
 /// listener on Linux and Android.
+/// The local rnsd's AutoInterfaces, together, as `LanPresence` names them.
+const RNSD_LAN: &str = "AutoInterface";
+
 fn local_instance(config: &MeshConfig) -> String {
     config
         .interfaces()
@@ -802,6 +848,9 @@ pub(crate) struct MeshRuntime {
     interface_transitions: InterfaceTransitions,
     /// This node's own interfaces' state and the paths a network change made suspect.
     route_book: RouteBook,
+    /// The destinations return home already asked a shorter path for in the transition
+    /// being settled, so each is asked once per transition.
+    return_home_asked: parking_lot::Mutex<HashSet<String>>,
     destination: Mutex<DestinationState>,
     /// Held shared for the node's lifetime so no process rotates the key it announces
     /// under; `None` once `shutdown` has released it. Outside `DestinationState` because a
@@ -1077,9 +1126,10 @@ impl MeshRuntime {
             KnockCache::new(&paths.cache_dir, config.knock_retention_hours),
             options.hooks.clone(),
         ));
-        let rnsd_lan = joined
+        let attached = joined
             .iter()
-            .any(|iface| matches!(iface, JoinedInterface::Local { .. }))
+            .any(|iface| matches!(iface, JoinedInterface::Local { .. }));
+        let rnsd_lan = reads_local_rnsd(attached, config.interfaces(), &own_addresses())
             .then(|| RnsdLanReader::new(options.rnsd.clone(), &local_instance(config)));
         let runtime = Arc::new(Self {
             fingerprint,
@@ -1111,6 +1161,7 @@ impl MeshRuntime {
             rnsd_lan,
             interface_transitions: InterfaceTransitions::default(),
             route_book: RouteBook::default(),
+            return_home_asked: parking_lot::Mutex::new(HashSet::new()),
             destination: Mutex::new(DestinationState {
                 dest,
                 hash,
@@ -1772,7 +1823,8 @@ impl MeshRuntime {
         &self.interface_transitions
     }
 
-    /// The reader of the attached `local` rnsd's interface stats, when there is one.
+    /// The reader of the local rnsd's interface stats, when the node attaches to it or a
+    /// `private` interface dials it.
     pub(crate) fn rnsd_reader(&self) -> Option<&RnsdLanReader> {
         self.rnsd_lan.as_ref()
     }
@@ -1818,9 +1870,13 @@ impl MeshRuntime {
     /// After the watch saw rnsd's upstream come back or the host's network change: every
     /// path over the interface that changed (every path, for a network change) is marked
     /// suspect, so its next request asks the network first, and the trusted sessions and
-    /// filed nodes routed the long way round are asked for once over the one that came
-    /// back. Runs off the watcher, which it never holds up.
-    fn after_upstream_change(self: &Arc<Self>, change: &UpstreamChange) {
+    /// filed nodes routed the long way round are asked for over the one that came back,
+    /// each once per transition: `first_sighting` starts a new transition. Runs off the
+    /// watcher, which it never holds up.
+    fn after_upstream_change(self: &Arc<Self>, change: &UpstreamChange, first_sighting: bool) {
+        if first_sighting {
+            self.return_home_asked.lock().clear();
+        }
         let reconnected = change.reconnected.clone();
         let moved = !change.network_changed.is_empty();
         self.spawn_route_work(move |runtime| async move {
@@ -1846,9 +1902,80 @@ impl MeshRuntime {
             }
             let wanted = runtime.return_home_wanted();
             for returned in &reconnected {
-                routes.return_home_rnsd(returned, &wanted).await;
+                routes
+                    .return_home_rnsd(returned, &wanted, &runtime.return_home_asked)
+                    .await;
             }
         });
+    }
+
+    /// After a LAN interface went from reaching nobody to reaching someone (`gained`, as
+    /// `lan_presence` names them): the trusted sessions and filed nodes routed the long
+    /// way round are asked for over it, each once per transition; `first_sighting` starts
+    /// a new one.
+    fn after_lan_gained(self: &Arc<Self>, gained: Vec<String>, first_sighting: bool) {
+        if first_sighting {
+            self.return_home_asked.lock().clear();
+        }
+        self.spawn_route_work(move |runtime| async move {
+            let Some(transport) = runtime.transport_handle().await else {
+                return;
+            };
+            let routes = runtime.routes(&transport);
+            let wanted = runtime.return_home_wanted();
+            for lan in &gained {
+                debug!("Mesh LAN interface {lan} reaches hosts again");
+                if lan == RNSD_LAN {
+                    routes
+                        .return_home_rnsd(lan, &wanted, &runtime.return_home_asked)
+                        .await;
+                } else if let Ok(host) = AddressHash::new_from_hex_string(lan) {
+                    routes
+                        .return_home_in_process(host, &wanted, &runtime.return_home_asked)
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// What each LAN interface reaches now, for `LanPresence`: every in-process `lan`
+    /// channel by its hash, and the local rnsd's AutoInterfaces (`RNSD_LAN`) as its latest
+    /// reading had them, with no call. `None` for a count that could not be read.
+    pub(crate) async fn lan_presence(&self) -> Vec<(String, Option<u64>)> {
+        let hosts: Vec<AddressHash> = self
+            .interfaces
+            .lock()
+            .await
+            .iter()
+            .filter_map(|iface| match iface {
+                JoinedInterface::Lan { host, .. } => Some(*host),
+                _ => None,
+            })
+            .collect();
+        let mut counts = Vec::new();
+        if let Some(transport) = self.transport.lock().await.clone() {
+            for host in hosts {
+                counts.push((
+                    host.to_hex_string(),
+                    transport.interface_peer_count(&host).await,
+                ));
+            }
+        }
+        if let Some(lan) = self
+            .rnsd_lan
+            .as_ref()
+            .and_then(RnsdLanReader::reading_seen)
+            .and_then(|reading| reading.lan)
+        {
+            counts.push((
+                RNSD_LAN.to_string(),
+                match lan {
+                    LanReading::Count(hosts) => Some(hosts),
+                    LanReading::Unknown => None,
+                },
+            ));
+        }
+        counts
     }
 
     /// Runs route work off the caller as a task the node owns: registered, and ended when
@@ -1900,7 +2027,9 @@ impl MeshRuntime {
             let marked = routes.own_destinations_over(iface).await;
             runtime.route_book.mark(marked);
             let wanted = runtime.return_home_wanted();
-            routes.return_home_in_process(iface, &wanted).await;
+            routes
+                .return_home_in_process(iface, &wanted, &runtime.return_home_asked)
+                .await;
         });
     }
 
@@ -2272,10 +2401,11 @@ impl MeshRuntime {
         };
         let message = build(&origin);
         let node_hex = node.destination.address_hash.to_hex_string();
+        let label = self.propagation_node_label(&node_hex);
         self.routes(&transport)
             .recovering(
                 &node.destination.address_hash,
-                || format!("propagation node {}", short(&node_hex)),
+                || label.clone(),
                 LinkTry {
                     link_timeout: options.link_timeout,
                     path_requested: options.path_requested,
@@ -2300,8 +2430,24 @@ impl MeshRuntime {
                 },
                 crate::mesh::routes::post_link_error,
             )
-            .await?;
+            .await
+            .map_err(|err| err.naming_node(&node_hex, &label))?;
         Ok(())
+    }
+
+    /// A propagation node as every line names it: `propagation node <hash8>`, with
+    /// `(configured)` when `mesh.propagation_nodes` pins it. Never the bare hash.
+    pub(crate) fn propagation_node_label(&self, node_hex: &str) -> String {
+        let configured = self
+            .configured_propagation_nodes()
+            .hashes()
+            .iter()
+            .any(|hash| hash.eq_ignore_ascii_case(node_hex));
+        format!(
+            "propagation node {}{}",
+            short(node_hex),
+            if configured { " (configured)" } else { "" }
+        )
     }
 
     /// Sends one request to `destination` over a link, proving this node's identity first
@@ -4033,6 +4179,7 @@ fn note_link_outcome(
         Ok(_)
         | Err(
             RequestError::Timeout { .. }
+            | RequestError::LateLinkUnanswered { .. }
             | RequestError::IdentifyTimeout { .. }
             | RequestError::ResponseIncomplete { .. }
             | RequestError::RequestIncomplete { .. }
@@ -4527,10 +4674,14 @@ fn reconcile_tcp_after_lag(
 ///
 /// Every `UPSTREAM_POLL` the watcher also reads the local rnsd's TCP interfaces and this
 /// host's addresses (`UpstreamPoll`): an rnsd upstream that came back online, or a change
-/// of the host's addresses, leaves everyone who knew this session unable to reach it, so
-/// either is greeted once through `greet`, all of them sharing one budget of
-/// `RECONNECT_GREETINGS_PER_HOUR`, and a poll that finds both greets once. Each
-/// transition is recorded on the node (`interface_transitions`).
+/// of the host's addresses, leaves everyone who knew this session unable to reach it.
+/// What it sees is settled into one transition (`TransitionSettle`, reading every
+/// `SETTLE_READ` until `GREETING_DEBOUNCE` passes with nothing new), which is greeted
+/// once through `greet`, every transition sharing one budget of
+/// `RECONNECT_GREETINGS_PER_HOUR`. Each sighting marks the paths over what changed and
+/// asks return home's destinations at once, each once per transition, and a LAN that
+/// reaches hosts again asks the same way (`LanPresence`). Each transition is recorded on
+/// the node (`interface_transitions`).
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -4558,12 +4709,14 @@ async fn watch_interfaces(
             .upgrade()
             .is_some_and(|runtime| runtime.rnsd_reader().is_some());
     let mut move_greeting = MoveGreeting::default();
+    let mut settle = TransitionSettle::default();
+    let mut lan_presence = LanPresence::default();
     let mut client_greeted_at: Option<tokio::time::Instant> = None;
     loop {
         let mut transitions = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
-            () = upstream.tick() => {
+            () = upstream.tick_for(settle.is_open()) => {
                 let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
                     return;
                 };
@@ -4575,17 +4728,25 @@ async fn watch_interfaces(
                         runtime.interface_transitions(),
                     ) => change,
                 };
-                // The paths over what changed are marked whether or not the greeting is
-                // held back a poll.
+                // The paths over what changed are marked, and return home asks, at each
+                // sighting, whether or not the greeting waits for the transition to settle.
+                let step = settle.observe(&change, tokio::time::Instant::now());
                 if !change.is_empty() {
-                    runtime.after_upstream_change(&change);
+                    runtime.after_upstream_change(&change, step.opens);
                 }
-                let change = move_greeting.decide(
-                    change,
-                    defers_moves,
-                    client_greeted_at,
-                    tokio::time::Instant::now(),
-                );
+                let gained = lan_presence.observe(&runtime.lan_presence().await);
+                if !gained.is_empty() {
+                    runtime.after_lan_gained(gained, !settle.is_open());
+                }
+                // While a transition settles nothing is greeted; once it has, it is one
+                // greeting, which a network change held back a poll may still join.
+                if settle.is_open() {
+                    continue;
+                }
+                let (first, settled) = step
+                    .settled
+                    .unwrap_or_else(|| (tokio::time::Instant::now(), UpstreamChange::default()));
+                let change = move_greeting.decide(settled, defers_moves, client_greeted_at, first);
                 if change.is_empty() {
                     continue;
                 }
@@ -16137,6 +16298,110 @@ mod tests {
             .to_string(),
             "lost, retrying: x"
         );
+    }
+
+    /// The local rnsd is read for a `local` attach, and for a `private` interface whose
+    /// host is this machine: its loopback, `localhost` or one of its own addresses. A
+    /// `private` or `public` interface to another host does not bring it, nor does `lan`.
+    #[test]
+    fn the_local_rnsd_is_read_for_a_private_interface_to_this_host_only() {
+        let own: Vec<std::net::IpAddr> = vec![
+            "127.0.0.1".parse().unwrap(),
+            "192.168.0.20".parse().unwrap(),
+            "fd00::20".parse().unwrap(),
+        ];
+        let private = |host: &str| MeshInterface::Private {
+            host: host.to_string(),
+            port: 4242,
+        };
+        for host in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "localhost",
+            "[::1]",
+            "192.168.0.20",
+            "[fd00::20]",
+        ] {
+            assert!(
+                reads_local_rnsd(false, &[private(host)], &own),
+                "private {host} is this host's rnsd"
+            );
+        }
+        for host in [
+            "192.168.0.84",
+            "relay.example",
+            "reticulum.nepamesh.com",
+            "10.0.0.1",
+        ] {
+            assert!(
+                !reads_local_rnsd(false, &[private(host)], &own),
+                "private {host} is another host"
+            );
+        }
+        assert!(!reads_local_rnsd(
+            false,
+            &[
+                MeshInterface::Lan,
+                MeshInterface::Public {
+                    host: "127.0.0.1".to_string(),
+                    port: 4242
+                }
+            ],
+            &own
+        ));
+        assert!(reads_local_rnsd(true, &[], &own), "a local attach");
+        assert!(
+            reads_local_rnsd(
+                false,
+                &[private("192.168.0.84"), private("127.0.0.1")],
+                &own
+            ),
+            "any one private interface to this host"
+        );
+    }
+
+    /// A propagation node is named `propagation node <hash8>`, with `(configured)` when
+    /// `mesh.propagation_nodes` pins it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_propagation_node_is_labelled_by_its_short_hash_and_whether_it_is_configured() {
+        let pinned = "9af2fd9114dc43947dbcfb810276a19c";
+        let started = crate::mesh::test_support::started_runtime_with("node-pn-label", |config| {
+            config.propagation_nodes = vec![pinned.to_string()];
+        })
+        .await;
+        let runtime = &started.runtime;
+        assert_eq!(
+            runtime.propagation_node_label(pinned),
+            "propagation node 9af2fd91 (configured)"
+        );
+        assert_eq!(
+            runtime.propagation_node_label(&"ab".repeat(16)),
+            "propagation node abababab"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    /// A node whose only interface is `private` to a relay on this host's loopback reads
+    /// the local rnsd, as a `local` node does, so its upstream watch can greet.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_on_a_private_loopback_relay_reads_the_local_rnsd() {
+        let relay = TransportRelay::start().await;
+        let tmp = TempDir::new("node-private-loopback-reader");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.rnsd_reader().is_some());
+        runtime.shutdown().await.unwrap();
+        relay.stop().await;
     }
 
     #[test]

@@ -1440,6 +1440,14 @@ pub(crate) enum SendError {
     Propagation(PropagationError),
     /// The peer answered, but not with the acknowledgement for this id.
     NotAcknowledged,
+    /// The first link to `destination` (`who` names it, `<user> / <session>`) did not come
+    /// up in time, the retry's did and carried the message, and no acknowledgement came
+    /// within `after`. It may have arrived, so it was not stored as well.
+    MayHaveArrived {
+        destination: String,
+        who: String,
+        after: Duration,
+    },
 }
 
 impl fmt::Display for SendError {
@@ -1530,6 +1538,11 @@ impl fmt::Display for SendError {
             Self::NotAcknowledged => write!(
                 f,
                 "That session answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
+            ),
+            Self::MayHaveArrived { who, after, .. } => write!(
+                f,
+                "Sent to {who} but no acknowledgement came within {} s; it may have arrived - .mesh messaging inbox shows a reply",
+                after.as_secs_f64().round()
             ),
         }
     }
@@ -1640,6 +1653,7 @@ impl SendError {
             Self::NoAnswer(_) => "no_answer",
             Self::Propagation(_) => "propagation",
             Self::NotAcknowledged => "not_acknowledged",
+            Self::MayHaveArrived { .. } => "may_have_arrived",
         }
     }
 
@@ -1658,6 +1672,14 @@ impl SendError {
                 destination: destination.clone(),
                 who: short(destination).to_string(),
                 age: age.clone(),
+            }
+            .to_string(),
+            Self::MayHaveArrived {
+                destination, after, ..
+            } => Self::MayHaveArrived {
+                destination: destination.clone(),
+                who: short(destination).to_string(),
+                after: *after,
             }
             .to_string(),
             other => other.to_string(),
@@ -2446,6 +2468,19 @@ impl MeshRuntime {
                         return Err(SendError::NotAcknowledged);
                     }
                     Err(err) if err.falls_back_to_store() => err,
+                    Err(RequestError::LateLinkUnanswered { after, .. }) => {
+                        debug!(
+                            "Mesh {kind} {id} to {dest8} went out on a link that came up late and was not acknowledged; it is not stored as well"
+                        );
+                        return Err(SendError::MayHaveArrived {
+                            who: self
+                                .owner_namer()
+                                .who(self.identity_at(&destination).as_deref(), &destination)
+                                .to_string(),
+                            destination: destination.clone(),
+                            after,
+                        });
+                    }
                     Err(RequestError::Refused(RefusalCode::NoAccess)) => {
                         debug!(
                             "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
