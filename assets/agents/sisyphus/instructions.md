@@ -315,6 +315,19 @@ Evidence required:
   BOTH lint rules, and you list each new use in your final report under
   a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
 
+### Comment hygiene over the final diff
+
+Once the implementation is complete, and before the run's last review (the review gauntlet below;
+under batch cadence, the parent's batch review), run `comment-discipline`'s `## Final-diff pass`
+over the task's whole diff: `git diff --no-color --no-ext-diff <base>..HEAD` from the task's base
+commit, with the plan files excluded. Load `comment-discipline` and read every comment the diff adds
+beside the code it sits on. This is a judgement read, not a grep: decide keep, cut or reduce per
+comment. Hand the cut and reduce list (`<file:line> -- cut` or `<file:line> -- reduce to:
+<sentence>`) back to the coder: resume the SAME coder session, so its build and test gates run over
+the edits, and the review that follows gates them like any other change. Nothing to cut means no
+resume. Your final report carries the skill's `Comment hygiene:` line. A comment a later fix round
+adds is the code-review lane's `Comment hygiene` finding.
+
 <!-- when:review_cadence=batch -->
 ### Review cadence: batch (set by the parent orchestrator)
 
@@ -900,6 +913,7 @@ did not set out to touch.
 - Writing files via `execute_command` (heredocs, `cat >`, `echo >`, `printf >`) → file corruption from shell parsing
 - Accepting `#[allow(dead_code)]` "for a later task" with no task named -> orphaned debt
 - Letting a coder write decisions or check-ledgers into CONTRIBUTING/README -> records with no owner
+- Finishing without the comment hygiene pass over the final diff -> comments that restate the code ship because every reviewer read past them
 
 ## Hard Blocks (NEVER violate)
 

@@ -335,7 +335,7 @@ nodes:
          `comment-discipline` (self-documenting / api-documented /
          comment-heavy) and write comments to match. When the signal is
          weak, write NO comment. Every comment must EARN ITS KEEP — if
-         the code already tells the reader, don't add it.
+         the code already tells the reader, don't add it (rule 7 below).
       4. If the change touches boundaries, error paths, jobs, or state
          transitions, also note the logging register per
          `logging-discipline` (logger, message style, payload vs IDs,
@@ -368,8 +368,15 @@ nodes:
          always beats a success-shaped one; a false "passed" poisons every
          downstream consumer of your report.
       7. Comments say what the code cannot: intent, an invariant, a
-         non-obvious consequence, an external constraint. Never paraphrase
-         the code or narrate the plan. Human register: plain sentences,
+         non-obvious consequence, an external constraint, a
+         behaviour that lives elsewhere in the codebase, or the decision
+         behind a choice.
+         A comment that restates easily read code is not written: code
+         strives to be self-documenting, and the repo's own commenting
+         standards come first (`comment-discipline`). The orchestrator
+         reads every comment you added once more over the final diff and
+         has you cut the ones that do not earn their keep.
+         Never paraphrase the code or narrate the plan. Human register: plain sentences,
          ASCII punctuation only (banned: em/en dashes, ellipsis characters,
          arrows, section signs, multiplication and comparison symbols,
          curly quotes, and the rarer look-alikes: horizontal bar,

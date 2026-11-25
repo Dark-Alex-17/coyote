@@ -129,6 +129,8 @@ instructions: |
   - **🟢 SUGGESTION** — Clarity, coupling, naming, footgun mitigations, missing tests for the change
   - **💡 NITPICK** — Style if no formatter enforces it, minor naming, slop-remover findings on prose-style comments
 
+  A severity the loaded skill assigns to a named rule wins over this mapping: a `Comment hygiene` finding (an added comment that restates the code or narrates the plan) stays 🟡 WARNING, never a nitpick.
+
   ### The `[convention]` / `[correctness]` marker
 
   Finding titles may optionally carry a `[convention]` or `[correctness]` marker (e.g. `#### [convention] Collection endpoint without pagination`). Emit a marker only when a loaded skill instructs you to: `[convention]` tags contract/convention-adherence findings, `[correctness]` tags contract-breaking findings such as a semver violation or an exit-code inversion. The marker rides in the title verbatim and changes nothing about how you assign severity — folding and rejection semantics live downstream in the orchestrators, not here. The severity mapping above is unchanged.

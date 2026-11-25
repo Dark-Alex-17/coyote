@@ -223,6 +223,81 @@ fn usage_probe_architect_hygiene_pass_resolves_the_run_base_once_and_reads_lint_
     );
 }
 
+/// The comment rule is applied three times: the coder while writing, the
+/// closing pass over the final diff (Sisyphus per task, the architect's
+/// run-closing hygiene task per run), and the review's finding class. The
+/// Sisyphus pass must run before its review gauntlet so the review gates the
+/// removals, and the architect's must sit inside the hygiene brief.
+#[test]
+fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
+    assert_anchors(
+        "coder/graph.yaml",
+        &[
+            "behaviour that lives elsewhere in the codebase, or the decision",
+            "A comment that restates easily read code is not written",
+        ],
+    );
+    assert_anchors(
+        "file-reviewer/config.yaml",
+        &[
+            "a `Comment hygiene` finding (an added comment that restates the code or narrates the plan) stays 🟡 WARNING, never a nitpick",
+        ],
+    );
+
+    let sisyphus = agent_file("sisyphus/instructions.md");
+    let pass = sisyphus
+        .find("### Comment hygiene over the final diff")
+        .expect("sisyphus has the comment hygiene pass");
+    let gauntlet = sisyphus
+        .find("### The review gauntlet (preferred)")
+        .expect("sisyphus has the review gauntlet section");
+    assert!(
+        pass < gauntlet,
+        "the comment hygiene pass must come before the review gauntlet that gates it"
+    );
+    let section = &sisyphus[pass..gauntlet];
+    for anchor in [
+        "`comment-discipline`'s `## Final-diff pass`",
+        "git diff --no-color --no-ext-diff <base>..HEAD",
+        "resume the SAME coder session",
+        "before the run's last review",
+        "`Comment hygiene:` line",
+    ] {
+        assert!(
+            section.contains(anchor),
+            "sisyphus comment hygiene pass lost {anchor:?}"
+        );
+    }
+    assert!(
+        sisyphus.contains("- Finishing without the comment hygiene pass over the final diff"),
+        "sisyphus anti-patterns must name the skipped pass"
+    );
+
+    let architect = agent_file("architect/instructions.md");
+    let start = architect
+        .find("2. **Run-closing hygiene pass.**")
+        .expect("architect has the run-closing hygiene step");
+    let end = architect[start..]
+        .find("Verification: run the review gauntlet")
+        .map(|i| start + i)
+        .expect("the hygiene brief is followed by its verification");
+    let brief = architect[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for anchor in [
+        "comment hygiene over the run's final diff: per `comment-discipline`'s `## Final-diff pass`",
+        "every comment the run diff adds",
+        "a kept comment needs no `HYGIENE:` row",
+    ] {
+        assert!(
+            brief.contains(anchor),
+            "architect hygiene brief lost {anchor:?}"
+        );
+    }
+    assert_anchors("architect/README.md", &["comments that restate the code"]);
+}
+
 /// The probe's docs walkthrough is specified three times (prompt, README,
 /// skill) and the acceptance criteria require the two load-bearing contracts
 /// to read the same in all three: when a page counts as "unusable" (two or
