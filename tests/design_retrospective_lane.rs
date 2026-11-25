@@ -76,6 +76,17 @@ fn design_retrospective_agent_ships_read_only_with_explore_as_its_only_child() {
         variables.contains(&"project_dir"),
         "design-retrospective must declare project_dir, got {variables:?}"
     );
+    let grounding = config["variables"]
+        .as_sequence()
+        .expect("config has a variables list")
+        .iter()
+        .find(|v| v["name"].as_str() == Some("review_grounding"))
+        .expect("design-retrospective must declare review_grounding, like every review lane");
+    assert_eq!(
+        grounding["default"].as_str(),
+        Some("1"),
+        "review_grounding defaults to on"
+    );
     assert!(
         !variables.contains(&"auto_confirm"),
         "design-retrospective runs no confirmable commands and must not declare auto_confirm"
