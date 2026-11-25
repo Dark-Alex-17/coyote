@@ -478,20 +478,28 @@ impl TokenUsage {
     /// Bedrock Converse (`input_tokens` excludes cache tokens), so the terms
     /// sum without adjustment. Strict on missing prices: any nonzero
     /// component without a price yields `None` rather than a silent
-    /// undercount. All-zero usage is also `None` — nothing billed, nothing
-    /// to show.
+    /// undercount. A zero total is also `None`: nothing billed, nothing to
+    /// show.
     pub fn cost_usd(&self, model: &Model) -> Option<f64> {
+        self.billed_cost_usd(model).filter(|total| *total > 0.0)
+    }
+
+    /// The cost of one call for run accounting. Unlike [`Self::cost_usd`],
+    /// which hides zero costs from display, a zero total is a known cost:
+    /// only a nonzero token bucket without a price leaves the cost unknown.
+    pub fn billed_cost_usd(&self, model: &Model) -> Option<f64> {
         fn term(tokens: Option<u64>, price: Option<f64>) -> Option<f64> {
             match tokens.unwrap_or(0) {
                 0 => Some(0.0),
                 tokens => Some(tokens as f64 * price? / 1_000_000.0),
             }
         }
-        let total = term(self.input_tokens, model.input_price())?
-            + term(self.output_tokens, model.output_price())?
-            + term(self.cache_read_input_tokens, model.cache_read_price())?
-            + term(self.cache_creation_input_tokens, model.cache_write_price())?;
-        (total > 0.0).then_some(total)
+        Some(
+            term(self.input_tokens, model.input_price())?
+                + term(self.output_tokens, model.output_price())?
+                + term(self.cache_read_input_tokens, model.cache_read_price())?
+                + term(self.cache_creation_input_tokens, model.cache_write_price())?,
+        )
     }
 }
 
@@ -660,26 +668,8 @@ fn llm_failed_extras(
 fn succeeded_call<'a>(usage: Option<&'a TokenUsage>, model: &Model) -> RunCallOutcome<'a> {
     RunCallOutcome::Succeeded {
         usage,
-        cost: usage.and_then(|usage| billed_cost_usd(usage, model)),
+        cost: usage.and_then(|usage| usage.billed_cost_usd(model)),
     }
-}
-
-/// The cost of one call for run accounting. Unlike [`TokenUsage::cost_usd`],
-/// which hides zero costs from display, a zero total is a known cost: only a
-/// nonzero token bucket without a price leaves the cost unknown.
-fn billed_cost_usd(usage: &TokenUsage, model: &Model) -> Option<f64> {
-    fn term(tokens: Option<u64>, price: Option<f64>) -> Option<f64> {
-        match tokens.unwrap_or(0) {
-            0 => Some(0.0),
-            tokens => Some(tokens as f64 * price? / 1_000_000.0),
-        }
-    }
-    Some(
-        term(usage.input_tokens, model.input_price())?
-            + term(usage.output_tokens, model.output_price())?
-            + term(usage.cache_read_input_tokens, model.cache_read_price())?
-            + term(usage.cache_creation_input_tokens, model.cache_write_price())?,
-    )
 }
 
 pub async fn call_chat_completions(
@@ -2076,11 +2066,8 @@ mod tests {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
         };
-        assert_eq!(billed_cost_usd(&zero, &unpriced), Some(0.0));
-        assert_eq!(
-            billed_cost_usd(&TokenUsage::default(), &unpriced),
-            Some(0.0)
-        );
+        assert_eq!(zero.billed_cost_usd(&unpriced), Some(0.0));
+        assert_eq!(TokenUsage::default().billed_cost_usd(&unpriced), Some(0.0));
     }
 
     #[test]
@@ -2091,7 +2078,7 @@ mod tests {
             output_tokens: Some(10),
             ..Default::default()
         };
-        assert_eq!(billed_cost_usd(&usage, &free), Some(0.0));
+        assert_eq!(usage.billed_cost_usd(&free), Some(0.0));
     }
 
     #[test]
@@ -2102,7 +2089,7 @@ mod tests {
             ..Default::default()
         };
         let model = priced_model(Some(3.0), Some(15.0), None, Some(3.75));
-        assert_eq!(billed_cost_usd(&usage, &model), None);
+        assert_eq!(usage.billed_cost_usd(&model), None);
     }
 
     #[test]
@@ -2114,7 +2101,7 @@ mod tests {
             cache_read_input_tokens: Some(2_000_000),
         };
         let model = priced_model(Some(3.0), Some(15.0), Some(0.3), Some(3.75));
-        assert_eq!(billed_cost_usd(&usage, &model), usage.cost_usd(&model));
+        assert_eq!(usage.billed_cost_usd(&model), usage.cost_usd(&model));
     }
 
     #[tokio::test]
