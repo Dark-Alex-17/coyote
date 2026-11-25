@@ -10,7 +10,7 @@ use crate::config::is_format_char;
 use crate::render::{MarkdownRender, RenderOptions};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
@@ -152,19 +152,29 @@ fn without_conceal(params: &str) -> Option<String> {
 
 /// Parses SGR-styled text into lines; falls back to the bare characters
 /// when the parser rejects the input. Conceal (SGR 8) is dropped: text a
-/// model or a tool painted invisible is still text the user is shown.
+/// model or a tool painted invisible is still text the user is shown. A
+/// reset background (what SGR 0 and 49 leave) is dropped too, so the
+/// text shows the surface it is drawn on rather than the terminal's own
+/// background; a colour a tool painted on purpose stays.
 fn styled_lines(ansi: &str) -> Vec<Line<'static>> {
     if ansi.is_empty() {
         return Vec::new();
     }
+    let clean = |style: Style| {
+        let mut style = style.remove_modifier(Modifier::HIDDEN);
+        if style.bg == Some(Color::Reset) {
+            style.bg = None;
+        }
+        style
+    };
     match ansi.into_text() {
         Ok(text) => text
             .lines
             .into_iter()
             .map(|mut line| {
-                line.style = line.style.remove_modifier(Modifier::HIDDEN);
+                line.style = clean(line.style);
                 for span in &mut line.spans {
-                    span.style = span.style.remove_modifier(Modifier::HIDDEN);
+                    span.style = clean(span.style);
                 }
                 line
             })
@@ -451,7 +461,6 @@ impl RenderCache {
 mod tests {
     use super::*;
     use crate::utils::decode_bin;
-    use ratatui::style::Color;
     use syntect::highlighting::Theme;
 
     const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
@@ -606,6 +615,31 @@ mod tests {
             every_span(&lines).all(|span| matches!(span.style.fg, None | Some(Color::Reset))),
             "{lines:?}"
         );
+    }
+
+    /// The reset SGR 0 and 49 leave behind is no background at all, so the
+    /// surface under the text shows; a background a tool painted stays.
+    #[test]
+    fn a_reset_background_is_dropped_and_a_painted_one_kept() {
+        let theme: Theme = decode_bin(DARK_THEME).unwrap();
+        let mut renderer = Renderer::new(RenderOptions {
+            theme: Some(theme),
+            truecolor: true,
+            ..RenderOptions::default()
+        })
+        .unwrap();
+        let lines = renderer.markdown(
+            "# Title\n\n1. one **bold** `code` [x](https://e.com)\n\n```rust\nfn main() {}\n```\n",
+            80,
+        );
+        assert!(every_span(&lines).count() > 10, "{lines:?}");
+        for span in every_span(&lines) {
+            assert_ne!(span.style.bg, Some(Color::Reset), "{span:?}");
+        }
+        let painted = preformatted_lines("\x1b[41mred\x1b[0m plain \x1b[49mback");
+        let bgs: Vec<_> = every_span(&painted).map(|span| span.style.bg).collect();
+        assert_eq!(bgs.first(), Some(&Some(Color::Red)), "{painted:?}");
+        assert!(bgs[1..].iter().all(Option::is_none), "{painted:?}");
     }
 
     #[test]

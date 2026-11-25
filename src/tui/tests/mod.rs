@@ -3651,6 +3651,63 @@ fn each_region_is_drawn_on_its_theme_surface() {
     }
 }
 
+const MARKDOWN_SAMPLE: &str = "# Heading\n\n1. a numbered item with `inline code`\n2. a **bold** word and a [link](https://example.com)\n\nPlain prose under the list.\n\n```rust\nfn main() {}\n```\n";
+
+/// A themed reply in markdown drawn on an idle frame.
+fn markdown_frame(width: u16, height: u16, no_color: bool) -> (Harness, String) {
+    let config = Arc::new(AppConfig {
+        highlight: true,
+        ..(*plain_config()).clone()
+    });
+    let footer = FooterInfo {
+        model: "openai:test-model".to_string(),
+        ..FooterInfo::default()
+    };
+    let mut harness = Harness::new(width, height, config, footer);
+    harness.app.set_no_color(no_color);
+    harness.app.begin_turn("show markdown", false);
+    harness
+        .app
+        .handle_msg(UiMsg::AssistantText(MARKDOWN_SAMPLE.to_string()));
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let frame = harness.draw();
+    (harness, frame)
+}
+
+/// Every cell of a rendered markdown reply (heading, list, inline code,
+/// link, prose and the fenced block) sits on the transcript's surface:
+/// no span carries the terminal's own background over it.
+#[test]
+fn rendered_markdown_sits_on_the_transcript_surface() {
+    for (width, height) in [(80, 24), (40, 20)] {
+        let (harness, frame) = markdown_frame(width, height, false);
+        assert_welcome_snapshot(&format!("markdown_on_surface_{width}x{height}"), &frame);
+        assert!(
+            frame.contains("Heading") && frame.contains("main"),
+            "{frame}"
+        );
+        let base = harness.app.theme.surface_base.bg.expect("a coloured base");
+        let rule = full_rules(&harness)[0];
+        let buffer = harness.terminal.backend().buffer();
+        for y in 0..rule {
+            for x in 0..width {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    base,
+                    "({x}, {y}) {:?}:\n{frame}",
+                    buffer[(x, y)].symbol()
+                );
+            }
+        }
+    }
+    let (harness, frame) = markdown_frame(80, 24, true);
+    let buffer = harness.terminal.backend().buffer();
+    assert!(
+        buffer.content().iter().all(|cell| cell.bg == Color::Reset),
+        "{frame}"
+    );
+}
+
 /// Under `NO_COLOR` no region is filled.
 #[test]
 fn no_color_fills_no_region() {

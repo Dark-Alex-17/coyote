@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/mod.rs
+expression: frame
+---
+"                                        "
+" Heading                                "
+"                                        "
+"1. a numbered item with inline code     "
+"2. a bold word and a link https://      "
+"   example.com                          "
+"                                        "
+"Plain prose under the list.             "
+"                                        "
+"```rust                                 "
+"fn main() {}                            "
+"```                                     "
+"────────────────────────────────────────"
+"? = keys  Alt+T = tasks  Ctrl+X = todo  "
+"────────────────────────────────────────"
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"openai:test-model . no sess mouse scroll"
