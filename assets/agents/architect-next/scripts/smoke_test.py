@@ -1276,6 +1276,9 @@ check("hygiene brief: comment hygiene over the run's final diff per the Final-di
       and "every comment the same abc1234..HEAD diff adds" in _hb and "comment needs no `HYGIENE:` row" in _hb
       and "`Comment hygiene:` line beside the `HYGIENE:` list" in _hb
       and _hb.index("debris-exempt") < _hb.index("Run comment hygiene") < _hb.index("For each hit"), _hb)
+check("hygiene criteria: a removed or shortened comment, like a debris-exempt token, is not a code path change",
+      "a `debris-exempt` token added to a justified line, or a removed or shortened comment, is not a code path change"
+      in gates.HYGIENE_CRITERIA, gates.HYGIENE_CRITERIA)
 REPORT_OK = ("Done.\nCommits: 1a2b3c4d5e6f\nHEAD SHA: 1a2b3c4d5e6f\n\nFOLLOW-UPS:\n- Provision the WIDGET_SECRET in vault (post-merge)\n\n"
              "Debt left behind:\n- src/a.go:12 #[allow(dead_code)] owner TASK-999\n\nDebris exemptions:\n- src/b.go:3 -- the glyph is the point\n\n"
              "Design decisions:\n- introduced a WidgetStore interface in src/a.go\n- ASK -- should the worker share the store?\n\nSisyphus run id: 20260101T000000-0badf00d\n")

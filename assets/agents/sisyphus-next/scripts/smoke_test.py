@@ -7292,8 +7292,8 @@ def hyg_state(**over):
 
 
 _hg = gates.review_gate(hyg_state())
-check("comment hygiene: the last review of a single-task run goes to comment_hygiene with the whole-task diff, "
-      "untracked files in and the plans dir out",
+check("comment hygiene: a single-task run's final whole-task review, before its first round, goes to comment_hygiene "
+      "with the whole-task diff, untracked files in and the plans dir out",
       _hg.get("_next") == "comment_hygiene" and "+# returns the total" in _hg.get("comment_diff", "")
       and "planning note" not in _hg.get("comment_diff", ""), (_hg.get("_next"), _hg.get("comment_diff")))
 _hg = gates.review_gate(hyg_state(subtasks=_ch_subs, subtask_index=2, final_review=True))
@@ -7308,7 +7308,8 @@ _hg = gates.review_gate(hyg_state(changed_files=[]))
 check("comment hygiene: a task that changed no files skips it", _hg.get("_next") != "comment_hygiene", _hg.get("_next"))
 _hb = [gates.review_gate(hyg_state(review_cadence="batch", subtasks=_ch_subs, subtask_index=2, final_review=True,
                                    **done)) for done in ({}, {"comment_hygiene_done": True})]
-check("comment hygiene: batch cadence runs it at the last review, then skips the panel",
+check("comment hygiene: batch cadence runs it at the task's final whole-task review, before its first round, then "
+      "skips the panel",
       [h.get("_next") for h in _hb] == ["comment_hygiene", "whetstone_gate"], [h.get("_next") for h in _hb])
 _hb = gates.review_gate(hyg_state(review_cadence="batch", subtasks=_ch_subs, subtask_index=0))
 check("comment hygiene: batch cadence does not run it in a subtask", _hb.get("_next") == "next_subtask", _hb.get("_next"))
@@ -7348,6 +7349,50 @@ with scenario("final_report: carries the Comment hygiene line, and none when the
     _hrep = gates.final_report(base_state(comment_hygiene_line=_hyg_line))["report"]
     check(name, f"- {_hyg_line}" in _hrep.splitlines()
           and "Comment hygiene:" not in gates.final_report(base_state())["report"], _hrep)
+with scenario("comment hygiene: a re-entered run keeps comment_hygiene_done, so review_gate goes on to the "
+              "gauntlet") as name:
+    _hst = gates.intake({"initial_prompt": "add a guard", "project_dir": REPO})
+    _lib.snapshot(_hst, {"comment_hygiene_done": True, "comment_hygiene_line": _hyg_line}, "review")
+    _hre = gates.intake({"initial_prompt": f"Fix the failure\nSisyphus run id: {_hst['run_id']}", "project_dir": REPO})
+    _hg = gates.review_gate(hyg_state(comment_hygiene_done=_hre.get("comment_hygiene_done")))
+    check(name, _hre.get("comment_hygiene_done") is True and _hre.get("comment_hygiene_line") == _hyg_line
+          and _hg.get("_next") == "build_gauntlet_prompt", (_hre.get("comment_hygiene_done"), _hg.get("_next")))
+with scenario("comment hygiene: an empty whole-task diff with changed files fails open from review_gate without "
+              "the llm") as name:
+    _hg = gates.review_gate(hyg_state(base_sha="0" * 40, skipped_reviews=["earlier"]))
+    check(name, _hg.get("_next") == "build_gauntlet_prompt" and _hg.get("comment_hygiene_done") is True
+          and not _hg.get("comment_diff") and _hg.get("skipped_reviews", [])[:1] == ["earlier"]
+          and any("comment hygiene" in s for s in _hg.get("skipped_reviews", [])[1:])
+          and any(d.startswith("comment hygiene:") for d in _hg.get("decisions", [])), _hg)
+HYG_BIG = os.path.join(TMP, "hygiene-big")
+os.makedirs(HYG_BIG)
+for _a in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "init")):
+    subprocess.run(["git", "-C", HYG_BIG, *_a], check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+open(os.path.join(HYG_BIG, "a_big.txt"), "w").write("x" * 20 + "\n" + ("y" * 20 + "\n") * 2000)
+open(os.path.join(HYG_BIG, "b.py"), "w").write("# kept\nx = 1\n")
+with scenario("comment hygiene: a truncated diff names the files whose start was dropped, and the counts line "
+              "says so") as name:
+    _hg = gates.review_gate(hyg_state(project_dir=HYG_BIG, git_root=HYG_BIG, changed_files=["a_big.txt", "b.py"],
+                                      base_sha=subprocess.run(["git", "-C", HYG_BIG, "rev-parse", "HEAD"],
+                                                              capture_output=True, text=True).stdout.strip()))
+    _hr = gates.comment_hygiene_route(hyg_state(comment_cuts=[], comment_read=1, last_node_output="{}",
+                                                comment_diff_truncated=_hg.get("comment_diff_truncated")))
+    check(name, _hg.get("_next") == "comment_hygiene" and _hg.get("comment_diff", "").startswith(
+              "[diff truncated: the start was dropped; read these files with the tools: a_big.txt]\n")
+          and "+# kept" in _hg.get("comment_diff", "")
+          and _hr.get("comment_hygiene_line") == "Comment hygiene: 1 added comments read, 0 cut, 0 reduced (diff truncated)",
+          (_hg.get("comment_diff", "")[:200], _hr.get("comment_hygiene_line")))
+with scenario("comment_hygiene_route: counts a reduce by its `reduce to:` text, whatever separator precedes it") as name:
+    _hr = gates.comment_hygiene_route(hyg_state(comment_cuts=["a.py:3 reduce to: Keeps the order stable."],
+                                                comment_read=2, last_node_output="{}"))
+    check(name, _hr.get("comment_hygiene_line") == "Comment hygiene: 2 added comments read, 0 cut, 1 reduced", _hr)
+with scenario("comment hygiene: the route's real no-cuts output fed into review_gate reaches the gauntlet with the "
+              "diff cleared from state") as name:
+    _hs = hyg_state(comment_diff="+# returns the total", comment_cuts=[], comment_read=1, last_node_output="{}")
+    sub_step(_hs, "comment_hygiene_route", "review_gate")
+    check(name, _hs["_next"] == "build_gauntlet_prompt" and _hs.get("comment_diff") == "", _hs.get("_next"))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

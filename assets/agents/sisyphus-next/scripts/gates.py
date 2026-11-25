@@ -318,7 +318,7 @@ def intake(state):
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
                   "probe_adoption", "base_syncs", "base_integrated", "attention_notes", "autonomous_decisions",
-                  "judge_rulings", "answered_decisions"):
+                  "judge_rulings", "answered_decisions", "comment_hygiene_done", "comment_hygiene_line"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -3743,9 +3743,16 @@ def _design_ask(asks, adopted=()):
 def review_gate(state):
     u = {}
     if not _subtask_phase(state) and not truthy(state.get("comment_hygiene_done")) and as_list(state.get("changed_files")):
-        u["comment_diff"] = _whole_task_diff(state)
-        u["_next"] = "comment_hygiene"
-        return u
+        diff, truncated = _whole_task_diff(state)
+        if diff:
+            u["comment_diff"], u["comment_diff_truncated"] = diff, truncated
+            u["_next"] = "comment_hygiene"
+            return u
+        u["comment_hygiene_done"] = True
+        ledger(state, u, "comment hygiene: the whole-task diff came back empty although files changed; the review "
+                         "goes ahead without the pass")
+        u["skipped_reviews"] = list(as_list(state.get("skipped_reviews"))) + [
+            "comment hygiene: the whole-task diff could not be read, so added comments were not read for keep/cut/reduce"]
     cadence = var(state, "review_cadence", "task")
     if cadence == "batch":
         u["review_skipped_note"] = ("review cadence batch: no gauntlet / reviewer / observability pass on this task; "
@@ -3781,13 +3788,25 @@ def review_gate(state):
     return u
 
 
+COMMENT_DIFF_CAP = 30000
+
+
 def _whole_task_diff(state):
-    """The diff from the review base to the worktree as it stands, untracked files included, plans dir excluded."""
+    """The diff from the review base to the worktree as it stands, untracked files included, plans dir excluded, and
+    whether the cap dropped its start.
+
+    A truncated diff opens with a marker naming the files whose headers fell in the dropped part, so the node reads
+    them from disk instead."""
     root = state.get("git_root") or state.get("project_dir") or "."
     tree = _worktree_tree(root)
     code, out, _ = git(root, "diff", "--no-color", "--no-ext-diff", "-U3", state.get("base_sha") or "HEAD",
                        *([tree] if tree else []), "--", ".", *_plans_exclude(state, root), timeout=120)
-    return tail(out if code == 0 else "", 30000)
+    out = out if code == 0 else ""
+    if len(out) <= COMMENT_DIFF_CAP:
+        return out, False
+    dropped = re.findall(r"(?m)^diff --git a/.* b/(.*)$", out[:-COMMENT_DIFF_CAP])
+    return (f"[diff truncated: the start was dropped; read these files with the tools: {', '.join(dropped)}]\n"
+            + out[-COMMENT_DIFF_CAP:]), True
 
 
 def comment_hygiene_route(state):
@@ -3797,6 +3816,7 @@ def comment_hygiene_route(state):
     ran = isinstance(out, str) and out.lstrip().startswith("{")
     note_script_error(state, u, "comment_hygiene")
     u["comment_hygiene_done"] = True
+    u["comment_diff"] = ""
     u["_next"] = "review_gate"
     if not ran:
         ledger(state, u, "comment hygiene: the pass did not run; the review goes ahead without it")
@@ -3804,9 +3824,9 @@ def comment_hygiene_route(state):
             "comment hygiene: the pass over the final diff did not run, so added comments were not read for keep/cut/reduce"]
         return u
     cuts = [c for c in as_list(state.get("comment_cuts")) if isinstance(c, str) and c.strip()]
-    reduced = sum(1 for c in cuts if "-- reduce to:" in c)
+    reduced = sum(1 for c in cuts if "reduce to:" in c)
     line = (f"Comment hygiene: {as_int(state.get('comment_read'))} added comments read, {len(cuts) - reduced} cut, "
-            f"{reduced} reduced")
+            f"{reduced} reduced" + (" (diff truncated)" if truthy(state.get("comment_diff_truncated")) else ""))
     u["comment_hygiene_line"] = line
     ledger(state, u, line + (" -> one coder round" if cuts else ""))
     if cuts:
