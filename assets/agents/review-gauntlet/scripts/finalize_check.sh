@@ -39,7 +39,7 @@ emit() {
 # The results that keep a record from being green; a test that did not run
 # counts, since a finalize record needs a test that did.
 passing=$(python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import verify_record; print(json.dumps(verify_record.PASSING))' "$shared")
-FAILING='[.[] | select((.verdict as $v | $passing | any(. == $v) | not) or (.role == "test" and .verdict == "not_run"))
+FAILING='[.[] | select((.verdict as $v | '"$passing"' | any(. == $v) | not) or (.role == "test" and .verdict == "not_run"))
   | "\(.role) `\(.cmd)` \(.verdict)" + (if (.note // "") != "" then " (\(.note | .[0:300]))" else "" end)] | join("; ")'
 
 lookup=$(python3 "$shared/verify_record.py" lookup --root "$project_dir" --tier finalize 2>/dev/null) || lookup=''
@@ -54,7 +54,7 @@ if [[ $(jq -r '.status // "missing"' <<<"$lookup" 2>/dev/null) =~ ^(green|red)$ 
   FLOOR_SHA=$floor_sha jq -e '(.record.floor // "") == env.FLOOR_SHA' >/dev/null 2>&1 <<<"$lookup"; then
   status=$(jq -r '.status' <<<"$lookup")
   tree=$(jq -r '.record.tree' <<<"$lookup")
-  detail=$(jq -r --argjson passing "$passing" '"finalize record \(.record.tree) @ \(.record.recorded_at), reused"
+  detail=$(jq -r '"finalize record \(.record.tree) @ \(.record.recorded_at), reused"
     + ((.record.results | '"$FAILING"') as $f | if $f != "" then ": " + $f else "" end)' <<<"$lookup")
   emit "$status" "$tree" "$detail"
 fi
@@ -68,7 +68,7 @@ if (( rc != 0 )) || ! jq -e '.status | strings' >/dev/null 2>&1 <<<"$gate"; then
 fi
 status=$(jq -r '.status' <<<"$gate")
 tree=$(jq -r '.tree // ""' <<<"$gate")
-detail=$(jq -r --argjson passing "$passing" '"finalize gate ran on tree \(.tree)"
+detail=$(jq -r '"finalize gate ran on tree \(.tree)"
   + ((.items | '"$FAILING"') as $f | if $f != "" then ": " + $f else "" end)' <<<"$gate")
 if [[ -n "$review_tree" && -n "$tree" && "$tree" != "$review_tree" ]]; then
   changed=$(git -C "$project_dir" diff-tree -r --name-only --no-renames "$review_tree" "$tree" 2>/dev/null |
