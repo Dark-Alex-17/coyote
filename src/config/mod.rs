@@ -45,7 +45,7 @@ pub(crate) use self::agent::roster_line;
 pub use self::agent::{
     Agent, AgentListing, AgentVariable, AgentVariables, complete_agent_variables,
     list_agents_for_humans, list_agents_with_descriptions, load_agent_variables,
-    validate_agent_name,
+    try_load_agent_variables, validate_agent_name,
 };
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;
