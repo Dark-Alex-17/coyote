@@ -1164,6 +1164,9 @@ pub const MCP_CONFLICT_REFUSAL: &str =
 /// Where every no-terminal refusal sends the user.
 pub const TERMINAL_HINT: &str = "Re-run in a terminal";
 
+/// The title on the top rule of the box waiting on the user.
+const YOUR_TURN_LABEL: &str = "your turn";
+
 /// Whether an SGR sequence sets a foreground, background or underline
 /// colour (the 16 named colours, their bright twins, or a 38/48/58
 /// extended-colour introducer).
@@ -1715,10 +1718,15 @@ pub fn quit_declining_save(pty: &mut Pty) -> String {
 
 /// The composer's text in a repainted frame: what sits between the
 /// field's rules, cut at `footer_marker` should the frame end before the
-/// rule below the field, runs of blanks folded to one space.
+/// rule below the field, runs of blanks folded to one space. The label
+/// the idle composer's top rule ends with is not part of the text.
 pub fn composer_row_with_footer(frame: &str, footer_marker: &str) -> String {
     let (top, bottom) = field_span(frame);
     let field = &frame[top..bottom];
+    let field = field
+        .trim_start()
+        .strip_prefix(YOUR_TURN_LABEL)
+        .unwrap_or(field);
     let footer = field.find(footer_marker).unwrap_or(field.len());
     field[..footer]
         .split_whitespace()

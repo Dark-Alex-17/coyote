@@ -95,7 +95,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use theme::{ChromeKind, DIM, Theme, chrome_style};
+use theme::{ChromeKind, DIM, Theme, chrome_style, composer_state};
 use throbber::{THROBBER_INTERVAL, Tick};
 use todo::TodoPanel;
 use tokio::task::JoinSet;
@@ -2528,12 +2528,18 @@ impl App {
                 }
                 let macro_names: Vec<&str> =
                     self.macros.iter().map(|(name, _)| name.as_str()).collect();
+                let state = composer_state(
+                    self.turn.is_some(),
+                    !self.prompts.is_empty(),
+                    self.composer.is_empty(),
+                );
                 frame.render_widget(
                     self.composer.view(
                         self.config.command_prefix,
                         &macro_names,
                         &self.theme,
                         self.vi_mode == Some(ViMode::Normal),
+                        state,
                     ),
                     field,
                 );

@@ -3569,20 +3569,17 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
     assert_welcome_snapshot("composer_command_80x24", &frame);
     let buffer = harness.terminal.backend().buffer();
     for row in [COMPOSER_RULE_ROW, COMPOSER_BOTTOM_RULE_ROW] {
-        assert_eq!(
-            row_text(&harness, row),
-            ratatui::symbols::line::HORIZONTAL.repeat(80),
-            "{frame}"
-        );
         assert!(buffer[(0, row)].modifier.contains(Modifier::BOLD));
         assert_eq!(
             Some(buffer[(0, row)].bg),
             harness.app.theme.surface_raised.bg
         );
+        assert_eq!(buffer[(0, row)].fg, harness.app.theme.your_turn.fg.unwrap());
     }
     assert_eq!(
-        buffer[(0, COMPOSER_RULE_ROW)].fg,
-        harness.app.theme.rule.fg.unwrap()
+        row_text(&harness, COMPOSER_BOTTOM_RULE_ROW),
+        ratatui::symbols::line::HORIZONTAL.repeat(80),
+        "{frame}"
     );
     assert!(
         (0..11).all(|x| composer_cell(&harness, x) == (Color::Green, true)),
@@ -3594,13 +3591,201 @@ fn a_typed_command_is_painted_green_on_the_field_under_the_rule() {
     assert_eq!(Some(buffer[(79, COMPOSER_TEXT_ROW + 2)].bg), raised);
 }
 
-/// The rows of the last drawn frame that are a full-width rule.
+/// Checks the composer's two rules in the last drawn frame: `style` on
+/// both ends of each, and `label` ending the top one or no title on it.
+fn assert_composer_rules(harness: &Harness, style: ratatui::style::Style, label: Option<&str>) {
+    let frame = harness.terminal.backend().to_string();
+    let top = row_text(harness, COMPOSER_RULE_ROW);
+    match label {
+        Some(label) => assert!(top.ends_with(label), "{frame}"),
+        None => assert_eq!(
+            top,
+            ratatui::symbols::line::HORIZONTAL.repeat(80),
+            "{frame}"
+        ),
+    }
+    let buffer = harness.terminal.backend().buffer();
+    for row in [COMPOSER_RULE_ROW, COMPOSER_BOTTOM_RULE_ROW] {
+        for x in [0, 79] {
+            let cell = &buffer[(x, row)];
+            assert_eq!(cell.fg, style.fg.unwrap_or(Color::Reset), "{frame}");
+            assert!(cell.modifier.contains(Modifier::BOLD), "{frame}");
+        }
+    }
+}
+
+fn assert_your_turn(harness: &mut Harness) -> String {
+    let frame = harness.draw();
+    let accent = harness.app.theme.your_turn;
+    assert_composer_rules(harness, accent, Some(theme::YOUR_TURN_LABEL));
+    frame
+}
+
+/// No turn has run yet and the user holds the composer, so the first
+/// frame already waits on them.
+#[test]
+fn the_first_frame_after_boot_is_your_turn() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    assert_your_turn(&mut harness);
+}
+
+#[test]
+fn a_turn_that_ends_normally_hands_the_composer_back() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let frame = assert_your_turn(&mut harness);
+    insta::assert_snapshot!("your_turn_idle_80x24", &frame);
+}
+
+#[test]
+fn an_auto_continue_pause_hands_the_composer_back() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    harness.app.handle_msg(UiMsg::Notice {
+        kind: NoticeKind::AutoContinue,
+        text: "auto-continue paused".to_string(),
+    });
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let frame = assert_your_turn(&mut harness);
+    assert!(frame.contains("auto-continue paused"), "{frame}");
+}
+
+#[test]
+fn a_turn_that_ends_on_an_error_hands_the_composer_back() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    harness.app.end_turn(
+        false,
+        &TurnOutcome {
+            error: Some("boom".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_your_turn(&mut harness);
+}
+
+#[test]
+fn an_interrupted_turn_hands_the_composer_back() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    assert_eq!(harness.press(KeyCode::Esc), Some(Command::Interrupt));
+    harness.app.end_turn(false, &TurnOutcome::default());
+    assert_your_turn(&mut harness);
+}
+
+/// A question up mid-turn takes the highlight in place of the composer,
+/// which is not drawn while it is.
+#[test]
+fn an_open_question_carries_the_your_turn_highlight() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    let (reply, _answer) = mpsc::channel();
+    harness.app.handle_msg(UiMsg::Prompt {
+        req: Box::new(confirm_request(None)),
+        reply,
+    });
+    let frame = harness.draw();
+    insta::assert_snapshot!("your_turn_question_80x24", &frame);
+    assert!(!frame.contains("Type a prompt"), "{frame}");
+    let accent = harness.app.theme.your_turn.fg.unwrap();
+    let top = (0..24)
+        .find(|y| row_text(&harness, *y).ends_with(theme::YOUR_TURN_LABEL))
+        .expect("a labelled rule");
+    let buffer = harness.terminal.backend().buffer();
+    assert_eq!(buffer[(0, top)].fg, accent, "{frame}");
+    assert_eq!(buffer[(78, top)].fg, accent, "{frame}");
+    let rules: Vec<u16> = (top + 1..24)
+        .filter(|y| row_text(&harness, *y) == ratatui::symbols::line::HORIZONTAL.repeat(80))
+        .collect();
+    assert_eq!(rules.len(), 1, "{frame}");
+    assert_eq!(buffer[(0, rules[0])].fg, accent, "{frame}");
+}
+
+#[test]
+fn sending_takes_the_highlight_away() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    let frame = harness.draw();
+    let rule = harness.app.theme.rule;
+    assert_composer_rules(&harness, rule, None);
+    insta::assert_snapshot!("your_turn_working_80x24", &frame);
+}
+
+#[test]
+fn typing_mid_turn_fades_the_highlight_without_a_label() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    harness.app.begin_turn("x", false);
+    harness.type_text("next");
+    let frame = harness.draw();
+    let soft = harness.app.theme.your_turn_soft;
+    assert_composer_rules(&harness, soft, None);
+    insta::assert_snapshot!("your_turn_typing_80x24", &frame);
+}
+
+/// Under `NO_COLOR` the label still marks the turn and the rules keep
+/// their plain bold.
+#[test]
+fn no_color_keeps_the_your_turn_label_without_colour() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(true);
+    harness.app.begin_turn("x", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let frame = harness.draw();
+    let rule = harness.app.theme.rule;
+    assert_eq!(rule.fg, None);
+    assert_composer_rules(&harness, rule, Some(theme::YOUR_TURN_LABEL));
+    insta::assert_snapshot!("your_turn_no_color_80x24", &frame);
+}
+
+/// Each change of state is drawn by the one frame its event asks for,
+/// and an idle composer asks for none after it, typing or not.
+#[test]
+fn a_state_change_costs_one_frame_and_idle_asks_for_none() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.begin_turn("x", false);
+    assert!(harness.app.frames.due_at().is_some());
+    harness.render();
+    harness.app.frame_drawn();
+
+    harness.app.end_turn(false, &TurnOutcome::default());
+    assert!(harness.app.frames.due_at().is_some());
+    harness.render();
+    harness.app.frame_drawn();
+    assert_eq!(harness.app.frames.due_at(), None);
+
+    harness.type_text("draft");
+    assert!(harness.app.frames.due_at().is_some());
+    harness.render();
+    harness.app.frame_drawn();
+    assert_eq!(harness.app.frames.due_at(), None);
+}
+
+/// The rows of the last drawn frame that are a full-width rule, with or
+/// without the your-turn label at its right end.
 fn full_rules(harness: &Harness) -> Vec<u16> {
     let width = harness.terminal.backend().buffer().area().width;
     let height = harness.terminal.backend().buffer().area().height;
-    let rule = ratatui::symbols::line::HORIZONTAL.repeat(usize::from(width));
+    let horizontal = ratatui::symbols::line::HORIZONTAL;
+    let rule = horizontal.repeat(usize::from(width));
+    let label = theme::YOUR_TURN_LABEL;
+    let labelled = format!(
+        "{}{label}",
+        horizontal.repeat(usize::from(width).saturating_sub(label.len()))
+    );
     (0..height)
-        .filter(|&y| row_text(harness, y) == rule)
+        .filter(|&y| {
+            let row = row_text(harness, y);
+            row == rule || row == labelled
+        })
         .collect()
 }
 

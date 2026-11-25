@@ -1437,6 +1437,11 @@ fn box_rows(harness: &Harness, first: &str, last: &str) -> (u16, u16) {
 #[test]
 fn every_question_kind_draws_between_the_box_rules_and_hides_the_draft() {
     let rule = ratatui::symbols::line::HORIZONTAL.repeat(80);
+    let label = crate::tui::theme::YOUR_TURN_LABEL;
+    let labelled_rule = format!(
+        "{}{label}",
+        ratatui::symbols::line::HORIZONTAL.repeat(80 - label.len())
+    );
     let requests = [
         (confirm_request(None), "Proceed? tui-x7x", "y = yes"),
         (
@@ -1472,7 +1477,11 @@ fn every_question_kind_draws_between_the_box_rules_and_hides_the_draft() {
         let frame = harness.draw();
         assert!(!frame.contains("draft-z9q"), "{first}: {frame}");
         let (top, legend) = box_rows(&harness, first, hint);
-        assert_eq!(row_text(&harness, top - 1), rule, "{first}: {frame}");
+        assert_eq!(
+            row_text(&harness, top - 1),
+            labelled_rule,
+            "{first}: {frame}"
+        );
         assert_eq!(row_text(&harness, legend - 1), rule, "{first}: {frame}");
         assert!(
             (top..legend - 1).all(|y| row_text(&harness, y) != rule),

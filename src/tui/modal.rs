@@ -3,7 +3,7 @@ use super::composer::{RULE_ROWS, wrapped_rows};
 use super::keys::ModalKind;
 use super::render::Renderer;
 use super::sink::unattended_answer;
-use super::theme::Theme;
+use super::theme::{ComposerState, Theme};
 use super::{
     App, DIM, FIXED_ROWS, TRANSCRIPT_MIN_ROWS, escalation_kind, new_field, render, roster,
 };
@@ -497,12 +497,14 @@ impl Widget for PromptModal<'_> {
         }
         let prompt = self.prompt;
         let [top, origin, question, middle, bottom, hint] = prompt.areas(area, *buf.area());
-        let rule = self.theme.rule;
-        for row in [top, bottom] {
-            Block::new()
-                .borders(Borders::TOP)
-                .border_style(rule)
-                .render(row, buf);
+        // A prompt on screen is always waiting on the user.
+        let (rule, label) = self.theme.composer_rule(ComposerState::YourTurn);
+        for (row, label) in [(top, label), (bottom, None)] {
+            let mut block = Block::new().borders(Borders::TOP).border_style(rule);
+            if let Some(label) = label {
+                block = block.title(Line::styled(label, rule).right_aligned());
+            }
+            block.render(row, buf);
         }
         let (mut lines, help) = prompt.question_parts(area.width);
         for line in &mut lines {

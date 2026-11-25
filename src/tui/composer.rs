@@ -4,13 +4,14 @@
 //! something that would run and red when it does not.
 
 use super::keys::ViMotion;
-use super::theme::{DIM, Theme};
+use super::theme::{ComposerState, DIM, Theme};
 use crate::config::CommandPrefix;
 use crate::repl::{CommandSpan, classify_command, placeholder_ending_at, placeholder_starting_at};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_segmentation::UnicodeSegmentation;
@@ -258,6 +259,7 @@ impl Composer {
         extra_known: &[&str],
         theme: &'a Theme,
         vi_normal: bool,
+        state: ComposerState,
     ) -> ComposerView<'a> {
         let first_line = self.textarea.lines().first().map(String::as_str);
         ComposerView {
@@ -265,6 +267,7 @@ impl Composer {
             command: first_line.and_then(|line| classify_command(line, prefix, extra_known)),
             theme,
             vi_normal,
+            state,
         }
     }
 }
@@ -356,6 +359,7 @@ pub(super) struct ComposerView<'a> {
     command: Option<CommandSpan>,
     theme: &'a Theme,
     vi_normal: bool,
+    state: ComposerState,
 }
 
 impl ComposerView<'_> {
@@ -397,11 +401,15 @@ impl Widget for ComposerView<'_> {
         if area.is_empty() {
             return;
         }
+        let (style, label) = self.theme.composer_rule(self.state);
         let mut rule = Block::new()
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(self.theme.rule);
+            .border_style(style);
         if self.vi_normal {
             rule = rule.title(NORMAL_TAG);
+        }
+        if let Some(label) = label {
+            rule = rule.title(Line::styled(label, style).right_aligned());
         }
         let inner = rule.inner(area);
         rule.render(area, buf);
@@ -418,6 +426,7 @@ impl Widget for ComposerView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::theme::YOUR_TURN_LABEL;
     use ratatui::style::{Color, Modifier};
     use ratatui::symbols::line::HORIZONTAL;
 
@@ -426,13 +435,23 @@ mod tests {
     const UNKNOWN_COLOR: Color = Color::Red;
 
     fn render(text: &str, prefix: CommandPrefix, extra_known: &[&str], no_color: bool) -> Buffer {
+        render_in(text, prefix, extra_known, no_color, ComposerState::Working)
+    }
+
+    fn render_in(
+        text: &str,
+        prefix: CommandPrefix,
+        extra_known: &[&str],
+        no_color: bool,
+        state: ComposerState,
+    ) -> Buffer {
         let theme = Theme::fallback(no_color);
         let mut composer = Composer::new(prefix);
         composer.set_placeholder_style(theme.faded);
         composer.set_text(text);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(prefix, extra_known, &theme, false)
+            .view(prefix, extra_known, &theme, false, state)
             .render(AREA, &mut buf);
         buf
     }
@@ -537,7 +556,13 @@ mod tests {
         composer.set_text(&[".info x", "a", "b", "c", "d", "e"].join("\n"));
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(CommandPrefix::Dot, &[], &Theme::fallback(false), false)
+            .view(
+                CommandPrefix::Dot,
+                &[],
+                &Theme::fallback(false),
+                false,
+                ComposerState::Working,
+            )
             .render(AREA, &mut buf);
         assert!(composer.textarea.scroll_offset().0 > 0);
         assert!(first_row(&buf).iter().all(|cell| !cell.1));
@@ -548,11 +573,64 @@ mod tests {
         let composer = Composer::new(CommandPrefix::Dot);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(CommandPrefix::Dot, &[], &Theme::fallback(false), true)
+            .view(
+                CommandPrefix::Dot,
+                &[],
+                &Theme::fallback(false),
+                true,
+                ComposerState::Working,
+            )
             .render(AREA, &mut buf);
         let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains(NORMAL_TAG), "{top:?}");
         assert_eq!(buf[(AREA.width - 1, 0)].symbol(), HORIZONTAL);
+    }
+
+    /// Waiting on the user, the top rule carries the label at its right
+    /// end, the NORMAL tag staying on the left, and both rules take the
+    /// accent; the label stays under `NO_COLOR`.
+    #[test]
+    fn your_turn_labels_the_top_rule_and_paints_the_rules() {
+        for no_color in [false, true] {
+            let theme = Theme::fallback(no_color);
+            let composer = Composer::new(CommandPrefix::Dot);
+            let mut buf = Buffer::empty(AREA);
+            composer
+                .view(
+                    CommandPrefix::Dot,
+                    &[],
+                    &theme,
+                    true,
+                    ComposerState::YourTurn,
+                )
+                .render(AREA, &mut buf);
+            let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
+            assert!(top.starts_with(NORMAL_TAG), "{top:?}");
+            assert!(top.ends_with(YOUR_TURN_LABEL), "{top:?}");
+            let accent = theme.your_turn.fg.unwrap_or(Color::Reset);
+            for (x, y) in [(AREA.width - 2, 0), (0, AREA.height - 1)] {
+                assert_eq!(buf[(x, y)].fg, accent, "{no_color}: ({x}, {y})");
+                assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
+    /// Drafting during a turn fades the accent and drops the label.
+    #[test]
+    fn typing_mid_turn_takes_the_soft_accent_without_a_label() {
+        let buf = render_in(
+            "hi",
+            CommandPrefix::Dot,
+            &[],
+            false,
+            ComposerState::TypingMidTurn,
+        );
+        let soft = Theme::fallback(false).your_turn_soft.fg;
+        let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(top, HORIZONTAL.repeat(usize::from(AREA.width)));
+        for y in [0, AREA.height - 1] {
+            assert_eq!(Some(buf[(0, y)].fg), soft);
+        }
     }
 
     #[test]
@@ -703,7 +781,13 @@ mod tests {
         let area = Rect::new(0, 0, 20, composer.rows(20));
         let mut buf = Buffer::empty(area);
         composer
-            .view(CommandPrefix::Dot, &[], &Theme::fallback(false), false)
+            .view(
+                CommandPrefix::Dot,
+                &[],
+                &Theme::fallback(false),
+                false,
+                ComposerState::Working,
+            )
             .render(area, &mut buf);
         let row = |y: u16| -> String { (0..20).map(|x| buf[(x, y)].symbol()).collect() };
         assert_eq!(row(0), HORIZONTAL.repeat(20));
@@ -759,7 +843,13 @@ mod tests {
             let area = Rect::new(0, 0, 20, 14);
             let mut buf = Buffer::empty(area);
             composer
-                .view(CommandPrefix::Dot, &[], &Theme::fallback(true), false)
+                .view(
+                    CommandPrefix::Dot,
+                    &[],
+                    &Theme::fallback(true),
+                    false,
+                    ComposerState::Working,
+                )
                 .render(area, &mut buf);
             let drawn = (1..area.height - 1)
                 .filter(|y| (0..20).any(|x| !buf[(x, *y)].symbol().trim().is_empty()))

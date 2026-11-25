@@ -79,6 +79,49 @@ const LIGHT_THREADS: ThreadPalette = ThreadPalette {
     failed: (0xb3, 0x26, 0x1e),
 };
 
+/// The composer's rules while it waits on the user, and the faded take
+/// on them while the user drafts during a turn.
+struct YourTurnPalette {
+    accent: Rgb,
+    soft: Rgb,
+}
+
+const DARK_YOUR_TURN: YourTurnPalette = YourTurnPalette {
+    accent: (0x7a, 0xa2, 0xf7),
+    soft: (0x4f, 0x63, 0x90),
+};
+const LIGHT_YOUR_TURN: YourTurnPalette = YourTurnPalette {
+    accent: (0x2f, 0x5b, 0xb7),
+    soft: (0x8a, 0xa0, 0xcc),
+};
+
+/// The title on the top rule of whichever box is waiting on the user.
+pub(super) const YOUR_TURN_LABEL: &str = " your turn ";
+
+/// Who the composer is waiting on, as its rules show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ComposerState {
+    /// No turn runs, or a question or approval waits on an answer.
+    YourTurn,
+    Working,
+    /// A turn runs and the user is drafting the next line.
+    TypingMidTurn,
+}
+
+pub(super) fn composer_state(
+    turn_running: bool,
+    prompt_pending: bool,
+    composer_empty: bool,
+) -> ComposerState {
+    if !turn_running || prompt_pending {
+        ComposerState::YourTurn
+    } else if composer_empty {
+        ComposerState::Working
+    } else {
+        ComposerState::TypingMidTurn
+    }
+}
+
 /// A left-to-right blend between two colours, one per column; it has no
 /// colour under `NO_COLOR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,8 +277,13 @@ fn from_markdown(colour: crossterm::style::Color, fallback: Color) -> Color {
 /// change or a `NO_COLOR` switch reaches both.
 pub(super) struct Theme {
     /// Every separator rule: the one between the transcript and the status
-    /// row, the composer's two and a question's two.
+    /// row, and the composer's two while a turn runs with no draft.
     pub(super) rule: Style,
+    /// The rules of the box waiting on the user; bold like `rule` under
+    /// `NO_COLOR`.
+    pub(super) your_turn: Style,
+    /// The composer's rules while the user drafts during a turn.
+    pub(super) your_turn_soft: Style,
     pub(super) hint_key: Style,
     pub(super) hint_label: Style,
     /// What a turn is doing, on the status row.
@@ -305,6 +353,11 @@ impl Theme {
             Style::new().fg(rgb(palette.faded))
         };
         let threads = if light { &LIGHT_THREADS } else { &DARK_THREADS };
+        let your_turn = if light {
+            &LIGHT_YOUR_TURN
+        } else {
+            &DARK_YOUR_TURN
+        };
         let thread = |colour: Rgb| {
             if no_color {
                 Style::new()
@@ -314,6 +367,8 @@ impl Theme {
         };
         Self {
             rule: paint(BOLD, if light { RULE_LIGHT } else { RULE_DARK }),
+            your_turn: paint(BOLD, rgb(your_turn.accent)),
+            your_turn_soft: paint(BOLD, rgb(your_turn.soft)),
             hint_key: paint(ITALIC.add_modifier(Modifier::BOLD), HIGHLIGHT),
             hint_label: ITALIC.patch(faded),
             status_runtime: paint(DIM, tool_fn),
@@ -350,6 +405,16 @@ impl Theme {
                     ends: Some((threads.running, threads.failed)),
                 }
             },
+        }
+    }
+
+    /// The composer's rule style in `state`, and the label its top rule
+    /// carries.
+    pub(super) fn composer_rule(&self, state: ComposerState) -> (Style, Option<&'static str>) {
+        match state {
+            ComposerState::YourTurn => (self.your_turn, Some(YOUR_TURN_LABEL)),
+            ComposerState::Working => (self.rule, None),
+            ComposerState::TypingMidTurn => (self.your_turn_soft, None),
         }
     }
 }
@@ -493,6 +558,8 @@ mod tests {
         assert_eq!(coloured.hint_key.fg, Some(HIGHLIGHT));
         let pairs = [
             (coloured.rule, plain.rule),
+            (coloured.your_turn, plain.your_turn),
+            (coloured.your_turn_soft, plain.your_turn_soft),
             (coloured.hint_key, plain.hint_key),
             (coloured.status_runtime, plain.status_runtime),
             (coloured.throbber, plain.throbber),
@@ -534,6 +601,65 @@ mod tests {
             assert_eq!(surface, Style::new());
         }
         assert_eq!(plain.accent, Gradient::PLAIN);
+        assert_eq!(plain.your_turn, plain.rule);
+        assert_eq!(plain.your_turn_soft, plain.rule);
+    }
+
+    /// The box waits on the user whenever no turn runs or a question is
+    /// up; during a turn the draft alone decides between the two others.
+    #[test]
+    fn the_composer_state_covers_every_combination() {
+        use ComposerState::{TypingMidTurn, Working, YourTurn};
+        let cases = [
+            ((false, false, false), YourTurn),
+            ((false, false, true), YourTurn),
+            ((false, true, false), YourTurn),
+            ((false, true, true), YourTurn),
+            ((true, true, false), YourTurn),
+            ((true, true, true), YourTurn),
+            ((true, false, true), Working),
+            ((true, false, false), TypingMidTurn),
+        ];
+        for ((turn_running, prompt_pending, composer_empty), expected) in cases {
+            assert_eq!(
+                composer_state(turn_running, prompt_pending, composer_empty),
+                expected,
+                "turn {turn_running}, prompt {prompt_pending}, empty {composer_empty}"
+            );
+        }
+    }
+
+    /// Each state's rule takes its token, and only waiting on the user
+    /// carries the label, with or without colour.
+    #[test]
+    fn each_composer_state_maps_to_its_rule_and_label() {
+        for no_color in [false, true] {
+            let theme = Theme::fallback(no_color);
+            assert_eq!(
+                theme.composer_rule(ComposerState::YourTurn),
+                (theme.your_turn, Some(YOUR_TURN_LABEL))
+            );
+            assert_eq!(
+                theme.composer_rule(ComposerState::Working),
+                (theme.rule, None)
+            );
+            assert_eq!(
+                theme.composer_rule(ComposerState::TypingMidTurn),
+                (theme.your_turn_soft, None)
+            );
+        }
+    }
+
+    /// The your-turn tokens take their side's colours in bold.
+    #[test]
+    fn the_your_turn_tokens_take_their_sides_colours() {
+        let rgb = |(r, g, b): Rgb| Color::Rgb(r, g, b);
+        let truecolor = renderer(true);
+        for (light, palette) in [(false, &DARK_YOUR_TURN), (true, &LIGHT_YOUR_TURN)] {
+            let theme = Theme::new(truecolor.markdown_render(), false, light);
+            assert_eq!(theme.your_turn, BOLD.fg(rgb(palette.accent)));
+            assert_eq!(theme.your_turn_soft, BOLD.fg(rgb(palette.soft)));
+        }
     }
 
     /// The accent runs from the running thread colour to the failed one,
