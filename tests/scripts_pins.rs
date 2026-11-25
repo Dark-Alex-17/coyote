@@ -175,9 +175,9 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
     let stop = relay_branch
         .find("Stop-ScheduledTask -TaskName $TaskName")
         .unwrap();
-    let tree = relay_branch
-        .find("Invoke-RnsdTreeKill")
-        .unwrap_or_else(|| panic!("the [[Team Relay]] restart never ends rnsd's process tree: {relay_branch}"));
+    let tree = relay_branch.find("Invoke-RnsdTreeKill").unwrap_or_else(|| {
+        panic!("the [[Team Relay]] restart never ends rnsd's process tree: {relay_branch}")
+    });
     let start = relay_branch
         .find("Start-ScheduledTask -TaskName $TaskName")
         .expect("the restart starts the task again");

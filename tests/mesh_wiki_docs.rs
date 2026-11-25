@@ -11228,7 +11228,10 @@ fn the_windows_build_run_and_relay_notes_match_the_script() {
         "`'bash' is not recognized as an internal or external command`",
         "Coyote does not check for it at startup.",
     ] {
-        assert!(install.contains(needle), "Installation.md does not say {needle:?}");
+        assert!(
+            install.contains(needle),
+            "Installation.md does not say {needle:?}"
+        );
     }
     let deployment = flat(&read(wiki.join("Mesh-Deployment.md")));
     for needle in [
