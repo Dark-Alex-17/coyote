@@ -1459,8 +1459,8 @@ mod key_help_discovery {
     const HELP_MARK: &str = "Suspend to the shell";
     /// The roster's legend.
     const ROSTER_MARK: &str = "Esc = close";
-    const IDLE_HINT: &str = "? = keys  Alt+T = tasks  Ctrl+X = todo";
-    const TEXT_HINT: &str = "Alt+T = tasks  Ctrl+X = todo";
+    const IDLE_HINT: &str = "? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo";
+    const TEXT_HINT: &str = "Alt+T = tasks  Alt+S = threads  Ctrl+X = todo";
 
     fn boot(scenario: &str, extra: &str) -> (TempDirGuard, Pty) {
         let dir = fresh_config_dir(scenario);

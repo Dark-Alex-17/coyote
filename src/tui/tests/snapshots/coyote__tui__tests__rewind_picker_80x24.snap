@@ -15,7 +15,7 @@ expression: frame
 "                                                                                "
 "an answer                                                                       "
 "────────────────────────────────────────────────────────────────────────────────"
-"Alt+T = tasks  Ctrl+X = todo                                                    "
+"Alt+T = tasks  Alt+S = threads  Ctrl+X = todo                                   "
 "Rewind to (Enter = choose  Esc = close)                                         "
 "third question                                                                  "
 "second          +1 line                                                         "

@@ -449,6 +449,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         ),
         row(Composer, "Ctrl+T", "Open the transcript view"),
         row(Composer, "Alt+T", "Show or hide the tasks pop-up"),
+        row(Composer, "Alt+S", "Open the threads pop-up"),
         row(Composer, "?", "Show this help, on an empty composer"),
         row(
             Composer,
@@ -592,7 +593,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "o",
             "Show the highlighted task in the transcript view",
         ),
-        row(Roster, "t", "Pick a thread to show in the transcript view"),
+        row(
+            Roster,
+            "t / Alt+S",
+            "Pick a thread to show in the transcript view",
+        ),
         row(Roster, "Enter", "Answer the highlighted question"),
         row(Roster, "Ctrl+T", "Open the transcript view"),
         row(Roster, "Mouse wheel", "Move between the rows"),
@@ -775,6 +780,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         }
         None => match code {
             KeyCode::Char('t') if alt && !ctrl => Action::ToggleRoster,
+            KeyCode::Char('s') if alt && !ctrl => Action::OpenThreads,
             KeyCode::Char('t') if ctrl => Action::OpenPager,
             // A band is the innermost thing open, so the quit chords
             // close it first, as Esc does.
@@ -922,6 +928,7 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
         KeyCode::Char('c' | 'd') if ctrl => Action::ToggleRoster,
         KeyCode::Char('t') if ctrl => Action::OpenPager,
         KeyCode::Char('t') if alt => Action::ToggleRoster,
+        KeyCode::Char('s') if alt && !ctrl => Action::OpenThreads,
         _ if ctrl || alt => Action::Nothing,
         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => Action::RosterMove(-1),
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => Action::RosterMove(1),
@@ -2701,6 +2708,15 @@ mod tests {
             ),
             (
                 H::Composer,
+                "Alt+S",
+                vec![(
+                    press(KeyCode::Char('s'), KeyModifiers::ALT),
+                    IDLE,
+                    Action::OpenThreads,
+                )],
+            ),
+            (
+                H::Composer,
                 "?",
                 vec![
                     (letter('?'), IDLE, Action::ToggleHelp),
@@ -3024,8 +3040,15 @@ mod tests {
             ),
             (
                 H::Roster,
-                "t",
-                vec![(letter('t'), ROSTER, Action::OpenThreads)],
+                "t / Alt+S",
+                vec![
+                    (letter('t'), ROSTER, Action::OpenThreads),
+                    (
+                        press(KeyCode::Char('s'), KeyModifiers::ALT),
+                        ROSTER,
+                        Action::OpenThreads,
+                    ),
+                ],
             ),
             (
                 H::Roster,

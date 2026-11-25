@@ -5280,8 +5280,11 @@ fn the_idle_status_names_only_keys_the_help_lists() {
             .map(|entry| entry.split_once(" = ").expect(entry).0)
             .collect()
     };
-    assert_eq!(chords(IDLE_STATUS), ["Alt+T", "Ctrl+X"]);
-    assert_eq!(chords(IDLE_STATUS_WITH_HELP), ["?", "Alt+T", "Ctrl+X"]);
+    assert_eq!(chords(IDLE_STATUS), ["Alt+T", "Alt+S", "Ctrl+X"]);
+    assert_eq!(
+        chords(IDLE_STATUS_WITH_HELP),
+        ["?", "Alt+T", "Alt+S", "Ctrl+X"]
+    );
     for chord in chords(IDLE_STATUS_WITH_HELP) {
         assert!(
             keys::KEY_HELP
@@ -5801,6 +5804,28 @@ fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
         assert!(harness.app.queued.is_empty(), "{line}");
         assert!(harness.draw().contains("Enter open  Esc back"), "{line}");
+    }
+}
+
+/// Alt+S opens the threads pop-up straight from the main screen, with or
+/// without a draft and while a turn runs; the draft stays where it was.
+#[test]
+fn alt_s_opens_the_threads_popup_from_the_main_screen() {
+    let alt_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT);
+    for (draft, running) in [("", false), ("half a prompt", false), ("", true)] {
+        let mut harness = Harness::standalone(80, 24);
+        if running {
+            harness.app.begin_turn("work", false);
+        }
+        harness.type_text(draft);
+        harness.app.handle_key(alt_s);
+        let frame = harness.draw();
+        assert!(frame.contains("Enter open  Esc back"), "{draft:?}: {frame}");
+        assert!(frame.contains("Threads"), "{draft:?}: {frame}");
+        harness.press(KeyCode::Esc);
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.overlay.is_none(), "{draft:?}");
+        assert_eq!(harness.app.composer_text(), draft);
     }
 }
 

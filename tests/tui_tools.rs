@@ -2455,7 +2455,9 @@ def run(out: str) -> str:
             "the welcome does not name the key help",
         );
         assert!(
-            squeezed(&welcome).contains(&squeezed("? = keys  Alt+T = tasks  Ctrl+X = todo")),
+            squeezed(&welcome).contains(&squeezed(
+                "? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo"
+            )),
             "the status row does not name the help key and the panel chords:\n{welcome}"
         );
         pty.send(b"?").unwrap();
@@ -2484,7 +2486,7 @@ def run(out: str) -> str:
         );
         let typed = repainted_frame_showing(&mut pty, "why? h7k", "the draft is not on screen");
         assert!(
-            squeezed(&typed).contains(&squeezed("Alt+T = tasks  Ctrl+X = todo"))
+            squeezed(&typed).contains(&squeezed("Alt+T = tasks  Alt+S = threads  Ctrl+X = todo"))
                 && !squeezed(&typed).contains(&squeezed("? = keys")),
             "the status row still offers ? over a draft:\n{typed}"
         );

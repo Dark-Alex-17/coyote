@@ -166,11 +166,11 @@ const KEYS_COMMAND: &str = "keys";
 const THREADS_COMMAND: &str = "threads";
 /// The status row between turns, naming the chords of the panels that
 /// nothing else on screen points to.
-const IDLE_STATUS: &str = "Alt+T = tasks  Ctrl+X = todo";
+const IDLE_STATUS: &str = "Alt+T = tasks  Alt+S = threads  Ctrl+X = todo";
 /// The status row when `?` would open the key help. The key that lists
 /// the rest comes first, so a narrow frame clips the panel chords
 /// before it.
-const IDLE_STATUS_WITH_HELP: &str = "? = keys  Alt+T = tasks  Ctrl+X = todo";
+const IDLE_STATUS_WITH_HELP: &str = "? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo";
 
 /// The idle hint as key and label spans: each `key = label` entry's key
 /// in one style, the rest in the other.

@@ -15,7 +15,7 @@ expression: frame
 "└──────────────────────────────────────┘"
 "                                        "
 "────────────────────────────────────────"
-"? = keys  Alt+T = tasks  Ctrl+X = todo  "
+"? = keys  Alt+T = tasks  Alt+S = threads"
 "────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "
