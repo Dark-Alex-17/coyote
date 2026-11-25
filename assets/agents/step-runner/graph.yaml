@@ -85,6 +85,7 @@ initial_state:
   notes: '(none)'
   handoff_path: ''
   blocking_reason: ''
+  baseline_floor: ''
   plan_summary: ''
   implementation_brief: ''
   staleness_report: ''
@@ -308,6 +309,10 @@ nodes:
       {{fix_instructions}}
     inputs:
       project_dir: '{{project_dir}}'
+      # Each coder lap runs only the tests its change can break; the full
+      # suite and lint run once, at this graph's verify gates.
+      verify_tier: 'round'
+      baseline_floor: '{{baseline_floor}}'
     timeout: 3600
     state_updates:
       coder_result: '{{output}}'
@@ -349,7 +354,7 @@ nodes:
   verify_tests:
     id: verify_tests
     type: script
-    description: FULL test suite - regressions in untouched code fail the step too.
+    description: FULL test suite - regressions in untouched code fail the step too. A green finalize record for the worktree tree (.shared/verify_record.py) is reused instead of running the suite again; a green run writes one, with the build and lint gates that preceded it.
     script: scripts/verify_tests.sh
     timeout: 1200
     fallback: fix_loop_gate
@@ -725,7 +730,7 @@ nodes:
       Step: {{step_number}} ({{step_title}})
       Plan: {{step_plan_path}}
       Handoff: {{handoff_path}}
-      Build: passed | Tests: passed | Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
+      Build: passed | Tests: passed (full suite and lint at the step gate; the coder ran targeted and impacted tests per lap) | Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
 
       {{step_summary}}
 

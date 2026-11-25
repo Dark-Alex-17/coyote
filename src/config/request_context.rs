@@ -24297,7 +24297,10 @@ mod tests {
             ),
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
-            ("review-gauntlet".to_string(), Vec::new()),
+            (
+                "review-gauntlet".to_string(),
+                unreachable(&["finalize_check"]),
+            ),
             // The candidate graph routes almost everything through script
             // `_next` edges and runs its long islands (coder, gauntlet,
             // step-runner) plus the owner poll without a wall-clock bound.

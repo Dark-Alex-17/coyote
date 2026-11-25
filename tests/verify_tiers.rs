@@ -6,6 +6,11 @@
 //! was. On unix `bash`, `jq`, `git` and `python3` must be on PATH (asserted,
 //! so a missing tool cannot hide the pins); elsewhere the pins skip without
 //! them.
+//!
+//! The review side is pinned here too: review-gauntlet's and the adversary's
+//! `verification_tier` (a final-tier review needs a green finalize record for
+//! the reviewed tree and never re-runs the suite), and step-runner seating its
+//! coder at the round tier with its own gates as the step's finalize gate.
 
 use serde_json::{Value, json};
 use std::env;
@@ -1557,4 +1562,845 @@ fn finalize_gate_judges_the_full_suite_against_the_base() {
     let out = finalize(&dir, &other);
     assert_eq!(str_field(&out, "status"), "unavailable", "{out}");
     assert_eq!(str_field(&test_item(&out), "verdict"), "red", "{out}");
+}
+
+const RUN_CHECKS: &str = "adversary/scripts/run_checks.py";
+const ADVERSARY_VERDICT: &str = "adversary/scripts/verdict.py";
+const GAUNTLET_GATE: &str = "review-gauntlet/scripts/verdict_gate.py";
+const FINALIZE_CHECK: &str = "review-gauntlet/scripts/finalize_check.sh";
+const STEP_VERIFY_TESTS: &str = "step-runner/scripts/verify_tests.sh";
+const SUITE_CRITERION: &str = "the full test suite passes";
+const DEFERRED: &str = "DEFERRED: full suite runs at the final gate";
+
+fn run_py(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Value {
+    let state_file = dir.join(format!("state-{}.json", rel.replace('/', "-")));
+    fs::write(&state_file, state.to_string()).unwrap();
+    let output = scrubbed(Path::new("python3"))
+        .arg(asset(rel))
+        .current_dir(dir)
+        .env("GRAPH_STATE_FILE", &state_file)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("spawn python3");
+    assert!(
+        output.status.success(),
+        "{rel} exited {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse(rel, &output)
+}
+
+fn agent_graph(rel: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&fs::read_to_string(asset(rel)).unwrap()).unwrap()
+}
+
+/// Writes the finalize record of the worktree tree of `dir` holding `results`.
+fn write_finalize(dir: &Path, results: Value) {
+    let mut child = scrubbed(Path::new("python3"))
+        .arg(asset(".shared/verify_record.py"))
+        .args([
+            "write",
+            "--root",
+            path_str(dir),
+            "--tier",
+            "finalize",
+            "--writer",
+            "verify-tiers",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn python3");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(results.to_string().as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "verify_record.py write");
+}
+
+fn finalize_lookup(dir: &Path) -> Value {
+    shared_py(
+        "verify_record.py",
+        &["lookup", "--root", path_str(dir), "--tier", "finalize"],
+    )
+    .1
+}
+
+fn test_result(cmd: &str, exit: i64, verdict: &str, note: &str) -> Value {
+    json!([{
+        "role": "test",
+        "cmd": cmd,
+        "exit": exit,
+        "duration_s": 1,
+        "verdict": verdict,
+        "note": note,
+        "tail": "",
+    }])
+}
+
+/// What run_checks.py records for `dir` at `tier`, with `declared` as the
+/// verification_commands.
+fn adversary_checks(dir: &Path, tier: &str, declared: &[&str]) -> Value {
+    let state = json!({
+        "project_dir": path_str(dir),
+        "verification_tier": tier,
+        "verification_commands": json!(declared).to_string(),
+        "criteria": [{"id": "c1", "text": SUITE_CRITERION}],
+    });
+    let lock = dir.with_file_name("review-stack.lock");
+    run_py(
+        RUN_CHECKS,
+        dir,
+        &state,
+        &[("ADVERSARY_STACK_LOCK_PATH", path_str(&lock))],
+    )
+}
+
+fn verdict_of(status: &str, evidence: &str, no_test_reason: &str) -> Value {
+    json!([{
+        "id": "c1",
+        "text": SUITE_CRITERION,
+        "status": status,
+        "evidence": evidence,
+        "complaint": "",
+        "no_test_reason": no_test_reason,
+    }])
+}
+
+/// The adversary report for one criterion judged `verdicts`, over the
+/// exec_results and full_suite_record that `checks` recorded.
+fn adversary_report(dir: &Path, checks: &Value, verdicts: Value, tier: &str) -> String {
+    let mut state = json!({
+        "criteria": [{"id": "c1", "text": SUITE_CRITERION}],
+        "crit_verdicts": verdicts,
+        "verification_tier": tier,
+        "verification_commands": "[]",
+        "debris_summary": "debris: clean",
+    });
+    for key in ["exec_results", "full_suite_record"] {
+        if let Some(value) = checks.get(key) {
+            state[key] = value.clone();
+        }
+    }
+    str_field(&run_py(ADVERSARY_VERDICT, dir, &state, &[]), "adv_report").to_string()
+}
+
+fn report_line(report: &str, n: usize) -> &str {
+    report.lines().nth(n).unwrap_or("")
+}
+
+/// At the final tier a worktree tree with no finalize record diverges, even
+/// with every criterion met, and nothing declared runs.
+#[test]
+fn final_tier_adversary_without_a_finalize_record_diverges_with_every_criterion_met() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("adversary-no-record");
+    let dir = committed(&root.0);
+    let checks = adversary_checks(&dir, "final", &["touch sentinel.txt"]);
+    let tree = worktree_tree(&dir);
+    assert_eq!(checks["full_suite_record"]["status"], "missing", "{checks}");
+    let line = str_field(&checks["full_suite_record"], "line");
+    assert_eq!(
+        line,
+        format!("FULL-SUITE RECORD MISSING: no finalize record for the worktree tree {tree}"),
+        "{checks}"
+    );
+    assert!(!dir.join("sentinel.txt").exists(), "a declared command ran");
+
+    let met = verdict_of("MET", "the recorded run exits 0", "");
+    let report = adversary_report(&dir, &checks, met.clone(), "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: DIVERGES",
+        "{report}"
+    );
+    assert_eq!(report_line(&report, 2), line, "{report}");
+    assert!(report.contains(&format!("\n1. {line}\n")), "{report}");
+
+    let unchecked = adversary_report(&dir, &json!({}), met, "final");
+    assert!(
+        unchecked
+            .contains("FULL-SUITE RECORD MISSING: run_checks recorded no finalize record lookup"),
+        "{unchecked}"
+    );
+}
+
+/// A finalize record for another tree is stale: once the worktree changes,
+/// the review diverges.
+#[test]
+fn final_tier_adversary_with_a_stale_tree_record_diverges() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("adversary-stale");
+    let dir = committed(&root.0);
+    write_finalize(&dir, test_result("run-suite", 0, "green", ""));
+    let met = verdict_of("MET", "finalize record run exits 0", "");
+    let fresh = adversary_checks(&dir, "final", &[]);
+    assert_eq!(fresh["full_suite_record"]["status"], "green", "{fresh}");
+    let report = adversary_report(&dir, &fresh, met.clone(), "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: CONFORMS",
+        "{report}"
+    );
+
+    fs::write(dir.join("src/widget.txt"), "changed after the gate\n").unwrap();
+    let stale = adversary_checks(&dir, "final", &[]);
+    assert_eq!(stale["full_suite_record"]["status"], "missing", "{stale}");
+    let report = adversary_report(&dir, &stale, met, "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: DIVERGES",
+        "{report}"
+    );
+    assert!(
+        report_line(&report, 2).starts_with("FULL-SUITE RECORD MISSING: "),
+        "{report}"
+    );
+}
+
+/// With the reviewed tree named, a file another lane writes after it does
+/// not hide that tree's record, and a tree with no record is missing.
+#[test]
+fn final_tier_adversary_looks_up_the_named_review_tree() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("adversary-review-tree");
+    let dir = committed(&root.0);
+    write_finalize(&dir, test_result("run-suite", 0, "green", ""));
+    let reviewed = worktree_tree(&dir);
+    fs::write(dir.join("src/probe_test.txt"), "written by another lane\n").unwrap();
+    let lock = dir.with_file_name("review-stack.lock");
+    let checks_for = |tree: &str| {
+        let state = json!({
+            "project_dir": path_str(&dir),
+            "verification_tier": "final",
+            "review_tree": tree,
+            "verification_commands": "[]",
+            "criteria": [{"id": "c1", "text": SUITE_CRITERION}],
+        });
+        run_py(
+            RUN_CHECKS,
+            &dir,
+            &state,
+            &[("ADVERSARY_STACK_LOCK_PATH", path_str(&lock))],
+        )
+    };
+
+    let named = checks_for(&reviewed);
+    assert_eq!(named["full_suite_record"]["status"], "green", "{named}");
+    assert_eq!(str_field(&named["full_suite_record"], "tree"), reviewed);
+    let met = verdict_of("MET", "finalize record run exits 0", "");
+    let report = adversary_report(&dir, &named, met, "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: CONFORMS",
+        "{report}"
+    );
+
+    let live = checks_for("");
+    assert_eq!(live["full_suite_record"]["status"], "missing", "{live}");
+
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    let unknown = checks_for(other);
+    assert_eq!(
+        str_field(&unknown["full_suite_record"], "line"),
+        format!("FULL-SUITE RECORD MISSING: no finalize record for the reviewed tree {other}"),
+        "{unknown}"
+    );
+
+    let gauntlet = agent_graph("review-gauntlet/graph.yaml");
+    assert_eq!(
+        gauntlet["nodes"]["run_adversary"]["inputs"]["review_tree"].as_str(),
+        Some("{{review_tree_before}}")
+    );
+}
+
+/// A record with a new failure diverges with the RED line; one whose only
+/// failures already failed on the base passes.
+#[test]
+fn final_tier_adversary_diverges_on_a_regression_and_passes_pre_existing_failures() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("adversary-red");
+    let dir = committed(&root.0);
+    let met = verdict_of("MET", "finalize record run", "");
+
+    write_finalize(
+        &dir,
+        test_result("run-suite", 101, "red", "new failures: fresh"),
+    );
+    let red = adversary_checks(&dir, "final", &[]);
+    assert_eq!(red["full_suite_record"]["status"], "red", "{red}");
+    let line = str_field(&red["full_suite_record"], "line");
+    assert!(
+        line.starts_with("FULL-SUITE RECORD RED: finalize record "),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(": test `run-suite` red (new failures: fresh)"),
+        "{line}"
+    );
+    let report = adversary_report(&dir, &red, met.clone(), "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: DIVERGES",
+        "{report}"
+    );
+    assert_eq!(report_line(&report, 2), line, "{report}");
+
+    write_finalize(
+        &dir,
+        test_result(
+            "run-suite",
+            101,
+            "pre-existing",
+            "pre-existing failures: known",
+        ),
+    );
+    let old = adversary_checks(&dir, "final", &[]);
+    assert_eq!(old["full_suite_record"]["status"], "green", "{old}");
+    assert_eq!(
+        old["exec_results"][0]["baseline"]["status"], "pre-existing",
+        "{old}"
+    );
+    let report = adversary_report(&dir, &old, met, "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: CONFORMS",
+        "{report}"
+    );
+    assert!(
+        report.contains("Pre-existing failures (not blocking):\n- `run-suite` -- exit 101"),
+        "{report}"
+    );
+}
+
+/// A green record is the execution evidence: its runs reach exec_results
+/// naming the record, and the declared command does not run; at the empty
+/// tier the same declaration does run.
+#[test]
+fn final_tier_adversary_cites_a_green_record_without_running_the_command() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("adversary-green");
+    let dir = committed(&root.0);
+    let sentinel = "touch sentinel.txt";
+    write_finalize(&dir, test_result(sentinel, 0, "green", ""));
+    let record = finalize_lookup(&dir)["record"].clone();
+    let checks = adversary_checks(&dir, "final", &[sentinel]);
+    assert!(!dir.join("sentinel.txt").exists(), "the full command ran");
+    let run = &checks["exec_results"][0];
+    assert_eq!(str_field(run, "cmd"), sentinel, "{checks}");
+    assert_eq!(run["exit"], 0, "{checks}");
+    assert_eq!(
+        str_field(run, "source"),
+        format!(
+            "finalize record {} @ {}",
+            str_field(&record, "tree"),
+            str_field(&record, "recorded_at")
+        ),
+        "{checks}"
+    );
+    assert!(
+        str_field(&checks, "tier_note").contains("finalize record of this worktree tree"),
+        "{checks}"
+    );
+    let evidence = format!(
+        "recorded run `{sentinel}` exit 0 ({})",
+        str_field(run, "source")
+    );
+    let report = adversary_report(&dir, &checks, verdict_of("MET", &evidence, ""), "final");
+    assert_eq!(
+        report_line(&report, 0),
+        "ADVERSARIAL_REVIEW: CONFORMS",
+        "{report}"
+    );
+    assert!(report.contains(&evidence), "{report}");
+
+    let plain = adversary_checks(&dir, "", &[sentinel]);
+    assert!(dir.join("sentinel.txt").exists(), "{plain}");
+    assert!(plain.get("full_suite_record").is_none(), "{plain}");
+}
+
+/// A criterion deferred to the final gate conforms at the round tier beside
+/// a green recorded run, is partial at the round tier with none, and is
+/// always partial at the final tier.
+#[test]
+fn deferred_criterion_conforms_at_round_and_diverges_at_final() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("adversary-deferred");
+    let dir = committed(&root.0);
+    let reason = format!("{DEFERRED}; the targeted tests cover the change");
+    let deferred = verdict_of("INSPECTED", "src/widget.txt:1 holds the change", &reason);
+    let green = json!({
+        "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}],
+        "full_suite_record": {"status": "green", "tree": "t", "line": ""},
+    });
+
+    let round = adversary_report(&dir, &green, deferred.clone(), "round");
+    assert_eq!(
+        report_line(&round, 0),
+        "ADVERSARIAL_REVIEW: CONFORMS",
+        "{round}"
+    );
+
+    let nothing_ran = json!({"exec_results": "none declared"});
+    let unproven = adversary_report(&dir, &nothing_ran, deferred.clone(), "round");
+    assert_eq!(
+        report_line(&unproven, 0),
+        "ADVERSARIAL_REVIEW: DIVERGES",
+        "{unproven}"
+    );
+    assert!(
+        unproven.contains("1 partial")
+            && unproven.contains("deferred to the final gate and judged from the diff only"),
+        "{unproven}"
+    );
+
+    let fin = adversary_report(&dir, &green, deferred, "final");
+    assert_eq!(
+        report_line(&fin, 0),
+        "ADVERSARIAL_REVIEW: DIVERGES",
+        "{fin}"
+    );
+    assert!(
+        fin.contains("1 partial")
+            && fin.contains("deferred to the final gate, but this review is the final gate"),
+        "{fin}"
+    );
+
+    let round_note = str_field(&adversary_checks(&dir, "round", &[]), "tier_note").to_string();
+    assert!(round_note.contains(DEFERRED), "{round_note}");
+}
+
+/// verdict_gate.py state for a review whose every lane is green.
+fn green_lanes(dir: &Path, before: &str, tier: &str) -> Value {
+    json!({
+        "project_dir": path_str(dir),
+        "review_tree_before": before,
+        "verification_tier": tier,
+        "debris_summary": "debris: clean",
+        "code_review_results": ["**Verdict: MERGE-READY**\n"],
+        "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 1/1 met.\n"],
+    })
+}
+
+fn gauntlet_gate(dir: &Path, state: &Value) -> (String, String) {
+    let out = run_py(GAUNTLET_GATE, dir, state, &[]);
+    (
+        str_field(&out, "gauntlet_verdict").to_string(),
+        str_field(&out, "gauntlet_report").to_string(),
+    )
+}
+
+/// A final-tier gauntlet routes signals to finalize_check, which runs the
+/// finalize gate on a miss and writes the record, reuses it on a hit, and
+/// reports a red record or an unclassified red suite; the verdict gate blocks
+/// on anything but a green record for the reviewed tree, lanes green or not.
+#[test]
+fn final_tier_gauntlet_runs_the_finalize_gate_once_and_blocks_without_a_green_record() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("gauntlet-final");
+    let dir = committed(&root.0);
+    fs::write(dir.join("src/widget.txt"), "under review\n").unwrap();
+
+    let signals_state = json!({"project_dir": path_str(&dir), "diff_spec": "worktree"});
+    let plain = run_py(
+        "review-gauntlet/scripts/signals.py",
+        &dir,
+        &signals_state,
+        &[],
+    );
+    assert!(plain.get("_next").is_none(), "{plain}");
+    let mut final_state = signals_state.clone();
+    final_state["verification_tier"] = json!("final");
+    let signals = run_py(
+        "review-gauntlet/scripts/signals.py",
+        &dir,
+        &final_state,
+        &[],
+    );
+    assert_eq!(str_field(&signals, "_next"), "finalize_check", "{signals}");
+    let before = str_field(&signals, "review_tree_before").to_string();
+    assert_eq!(before, worktree_tree(&dir));
+
+    let runs = root.0.join("suite-runs.txt");
+    let suite = format!("echo ran >> '{}'", runs.display());
+    let check_state = json!({"project_dir": path_str(&dir), "review_tree_before": before});
+    let miss = run_script(FINALIZE_CHECK, &dir, &check_state, &[("TEST_CMD", &suite)]);
+    let record = &miss["full_suite_record"];
+    assert_eq!(str_field(record, "status"), "green", "{miss}");
+    assert_eq!(str_field(record, "tree"), before, "{miss}");
+    assert_eq!(
+        lines(&runs).len(),
+        1,
+        "the finalize gate did not run the suite"
+    );
+    assert_eq!(str_field(&finalize_lookup(&dir), "status"), "green");
+
+    let hit = run_script(FINALIZE_CHECK, &dir, &check_state, &[("TEST_CMD", &suite)]);
+    assert_eq!(
+        str_field(&hit["full_suite_record"], "status"),
+        "green",
+        "{hit}"
+    );
+    assert!(
+        str_field(&hit["full_suite_record"], "detail").ends_with(", reused"),
+        "{hit}"
+    );
+    assert_eq!(lines(&runs).len(), 1, "a record hit ran the suite again");
+
+    let mut state = green_lanes(&dir, &before, "final");
+    state["full_suite_record"] = hit["full_suite_record"].clone();
+    let (verdict, report) = gauntlet_gate(&dir, &state);
+    assert_eq!(verdict, "PASS", "{report}");
+    assert!(
+        report.contains("| full-suite | GREEN | finalize record "),
+        "{report}"
+    );
+
+    let (verdict, report) = gauntlet_gate(&dir, &green_lanes(&dir, &before, "final"));
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(
+        report.contains(
+            "\n- FULL-SUITE RECORD MISSING: the finalize check did not finish, so no record was looked up or written"
+        ),
+        "{report}"
+    );
+    let mut moved = green_lanes(&dir, "0123456789abcdef0123456789abcdef01234567", "final");
+    moved["full_suite_record"] = hit["full_suite_record"].clone();
+    let (verdict, report) = gauntlet_gate(&dir, &moved);
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(
+        report.contains("not the reviewed tree 0123456789abcdef0123456789abcdef01234567"),
+        "{report}"
+    );
+
+    fs::write(dir.join("src/widget.txt"), "red under review\n").unwrap();
+    write_finalize(
+        &dir,
+        test_result("run-suite", 101, "red", "new failures: fresh"),
+    );
+    let red_before = worktree_tree(&dir);
+    let red_state = json!({"project_dir": path_str(&dir), "review_tree_before": red_before});
+    let red = run_script(FINALIZE_CHECK, &dir, &red_state, &[("TEST_CMD", &suite)]);
+    assert_eq!(
+        str_field(&red["full_suite_record"], "status"),
+        "red",
+        "{red}"
+    );
+    assert_eq!(
+        lines(&runs).len(),
+        1,
+        "a red record hit ran the suite again"
+    );
+    let mut state = green_lanes(&dir, &red_before, "final");
+    state["full_suite_record"] = red["full_suite_record"].clone();
+    let (verdict, report) = gauntlet_gate(&dir, &state);
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(
+        report.contains("\n- FULL-SUITE RECORD RED: finalize record "),
+        "{report}"
+    );
+    assert!(
+        report.contains("test `run-suite` red (new failures: fresh)"),
+        "{report}"
+    );
+
+    fs::write(dir.join("src/widget.txt"), "unclassified under review\n").unwrap();
+    let odd_before = worktree_tree(&dir);
+    let odd_state = json!({"project_dir": path_str(&dir), "review_tree_before": odd_before});
+    let odd = run_script(
+        FINALIZE_CHECK,
+        &dir,
+        &odd_state,
+        &[("TEST_CMD", "printf 'test other ... FAILED\\n'; exit 1")],
+    );
+    assert_eq!(
+        str_field(&odd["full_suite_record"], "status"),
+        "unavailable",
+        "{odd}"
+    );
+    let mut state = green_lanes(&dir, &odd_before, "final");
+    state["full_suite_record"] = odd["full_suite_record"].clone();
+    let (verdict, report) = gauntlet_gate(&dir, &state);
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(
+        report.contains("\n- FULL-SUITE RECORD UNAVAILABLE: "),
+        "{report}"
+    );
+
+    let gauntlet = agent_graph("review-gauntlet/graph.yaml");
+    let node = &gauntlet["nodes"]["finalize_check"];
+    assert_eq!(node["script"].as_str(), Some("scripts/finalize_check.sh"));
+    assert_eq!(node["timeout"].as_u64(), Some(3600));
+    assert_eq!(node["next"].as_str(), Some("debris_lint"));
+    assert_eq!(node["fallback"].as_str(), Some("debris_lint"));
+    assert_eq!(
+        gauntlet["nodes"]["run_adversary"]["inputs"]["verification_tier"].as_str(),
+        Some("{{verification_tier}}")
+    );
+    let script = fs::read_to_string(asset(FINALIZE_CHECK)).unwrap();
+    assert!(script.contains("DEADLINE_SECS=3300\n"), "{script}");
+}
+
+/// A finalize gate whose fmt step rewrites a reviewed file is reported red
+/// with the rewritten path, not hidden behind a record for another tree.
+#[test]
+fn final_tier_gauntlet_reports_a_tree_the_finalize_gate_rewrote() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("gauntlet-rewrite");
+    let dir = committed(&root.0);
+    fs::write(
+        dir.join(".coyote-project.json"),
+        r#"{"type":"unknown","build":"","test":"","check":"","lint":"","fmt":"printf 'formatted\\n' > src/widget.txt"}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("src/widget.txt"), "unformatted\n").unwrap();
+    let before = worktree_tree(&dir);
+    let state = json!({"project_dir": path_str(&dir), "review_tree_before": before});
+    let out = run_script(FINALIZE_CHECK, &dir, &state, &[("TEST_CMD", "true")]);
+    let record = &out["full_suite_record"];
+    assert_eq!(str_field(record, "status"), "red", "{out}");
+    assert_ne!(str_field(record, "tree"), before, "{out}");
+    assert!(
+        str_field(record, "detail").contains(&format!(
+            "; the gate rewrote the reviewed tree {before}: src/widget.txt; format the change and review again"
+        )),
+        "{out}"
+    );
+
+    let mut lanes = green_lanes(&dir, &before, "final");
+    lanes["full_suite_record"] = record.clone();
+    let (verdict, report) = gauntlet_gate(&dir, &lanes);
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(
+        report.contains("\n- FULL-SUITE RECORD RED: finalize gate ran on tree "),
+        "{report}"
+    );
+}
+
+/// An empty verification_tier leaves the gauntlet verdict, the adversary's
+/// runs and its verdict exactly as without the variable; round adds only the
+/// criterion checks' note, and an unknown tier fails closed.
+#[test]
+fn empty_verification_tier_changes_nothing() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("empty-tier");
+    let dir = committed(&root.0);
+    let before = worktree_tree(&dir);
+
+    let mut absent = green_lanes(&dir, &before, "");
+    absent.as_object_mut().unwrap().remove("verification_tier");
+    let (verdict, report) = gauntlet_gate(&dir, &absent);
+    assert_eq!(verdict, "PASS", "{report}");
+    assert!(!report.contains("full-suite"), "{report}");
+    for tier in ["", "round"] {
+        assert_eq!(
+            gauntlet_gate(&dir, &green_lanes(&dir, &before, tier)),
+            (verdict.clone(), report.clone()),
+            "verification_tier {tier:?}"
+        );
+    }
+    let (verdict, report) = gauntlet_gate(&dir, &green_lanes(&dir, &before, "Final"));
+    assert_eq!(verdict, "BLOCKED", "{report}");
+    assert!(
+        report.contains("verification_tier 'Final' is not"),
+        "{report}"
+    );
+
+    let mut runs_state = json!({
+        "project_dir": path_str(&dir),
+        "verification_commands": "[]",
+    });
+    let without = run_py(RUN_CHECKS, &dir, &runs_state, &[]);
+    runs_state["verification_tier"] = json!("");
+    assert_eq!(run_py(RUN_CHECKS, &dir, &runs_state, &[]), without);
+    assert!(without.get("tier_note").is_none(), "{without}");
+    runs_state["verification_tier"] = json!("round");
+    let round = run_py(RUN_CHECKS, &dir, &runs_state, &[]);
+    assert_eq!(round["exec_results"], without["exec_results"], "{round}");
+    assert!(
+        round["tier_note"]
+            .as_str()
+            .is_some_and(|n| n.contains(DEFERRED))
+    );
+    runs_state["verification_tier"] = json!("rounds");
+    let bad = run_py(RUN_CHECKS, &dir, &runs_state, &[]);
+    assert!(
+        str_field(&bad, "exec_results")
+            .starts_with("PIPELINE-FAULT: verification_tier declaration invalid"),
+        "{bad}"
+    );
+
+    let met = verdict_of("MET", "a test proves it", "");
+    let checks = json!({"exec_results": "none declared"});
+    let mut state = json!({
+        "criteria": [{"id": "c1", "text": SUITE_CRITERION}],
+        "crit_verdicts": met,
+        "exec_results": "none declared",
+        "verification_commands": "[]",
+        "debris_summary": "debris: clean",
+    });
+    let plain = str_field(&run_py(ADVERSARY_VERDICT, &dir, &state, &[]), "adv_report").to_string();
+    assert_eq!(adversary_report(&dir, &checks, met.clone(), ""), plain);
+    assert_eq!(adversary_report(&dir, &checks, met, "round"), plain);
+    state["verification_tier"] = json!("");
+    assert_eq!(
+        str_field(&run_py(ADVERSARY_VERDICT, &dir, &state, &[]), "adv_report"),
+        plain
+    );
+
+    let adversary = agent_graph("adversary/graph.yaml");
+    let gauntlet = agent_graph("review-gauntlet/graph.yaml");
+    for graph in [&adversary, &gauntlet] {
+        let tier = graph["variables"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"].as_str() == Some("verification_tier"))
+            .expect("verification_tier variable");
+        assert_eq!(tier["default"].as_str(), Some(""));
+    }
+    assert_eq!(adversary["initial_state"]["tier_note"].as_str(), Some(""));
+    for node in ["check_criterion", "holistic"] {
+        let prompt = adversary["nodes"][node]["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("{{exec_results}}{{tier_note}}\n"),
+            "{node}: {prompt}"
+        );
+    }
+}
+
+/// step-runner seats its coder at the round tier with the commit the step
+/// started from as baseline_floor, and its verify_tests gate writes a
+/// finalize record after a green suite and reuses it for the same tree.
+#[test]
+fn step_runner_seats_its_coder_at_round_and_reuses_its_finalize_record() {
+    let graph = agent_graph("step-runner/graph.yaml");
+    let inputs = &graph["nodes"]["implement"]["inputs"];
+    assert_eq!(inputs["verify_tier"].as_str(), Some("round"));
+    assert_eq!(
+        inputs["baseline_floor"].as_str(),
+        Some("{{baseline_floor}}")
+    );
+    assert_eq!(graph["initial_state"]["baseline_floor"].as_str(), Some(""));
+    let output = graph["nodes"]["end_success"]["output"].as_str().unwrap();
+    assert!(
+        output.contains(
+            "\nBuild: passed | Tests: passed (full suite and lint at the step gate; the coder ran \
+             targeted and impacted tests per lap)"
+        ),
+        "{output}"
+    );
+
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("step-runner-tier");
+    let dir = committed(&root.0);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    fs::create_dir_all(dir.join("plans/steps")).unwrap();
+    fs::write(
+        dir.join("plans/steps/01-first.md"),
+        "---\ntitle: first\nstatus: pending\n---\nfirst\n",
+    )
+    .unwrap();
+    let resolved = run_script(
+        "step-runner/scripts/resolve_step.sh",
+        &dir,
+        &json!({}),
+        &[("LLM_AGENT_VAR_PROJECT_DIR", path_str(&dir))],
+    );
+    assert_eq!(str_field(&resolved, "baseline_floor"), head, "{resolved}");
+
+    fs::write(dir.join("src/widget.txt"), "step edit\n").unwrap();
+    let runs = root.0.join("suite-runs.txt");
+    let suite = format!("echo ran >> '{}'", runs.display());
+    let state = json!({
+        "project_dir": path_str(&dir),
+        "build_ok": true,
+        "build_output": "Ran: make check\n\nok",
+        "lint_ok": true,
+        "lint_output": "(GATE NOT RUN: no lint command configured or detected.)",
+    });
+    let first = run_script(STEP_VERIFY_TESTS, &dir, &state, &[("TEST_CMD", &suite)]);
+    assert_eq!(first["tests_ok"], Value::Bool(true), "{first}");
+    assert_eq!(str_field(&first, "_next"), "debt_scan", "{first}");
+    assert!(
+        str_field(&first, "tests_output").starts_with("Ran: "),
+        "{first}"
+    );
+    assert_eq!(lines(&runs).len(), 1);
+    let lookup = finalize_lookup(&dir);
+    assert_eq!(str_field(&lookup, "status"), "green", "{lookup}");
+    let record = &lookup["record"];
+    assert_eq!(str_field(record, "writer"), "step-runner", "{lookup}");
+    let results: Vec<(&str, &str, &str)> = record["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                str_field(r, "role"),
+                str_field(r, "cmd"),
+                str_field(r, "verdict"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("check", "make check", "green"),
+            ("lint", "", "not_run"),
+            ("test", suite.as_str(), "green"),
+        ]
+    );
+
+    let second = run_script(STEP_VERIFY_TESTS, &dir, &state, &[("TEST_CMD", &suite)]);
+    assert_eq!(second["tests_ok"], Value::Bool(true), "{second}");
+    assert_eq!(str_field(&second, "_next"), "debt_scan", "{second}");
+    assert!(
+        str_field(&second, "tests_output").starts_with("Reused the finalize record "),
+        "{second}"
+    );
+    assert_eq!(lines(&runs).len(), 1, "a record hit ran the suite again");
+
+    fs::write(dir.join("src/widget.txt"), "known failure\n").unwrap();
+    write_finalize(
+        &dir,
+        test_result(
+            "run-suite",
+            101,
+            "pre-existing",
+            "pre-existing failures: known",
+        ),
+    );
+    let failing = format!("{suite}; exit 1");
+    let known = run_script(STEP_VERIFY_TESTS, &dir, &state, &[("TEST_CMD", &failing)]);
+    assert_eq!(known["tests_ok"], Value::Bool(false), "{known}");
+    assert_eq!(str_field(&known, "_next"), "fix_loop_gate", "{known}");
+    assert_eq!(
+        lines(&runs).len(),
+        2,
+        "a record green only through pre-existing failures was reused"
+    );
 }
