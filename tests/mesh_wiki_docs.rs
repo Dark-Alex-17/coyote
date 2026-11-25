@@ -4856,7 +4856,8 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
     for needle in [
         "systemctl --user daemon-reload && systemctl --user restart coyote-rnsd",
         "An unchanged definition restarts nothing.",
-        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Start-ScheduledTask -TaskName 'Coyote rnsd'",
+        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--config \"<config dir>\"') } | ForEach-Object { taskkill.exe /PID $_.ProcessId /T /F }; Start-ScheduledTask -TaskName 'Coyote rnsd'",
+        "Stop-ScheduledTask 'Coyote rnsd' ends only the task's cmd.exe",
     ] {
         assert!(
             setup_prose.contains(needle),
@@ -6009,10 +6010,10 @@ fn the_readme_names_the_daemon_prerequisite_and_the_local_default() {
         "prints the stanza to add by hand",
         "systemctl --user restart coyote-rnsd",
         "launchctl kickstart -k gui/<uid>/com.coyote.rnsd",
-        "Start-ScheduledTask 'Coyote rnsd'",
+        "`Stop-ScheduledTask 'Coyote rnsd'`, then ending the rnsd process tree it leaves running, then `Start-ScheduledTask 'Coyote rnsd'`",
         "On Linux and macOS, when the setup script itself rewrites a changed service definition it restarts the service for you",
         "runs `launchctl bootout`, waits for launchd to unload the agent, then `launchctl bootstrap`",
-        "on Windows the task is re-registered in place and `Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'` is printed for you to run",
+        "on Windows the task is re-registered in place and the restart (stop the task, end the rnsd process tree it leaves running, start it) is printed for you to run",
         "--relay <node host>:4242",
         "bash -s -- --relay",
         "-ExecutionPolicy Bypass -File .\\mesh-relay.ps1",
@@ -11184,6 +11185,73 @@ fn the_commands_page_says_a_sync_failure_once_per_node() {
         assert!(
             commands.contains(needle),
             "Mesh-Commands.md does not say {needle:?}"
+        );
+    }
+}
+
+/// The Windows notes: the install page's build prerequisites, each with the error it
+/// prevents, and Git Bash for the tools; the deployment page's restart that ends rnsd's
+/// process tree as the script prints it, `-AllowRoot` over SSH, and the rnstatus shim the
+/// script writes.
+#[test]
+fn the_windows_build_run_and_relay_notes_match_the_script() {
+    let ps1 = read(repo_root().join("scripts/mesh-relay.ps1"));
+    for piece in [
+        "return \"Stop-ScheduledTask -TaskName '$TaskName'; Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('--config `\"$script:RnsDir`\"') } | ForEach-Object { taskkill.exe /PID `$_.ProcessId /T /F }; Start-ScheduledTask -TaskName '$TaskName'\"",
+        "Diagnostics: '$rnstatus' attaches to the shared instance and lists its interfaces; run it in Windows Terminal",
+        "@set `\"PYTHONUTF8=1`\"",
+        "is the one this script wrote (already there); not touched",
+    ] {
+        assert!(
+            ps1.contains(piece),
+            "scripts/mesh-relay.ps1 no longer carries {piece:?}; update the wiki and this test"
+        );
+    }
+    let readme = read(repo_root().join("README.md"));
+    assert!(
+        readme.contains("wiki/Installation#building-from-source-on-windows"),
+        "README.md's Windows instructions do not link the build section"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let install = flat(&read(wiki.join("Installation.md")));
+    for needle in [
+        "### Building from source on Windows",
+        "Without it: `NASM command not found`.",
+        "Without it: `Missing dependency: cmake`.",
+        "or point `CMAKE` at the copy the Visual Studio build tools ship",
+        "`setx LIBCLANG_PATH \"C:\\Program Files\\LLVM\\bin\"`",
+        "Without it: `Unable to find libclang`.",
+        "apply to new logons only",
+        "### Running on Windows",
+        "with `C:\\Program Files\\Git\\bin` on `PATH`",
+        "`'bash' is not recognized as an internal or external command`",
+        "Coyote does not check for it at startup.",
+    ] {
+        assert!(install.contains(needle), "Installation.md does not say {needle:?}");
+    }
+    let deployment = flat(&read(wiki.join("Mesh-Deployment.md")));
+    for needle in [
+        "over SSH, pass `-AllowRoot`",
+        "`<config> is the one this script wrote (already there); not touched`",
+        "writes `rnstatus.cmd` beside `rnsd.cmd`, which runs the `rnstatus` next to that rnsd with `PYTHONUTF8=1`",
+        "Run it in Windows Terminal",
+        "`Diagnostics: '<bin dir>\\rnstatus.cmd' attaches to the shared instance and lists its interfaces; run it in Windows Terminal`",
+        "the `rnsd.exe` and `python.exe` it started keep running with the config they read",
+    ] {
+        assert!(
+            deployment.contains(needle),
+            "Mesh-Deployment.md does not say {needle:?}"
+        );
+    }
+    let platform = flat(&read(wiki.join("Mesh-Platform-Support.md")));
+    for needle in [
+        "Stopping the task does not stop rnsd",
+        "[Building from source on Windows](Installation#building-from-source-on-windows)",
+    ] {
+        assert!(
+            platform.contains(needle),
+            "Mesh-Platform-Support.md does not say {needle:?}"
         );
     }
 }

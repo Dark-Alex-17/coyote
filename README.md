@@ -195,6 +195,10 @@ To use a binary from the releases page on Windows, do the following:
 2. Use 7-Zip or TarTool to unpack the Tar file.
 3. Run the executable `coyote.exe`!
 
+Coyote's function tools run through `bash`: install [Git for Windows](https://gitforwindows.org/) and put
+`C:\Program Files\Git\bin` (not only `\cmd`) on your `Path`. Building from source on Windows also needs NASM, CMake
+and LLVM; see [Building from source on Windows](https://github.com/Dark-Alex-17/coyote/wiki/Installation#building-from-source-on-windows).
+
 #### Linux/MacOS Instructions
 To use a binary from the releases page on Linux/MacOS, do the following:
 
