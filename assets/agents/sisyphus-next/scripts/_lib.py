@@ -278,6 +278,7 @@ STATE_KEYS = (
     "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests", "probe_adoption",
     "base_syncs", "base_integrated", "base_checked_head",
     "attention_notes", "autonomous_decisions", "judge_rulings", "answered_decisions",
+    "comment_hygiene_done", "comment_hygiene_line",
 )
 
 
