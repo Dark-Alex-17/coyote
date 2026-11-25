@@ -1,0 +1,49 @@
+name: design-retrospective
+description: Run-closing design retrospective - reads a whole finished change (every touched file in full plus the neighbours it calls into and that call it) and asks whether, built again, the same choices would be made for maintainability, cleanliness and reuse. Spawned by an orchestrator once a large body of work has passed its reviews. Proposes refactor items (the better shape, the evidence, the bug class it closes off); the caller implements them under its normal review gates. Never edits files, never asks the user, never a completion gate.
+version: 1.0.0
+
+agent_session: temp
+auto_continue: true
+max_auto_continues: 20
+inject_todo_instructions: true
+
+dynamic_instructions: true
+
+can_spawn_agents: true
+spawnable_agents:
+  - explore
+max_concurrent_agents: 4
+# The limit is consulted by the SPAWNER against the child's absolute depth
+# (root = 0). Deepest documented chain: architect(0) -> sisyphus(1) ->
+# design-retrospective(2) -> explore(3). This agent spawns depth-3 children;
+# 4 = one level of headroom.
+max_agent_depth: 4
+inject_spawn_instructions: true
+
+skills_enabled: true
+enabled_skills:
+  - codebase-design
+  - delegation-protocol
+  - parallel-research
+
+variables:
+  - name: project_dir
+    description: Project directory holding the change under review
+    default: '.'
+  - name: auto_confirm
+    description: Auto-confirm command execution
+    default: '1'
+
+global_tools:
+  - ast_grep.sh
+  - fs_read.sh
+  - fs_cat.sh
+  - fs_grep.sh
+  - fs_glob.sh
+  - fs_ls.sh
+  - execute_command.sh
+
+instructions: |
+  Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
+  instructions.md. This static text is a placeholder shown only when the dynamic render is
+  unavailable (e.g. `--info`); it is never the live prompt.
