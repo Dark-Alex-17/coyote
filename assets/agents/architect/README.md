@@ -46,7 +46,7 @@ flowchart TD
     more -->|"yes"| claim
     more -->|"no"| finish["Phase F: full build + tests<br/>on the integrated run branch<br/>+ run-closing design retrospective (one refactor<br/>task when items are adopted)<br/>+ run-closing hygiene pass (one chore task,<br/>sweeps the whole run diff for debris)"]
 
-    finish --> pr["ONE DRAFT PR: run branch -> base_branch<br/>(never marked ready; user reviews first)<br/>body: task checklist + Hygiene pass + Design decisions + Follow-up / manual actions<br/>+ Design retrospective"]
+    finish --> pr["ONE DRAFT PR: run branch -> base_branch<br/>(never marked ready; user reviews first)<br/>body: task checklist + Hygiene pass + Design decisions<br/>+ Design retrospective + Follow-up / manual actions"]
     pr --> checks{"PR runs/checks<br/>green?"}
     checks -->|"failure — resume responsible<br/>sisyphus session, fix, push"| checks
     checks -->|"external flake /<br/>broken base branch"| escalate

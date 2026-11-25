@@ -355,7 +355,9 @@ fn orchestrators_carry_the_coder_design_disclosure() {
     );
     assert_anchors(
         "architect/README.md",
-        &["body: task checklist + Hygiene pass + Design decisions + Follow-up / manual actions"],
+        &[
+            "body: task checklist + Hygiene pass + Design decisions<br/>+ Design retrospective + Follow-up / manual actions",
+        ],
     );
     assert_anchors(
         "step-runner/graph.yaml",

@@ -812,6 +812,8 @@ these substitutions:
   parent merges, retarget the child to {{base_branch}} and rebase.
 - Step 5 (checks green) also gates STARTING the next group: do not fork group N+1 until group N's
   PR checks are green.
+- Step 2 tags each decline it records in the PLAN file with the group:
+  `retro-declined (g<N>): <item> -- <reason>`, so each group's PR body lists its own.
 - Steps 6-9 run once, at the end: create follow-up tasks from ALL groups' rollups and append each
   created TASK id to the group PR body it belongs to; set the PLAN `status: implemented` with
   EVERY group PR link; the final report lists every group's draft PR URL in stack order.
@@ -828,14 +830,15 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
    change other code will be built on. Those are examples, not a threshold, and architect runs
    usually qualify. State the judgement and why in one line, carried into the step-9 report and
    the PR body. Not large -> record that line and go on to step 3.
-   Otherwise resolve the run base -- `base=$(git -C {{project_dir}} merge-base {{base_branch}} HEAD)`
-   -- STOP if it is empty, and spawn the retrospective ONCE over the run diff, writing the
-   resolved SHA literally:
+   Otherwise resolve `$base` -- `base=$(git -C {{project_dir}} merge-base {{base_branch}} HEAD)`
+   (under multi, the GROUP BASE SHA). When it is empty, record `not run: the run base could not
+   be resolved` and go on to step 3. Else spawn the retrospective ONCE over the diff, writing
+   the SHA in `$base` literally:
 
    ```
    agent__spawn --agent design-retrospective --prompt "Run-closing design retrospective.
    Project: {{project_dir}}
-   Diff: <resolved base SHA>..HEAD
+   Diff: $base..HEAD
    What the work set out to do: <the plan's Problem/Approach, verbatim>
    Plans dir: {{plans_dir}} (bookkeeping, not code under review)"
    --variables {"project_dir": "{{project_dir}}"}
@@ -851,7 +854,9 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
      a Phase E task: claim it per Phase E step 1 (record its BASE SHA), spawn ONE Sisyphus with a
      self-contained brief in the Phase E step 2 shape, run the Phase E step 4 review gauntlet
      with those criteria, route findings per the Phase E rules, and close it per Phase E step 5.
-   - **Too large for this run** -> a follow-up; it becomes a step-6 follow-up task.
+   - **Too large for this run** -> a `Follow-ups:` line prefixed `Design retrospective:`, in the
+     refactor task's `log.md` or, when no refactor task exists, in the PLAN file next to the
+     decline lines; it becomes a step-6 follow-up task.
    - **Changes the plan's agreed interface or scope** -> escalate to the user; never
      self-answered.
    - **`DESIGN_RETROSPECTIVE: CLEAN`, or the step was skipped** -> no task; one line in the
@@ -971,7 +976,8 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
      touched); omit the section entirely when there are none,
    - a **`## Design retrospective`** section: one line saying whether step 2 ran or was skipped
      and why, the refactor task id when one was created (its row also lands in the task
-     checklist), and every `retro-declined:` line,
+     checklist), every `retro-declined:` line, and beside them every item step 2 deferred as
+     too large (its `Design retrospective:` follow-up line),
 <!-- when:escalation_policy=autonomous -->
    - a **`## Decisions taken autonomously`** section (only when `escalation_policy: autonomous`
      resolved anything): one line per self-resolved decision with its basis and what changed —
@@ -988,8 +994,9 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
    cannot drop a line) and prints `NOTE` lines for anything it could not derive (a task without
    SHAs in its `completed` entry, a plan without `rigor:`). Read the body, fix what the NOTEs
    name, add any section the tool does not produce (the `## Design retrospective` section, and
-   the autonomous-decisions digest when it applies), then
-   `gh pr create --draft --body-file <body file>`.
+   the autonomous-decisions digest when it applies), inserting `## Design retrospective` right
+   after `## Design decisions` in the assembled body (after `## Hygiene pass` when there is no
+   `## Design decisions`), then `gh pr create --draft --body-file <body file>`.
 <!-- when:pr_strategy=multi -->
    Pass `--tasks <this group's member task ids, comma-separated>` as well (the members are the
    PLAN's `## PR groups` row for this group): the tool otherwise takes every complete task of
