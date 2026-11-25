@@ -2548,9 +2548,35 @@ mod bottom_pane {
         sgr_params(&raw[start..at])
     }
 
-    /// Whether the lists carry an indexed background (`48;5;N`).
-    fn has_indexed_background(params: &[Vec<u16>]) -> bool {
-        params.iter().any(|p| p.windows(2).any(|w| w == [48, 5]))
+    /// The background the lists leave in effect, read in order: the
+    /// parameters of the last `48;5;N` or `48;2;r;g;b`, or `None` when no
+    /// background was set or a later `49` or `0` reset it.
+    fn background_after(params: &[Vec<u16>]) -> Option<Vec<u16>> {
+        let mut background = None;
+        for list in params {
+            let mut i = 0;
+            while i < list.len() {
+                match list[i] {
+                    38 | 48 | 58 => {
+                        let len = match list.get(i + 1) {
+                            Some(5) => 3,
+                            Some(2) => 5,
+                            _ => 1,
+                        };
+                        let end = (i + len).min(list.len());
+                        if list[i] == 48 && len > 1 {
+                            background = Some(list[i..end].to_vec());
+                        }
+                        i = end;
+                        continue;
+                    }
+                    0 | 49 => background = None,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        background
     }
 
     /// Whether the lists set the indexed foreground `index` (`38;5;index`);
@@ -2663,12 +2689,12 @@ mod bottom_pane {
     }
 
     /// The field is its own surface: the cells of its text rows are painted
-    /// on a background the transcript rows above the rule are not. The screen
-    /// is made tall enough for the `.info` table so the `> .info` header is
-    /// still on screen to compare against.
+    /// on a background, and the transcript rows above the rule on a
+    /// different one. The screen is made tall enough for the `.info` table
+    /// so the `> .info` header is still on screen to compare against.
     #[test]
     #[serial]
-    fn the_composer_rows_carry_a_background_the_transcript_rows_do_not() {
+    fn the_composer_rows_carry_a_background_distinct_from_the_transcript_rows() {
         let dir = fresh_config_dir("field-bg");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
@@ -2700,15 +2726,23 @@ mod bottom_pane {
             )
         });
         let probe_style = sgr_before(raw, probe_at);
-        assert!(
-            has_indexed_background(&probe_style),
-            "the field's text row was painted without an indexed background: {probe_style:?}\n{}",
-            since(&pty, repainted)
-        );
+        let Some(probe_background) = background_after(&probe_style) else {
+            panic!(
+                "the field's text row was painted without a background: {probe_style:?}\n{}",
+                since(&pty, repainted)
+            );
+        };
         let header_style = sgr_before(raw, header_at);
-        assert!(
-            !has_indexed_background(&header_style),
-            "the transcript row carries the field's background: {header_style:?}\n{}",
+        let Some(header_background) = background_after(&header_style) else {
+            panic!(
+                "the transcript row was painted without a background: {header_style:?}\n{}",
+                since(&pty, repainted)
+            );
+        };
+        assert_ne!(
+            probe_background,
+            header_background,
+            "the transcript row carries the field's background\n{}",
             since(&pty, repainted)
         );
         let probe_rows = painted_at(raw, b"probe-bg-q9d", repainted);

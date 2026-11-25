@@ -2469,20 +2469,59 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
         assert!(ends_dim(&[vec![38, 2, 10, 20, 30, 2]]));
     }
 
+    /// Whether the lists leave an explicit foreground in effect: a
+    /// `38;5;N` or `38;2;r;g;b` with no later `39` or `0` resetting it to
+    /// the terminal's default.
+    fn ends_coloured(params: &[Vec<u16>]) -> bool {
+        let mut coloured = false;
+        for list in params {
+            let mut rest = list.as_slice();
+            while let Some((&p, tail)) = rest.split_first() {
+                rest = tail;
+                match p {
+                    0 | 39 => coloured = false,
+                    38 | 48 | 58 => {
+                        let arguments = match rest.first() {
+                            Some(5) => 2,
+                            Some(2) => 4,
+                            _ => 0,
+                        };
+                        if p == 38 && arguments > 0 {
+                            coloured = true;
+                        }
+                        rest = &rest[arguments.min(rest.len())..];
+                    }
+                    _ => {}
+                }
+            }
+        }
+        coloured
+    }
+
+    #[test]
+    fn ends_coloured_reads_a_reset_and_a_background_as_no_foreground() {
+        assert!(ends_coloured(&[vec![38, 5, 248, 48, 5, 235]]));
+        assert!(ends_coloured(&[vec![38, 2, 10, 20, 30]]));
+        assert!(!ends_coloured(&[vec![38, 5, 248], vec![39]]));
+        assert!(!ends_coloured(&[vec![38, 5, 248], vec![0]]));
+        assert!(!ends_coloured(&[vec![48, 5, 235]]));
+    }
+
     // ---------------------------------------------------------------------
-    // The mid-turn cell: dim in colour, a rewind non-entity.
+    // The mid-turn cell: faded in colour, a rewind non-entity.
     // ---------------------------------------------------------------------
 
     /// After a plain exchange, a tool turn gets a line while its tool sleeps;
     /// once the model read it the transcript carries the line as a cell
-    /// painted dim with its `(sent mid-turn)` marker. Esc Esc then offers
+    /// painted faded (a foreground colour, not DIM) with its
+    /// `(sent mid-turn)` marker. Esc Esc then offers
     /// the tool turn's opener and the older prompt, never the mid-turn line,
     /// and no macro-stop notice; choosing the opener pops the tool turn with
     /// its mid-turn cell and reply, keeps the older exchange, and prefills
     /// the opener.
     #[test]
     #[serial]
-    fn a_mid_turn_cell_is_dim_and_neither_a_rewind_row_nor_a_barrier() {
+    fn a_mid_turn_cell_is_faded_and_neither_a_rewind_row_nor_a_barrier() {
         let dir = fresh_config_dir("mid-turn-rewind");
         let _guard = TempDirGuard(dir.clone());
         let tool_a = dir.join("tool-a");
@@ -2532,7 +2571,7 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
         );
 
         let mut misses: Vec<String> = Vec::new();
-        // The committed cell: marker + dim.
+        // The committed cell: marker + faded.
         let repaint_at = repaint(&mut pty, 40, 100);
         let frame = since(&pty, repaint_at);
         if !squeezed(&frame).contains(&squeezed(&format!("> ghost-k7m {MID_TURN_MARKER}"))) {
@@ -2544,9 +2583,9 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
             let ghost_at = find(raw, b"ghost-k7m", repaint_at)
                 .expect("the raw output has the mid-turn cell the stripped frame shows");
             let params = sgr_since(raw, repaint_at, ghost_at);
-            if !ends_dim(&params) {
+            if !ends_coloured(&params) || ends_dim(&params) {
                 misses.push(format!(
-                    "the mid-turn cell is not painted dim (SGR state before it: {:?}):\n{frame}",
+                    "the mid-turn cell is not painted faded, a foreground colour without DIM (SGR state before it: {:?}):\n{frame}",
                     params.last()
                 ));
             }
