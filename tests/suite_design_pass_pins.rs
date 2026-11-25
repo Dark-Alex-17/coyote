@@ -29,6 +29,10 @@
 //!   and never restate the resume call shape (`--session_id`) or a made-up
 //!   session id; the plain `agent__spawn --agent X --prompt` template form
 //!   stays by design.
+//! - `orchestrators_review_work_rounds_at_round_and_run_one_final_review`
+//!   and `orchestrators_anchor_baselines_at_the_run_base`: the verification
+//!   tier each orchestrator review and coder spawn passes, and the run base
+//!   every baseline and the final review are judged from.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -618,6 +622,117 @@ fn child_session_id_needle_is_identifier_bounded() {
         assert!(
             !names_a_child_session_id(text),
             "{text:?} does not name a child session id"
+        );
+    }
+}
+
+const FINAL_TIER: &str = r#""verification_tier": "final""#;
+
+/// The review-gauntlet spawn templates in `text`: every `--variables` line
+/// that declares verification_commands.
+fn gauntlet_spawns(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| l.contains(r#"--variables {"verification_commands""#))
+        .collect()
+}
+
+/// Work rounds review at the round tier and the full suite runs once, at a
+/// single final-tier review: architect's per-task and fix-round gauntlets
+/// and Sisyphus's work-round reviews pass `round`, only architect's
+/// run-closing hygiene gauntlet and Sisyphus's last review pass `final`, and
+/// every coder spawn runs at the round tier, never the full one.
+#[test]
+fn orchestrators_review_work_rounds_at_round_and_run_one_final_review() {
+    for rel in ["architect/instructions.md", "sisyphus/instructions.md"] {
+        let text = agent_file(rel);
+        let spawns = gauntlet_spawns(&text);
+        assert_eq!(spawns.len(), 2, "{rel}: {spawns:?}");
+        for spawn in spawns {
+            assert!(
+                spawn.ends_with(r#", "verification_tier": "round"}"#),
+                "{rel}: {spawn}"
+            );
+        }
+        assert_eq!(text.matches(FINAL_TIER).count(), 1, "{rel}");
+        assert!(
+            !text.contains(r#""verify_tier": "full""#),
+            "{rel} seats a coder at the full tier"
+        );
+    }
+
+    let architect = agent_file("architect/instructions.md");
+    let hygiene = &architect[architect
+        .find("3. **Run-closing hygiene pass.**")
+        .expect("architect has the hygiene pass")..];
+    let hygiene = &hygiene[..hygiene
+        .find("4. **Roll up follow-ups")
+        .expect("the hygiene pass is followed by the roll-up step")];
+    assert!(
+        hygiene.contains(FINAL_TIER),
+        "the hygiene gauntlet is the final tier"
+    );
+
+    let sisyphus = agent_file("sisyphus/instructions.md");
+    let tiers = &sisyphus[sisyphus
+        .find("**Verification tiers.**")
+        .expect("sisyphus has the verification tiers paragraph")..];
+    let last = flat(&tiers[..tiers.find(FINAL_TIER).expect("final tier named there")]);
+    assert!(
+        last.ends_with("The LAST review before you finish or push passes `"),
+        "{last}"
+    );
+    let coder_spawn = sisyphus
+        .lines()
+        .find(|l| l.starts_with("Every coder spawn also passes `--variables {"))
+        .expect("sisyphus states the coder spawn variables");
+    assert!(
+        coder_spawn.contains(r#""verify_tier": "round""#),
+        "{coder_spawn}"
+    );
+}
+
+/// The baseline every coder and the final-tier review judge failures by sits
+/// at the commit the run started from: Sisyphus records that run base (or
+/// takes it from its parent) and passes it as baseline_floor, and architect
+/// records it once and hands it to every Sisyphus and to its final review.
+#[test]
+fn orchestrators_anchor_baselines_at_the_run_base() {
+    let sisyphus = agent_file("sisyphus/instructions.md");
+    let coder_spawn = sisyphus
+        .lines()
+        .find(|l| l.starts_with("Every coder spawn also passes `--variables {"))
+        .expect("sisyphus states the coder spawn variables");
+    assert!(
+        coder_spawn.contains(r#""baseline_floor": "<the run base>"}"#),
+        "{coder_spawn}"
+    );
+    for anchor in [
+        "the `run_base` variable when a parent orchestrator set it (here: `{{run_base}}`), else `git merge-base <the branch this work will merge into> HEAD`",
+        r#"will push, and `"baseline_floor": "<the run base>"`"#,
+        "declare only what that run does not cover (the run-wide debris lint, when there is one), never the full suite",
+    ] {
+        assert!(flat(&sisyphus).contains(anchor), "sisyphus lost {anchor:?}");
+    }
+    let config = agent_file("sisyphus/config.yaml");
+    assert!(
+        config.contains("  - name: run_base\n"),
+        "sisyphus declares run_base"
+    );
+
+    let architect = agent_file("architect/instructions.md");
+    assert_eq!(
+        architect.matches(r#""run_base": "<the RUN base>""#).count(),
+        2,
+        "the sequential and the parallel Sisyphus spawns pass the run base"
+    );
+    for anchor in [
+        "Before the run's FIRST task, also record the RUN base once in a todo item: `git -C {{project_dir}} merge-base {{base_branch}} HEAD`",
+        r#"`"verification_tier": "final"` and `"baseline_floor": "<the RUN base>"`"#,
+        "to that spawn's `verification_commands` variable, and declare nothing else there",
+    ] {
+        assert!(
+            flat(&architect).contains(anchor),
+            "architect lost {anchor:?}"
         );
     }
 }

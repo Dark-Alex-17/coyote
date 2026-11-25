@@ -177,6 +177,12 @@ fn usage_probe_architect_hygiene_pass_resolves_the_run_base_once_and_reads_lint_
         folded.contains("over `$base`, the RUN base, not the hygiene BASE SHA"),
         "the run-wide lint in verification_commands must name the RUN base, not the hygiene BASE SHA"
     );
+    assert!(
+        folded.contains(
+            "to that spawn's `verification_commands` variable, and declare nothing else there: the full suite, formatter and lint come from the gauntlet's finalize record, while every declared command still runs at this tier"
+        ),
+        "the final-tier hygiene gauntlet declares only the run-wide lint, which still runs there"
+    );
     // os.path.relpath against the git toplevel is what makes `<plans rel>` a
     // plain repo-relative literal the CLI accepts, on every platform.
     assert!(

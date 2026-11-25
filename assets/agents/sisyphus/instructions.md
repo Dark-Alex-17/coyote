@@ -139,7 +139,9 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
-Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>", "verify_tier": "round", "baseline_floor": "<the task's base commit>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>", "verify_tier": "round", "baseline_floor": "<the run base>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
+
+The run base is the commit this whole run started from, recorded once before the run's first coder spawn and kept with the task's base commit (todo text / run-state memory): the `run_base` variable when a parent orchestrator set it (here: `{{run_base}}`), else `git merge-base <the branch this work will merge into> HEAD` (the branch the request names, else the remote's default branch). It is never a later task's base commit: a baseline taken there would hold an earlier task's regressions and accept them as pre-existing.
 
 `verify_tier: round` is the work-round tier: the coder's test gate runs the tests the change needs (targeted), then the tests it can affect (impacted), and its pre-change baseline runs in the background on a detached checkout of `baseline_floor`, so no round waits for a full suite. The full suite and lint run once, at the final-tier review before you finish or push (see the review gauntlet below). The coder's `Tier:` and `Baseline mode:` lines say what actually ran; carry them into your report.
 
@@ -409,10 +411,13 @@ verification to generate/lint/build/unit/integration commands.
 commands on the coder's `Tier:` line (its targeted and impacted runs) plus the build command,
 not the full suite; a criterion that needs the whole suite waits for the final tier. The LAST
 review before you finish or push passes `"verification_tier": "final"` on exactly the tree you
-will push, with the project's full build/test/lint commands declared as above: the gauntlet
-runs the full suite, the formatter check and lint once (or reuses a green record for
-that same tree), and it returns `GAUNTLET: BLOCKED` with a `FULL-SUITE RECORD` blocker when no
-green full-suite record exists. Any edit after it needs another final-tier review; push only
+will push, and `"baseline_floor": "<the run base>"`: the gauntlet runs the full suite, the
+formatter check and lint once (or reuses a green record for that same tree), judges a red suite
+only against the base suite at the run base, and returns `GAUNTLET: BLOCKED` with a
+`FULL-SUITE RECORD` blocker when no green full-suite record exists. Its `verification_commands`
+declare only what that run does not cover (the run-wide debris lint, when there is one), never
+the full suite, formatter or lint: the adversary still runs every declared command at this tier.
+Any edit after it needs another final-tier review; push only
 after one passes, and after the push only CI and review remain. The final tier runs even when no
 push was asked. When `finalize_owner` is `parent` (here: `{{finalize_owner}}`), a parent
 orchestrator runs the final gate over the integrated work: every review you run stays at
