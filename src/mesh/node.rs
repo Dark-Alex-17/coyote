@@ -16421,7 +16421,10 @@ mod tests {
         let runtime = &started.runtime;
         runtime.return_home_asked.lock().insert("ab".repeat(16));
         runtime.begin_return_home_transition();
-        assert!(runtime.return_home_asked.lock().is_empty(), "a new transition");
+        assert!(
+            runtime.return_home_asked.lock().is_empty(),
+            "a new transition"
+        );
         runtime.return_home_asked.lock().insert("cd".repeat(16));
         runtime.begin_return_home_transition();
         assert_eq!(
