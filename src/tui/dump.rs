@@ -116,7 +116,7 @@ mod tests {
             elapsed: Duration::from_millis(200),
         };
         let cells = vec![
-            Cell::welcome("m".to_string(), crate::config::CommandPrefix::Dot),
+            Cell::welcome(),
             Cell::user("read \x1b[31ma.txt\x1b[0m"),
             tool,
             Cell::assistant(
@@ -150,10 +150,7 @@ mod tests {
 
     #[test]
     fn nothing_committed_dumps_nothing() {
-        let cells = vec![Cell::welcome(
-            "m".to_string(),
-            crate::config::CommandPrefix::Dot,
-        )];
+        let cells = vec![Cell::welcome()];
         assert_eq!(transcript_text(&cells, &no_color_config()), "");
     }
 }

@@ -18,8 +18,8 @@ mod binary_tools {
     //! wizard and macro steps that reach those questions.
     //! After them: the Ctrl+T pager over a tool's whole output with its find
     //! and thread picker, the Alt+T roster cancelling a background job, and both
-    //! with nothing to show, and the key help that `?` opens from the welcome
-    //! screen's hint. The transcript printed when the UI leaves is checked in
+    //! with nothing to show, and the key help that `?` opens from the status
+    //! row's hint. The transcript printed when the UI leaves is checked in
     //! `binary_exit` in `tui_lifecycle_and_signals.rs`.
     //! Each case runs the binary on a pseudo-terminal under a bash wrapper
     //! that reports the exit code and `stty -a` afterwards, so the module is
@@ -2436,13 +2436,13 @@ def run(out: str) -> str:
         assert_tty_restored(&transcript);
     }
 
-    /// The welcome screen and the status row name `?`; on the empty composer
-    /// it opens the key help over the whole screen, Esc closes it, and the
-    /// composer then takes keys, a `?` after text among them, while the
-    /// status row stops offering it.
+    /// The status row names `?`; on the empty composer it opens the key
+    /// help over the whole screen, Esc closes it, and the composer then
+    /// takes keys, a `?` after text among them, while the status row stops
+    /// offering it.
     #[test]
     #[serial]
-    fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
+    fn question_mark_opens_the_key_help_the_status_row_names_and_esc_closes_it() {
         let dir = fresh_config_dir("key-help");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
@@ -2451,8 +2451,8 @@ def run(out: str) -> str:
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         let welcome = repainted_frame_showing(
             &mut pty,
-            "Empty prompt: \"?\" or \".keys\" = keys",
-            "the welcome does not name the key help",
+            "? = keys",
+            "the status row does not name the key help",
         );
         assert!(
             squeezed(&welcome).contains(&squeezed(

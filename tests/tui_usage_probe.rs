@@ -178,36 +178,56 @@ mod mid_turn_commands {
 }
 
 mod welcome_and_footer {
-    //! The wordmark above the welcome card at each width and under
-    //! NO_COLOR.
+    //! The welcome wordmark at each width and under NO_COLOR.
     use super::common::tui_harness::*;
     use serial_test::serial;
 
-    /// Two rows of the "coyote" wordmark, squeezed of spaces.
+    /// Two rows of the small "coyote" wordmark, squeezed of spaces.
     const MARK_ROWS: [&str; 2] = [r"/_/_\||/_\_/-_)", r"\__\___/\_,\___/\__\___|"];
+
+    /// Two rows of the wide "COYOTE" wordmark, squeezed of spaces.
+    const BIG_MARK_ROWS: [&str; 2] = [
+        "██╔════╝██╔═══██╗╚██╗██╔╝██╔═══██╗╚══██╔══╝██╔════╝",
+        "╚██████╗╚██████╔╝██║╚██████╔╝██║███████╗",
+    ];
 
     fn shows_mark(frame: &str) -> bool {
         let flat = squeezed(frame);
         MARK_ROWS.iter().all(|row| flat.contains(row))
     }
 
-    /// The welcome card has the wordmark above it from a wide terminal
-    /// down to 40x20, and leaves it out on one narrower than the wordmark
-    /// while keeping the card's version.
+    fn shows_big_mark(frame: &str) -> bool {
+        let flat = squeezed(frame);
+        BIG_MARK_ROWS.iter().all(|row| flat.contains(row))
+    }
+
+    /// The welcome shows the wide wordmark from 54 columns, the small one
+    /// below that down to 40x20, and neither on a terminal narrower than
+    /// the small one, keeping the version under each and on its own.
     #[test]
     #[serial]
-    fn the_welcome_wordmark_shows_down_to_forty_columns_and_leaves_narrower() {
+    fn the_welcome_wordmark_narrows_to_the_small_one_and_then_leaves() {
         let dir = fresh_config_dir("welcome-logo");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        let version = env!("CARGO_PKG_VERSION");
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        // The wordmark builds in over the first frames; once the startup
+        // animation is over each repaint shows it whole.
+        pty.read_for(std::time::Duration::from_millis(3700));
 
         // The pty starts at 100x40, so 101 columns forces a full repaint.
         let wide = repainted_frame_after_resize(&mut pty, 40, 101);
-        assert!(shows_mark(&wide), "no wordmark at 101x40:\n{wide}");
-        assert!(wide.contains(version), "no version on the card:\n{wide}");
+        assert!(shows_big_mark(&wide), "no wide wordmark at 101x40:\n{wide}");
+        assert!(!shows_mark(&wide), "the small wordmark at 101x40:\n{wide}");
+        assert!(wide.contains(version), "no version at 101x40:\n{wide}");
+
+        let fallback = repainted_frame_after_resize(&mut pty, 24, 53);
+        assert!(
+            shows_mark(&fallback) && !shows_big_mark(&fallback),
+            "no small wordmark in place of the wide one at 53x24:\n{fallback}"
+        );
 
         let small = repainted_frame_after_resize(&mut pty, 20, 40);
         assert!(shows_mark(&small), "no wordmark at 40x20:\n{small}");
@@ -215,24 +235,25 @@ mod welcome_and_footer {
 
         let narrow = repainted_frame_after_resize(&mut pty, 40, 24);
         assert!(
-            !shows_mark(&narrow),
+            !shows_mark(&narrow) && !shows_big_mark(&narrow),
             "the wordmark is drawn at 24 columns:\n{narrow}"
         );
         assert!(
-            squeezed(&narrow).contains(&squeezed(version)),
-            "the card lost its version at 24 columns:\n{narrow}"
+            squeezed(&narrow).contains(version),
+            "the welcome lost its version at 24 columns:\n{narrow}"
         );
 
         let back = repainted_frame_after_resize(&mut pty, 40, 100);
         assert!(
-            shows_mark(&back),
+            shows_big_mark(&back),
             "the wordmark did not come back at 100 columns:\n{back}"
         );
         quit_and_check(&mut pty);
     }
 
-    /// The wordmark's startup sweep repaints the screen for a moment and
-    /// then stops: an idle TUI writes nothing more to the terminal.
+    /// The wordmark's startup animation repaints the screen for a few
+    /// seconds and then stops: an idle TUI writes nothing more to the
+    /// terminal.
     #[test]
     #[serial]
     fn the_welcome_sweep_runs_at_startup_and_then_goes_quiet() {
@@ -245,7 +266,7 @@ mod welcome_and_footer {
         let booted = pty.raw().len();
         pty.read_for(std::time::Duration::from_millis(400));
         let painted = pty.raw().len() - booted;
-        pty.read_for(std::time::Duration::from_millis(2500));
+        pty.read_for(std::time::Duration::from_millis(3500));
         let quiet_from = pty.raw().len();
         pty.read_for(std::time::Duration::from_millis(1500));
         let after = pty.raw().len() - quiet_from;
@@ -276,7 +297,7 @@ mod welcome_and_footer {
         // The pty starts at 100x40, so 101 columns forces a full repaint.
         let at = repaint(&mut pty, 40, 101);
         let frame = since(&pty, at);
-        assert!(shows_mark(&frame), "no wordmark at 101x40:\n{frame}");
+        assert!(shows_big_mark(&frame), "no wordmark at 101x40:\n{frame}");
         let colored: Vec<Vec<u16>> = sgr_params(&pty.raw()[at..])
             .into_iter()
             .filter(|p| {
@@ -436,10 +457,11 @@ mod elapsed_format {
 }
 
 mod welcome_sweep {
-    //! The welcome wordmark's startup sweep as a user sees it: a bright
-    //! band that moves over the wordmark for a moment, never under
-    //! NO_COLOR, settled at once by the first key or click, and a 40x20
-    //! welcome that keeps the wordmark, the version and the model.
+    //! The welcome wordmark's startup animation as a user sees it: the
+    //! letters build in, then a bright band moves over them for a few
+    //! seconds, never under NO_COLOR, settled at once by the first key or
+    //! click, and a 40x20 welcome that keeps the small wordmark and the
+    //! version.
     use std::time::{Duration, Instant};
 
     use super::common::pty::Pty;
@@ -447,12 +469,28 @@ mod welcome_sweep {
     use serial_test::serial;
 
     /// Whether an SGR parameter list sets a white or bright-white
-    /// foreground, in any of the spellings a backend may use.
+    /// foreground, in any of the spellings a backend may use. The
+    /// components of an extended colour are skipped, so an RGB channel of
+    /// 97 is not read as bright white.
     fn sets_white(params: &[u16]) -> bool {
-        params
-            .windows(3)
-            .any(|w| w == [38, 5, 15] || w == [38, 5, 7])
-            || params.iter().any(|&p| p == 37 || p == 97)
+        let mut i = 0;
+        while i < params.len() {
+            match params[i] {
+                38 | 48 | 58 => match params.get(i + 1) {
+                    Some(5) => {
+                        if params[i] == 38 && matches!(params.get(i + 2), Some(15 | 7)) {
+                            return true;
+                        }
+                        i += 3;
+                    }
+                    Some(2) => i += 5,
+                    _ => i += 1,
+                },
+                37 | 97 => return true,
+                _ => i += 1,
+            }
+        }
+        false
     }
 
     fn white_in(raw: &[u8]) -> bool {
@@ -520,9 +558,9 @@ mod welcome_sweep {
     }
 
     /// On start, with a terminal that answers its probes, the wordmark is
-    /// repainted several times with a white band for a moment (long enough
-    /// to be seen, about a second and a half), and then the band is gone
-    /// and the screen goes still.
+    /// repainted several times with a white band once it has built in
+    /// (long enough to be seen, about three seconds in all), and then the
+    /// band is gone and the screen goes still.
     #[test]
     #[serial]
     fn the_sweep_paints_a_moving_band_for_a_moment_and_ends() {
@@ -531,7 +569,7 @@ mod welcome_sweep {
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         let (shown, first, mut answered) = boot(&mut pty);
-        let seen = slices(&mut pty, shown, Duration::from_millis(3000), &mut answered);
+        let seen = slices(&mut pty, shown, Duration::from_millis(4000), &mut answered);
         let frames: Vec<Duration> = std::iter::once((Duration::ZERO, first, seen[0].1))
             .chain(seen.iter().copied())
             .filter(|(_, from, to)| white_in(&pty.raw()[*from..*to]))
@@ -548,7 +586,7 @@ mod welcome_sweep {
             "the band was gone {last:?} after the first frame: too short to be seen"
         );
         assert!(
-            last <= Duration::from_millis(2500),
+            last <= Duration::from_millis(3500),
             "the band was still painted {last:?} after the first frame"
         );
         let quiet_from = pty.raw().len();
@@ -559,8 +597,12 @@ mod welcome_sweep {
             "the screen kept changing after the sweep"
         );
         let settled = repaint(&mut pty, 40, 101);
+        // The rules under the transcript are white too, so only the rows
+        // down to the version line under the wordmark are read.
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let below = find(pty.raw(), version.as_bytes(), settled).expect("no version line");
         assert!(
-            !white_in(&pty.raw()[settled..]),
+            !white_in(&pty.raw()[settled..below]),
             "the settled wordmark still carries the band"
         );
         quit_and_check(&mut pty);
@@ -604,7 +646,7 @@ mod welcome_sweep {
     /// run its course.
     fn settles_after(pty: &mut Pty, input: &[u8], what: &str) {
         let (_, first, mut answered) = boot(pty);
-        let by = Instant::now() + Duration::from_millis(600);
+        let by = Instant::now() + Duration::from_millis(1000);
         while !white_in(&pty.raw()[first..]) && Instant::now() < by {
             slices(
                 pty,
@@ -661,46 +703,43 @@ mod welcome_sweep {
         quit_and_check(&mut pty);
     }
 
-    /// At 40x20 the welcome keeps the wordmark above the box, and the box
-    /// keeps its border, the version, the model and the help pointer while
-    /// leaving the interrupt tip out.
+    /// At 40x20 the welcome is the small wordmark with the version under
+    /// it, and nothing else: no model, no hints.
     #[test]
     #[serial]
-    fn forty_by_twenty_keeps_the_wordmark_version_and_model() {
+    fn forty_by_twenty_keeps_the_small_wordmark_and_the_version() {
         let dir = fresh_config_dir("sweep-40x20");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(2500));
+        pty.read_for(Duration::from_millis(3700));
         let at = repaint(&mut pty, 20, 40);
         let frame = since(&pty, at);
         let flat = squeezed(&frame);
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
         assert!(
             flat.contains(r"\__\___/\_,\___/\__\___|"),
             "no wordmark at 40x20:\n{frame}"
         );
+        assert!(flat.contains(version), "no version at 40x20:\n{frame}");
+        for gone in [
+            "model:",
+            "Type \".help\"",
+            "Tip: Press Ctrl-C",
+            "Empty prompt",
+        ] {
+            assert!(
+                !flat.contains(&squeezed(gone)),
+                "{gone:?} shows at 40x20:\n{frame}"
+            );
+        }
+        // The repaint writes the screen top to bottom.
+        let mark_at = flat.find(r"\__\___/\_,\___/\__\___|");
+        let version_at = flat.find(version);
         assert!(
-            flat.contains(&squeezed(concat!("coyote ", env!("CARGO_PKG_VERSION")))),
-            "no version at 40x20:\n{frame}"
-        );
-        assert!(
-            flat.contains("model:"),
-            "no model in the box at 40x20:\n{frame}"
-        );
-        assert!(
-            flat.contains(&squeezed("Type \".help\" for additional help.")),
-            "no help pointer at 40x20:\n{frame}"
-        );
-        assert!(
-            !flat.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the interrupt tip shows at 40x20:\n{frame}"
-        );
-        let mark_rows = painted_at(pty.raw(), b"\\__\\___/", at);
-        let box_rows = painted_at(pty.raw(), "┌".as_bytes(), at);
-        assert!(
-            matches!((mark_rows.first(), box_rows.first()), (Some(m), Some(b)) if m.0 < b.0),
-            "the wordmark is not above the box at 40x20: mark {mark_rows:?} box {box_rows:?}\n{frame}"
+            matches!((mark_at, version_at), (Some(m), Some(v)) if m < v),
+            "the wordmark is not above the version at 40x20:\n{frame}"
         );
         quit_and_check(&mut pty);
     }
@@ -726,7 +765,7 @@ mod welcome_sweep {
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         let (_, first, mut answered) = boot(&mut pty);
-        let by = Instant::now() + Duration::from_millis(600);
+        let by = Instant::now() + Duration::from_millis(1000);
         while !white_in(&pty.raw()[first..]) && Instant::now() < by {
             slices(
                 &mut pty,
@@ -761,39 +800,37 @@ mod welcome_sweep {
         quit_and_check(&mut pty);
     }
 
-    /// The sweep reveals the wordmark: on the first frame the letters the
-    /// band has yet to reach are dim, and once it has run the wordmark is
-    /// bold and nothing of it is dim.
+    /// The wordmark builds in from the left: the first frame lacks its
+    /// right part, and once the animation has run the whole wordmark is
+    /// there, bold and not dim.
     #[test]
     #[serial]
-    fn the_sweep_reveals_dim_letters_and_settles_bold() {
+    fn the_wordmark_builds_in_and_settles_bold() {
+        let full_row = "██╔════╝██╔═══██╗╚██╗██╔╝██╔═══██╗╚══██╔══╝██╔════╝";
         let dir = fresh_config_dir("sweep-reveal");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         let (_, first, mut answered) = boot(&mut pty);
-        let first_end = pty.raw().len();
-        // Dim is set once at the row's start, so the state is read from
-        // the frame's start up to the wordmark's right end.
-        let right_end =
-            find(&pty.raw()[..first_end], b"-_)", first).expect("no wordmark on the first frame");
-        let dim = sgr_params(&pty.raw()[first..right_end])
-            .iter()
-            .fold(false, |dim, params| dim_after(params).unwrap_or(dim));
+        let built = squeezed(&since(&pty, first));
         assert!(
-            dim,
-            "the wordmark's right end is not dim on the first frame: {:?}",
-            String::from_utf8_lossy(&pty.raw()[first..first_end])
+            !built.contains(full_row),
+            "the whole wordmark is on the first frame:\n{built}"
         );
         slices(
             &mut pty,
             Instant::now(),
-            Duration::from_millis(2500),
+            Duration::from_millis(3700),
             &mut answered,
         );
         let settled = repaint(&mut pty, 40, 101);
+        let frame = squeezed(&since(&pty, settled));
+        assert!(
+            frame.contains(full_row),
+            "the settled frame lacks the whole wordmark:\n{frame}"
+        );
         let raw = pty.raw();
-        let at = find(raw, b"-_)", settled).expect("no wordmark after the sweep");
+        let at = find(raw, "█".as_bytes(), settled).expect("no wordmark after the sweep");
         let params = sgr_params(&raw[settled..at]);
         let dim = params
             .iter()
@@ -826,42 +863,45 @@ mod welcome_sweep {
         quit_and_check(&mut pty);
     }
 
-    /// A short terminal gives up the box's hints before the wordmark: at
-    /// every height the box keeps its border, the version and the model,
-    /// and once there is room for the wordmark over the bare box (eight
-    /// transcript rows, 80x16) the wordmark shows.
+    /// A short terminal gives up the wordmark before the version: at every
+    /// height the version shows, the wide wordmark from 80x16 up, and no
+    /// wordmark at all at 80x12.
     #[test]
     #[serial]
-    fn a_short_terminal_drops_the_hints_before_the_wordmark() {
+    fn a_short_terminal_drops_the_wordmark_before_the_version() {
         let dir = fresh_config_dir("sweep-short");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(2500));
-        let version = squeezed(concat!("coyote ", env!("CARGO_PKG_VERSION")));
+        pty.read_for(Duration::from_millis(3700));
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let big_row = "╚██████╗╚██████╔╝██║╚██████╔╝██║███████╗";
+        let small_row = r"\__\___/\_,\___/\__\___|";
         let mut seen = Vec::new();
         for (i, rows) in (12u16..=20).enumerate() {
             // Alternate the width so no resize is coalesced away.
             let cols = if i % 2 == 0 { 80 } else { 81 };
             let frame = repainted_frame_after_resize(&mut pty, rows, cols);
             let flat = squeezed(&frame);
-            let mark = flat.contains(r"\__\___/\_,\___/\__\___|");
-            let hint = flat.contains(&squeezed("Empty prompt"))
-                || flat.contains(&squeezed("Type \".help\""));
+            let big = flat.contains(big_row);
+            let small = flat.contains(small_row);
             assert!(
-                flat.contains(&version) && flat.contains("model:") && frame.contains('┌'),
-                "at {cols}x{rows} the box lost its border, version or model:\n{frame}"
+                flat.contains(version),
+                "at {cols}x{rows} the version is gone:\n{frame}"
             );
             if rows >= 16 {
+                assert!(big, "at {cols}x{rows} the wide wordmark is gone:\n{frame}");
+            }
+            if rows == 12 {
                 assert!(
-                    mark,
-                    "at {cols}x{rows} the wordmark is gone (hints shown: {hint}):\n{frame}"
+                    !big && !small,
+                    "at {cols}x{rows} a wordmark is drawn:\n{frame}"
                 );
             }
-            seen.push((rows, mark, hint));
+            seen.push((rows, big, small));
         }
-        eprintln!("rows/wordmark/hint: {seen:?}");
+        eprintln!("rows/wide/small: {seen:?}");
         quit_and_check(&mut pty);
     }
 }

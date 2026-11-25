@@ -319,6 +319,9 @@ pub(crate) struct Renderer {
     /// What faded text in the cells is drawn with: the theme's, which the
     /// App sets each time it builds one.
     pub(super) faded: Style,
+    /// The theme's accent, which the welcome wordmark is painted in; set
+    /// with `faded`.
+    pub(super) accent: super::theme::Gradient,
     /// The instant the frame being laid out is drawn for: what a running
     /// row's throbber and elapsed time read. The App sets it each frame.
     pub(super) tick: Tick,
@@ -342,6 +345,7 @@ impl Renderer {
             wrap_cap,
             no_color: *crate::utils::NO_COLOR,
             faded: super::theme::DIM,
+            accent: super::theme::Gradient::PLAIN,
             tick: Tick { origin: now, now },
         })
     }

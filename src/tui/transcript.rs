@@ -12,7 +12,6 @@ use super::pager::{COMPRESSED_DIVIDER, ChildEntry, entry_summary};
 use super::render::{RenderCache, Renderer};
 use super::selection::{self, Pos};
 use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
-use crate::config::CommandPrefix;
 use crate::events::NoticeKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -85,10 +84,6 @@ impl Placement {
 
 pub(super) struct Transcript {
     cells: Vec<Cell>,
-    /// What the greeting names; it is drawn whenever the transcript has
-    /// no turn in it, on boot and again after an undo empties it.
-    model: String,
-    prefix: CommandPrefix,
     /// Lines between the bottom of the view and the bottom of the
     /// transcript; zero while the view follows new output.
     offset_from_bottom: usize,
@@ -142,11 +137,9 @@ pub(super) struct Transcript {
 }
 
 impl Transcript {
-    pub(super) fn new(model: String, prefix: CommandPrefix) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            cells: vec![Cell::welcome(model.clone(), prefix)],
-            model,
-            prefix,
+            cells: vec![Cell::welcome()],
             offset_from_bottom: 0,
             last_offset: 0,
             anchor: None,
@@ -514,8 +507,7 @@ impl Transcript {
             other => other,
         };
         if self.cells.is_empty() {
-            self.cells
-                .push(Cell::welcome(self.model.clone(), self.prefix));
+            self.cells.push(Cell::welcome());
             let revision = self.next_revision();
             self.revisions.push(revision);
         }
@@ -737,6 +729,7 @@ impl Transcript {
             return TranscriptView {
                 lines: Vec::new(),
                 centre: false,
+                centre_rows: None,
                 chip: None,
             };
         }
@@ -849,6 +842,7 @@ impl Transcript {
         TranscriptView {
             lines,
             centre,
+            centre_rows: None,
             chip,
         }
     }
@@ -1332,7 +1326,20 @@ impl Anchor {
 pub(super) struct TranscriptView {
     lines: Vec<Line<'static>>,
     centre: bool,
+    /// The height the greeting is centred in, when that is not the
+    /// area's own: a band opening over the composer then covers the
+    /// greeting's bottom rows instead of moving it.
+    centre_rows: Option<u16>,
     chip: Option<String>,
+}
+
+impl TranscriptView {
+    /// Centres the greeting in `rows` from the area's top, whatever height
+    /// the area is drawn at.
+    pub(super) fn centred_in(mut self, rows: u16) -> Self {
+        self.centre_rows = Some(rows);
+        self
+    }
 }
 
 impl Widget for TranscriptView {
@@ -1343,8 +1350,11 @@ impl Widget for TranscriptView {
         }
         let mut content = area;
         if self.centre {
-            let spare = usize::from(area.height).saturating_sub(self.lines.len());
-            let top = u16::try_from(spare / 2).unwrap_or(0);
+            let rows = self.centre_rows.unwrap_or(area.height);
+            let spare = usize::from(rows).saturating_sub(self.lines.len());
+            let top = u16::try_from(spare / 2)
+                .unwrap_or(0)
+                .min(area.height.saturating_sub(1));
             content.y += top;
             content.height -= top;
         }
@@ -1371,7 +1381,7 @@ impl Widget for TranscriptView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, CommandPrefix};
+    use crate::config::AppConfig;
     use crate::tui::cells::{ToolStatus, append_output};
     use std::time::{Duration, Instant};
 
@@ -1381,7 +1391,7 @@ mod tests {
             ..Default::default()
         };
         let renderer = Renderer::new(config.render_options().unwrap()).unwrap();
-        let mut transcript = Transcript::new("m".to_string(), CommandPrefix::Dot);
+        let mut transcript = Transcript::new();
         transcript.clear_welcome();
         (transcript, renderer)
     }

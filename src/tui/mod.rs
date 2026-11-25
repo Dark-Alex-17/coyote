@@ -550,11 +550,12 @@ impl App {
             config.light_theme(),
         );
         renderer.faded = theme.faded;
+        renderer.accent = theme.accent;
         let mut composer = Composer::new(config.command_prefix);
         composer.set_placeholder_style(theme.faded);
         let history_file = history_file(&config, footer.session.as_deref());
         Ok(Self {
-            transcript: Transcript::new(footer.model.clone(), config.command_prefix),
+            transcript: Transcript::new(),
             todo: TodoPanel::default(),
             composer,
             pasted_images: Vec::new(),
@@ -629,9 +630,10 @@ impl App {
     }
 
     /// Swaps in a theme built with the current renderer; the cells and the
-    /// composer's placeholder take its faded style from here.
+    /// composer's placeholder take their styles from here.
     fn set_theme(&mut self, theme: Theme) {
         self.renderer.faded = theme.faded;
+        self.renderer.accent = theme.accent;
         self.composer.set_placeholder_style(theme.faded);
         self.theme = theme;
     }
@@ -662,7 +664,7 @@ impl App {
         let elapsed = self.clock.now().saturating_duration_since(from);
         let step = usize::try_from(elapsed.as_millis() / WELCOME_SWEEP_INTERVAL.as_millis())
             .unwrap_or(usize::MAX);
-        if step >= cells::SWEEP_STEPS || self.renderer.no_color {
+        if step >= cells::WELCOME_STEPS || self.renderer.no_color {
             self.welcome_sweep_from = None;
             return None;
         }
@@ -2314,6 +2316,18 @@ impl App {
         }
     }
 
+    /// The transcript's rows on `area` with no band open over the
+    /// composer: what the greeting is centred in, so the completion list
+    /// coming and going covers its bottom instead of moving it.
+    fn resting_transcript_rows(&self, area: Rect) -> u16 {
+        let bottom = match self.prompts.front() {
+            Some(prompt) => prompt.rows(area.width, area.height),
+            None => self.composer.rows(area.width),
+        };
+        area.height
+            .saturating_sub(rule_rows(area.height, bottom) + 1 + bottom + 1)
+    }
+
     /// The rows the band above the composer takes from the transcript:
     /// what the view asks for, or the queued-lines preview when no view
     /// is open, within what the frame can give once the composer, the
@@ -2427,7 +2441,10 @@ impl App {
         }
         let sweep = self.welcome_sweep_step();
         self.transcript.set_welcome_sweep(sweep);
-        let view = self.transcript.view(transcript, &mut self.renderer);
+        let view = self
+            .transcript
+            .view(transcript, &mut self.renderer)
+            .centred_in(self.resting_transcript_rows(area));
         frame.render_widget(view, transcript);
         if let Some(selection) = self.selection.shown()
             && selection.region == Region::Transcript

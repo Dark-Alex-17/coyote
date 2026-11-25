@@ -1690,7 +1690,6 @@ impl Widget for PickerPopup<'_> {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
-    use crate::config::CommandPrefix;
     use crate::config::child_sessions::{ChildMeta, ChildStatus, EffectiveStatus};
     use crate::tui::TOOL_OUTPUT_TAIL;
     use crate::tui::cells::{
@@ -2936,7 +2935,7 @@ mod tests {
     /// every cell before it is taken from the last layout.
     #[test]
     fn streaming_into_the_last_cell_lays_out_only_that_cell() {
-        let mut transcript = Transcript::new("m".to_string(), CommandPrefix::Dot);
+        let mut transcript = Transcript::new();
         for cell in root_cells() {
             transcript.push(cell);
         }

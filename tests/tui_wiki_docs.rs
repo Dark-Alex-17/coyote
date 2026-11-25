@@ -834,8 +834,6 @@ fn tui_page_quotes_the_code() {
     let idle_status_with_help = flat(&const_str(tui, "IDLE_STATUS_WITH_HELP"));
     let keys_command = const_str(tui, "KEYS_COMMAND");
     let threads_command = const_str(tui, "THREADS_COMMAND");
-    let welcome_keys = literal_with(production(&cells), "Empty prompt: ")
-        .replace("{}{}", &format!(".{keys_command}"));
     let normal = const_str(&src(&["tui", "composer.rs"]), "NORMAL_TAG");
     for (source, gap) in [(tui, "HOTKEY_IDLE"), (rewind_code, "REWIND_ESC_GAP")] {
         assert_eq!(const_expr(source, gap), "Duration::from_secs(1)", "{gap}");
@@ -875,7 +873,6 @@ fn tui_page_quotes_the_code() {
         format!("`{roster_empty}`"),
         format!("`{idle_status}`"),
         format!("`{idle_status_with_help}`"),
-        format!("`{welcome_keys}`"),
         format!("`.{keys_command}`"),
         format!("`.{threads_command}`"),
         format!("`{}`", normal.trim()),

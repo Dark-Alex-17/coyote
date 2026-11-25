@@ -2,15 +2,13 @@
 //! and the rules for how a tool, job or agent row collapses to one line.
 
 use super::render::{self, RenderCache, Renderer};
-use super::theme::{SWEEP_HIGHLIGHT, ToolHeaderStyles, logo_style, notice_style};
+use super::theme::{SWEEP_HIGHLIGHT, ToolHeaderStyles, notice_style};
 use super::throbber::{self, Tick};
 use super::{
     ChromeKind, DIM, FULL_OUTPUT_LIMIT, LATE_OUTPUT_LIMIT, TOOL_OUTPUT_TAIL, chrome_style,
 };
-use crate::config::CommandPrefix;
 use crate::events::NoticeKind;
 use ratatui::style::{Modifier, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -572,12 +570,10 @@ pub(super) enum Cell {
         row: TaskRow<NodeStatus>,
         cache: LineCache,
     },
-    /// The boxed greeting an empty transcript shows until a line is
-    /// submitted, laid out per width and the height it has to fit.
+    /// The greeting an empty transcript shows until a line is submitted,
+    /// laid out per width and the height it has to fit.
     Welcome {
-        model: String,
-        prefix: CommandPrefix,
-        /// Where the startup sweep is across the wordmark; None once it
+        /// The step the wordmark's startup animation is at; None once it
         /// has settled, or never started.
         sweep: Option<usize>,
         cache: LineCache<(u16, Option<u16>)>,
@@ -743,10 +739,8 @@ impl Cell {
         cell
     }
 
-    pub(super) fn welcome(model: String, prefix: CommandPrefix) -> Self {
+    pub(super) fn welcome() -> Self {
         Self::Welcome {
-            model,
-            prefix,
             sweep: None,
             cache: LineCache::default(),
         }
@@ -1210,14 +1204,16 @@ impl Cell {
                 };
                 row_lines(header, row, width, &styles)
             }),
-            Cell::Welcome {
-                model,
-                prefix,
-                sweep,
-                cache,
-            } => cache.get((width, height), || {
-                let logo = logo_style(renderer.markdown_render(), no_color);
-                welcome_lines(model, *prefix, width, height, logo, *sweep)
+            Cell::Welcome { sweep, cache } => cache.get((width, height), || {
+                let accent = renderer.accent;
+                let markdown = renderer.markdown_render();
+                welcome_lines(
+                    width,
+                    height,
+                    renderer.faded,
+                    |column, of| accent.style_at(column, of, markdown),
+                    *sweep,
+                )
             }),
         })
     }
@@ -1696,8 +1692,9 @@ fn folded_verb(name: &str) -> &str {
     }
 }
 
-/// The greeting's wordmark, "coyote" in figlet's small font. Plain ASCII,
-/// so any terminal and any font draws it the same.
+/// The greeting's wordmark on a frame too narrow or too short for
+/// `BIG_WORDMARK`, "coyote" in figlet's small font. Plain ASCII, so any
+/// terminal and any font draws it the same.
 const WORDMARK: [&str; 5] = [
     r"                 _       ",
     r" __ ___ _  _ ___| |_ ___ ",
@@ -1706,197 +1703,126 @@ const WORDMARK: [&str; 5] = [
     r"        |__/             ",
 ];
 
-pub(super) const WORDMARK_WIDTH: usize = 25;
+const WORDMARK_WIDTH: usize = 25;
+
+/// The greeting's wordmark, "COYOTE" in figlet's ANSI Shadow font.
+const BIG_WORDMARK: [&str; 6] = [
+    " ██████╗ ██████╗ ██╗   ██╗ ██████╗ ████████╗███████╗",
+    "██╔════╝██╔═══██╗╚██╗ ██╔╝██╔═══██╗╚══██╔══╝██╔════╝",
+    "██║     ██║   ██║ ╚████╔╝ ██║   ██║   ██║   █████╗  ",
+    "██║     ██║   ██║  ╚██╔╝  ██║   ██║   ██║   ██╔══╝  ",
+    "╚██████╗╚██████╔╝   ██║   ╚██████╔╝   ██║   ███████╗",
+    " ╚═════╝ ╚═════╝    ╚═╝    ╚═════╝    ╚═╝   ╚══════╝",
+];
+
+pub(super) const BIG_WORDMARK_WIDTH: usize = 52;
+
+/// The narrowest frame `BIG_WORDMARK` is drawn on: a column of margin on
+/// each side.
+const BIG_WORDMARK_MIN_COLUMNS: usize = BIG_WORDMARK_WIDTH + 2;
 
 /// Columns the bright band of the startup sweep spans.
 const SWEEP_BAND: usize = 4;
 
-/// The steps the startup sweep takes: its band enters at the wordmark's
-/// left edge and has left it at the last step, where the sweep settles.
-pub(super) const SWEEP_STEPS: usize = WORDMARK_WIDTH + SWEEP_BAND;
+/// The steps of the startup build-in: each reveals the next eighth of
+/// the wordmark's columns.
+pub(super) const BUILD_STEPS: usize = 8;
 
-/// Two border columns and one space of padding on each side.
-const WELCOME_FRAME: usize = 4;
+/// The steps of the shine that follows: its band enters at the wide
+/// wordmark's left edge and has crossed it when the animation settles.
+const SHINE_STEPS: usize = BIG_WORDMARK_WIDTH + SWEEP_BAND;
 
-/// The widest the box's text runs before it wraps.
-const WELCOME_TEXT_WIDTH: usize = 52;
+/// The steps the startup animation takes before it settles.
+pub(super) const WELCOME_STEPS: usize = BUILD_STEPS + SHINE_STEPS;
 
-/// The greeting, centred in `width`: the wordmark, then a box with the
-/// version and the model, the interrupt hint, and the help and key help
-/// hints spelled with the active command prefix. Within `height` the hints
-/// give way, the interrupt tip first; the wordmark goes only when the box's
-/// first line and borders would not fit under it, or on a frame narrower
-/// than it. `sweep` is the step of the startup sweep across the wordmark,
-/// None once settled. Only BOLD and DIM mark the box up, so it reads the
-/// same under `NO_COLOR`.
+/// The greeting, centred in `width`: the wordmark with the version under
+/// it in `faded`. The wide wordmark gives way to the small one on a frame
+/// narrower than `BIG_WORDMARK_MIN_COLUMNS` or too short for it, and the
+/// small one to the version alone the same way. The letters take
+/// `accent(column, wordmark_width)`, in bold. `sweep` is the step of the
+/// startup animation, None once settled.
 pub(super) fn welcome_lines(
-    model: &str,
-    prefix: CommandPrefix,
     width: u16,
     height: Option<u16>,
-    logo: Style,
+    faded: Style,
+    accent: impl Fn(usize, usize) -> Style,
     sweep: Option<usize>,
 ) -> Vec<Line<'static>> {
-    let plain = Style::new();
-    let help = prefix.render_hints(crate::repl::WELCOME_HELP_HINT);
-    // The version and the model share a line where it fits the box, and
-    // take one each where it would wrap.
-    let version = format!("coyote {}", env!("CARGO_PKG_VERSION"));
-    let model_line = format!("model: {model}");
-    let joined = format!("{version}  {model_line}");
-    let room = usize::from(width)
-        .saturating_sub(WELCOME_FRAME)
-        .min(WELCOME_TEXT_WIDTH);
-    let head: Vec<(String, Style)> = if joined.width() <= room {
-        vec![(joined, plain)]
-    } else {
-        vec![(version, plain), (model_line, plain)]
-    };
-    // In the order they give way, with no blank rows between: the dim tip
-    // reads apart from the plain hints under it. The tip goes as a whole,
-    // its later lines reading on from its first.
-    let mut hints: Vec<(String, Style)> = crate::repl::WELCOME_INTERRUPT_HINT
-        .lines()
-        .map(|line| (line.to_string(), DIM))
-        .collect();
-    let interrupt = hints.len();
-    hints.push((help.into_owned(), plain));
-    hints.push((
-        format!(
-            "Empty prompt: \"?\" or \"{}{}\" = keys",
-            prefix.display(),
-            super::KEYS_COMMAND
-        ),
-        plain,
-    ));
-    let text_without = |dropped: usize| {
-        let mut text = head.to_vec();
-        text.extend(hints[dropped..].iter().cloned());
-        text
-    };
-
     let columns = usize::from(width);
-    if columns <= WELCOME_FRAME {
-        return text_without(0)
-            .into_iter()
-            .flat_map(|(line, style)| render::plain_lines(&line, width, style))
-            .collect();
-    }
-    let longest = text_without(0)
+    // Fewer rows than `height`, as the version line takes one more.
+    let fits = |rows: usize| height.is_none_or(|height| rows < usize::from(height));
+    let (mark, mark_width): (&[&str], usize) =
+        if columns >= BIG_WORDMARK_MIN_COLUMNS && fits(BIG_WORDMARK.len()) {
+            (&BIG_WORDMARK, BIG_WORDMARK_WIDTH)
+        } else if columns >= WORDMARK_WIDTH && fits(WORDMARK.len()) {
+            (&WORDMARK, WORDMARK_WIDTH)
+        } else {
+            (&[], 0)
+        };
+    let margin = " ".repeat(columns.saturating_sub(mark_width) / 2);
+    let mut lines: Vec<Line<'static>> = mark
         .iter()
-        .map(|(line, _)| line.width())
-        .max()
-        .unwrap_or(0);
-    let natural = longest.min(WELCOME_TEXT_WIDTH) + WELCOME_FRAME;
-    let box_width = columns.min(natural);
-    let fits = |rows: usize| height.is_none_or(|height| rows <= usize::from(height));
-    let drops = [0, interrupt, interrupt + 1, hints.len()];
-    // The wordmark's last row holds only its descender, which spaces it
-    // from the box below.
-    let mark_rows = WORDMARK.len();
-    let marked = (columns >= WORDMARK_WIDTH)
-        .then(|| {
-            drops
-                .iter()
-                .map(|&dropped| boxed(text_without(dropped), box_width))
-                .find(|rows| fits(rows.len() + mark_rows))
-        })
-        .flatten();
-    let with_mark = marked.is_some();
-    let rows = marked.unwrap_or_else(|| {
-        drops[..3]
-            .iter()
-            .map(|&dropped| boxed(text_without(dropped), box_width))
-            .find(|rows| fits(rows.len()))
-            .unwrap_or_else(|| boxed(text_without(hints.len()), box_width))
-    });
-
-    let mut lines = Vec::with_capacity(rows.len() + mark_rows);
-    if with_mark {
-        let margin = " ".repeat((columns - WORDMARK_WIDTH) / 2);
-        lines.extend(
-            WORDMARK
-                .iter()
-                .map(|row| wordmark_line(&margin, row, logo, sweep)),
-        );
+        .map(|row| wordmark_line(&margin, row, &accent, sweep))
+        .collect();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    if version.width() > columns {
+        lines.extend(render::plain_lines(&version, width, faded));
+        return lines;
     }
-    let margin = " ".repeat((columns - box_width) / 2);
-    lines.extend(rows.into_iter().map(|row| {
-        let mut spans = vec![Span::raw(margin.clone())];
-        spans.extend(row.spans);
-        Line::from(spans)
-    }));
+    let margin = " ".repeat(columns.saturating_sub(version.width()) / 2);
+    lines.push(Line::from(vec![
+        Span::raw(margin),
+        Span::styled(version, faded),
+    ]));
     lines
 }
 
-/// One row of the wordmark after `margin`. Settled, it is drawn bold in
-/// the logo's style. Mid-sweep, the columns the band has passed are
-/// settled, the band itself is bright, and those it has yet to reach are
-/// dim, so the word is revealed left to right.
-fn wordmark_line(margin: &str, row: &str, logo: Style, sweep: Option<usize>) -> Line<'static> {
-    let settled = logo.add_modifier(Modifier::BOLD);
-    let Some(step) = sweep else {
-        return Line::from(vec![
-            Span::raw(margin.to_string()),
-            Span::styled(row.to_string(), settled),
-        ]);
-    };
+/// One row of the wordmark after `margin`. Settled, each column is drawn
+/// bold in its `accent`. During the build-in the columns not yet revealed
+/// are blank; during the shine a bright band crosses the settled letters.
+fn wordmark_line(
+    margin: &str,
+    row: &str,
+    accent: impl Fn(usize, usize) -> Style,
+    sweep: Option<usize>,
+) -> Line<'static> {
+    let glyphs: Vec<char> = row.chars().collect();
+    let width = glyphs.len();
+    let settled = |column: usize| accent(column, width).add_modifier(Modifier::BOLD);
     let band = Style::new()
         .fg(SWEEP_HIGHLIGHT)
         .add_modifier(Modifier::BOLD);
-    let ahead = logo.add_modifier(Modifier::DIM);
-    let style_at = |column: usize| {
-        if column + SWEEP_BAND < step {
-            settled
-        } else if column < step {
-            band
-        } else {
-            ahead
+    let per_build_step = width.div_ceil(BUILD_STEPS);
+    let cell_at = |column: usize| -> (char, Style) {
+        match sweep {
+            Some(step) if step < BUILD_STEPS && column >= per_build_step * (step + 1) => {
+                (' ', Style::new())
+            }
+            Some(step)
+                if step >= BUILD_STEPS
+                    && column < step - BUILD_STEPS
+                    && column + SWEEP_BAND >= step - BUILD_STEPS =>
+            {
+                (glyphs[column], band)
+            }
+            _ => (glyphs[column], settled(column)),
         }
     };
     let mut spans = vec![Span::raw(margin.to_string())];
-    let mut start = 0;
-    for column in 1..=row.len() {
-        if column == row.len() || style_at(column) != style_at(start) {
-            spans.push(Span::styled(
-                row[start..column].to_string(),
-                style_at(start),
-            ));
-            start = column;
+    let mut run = String::new();
+    let mut run_style = Style::new();
+    for column in 0..width {
+        let (glyph, style) = cell_at(column);
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
         }
+        run_style = style;
+        run.push(glyph);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
     }
     Line::from(spans)
-}
-
-/// `text` wrapped inside a box `box_width` columns wide, border included;
-/// `box_width` is more than `WELCOME_FRAME`.
-fn boxed(text: Vec<(String, Style)>, box_width: usize) -> Vec<Line<'static>> {
-    let inner = box_width - WELCOME_FRAME;
-    let inner_width = u16::try_from(inner).unwrap_or(u16::MAX);
-    let edge = |left: &str, fill: &str, right: &str| {
-        Line::from(format!("{left}{}{right}", fill.repeat(box_width - 2)))
-    };
-    let set = border::PLAIN;
-    let mut lines = vec![edge(set.top_left, set.horizontal_top, set.top_right)];
-    for (line, style) in text {
-        for wrapped in render::plain_lines(&line, inner_width, style) {
-            let pad = inner.saturating_sub(wrapped.width()) + 1;
-            let mut spans = vec![Span::raw(format!("{} ", set.vertical_left))];
-            spans.extend(wrapped.spans);
-            spans.push(Span::raw(format!(
-                "{}{}",
-                " ".repeat(pad),
-                set.vertical_right
-            )));
-            lines.push(Line::from(spans));
-        }
-    }
-    lines.push(edge(
-        set.bottom_left,
-        set.horizontal_bottom,
-        set.bottom_right,
-    ));
-    lines
 }
 
 /// Decodes one read of a byte stream, carrying an incomplete trailing
@@ -2263,15 +2189,9 @@ mod tests {
 
     #[test]
     fn welcome_lines_use_only_bold_and_dim() {
-        for width in [80, 40, 20, 3] {
-            let lines = welcome_lines(
-                "openai:test-model",
-                CommandPrefix::Dot,
-                width,
-                None,
-                DIM,
-                None,
-            );
+        let plain = |_: usize, _: usize| Style::new();
+        for width in [80, 54, 53, 40, 25, 24, 3] {
+            let lines = welcome_lines(width, None, DIM, plain, None);
             for line in &lines {
                 assert!(
                     line.width() <= usize::from(width),
@@ -2287,156 +2207,136 @@ mod tests {
                     );
                 }
             }
-            let text: Vec<String> = lines.iter().map(Line::to_string).collect();
-            let text = text.join("\n");
-            if width >= 40 {
-                // Narrower boxes wrap these phrases across rows.
-                assert!(text.contains("openai:test-model"), "{text}");
-                assert!(text.contains("Tip: Press Ctrl-C"), "{text}");
-                assert!(text.contains(".help"), "{text}");
-                assert!(
-                    text.contains("Empty prompt: \"?\" or \".keys\" = keys"),
-                    "{text}"
-                );
-            }
         }
     }
 
+    /// Under the wordmark is one line holding only the version, in the
+    /// faded style; nothing else is written.
     #[test]
-    fn welcome_lines_spell_the_help_hint_with_the_active_prefix() {
-        let lines = welcome_lines("m", CommandPrefix::Slash, 80, None, DIM, None);
-        let text: Vec<String> = lines.iter().map(Line::to_string).collect();
-        assert!(
-            text.iter().any(|line| line.contains("\"/help\"")),
-            "{text:?}"
+    fn the_welcome_shows_only_the_wordmark_and_the_version() {
+        let faded = Style::new().fg(ratatui::style::Color::Blue);
+        let lines = welcome_lines(80, None, faded, |_, _| Style::new(), None);
+        assert_eq!(lines.len(), BIG_WORDMARK.len() + 1, "{lines:#?}");
+        for (line, row) in lines.iter().zip(BIG_WORDMARK) {
+            assert_eq!(line.to_string().trim_start(), row.trim_start());
+        }
+        let version = lines.last().unwrap();
+        assert_eq!(
+            version.to_string().trim(),
+            concat!("v", env!("CARGO_PKG_VERSION"))
         );
-        assert!(
-            text.iter().any(|line| line.contains("\"/keys\"")),
-            "{text:?}"
-        );
+        assert_eq!(version.spans.last().unwrap().style, faded);
     }
 
+    /// The wide wordmark needs 54 columns and its rows plus the version's;
+    /// short of either the small one stands in, and short of that the
+    /// version stands alone. Each is centred.
     #[test]
-    fn welcome_lines_give_up_the_hints_before_the_wordmark() {
-        let text = |height: u16| -> Vec<String> {
-            welcome_lines("m", CommandPrefix::Dot, 40, Some(height), DIM, None)
+    fn the_wide_wordmark_gives_way_to_the_small_one_then_to_the_version() {
+        let text = |width: u16, height: Option<u16>| -> Vec<String> {
+            welcome_lines(width, height, DIM, |_, _| Style::new(), None)
                 .iter()
                 .map(Line::to_string)
                 .collect()
         };
-        let full = text(u16::MAX);
-        assert!(full.iter().any(|line| line.contains("Tip:")), "{full:?}");
-        assert!(full[1].contains(WORDMARK[1]), "{full:?}");
-        for height in [9, 8, 7, 5, 3] {
-            let lines = text(height);
-            assert!(lines.len() <= usize::from(height), "{height}: {lines:?}");
-            let top = lines
-                .iter()
-                .position(|line| line.contains(border::PLAIN.top_left))
-                .unwrap_or_else(|| panic!("{height}: no box in {lines:?}"));
-            assert!(lines[top + 1].contains("coyote "), "{height}: {lines:?}");
-            assert!(lines[top + 1].contains("model: m"), "{height}: {lines:?}");
-            let bottom = lines.last().unwrap();
-            assert!(bottom.contains(border::PLAIN.bottom_left), "{lines:?}");
-            assert!(!lines.iter().any(|line| line.contains("Tip:")), "{lines:?}");
+        let has = |lines: &[String], row: &str| lines.iter().any(|line| line.contains(row));
+        assert!(has(&text(54, None), BIG_WORDMARK[2]));
+        assert!(has(&text(80, Some(7)), BIG_WORDMARK[2]));
+        for (width, height) in [(53, None), (80, Some(6)), (25, None)] {
+            let lines = text(width, height);
+            assert!(!has(&lines, BIG_WORDMARK[2]), "{width}x{height:?}");
+            assert!(has(&lines, WORDMARK[2]), "{width}x{height:?}: {lines:#?}");
         }
-        // The hints go before the wordmark: it stays while the box keeps
-        // its first line, and goes only when even that would not fit.
-        assert!(text(8).iter().any(|line| line.contains(WORDMARK[1])));
-        assert!(!text(7).iter().any(|line| line.contains(WORDMARK[1])));
-        assert!(text(7).iter().any(|line| line.contains("Empty prompt")));
-    }
-
-    /// The box under the wordmark is slim: at 80 columns, with every hint,
-    /// it is one row for the version and the model, four for the tip, two
-    /// for the hints and its borders, with no blank rows; the whole card
-    /// is the wordmark and that box.
-    #[test]
-    fn the_welcome_box_holds_no_blank_rows() {
-        let lines = welcome_lines("m", CommandPrefix::Dot, 80, None, DIM, None);
-        assert_eq!(lines.len(), WORDMARK.len() + 9, "{lines:#?}");
-        let inside: Vec<String> = lines[WORDMARK.len() + 1..lines.len() - 1]
-            .iter()
-            .map(|line| {
-                line.to_string()
-                    .trim()
-                    .trim_matches('\u{2502}')
-                    .trim()
-                    .to_string()
-            })
-            .collect();
-        assert!(inside.iter().all(|row| !row.is_empty()), "{inside:#?}");
-        assert!(inside[0].contains("coyote ") && inside[0].contains("model: m"));
+        for (width, height) in [(24, None), (80, Some(5))] {
+            let lines = text(width, height);
+            assert_eq!(lines.len(), 1, "{width}x{height:?}: {lines:#?}");
+        }
+        for (width, row, mark_width) in [
+            (80, BIG_WORDMARK[2], BIG_WORDMARK_WIDTH),
+            (40, WORDMARK[2], WORDMARK_WIDTH),
+        ] {
+            let lines = text(width, None);
+            let mark = lines.iter().find(|line| line.contains(row)).unwrap();
+            let left = mark.len() - mark.trim_start().len();
+            assert_eq!(left, (usize::from(width) - mark_width) / 2, "{width}");
+        }
     }
 
     #[test]
-    fn the_wordmark_sits_above_the_box_where_it_fits() {
-        let has_mark = |width: u16, height: Option<u16>| {
-            welcome_lines("m", CommandPrefix::Dot, width, height, DIM, None)
-                .iter()
-                .any(|line| line.to_string().contains(WORDMARK[2]))
-        };
-        assert!(has_mark(80, None));
-        assert!(has_mark(40, Some(16)));
-        assert!(has_mark(25, None));
-        assert!(!has_mark(24, None));
-        assert!(!has_mark(80, Some(4)));
+    fn every_wordmark_row_is_as_wide_as_its_wordmark() {
         assert!(
             WORDMARK
                 .iter()
                 .all(|row| row.is_ascii() && row.len() == WORDMARK_WIDTH)
         );
-        for width in [80, 40, 25] {
-            let lines = welcome_lines("m", CommandPrefix::Dot, width, None, DIM, None);
-            assert!(
-                lines.iter().all(|line| line.width() <= usize::from(width)),
-                "{lines:?}"
-            );
-            let mark = lines
+        assert!(
+            BIG_WORDMARK
                 .iter()
-                .find(|line| line.to_string().contains(WORDMARK[2]))
-                .unwrap()
-                .to_string();
-            let left = mark.len() - mark.trim_start().len();
+                .all(|row| row.chars().count() == BIG_WORDMARK_WIDTH
+                    && row.width() == BIG_WORDMARK_WIDTH)
+        );
+    }
+
+    /// The style of each column of a wordmark row drawn with no margin.
+    fn column_styles(line: &Line<'static>) -> Vec<(char, Style)> {
+        line.spans
+            .iter()
+            .flat_map(|span| span.content.chars().map(move |glyph| (glyph, span.style)))
+            .collect()
+    }
+
+    /// Settled, each column is bold in the accent asked for with that
+    /// column and the wordmark's width.
+    #[test]
+    fn the_settled_wordmark_takes_the_accent_per_column() {
+        let accent = |column: usize, width: usize| {
+            assert_eq!(width, BIG_WORDMARK_WIDTH);
+            Style::new().fg(ratatui::style::Color::Indexed(
+                u8::try_from(column).unwrap(),
+            ))
+        };
+        let cells = column_styles(&wordmark_line("", BIG_WORDMARK[0], accent, None));
+        assert_eq!(cells.len(), BIG_WORDMARK_WIDTH);
+        for (column, (_, style)) in cells.iter().enumerate() {
             assert_eq!(
-                left,
-                (usize::from(width) - WORDMARK_WIDTH) / 2,
-                "{width}: not centred"
+                *style,
+                accent(column, BIG_WORDMARK_WIDTH).add_modifier(Modifier::BOLD)
             );
         }
     }
 
-    /// Mid-sweep the wordmark is revealed left to right: settled behind
-    /// the band, the band bright, the rest dim; at no step does the text
-    /// itself change, and settled it is one bold span per row.
+    /// The build-in reveals an eighth of the columns per step, the rest
+    /// blank; then the shine's bright band crosses the settled letters
+    /// and has reached the last column at the last step.
     #[test]
-    fn the_sweep_reveals_the_wordmark_left_to_right() {
-        let logo = Style::new().fg(ratatui::style::Color::Yellow);
-        let row = WORDMARK[2];
-        let style_at = |line: &Line<'static>, column: usize| {
-            let mut at = 0;
-            for span in &line.spans[1..] {
-                at += span.content.len();
-                if column < at {
-                    return span.style;
-                }
-            }
-            panic!("column {column} is past {line:?}");
-        };
-        let step = 12;
-        let line = wordmark_line("", row, logo, Some(step));
-        assert_eq!(line.to_string(), row);
-        assert_eq!(style_at(&line, 0), logo.add_modifier(Modifier::BOLD));
-        assert_eq!(style_at(&line, step - 1).fg, Some(SWEEP_HIGHLIGHT));
-        assert_eq!(style_at(&line, step), logo.add_modifier(Modifier::DIM));
-        let first = wordmark_line("", row, logo, Some(0));
-        assert_eq!(style_at(&first, 0), logo.add_modifier(Modifier::DIM));
-        let last = wordmark_line("", row, logo, Some(SWEEP_STEPS - 1));
-        assert_eq!(style_at(&last, 0), logo.add_modifier(Modifier::BOLD));
-        assert_eq!(style_at(&last, row.len() - 1).fg, Some(SWEEP_HIGHLIGHT));
-        let settled = wordmark_line("  ", row, logo, None);
-        assert_eq!(settled.spans.len(), 2);
-        assert_eq!(settled.spans[1].style, logo.add_modifier(Modifier::BOLD));
+    fn the_build_in_reveals_the_columns_then_the_shine_crosses_them() {
+        let accent = |_: usize, _: usize| Style::new().fg(ratatui::style::Color::Red);
+        let settled = accent(0, 0).add_modifier(Modifier::BOLD);
+        let row = BIG_WORDMARK[0];
+        let glyphs: Vec<char> = row.chars().collect();
+        let at = |step: usize| column_styles(&wordmark_line("", row, accent, Some(step)));
+        let per_step = BIG_WORDMARK_WIDTH.div_ceil(BUILD_STEPS);
+
+        let first = at(0);
+        assert_eq!(first.len(), BIG_WORDMARK_WIDTH);
+        assert_eq!(first[per_step - 1], (glyphs[per_step - 1], settled));
+        assert_eq!(first[per_step], (' ', Style::new()));
+        let built = at(BUILD_STEPS - 1);
+        assert!(
+            built
+                .iter()
+                .zip(&glyphs)
+                .all(|(cell, glyph)| cell.0 == *glyph)
+        );
+
+        let shine = at(BUILD_STEPS + 12);
+        assert_eq!(shine[0].1, settled);
+        assert_eq!(shine[11].1.fg, Some(SWEEP_HIGHLIGHT));
+        assert_eq!(shine[12].1, settled);
+        let last = at(WELCOME_STEPS - 1);
+        assert_eq!(last[BIG_WORDMARK_WIDTH - 1].1.fg, Some(SWEEP_HIGHLIGHT));
+        assert_eq!(last[0].1, settled);
+        assert!(at(WELCOME_STEPS).iter().all(|(_, style)| *style == settled));
     }
 
     #[test]

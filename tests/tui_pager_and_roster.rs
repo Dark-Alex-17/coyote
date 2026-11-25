@@ -16,9 +16,9 @@ mod transcript {
     //! each takes a controlling tty.
     //!
     //! Covered here and nowhere else in `tests/`:
-    //! - the welcome block leaves for the first reply, not for typing, and
-    //!   names the model;
-    //! - the welcome block carries no colour under `NO_COLOR`;
+    //! - the welcome wordmark leaves for the first reply, not for typing,
+    //!   and shows the version alone under it;
+    //! - the welcome wordmark carries no colour under `NO_COLOR`;
     //! - `.undo` removes the last exchange's cells back to the previous user
     //!   cell (against a recording session: a dry-run turn is never saved);
     //! - `.undo` with nothing to undo, a terminal shrunk to a few cells, and
@@ -201,30 +201,32 @@ mod transcript {
     }
 
     // ---------------------------------------------------------------------
-    // The welcome block fills the empty transcript on boot and leaves for
+    // The welcome wordmark fills the empty transcript on boot and leaves for
     // good once the first reply is in. The dry-run echo renders the prompt's
     // markdown, so the asterisk-free form of the prompt can only come from
     // the assistant cell, never from the composer echo or the user cell.
     // ---------------------------------------------------------------------
 
+    /// The run of the wide wordmark's fifth row before its first space.
+    const WORDMARK_ROW: &str = "╚██████╗╚██████╔╝";
+    const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
     #[test]
     #[serial]
-    fn the_welcome_block_leaves_after_the_first_reply() {
+    fn the_welcome_wordmark_leaves_after_the_first_reply() {
         let dir = fresh_config_dir("welcome");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config_with(&dir, "");
         let mut pty = spawn_tui(&dir, &[]);
 
-        let booted = pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(300));
-        let booted = squeezed(&strip_ansi(&booted));
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        // The first frames show the wordmark building in; a repaint once
+        // it has shows it whole.
+        pty.read_for(Duration::from_millis(600));
+        let booted = ctrl_l_repaint(&mut pty);
         assert!(
-            booted.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block did not show the interrupt hint on boot:\n{booted}"
-        );
-        assert!(
-            booted.contains(&squeezed(concat!("coyote ", env!("CARGO_PKG_VERSION")))),
-            "the welcome block did not show the wordmark and version on boot:\n{booted}"
+            booted.contains(WORDMARK_ROW) && booted.contains(VERSION),
+            "the welcome did not show the wordmark and version on boot:\n{booted}"
         );
 
         let before = pty.raw().len();
@@ -238,34 +240,34 @@ mod transcript {
             "the repaint after the first reply does not show the reply:\n{repainted}"
         );
         assert!(
-            !repainted.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block is still on screen after the first reply:\n{repainted}"
+            !repainted.contains(WORDMARK_ROW) && !repainted.contains(VERSION),
+            "the welcome is still on screen after the first reply:\n{repainted}"
         );
 
         quit(pty);
     }
 
     // ---------------------------------------------------------------------
-    // The welcome block carries the same facts the REPL banner prints (name
-    // and version, model, interrupt hint, .help pointer) and typing alone
-    // does not dismiss it.
+    // The welcome is the wordmark and the version, with no hints and no
+    // model (the footer names it), and typing alone does not dismiss it.
     // ---------------------------------------------------------------------
 
     #[test]
     #[serial]
-    fn the_welcome_block_names_the_model_and_survives_typing() {
+    fn the_welcome_shows_only_the_version_and_survives_typing() {
         let (_guard, mut pty) = boot("welcome-typing", &[]);
 
         let frame = ctrl_l_repaint(&mut pty);
-        for fact in [
-            concat!("coyote ", env!("CARGO_PKG_VERSION")),
-            "model: dryrun:dry-model",
-            "Tip: Press Ctrl-C",
-            "\".help\"",
-        ] {
+        for fact in [WORDMARK_ROW, VERSION] {
             assert!(
-                frame.contains(&squeezed(fact)),
-                "the welcome block lacks {fact:?} on boot:\n{frame}"
+                frame.contains(fact),
+                "the welcome lacks {fact:?} on boot:\n{frame}"
+            );
+        }
+        for gone in ["Tip: Press Ctrl-C", "model: dryrun:dry-model", "\".help\""] {
+            assert!(
+                !frame.contains(&squeezed(gone)),
+                "the welcome still shows {gone:?}:\n{frame}"
             );
         }
 
@@ -277,8 +279,8 @@ mod transcript {
             "the composer did not echo the typed text:\n{frame}"
         );
         assert!(
-            frame.contains(&squeezed("Tip: Press Ctrl-C")),
-            "typing (without Enter) dismissed the welcome block:\n{frame}"
+            frame.contains(WORDMARK_ROW),
+            "typing (without Enter) dismissed the welcome:\n{frame}"
         );
 
         let before = pty.raw().len();
@@ -287,8 +289,8 @@ mod transcript {
         pty.read_for(Duration::from_millis(500));
         let frame = ctrl_l_repaint(&mut pty);
         assert!(
-            !frame.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block is still on screen after the first submitted line:\n{frame}"
+            !frame.contains(WORDMARK_ROW),
+            "the welcome is still on screen after the first submitted line:\n{frame}"
         );
 
         quit(pty);
@@ -300,7 +302,7 @@ mod transcript {
 
     #[test]
     #[serial]
-    fn the_welcome_block_has_no_colour_under_no_color() {
+    fn the_welcome_wordmark_has_no_colour_under_no_color() {
         let (_guard, mut pty) = boot("welcome-no-color", &[("NO_COLOR", "1")]);
 
         let at = pty.raw().len();
@@ -309,8 +311,8 @@ mod transcript {
         let raw = &pty.raw()[at..];
         let text = strip_ansi(&String::from_utf8_lossy(raw));
         assert!(
-            squeezed(&text).contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block is missing under NO_COLOR:\n{text}"
+            squeezed(&text).contains(WORDMARK_ROW),
+            "the welcome wordmark is missing under NO_COLOR:\n{text}"
         );
         if let Some(seq) = has_colour_sgr(raw) {
             panic!("NO_COLOR is set but the frame carries a colour SGR {seq}:\n{text}");
@@ -2003,7 +2005,7 @@ mod transcript {
     }
 
     // ---------------------------------------------------------------------
-    // Every widget clamps to the buffer. With the welcome block up and the
+    // Every widget clamps to the buffer. With the welcome up and the
     // Todo panel open, the terminal is shrunk to a handful of cells and then
     // to a single cell; nothing may panic, a key typed under every size
     // still reaches the composer, and once the terminal grows back both
@@ -2018,7 +2020,7 @@ mod transcript {
 
     #[test]
     #[serial]
-    fn tiny_terminal_sizes_clamp_the_welcome_block_and_todo_panel() {
+    fn tiny_terminal_sizes_clamp_the_welcome_and_todo_panel() {
         let (_guard, mut pty) = boot("tiny", &[]);
 
         pty.send(CTRL_X).unwrap();
@@ -2054,8 +2056,8 @@ mod transcript {
         pty.read_for(Duration::from_millis(500));
         let frame = ctrl_l_repaint(&mut pty);
         assert!(
-            frame.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block did not come back after growing the terminal:\n{frame}"
+            frame.contains(VERSION),
+            "the welcome did not come back after growing the terminal:\n{frame}"
         );
         assert!(
             frame.contains("Todo"),
@@ -2107,7 +2109,7 @@ mod transcript {
     // "Undo removes cells back to the last user cell", at the boundary where
     // the previous user cell is a command (`.session scratch`) rather than a
     // prompt: the only exchange goes, the command cell stays, and the undone
-    // prompt is handed back to the composer. The welcome block does not
+    // prompt is handed back to the composer. The welcome does not
     // return: a submitted line (the command) is still in the transcript.
     // ---------------------------------------------------------------------
 
@@ -2126,8 +2128,8 @@ mod transcript {
         pty.read_for(Duration::from_millis(500));
         let frame = ctrl_l_repaint(&mut pty);
         assert!(
-            !frame.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block is up with a turn on screen:\n{frame}"
+            !frame.contains(VERSION),
+            "the welcome is up with a turn on screen:\n{frame}"
         );
 
         pty.send(b".undo\r").unwrap();
@@ -2142,8 +2144,8 @@ mod transcript {
             ".undo removed the command cell before the exchange:\n{frame}"
         );
         assert!(
-            !frame.contains(&squeezed("Tip: Press Ctrl-C")),
-            "the welcome block came back over the command cell:\n{frame}"
+            !frame.contains(VERSION),
+            "the welcome came back over the command cell:\n{frame}"
         );
         assert!(
             frame.contains("solomarkerone"),

@@ -79,6 +79,34 @@ const LIGHT_THREADS: ThreadPalette = ThreadPalette {
     failed: (0xb3, 0x26, 0x1e),
 };
 
+/// A left-to-right blend between two colours, one per column; it has no
+/// colour under `NO_COLOR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Gradient {
+    ends: Option<(Rgb, Rgb)>,
+}
+
+impl Gradient {
+    pub(super) const PLAIN: Self = Self { ends: None };
+
+    /// The colour of `column` of `width`: the first column takes the
+    /// left end, the last the right end. RGB goes through `markdown` so a
+    /// terminal without truecolor gets a palette entry instead.
+    pub(super) fn style_at(&self, column: usize, width: usize, markdown: &MarkdownRender) -> Style {
+        let Some((from, to)) = self.ends else {
+            return Style::new();
+        };
+        let last = width.saturating_sub(1).max(1);
+        let column = column.min(last);
+        let mix = |a: u8, b: u8| {
+            let blended = (usize::from(a) * (last - column) + usize::from(b) * column) / last;
+            u8::try_from(blended).unwrap_or(u8::MAX)
+        };
+        let colour = markdown.rgb_color(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2));
+        Style::new().fg(Color::from_crossterm(colour))
+    }
+}
+
 /// How a list's columns and its highlighted row are painted.
 pub(super) struct RowStyles {
     pub(super) name: Style,
@@ -162,16 +190,6 @@ impl ToolHeaderStyles {
             failed: chrome_style(ChromeKind::Error, no_color),
             throbber: paint(Style::new(), tool_fn),
         }
-    }
-}
-
-/// The greeting's wordmark colour: the heading colour; the wordmark adds
-/// its own weight.
-pub(super) fn logo_style(markdown: &MarkdownRender, no_color: bool) -> Style {
-    if no_color {
-        Style::new()
-    } else {
-        Style::new().fg(from_markdown(markdown.heading_color(), HEADING_FALLBACK))
     }
 }
 
@@ -259,6 +277,9 @@ pub(super) struct Theme {
     pub(super) thread_failed: Style,
     /// Text selected with the mouse; reversed under `NO_COLOR`.
     pub(super) selection: Style,
+    /// The welcome wordmark's colours, from the running thread colour on
+    /// the left to the failed one on the right.
+    pub(super) accent: Gradient,
 }
 
 impl Theme {
@@ -321,6 +342,13 @@ impl Theme {
                 Style::new().add_modifier(Modifier::REVERSED)
             } else {
                 Style::new().bg(rgb(palette.selection))
+            },
+            accent: if no_color {
+                Gradient::PLAIN
+            } else {
+                Gradient {
+                    ends: Some((threads.running, threads.failed)),
+                }
             },
         }
     }
@@ -505,12 +533,31 @@ mod tests {
         ] {
             assert_eq!(surface, Style::new());
         }
-        let renderer = renderer(false);
-        let markdown = renderer.markdown_render();
-        assert_eq!(
-            logo_style(markdown, false),
-            Style::new().fg(HEADING_FALLBACK)
-        );
-        assert_eq!(logo_style(markdown, true), Style::new());
+        assert_eq!(plain.accent, Gradient::PLAIN);
+    }
+
+    /// The accent runs from the running thread colour to the failed one,
+    /// blending in between, per theme side; a terminal without truecolor
+    /// gets palette entries.
+    #[test]
+    fn the_accent_blends_from_running_to_failed() {
+        let rgb = |(r, g, b): Rgb| Some(Color::Rgb(r, g, b));
+        let truecolor = renderer(true);
+        let markdown = truecolor.markdown_render();
+        for (light, threads) in [(false, &DARK_THREADS), (true, &LIGHT_THREADS)] {
+            let accent = Theme::new(markdown, false, light).accent;
+            assert_eq!(accent.style_at(0, 50, markdown).fg, rgb(threads.running));
+            assert_eq!(accent.style_at(49, 50, markdown).fg, rgb(threads.failed));
+            let middle = accent.style_at(25, 50, markdown).fg;
+            assert_ne!(middle, rgb(threads.running));
+            assert_ne!(middle, rgb(threads.failed));
+        }
+        let plain = renderer(false);
+        let accent = Theme::new(plain.markdown_render(), false, false).accent;
+        assert!(matches!(
+            accent.style_at(10, 50, plain.markdown_render()).fg,
+            Some(Color::Indexed(_))
+        ));
+        assert_eq!(Gradient::PLAIN.style_at(10, 50, markdown), Style::new());
     }
 }

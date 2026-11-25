@@ -106,7 +106,7 @@ fn an_undo_looks_past_a_command_that_opened_no_exchange() {
     harness.app.end_turn(true, &TurnOutcome::default());
     harness.app.begin_turn(".undo", true);
     harness.app.end_turn(true, &TurnOutcome::default());
-    assert!(harness.draw().contains("Tip: Press"));
+    assert!(harness.draw().contains(WELCOME_VERSION));
 }
 
 /// A `.file` whose request reached the model and failed before any
@@ -161,7 +161,7 @@ fn an_undo_looks_past_a_file_command_that_bailed_before_a_reply() {
     ));
     harness.app.begin_turn(".undo", true);
     harness.app.end_turn(true, &TurnOutcome::default());
-    assert!(harness.draw().contains("Tip: Press"));
+    assert!(harness.draw().contains(WELCOME_VERSION));
 }
 
 /// A prompt whose turn failed before any request (no API key)
@@ -192,7 +192,7 @@ fn an_undo_after_a_prompt_that_never_reached_the_model_takes_the_exchange_before
         harness.app.transcript.cells(),
         [Cell::Welcome { .. }]
     ));
-    assert!(frame.contains("Tip: Press"), "{frame}");
+    assert!(frame.contains(WELCOME_VERSION), "{frame}");
     assert!(!frame.contains("first question"), "{frame}");
 }
 
@@ -212,7 +212,7 @@ fn an_undo_after_a_regenerate_takes_the_original_exchange_too() {
     harness.app.begin_turn(".undo", true);
     harness.app.end_turn(true, &TurnOutcome::default());
     let frame = harness.draw();
-    assert!(frame.contains("Tip: Press"), "{frame}");
+    assert!(frame.contains(WELCOME_VERSION), "{frame}");
     assert!(!frame.contains("first question"), "{frame}");
 }
 
@@ -222,15 +222,15 @@ fn an_undo_after_a_regenerate_takes_the_original_exchange_too() {
 fn undoing_the_only_exchange_brings_the_greeting_back() {
     let mut harness = Harness::standalone(80, 24);
     exchange(&mut harness);
-    assert!(!harness.draw().contains("Tip: Press"));
+    assert!(!harness.draw().contains(WELCOME_VERSION));
     harness.app.begin_turn(".undo", true);
     harness.app.end_turn(true, &TurnOutcome::default());
     let frame = harness.draw();
-    assert!(frame.contains("Tip: Press"), "{frame}");
+    assert!(frame.contains(WELCOME_VERSION), "{frame}");
     assert!(!frame.contains(".undo"), "{frame}");
     harness.app.begin_turn("second question", false);
     let frame = harness.draw();
-    assert!(!frame.contains("Tip: Press"), "{frame}");
+    assert!(!frame.contains(WELCOME_VERSION), "{frame}");
     assert!(matches!(
         harness.app.transcript.cells(),
         [Cell::User { text, .. }] if text == "second question"

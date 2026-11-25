@@ -2,17 +2,17 @@
 source: src/tui/tests/mod.rs
 expression: frame
 ---
+"                                        "
+"                                        "
+"                                        "
 "                        _               "
 "        __ ___ _  _ ___| |_ ___         "
 "       / _/ _ \ || / _ \  _/ -_)        "
 "       \__\___/\_, \___/\__\___|        "
 "               |__/                     "
-"┌──────────────────────────────────────┐"
-"│ coyote X.Y.Z │"
-"│ model: openai:test-model             │"
-"│ Type ".help" for additional help.    │"
-"│ Empty prompt: "?" or ".keys" = keys  │"
-"└──────────────────────────────────────┘"
+"vX.Y.Z"
+"                                        "
+"                                        "
 "                                        "
 "────────────────────────────────────────"
 "? = keys  Alt+T = tasks  Alt+S = threads"

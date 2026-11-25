@@ -276,13 +276,9 @@ fn the_palette_does_not_offer_dot_keys() {
 }
 
 #[test]
-fn the_welcome_card_and_the_idle_hint_name_the_key_help_and_the_chords() {
+fn the_idle_hint_names_the_key_help_and_the_chords() {
     let mut harness = Harness::standalone(80, 24);
     let frame = harness.draw();
-    assert!(
-        frame.contains("Empty prompt: \"?\" or \".keys\" = keys"),
-        "the welcome card does not point at the key help:\n{frame}"
-    );
     assert!(
         frame.contains(IDLE_STATUS_WITH_HELP),
         "the idle status row lacks `{IDLE_STATUS_WITH_HELP}`:\n{frame}"
@@ -307,17 +303,6 @@ fn the_welcome_card_and_the_idle_hint_name_the_key_help_and_the_chords() {
     assert!(
         frame.contains(IDLE_STATUS) && !frame.contains("? = keys"),
         "with text the hint should read `{IDLE_STATUS}` alone:\n{frame}"
-    );
-}
-
-#[test]
-fn the_slash_prefix_spells_the_welcome_pointer_with_slash() {
-    let mut harness = harness_under(CommandPrefix::Slash);
-    let frame = harness.draw();
-    assert_welcome_snapshot("welcome_slash_80x24", &frame);
-    assert!(
-        frame.contains("Empty prompt: \"?\" or \"/keys\" = keys"),
-        "the welcome card does not spell /keys under the slash prefix:\n{frame}"
     );
 }
 

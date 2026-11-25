@@ -225,14 +225,13 @@ fn squeezed(text: &str) -> String {
         .collect()
 }
 
-/// Snapshots a frame that shows the welcome block. The version on the
-/// box's first row changes with every release, so the row is folded to
-/// a fixed text, the model beside the version kept, together with the
-/// padding that follows, which would otherwise shift with the version's
-/// length.
+/// Snapshots a frame that shows the welcome. The version under the
+/// wordmark changes with every release, so its row is folded to a fixed
+/// text, the centring padding with it, which would otherwise shift with
+/// the version's length.
 fn assert_welcome_snapshot(name: &str, frame: &str) {
     insta::with_settings!(
-        { filters => vec![(r"coyote \S+( +model: \S+)? +", "coyote X.Y.Z$1 ")] },
+        { filters => vec![(r#"" *v\d+\.\d+\.\d+[^\s"]* *""#, r#""vX.Y.Z""#)] },
         { insta::assert_snapshot!(name, frame) }
     );
 }
@@ -4521,27 +4520,27 @@ fn a_long_todo_list_scrolls_by_alt_page_keys_and_the_wheel_over_it() {
 }
 
 #[test]
-fn the_welcome_block_greets_an_empty_transcript_until_the_first_turn() {
+fn the_welcome_greets_an_empty_transcript_until_the_first_turn() {
     let mut harness = Harness::standalone(80, 24);
     let frame = harness.draw();
     assert_welcome_snapshot("welcome_80x24", &frame);
-    assert!(frame.contains(concat!("coyote ", env!("CARGO_PKG_VERSION"))));
-    assert!(frame.contains("model: openai:test-model"));
+    assert!(frame.contains(WELCOME_VERSION), "{frame}");
+    assert!(frame.contains(BIG_MARK_ROW), "{frame}");
     harness.type_text("hello there");
     let frame = harness.draw();
     assert!(
-        frame.contains("Tip: Press"),
+        frame.contains(BIG_MARK_ROW),
         "typing removed the welcome:\n{frame}"
     );
     harness.app.begin_turn("hi", false);
     let frame = harness.draw();
-    assert!(!frame.contains("Tip: Press"), "{frame}");
+    assert!(!frame.contains(BIG_MARK_ROW), "{frame}");
     harness
         .app
         .handle_msg(UiMsg::AssistantText("hello".to_string()));
     harness.app.end_turn(false, &TurnOutcome::default());
     let frame = harness.draw();
-    assert!(!frame.contains("Tip: Press"), "{frame}");
+    assert!(!frame.contains(WELCOME_VERSION), "{frame}");
     assert!(
         !harness
             .app
@@ -4554,83 +4553,185 @@ fn the_welcome_block_greets_an_empty_transcript_until_the_first_turn() {
     let mut narrow = Harness::standalone(40, 20);
     let frame = narrow.draw();
     assert_welcome_snapshot("welcome_40x20", &frame);
-    assert!(frame.contains(concat!("coyote ", env!("CARGO_PKG_VERSION"))));
+    assert!(frame.contains(SMALL_MARK_ROW), "{frame}");
+    assert!(frame.contains(WELCOME_VERSION), "{frame}");
 }
 
-/// The wordmark sits centred above the box where both fit, and is left
-/// out on a frame too short for it and the box's first line.
+/// The welcome's version line, as `assert_welcome_snapshot` leaves it.
+const WELCOME_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
+/// A row of the wide wordmark, and one of the small one.
+const BIG_MARK_ROW: &str = "██║     ██║   ██║ ╚████╔╝ ██║   ██║   ██║   █████╗";
+const SMALL_MARK_ROW: &str = r"/ _/ _ \ || / _ \  _/ -_)";
+
+/// The wide wordmark shows where it fits, the small one where only it
+/// does, and the version alone on a frame too short for either.
 #[test]
 fn the_welcome_wordmark_shows_only_where_it_fits() {
-    let mark = r"/ _/ _ \ || / _ \  _/ -_)";
-    for (name, width, height, shown) in [
-        ("welcome_120x40", 120, 40, true),
-        ("welcome_60x24", 60, 24, true),
-        ("welcome_80x12", 80, 12, false),
+    for (name, width, height, big, small) in [
+        ("welcome_120x40", 120, 40, true, false),
+        ("welcome_60x24", 60, 24, true, false),
+        ("welcome_53x24", 53, 24, false, true),
+        ("welcome_80x12", 80, 12, false, false),
     ] {
         let frame = Harness::standalone(width, height).draw();
         assert_welcome_snapshot(name, &frame);
-        assert_eq!(frame.contains(mark), shown, "{frame}");
-        assert!(frame.contains(concat!("coyote ", env!("CARGO_PKG_VERSION"))));
+        assert_eq!(frame.contains(BIG_MARK_ROW), big, "{frame}");
+        assert_eq!(frame.contains(SMALL_MARK_ROW), small, "{frame}");
+        assert!(frame.contains(WELCOME_VERSION), "{frame}");
     }
 }
 
-/// The wordmark takes the theme's colour, and `NO_COLOR` takes it away.
+/// Settled, the wordmark runs from the running thread colour at its left
+/// to the failed one at its right.
 #[test]
-fn the_welcome_wordmark_loses_its_colour_under_no_color() {
-    for no_color in [false, true] {
-        let mut harness = Harness::standalone(80, 24);
-        harness.app.set_no_color(no_color);
-        let frame = harness.draw();
-        let buffer = harness.terminal.backend().buffer();
-        let row = wordmark_row_at(&harness).unwrap_or_else(|| panic!("no wordmark in\n{frame}"));
-        let art: Vec<Color> = wordmark_columns(80)
-            .map(|x| &buffer[(x, row)])
-            .filter(|cell| cell.symbol() != " ")
-            .map(|cell| cell.fg)
-            .collect();
-        assert!(!art.is_empty(), "{frame}");
-        for fg in art {
-            assert_eq!(fg == Color::Reset, no_color, "{fg:?}\n{frame}");
-        }
-    }
+fn the_settled_wordmark_carries_the_accent_gradient() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    let frame = harness.draw();
+    let row = big_wordmark_row_at(&harness).unwrap_or_else(|| panic!("no wordmark in\n{frame}"));
+    let columns = wordmark_columns(80, cells::BIG_WORDMARK_WIDTH);
+    let (left, right) = (columns.start, columns.end - 1);
+    let buffer = harness.terminal.backend().buffer();
+    let accent = harness.app.theme.accent;
+    let markdown = harness.app.renderer.markdown_render();
+    let end = |column: usize| {
+        accent
+            .style_at(column, cells::BIG_WORDMARK_WIDTH, markdown)
+            .fg
+            .unwrap()
+    };
+    assert_eq!(buffer[(left, row)].fg, end(0), "{frame}");
+    assert_eq!(
+        buffer[(right, row)].fg,
+        end(cells::BIG_WORDMARK_WIDTH - 1),
+        "{frame}"
+    );
+    assert_ne!(buffer[(left, row)].fg, buffer[(right, row)].fg);
+    assert!(buffer[(left, row)].modifier.contains(Modifier::BOLD));
 }
 
-/// The columns the centred wordmark takes on a frame `width` wide.
-fn wordmark_columns(width: u16) -> std::ops::Range<u16> {
-    let mark = u16::try_from(cells::WORDMARK_WIDTH).unwrap();
+/// Under `NO_COLOR` the wordmark has no colour and the version is dim.
+#[test]
+fn the_welcome_has_no_colour_under_no_color() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(true);
+    harness.app.start_welcome_sweep();
+    let frame = harness.draw();
+    assert_welcome_snapshot("welcome_no_color_80x24", &frame);
+    let buffer = harness.terminal.backend().buffer();
+    let row = big_wordmark_row_at(&harness).unwrap_or_else(|| panic!("no wordmark in\n{frame}"));
+    let art: Vec<_> = wordmark_columns(80, cells::BIG_WORDMARK_WIDTH)
+        .map(|x| &buffer[(x, row)])
+        .filter(|cell| cell.symbol() != " ")
+        .collect();
+    assert!(!art.is_empty(), "{frame}");
+    for cell in art {
+        assert_eq!(cell.fg, Color::Reset, "{frame}");
+        assert!(!cell.modifier.contains(Modifier::DIM), "{frame}");
+    }
+    let version_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains(WELCOME_VERSION)
+        })
+        .unwrap_or_else(|| panic!("no version in\n{frame}"));
+    let v = (0..buffer.area.width)
+        .find(|&x| buffer[(x, version_row)].symbol() == "v")
+        .unwrap();
+    assert_eq!(buffer[(v, version_row)].fg, Color::Reset);
+    assert!(buffer[(v, version_row)].modifier.contains(Modifier::DIM));
+}
+
+/// The columns a centred wordmark `mark_width` wide takes on a frame
+/// `width` wide.
+fn wordmark_columns(width: u16, mark_width: usize) -> std::ops::Range<u16> {
+    let mark = u16::try_from(mark_width).unwrap();
     let left = (width - mark) / 2;
     left..left + mark
 }
 
-/// The screen row of the wordmark's fourth row, which starts `\__`.
-fn wordmark_row_at(harness: &Harness) -> Option<u16> {
+/// The screen row of the wide wordmark's fifth row, the only one that
+/// starts with a corner and a block.
+fn big_wordmark_row_at(harness: &Harness) -> Option<u16> {
     let buffer = harness.terminal.backend().buffer();
-    let left = wordmark_columns(buffer.area.width).start;
-    (0..buffer.area.height)
-        .find(|&y| buffer[(left, y)].symbol() == "\\" && buffer[(left + 1, y)].symbol() == "_")
+    let left = wordmark_columns(buffer.area.width, cells::BIG_WORDMARK_WIDTH).start;
+    (0..buffer.area.height).find(|&y| {
+        buffer[(left, y)].symbol() == "\u{255a}" && buffer[(left + 1, y)].symbol() == "\u{2588}"
+    })
 }
 
-/// The startup sweep reveals the wordmark from the left: mid-sweep the
-/// columns ahead of its band are dim and the band is bright. It counts
-/// from the first frame drawn, settles on its own, at once on the first
-/// key, keeps going through a resize or an ignored event, asks for no
-/// more frames once settled, and never starts under `NO_COLOR`.
+/// Typing a command opens the completion list over the composer and
+/// narrows it; the greeting stays where it was, the list covering its
+/// bottom rows on a short frame rather than pushing it up, and it is
+/// whole again once the list closes.
+#[test]
+fn the_wordmark_holds_still_while_the_completion_list_comes_and_goes() {
+    for (width, height) in [(80, 40), (80, 24)] {
+        let mut harness = Harness::standalone(width, height);
+        harness.press(KeyCode::Char('x'));
+        harness.press(KeyCode::Backspace);
+        let idle = harness.draw();
+        let mark_row = big_wordmark_row_at(&harness).expect("the wide wordmark");
+        let rows: Vec<String> = (0..height).map(|y| row_text(&harness, y)).collect();
+        let check = |harness: &Harness, step: &str| {
+            let frame = harness.terminal.backend().to_string();
+            let transcript_rows = full_rules(harness)[0];
+            for y in 0..transcript_rows {
+                assert_eq!(
+                    row_text(harness, y),
+                    rows[usize::from(y)],
+                    "{width}x{height} {step}: row {y} moved\nbefore:\n{idle}\nafter:\n{frame}"
+                );
+            }
+        };
+        for (step, keys) in [(".", "."), (".in", "in")] {
+            harness.type_text(keys);
+            let frame = harness.draw();
+            assert!(
+                palette(&harness).is_some(),
+                "{step}: no completion list\n{frame}"
+            );
+            check(&harness, step);
+        }
+        for _ in 0..3 {
+            harness.press(KeyCode::Backspace);
+        }
+        harness.draw();
+        check(&harness, "closed");
+        assert_eq!(big_wordmark_row_at(&harness), Some(mark_row));
+    }
+}
+
+/// The startup animation builds the wordmark in from the left, then a
+/// bright band crosses it. It counts from the first frame drawn, settles
+/// on its own, at once on the first key, keeps going through a resize or
+/// an ignored event, asks for no more frames once settled, and never
+/// starts under `NO_COLOR`.
 #[test]
 fn the_welcome_sweep_animates_then_settles() {
     let wordmark_row = |harness: &Harness, y: u16| -> Vec<(String, Color, Modifier)> {
         let buffer = harness.terminal.backend().buffer();
-        wordmark_columns(buffer.area.width)
+        wordmark_columns(buffer.area.width, cells::BIG_WORDMARK_WIDTH)
             .map(|x| {
                 let cell = &buffer[(x, y)];
                 (cell.symbol().to_string(), cell.fg, cell.modifier)
             })
             .collect()
     };
-    let row_of_mark = |harness: &Harness| wordmark_row_at(harness).expect("no wordmark");
+    let row_of_mark = |harness: &Harness| big_wordmark_row_at(harness).expect("no wordmark");
+    let is_settled = |cells: &[(String, Color, Modifier)]| {
+        cells.iter().all(|(symbol, fg, modifier)| {
+            *fg != theme::SWEEP_HIGHLIGHT && (symbol == " " || modifier.contains(Modifier::BOLD))
+        })
+    };
     let settled_frames = |harness: &mut Harness| {
         harness.app.frame_drawn();
         harness.app.frames.due_at().is_none()
     };
+    let last = cells::BIG_WORDMARK_WIDTH - 1;
 
     let mut harness = Harness::standalone(80, 24);
     harness.app.set_no_color(false);
@@ -4639,24 +4740,30 @@ fn the_welcome_sweep_animates_then_settles() {
     harness.clock.advance(WELCOME_SWEEP_INTERVAL * 100);
     harness.draw();
     let y = row_of_mark(&harness);
+    let cells = wordmark_row(&harness, y);
     assert!(
-        wordmark_row(&harness, y)[0].2.contains(Modifier::DIM),
+        cells[0].0 != " " && cells[last].0 == " ",
         "the sweep was used up before the first frame"
     );
     harness.app.handle_input(TermInput::Resize);
     harness.app.handle_input(TermInput::Ignored);
-    harness.clock.advance(WELCOME_SWEEP_INTERVAL * 12);
+    harness
+        .clock
+        .advance(WELCOME_SWEEP_INTERVAL * (cells::BUILD_STEPS + 20) as u32);
     let mid = harness.draw();
     let cells = wordmark_row(&harness, y);
+    assert_ne!(cells[last].0, " ", "the build-in did not finish:\n{mid}");
     assert!(
-        cells[24].2.contains(Modifier::DIM),
-        "the right end is not dim mid-sweep:\n{mid}"
-    );
-    assert!(
-        cells[..12]
+        cells[..20]
             .iter()
             .any(|(_, fg, _)| *fg == theme::SWEEP_HIGHLIGHT),
         "no bright band mid-sweep:\n{mid}"
+    );
+    assert!(
+        cells[20..]
+            .iter()
+            .all(|(_, fg, _)| *fg != theme::SWEEP_HIGHLIGHT),
+        "the band ran ahead mid-sweep:\n{mid}"
     );
     harness.app.frame_drawn();
     assert!(
@@ -4665,34 +4772,32 @@ fn the_welcome_sweep_animates_then_settles() {
     );
     harness
         .clock
-        .advance(WELCOME_SWEEP_INTERVAL * cells::SWEEP_STEPS as u32);
+        .advance(WELCOME_SWEEP_INTERVAL * cells::WELCOME_STEPS as u32);
     let settled = harness.draw();
-    let cells = wordmark_row(&harness, y);
     assert!(
-        cells
-            .iter()
-            .all(|(_, fg, modifier)| *fg != theme::SWEEP_HIGHLIGHT
-                && !modifier.contains(Modifier::DIM)),
+        is_settled(&wordmark_row(&harness, y)),
         "the sweep did not settle:\n{settled}"
     );
     assert!(
         settled_frames(&mut harness),
         "frames are still asked for once settled"
     );
+    harness.clock.advance(WELCOME_SWEEP_INTERVAL * 10);
+    harness.draw();
+    assert!(
+        settled_frames(&mut harness),
+        "a later frame asked for another after the sweep settled"
+    );
 
     let mut keyed = Harness::standalone(80, 24);
     keyed.app.set_no_color(false);
     keyed.app.start_welcome_sweep();
     keyed.draw();
-    keyed.clock.advance(WELCOME_SWEEP_INTERVAL * 5);
+    keyed.clock.advance(WELCOME_SWEEP_INTERVAL * 2);
     keyed.press(KeyCode::Char('h'));
     keyed.draw();
-    let cells = wordmark_row(&keyed, row_of_mark(&keyed));
     assert!(
-        cells
-            .iter()
-            .all(|(_, fg, modifier)| !modifier.contains(Modifier::DIM)
-                && *fg != theme::SWEEP_HIGHLIGHT),
+        is_settled(&wordmark_row(&keyed, row_of_mark(&keyed))),
         "a key did not settle the sweep"
     );
     assert!(
@@ -4706,11 +4811,10 @@ fn the_welcome_sweep_animates_then_settles() {
     plain.draw();
     let cells = wordmark_row(&plain, row_of_mark(&plain));
     assert!(
-        cells
-            .iter()
-            .all(|(_, fg, modifier)| *fg == Color::Reset && !modifier.contains(Modifier::DIM)),
+        cells.iter().all(|(_, fg, _)| *fg == Color::Reset),
         "the sweep ran under NO_COLOR"
     );
+    assert!(is_settled(&cells), "the sweep ran under NO_COLOR");
 }
 
 #[test]
