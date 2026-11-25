@@ -1008,22 +1008,6 @@ mod tests {
         }
     }
 
-    fn hello_data(stream: bool) -> ChatCompletionsData {
-        ChatCompletionsData {
-            messages: vec![Message::new(
-                MessageRole::User,
-                MessageContent::Text("hello".to_string()),
-            )],
-            temperature: None,
-            top_p: None,
-            reasoning_effort: None,
-            functions: None,
-            stream,
-            prompt_cache_ttl: None,
-            structured_output: None,
-        }
-    }
-
     #[test]
     fn native_structured_output_dialect_follows_model_category() {
         let cases = [
@@ -1053,7 +1037,7 @@ mod tests {
 
         for stream in [true, false] {
             let request_data =
-                prepare_chat_completions(&client, hello_data(stream), &ModelCategory::Mistral)
+                prepare_chat_completions(&client, plain_data(stream), &ModelCategory::Mistral)
                     .unwrap();
 
             assert!(
@@ -1096,7 +1080,7 @@ mod tests {
     #[test]
     fn gemini_without_spec_body_is_unchanged() {
         let body = gemini_build_chat_completions_body(
-            hello_data(false),
+            plain_data(false),
             &Model::new("vertexai", "gemini-test"),
         )
         .unwrap();

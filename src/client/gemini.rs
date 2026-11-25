@@ -351,19 +351,7 @@ mod tests {
     }
 
     fn prepare_chat(client: &GeminiClient) -> Result<RequestData> {
-        let data = ChatCompletionsData {
-            messages: vec![Message::new(
-                MessageRole::User,
-                MessageContent::Text("hello".to_string()),
-            )],
-            temperature: None,
-            top_p: None,
-            reasoning_effort: None,
-            functions: None,
-            stream: false,
-            prompt_cache_ttl: None,
-            structured_output: None,
-        };
+        let data = plain_data(false);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

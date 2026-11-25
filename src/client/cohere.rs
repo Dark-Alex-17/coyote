@@ -280,21 +280,7 @@ mod tests {
         };
 
         for stream in [true, false] {
-            let data = ChatCompletionsData {
-                messages: vec![Message::new(
-                    MessageRole::User,
-                    MessageContent::Text("hello".to_string()),
-                )],
-                temperature: None,
-                top_p: None,
-                reasoning_effort: None,
-                functions: None,
-                stream,
-                prompt_cache_ttl: None,
-                structured_output: None,
-            };
-
-            let request_data = prepare_chat_completions(&client, data).unwrap();
+            let request_data = prepare_chat_completions(&client, plain_data(stream)).unwrap();
 
             assert!(
                 request_data.body.get("stream_options").is_none(),

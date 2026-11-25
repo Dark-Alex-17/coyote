@@ -1994,7 +1994,7 @@ mod tests {
             .block_on(prepare_chat_completions(
                 client,
                 &ReqwestClient::new(),
-                hello_data(stream),
+                plain_data(stream),
             ))
     }
 
@@ -2589,22 +2589,6 @@ mod tests {
         assert_eq!(request_data.body, body_before, "a chat-shaped model patch must not merge into a responses body");
     }
 
-    fn hello_data(stream: bool) -> ChatCompletionsData {
-        ChatCompletionsData {
-            messages: vec![Message::new(
-                MessageRole::User,
-                MessageContent::Text("hello".to_string()),
-            )],
-            temperature: None,
-            top_p: None,
-            reasoning_effort: None,
-            functions: None,
-            stream,
-            prompt_cache_ttl: None,
-            structured_output: None,
-        }
-    }
-
     #[test]
     fn extract_chat_parses_usage_with_cached_reads() {
         let data = json!({
@@ -2740,7 +2724,7 @@ mod tests {
 
         assert_eq!(wire, WireApi::Chat);
         let mut expected =
-            openai_build_chat_completions_body(hello_data(true), &Model::new("openai", "gpt-test"));
+            openai_build_chat_completions_body(plain_data(true), &Model::new("openai", "gpt-test"));
         expected["stream_options"] = json!({ "include_usage": true });
         assert_eq!(request_data.body, expected);
     }
@@ -2753,7 +2737,7 @@ mod tests {
 
         assert_eq!(
             request_data.body,
-            openai_build_chat_completions_body(hello_data(false), &Model::new("openai", "gpt-test"))
+            openai_build_chat_completions_body(plain_data(false), &Model::new("openai", "gpt-test"))
         );
     }
 
@@ -2768,7 +2752,7 @@ mod tests {
         assert_eq!(wire, WireApi::Chat);
         assert_eq!(
             request_data.body,
-            openai_build_chat_completions_body(hello_data(true), &Model::new("openai", "gpt-test"))
+            openai_build_chat_completions_body(plain_data(true), &Model::new("openai", "gpt-test"))
         );
     }
 
@@ -2833,7 +2817,7 @@ mod tests {
     #[test]
     fn chat_without_spec_body_is_unchanged() {
         let body =
-            openai_build_chat_completions_body(hello_data(false), &Model::new("openai", "gpt-test"));
+            openai_build_chat_completions_body(plain_data(false), &Model::new("openai", "gpt-test"));
 
         assert_eq!(
             body.to_string(),
@@ -2861,7 +2845,7 @@ mod tests {
 
     #[test]
     fn responses_without_spec_has_no_text_key() {
-        let body = openai_build_responses_body(hello_data(false), &Model::new("openai", "gpt-test"));
+        let body = openai_build_responses_body(plain_data(false), &Model::new("openai", "gpt-test"));
 
         assert!(body.get("text").is_none(), "body: {body}");
         assert_eq!(

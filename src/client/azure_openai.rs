@@ -108,22 +108,6 @@ mod tests {
         }
     }
 
-    fn hello_data(stream: bool) -> ChatCompletionsData {
-        ChatCompletionsData {
-            messages: vec![Message::new(
-                MessageRole::User,
-                MessageContent::Text("hello".to_string()),
-            )],
-            temperature: None,
-            top_p: None,
-            reasoning_effort: None,
-            functions: None,
-            stream,
-            prompt_cache_ttl: None,
-            structured_output: None,
-        }
-    }
-
     #[test]
     fn native_structured_output_dialect_is_openai_strict() {
         assert_eq!(
@@ -136,9 +120,9 @@ mod tests {
     fn streaming_chat_requests_usage() {
         let client = make_client();
 
-        let request_data = prepare_chat_completions(&client, hello_data(true)).unwrap();
+        let request_data = prepare_chat_completions(&client, plain_data(true)).unwrap();
 
-        let mut expected = openai_build_chat_completions_body(hello_data(true), &client.model);
+        let mut expected = openai_build_chat_completions_body(plain_data(true), &client.model);
         expected["stream_options"] = json!({ "include_usage": true });
         assert_eq!(request_data.body, expected);
     }
@@ -147,11 +131,11 @@ mod tests {
     fn non_streaming_chat_body_is_unchanged() {
         let client = make_client();
 
-        let request_data = prepare_chat_completions(&client, hello_data(false)).unwrap();
+        let request_data = prepare_chat_completions(&client, plain_data(false)).unwrap();
 
         assert_eq!(
             request_data.body,
-            openai_build_chat_completions_body(hello_data(false), &client.model)
+            openai_build_chat_completions_body(plain_data(false), &client.model)
         );
     }
 }
