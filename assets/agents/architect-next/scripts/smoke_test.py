@@ -1082,6 +1082,10 @@ check("replay 08/1: the shortfall still there after the retry -> ledgered and re
 u = gates.branch_setup(base_state(**PS))
 check("branch_setup: single -> run branch created + pushed", u["_next"] == "select_tasks" and u["run_branch"] == "feat/PLAN-widgets" and git(CODE, "branch", "--show-current") == "feat/PLAN-widgets"
       and git(CODE, "rev-parse", "--verify", "origin/feat/PLAN-widgets"))
+check("branch_setup: the first branch records the run base", u.get("run_base_sha") == u["unit_base_sha"] != "", u.get("run_base_sha"))
+u = gates.branch_setup(base_state(run_base_sha="r0base", **PS))
+check("branch_setup: a recorded run base is never overwritten by a later branch", "run_base_sha" not in u and u["unit_base_sha"],
+      u.get("run_base_sha"))
 u = gates.branch_setup(base_state(**PS))
 check("branch_setup: existing run branch -> checkout, never recreated", u["_next"] == "select_tasks" and any("existing" in d for d in u["decisions"]))
 u = gates.branch_setup(base_state(pr_strategy="multi", **PS))
@@ -3740,7 +3744,7 @@ RETRO_REFACTORS = "DESIGN_RETROSPECTIVE: REFACTORS 2\n\n## Refactor items\n\n1. 
 
 def _retro_large(**over):
     return base_state(**{"plan_path": PROMOTED, "tasks": copy.deepcopy(ts_f), "retro_large": True,
-                         "retro_large_reason": "a new subsystem", "last_node_output": RETRO_JUDGED, "unit_base_sha": CODE_BASE,
+                         "retro_large_reason": "a new subsystem", "last_node_output": RETRO_JUDGED, "run_base_sha": CODE_BASE,
                          "closeout_scope": "run", **over})
 
 
@@ -3756,6 +3760,12 @@ def _retro_integrate_not_large():
     u = gates.integrate_route(_retro_large(**{"retro_large": False, "retro_large_reason": "one small task"}))
     return (u["_next"] == "hygiene_create" and u.get("retro_done") is True
             and any("one small task" in l for l in u["retro_report"])), (u.get("_next"), u.get("retro_report"))
+
+
+def _retro_groups_run_base():
+    u = gates.integrate_route(_retro_large(pr_strategy="multi", group_index=2, unit_base_sha="g2base"))
+    p = u.get("retro_prompt", "")
+    return f"Diff: {CODE_BASE}..HEAD" in p and "g2base" not in p, p
 
 
 def _retro_integrate_unjudged():
@@ -3822,6 +3832,7 @@ def _retro_report():
 
 guarded("integrate_route: a large run at run close -> run_retrospective over the run diff, retro_done set first", _retro_integrate_large)
 guarded("integrate_route: not a large body of work -> hygiene_create, the reason in the report lines", _retro_integrate_not_large)
+guarded("integrate_route: a groups-mode run close diffs from the run base, never the last group's base", _retro_groups_run_base)
 guarded("integrate_route: no valid size judgement (the llm node failed) -> hygiene_create with a note", _retro_integrate_unjudged)
 guarded("integrate_route: retro_done -> hygiene_create (at most once per run)", _retro_integrate_done)
 guarded("integrate_route: a group close-out short of run close -> hygiene_create, the retrospective waits", _retro_group_closeout)

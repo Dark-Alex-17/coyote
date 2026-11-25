@@ -1378,6 +1378,8 @@ def branch_setup(state):
         elif exists:
             ledger(state, u, f"branch: {branch} has no upstream; nothing to pull")
         u["unit_base_sha"] = git_out(code, "rev-parse", "HEAD", default="")
+        if not state.get("run_base_sha"):
+            u["run_base_sha"] = u["unit_base_sha"]
         ledger(state, u, f"branch: {branch} ready ({'existing' if exists else 'created from ' + start}) @ {u['unit_base_sha']}")
     else:
         u["run_branch"] = ""
@@ -5086,8 +5088,10 @@ def _after_integration(state, u):
         ledger(state, u, "design retrospective: skipped; per-task PRs cannot carry a run-closing refactor task")
         return u
     code = state.get("code_repo_path", "")
-    base = state.get("unit_base_sha") or git_out(code, "merge-base", "--end-of-options",
-                                                 f"origin/{state.get('base_branch_name') or 'main'}", "HEAD", default="")
+    base = state.get("run_base_sha")
+    if not base:
+        git(code, "fetch", "--quiet", "origin")
+        base = git_out(code, "merge-base", "--end-of-options", f"origin/{state.get('base_branch_name') or 'main'}", "HEAD", default="")
     if not base:
         u["retro_report"] = [f"- not run: large ({reason}), but the run base could not be resolved"]
         ledger(state, u, "design retrospective: skipped; the run base could not be resolved")

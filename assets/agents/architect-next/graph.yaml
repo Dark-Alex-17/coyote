@@ -261,6 +261,7 @@ initial_state:
   run_branch: ''
   unit_base_branch: ''
   unit_base_sha: ''
+  run_base_sha: ''
   group_index: 0
   closeout_scope: ''
   closeout_unit: ''
