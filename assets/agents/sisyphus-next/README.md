@@ -67,7 +67,7 @@ below. Later landings add their own rows.
 | The coder sees what the review reruns | `scripts/gates.py` `render_coder_prompt` / `_declared_commands`, `scripts/smoke_test.py` | Every coder prompt, the first and each fix round's, names in its CONTEXT the verification commands the review reruns against the change: a non-empty `review_verification_commands` once a review of the same subtask or final review ran (the declared commands plus the criterion commands the review added), else `verification_commands`. Each subtask and the final review start with `review_verification_commands` back at its empty seed, so one subtask's criterion commands never reach the next. |
 | The subtask review sees the carried failures | `scripts/gates.py` `build_gauntlet_prompt` / `_carried_review_section`, `graph.yaml` the `review_carried_failures` seed and the `run_gauntlet` `carried_failures` input, `scripts/smoke_test.py` | The carried-forward test failures went into the subtask's task text only, so the gauntlet read a red test a later subtask owns as a fresh regression of the change. During a subtask review with carried failures, the gauntlet prompt now lists them above the `Plan / acceptance criteria:` block, so they are never read as a criterion, each with its owning subtask, and says that one a later subtask owns is expected to stay red and is not a regression of this change. The final whole-task review gets no such section. Each review round also sets `review_carried_failures` to the carried failures not yet owed (owned by a later subtask), a JSON array, and `[]` at the final review; `run_gauntlet` passes it as the gauntlet's `carried_failures`, so the adversary lane reports a red run made only of those failures as advisory when every criterion naming the command is met. It is part of the key a passed round is reused on. |
 | The headless judge decides a question that recommends no option | `graph.yaml` the `headless_judge` llm node (`tools: []`, `timeout: 120`, next and fallback `interpret_route`), the `judge_rulings` seed and the `parse_answer` / `interpret_route` descriptions, the `ask_review_incomplete` approval node removed, `scripts/gates.py` `parse_answer` / `_to_headless_judge` / `interpret_route` / `_judge_route` / `OWN_PROMPT_KINDS` / `_TERMINAL_PROMPTS`, `scripts/audit_graph.py`, `scripts/smoke_test.py`, `tests/candidate_sisyphus_next.rs`, `src/config/request_context.rs` | The engine's no-human reply (`HEADLESS_GUIDANCE`, matched as the exact canned text) takes the recommended option. On a question with options and none recommended, `parse_answer` now sends it to the `headless_judge` llm node, as architect-next does, instead of interpreting the canned words: the judge weighs the question's evidence and returns an option or an instruction the kind accepts, with its reason. `interpret_route` reads a judge ruling first (`reply_source` `judge`): a usable one goes through `apply_answer` and into the autonomous digest as `basis: headless judge: <reason>`, an option pick reaching `apply_answer` as `<option>: <reason>` so a branch that records the stated reason records the judge's; a faulty one (no reason, no offered option, an instruction the kind does not accept) gets one more judge turn with the fault in the escalation's data as `judge_fault`, which the judge's instructions name, then the run ends blocked with the question and its options. `judge_rulings` counts rulings per decision key (the key the failed-once rule uses), and at `STRIKE_LIMIT` the run ends blocked without the judge. A hard trigger is never judged: with no recommended option and no human it ends blocked with the question. The kinds with an approval node of their own are not judged; `review_incomplete` lost its approval node, whose first option a run with no human always took, and is asked at the typed prompt so it reaches the judge. |
-| The run's design retrospective | `graph.yaml` the `retrospective` variable, the `retro_*` seeds, the `retro_size`, `retro_size_route`, `run_retrospective`, `retro_triage` and `retro_route` nodes and the `max_loop_iterations` comment; `scripts/gates.py` `route_gauntlet` / `triage_route` / `_after_final_review` / `retro_size_route` / `retro_route` / `compose_fix` / `_assemble_report`; `scripts/retro_size_route.py`, `scripts/retro_route.py`; `scripts/_lib.py` `RUN_VARIABLES` / `STATE_KEYS`; `scripts/check_session_block.sh` `GRAPH_ONLY_VARS`; `scripts/audit_graph.py`; `scripts/smoke_test.py`; `tests/candidate_sisyphus_next.rs`; `src/config/request_context.rs` | the run-closing design retrospective (The run's design retrospective below). `retrospective` is graph-only: the prose sisyphus reads the same decision from its delegation brief |
+| The run's design retrospective | `graph.yaml` the `retrospective` variable, the `retro_*` seeds, the `retro_size`, `retro_size_route`, `run_retrospective`, `retro_triage` and `retro_route` nodes and the `max_loop_iterations` comment; `scripts/gates.py` `route_gauntlet` / `triage_route` / `apply_answer` / `_after_final_review` / `retro_size_route` / `retro_route` / `compose_fix` / `_assemble_report`; `scripts/retro_size_route.py`, `scripts/retro_route.py`; `scripts/_lib.py` `RUN_VARIABLES` / `STATE_KEYS`; `scripts/check_session_block.sh` `GRAPH_ONLY_VARS`; `scripts/audit_graph.py`; `scripts/smoke_test.py`; `tests/candidate_sisyphus_next.rs`; `src/config/request_context.rs` | the run-closing design retrospective (The run's design retrospective below). `retrospective` is graph-only: the prose sisyphus reads the same decision from its delegation brief |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -451,12 +451,16 @@ without blocking, any path that changed after the last passing review.
 ## The run's design retrospective
 
 A run gets at most one design retrospective, after its whole-task review is green: a PASS in
-`route_gauntlet` outside an adoption round, or `triage_route` with every blocker rejected.
+`route_gauntlet` outside an adoption round, `triage_route` with every blocker rejected, or an
+`apply_answer` exit that accepts the whole-task review and moves on (yellow findings, a plan
+defect or a probe gap accepted, NEEDS-HUMAN accepted, review blockers accepted).
 `_after_final_review` sends a subtask's green review on to `next_subtask` as before; for the
 whole task it sets `retro_done` and goes to `retro_size` with the run's diff stat, unless
 `retro_done` is already set or the `retrospective` variable is `parent` (the value
 architect-next passes, because it runs one retrospective over its whole run), which go
-straight to `observability_gate`.
+straight to `observability_gate`. A green review after the PR is out (`pr_published`,
+`ci_fix_active` or a PR-review round) and a run whose base commit cannot be resolved also go
+there, with the reason in the report.
 
 `retro_size` judges whether the task is a large body of work and gives a one-line reason; the
 examples in its instructions prompt judgement and are not a threshold. `retro_size_route` sends
@@ -470,9 +474,12 @@ Each decline is ledgered as `retro-declined: <item> -- <reason>` and deferred it
 follow-ups. Adopted items go to `compose_fix` as one coder round (`fix_source: retrospective`),
 which runs the normal gates and a fresh review round; its green review finds `retro_done` set
 and goes on to `observability_gate`. With the review rounds already spent, adopted items become
-follow-ups instead. A CLEAN result or a reply without the first line (an agent fault) goes on
-to `observability_gate`: the retrospective never blocks completion and never escalates. The
-run report's `Design retrospective:` block says whether it ran and why and lists the declines.
+follow-ups instead. A failed triage of a REFACTORS reply keeps the items as one follow-up that
+points at the saved report. One leading code-fence line before the first line is skipped; any
+other text before it is a fault. A CLEAN result or a fault goes on to `observability_gate`.
+The retrospective itself never blocks completion; an adopted refactor round runs under the
+normal gates and can escalate like any fix round. The run report's `Design retrospective:`
+block says whether it ran and why and lists the declines.
 
 ## Verify
 
