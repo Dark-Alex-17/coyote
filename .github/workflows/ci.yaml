@@ -308,7 +308,11 @@ jobs:
         echo "::group::second run changes nothing"
         out=$("${relay[@]}" --no-service)
         printf '%s\n' "$out"
-        grep -q 'already exists' <<<"$out"
+        grep -qF '(already there); not touched' <<<"$out"
+        if grep -qF 'Make sure it carries these settings' <<<"$out"; then
+          echo "::error::a re-run on the script's own config printed the stanzas to merge"
+          exit 1
+        fi
         [ "$(shasum -a 256 "$cfg")" = "$before" ]
         echo "::endgroup::"
 
@@ -471,7 +475,8 @@ jobs:
         Write-Output '::group::second run changes nothing'
         $out = Invoke-Relay 0 @('-NoService', '-AllowRoot')
         $out | Write-Output
-        if (($out -join "`n") -notmatch 'already exists') { throw 'second run did not report the existing config' }
+        if (-not ($out -join "`n").Contains('(already there); not touched')) { throw 'second run did not report the existing config' }
+        if (($out -join "`n").Contains('Make sure it carries these settings')) { throw "a re-run on the script's own config printed the stanzas to merge" }
         if ((Get-FileHash -Algorithm SHA256 $cfg).Hash -ne $before) { throw 'second run changed the config' }
         Write-Output '::endgroup::'
 

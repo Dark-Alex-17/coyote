@@ -329,11 +329,14 @@ fn a_stopped_task_whose_rnsd_outlived_it_is_started_only_after_that_rnsd_is_ende
                 "start"
             }
         })
-        .collect::<Vec<_>>()
-        .into_iter()
         .collect();
     assert_eq!(order, ["kill", "start"], "{out}");
-    assert!(run.calls().contains("Invoke-TreeKill 101\n"), "{out}");
+    assert!(
+        run.calls()
+            .lines()
+            .any(|line| line == "Invoke-TreeKill 101"),
+        "{out}"
+    );
     assert_eq!(rnsd_outcome(&run).0, "rnsd processes: 900", "{out}");
     assert!(
         run.stdout.contains("Ended an rnsd left running on "),
@@ -388,7 +391,10 @@ fn a_native_commands_stderr_is_printed_as_plain_text() {
     let run = Scenario::run(&pwsh, "native-stderr");
     let out = run.transcript();
     assert_eq!(run.code, 0, "{out}");
-    assert!(run.stdout.contains("Collecting rns 42%\n"), "{out}");
+    assert!(
+        run.stdout.lines().any(|line| line == "Collecting rns 42%"),
+        "{out}"
+    );
     assert!(run.stdout.contains("exit 3"), "{out}");
     assert!(
         !run.stdout.contains("NativeCommandError") && !run.stderr.contains("NativeCommandError"),

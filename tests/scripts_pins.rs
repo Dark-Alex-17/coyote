@@ -927,7 +927,17 @@ fn the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_family() {
         ),
         (
             "re-run reports the existing config",
-            &["grep -q 'already exists'", "-notmatch 'already exists'"],
+            &[
+                "grep -qF '(already there); not touched'",
+                ".Contains('(already there); not touched')",
+            ],
+        ),
+        (
+            "re-run on the script's own config prints no stanzas",
+            &[
+                "grep -qF 'Make sure it carries these settings'",
+                ".Contains('Make sure it carries these settings')",
+            ],
         ),
         (
             "pre-existing config byte-identical",

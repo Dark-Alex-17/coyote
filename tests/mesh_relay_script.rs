@@ -1657,7 +1657,17 @@ fn without_a_user_bus_the_unit_is_written_the_enable_command_printed_and_nothing
         mtime,
         "the second run rewrote an identical unit"
     );
-    assert!(out.contains("already exists, not touched"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "{} is the one this script wrote (already there); not touched",
+            home.reticulum_config().display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Make sure it carries these settings and stanzas"),
+        "a re-run on the script's own config prints no stanzas to merge:\n{out}"
+    );
 
     // The dry run against a present, identical unit says so and writes nothing new.
     let entries = home.entries();
