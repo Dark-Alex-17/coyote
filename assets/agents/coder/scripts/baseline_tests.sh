@@ -133,7 +133,8 @@ fi
 # the base commit (.shared/base_suite.py), so this node returns at once and
 # edits already in the tree do not matter. Under build_lock the job waits
 # until verify_tests has run this lap's selected tests, so it never holds the
-# lock ahead of them.
+# lock ahead of them; its base is still fixed here, so a HEAD that moves
+# before the job starts cannot change what the change is judged against.
 if [[ $(gate_verify_tier) == "round" ]]; then
   if ! command -v python3 >/dev/null 2>&1; then
     BASELINE_MODE=none
@@ -142,6 +143,10 @@ if [[ $(gate_verify_tier) == "round" ]]; then
     exit 0
   fi
   if [[ -n "$(gate_prefix)" ]]; then
+    resolved=$(python3 "$(dirname "$0")/../../.shared/base_suite.py" resolve --root "$workdir" --cmd "$cmd" \
+      --floor "${LLM_AGENT_VAR_BASELINE_FLOOR:-}" 2>/dev/null) || resolved='{}'
+    BASELINE_KEY=$(jq -r '.key // ""' <<<"$resolved")
+    BASELINE_BASE=$(jq -r '.base // ""' <<<"$resolved")
     BASELINE_MODE="background (deferred: build_lock)"
     BASELINE_STATUS=pending
     BASELINE_NOTE="The baseline is pending: the base suite starts once this lap's selected tests release build_lock, and failures are classified against it when a test goes red."

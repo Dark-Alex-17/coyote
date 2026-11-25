@@ -69,6 +69,16 @@ variables:
       line unless that record is green, even when every lane is green. Any
       other value blocks as a PIPELINE-FAULT.
     default: ''
+  - name: baseline_floor
+    description: |
+      Final tier only: the commit the run started from (the run base). A
+      red full suite is then judged only against the base suite at that
+      commit, run there on demand when no record exists, so failures an
+      earlier commit of the run introduced are never accepted as
+      pre-existing. Empty judges it against the nearest base record on
+      HEAD's first-parent chain that no merge and no older commit separates
+      from HEAD.
+    default: ''
 
 settings:
   max_loop_iterations: 10
@@ -249,7 +259,7 @@ nodes:
   finalize_check:
     id: finalize_check
     type: script
-    description: Final tier only (signals routes here). Looks up the finalize record for the worktree tree signals recorded and, on a miss, runs .shared/finalize_gate.sh there (fmt, check, lint, then the full suite, each killed after 3300s) to write one; records full_suite_record {status, tree, detail} for the verdict gate. If the node is killed, full_suite_record stays unset and the verdict gate blocks on a missing record.
+    description: Final tier only (signals routes here). Looks up the finalize record for the worktree tree signals recorded and, on a miss, runs .shared/finalize_gate.sh there (fmt, check, lint, then the full suite, each killed after 3300s, a red suite judged against the base at baseline_floor when one is set) to write one; records full_suite_record {status, tree, detail} for the verdict gate. If the node is killed, full_suite_record stays unset and the verdict gate blocks on a missing record.
     script: scripts/finalize_check.sh
     timeout: 3600
     fallback: debris_lint

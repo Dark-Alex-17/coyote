@@ -336,7 +336,9 @@ nodes:
     id: verify_format_lint
     type: script
     description: |
-      Format BEFORE evidence collection (FORMAT_CMD override or per-type
+      Cancel the coder's background base suite jobs for this worktree
+      (.shared/base_suite.py cancel, reported at the top of format_output),
+      then format BEFORE evidence collection (FORMAT_CMD override or per-type
       heuristic), then lint (LINT_CMD, when configured). Lint failure routes
       to the fix loop.
     script: scripts/verify_format_lint.sh

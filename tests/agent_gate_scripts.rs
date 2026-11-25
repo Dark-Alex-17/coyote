@@ -180,7 +180,13 @@ fn run_script(
         .env_remove("FORMAT_CMD")
         .env_remove("LINT_CMD")
         .env_remove("LLM_AGENT_VAR_TEST_COMMAND")
-        .env_remove("LLM_AGENT_VAR_BUILD_LOCK");
+        .env_remove("LLM_AGENT_VAR_BUILD_LOCK")
+        .env_remove("LLM_AGENT_VAR_VERIFY_TIER")
+        .env_remove("LLM_AGENT_VAR_BASELINE_FLOOR")
+        .env_remove("LLM_AGENT_VAR_TEST_TIMEOUT")
+        .env_remove("LLM_AGENT_VAR_BUILD_TIMEOUT")
+        .env_remove("TEST_TIMEOUT")
+        .env_remove("BUILD_TIMEOUT");
     for (k, v) in envs {
         cmd.env(k, v);
     }

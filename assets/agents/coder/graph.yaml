@@ -566,7 +566,7 @@ nodes:
 
       ## Facts about the change
       {{impact_facts}}
-    tools: [fs_cat, fs_ls, execute_command]
+    tools: [fs_cat, fs_ls, fs_grep, fs_glob, ast_grep]
     max_iterations: 30
     timeout: 600
     output_schema:

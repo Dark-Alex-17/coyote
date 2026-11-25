@@ -9,6 +9,11 @@ index is never written. Records live under
 `<git-common-dir>/coyote-verification/`, shared by every linked worktree,
 because the key is content, not a branch or a HEAD.
 
+A finalize record that decides nothing (a result timed out, the suite did
+not run, or the finalize gate could not classify a red suite) reads as
+missing, so a caller runs the gate again instead of trusting or failing on
+it.
+
 CLI:
   verify_record.py tree [--root DIR]
   verify_record.py write --root DIR --tier round|finalize --writer NAME
@@ -31,6 +36,7 @@ TIERS = ("round", "finalize")
 TREE_SECS = 40
 SCAN_LIMIT = 50
 PASSING = ("green", "pre-existing", "not_run")
+UNCLASSIFIED_NOTE = "not classified:"
 
 
 def _git(root, *args, env=None):
@@ -154,12 +160,29 @@ def _read(path, tier):
 
 
 def is_green(record, tier):
+    if not decides(record, tier):
+        return False
     results = record.get("results") or []
     if not all(isinstance(r, dict) and r.get("verdict") in PASSING for r in results):
         return False
     if tier == "finalize":
         return any(r.get("role") == "test" and r.get("verdict") in ("green", "pre-existing") for r in results)
     return bool(results)
+
+
+def decides(record, tier):
+    """False for a finalize record whose results cannot say whether the suite passed."""
+    if tier != "finalize":
+        return True
+    results = [r for r in record.get("results") or [] if isinstance(r, dict)]
+    tests = [r for r in results if r.get("role") == "test"]
+    if not tests or any(r.get("verdict") == "timed_out" for r in results):
+        return False
+    for r in tests:
+        note = r.get("note") if isinstance(r.get("note"), str) else ""
+        if r.get("verdict") == "not_run" or (r.get("verdict") == "red" and note.startswith(UNCLASSIFIED_NOTE)):
+            return False
+    return True
 
 
 def _differs_only_under(root, old, new, exclude):
@@ -176,7 +199,7 @@ def lookup_exact(root, tier, tree, rel=None):
     """(path, record) of the record for exactly `tree`, or (None, None)."""
     path = record_path(root, tree, tier, rel)
     record = _read(path, tier)
-    if record is not None and record["tree"] == tree:
+    if record is not None and record["tree"] == tree and decides(record, tier):
         return path, record
     return None, None
 
@@ -205,7 +228,7 @@ def lookup(root, tier, exclude=()):
     paths = sorted((os.path.join(store_dir(root), n) for n in names), key=os.path.getmtime, reverse=True)
     for candidate in paths[:SCAN_LIMIT]:
         record = _read(candidate, tier)
-        if record is None or record.get("rel_dir") != rel:
+        if record is None or record.get("rel_dir") != rel or not decides(record, tier):
             continue
         try:
             if _differs_only_under(root, record["tree"], tree, exclude):
