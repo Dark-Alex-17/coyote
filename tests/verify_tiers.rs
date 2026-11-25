@@ -1912,7 +1912,7 @@ fn final_tier_adversary_cites_a_green_record_without_running_the_command() {
         "{checks}"
     );
     assert!(
-        str_field(&checks, "tier_note").contains("finalize record of this worktree tree"),
+        str_field(&checks, "tier_note").contains("finalize record of the reviewed tree"),
         "{checks}"
     );
     let evidence = format!(

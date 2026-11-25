@@ -172,6 +172,15 @@ def _differs_only_under(root, old, new, exclude):
     return r.returncode == 0
 
 
+def lookup_exact(root, tier, tree, rel=None):
+    """(path, record) of the record for exactly `tree`, or (None, None)."""
+    path = record_path(root, tree, tier, rel)
+    record = _read(path, tier)
+    if record is not None and record["tree"] == tree:
+        return path, record
+    return None, None
+
+
 def lookup(root, tier, exclude=()):
     """(path, record) of the record for the worktree as it stands, or (None, None).
 
@@ -183,9 +192,8 @@ def lookup(root, tier, exclude=()):
     if not tree:
         return None, None
     rel = rel_dir(root)
-    path = record_path(root, tree, tier, rel)
-    record = _read(path, tier)
-    if record is not None and record["tree"] == tree:
+    path, record = lookup_exact(root, tier, tree, rel)
+    if record is not None:
         return path, record
     if not exclude:
         return None, None
