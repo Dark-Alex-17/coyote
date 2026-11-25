@@ -19,7 +19,6 @@ mod command_timing;
 mod composer;
 mod context;
 mod control;
-mod dump;
 mod events;
 mod help;
 mod history;
@@ -465,9 +464,6 @@ pub(crate) struct App {
     /// Index of the first cell the exit work may add; what came after it
     /// is the exit's late output.
     exit_first_cell: usize,
-    /// End of the cells printed on the way out, fixed when the exit
-    /// began: a turn cut short then is left out with the exit's cells.
-    committed_end: usize,
     footer: FooterInfo,
     usage: String,
     /// The agent, session, role and RAG the composer's top rule names,
@@ -617,7 +613,6 @@ impl App {
             turn: None,
             exiting: false,
             exit_first_cell: 0,
-            committed_end: 0,
             footer,
             usage: String::new(),
             context_label: None,
@@ -2451,20 +2446,6 @@ impl App {
 
     fn take_copy_requests(&mut self) -> Vec<String> {
         std::mem::take(&mut self.copy_requests)
-    }
-
-    /// The cells of the turns that ended: none of the exit's own, nor of
-    /// a turn whose task was lost under it.
-    fn committed_cells(&self) -> &[Cell] {
-        let cells = self.transcript.cells();
-        let end = if self.exiting {
-            self.committed_end
-        } else {
-            self.turn
-                .as_ref()
-                .map_or(cells.len(), |turn| turn.first_cell)
-        };
-        &cells[..end.min(cells.len())]
     }
 
     /// Every turn state is dim and the idle hint is italic instead; the

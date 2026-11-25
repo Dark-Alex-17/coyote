@@ -795,7 +795,7 @@ pub fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
 }
 
 /// Writes `extra` top-level YAML after the fake-LLM config, so a case can
-/// add a setting (`document_loaders`, `tui_dump_on_exit`) while keeping
+/// add a setting (`document_loaders`, `enabled_tools`) while keeping
 /// the fake model.
 pub fn write_fake_llm_config_with(dir: &Path, fake: &FakeLlm, extra: &str) {
     write_fake_llm_config(dir, fake);
@@ -873,60 +873,25 @@ pub fn squeezed(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// The bytes between the last alternate-screen leave and the wrapper's
-/// report, raw.
-pub fn raw_between_leave_and_report(pty: &Pty) -> Vec<u8> {
+/// What the binary wrote after it last left the alternate screen, escapes
+/// stripped, without the report lines `TTY_REPORT` prints.
+pub fn printed_after_the_leave(pty: &Pty) -> String {
     let raw = pty.raw();
     let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
-    let tail = &raw[left + LEAVE_ALT.len()..];
-    let report = find(tail, b"exit=", 0).expect("no exit= line after the leave");
-    tail[..report].to_vec()
-}
-
-/// Leaves an idle UI with `leave` after one exchange and checks the
-/// prompt and then the reply were printed between the leave and the
-/// report, each once. `leave` gets the coyote process's pid.
-pub fn leaving_prints_the_transcript(
-    name: &str,
-    leave: impl FnOnce(&mut Pty, i32),
-    prompt: &str,
-    reply: &str,
-) {
-    let dir = fresh_config_dir(name);
-    let _guard = TempDirGuard(dir.clone());
-    let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
-    write_fake_llm_config(&dir, &fake);
-    let mut pty = spawn_tui(&dir, &[]);
-
-    let started = pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    let pid = child_pid(&started);
-    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
-    wait_for_squeezed(&mut pty, reply, "the reply");
-    pty.read_for(Duration::from_millis(800));
-    leave(&mut pty, pid);
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
-
-    let printed = strip_ansi(&String::from_utf8_lossy(&raw_between_leave_and_report(
-        &pty,
-    )));
-    let between = squeezed(&printed);
-    let at = |marker: &str| {
-        let marker = squeezed(marker);
-        assert_eq!(
-            between.matches(&marker).count(),
-            1,
-            "{marker:?} was not printed exactly once after leaving: {:?}",
-            printed.trim()
-        );
-        between.find(&marker).unwrap()
-    };
+    let tail = strip_ansi(&String::from_utf8_lossy(&raw[left + LEAVE_ALT.len()..]));
     assert!(
-        at(prompt) < at(reply),
-        "the reply was printed ahead of its prompt: {:?}",
-        printed.trim()
+        tail.contains("tty-probe-done"),
+        "the wrapper's report is missing after the leave: {tail:?}"
     );
+    tail.lines()
+        .filter(|line| {
+            let line = line.trim();
+            !(line.starts_with("exit=")
+                || line.starts_with("tty-flags:")
+                || line == "tty-probe-done")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Files under `dir` (outside the cache) that were not there before and

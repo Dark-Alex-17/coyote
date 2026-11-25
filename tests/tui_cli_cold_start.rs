@@ -914,8 +914,8 @@ fn completions_for_the_common_shells_name_both_shell_flags() {
     }
 }
 
-/// `config.example.yaml` and the config template ship the two new rows,
-/// and those rows, taken verbatim, load into a config whose `--info`
+/// `config.example.yaml` and the config template ship the `ui` row, and
+/// that row, taken verbatim, loads into a config whose `--info`
 /// resolves the documented default, the REPL.
 #[test]
 #[serial]
@@ -928,13 +928,9 @@ fn the_documented_ui_rows_load_verbatim_and_resolve_to_the_repl() {
         let text = fs::read_to_string(root.join(file)).unwrap();
         let rows: Vec<&str> = text
             .lines()
-            .filter(|line| line.starts_with("ui:") || line.starts_with("tui_dump_on_exit:"))
+            .filter(|line| line.starts_with("ui:"))
             .collect();
-        assert_eq!(
-            rows.len(),
-            2,
-            "{file} lacks the ui / tui_dump_on_exit rows:\n{text}"
-        );
+        assert_eq!(rows.len(), 1, "{file} lacks the ui row:\n{text}");
         assert!(
             rows.iter().any(|row| row.starts_with("ui: repl")),
             "{file} documents a default other than `ui: repl`: {rows:?}"

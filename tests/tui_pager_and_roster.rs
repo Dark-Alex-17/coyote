@@ -1515,9 +1515,7 @@ mod transcript {
         const EXCHANGES: usize = 2_500;
         let dir = fresh_config_dir("big-dot-session");
         let _guard = TempDirGuard(dir.clone());
-        // The exit dump of the whole history is not what this case checks,
-        // and on a loaded host its 5,000 messages outlast the quit deadline.
-        write_dry_run_config_with(&dir, "tui_dump_on_exit: false\n");
+        write_dry_run_config_with(&dir, "");
         write_session(&dir, "huge", EXCHANGES);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -2727,8 +2725,8 @@ mod binary_threads {
     //! the child with its status, a chosen child's transcript is read from its
     //! session file and read again when the child flushes it, a child file that
     //! does not parse degrades without a panic, a child's question reaches the
-    //! roster and its answer reaches the child, and the transcript is printed on
-    //! the normal screen when the UI leaves with the pager open. A question
+    //! roster and its answer reaches the child, and nothing is printed on the
+    //! normal screen when the UI leaves with the pager open. A question
     //! leaves the roster when its asker is cancelled, along with a grandchild's
     //! question when its parent is cancelled, and a question asked after that
     //! cancel is never listed; answering a question whose asker stopped
@@ -3944,25 +3942,38 @@ mod binary_threads {
     // ---------------------------------------------------------------------------
 
     /// SIGTERM while the pager is open still leaves through the same path:
-    /// exit 0, the terminal restored and the committed transcript printed
-    /// once on the normal screen, prompt before reply.
+    /// exit 0, the terminal restored and nothing of the pager or the
+    /// transcript left on the normal screen.
     #[test]
     #[serial]
-    fn sigterm_with_the_pager_open_prints_the_transcript() {
-        leaving_prints_the_transcript(
-            "thr-sigterm-pager",
-            |pty, pid| {
-                pty.send(b"\x14").unwrap();
-                repainted_frame_showing(
-                    pty,
-                    "Thread: root thread",
-                    "Ctrl+T did not open the pager",
-                );
-                // SAFETY: kill takes a pid and a signal number and touches no memory.
-                assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-            },
-            "pager exit prompt v3k",
-            "pager exit reply w6d",
+    fn sigterm_with_the_pager_open_leaves_cleanly() {
+        let dir = fresh_config_dir("thr-sigterm-pager");
+        let _guard = TempDirGuard(dir.clone());
+        let fake = FakeLlm::start(vec![Reply::Text("pager exit reply w6d".to_string())]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+
+        let started = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        let pid = child_pid(&started);
+        pty.send(b"pager exit prompt v3k\r").unwrap();
+        wait_for_squeezed(&mut pty, "pager exit reply w6d", "the reply");
+        pty.read_for(Duration::from_millis(800));
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        // SAFETY: kill takes a pid and a signal number and touches no memory.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+        assert_tty_restored(&transcript);
+        let printed = printed_after_the_leave(&pty);
+        assert!(
+            printed.trim().is_empty(),
+            "the exit printed to the normal screen: {:?}",
+            printed.trim()
         );
     }
 

@@ -7185,50 +7185,6 @@ fn the_sink_forwards_a_childs_flush() {
     }
 }
 
-/// What the exit prints is the turns that ended: the exit's own
-/// output is printed apart from it.
-#[test]
-fn the_dump_covers_the_committed_turns_only() {
-    let mut harness = Harness::standalone(80, 24);
-    harness.app.begin_turn("hello there", false);
-    harness
-        .app
-        .handle_msg(UiMsg::AssistantText("general kenobi".to_string()));
-    assert!(
-        harness.app.committed_cells().is_empty(),
-        "a running turn was counted as committed"
-    );
-    harness.app.end_turn(false, &TurnOutcome::default());
-    harness.app.begin_exit();
-    harness.app.transcript.push_notice(
-        harness.app.notice_merge_from(),
-        NoticeKind::Routing,
-        "Saved the session".to_string(),
-    );
-    let text = dump::transcript_text(harness.app.committed_cells(), &harness.app.config);
-    assert_eq!(render::plain_text(&text), "> hello there\ngeneral kenobi\n");
-}
-
-/// A signal mid-turn leaves the half-finished turn out of what is
-/// printed, even after the turn is wound up during the exit.
-#[test]
-fn the_dump_leaves_out_a_turn_the_exit_cut_short() {
-    let mut harness = Harness::standalone(80, 24);
-    harness.app.begin_turn("first", false);
-    harness
-        .app
-        .handle_msg(UiMsg::AssistantText("one".to_string()));
-    harness.app.end_turn(false, &TurnOutcome::default());
-    harness.app.begin_turn("second", false);
-    harness
-        .app
-        .handle_msg(UiMsg::AssistantText("half of tw".to_string()));
-    harness.app.begin_exit();
-    harness.app.end_turn(false, &TurnOutcome::default());
-    let text = dump::transcript_text(harness.app.committed_cells(), &harness.app.config);
-    assert_eq!(render::plain_text(&text), "> first\none\n");
-}
-
 /// Comments in the UI's sources describe the code, not the process
 /// that produced it: none carries the vocabulary of a plan or a
 /// review. The needles are spelled in halves (or built from parts) so

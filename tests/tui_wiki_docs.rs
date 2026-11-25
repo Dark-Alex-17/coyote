@@ -44,7 +44,7 @@ const ENV_HEADING: &str = "# UI and Prompt Related Variables";
 const HEADLESS_HEADING: &str = "## Prompts without a human";
 const IN_PROCESS_LEAD: &str = "- **Also published in-process.**";
 /// The settings whose README and Getting-Started rows this lint checks.
-const SETTINGS: [&str; 4] = ["ui", "tui_dump_on_exit", "editor", "theme"];
+const SETTINGS: [&str; 3] = ["ui", "editor", "theme"];
 const WIKI_URL: &str = "https://github.com/Dark-Alex-17/coyote/wiki/";
 /// Words that narrate a plan or a release rather than describe the product.
 const PLANNING_WORDS: [&str; 8] = [
@@ -473,14 +473,8 @@ fn config_rows_match_the_template() {
 
     let Some(wiki) = wiki else { return };
     let tui = read(wiki.join(PAGE));
-    for key in ["ui", "tui_dump_on_exit"] {
-        let row = table_row(PAGE, &tui, &format!("`{key}`"));
-        assert_eq!(
-            row[1],
-            format!("`{}`", template_value(key)),
-            "{PAGE} `{key}`"
-        );
-    }
+    let row = table_row(PAGE, &tui, "`ui`");
+    assert_eq!(row[1], format!("`{}`", template_value("ui")), "{PAGE} `ui`");
     for page in wiki_pages(&wiki) {
         let text = read(&page);
         assert!(
@@ -840,7 +834,6 @@ fn tui_page_quotes_the_code() {
     }
     assert_eq!(const_expr(tui, "FULL_OUTPUT_LIMIT"), "4 * 1024 * 1024");
     assert_eq!(const_expr(tui, "FULL_OUTPUT_BUDGET"), "32 * 1024 * 1024");
-    assert!(run_loop.contains("if app.config.tui_dump_on_exit {"));
     let suspend = run_loop
         .lines()
         .skip_while(|line| line.trim() != "Some(Command::Suspend) => {")
@@ -881,7 +874,6 @@ fn tui_page_quotes_the_code() {
         "within a second".to_string(),
         "4 MiB".to_string(),
         "32 MiB".to_string(),
-        "`tui_dump_on_exit: false`".to_string(),
         "`$VISUAL`".to_string(),
         "`$EDITOR`".to_string(),
         "`NO_COLOR`".to_string(),

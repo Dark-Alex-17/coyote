@@ -41,15 +41,13 @@ mod binary_lifecycle {
     /// the cell empty and show the table a blank row lower, as a notice. The
     /// table is a `Command` cell inside the alternate screen, so once the
     /// screen is left nothing of it may leak to the terminal the shell gets
-    /// back. The transcript printed on exit would carry the cell on purpose,
-    /// so it is switched off here: what is left after the leave is the
-    /// wrapper's own report.
+    /// back: what is left after the leave is the wrapper's own report.
     #[test]
     #[serial]
     fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
         let dir = fresh_config_dir("ctrl-d");
         let _guard = TempDirGuard(dir.clone());
-        write_config(&dir, "save_session: false\ntui_dump_on_exit: false\n");
+        write_config(&dir, "save_session: false\n");
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1257,12 +1255,10 @@ mod binary_lifecycle {
     }
 
     /// The first run ever: no cache dir, no sessions, no config beyond the
-    /// dry-run file. The UI comes up with its chrome, and leaving prints the
-    /// transcript ahead of the tty report: the prompt line and the reply's
-    /// last line each once, in that order. The dry-run reply echoes the
-    /// whole request, so the lines between the prompt line and that last
-    /// line are not checked; no line before or after them looks like a log
-    /// line, a warning or an error (about the missing directories, say).
+    /// dry-run file. The UI comes up with its chrome, answers a turn, and
+    /// leaves once with exit 0. The run is sessionless, so nothing reaches
+    /// the normal screen after the leave: no transcript, and no log line,
+    /// warning or error about the missing directories either.
     #[test]
     #[serial]
     fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
@@ -1284,128 +1280,48 @@ mod binary_lifecycle {
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
-        let after = strip_ansi(&String::from_utf8_lossy(
-            &pty.raw()[rfind(pty.raw(), LEAVE_ALT).unwrap()..],
-        ));
-        let report_at = after.find("exit=").unwrap();
-        let printed: Vec<&str> = after[..report_at]
-            .trim()
-            .lines()
-            .map(str::trim_end)
-            .collect();
-        // The dry-run reply echoes the whole request, system prompt included,
-        // and ends on the rendered user message.
-        let prompt = "> **zebra** and `quartz` marker";
-        let reply = "zebra and quartz marker";
-        for line in [prompt, reply] {
-            assert_eq!(
-                printed.iter().filter(|printed| **printed == line).count(),
-                1,
-                "{line:?} is not printed exactly once: {printed:#?}"
-            );
-        }
-        let prompt_at = printed.iter().position(|line| *line == prompt).unwrap();
-        let reply_at = printed.iter().position(|line| *line == reply).unwrap();
-        assert!(prompt_at < reply_at, "{printed:#?}");
-        let leaked: Vec<&&str> = printed[..=prompt_at]
-            .iter()
-            .chain(&printed[reply_at..])
-            .filter(|line| {
-                let line = line.trim_start();
-                [
-                    "WARN", "ERROR", "INFO", "DEBUG", "Failed", "warning:", "error:", "Error:",
-                    "Warning:",
-                ]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
-                    || ["panicked", "No such file", "cannot", "could not"]
-                        .iter()
-                        .any(|word| line.contains(word))
-                    || [" WARN ", " ERROR ", " INFO ", " DEBUG "]
-                        .iter()
-                        .any(|level| line.contains(level))
-            })
-            .collect();
+        assert_eq!(
+            count(pty.raw(), LEAVE_ALT),
+            1,
+            "the cold start left the alternate screen more than once:\n{transcript}"
+        );
+        let printed = printed_after_the_leave(&pty);
         assert!(
-            leaked.is_empty(),
-            "lines printed around the echoed request look like log output: {leaked:#?}"
+            printed.trim().is_empty(),
+            "the cold start printed to the normal screen: {:?}",
+            printed.trim()
         );
     }
 }
 
 mod binary_exit {
-    //! Real-process checks of the transcript the full-screen UI prints on the
-    //! normal screen when it leaves: on Ctrl+C, `.exit` and SIGTERM, nothing
-    //! before any turn or under `tui_dump_on_exit: false`, the printed reply
-    //! without colour under `NO_COLOR`, and row for row what the plain REPL
-    //! prints for the same reply, and a bounded, clean exit while a roster
-    //! cancel still waits out a job's kill grace (the Ctrl+D case lives in
-    //! `binary` in `tui_tools.rs`, the cold start in `binary_lifecycle`). Each
-    //! case runs the binary on a pseudo-terminal under a bash wrapper that
-    //! reports the exit code and `stty -a` afterwards, so the module is
-    //! unix-only. The cases run one at a time: each spawn forks a session
-    //! leader and takes a controlling tty, and a fork landing between another
-    //! test's `openpty` and its `exec` has failed the spawn with a garbled
-    //! errno.
+    //! Real-process checks of what the full-screen UI leaves on the normal
+    //! screen: nothing after a sessionless run, one resume line after a run
+    //! with a saved session, and a bounded, clean exit while a roster cancel
+    //! still waits out a job's kill grace. Each case runs the binary on a
+    //! pseudo-terminal under a bash wrapper that reports the exit code and
+    //! `stty -a` afterwards, so the module is unix-only. The cases run one at
+    //! a time: each spawn forks a session leader and takes a controlling tty,
+    //! and a fork landing between another test's `openpty` and its `exec` has
+    //! failed the spawn with a garbled errno.
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
 
     use super::common::fake_llm::{FakeLlm, Reply};
-    use super::common::pty::strip_ansi;
     use super::common::tui_harness::*;
     use serial_test::serial;
 
-    /// Ctrl+C on an idle empty composer leaves the UI like Ctrl+D does, and
-    /// the transcript is printed on the normal screen on that path too.
+    /// A sessionless run leaves nothing on the normal screen: after a turn,
+    /// Ctrl+D leaves the alternate screen and the wrapper's report follows
+    /// with only whitespace before it.
     #[test]
     #[serial]
-    fn ctrl_c_on_an_idle_composer_also_prints_the_transcript() {
-        leaving_prints_the_transcript(
-            "ctrl-c-dump",
-            |pty, _| pty.send(b"\x03").unwrap(),
-            "prompt to keep z1c",
-            "the reply to keep h3w",
-        );
-    }
-
-    /// `.exit` leaves the UI too, and prints the transcript the same way.
-    #[test]
-    #[serial]
-    fn dot_exit_also_prints_the_transcript() {
-        leaving_prints_the_transcript(
-            "dot-exit-dump",
-            |pty, _| pty.send(b".exit\r").unwrap(),
-            "prompt to keep e8y",
-            "the reply to keep m4s",
-        );
-    }
-
-    /// SIGTERM after a finished turn leaves the UI and prints the transcript
-    /// like a key does.
-    #[test]
-    #[serial]
-    fn sigterm_after_a_turn_also_prints_the_transcript() {
-        leaving_prints_the_transcript(
-            "sigterm-dump",
-            |_, pid| {
-                // SAFETY: kill takes a pid and a signal number and touches no memory.
-                assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-            },
-            "prompt to keep s7g",
-            "the reply to keep t4m",
-        );
-    }
-
-    /// With `tui_dump_on_exit: false` the transcript is not printed when the
-    /// UI leaves: the wrapper's report follows the leave directly.
-    #[test]
-    #[serial]
-    fn tui_dump_on_exit_false_prints_nothing_between_the_leave_and_the_report() {
-        let dir = fresh_config_dir("dump-off");
+    fn a_sessionless_exit_prints_nothing_on_the_normal_screen() {
+        let dir = fresh_config_dir("exit-sessionless");
         let _guard = TempDirGuard(dir.clone());
         let fake = FakeLlm::start(vec![Reply::Text("the reply to drop k4w".to_string())]);
-        write_fake_llm_config_with(&dir, &fake, "tui_dump_on_exit: false\n");
+        write_fake_llm_config(&dir, &fake);
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1417,162 +1333,90 @@ mod binary_exit {
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
 
-        let between = strip_ansi(&String::from_utf8_lossy(&raw_between_leave_and_report(
-            &pty,
-        )));
+        let printed = printed_after_the_leave(&pty);
         assert!(
-            between.trim().is_empty(),
-            "the transcript was printed with tui_dump_on_exit: false: {:?}",
-            between.trim()
+            printed.trim().is_empty(),
+            "the exit printed to the normal screen: {:?}",
+            printed.trim()
         );
     }
 
-    /// A first start where nothing is said: Ctrl+D prints no transcript, no
-    /// banner and no log line before the report.
+    /// A run on a named session that saves on exit leaves exactly one line
+    /// on the normal screen: the session's name and how to resume it, in
+    /// place of the REPL's own save confirmation.
     #[test]
     #[serial]
-    fn ctrl_d_before_any_turn_prints_nothing_on_the_normal_screen() {
-        let dir = fresh_config_dir("dump-empty");
+    fn a_saved_session_exit_prints_only_the_resume_line() {
+        let dir = fresh_config_dir("exit-saved-session");
         let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
-        let mut pty = spawn_tui(&dir, &[]);
-
-        pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        pty.read_for(Duration::from_millis(500));
-        pty.send(b"\x04").unwrap();
-        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-        assert_eq!(exit_code(&transcript), 0, "{transcript}");
-        assert_tty_restored(&transcript);
-        let between = strip_ansi(&String::from_utf8_lossy(&raw_between_leave_and_report(
-            &pty,
-        )));
-        assert!(
-            between.trim().is_empty(),
-            "bytes were printed after the leave with no turn: {:?}",
-            between.trim()
-        );
-    }
-
-    /// A markdown reply with a heading, bold, inline code, a list and a
-    /// fenced block.
-    const MARKDOWN_REPLY: &str = "# Heading r6t\n\nSome **bold b4k** and `code c2m` here.\n\n- item one i1q\n- item two i2q\n\n```rust\nfn fenced_f7p() {}\n```\n";
-
-    fn is_color_sgr(params: &[u16]) -> bool {
-        params
-            .iter()
-            .any(|p| matches!(p, 30..=38 | 40..=48 | 90..=97 | 100..=107))
-    }
-
-    /// With `NO_COLOR` set the transcript printed on exit carries no colour
-    /// escape, while the reply's words are all there.
-    #[test]
-    #[serial]
-    fn the_transcript_printed_on_exit_honours_no_color() {
-        let dir = fresh_config_dir("dump-no-color");
-        let _guard = TempDirGuard(dir.clone());
-        let fake = FakeLlm::start(vec![Reply::Text(MARKDOWN_REPLY.to_string())]);
+        let fake = FakeLlm::start(vec![Reply::Text("the reply to keep r2v".to_string())]);
         write_fake_llm_config(&dir, &fake);
-        let mut pty = spawn_tui(&dir, &[("NO_COLOR", "1")]);
+        let config = dir.join("config.yaml");
+        let saving = fs::read_to_string(&config)
+            .unwrap()
+            .replace("save_session: false", "save_session: true");
+        fs::write(&config, saving).unwrap();
+        let mut pty = spawn_tui_with_args(&dir, &[], &["-s", "notes-p8w"]);
 
-        pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        pty.send(b"markdown please m9d\r").unwrap();
-        wait_for_squeezed(&mut pty, "fenced_f7p", "the reply");
+        pty.wait_for("notes-p8w", PTY_DEADLINE).unwrap();
+        pty.send(b"prompt to keep q5n\r").unwrap();
+        wait_for_squeezed(&mut pty, "the reply to keep r2v", "the reply");
         pty.read_for(Duration::from_millis(800));
         pty.send(b"\x04").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
 
-        let between = raw_between_leave_and_report(&pty);
-        let text = squeezed(&strip_ansi(&String::from_utf8_lossy(&between)));
-        for word in [
-            "Headingr6t",
-            "boldb4k",
-            "codec2m",
-            "itemtwoi2q",
-            "fenced_f7p",
-        ] {
-            assert!(
-                text.contains(word),
-                "{word:?} missing from the dump: {text:?}"
-            );
-        }
-        let colored: Vec<Vec<u16>> = sgr_params(&between)
-            .into_iter()
-            .filter(|params| is_color_sgr(params))
-            .collect();
-        assert!(
-            colored.is_empty(),
-            "the dump carries colour under NO_COLOR: {colored:?}\n{:?}",
-            String::from_utf8_lossy(&between)
+        let printed = printed_after_the_leave(&pty);
+        assert_eq!(
+            printed.trim(),
+            "Session saved: notes-p8w (resume: coyote -s notes-p8w)",
+            "{printed:?}"
         );
     }
 
-    /// The non-blank text rows of a stretch of output, trimmed.
-    fn text_rows(raw: &[u8]) -> Vec<String> {
-        strip_ansi(&String::from_utf8_lossy(raw))
-            .lines()
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect()
-    }
-
-    /// The reply rows the transcript printed on exit holds are the rows the
-    /// plain REPL prints for the same reply, in the same order.
+    /// An agent's session is filed under the agent's own sessions dir, which
+    /// `coyote -s` alone does not search, so its resume line names the agent.
     #[test]
     #[serial]
-    fn the_transcript_printed_on_exit_renders_the_reply_like_the_repl() {
-        let repl_dir = fresh_config_dir("dump-vs-repl-repl");
-        let _repl_guard = TempDirGuard(repl_dir.clone());
-        let fake = FakeLlm::start(vec![Reply::Text(MARKDOWN_REPLY.to_string())]);
-        write_fake_llm_config(&repl_dir, &fake);
-        let mut repl = spawn_repl_under(&repl_dir, &[], WAIT_WRAPPER, "/dev/tty");
-        let from = wait_for_repl_prompt(&mut repl, "fake-model)>", 0);
-        repl.send(b"markdown please m9d\r").unwrap();
-        repl.wait_for_after("fenced_f7p", from, PTY_DEADLINE)
-            .unwrap();
-        let replied = find(repl.raw(), b"fenced_f7p", from)
-            .expect("the reply was seen in the stripped transcript but not in the raw bytes");
-        wait_for_repl_prompt(&mut repl, "fake-model)>", replied);
-        let repl_rows = text_rows(&repl.raw()[from..]);
-        repl.send(b"\x04").unwrap();
-        let transcript = repl.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-        assert_eq!(exit_code(&transcript), 0, "{transcript}");
-        assert_tty_restored(&transcript);
-        let start = repl_rows
-            .iter()
-            .position(|row| row.contains("Heading r6t"))
-            .unwrap_or_else(|| panic!("the REPL printed no heading: {repl_rows:#?}"));
-        let end = repl_rows
-            .iter()
-            .position(|row| row.contains("fenced_f7p"))
-            .unwrap();
-        let repl_reply = &repl_rows[start..=end];
-
-        let dir = fresh_config_dir("dump-vs-repl-tui");
+    fn an_agent_session_exit_names_the_agent_in_the_resume_line() {
+        let dir = fresh_config_dir("exit-agent-session");
         let _guard = TempDirGuard(dir.clone());
-        let fake = FakeLlm::start(vec![Reply::Text(MARKDOWN_REPLY.to_string())]);
+        let fake = FakeLlm::start(vec![Reply::Text("the agent reply m6t".to_string())]);
         write_fake_llm_config(&dir, &fake);
-        let mut pty = spawn_tui(&dir, &[]);
-        pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        pty.send(b"markdown please m9d\r").unwrap();
-        wait_for_squeezed(&mut pty, "fenced_f7p", "the reply");
+        let config = dir.join("config.yaml");
+        let saving = fs::read_to_string(&config)
+            .unwrap()
+            .replace("save_session: false", "save_session: true");
+        fs::write(&config, saving).unwrap();
+        let agent_dir = dir.join("agents/probe-agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            "name: probe-agent\n\
+             description: a test agent\n\
+             version: 0.1.0\n\
+             instructions: |\n\
+             \x20 You are a probe agent. Reply briefly.\n",
+        )
+        .unwrap();
+        let mut pty = spawn_tui_with_args(&dir, &[], &["-a", "probe-agent", "-s", "notes-a3k"]);
+
+        pty.wait_for("notes-a3k", PTY_DEADLINE).unwrap();
+        pty.send(b"prompt for the agent w9d\r").unwrap();
+        wait_for_squeezed(&mut pty, "the agent reply m6t", "the agent reply");
         pty.read_for(Duration::from_millis(800));
         pty.send(b"\x04").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
-        let dumped = text_rows(&raw_between_leave_and_report(&pty));
-        let at = dumped
-            .iter()
-            .position(|row| row.contains("Heading r6t"))
-            .unwrap_or_else(|| panic!("the dump holds no heading: {dumped:#?}"));
-        let dump_reply: Vec<String> = dumped[at..]
-            .iter()
-            .take(repl_reply.len())
-            .cloned()
-            .collect();
-        assert_eq!(dump_reply, repl_reply, "dump rows differ from the REPL's");
+
+        let printed = printed_after_the_leave(&pty);
+        assert_eq!(
+            printed.trim(),
+            "Session saved: notes-a3k (resume: coyote -a probe-agent -s notes-a3k)",
+            "{printed:?}"
+        );
     }
 
     /// A job that shrugs off SIGTERM: it records its pid and loops forever.
@@ -1595,7 +1439,7 @@ mod binary_exit {
 
     /// `x` on a job that ignores SIGTERM starts a cancel that has to sit
     /// through the kill grace; the user leaves at once. The exit is bounded,
-    /// exits 0, restores the terminal and prints the transcript.
+    /// exits 0 and restores the terminal.
     #[test]
     #[serial]
     fn leaving_during_a_slow_roster_cancel_is_bounded_and_clean() {
@@ -1656,23 +1500,15 @@ mod binary_exit {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(300));
-        let from = pty.raw().len();
         let started = std::time::Instant::now();
         pty.send(b"\x04").unwrap();
         let transcript = pty
             .wait_for("tty-probe-done", Duration::from_secs(40))
             .unwrap_or_else(|err| panic!("the UI did not leave within 40s: {err:?}"));
         let took = started.elapsed();
-        let tail = String::from_utf8_lossy(&pty.raw()[from..]).to_string();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
         assert!(!transcript.contains("panicked"), "{transcript}");
-        let printed = strip_ansi(&tail);
-        let left = printed.rfind("exit=").unwrap_or(printed.len());
-        assert!(
-            printed[..left].contains("s5w"),
-            "the transcript was not printed on exit:\n{printed}"
-        );
         assert!(
             took < Duration::from_secs(30),
             "leaving during a slow cancel took {took:?}"

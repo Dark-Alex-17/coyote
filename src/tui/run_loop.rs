@@ -1,4 +1,5 @@
 use super::command_timing::{self, Timing};
+use super::context::{self, SAVED_SESSION_LINE};
 use super::control::{TurnOutcome, spawn_control_request, spawn_exit, spawn_run_now, spawn_turn};
 use super::events::SystemClock;
 use super::lend::{OwnerGuard, TtyHandles, remember_tty};
@@ -8,9 +9,9 @@ use super::rewind::apply_rewind;
 use super::run_now::{CommandOutput, replay_deferred};
 use super::sink::{LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use super::terminal::Screen;
-use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, dump, events, queued, redirect, render};
+use super::{App, CONTROL_TASK_WAIT, Command, FooterInfo, events, queued, redirect, render};
 use crate::client::Model;
-use crate::config::{CommandPrefix, RequestContext};
+use crate::config::{CommandPrefix, ExitedSession, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::repl::{
     EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, PreparedPaste, is_command, prepare_clipboard_paste,
@@ -47,6 +48,8 @@ pub(super) const EXIT_TEARDOWN_WAIT: Duration = CONTROL_TASK_WAIT
 /// loop.
 const TYPEAHEAD_GRACE: Duration = Duration::from_millis(5);
 pub(super) const TYPEAHEAD_LIMIT: usize = 50;
+/// The command the resume hint on the way out tells the user to run.
+const BINARY_NAME: &str = "coyote";
 
 struct BusSubscription(SubscriptionId);
 
@@ -419,8 +422,9 @@ enum Step {
 /// Why the loop stopped.
 pub(super) enum Leave {
     /// The teardown task ran on the alternate screen; its result and
-    /// whatever it printed come along.
-    Finished(Result<()>, String),
+    /// whatever it printed come along, with how to resume the session it
+    /// left on disk.
+    Finished(Result<()>, String, Option<ExitedSession>),
     /// A termination signal or a closed stdin: nobody is left to answer a
     /// prompt, so the teardown runs after the screen is restored, on the
     /// context the turn handed back (or never left). Boxed for its size.
@@ -432,23 +436,6 @@ pub(super) enum Leave {
     /// the loop already fed to the app comes along: the panic message
     /// arrives that way, and the app is never drawn again.
     Lost(tokio::task::JoinError, Vec<String>),
-}
-
-/// Where the transcript printed on the way out goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DumpRoute {
-    /// Fd 1, back to the terminal once the work task let go of it.
-    Terminal,
-    /// The screen's own descriptor: a task left running still holds fds
-    /// 1 and 2 captured, and what went there would never be seen.
-    ScreenFd,
-}
-
-pub(super) fn dump_route(leave: &Leave) -> DumpRoute {
-    match leave {
-        Leave::Outlived(_) => DumpRoute::ScreenFd,
-        Leave::Finished(..) | Leave::Abandoned(_) | Leave::Lost(..) => DumpRoute::Terminal,
-    }
 }
 
 /// The work task the UI gave up waiting for.
@@ -561,6 +548,30 @@ fn write_to_terminal(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(text.as_bytes());
     let _ = out.flush();
+}
+
+/// The line the exit leaves on the restored terminal for a session it left
+/// on disk; nothing for no session or a discarded one.
+pub(super) fn saved_session_line(session: Option<&ExitedSession>) -> Option<String> {
+    session.map(|ExitedSession { name, agent }| match agent {
+        Some(agent) => {
+            format!("Session saved: {name} (resume: {BINARY_NAME} -a {agent} -s {name})")
+        }
+        None => format!("Session saved: {name} (resume: {BINARY_NAME} -s {name})"),
+    })
+}
+
+/// What the exit printed goes to the restored terminal with its colours
+/// but without anything that could move the cursor or change a mode, and
+/// without the REPL's own save confirmation, which the resume line
+/// replaces. A terminal that is already gone (EIO after a hang-up) must
+/// not turn the write into a panic ahead of the hook drain.
+fn print_exit_output(captured: &str, session: Option<&ExitedSession>) {
+    let kept = context::without_lines_holding(captured, SAVED_SESSION_LINE);
+    write_to_terminal(&render::sanitize_ansi(kept.as_deref().unwrap_or(captured)));
+    if let Some(line) = saved_session_line(session) {
+        write_to_terminal(&format!("{line}\n"));
+    }
 }
 
 /// The stderr twin of `write_to_terminal`.
@@ -733,26 +744,9 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     if let Err(err) = screen.leave() {
         warn!("Failed to restore the terminal: {err}");
     }
-    // The transcript goes first, on every way out, so what the exit
-    // itself printed, or the message of a task that died, follows it.
-    if app.config.tui_dump_on_exit {
-        let text = dump::transcript_text(app.committed_cells(), &app.config);
-        if !text.is_empty() {
-            match dump_route(&leave) {
-                DumpRoute::Terminal => write_to_terminal(&text),
-                DumpRoute::ScreenFd => {
-                    let _ = screen.print_line(text.strip_suffix('\n').unwrap_or(&text));
-                }
-            }
-        }
-    }
-    // What the exit printed goes to the restored terminal with its colours
-    // but without anything that could move the cursor or change a mode.
-    // A terminal that is already gone (EIO after a hang-up) must not turn
-    // the write into a panic ahead of the hook drain below.
     let result = match leave {
-        Leave::Finished(result, captured) => {
-            write_to_terminal(&render::sanitize_ansi(&captured));
+        Leave::Finished(result, captured, session) => {
+            print_exit_output(&captured, session.as_ref());
             result
         }
         // The exit work gets the same bounded, unattended wait the loop
@@ -771,8 +765,8 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             )
             .await;
             match joined {
-                Join::Finished((_, result, captured)) => {
-                    write_to_terminal(&render::sanitize_ansi(&captured));
+                Join::Finished((returned, result, captured)) => {
+                    print_exit_output(&captured, returned.exited_session.as_ref());
                     result
                 }
                 Join::Panicked(err) => {
@@ -1091,8 +1085,8 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Task::Exit(handle)) => {
                         let (joined, late) = join_unattended(handle, rx, EXIT_TEARDOWN_WAIT).await;
                         match joined {
-                            Join::Finished((_, result, captured)) => {
-                                Leave::Finished(result, captured)
+                            Join::Finished((returned, result, captured)) => {
+                                Leave::Finished(result, captured, returned.exited_session)
                             }
                             Join::Panicked(err) => {
                                 Leave::Lost(err, with_late(app.exit_late_output(), late))
@@ -1322,7 +1316,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 Done::Exit(joined) => {
                     app.abandon_prompts();
                     return match joined {
-                        Ok((_, result, captured)) => Leave::Finished(result, captured),
+                        Ok((returned, result, captured)) => {
+                            Leave::Finished(result, captured, returned.exited_session)
+                        }
                         Err(err) => {
                             // The panic's message may still sit in the
                             // channel next to the join that won the select.

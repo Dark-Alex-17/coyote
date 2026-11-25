@@ -345,6 +345,15 @@ pub fn merged_session_names(workspace_dir: &Path, global_dir: &Path) -> Vec<Stri
     names
 }
 
+/// A session an exit left on disk, named the way the command line resumes
+/// it: `agent` is the agent whose session directory holds the file, which
+/// `coyote -s` alone does not search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExitedSession {
+    pub(crate) name: String,
+    pub(crate) agent: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -1417,20 +1426,23 @@ impl Session {
         self.autoname = Some(AutoName::new(name));
     }
 
+    /// Saves the session the way the user or `save_session` decides and
+    /// returns the name `coyote -s` resumes it by, when it ends up on disk.
+    /// `None` when the save was declined, never written, or skipped.
     pub fn exit(
         &mut self,
         session_dir: &Path,
         is_repl: bool,
         prompter: &dyn Prompter,
         origin: Origin,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let save_session = self.effective_save_session();
         if self.dirty && save_session != Some(false) {
-            let mut session_dir = session_dir.to_path_buf();
+            let mut save_dir = session_dir.to_path_buf();
             let mut session_name = self.name().to_string();
             if save_session.is_none() {
                 if !is_repl {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let save = PromptRequest {
                     default: Some(json!(false)),
@@ -1438,15 +1450,15 @@ impl Session {
                 };
                 let ans = ask(prompter, save)?.into_confirmed()?;
                 if !ans {
-                    return Ok(());
+                    return Ok(None);
                 }
                 if session_name == TEMP_SESSION_NAME {
                     session_name = ask_session_name(prompter, &origin)?;
                 }
             } else if save_session == Some(true) && session_name == TEMP_SESSION_NAME {
-                session_dir = session_dir.join(AUTONAME_PLACEHOLDER);
-                ensure_parent_exists(&session_dir).with_context(|| {
-                    format!("Failed to create directory '{}'", session_dir.display())
+                save_dir = save_dir.join(AUTONAME_PLACEHOLDER);
+                ensure_parent_exists(&save_dir).with_context(|| {
+                    format!("Failed to create directory '{}'", save_dir.display())
                 })?;
 
                 let now = chrono::Local::now();
@@ -1455,7 +1467,7 @@ impl Session {
                     session_name = format!("{session_name}-{autoname}")
                 }
             }
-            let session_path = session_dir.join(format!("{session_name}.yaml"));
+            let session_path = save_dir.join(format!("{session_name}.yaml"));
             self.save(&session_name, &session_path, is_repl)?;
         } else if is_repl
             && save_session == Some(true)
@@ -1465,7 +1477,23 @@ impl Session {
             // way a dirty exit does, without writing again.
             print_saved_to(Path::new(path));
         }
-        Ok(())
+        Ok(self.on_disk_name(session_dir))
+    }
+
+    /// The name `coyote -s` finds this session's existing file by: its path
+    /// under `session_dir` without the extension, so an auto-named session
+    /// keeps its `_/` folder.
+    fn on_disk_name(&self, session_dir: &Path) -> Option<String> {
+        let path = self.path().filter(|path| path.is_file())?;
+        let Ok(relative) = path.strip_prefix(session_dir) else {
+            return Some(self.name.clone());
+        };
+        let parts: Vec<_> = relative
+            .with_extension("")
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        Some(parts.join("/"))
     }
 
     pub fn save(&mut self, session_name: &str, session_path: &Path, is_repl: bool) -> Result<()> {
@@ -3140,7 +3168,7 @@ last_run:
         let before = read_to_string(&destination).unwrap();
         let modified_before = destination.metadata().unwrap().modified().unwrap();
 
-        session
+        let name = session
             .exit(
                 &sessions_dir,
                 true,
@@ -3149,6 +3177,7 @@ last_run:
             )
             .unwrap();
 
+        assert_eq!(name.as_deref(), Some("notes"));
         assert_eq!(read_to_string(&destination).unwrap(), before);
         assert_eq!(
             destination.metadata().unwrap().modified().unwrap(),
@@ -3188,7 +3217,7 @@ last_run:
         let (dir, sessions_dir) = unique_sessions_dir("exit-headless");
         let mut session = dirty_unsaved_session();
 
-        session
+        let name = session
             .exit(
                 &sessions_dir,
                 false,
@@ -3197,6 +3226,7 @@ last_run:
             )
             .unwrap();
 
+        assert_eq!(name, None);
         assert!(std::fs::read_dir(&sessions_dir).unwrap().next().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3208,10 +3238,11 @@ last_run:
         let mut session = dirty_unsaved_session();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
 
-        session
+        let name = session
             .exit(&sessions_dir, true, &prompter, Origin::detached())
             .unwrap();
 
+        assert_eq!(name, None);
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].action, PromptAction::Confirm);
@@ -3239,10 +3270,11 @@ last_run:
             depth: 1,
             node: None,
         };
-        session
+        let name = session
             .exit(&sessions_dir, true, &prompter, origin.clone())
             .unwrap();
 
+        assert_eq!(name.as_deref(), Some("my-sess-9z"));
         let requests = prompter.requests();
         assert!(requests.iter().all(|req| req.origin == origin));
         let questions: Vec<String> = requests.into_iter().map(|req| req.question).collect();
@@ -3257,6 +3289,63 @@ last_run:
         );
         assert!(sessions_dir.join("my-sess-9z.yaml").is_file());
         assert_eq!(session.name(), "my-sess-9z");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn exit_names_an_autosaved_temp_session_by_its_folder() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-autosaved");
+        let mut session = dirty_unsaved_session();
+        session.set_save_session(Some(true));
+
+        let name = session
+            .exit(
+                &sessions_dir,
+                true,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let stem = name.strip_prefix(AUTONAME_LABEL_PREFIX).unwrap();
+        assert!(
+            sessions_dir
+                .join(AUTONAME_PLACEHOLDER)
+                .join(format!("{stem}.yaml"))
+                .is_file()
+        );
+        let again = session
+            .exit(
+                &sessions_dir,
+                true,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
+            .unwrap();
+        assert_eq!(again, Some(name));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn exit_without_a_file_on_disk_names_nothing() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-no-file");
+        let mut session = Session::default();
+        session.set_save_session(Some(false));
+        session.mark_dirty();
+
+        let name = session
+            .exit(
+                &sessions_dir,
+                true,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
+            .unwrap();
+
+        assert_eq!(name, None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

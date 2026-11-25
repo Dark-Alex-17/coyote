@@ -4086,8 +4086,8 @@ mod binary_wizards {
     //! reined in, and however a case leaves the tty it ran on must come back
     //! in its cooked, echoing state (the prompter-routed menus answered from
     //! a clean config dir, and the runs with no human to ask, live in
-    //! `binary_menus`, and the transcript printed on the normal screen when
-    //! the UI leaves in `binary_exit` in `tui_lifecycle_and_signals.rs`).
+    //! `binary_menus`, and what the UI prints on the normal screen when it
+    //! leaves in `binary_exit` in `tui_lifecycle_and_signals.rs`).
     //! Each case runs the binary
     //! on a pseudo-terminal under a bash wrapper that reports the exit code
     //! and `stty -a` afterwards, so the module is unix-only. The cases run one
@@ -5352,15 +5352,13 @@ mod binary_wizards {
     /// transcript starts afresh at a `left session ... saved` divider, which
     /// stands in for the REPL's `Saved the session to '<path>'` line, the
     /// footer goes back to "no session", the UI keeps taking keys, and
-    /// nothing of the line leaks to the normal screen after Ctrl+D. The
-    /// transcript printed on exit is switched off, so the normal screen
-    /// holds only what leaked.
+    /// nothing of the line leaks to the normal screen after Ctrl+D.
     #[test]
     #[serial]
     fn dot_exit_session_saving_on_y_says_saved_on_a_divider_over_a_fresh_view() {
         let dir = fresh_config_dir("exit-session-saved-line");
         let _guard = TempDirGuard(dir.clone());
-        write_config(&dir, "tui_dump_on_exit: false\n");
+        write_config(&dir, "");
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -5433,15 +5431,13 @@ mod binary_wizards {
         );
     }
 
-    /// `.exit` on a dirty temp session, answered `y` and named: the exit
-    /// work's own output (the same `Saved the session to '<path>'` line) is
-    /// not lost with the alternate screen; it is carried to the normal screen
-    /// after the UI left, exactly once, before the shell gets the terminal
-    /// back (above the wrapper's report), with the tty cooked and the file
-    /// written.
+    /// `.exit` on a dirty temp session, answered `y` and named: once the UI
+    /// left, the normal screen holds one line naming the session and how to
+    /// resume it, in place of the REPL's `Saved the session to '<path>'`
+    /// line, with the tty cooked and the file written.
     #[test]
     #[serial]
-    fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen() {
+    fn dot_exit_saving_the_session_on_y_leaves_the_resume_line_on_the_normal_screen() {
         let dir = fresh_config_dir("exit-saved-line");
         let _guard = TempDirGuard(dir.clone());
         write_config(&dir, "");
@@ -5456,34 +5452,16 @@ mod binary_wizards {
         pty.read_for(HOTKEY_GAP);
         pty.send(b"y").unwrap();
         pty.wait_for("ession name", PTY_DEADLINE).unwrap();
-        let named_at = pty.raw().len();
         answer_field_modal(&mut pty, "saved-w9-exit");
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
 
-        let left_at = rfind(pty.raw(), LEAVE_ALT).expect("no leave sequence");
-        let saved_at = find(pty.raw(), SAVED_LINE, named_at).unwrap_or_else(|| {
-            panic!("the save confirmation was lost with the screen:\n{transcript}")
-        });
-        assert!(
-            saved_at > left_at,
-            "the confirmation was drawn inside the alternate screen only, not carried out:\n{transcript}"
-        );
-        let report_at = find(pty.raw(), b"exit=", left_at).expect("no exit= line");
-        assert!(
-            saved_at < report_at,
-            "the confirmation came after the shell took the terminal back:\n{transcript}"
-        );
+        let printed = printed_after_the_leave(&pty);
         assert_eq!(
-            count(&pty.raw()[named_at..], SAVED_LINE),
-            1,
-            "the confirmation was printed more than once:\n{transcript}"
-        );
-        let after_leave = strip_ansi(&String::from_utf8_lossy(&pty.raw()[left_at..]));
-        assert!(
-            after_leave.contains("saved-w9-exit.yaml"),
-            "the confirmation does not name the written file:\n{after_leave}"
+            printed.trim(),
+            "Session saved: saved-w9-exit (resume: coyote -s saved-w9-exit)",
+            "{printed:?}"
         );
         assert!(
             walk(&dir)

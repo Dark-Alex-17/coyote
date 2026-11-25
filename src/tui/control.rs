@@ -481,10 +481,6 @@ impl App {
             self.exiting = true;
             self.transcript.clear_welcome();
             self.exit_first_cell = self.transcript.len();
-            self.committed_end = self
-                .turn
-                .as_ref()
-                .map_or(self.exit_first_cell, |turn| turn.first_cell);
             // The teardown owns the context now; nothing may act beside it.
             self.control = None;
             self.roster_sources = RosterSources::default();

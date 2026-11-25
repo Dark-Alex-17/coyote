@@ -4,9 +4,10 @@ use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
-    KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
-    list_session_names, merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
+    AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, ExitedSession,
+    INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope, SystemPromptSplit,
+    keep_token_budget, labeled_session_names, list_session_names, merged_session_names,
+    min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -625,6 +626,9 @@ pub struct RequestContext {
     /// under. Resolved once per graph run by `ensure_child_session_root`;
     /// forks and children copy the parent's handle.
     pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
+    /// How to resume the session the last `exit_session` left on disk;
+    /// `None` when that exit left nothing to resume.
+    pub(crate) exited_session: Option<ExitedSession>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -700,6 +704,7 @@ impl RequestContext {
         let prompter = default_prompter(&prompt_memory);
         Self {
             app,
+            exited_session: None,
             macro_flag: false,
             macro_non_isolated: false,
             info_flag: false,
@@ -791,6 +796,7 @@ impl RequestContext {
         let prompter = default_prompter(&prompt_memory);
         let mut ctx = Self {
             app,
+            exited_session: None,
             macro_flag: false,
             macro_non_isolated: false,
             info_flag,
@@ -923,6 +929,7 @@ impl RequestContext {
         };
         Self {
             app: Arc::clone(&self.app),
+            exited_session: None,
             macro_flag: self.macro_flag,
             macro_non_isolated: self.macro_non_isolated,
             info_flag: self.info_flag,
@@ -995,6 +1002,7 @@ impl RequestContext {
 
         Self {
             app,
+            exited_session: None,
             macro_flag: parent.macro_flag,
             macro_non_isolated: parent.macro_non_isolated,
             info_flag: parent.info_flag,
@@ -1815,8 +1823,19 @@ impl RequestContext {
         // The next session engaged in this context resolves its own root;
         // keeping this one would file its children under the exited uid.
         self.child_session_root = None;
-        exited.transpose()?;
-        Ok(())
+        match exited.transpose() {
+            Ok(name) => {
+                self.exited_session = name.flatten().map(|name| ExitedSession {
+                    name,
+                    agent: self.agent.as_ref().map(|agent| agent.name().to_string()),
+                });
+                Ok(())
+            }
+            Err(err) => {
+                self.exited_session = None;
+                Err(err)
+            }
+        }
     }
 
     /// The root context, excluding the forked context an isolated macro
@@ -12385,6 +12404,50 @@ mod tests {
         assert!(ctx.session.is_some());
         ctx.exit_session().unwrap();
         assert!(ctx.session.is_none());
+    }
+
+    fn exit_a_session_saved_on_disk(agent: Option<&str>) -> Option<ExitedSession> {
+        let _guard = TestConfigDirGuard::new("exited-session");
+        let mut ctx = create_test_ctx();
+        ctx.agent = agent.map(|name| {
+            Agent::test_new(AgentConfig {
+                name: name.to_string(),
+                ..AgentConfig::default()
+            })
+        });
+        let mut session = Session::default();
+        session
+            .save("notes-e5x", &ctx.session_file("notes-e5x"), false)
+            .unwrap();
+        ctx.session = Some(session);
+
+        ctx.exit_session().unwrap();
+
+        ctx.exited_session
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_records_the_engaged_agent_with_the_session_name() {
+        assert_eq!(
+            exit_a_session_saved_on_disk(Some("exit-agent-e5x")),
+            Some(ExitedSession {
+                name: "notes-e5x".to_string(),
+                agent: Some("exit-agent-e5x".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_without_an_agent_records_only_the_session_name() {
+        assert_eq!(
+            exit_a_session_saved_on_disk(None),
+            Some(ExitedSession {
+                name: "notes-e5x".to_string(),
+                agent: None,
+            })
+        );
     }
 
     #[test]

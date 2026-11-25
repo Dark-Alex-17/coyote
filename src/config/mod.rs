@@ -71,6 +71,7 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
 pub use self::round_chains::RoundChains;
+pub(crate) use self::session::ExitedSession;
 pub use self::session::{
     Session, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names, session_scope_dirs,
 };
@@ -261,7 +262,6 @@ pub struct Config {
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
     pub ui: UiMode,
-    pub tui_dump_on_exit: bool,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -368,7 +368,6 @@ impl Default for Config {
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
             ui: UiMode::default(),
-            tui_dump_on_exit: true,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -1634,9 +1633,6 @@ clients:
             "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
         ));
         assert!(CONFIG_TEMPLATE.contains(
-            "tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
-        ));
-        assert!(CONFIG_TEMPLATE.contains(
             "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
         ));
         assert!(CONFIG_TEMPLATE.contains(
@@ -1652,7 +1648,17 @@ clients:
                 !text.contains("COYOTE_UI"),
                 "{label} names COYOTE_UI, which coyote does not read"
             );
+            assert!(
+                !text.contains("tui_dump_on_exit"),
+                "{label} documents tui_dump_on_exit, which coyote no longer reads"
+            );
         }
+    }
+
+    #[test]
+    fn a_config_still_holding_tui_dump_on_exit_loads() {
+        let cfg = Config::load_from_str("ui: tui\ntui_dump_on_exit: true\n").unwrap();
+        assert_eq!(cfg.ui, UiMode::Tui);
     }
 
     #[test]
@@ -1692,9 +1698,6 @@ clients:
             "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
         ));
         assert!(example.contains(
-            "\ntui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
-        ));
-        assert!(example.contains(
             "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
         ));
         assert!(example.contains(
@@ -1705,7 +1708,6 @@ clients:
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
         assert_eq!(cfg.ui, UiMode::Repl);
-        assert!(cfg.tui_dump_on_exit);
         assert_eq!(cfg.theme, None);
     }
 

@@ -1,8 +1,9 @@
 use super::*;
+use crate::config::ExitedSession;
 use crate::tui::run_loop::{
-    AfterTurn, DumpRoute, ImmediateCommands, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished,
-    cancel_command, dump_route, finish_turn, flush_typeahead, join_unattended, purge_turn_queue,
-    quit_abort, restore_held_back, unqueue_held,
+    AfterTurn, ImmediateCommands, Join, TYPEAHEAD_LIMIT, Task, cancel_command, finish_turn,
+    flush_typeahead, join_unattended, purge_turn_queue, quit_abort, restore_held_back,
+    saved_session_line, unqueue_held,
 };
 #[cfg(unix)]
 use crate::tui::run_loop::{Termination, edit_in_editor};
@@ -244,22 +245,42 @@ async fn the_typeahead_flush_stops_at_its_limit() {
     assert_eq!(polled, TYPEAHEAD_LIMIT);
 }
 
-/// Only a task left running keeps fds 1 and 2 captured; its dump goes
-/// through the screen's descriptor, every other one to fd 1.
+fn exited(name: &str, agent: Option<&str>) -> ExitedSession {
+    ExitedSession {
+        name: name.to_string(),
+        agent: agent.map(str::to_string),
+    }
+}
+
 #[test]
-fn the_dump_goes_round_a_task_left_running() {
+fn a_saved_session_leaves_one_line_naming_how_to_resume_it() {
     assert_eq!(
-        dump_route(&Leave::Outlived(Unfinished::Turn)),
-        DumpRoute::ScreenFd
+        saved_session_line(Some(&exited("notes-4q", None))).as_deref(),
+        Some("Session saved: notes-4q (resume: coyote -s notes-4q)")
     );
     assert_eq!(
-        dump_route(&Leave::Outlived(Unfinished::Exit)),
-        DumpRoute::ScreenFd
+        saved_session_line(Some(&exited("_/20250101T120000-plan", None))).as_deref(),
+        Some("Session saved: _/20250101T120000-plan (resume: coyote -s _/20250101T120000-plan)")
+    );
+}
+
+#[test]
+fn an_agents_session_names_the_agent_in_its_resume_hint() {
+    assert_eq!(
+        saved_session_line(Some(&exited("notes-4q", Some("coder")))).as_deref(),
+        Some("Session saved: notes-4q (resume: coyote -a coder -s notes-4q)")
     );
     assert_eq!(
-        dump_route(&Leave::Finished(Ok(()), String::new())),
-        DumpRoute::Terminal
+        saved_session_line(Some(&exited("_/20250101T120000-plan", Some("coder")))).as_deref(),
+        Some(
+            "Session saved: _/20250101T120000-plan (resume: coyote -a coder -s _/20250101T120000-plan)"
+        )
     );
+}
+
+#[test]
+fn no_session_leaves_no_line() {
+    assert_eq!(saved_session_line(None), None);
 }
 
 /// The keyboard-enhancement probe inside `Screen::enter` reads the tty

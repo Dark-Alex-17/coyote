@@ -30,7 +30,6 @@ pub struct AppConfig {
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
     pub ui: UiMode,
-    pub tui_dump_on_exit: bool,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -138,7 +137,6 @@ impl Default for AppConfig {
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
             ui: UiMode::default(),
-            tui_dump_on_exit: true,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -252,7 +250,6 @@ impl AppConfig {
             keybindings: config.keybindings,
             command_prefix: config.command_prefix,
             ui: config.ui,
-            tui_dump_on_exit: config.tui_dump_on_exit,
             editor: config.editor,
             wrap: config.wrap,
             wrap_code: config.wrap_code,
@@ -1164,11 +1161,10 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn from_config_copies_ui_and_tui_dump_on_exit() {
+    fn from_config_copies_ui() {
         let cfg = Config {
             model_id: "test-model".to_string(),
             ui: UiMode::Tui,
-            tui_dump_on_exit: false,
             clients: vec![ClientConfig::default()],
             ..Config::default()
         };
@@ -1176,7 +1172,6 @@ mod tests {
         let app = AppConfig::from_config(cfg).unwrap();
 
         assert_eq!(app.ui, UiMode::Tui);
-        assert!(!app.tui_dump_on_exit);
     }
 
     /// `COYOTE_UI` is what coyote exports to its tools, not a setting:

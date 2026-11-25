@@ -19,8 +19,8 @@ mod binary_tools {
     //! After them: the Ctrl+T pager over a tool's whole output with its find
     //! and thread picker, the Alt+T roster cancelling a background job, and both
     //! with nothing to show, and the key help that `?` opens from the status
-    //! row's hint. The transcript printed when the UI leaves is checked in
-    //! `binary_exit` in `tui_lifecycle_and_signals.rs`.
+    //! row's hint. What the UI prints on the normal screen when it leaves is
+    //! checked in `binary_exit` in `tui_lifecycle_and_signals.rs`.
     //! Each case runs the binary on a pseudo-terminal under a bash wrapper
     //! that reports the exit code and `stty -a` afterwards, so the module is
     //! unix-only. The cases run one at a time: each spawn forks a session
@@ -4473,20 +4473,6 @@ mod binary {
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
         assert_tty_restored(&transcript);
-    }
-
-    /// On exit the committed transcript is written to the normal screen: after
-    /// a turn, Ctrl+D leaves the alternate screen and the user's prompt and the
-    /// reply are printed where the shell prompt will follow.
-    #[test]
-    #[serial]
-    fn ctrl_d_prints_the_committed_transcript_on_the_normal_screen() {
-        leaving_prints_the_transcript(
-            "ctrl-d-dump",
-            |pty, _| pty.send(b"\x04").unwrap(),
-            "prompt to keep u6j",
-            "the reply to keep v7k",
-        );
     }
 
     // ---------------------------------------------------------------------
