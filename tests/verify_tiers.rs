@@ -278,7 +278,7 @@ fn project_state(dir: &Path) -> Value {
     json!({ "project_dir": path_str(dir) })
 }
 
-fn round<'a>(cmd: &'a str) -> Vec<(&'a str, &'a str)> {
+fn round(cmd: &str) -> Vec<(&str, &str)> {
     vec![("LLM_AGENT_VAR_VERIFY_TIER", "round"), ("TEST_CMD", cmd)]
 }
 
