@@ -238,7 +238,9 @@ def remove_worktree(root, path):
 
 
 def mark_killed(root, key, status, error=KILLED_ERROR):
-    kill_group(status.get("cmd_pgid"))
+    # A dead or stale job's group id may already belong to another process.
+    if job_alive(status):
+        kill_group(status.get("cmd_pgid"))
     remove_worktree(root, status.get("worktree"))
     status.update(state="killed", finished_at=now_iso(), error=status.get("error") or error)
     write_status(root, key, status)
@@ -285,9 +287,12 @@ def cancel(root):
         status = read_status(root, key)
         if status is None or status.get("state") not in LIVE or status.get("root") != top:
             continue
-        # The job first, so it cannot store a record from a command killed under it.
-        kill_group(status.get("pgid"))
-        kill_group(status.get("cmd_pgid"))
+        # The job first, so it cannot store a record from a command killed
+        # under it; a job that is not alive is never signalled, since its
+        # group ids may already belong to other processes.
+        if job_alive(status):
+            kill_group(status.get("pgid"))
+            kill_group(status.get("cmd_pgid"))
         remove_worktree(root, status.get("worktree"))
         status.update(state="cancelled", finished_at=now_iso(), error="cancelled by a later gate in this worktree")
         write_status(root, key, status)

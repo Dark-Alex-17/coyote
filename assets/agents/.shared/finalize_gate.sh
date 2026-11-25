@@ -13,17 +13,18 @@
 # commit older than the record lies between it and HEAD.
 #
 # fmt runs over the tree but never changes it: every file it rewrote gets
-# its exact earlier bytes back. A rewritten file that belongs to the change
-# (the diff from FLOOR, else from the base a red suite is judged against,
-# else from HEAD, to the worktree, plus untracked files that are not
-# ignored) is not formatted, and turns the fmt result red with its path; one
-# outside the change is only noted.
+# its exact earlier bytes back. With FLOOR, a rewritten file that belongs to
+# the change (the diff from FLOOR to the worktree, plus untracked files that
+# are not ignored) is not formatted, and turns the fmt result red with its
+# path; one outside the change is only noted. Without FLOOR the change cannot
+# be measured, so any rewrite makes the fmt result unavailable.
 #
 # Prints {status: green|red|unavailable, tree, items}; `unavailable` means
 # nothing new failed but the suite could not be shown green: there is no test
 # command, or a red suite had no base to be compared with. Writes the
-# finalize verification record for the worktree tree, except when the status
-# is `unavailable` or a step timed out: such a record would decide nothing.
+# finalize verification record for the worktree tree, with the floor it ran
+# with, except when the status is `unavailable` or a step timed out: such a
+# record would decide nothing.
 set -uo pipefail
 
 shared=$(cd "$(dirname "$0")" && pwd)
@@ -106,23 +107,6 @@ change_paths() {
   } | tr '\0' '\n' | LC_ALL=C sort -u
 }
 
-# change_base prints the commit the change is measured from.
-change_base() {
-  local found='{}'
-  if [[ -n "$floor_sha" ]]; then
-    printf '%s' "$floor_sha"
-    return
-  fi
-  if [[ -n "$test_cmd" ]]; then
-    found=$(python3 "$shared/base_suite.py" status --root "$dir" --cmd "$test_cmd" --chain 50 2>/dev/null) || found='{}'
-  fi
-  if [[ $(jq -r '.found // false' <<<"$found" 2>/dev/null) == true ]]; then
-    jq -r '.base' <<<"$found"
-  else
-    git -C "$top" rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null
-  fi
-}
-
 floor_sha=''
 if [[ -n "$floor" ]]; then
   floor_sha=$(git -C "$top" rev-parse --verify -q "$floor^{commit}" 2>/dev/null) || floor_sha=''
@@ -177,17 +161,23 @@ else
   done <<<"$before"
   run_step "$fmt_cmd"
   restore_rewritten
-  change=$(change_paths "$(change_base)")
   in_change=()
   outside=()
-  for path in ${REWRITTEN[@]+"${REWRITTEN[@]}"}; do
-    if printf '%s\n' "$change" | grep -Fqx -- "$path"; then
-      in_change+=("$path")
-    else
-      outside+=("$path")
-    fi
-  done
   note=''
+  if [[ -z "$floor_sha" ]]; then
+    if (( ${#REWRITTEN[@]} > 0 )); then
+      note="fmt rewrote files and no floor was given, so whether they belong to the change cannot be told: ${REWRITTEN[*]}; each was restored to its submitted bytes"
+    fi
+  else
+    change=$(change_paths "$floor_sha")
+    for path in ${REWRITTEN[@]+"${REWRITTEN[@]}"}; do
+      if printf '%s\n' "$change" | grep -Fqx -- "$path"; then
+        in_change+=("$path")
+      else
+        outside+=("$path")
+      fi
+    done
+  fi
   if (( ${#in_change[@]} > 0 )); then
     note="fmt rewrote files in the change, so they are not formatted: ${in_change[*]}; each was restored to its submitted bytes"
   fi
@@ -197,6 +187,8 @@ else
   note=${note:0:1500}
   if (( STEP_TIMED_OUT == 1 )); then
     add_result fmt "$fmt_cmd" "$STEP_RC" "$STEP_SECS" timed_out "killed after ${deadline} s${note:+; $note}"
+  elif (( STEP_RC == 0 )) && [[ -z "$floor_sha" ]] && (( ${#REWRITTEN[@]} > 0 )); then
+    add_result fmt "$fmt_cmd" 0 "$STEP_SECS" unavailable "$note"
   elif (( STEP_RC == 0 && ${#in_change[@]} == 0 )); then
     add_result fmt "$fmt_cmd" 0 "$STEP_SECS" green "$note"
   else
@@ -333,7 +325,8 @@ if jq -e '.status == "unavailable" or any(.items[]; .verdict == "timed_out")' >/
   echo "finalize_gate.sh: no record was written: a step timed out or the suite could not be judged" >&2
 elif [[ -n "$tree" ]]; then
   python3 "$shared/verify_record.py" write --root "$dir" --tier finalize --writer "$writer" \
-    --tree "$tree" --baseline-mode "$BASE_MODE${BASE_SHA:+ at $BASE_SHA}" < <(jq -sc '.' "$results_file") >/dev/null 2>&1 ||
+    --tree "$tree" --floor "$floor_sha" --baseline-mode "$BASE_MODE${BASE_SHA:+ at $BASE_SHA}" \
+    < <(jq -sc '.' "$results_file") >/dev/null 2>&1 ||
     echo "finalize_gate.sh: the finalize record could not be written" >&2
 else
   echo "finalize_gate.sh: git could not write a tree of the worktree, so no record was written" >&2

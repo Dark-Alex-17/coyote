@@ -17,7 +17,7 @@ it.
 CLI:
   verify_record.py tree [--root DIR]
   verify_record.py write --root DIR --tier round|finalize --writer NAME
-                         [--tree ID] [--baseline-mode MODE] < results.json
+                         [--tree ID] [--floor SHA] [--baseline-mode MODE] < results.json
   verify_record.py lookup --root DIR --tier round|finalize [--exclude DIR]...
 """
 
@@ -109,8 +109,10 @@ def record_path(root, tree, tier, rel=None):
     return os.path.join(store_dir(root), f"{tree}-{_sha16(rel)}-{tier}.json")
 
 
-def write(root, tier, results, writer, baseline_mode="", tree=None):
-    """Stores the record of `results` for the worktree tree (or `tree`) and returns its path."""
+def write(root, tier, results, writer, baseline_mode="", tree=None, floor=""):
+    """Stores the record of `results` for the worktree tree (or `tree`) and returns its path.
+
+    `floor` is the commit the writer measured the change from, empty when it had none."""
     if tier not in TIERS:
         raise ValueError(f"unknown tier {tier!r}")
     tree = tree or worktree_tree(root)
@@ -130,6 +132,7 @@ def write(root, tier, results, writer, baseline_mode="", tree=None):
         "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "writer": writer,
         "baseline_mode": baseline_mode,
+        "floor": floor,
         "results": results,
     }
     path = record_path(root, tree, tier, rel)
@@ -249,6 +252,7 @@ def main(argv=None):
     p_write.add_argument("--writer", required=True)
     p_write.add_argument("--tree", default="")
     p_write.add_argument("--baseline-mode", default="")
+    p_write.add_argument("--floor", default="")
     p_lookup = sub.add_parser("lookup")
     p_lookup.add_argument("--root", required=True)
     p_lookup.add_argument("--tier", required=True, choices=TIERS)
@@ -264,7 +268,7 @@ def main(argv=None):
         return 0
     if args.action == "write":
         results = json.load(sys.stdin)
-        print(write(args.root, args.tier, results, args.writer, args.baseline_mode, args.tree or None))
+        print(write(args.root, args.tier, results, args.writer, args.baseline_mode, args.tree or None, args.floor))
         return 0
     path, record = lookup(args.root, args.tier, args.exclude)
     if record is None:
