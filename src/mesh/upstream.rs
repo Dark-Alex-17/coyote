@@ -312,6 +312,9 @@ impl UpstreamWatch {
 pub(crate) struct UpstreamPoll {
     ticks: Interval,
     watch: UpstreamWatch,
+    /// When the next settle read is due, kept across a wait another event cut short so
+    /// the read resumes rather than starts over.
+    settle_at: Option<tokio::time::Instant>,
 }
 
 impl UpstreamPoll {
@@ -321,6 +324,7 @@ impl UpstreamPoll {
         Self {
             ticks,
             watch: UpstreamWatch::with_addresses(addresses),
+            settle_at: None,
         }
     }
 
@@ -329,13 +333,19 @@ impl UpstreamPoll {
         self.ticks.tick().await;
     }
 
-    /// Waits for the next read: `SETTLE_READ` while a transition settles, after which the
-    /// regular ticks restart a whole `UPSTREAM_POLL` on; the next tick otherwise.
+    /// Waits for the next read: `SETTLE_READ` after the last one while a transition
+    /// settles, after which the regular ticks restart a whole `UPSTREAM_POLL` on; the next
+    /// tick otherwise. Cancel-safe: a wait dropped for another event keeps its deadline.
     pub(crate) async fn tick_for(&mut self, settling: bool) {
         if settling {
-            tokio::time::sleep(SETTLE_READ).await;
+            let at = *self
+                .settle_at
+                .get_or_insert_with(|| tokio::time::Instant::now() + SETTLE_READ);
+            tokio::time::sleep_until(at).await;
+            self.settle_at = None;
             self.ticks.reset();
         } else {
+            self.settle_at = None;
             self.tick().await;
         }
     }
@@ -959,6 +969,20 @@ mod tests {
         assert!(UPSTREAM_POLL <= Duration::from_secs(10));
         assert!(SETTLE_READ < GREETING_DEBOUNCE);
         assert!(SETTLE_CAP > GREETING_DEBOUNCE);
+    }
+
+    /// A settle read whose wait another event cut short resumes at its deadline instead of
+    /// waiting a whole `SETTLE_READ` again, so a burst of events cannot hold it off.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_read_cut_short_resumes_at_its_deadline() {
+        let mut poll = UpstreamPoll::new(None);
+        let started = tokio::time::Instant::now();
+        for _ in 0..4 {
+            let cut = tokio::time::timeout(Duration::from_secs(1), poll.tick_for(true)).await;
+            assert!(cut.is_err(), "cut short by the other event");
+        }
+        poll.tick_for(true).await;
+        assert_eq!(started.elapsed(), SETTLE_READ, "the first wait's deadline");
     }
 
     /// A LAN interface that goes from nobody to somebody has come back; its first reading,

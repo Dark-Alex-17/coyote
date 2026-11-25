@@ -339,6 +339,19 @@ impl fmt::Display for FetchError {
 
 impl std::error::Error for FetchError {}
 
+impl FetchError {
+    /// This error with the node's destination hash `hex`, where a link error's own text
+    /// spells it, replaced by `label`, as `PropagationError::naming_node` does for a post.
+    pub(crate) fn naming_node(self, hex: &str, label: &str) -> Self {
+        match self {
+            Self::Link(err) => {
+                Self::Link(crate::mesh::propagation::naming_node_in(err, hex, label))
+            }
+            other => other,
+        }
+    }
+}
+
 /// `60 s` for a whole number of seconds, `0.5 s` otherwise.
 fn seconds(after: Duration) -> String {
     if after.subsec_nanos() == 0 {

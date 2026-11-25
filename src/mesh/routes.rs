@@ -16,7 +16,7 @@ use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
 use crate::mesh::lan_count::RnsdLanReader;
 use crate::mesh::propagation::PropagationError;
 use crate::mesh::propagation_fetch::FetchError;
-use crate::mesh::request::{RequestError, redact_hashes, short};
+use crate::mesh::request::{MESSAGE_PATH, RequestError, redact_hashes, short};
 use crate::mesh::upstream::InterfaceTransitions;
 
 use log::debug;
@@ -219,16 +219,22 @@ pub(crate) fn return_home_candidates(
         .collect()
 }
 
-/// The `candidates` not in `asked_before`, each added to it: return home asks a
-/// destination once per transition however many interfaces come back in it.
+/// The `candidates` that read as a destination hash and are not in `asked_before`, with
+/// their hash, each added to it: return home asks a destination once per transition
+/// however many interfaces come back in it.
 fn claim_unasked(
     candidates: Vec<String>,
-    asked_before: &parking_lot::Mutex<HashSet<String>>,
-) -> Vec<String> {
+    asked_before: &Mutex<HashSet<String>>,
+) -> Vec<(String, AddressHash)> {
     let mut asked = asked_before.lock();
     candidates
         .into_iter()
-        .filter(|destination| asked.insert(destination.clone()))
+        .filter_map(|destination| {
+            let hash = AddressHash::new_from_hex_string(&destination).ok()?;
+            asked
+                .insert(destination.clone())
+                .then_some((destination, hash))
+        })
         .collect()
 }
 
@@ -634,7 +640,7 @@ impl Routes<'_> {
         &self,
         returned: &str,
         wanted: &HashSet<String>,
-        asked_before: &parking_lot::Mutex<HashSet<String>>,
+        asked_before: &Mutex<HashSet<String>>,
     ) -> usize {
         let Some(rows) = self.rnsd_rows().await else {
             return 0;
@@ -643,15 +649,11 @@ impl Routes<'_> {
             .into_iter()
             .map(|row| (row.hash.to_hex_string(), row.interface, row.hops))
             .collect();
-        let candidates = claim_unasked(
+        let mut asked = 0;
+        for (destination, hash) in claim_unasked(
             return_home_candidates(&rows, returned, wanted),
             asked_before,
-        );
-        let mut asked = 0;
-        for destination in candidates {
-            let Ok(hash) = AddressHash::new_from_hex_string(&destination) else {
-                continue;
-            };
+        ) {
             debug!(
                 "Mesh is asking again for the path to {}, which runs the long way round now that {returned} is back",
                 short(&destination)
@@ -669,18 +671,14 @@ impl Routes<'_> {
         &self,
         iface: AddressHash,
         wanted: &HashSet<String>,
-        asked_before: &parking_lot::Mutex<HashSet<String>>,
+        asked_before: &Mutex<HashSet<String>>,
     ) -> usize {
         let rows = self.own_rows().await;
         let mut asked = 0;
-        let candidates = claim_unasked(
+        for (destination, hash) in claim_unasked(
             return_home_candidates(&rows, &iface.to_hex_string(), wanted),
             asked_before,
-        );
-        for destination in candidates {
-            let Ok(hash) = AddressHash::new_from_hex_string(&destination) else {
-                continue;
-            };
+        ) {
             debug!(
                 "Mesh is asking for a shorter path to {} over an interface that came back",
                 short(&destination)
@@ -831,11 +829,14 @@ impl Routes<'_> {
         }
         // The first link never came up and the retry's did, so the request went out on
         // it: a silence now may be the answer still on its way, not a session that never
-        // heard it.
+        // heard it. Only a message is relabelled: its sender would otherwise store a
+        // second copy with a propagation node, while every other request keeps the
+        // timeout its caller reads as the session's silence.
         if first_never_linked
             && let Err(err) = &mut retried
             && let Some(failed) = link_error(err)
             && let RequestError::Timeout { path, after } = failed
+            && path == MESSAGE_PATH
         {
             debug!(
                 "Mesh request {path} to {dest8} went out on a link that came up late and was not answered within {:.1} s",
@@ -1402,6 +1403,26 @@ mod rnsd_tests {
             "The request went out on a mesh link that came up late, and no answer came within 30 s; it may have arrived"
         );
 
+        let status_timeout = RequestError::Timeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(30),
+        };
+        let run = recover(
+            "routes-recover-late-link-status",
+            Duration::from_secs(3600),
+            true,
+            Mark::No,
+            true,
+            Some(never_linked()),
+            Some(status_timeout.clone()),
+        )
+        .await;
+        assert_eq!(
+            run.outcome,
+            Err(status_timeout),
+            "only a message is relabelled; another request keeps the timeout its caller reads"
+        );
+
         let run = recover(
             "routes-recover-late-link-dropped",
             Duration::from_secs(3600),
@@ -1474,7 +1495,7 @@ mod rnsd_tests {
                 .count()
         };
         let wanted: HashSet<String> = [destination().to_hex_string()].into();
-        let asked = parking_lot::Mutex::new(HashSet::new());
+        let asked = Mutex::new(HashSet::new());
 
         assert_eq!(
             routes.return_home_rnsd(TEAM_RELAY, &wanted, &asked).await,
@@ -1501,7 +1522,7 @@ mod rnsd_tests {
                 .return_home_rnsd(TEAM_RELAY, &HashSet::new(), &asked)
                 .await,
             0,
-            "nothing the node wants"
+            "nothing wanted"
         );
         assert_eq!(
             routes.return_home_rnsd(TEAM_RELAY, &wanted, &asked).await,

@@ -86,8 +86,8 @@ use crate::mesh::trust::{
     row_derives,
 };
 use crate::mesh::upstream::{
-    InterfaceTransitions, LanPresence, MoveGreeting, TransitionSettle, UpstreamChange,
-    UpstreamPoll, host_addresses,
+    GREETING_DEBOUNCE, InterfaceTransitions, LanPresence, MoveGreeting, TransitionSettle,
+    UpstreamChange, UpstreamPoll, host_addresses,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
@@ -496,10 +496,15 @@ pub(crate) fn loopback_endpoint(endpoint: &str) -> bool {
             .is_some_and(|(host, _)| loopback_host(host))
 }
 
+/// The local rnsd's AutoInterfaces, together, as `LanPresence` names them. It matches no
+/// path-table interface name (those read `AutoInterfacePeer[...]`), so return home over a
+/// LAN that came back asks for every wanted destination routed the long way round.
+const RNSD_LAN: &str = "rnsd AutoInterfaces";
+
 /// Whether `host`, as a `private` interface names it, is this machine: its loopback, or
 /// one of `local_addresses`, the addresses of this host's own interfaces. A name other
 /// than `localhost` is never resolved, so it reads as another host.
-pub(crate) fn targets_this_host(host: &str, local_addresses: &[std::net::IpAddr]) -> bool {
+fn targets_this_host(host: &str, local_addresses: &[std::net::IpAddr]) -> bool {
     if loopback_host(host) {
         return true;
     }
@@ -510,10 +515,10 @@ pub(crate) fn targets_this_host(host: &str, local_addresses: &[std::net::IpAddr]
 }
 
 /// Whether the node reads the local rnsd's interface stats (the LAN row, the upstream
-/// watch and its greeting, the silent-LAN inputs): it is attached to rnsd's shared
-/// instance (`attached`), or a `private` interface dials an rnsd on this host, whose
-/// TCP server that is. A `private` interface to another host greets through its own
-/// reconnects instead.
+/// watch and its greeting, the silent-LAN inputs, the route facts): it is attached to
+/// rnsd's shared instance (`attached`), or a `private` interface dials an rnsd on this
+/// host, whose TCP server that is (see `rnsd_known` for when its readings count). A
+/// `private` interface to another host greets through its own reconnects instead.
 fn reads_local_rnsd(
     attached: bool,
     interfaces: &[MeshInterface],
@@ -561,9 +566,6 @@ fn plan_interfaces(interfaces: &[MeshInterface]) -> Vec<InterfacePlan> {
 
 /// The shared instance the `local` entry names, which is also where rnsd binds its RPC
 /// listener on Linux and Android.
-/// The local rnsd's AutoInterfaces, together, as `LanPresence` names them.
-const RNSD_LAN: &str = "AutoInterface";
-
 fn local_instance(config: &MeshConfig) -> String {
     config
         .interfaces()
@@ -843,6 +845,9 @@ pub(crate) struct MeshRuntime {
     interfaces: Mutex<Vec<JoinedInterface>>,
     /// The local rnsd's LAN host count; `None` without an attached `local` entry.
     rnsd_lan: Option<RnsdLanReader>,
+    /// The node attaches to rnsd's shared instance, so its reader counts before any read
+    /// reached rnsd; one built for a `private` interface counts only once one has.
+    rnsd_attached: bool,
     /// The rnsd TCP interfaces that went offline or came back and the host interfaces
     /// whose addresses changed, with when, as the interface watcher saw them.
     interface_transitions: InterfaceTransitions,
@@ -851,6 +856,8 @@ pub(crate) struct MeshRuntime {
     /// The destinations return home already asked a shorter path for in the transition
     /// being settled, so each is asked once per transition.
     return_home_asked: parking_lot::Mutex<HashSet<String>>,
+    /// When the return-home transition began, so sightings a read apart share it.
+    return_home_began: parking_lot::Mutex<Option<std::time::Instant>>,
     destination: Mutex<DestinationState>,
     /// Held shared for the node's lifetime so no process rotates the key it announces
     /// under; `None` once `shutdown` has released it. Outside `DestinationState` because a
@@ -1159,9 +1166,11 @@ impl MeshRuntime {
             transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
             rnsd_lan,
+            rnsd_attached: attached,
             interface_transitions: InterfaceTransitions::default(),
             route_book: RouteBook::default(),
             return_home_asked: parking_lot::Mutex::new(HashSet::new()),
+            return_home_began: parking_lot::Mutex::new(None),
             destination: Mutex::new(DestinationState {
                 dest,
                 hash,
@@ -1824,16 +1833,27 @@ impl MeshRuntime {
     }
 
     /// The reader of the local rnsd's interface stats, when the node attaches to it or a
-    /// `private` interface dials it.
+    /// `private` interface dials it: the upstream watch reads through it.
     pub(crate) fn rnsd_reader(&self) -> Option<&RnsdLanReader> {
         self.rnsd_lan.as_ref()
+    }
+
+    /// The reader as everything that judges by rnsd's state takes it (routes, the LAN row,
+    /// the silent-LAN note, the return-home LAN check): always for a node attached to
+    /// rnsd's shared instance, and for one that reaches it only through a `private`
+    /// interface once a read has reached it, so a `private` target on this host that is
+    /// not an rnsd (a tunnel to a remote relay, a relay of its own) changes nothing.
+    fn rnsd_known(&self) -> Option<&RnsdLanReader> {
+        self.rnsd_lan
+            .as_ref()
+            .filter(|reader| self.rnsd_attached || reader.reads_answered() > 0)
     }
 
     /// This node's routes over `transport`, for reading and replacing a stale path.
     pub(crate) fn routes<'a>(&'a self, transport: &'a Transport) -> Routes<'a> {
         Routes {
             transport,
-            rnsd: self.rnsd_lan.as_ref(),
+            rnsd: self.rnsd_known(),
             transitions: &self.interface_transitions,
             book: &self.route_book,
         }
@@ -1875,7 +1895,7 @@ impl MeshRuntime {
     /// watcher, which it never holds up.
     fn after_upstream_change(self: &Arc<Self>, change: &UpstreamChange, first_sighting: bool) {
         if first_sighting {
-            self.return_home_asked.lock().clear();
+            self.begin_return_home_transition();
         }
         let reconnected = change.reconnected.clone();
         let moved = !change.network_changed.is_empty();
@@ -1915,7 +1935,7 @@ impl MeshRuntime {
     /// a new one.
     fn after_lan_gained(self: &Arc<Self>, gained: Vec<String>, first_sighting: bool) {
         if first_sighting {
-            self.return_home_asked.lock().clear();
+            self.begin_return_home_transition();
         }
         self.spawn_route_work(move |runtime| async move {
             let Some(transport) = runtime.transport_handle().await else {
@@ -1953,7 +1973,7 @@ impl MeshRuntime {
             })
             .collect();
         let mut counts = Vec::new();
-        if let Some(transport) = self.transport.lock().await.clone() {
+        if let Some(transport) = self.transport_handle().await {
             for host in hosts {
                 counts.push((
                     host.to_hex_string(),
@@ -1962,8 +1982,7 @@ impl MeshRuntime {
             }
         }
         if let Some(lan) = self
-            .rnsd_lan
-            .as_ref()
+            .rnsd_known()
             .and_then(RnsdLanReader::reading_seen)
             .and_then(|reading| reading.lan)
         {
@@ -2001,7 +2020,7 @@ impl MeshRuntime {
     /// costs. No call is made.
     fn worth_weighing(&self, destination: &str) -> bool {
         let something_down = self.route_book.any_down()
-            || self.rnsd_lan.as_ref().is_some_and(|reader| {
+            || self.rnsd_known().is_some_and(|reader| {
                 reader
                     .tcp_interfaces_seen()
                     .is_some_and(|interfaces| interfaces.iter().any(|interface| !interface.online))
@@ -2016,9 +2035,23 @@ impl MeshRuntime {
                 }))
     }
 
+    /// Starts a new transition for return home: the destinations it asked are forgotten,
+    /// unless the last transition began within `GREETING_DEBOUNCE`, which this sighting
+    /// is then part of (an upstream, a LAN and an in-process interface seen back a read
+    /// apart are one network change).
+    fn begin_return_home_transition(&self) {
+        let now = std::time::Instant::now();
+        let mut began = self.return_home_began.lock();
+        if began.is_none_or(|at| now.saturating_duration_since(at) >= GREETING_DEBOUNCE) {
+            self.return_home_asked.lock().clear();
+            *began = Some(now);
+        }
+    }
+
     /// `after_upstream_change` for an in-process interface that connected again after a
-    /// disconnect.
+    /// disconnect: its return is a transition of its own.
     fn after_interface_back(self: &Arc<Self>, iface: AddressHash) {
+        self.begin_return_home_transition();
         self.spawn_route_work(move |runtime| async move {
             let Some(transport) = runtime.transport_handle().await else {
                 return;
@@ -2083,13 +2116,7 @@ impl MeshRuntime {
             })
             .collect();
         let transport = self.transport.lock().await.clone();
-        lan_readings(
-            transport.as_deref(),
-            &lan_hosts,
-            self.rnsd_lan.as_ref(),
-            effort,
-        )
-        .await
+        lan_readings(transport.as_deref(), &lan_hosts, self.rnsd_known(), effort).await
     }
 
     /// `LAN_SILENT_NOTE` for an empty result the user asked for: when the peer table holds
@@ -2117,7 +2144,7 @@ impl MeshRuntime {
         quick: Option<QuickRead>,
     ) -> Option<&'static str> {
         let interfaces = self.interface_states();
-        let reading = self.rnsd_lan.as_ref().map(RnsdLanReader::reading_seen);
+        let reading = self.rnsd_known().map(RnsdLanReader::reading_seen);
         let (rnsd_relay, rnsd_lan) = reading.map_or((false, false), rnsd_note_inputs);
         let has_lan = rnsd_lan || interfaces.iter().any(|status| status.kind == "lan");
         let known = knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now);
@@ -2164,8 +2191,8 @@ impl MeshRuntime {
     /// One patient read of the local rnsd, so its relay state is known before anyone asks;
     /// started once the node has joined. Nothing is told.
     async fn read_rnsd_once(&self) {
-        if self.rnsd_lan.is_some() {
-            let _ = self.lan_readings(ReadEffort::Patient).await;
+        if let Some(reader) = &self.rnsd_lan {
+            reader.read().await;
         }
     }
 
@@ -2796,10 +2823,11 @@ impl MeshRuntime {
             ..FetchOptions::default()
         };
         let node_hex = node.destination.address_hash.to_hex_string();
+        let label = self.propagation_node_label(&node_hex);
         self.routes(transport)
             .recovering(
                 &node.destination.address_hash,
-                || format!("propagation node {}", short(&node_hex)),
+                || label.clone(),
                 LinkTry {
                     link_timeout: defaults.link_timeout,
                     path_requested: defaults.path_requested,
@@ -2834,6 +2862,7 @@ impl MeshRuntime {
                 crate::mesh::routes::fetch_link_error,
             )
             .await
+            .map_err(|err| err.naming_node(&node_hex, &label))
     }
 
     /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
@@ -16378,6 +16407,34 @@ mod tests {
         assert_eq!(
             runtime.propagation_node_label(&"ab".repeat(16)),
             "propagation node abababab"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    /// Return home's transition: the first sighting forgets what was asked, and a sighting
+    /// within `GREETING_DEBOUNCE` of it (an in-process interface back a read after rnsd's
+    /// upstream) is part of the same one and forgets nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_return_home_transition_forgets_what_it_asked_once_per_debounce() {
+        let started = crate::mesh::test_support::started_runtime("node-return-home-began").await;
+        let runtime = &started.runtime;
+        runtime.return_home_asked.lock().insert("ab".repeat(16));
+        runtime.begin_return_home_transition();
+        assert!(runtime.return_home_asked.lock().is_empty(), "a new transition");
+        runtime.return_home_asked.lock().insert("cd".repeat(16));
+        runtime.begin_return_home_transition();
+        assert_eq!(
+            runtime.return_home_asked.lock().len(),
+            1,
+            "a sighting a moment later is the same transition"
+        );
+        *runtime.return_home_began.lock() =
+            Some(std::time::Instant::now() - GREETING_DEBOUNCE - Duration::from_secs(1));
+        runtime.begin_return_home_transition();
+        assert!(
+            runtime.return_home_asked.lock().is_empty(),
+            "a sighting past the debounce is a new transition"
         );
         runtime.shutdown().await.unwrap();
     }

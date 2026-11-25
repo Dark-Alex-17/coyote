@@ -265,11 +265,6 @@ impl fmt::Display for PropagationError {
                 "The propagation node started to answer, but the answer had not finished arriving within {:.1}s",
                 after.as_secs_f64()
             ),
-            Self::Link(RequestError::LateLinkUnanswered { after, .. }) => write!(
-                f,
-                "The link to the propagation node came up late and the transfer was not confirmed within {} s; the propagation node may hold the message",
-                after.as_secs_f64().round()
-            ),
             Self::Link(err) => write!(f, "{err}"),
             Self::TransferFailed => {
                 write!(f, "The transfer to the propagation node did not complete")
@@ -296,20 +291,25 @@ impl PropagationError {
     /// spells it (`no known path to destination <hex>`), replaced by `label`, the node as
     /// the user knows it: a propagation node is never named by its bare hash.
     pub(crate) fn naming_node(self, hex: &str, label: &str) -> Self {
-        let rename = |text: String| {
-            text.replace(&format!("destination {hex}"), label)
-                .replace(hex, label)
-        };
         match self {
-            Self::Link(RequestError::LinkNotOpened(text)) => {
-                Self::Link(RequestError::LinkNotOpened(rename(text)))
-            }
-            Self::Link(RequestError::LinkFailed(text)) => {
-                Self::Link(RequestError::LinkFailed(rename(text)))
-            }
-            Self::Link(RequestError::Send(text)) => Self::Link(RequestError::Send(rename(text))),
+            Self::Link(err) => Self::Link(naming_node_in(err, hex, label)),
             other => other,
         }
+    }
+}
+
+/// `err` with the propagation node's destination hash `hex`, where its own text spells it
+/// (`no known path to destination <hex>`), replaced by `label`; any other error as it is.
+pub(crate) fn naming_node_in(err: RequestError, hex: &str, label: &str) -> RequestError {
+    let rename = |text: String| {
+        text.replace(&format!("destination {hex}"), label)
+            .replace(hex, label)
+    };
+    match err {
+        RequestError::LinkNotOpened(text) => RequestError::LinkNotOpened(rename(text)),
+        RequestError::LinkFailed(text) => RequestError::LinkFailed(rename(text)),
+        RequestError::Send(text) => RequestError::Send(rename(text)),
+        other => other,
     }
 }
 
@@ -1282,6 +1282,14 @@ mod tests {
         assert_eq!(
             PropagationError::TransferFailed.naming_node(hex, label),
             PropagationError::TransferFailed
+        );
+        let sync = crate::mesh::propagation_fetch::FetchError::Link(RequestError::LinkNotOpened(
+            format!("no known path to destination {hex}"),
+        ))
+        .naming_node(hex, label);
+        assert!(
+            matches!(&sync, crate::mesh::propagation_fetch::FetchError::Link(RequestError::LinkNotOpened(text)) if text == "no known path to propagation node 9af2fd91 (configured)"),
+            "{sync:?}"
         );
     }
 

@@ -84,6 +84,8 @@ const REPLY_NEEDS_IN_REPLY_TO: &str = "kind: \"reply\" needs in_reply_to: the me
 
 const KIND_IS_REPLY_OR_NOTE: &str = "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message";
 
+const MAY_HAVE_ARRIVED_NEXT_ACTION: &str = "Do not send it again yet: it may have arrived. Check this session's inbox (mesh__check_inbox) for a reply first.";
+
 const UNKNOWN_THREAD_NEXT_ACTION: &str = "Omit thread to start a new conversation, or pass a thread that this session's own mesh__send/mesh__ask returned or that a message it received showed.";
 
 pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
@@ -891,6 +893,9 @@ fn send_error(err: &SendError) -> Value {
         SendError::NoAnswer(no_answer) => {
             result["next_action"] = json!(no_answer.next_action());
             result[PEER_SIDE_REMEDY] = json!(no_answer.to_string());
+        }
+        SendError::MayHaveArrived { .. } => {
+            result["next_action"] = json!(MAY_HAVE_ARRIVED_NEXT_ACTION);
         }
         _ => {}
     }
@@ -4808,6 +4813,19 @@ mod tests {
         assert_eq!(payload["dropped_parts"], 1);
         let text = inbox.to_string();
         assert!(!text.contains("\"bytes\""), "{text}");
+    }
+
+    #[test]
+    fn a_send_that_may_have_arrived_tells_the_model_not_to_send_it_again_yet() {
+        let err = SendError::MayHaveArrived {
+            destination: hex_lower(&[0xab; 16]),
+            who: "Ann / laptop".to_string(),
+            after: Duration::from_secs(30),
+        };
+        let value = send_error(&err);
+        assert_eq!(value["kind"], "may_have_arrived");
+        assert_eq!(value["message"], err.to_string());
+        assert_eq!(value["next_action"], MAY_HAVE_ARRIVED_NEXT_ACTION);
     }
 
     #[test]

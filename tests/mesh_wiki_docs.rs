@@ -11280,14 +11280,17 @@ fn the_pages_quote_the_late_link_send_the_node_label_and_the_hub_hold() {
         ),
         "src/mesh/message.rs no longer words the late-link send"
     );
-    let node = read(repo_root().join("src/mesh/node.rs"));
-    for piece in [
-        "\"propagation node {}{}\"",
-        "if configured { \" (configured)\" } else { \"\" }",
-    ] {
+    let label = string_literals(&method_body("src/mesh/node.rs", "propagation_node_label"));
+    for piece in ["propagation node {}{}", " (configured)"] {
         assert!(
-            node.contains(piece),
-            "src/mesh/node.rs no longer labels a propagation node with {piece:?}"
+            label.iter().any(|literal| literal == piece),
+            "propagation_node_label no longer labels a propagation node with {piece:?}: {label:?}"
+        );
+    }
+    for script in ["scripts/mesh-relay.sh", "scripts/mesh-relay.ps1"] {
+        assert!(
+            read(repo_root().join(script)).contains("ingress_control = No"),
+            "{script} no longer writes ingress_control = No, which the hub note promises"
         );
     }
 
@@ -11358,8 +11361,6 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
         "drops the route (in rnsd's table as well as its own), asks the network for a new one once, and tries the link once more before it reports anything",
         "every route over that interface counts as stale before its next request",
         "the trusted sessions and the propagation nodes reached the long way round over another interface are asked for once more",
-        "The ask goes out at the read that first sees the upstream back, within about 15 seconds of it, with no link having to fail first, and each destination is asked once per transition",
-        "A LAN that goes from reaching nobody to reaching someone (rnsd's AutoInterface, or Coyote's own `lan`) asks the same way.",
         "A route over an interface that is up always wins over one over an interface that is down, whatever their hops.",
         "`rnpath -d` is no longer needed after a move.",
         "A route over an interface that is up, and not just asked for, gets no extra try: its failure is reported as it is.",
@@ -11434,6 +11435,8 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         "Coyote reads again every 5 seconds until 10 seconds pass with nothing new (60 seconds at most)",
         "share one limit of four an hour, the same number a relay reconnect is held to, counted per transition and not per interface, and do not move the heartbeat",
         "the next poll that finds rnsd's upstream online announces once more when that comes after the transition settled",
+        "The ask goes out at the read that first sees the upstream back, within about 15 seconds of it, with no link having to fail first, and each destination is asked once per transition",
+        "A LAN that goes from reaching nobody to reaching someone (rnsd's AutoInterface, or Coyote's own `lan`) asks the same way.",
     ]) {
         assert!(
             moving.contains(needle),

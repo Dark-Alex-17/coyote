@@ -2189,6 +2189,11 @@ fn recipient_outcome(sent: Result<SendOutcome, SendError>) -> RecipientOutcome {
                 reason: SendError::Direct(wait).to_string(),
             }
         }
+        // The message left on a late link and may have arrived: its own sentence says so,
+        // and it is never counted unreachable.
+        Err(err @ SendError::MayHaveArrived { .. }) => RecipientOutcome::RetryLater {
+            reason: err.to_string(),
+        },
         Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
             RecipientOutcome::Refused {
                 reason: err.to_string(),
@@ -2228,6 +2233,22 @@ mod recipient_outcome_tests {
 
             assert_eq!(row, RecipientOutcome::RetryLater { reason: single });
         }
+    }
+
+    /// A message that left on a late link and may have arrived keeps the single send's
+    /// sentence in a broadcast row and is never counted unreachable.
+    #[test]
+    fn a_message_that_may_have_arrived_is_not_an_unreachable_row() {
+        let err = SendError::MayHaveArrived {
+            destination: "ab".repeat(16),
+            who: "Ann / laptop".to_string(),
+            after: Duration::from_secs(30),
+        };
+        let single = err.to_string();
+
+        let row = recipient_outcome(Err(err));
+
+        assert_eq!(row, RecipientOutcome::RetryLater { reason: single });
     }
 
     #[test]
