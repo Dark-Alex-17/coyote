@@ -18,6 +18,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -358,6 +359,7 @@ fn await_base(dir: &Path, key: &str) -> Value {
     serde_json::from_str(&fs::read_to_string(str_field(&out, "record")).unwrap()).unwrap()
 }
 
+#[cfg(unix)]
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
@@ -377,6 +379,7 @@ fn lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn worktree_count(dir: &Path) -> usize {
     git(dir, &["worktree", "list", "--porcelain"])
         .lines()
