@@ -317,16 +317,19 @@ Evidence required:
 
 ### Comment hygiene over the final diff
 
-Once the implementation is complete, and before the run's last review (the review gauntlet below;
-under batch cadence, the parent's batch review), run `comment-discipline`'s `## Final-diff pass`
-over the task's whole diff: `git diff --no-color --no-ext-diff <base>..HEAD` from the task's base
-commit, with the plan files excluded. Load `comment-discipline` and read every comment the diff adds
-beside the code it sits on. This is a judgement read, not a grep: decide keep, cut or reduce per
-comment. Hand the cut and reduce list (`<file:line> -- cut` or `<file:line> -- reduce to:
-<sentence>`) back to the coder: resume the SAME coder session, so its build and test gates run over
-the edits, and the review that follows gates them like any other change. Nothing to cut means no
-resume. Your final report carries the skill's `Comment hygiene:` line. A comment a later fix round
-adds is the code-review lane's `Comment hygiene` finding.
+Once the implementation is complete, and before the first review of the finished work (the review
+gauntlet below, or the independent code review when the gauntlet is not installed; under batch
+cadence, before you report to the parent), run `comment-discipline`'s `## Final-diff pass` over the
+task's whole diff:
+`git diff --no-color --no-ext-diff <base>..HEAD -- :/ ":(top,literal,exclude)<plans dir>"` from the
+task's base commit (drop the exclude when there is no plans dir inside the repo). Load
+`comment-discipline` and read every comment the diff adds beside the code it sits on. This is a
+judgement read, not a grep: decide keep, cut or reduce per comment. Hand the cut and reduce list
+(`<file:line> -- cut` or `<file:line> -- reduce to: <sentence>`) back to the coder:
+resume the SAME coder session, so its build and test gates run over the edits, and the review that
+follows gates them like any other change. Nothing to cut means no resume. Your final report carries
+`comment-discipline`'s `Comment hygiene:` line. A comment a later fix round adds is the code-review
+lane's `Comment hygiene` finding.
 
 <!-- when:review_cadence=batch -->
 ### Review cadence: batch (set by the parent orchestrator)
@@ -344,8 +347,8 @@ observability pass of your own on this task - doing so would review the same lin
 task scope and once more at batch scope. What you still do, unchanged: coder delegation with
 the full verification discipline (build + tests GREEN before you report - compile-atomicity is
 the floor the batch cadence rests on), the debt / decision / debris bookkeeping above, the
-`Design:` -> `Design decisions:` routing, and the final-report contract (FOLLOW-UPS, Debt left
-behind, Debris exemptions, Design decisions). Report the HEAD SHA of your last commit so the
+comment hygiene pass, the `Design:` -> `Design decisions:` routing, and the final-report contract
+(FOLLOW-UPS, Debt left behind, Debris exemptions, Design decisions, Comment hygiene). Report the HEAD SHA of your last commit so the
 orchestrator can anchor the batch delta. If the task's acceptance criteria are not executable
 commands, or the task touches more than one seam, STOP and report it as a plan defect - do not
 widen the task to compensate. Whetstone handling below still applies when human feedback was

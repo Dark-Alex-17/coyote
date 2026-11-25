@@ -233,14 +233,15 @@ fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
     assert_anchors(
         "coder/graph.yaml",
         &[
-            "behaviour that lives elsewhere in the codebase, or the decision",
+            "behaviour that lives elsewhere in the codebase, or the reason for",
             "A comment that restates easily read code is not written",
+            "A one-sentence why beside the code it explains is a",
         ],
     );
     assert_anchors(
         "file-reviewer/config.yaml",
         &[
-            "a `Comment hygiene` finding (an added comment that restates the code or narrates the plan) stays 🟡 WARNING, never a nitpick",
+            "`Comment hygiene` finding (an added comment that restates the code or narrates the plan) stays 🟡 WARNING, never a nitpick",
         ],
     );
 
@@ -255,12 +256,23 @@ fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
         pass < gauntlet,
         "the comment hygiene pass must come before the review gauntlet that gates it"
     );
-    let section = &sisyphus[pass..gauntlet];
+    let batch = sisyphus
+        .find("<!-- when:review_cadence=batch -->")
+        .expect("sisyphus has the batch cadence block");
+    assert!(
+        pass < batch,
+        "the comment hygiene pass must sit outside both cadence blocks so every cadence renders it"
+    );
+    assert!(
+        sisyphus[batch..gauntlet].contains("comment hygiene pass, the `Design:`"),
+        "the batch cadence's still-do list must name the comment hygiene pass"
+    );
+    let section = &sisyphus[pass..batch];
     for anchor in [
         "`comment-discipline`'s `## Final-diff pass`",
-        "git diff --no-color --no-ext-diff <base>..HEAD",
+        "git diff --no-color --no-ext-diff <base>..HEAD -- :/ \":(top,literal,exclude)<plans dir>\"",
         "resume the SAME coder session",
-        "before the run's last review",
+        "before the first review of the finished work",
         "`Comment hygiene:` line",
     ] {
         assert!(
@@ -295,6 +307,14 @@ fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
             "architect hygiene brief lost {anchor:?}"
         );
     }
+    let criteria = architect[end..]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        criteria.contains("or a removed or shortened comment, is not a code path change"),
+        "the hygiene gauntlet's behaviour criterion must cover the comment cuts"
+    );
     assert_anchors("architect/README.md", &["comments that restate the code"]);
 }
 

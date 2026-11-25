@@ -151,6 +151,8 @@ fn code_review_skill_owns_a_comment_hygiene_finding_class() {
             "**Comment hygiene** -- every comment the diff adds or rewrites",
             "Title each finding `Comment hygiene: <file:line>`",
             "untagged on purpose: rigor folding must not hide",
+            "the untagged rules do not, on",
+            "A one-sentence why beside the code it explains is a comment, not a",
             "`Comment hygiene: <n> added comments checked, <m> redundant`",
         ],
     );
