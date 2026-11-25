@@ -30,9 +30,6 @@ variables:
   - name: project_dir
     description: Project directory holding the change under review
     default: '.'
-  - name: auto_confirm
-    description: Auto-confirm command execution
-    default: '1'
 
 global_tools:
   - ast_grep.sh
@@ -41,7 +38,6 @@ global_tools:
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
-  - execute_command.sh
 
 instructions: |
   Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
