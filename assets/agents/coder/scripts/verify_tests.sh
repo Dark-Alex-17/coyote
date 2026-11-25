@@ -83,6 +83,7 @@ if [[ "$tier" == "round" ]]; then
     deferred=1
   fi
   job_started=0
+  no_job_why=''
   if ! command -v python3 >/dev/null 2>&1; then
     no_base_why="python3 is not available"
   elif [[ -z "$cmd" ]]; then
@@ -132,6 +133,10 @@ if [[ "$tier" == "round" ]]; then
     key=$(jq -r '.key // ""' <<<"$start_json")
     base=$(jq -r '.base // ""' <<<"$start_json")
     lazy_why="background job $(jq -r '(.state // "unknown") + ": " + (.error // "")' <<<"$start_json")"
+    if [[ $(jq -r '.state // ""' <<<"$start_json") == unsupported ]]; then
+      no_job_why=$(jq -r '.error // ""' <<<"$start_json")
+      lazy_why=$no_job_why
+    fi
     case "$mode" in
       reused)
         record=$(jq -r '.record' <<<"$start_json")
@@ -297,9 +302,15 @@ if [[ "$tier" == "round" ]]; then
   fi
   if (( deferred == 1 && job_started == 0 )) && [[ "$outcome" != timed_out ]]; then
     job_started=1
-    base_start >/dev/null || true
+    deferred_start=$(base_start) || deferred_start='{}'
+    if [[ $(jq -r '.state // ""' <<<"$deferred_start") == unsupported ]]; then
+      no_job_why=$(jq -r '.error // ""' <<<"$deferred_start")
+    fi
   fi
-  if (( deferred == 1 && job_started == 1 )); then
+  if (( deferred == 1 && job_started == 1 )) && [[ -n "$no_job_why" ]]; then
+    mode_now="lazy ($no_job_why)"
+    report_lines+=("No background base suite was started ($no_job_why); a red test is re-run at the base when it needs classifying.")
+  elif (( deferred == 1 && job_started == 1 )); then
     if [[ "$mode_now" == "$base_mode" ]]; then
       mode_now="background (deferred: build_lock)"
     fi
