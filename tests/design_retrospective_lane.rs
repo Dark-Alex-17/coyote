@@ -6,6 +6,20 @@
 use std::fs;
 use std::path::Path;
 
+const READ_ONLY_GLOBAL_TOOLS: [&str; 6] = [
+    "ast_grep.sh",
+    "fs_read.sh",
+    "fs_cat.sh",
+    "fs_grep.sh",
+    "fs_glob.sh",
+    "fs_ls.sh",
+];
+
+const MUTATING_GIT_VERBS: [&str; 11] = [
+    "commit", "checkout", "reset", "push", "add", "rm", "stash", "apply", "merge", "rebase",
+    "clean",
+];
+
 fn agent_file(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets/agents")
@@ -62,17 +76,18 @@ fn design_retrospective_agent_ships_read_only_with_explore_as_its_only_child() {
         variables.contains(&"project_dir"),
         "design-retrospective must declare project_dir, got {variables:?}"
     );
+    assert!(
+        !variables.contains(&"auto_confirm"),
+        "design-retrospective runs no confirmable commands and must not declare auto_confirm"
+    );
     let tools = string_list(&config, "global_tools");
-    for write_tool in ["fs_write.sh", "fs_patch.sh"] {
+    for tool in &tools {
         assert!(
-            !tools.iter().any(|t| t == write_tool),
-            "design-retrospective is read-only and must not grant {write_tool}, got {tools:?}"
+            READ_ONLY_GLOBAL_TOOLS.contains(&tool.as_str()),
+            "design-retrospective is read-only; global tool {tool} is not in the read-only \
+             allowlist {READ_ONLY_GLOBAL_TOOLS:?}"
         );
     }
-    assert!(
-        tools.iter().any(|t| t == "execute_command.sh"),
-        "design-retrospective needs execute_command.sh to read git history, got {tools:?}"
-    );
     assert_eq!(
         string_list(&config, "spawnable_agents"),
         ["explore"],
@@ -98,16 +113,71 @@ fn design_retrospective_prompt_carries_the_contract_and_the_core_question() {
         "These are examples to prompt judgement, not a checklist",
         "Never modify repository files.",
         "Never ask the user",
+        "Read every changed file IN FULL",
     ] {
         assert!(
             text.contains(anchor),
             "design-retrospective/instructions.md lost anchor {anchor:?}"
         );
     }
+    for file in ["instructions.md", "README.md", "config.yaml", "tools.sh"] {
+        assert!(
+            agent_file(&format!("design-retrospective/{file}")).is_ascii(),
+            "design-retrospective/{file} must stay ASCII"
+        );
+    }
+}
+
+/// The subcommand of every `git` invocation in `script`: the first word
+/// after `git` that is not an option, skipping the argument `-C` takes.
+fn git_subcommands(script: &str) -> Vec<String> {
+    let mut subcommands = Vec::new();
+    for line in script.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for (i, _) in words.iter().enumerate().filter(|(_, w)| **w == "git") {
+            let mut rest = words[i + 1..].iter();
+            while let Some(word) = rest.next() {
+                if *word == "-C" {
+                    rest.next();
+                } else if !word.starts_with('-') {
+                    subcommands.push(word.trim_matches(['"', '\'']).to_string());
+                    break;
+                }
+            }
+        }
+    }
+    subcommands
+}
+
+#[test]
+fn design_retrospective_git_tools_run_only_read_only_subcommands() {
+    let tools = agent_file("design-retrospective/tools.sh");
+    for function in [
+        "get_changed_files()",
+        "get_diff()",
+        "get_log()",
+        "_instructions()",
+    ] {
+        assert!(
+            tools.contains(function),
+            "design-retrospective/tools.sh must define {function}"
+        );
+    }
     assert!(
-        text.is_ascii(),
-        "design-retrospective/instructions.md must stay ASCII"
+        tools.contains("resolve_diff_base "),
+        "design-retrospective/tools.sh must resolve --base through the shared resolve_diff_base"
     );
+    let subcommands = git_subcommands(&tools);
+    assert!(
+        !subcommands.is_empty(),
+        "design-retrospective/tools.sh should run git; found no git invocations"
+    );
+    for verb in MUTATING_GIT_VERBS {
+        assert!(
+            !subcommands.iter().any(|s| s == verb),
+            "design-retrospective/tools.sh must not run `git {verb}`, got {subcommands:?}"
+        );
+    }
 }
 
 #[test]
@@ -220,5 +290,135 @@ fn architect_phase_f_steps_are_numbered_one_to_nine() {
             !phase_f.contains(stale),
             "Phase F still carries the pre-renumber range {stale:?}"
         );
+    }
+}
+
+/// Runs the design-retrospective git tools against a scratch repository.
+#[cfg(unix)]
+mod git_tools {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct ScratchDir(PathBuf);
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// Runs one tool with the argc variables in `envs`, returning
+    /// (exit code, stdout, stderr).
+    fn run_tool(project: &Path, function: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let agent = assets.join("agents/design-retrospective");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "source '{}'; {function}",
+                agent.join("tools.sh").display()
+            ))
+            .current_dir(project)
+            .env("LLM_ROOT_DIR", &assets)
+            .env("LLM_AGENT_ROOT_DIR", &agent)
+            .env("LLM_OUTPUT", "/dev/stdout")
+            .env("LLM_AGENT_VAR_PROJECT_DIR", project)
+            .envs(envs.iter().copied())
+            .output()
+            .expect("spawn bash");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// With one base commit and one change commit, the tools report exactly
+    /// the change, and an option-shaped `--base` that git would read as
+    /// `--output=<file>` is refused by every tool without writing.
+    #[test]
+    fn design_retrospective_git_tools_read_the_range_and_refuse_option_bases() {
+        for binary in ["bash", "git"] {
+            if which::which(binary).is_err() {
+                eprintln!("skipping: {binary} not available");
+                return;
+            }
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let scratch =
+            ScratchDir(std::env::temp_dir().join(format!("coyote-design-retro-{unique}")));
+        let repo = scratch.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&repo, &["add", "base.txt"]);
+        git(&repo, &["commit", "-q", "-m", "seed the base"]);
+        git(&repo, &["tag", "start"]);
+        fs::write(repo.join("feature.txt"), "feature body\n").unwrap();
+        git(&repo, &["add", "feature.txt"]);
+        git(&repo, &["commit", "-q", "-m", "add the feature"]);
+
+        let (code, out, err) = run_tool(&repo, "get_changed_files", &[("argc_base", "start")]);
+        assert_eq!(code, 0, "get_changed_files failed: {err}");
+        assert!(
+            out.contains("feature.txt") && !out.contains("base.txt"),
+            "get_changed_files --base start must list only the change: {out}"
+        );
+
+        let (code, out, err) = run_tool(&repo, "get_log", &[("argc_base", "start")]);
+        assert_eq!(code, 0, "get_log failed: {err}");
+        assert!(
+            out.contains("add the feature") && !out.contains("seed the base"),
+            "get_log --base start must list only the change's commits: {out}"
+        );
+
+        let (code, out, err) = run_tool(
+            &repo,
+            "get_diff",
+            &[("argc_base", "start"), ("argc_path", "feature.txt")],
+        );
+        assert_eq!(code, 0, "get_diff failed: {err}");
+        assert!(
+            out.contains("+feature body"),
+            "get_diff --path feature.txt must show that file's change: {out}"
+        );
+
+        let target = scratch.0.join("written-by-git");
+        let option_base = format!("--output={}", target.display());
+        for function in ["get_changed_files", "get_diff", "get_log"] {
+            let (code, out, _) = run_tool(&repo, function, &[("argc_base", &option_base)]);
+            assert_ne!(
+                code, 0,
+                "{function} must refuse the option-shaped base {option_base:?}: {out}"
+            );
+            assert!(
+                !target.exists(),
+                "{function} let git write {} through an option-shaped base",
+                target.display()
+            );
+        }
     }
 }

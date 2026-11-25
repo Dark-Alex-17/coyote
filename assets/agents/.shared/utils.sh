@@ -429,6 +429,41 @@ trim_output() {
   printf '%s' "${text:bytes-tail_bytes}"
 }
 
+##########################
+## GIT DIFF UTILITIES   ##
+##########################
+
+# Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so
+# commits that landed on the base after branching never surface as changes.
+# Explicit `..` ranges pass through, and so does a checkpoint commit on top of
+# HEAD that no ref holds, whose merge-base would be HEAD. Prints the base to
+# diff from. Returns 1 when there is no merge-base (printing the base as given)
+# and 2, printing nothing, for an option-shaped base that git would read as a
+# flag.
+# Usage: resolve_diff_base <project_dir> <base>
+resolve_diff_base() {
+  local project_dir="$1" base="$2" mb head commit held
+  case "${base}" in
+    -*) echo "error: --base '${base}' starts with '-'; pass a ref, a commit SHA or an a..b range" >&2; return 2 ;;
+    *..*) printf '%s' "${base}"; return ;;
+  esac
+  if mb=$(cd "${project_dir}" && git merge-base "${base}" HEAD 2>/dev/null) && [[ -n "${mb}" ]]; then
+    head=$(cd "${project_dir}" && git rev-parse HEAD 2>/dev/null) || head=""
+    commit=$(cd "${project_dir}" && git rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null) || commit=""
+    if [[ -n "${head}" && -n "${commit}" && "${mb}" == "${head}" && "${commit}" != "${head}" ]]; then
+      # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+      if held=$(cd "${project_dir}" && git for-each-ref --count=1 --contains "${commit}" 2>/dev/null) && [[ -z "${held}" ]]; then
+        printf '%s' "${base}"
+        return
+      fi
+    fi
+    printf '%s' "${mb}"
+  else
+    printf '%s' "${base}"
+    return 1
+  fi
+}
+
 ###########################
 ## FILE SEARCH UTILITIES ##
 ###########################
