@@ -7713,7 +7713,12 @@ mod modal_extremes_and_editor_failure {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"keep me m6k").unwrap();
-        pty.wait_for("keep me m6k", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "keep me m6k",
+            0,
+            "the typed draft never reached the composer",
+        );
         let before = pty.raw().len();
         pty.send(b"\x0f").unwrap();
         let left = pty
@@ -7762,7 +7767,12 @@ mod modal_extremes_and_editor_failure {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"keep me m6m").unwrap();
-        pty.wait_for("keep me m6m", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "keep me m6m",
+            0,
+            "the typed draft never reached the composer",
+        );
         let before = pty.raw().len();
         pty.send(b"\x0f").unwrap();
         pty.read_for(Duration::from_millis(1500));
@@ -7797,7 +7807,12 @@ mod modal_extremes_and_editor_failure {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"keep me m6s").unwrap();
-        pty.wait_for("keep me m6s", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "keep me m6s",
+            0,
+            "the typed draft never reached the composer",
+        );
         let before = pty.raw().len();
         pty.send(b"\x0f").unwrap();
         let left = pty

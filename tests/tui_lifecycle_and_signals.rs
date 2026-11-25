@@ -3566,7 +3566,12 @@ mod interrupt_and_paste {
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
         pty.send(b"undo-probe-h3x marker").unwrap();
-        pty.wait_for("undo-probe-h3x", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "undo-probe-h3x",
+            0,
+            "the typed draft never reached the composer",
+        );
         pty.read_for(Duration::from_millis(300));
         let sent_at = pty.raw().len();
         pty.send(b"\r").unwrap();
