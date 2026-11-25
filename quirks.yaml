@@ -91,53 +91,11 @@
       default_chunk_size: 2000
       max_batch_size: 100
     # legacy -- pruning candidates
-    - name: o4-mini-high
-      max_output_tokens: 100000
-      real_name: o4-mini
-      max_input_tokens: 200000
-      input_price: 1.1
-      output_price: 4.4
-      supports_vision: true
-      supports_function_calling: true
-      system_prompt_prefix: Formatting re-enabled
-      patch:
-        body:
-          reasoning_effort: high
-          max_tokens: null
-          temperature: null
-          top_p: null
-        responses:
-          body:
-            temperature: null
-            top_p: null
-            reasoning:
-              effort: high
     - name: o3-high
       real_name: o3
       max_input_tokens: 200000
       input_price: 2
       output_price: 8
-      supports_vision: true
-      supports_function_calling: true
-      system_prompt_prefix: Formatting re-enabled
-      patch:
-        body:
-          reasoning_effort: high
-          max_tokens: null
-          temperature: null
-          top_p: null
-        responses:
-          body:
-            temperature: null
-            top_p: null
-            reasoning:
-              effort: high
-    - name: o3-mini-high
-      max_output_tokens: 100000
-      real_name: o3-mini
-      max_input_tokens: 200000
-      input_price: 1.1
-      output_price: 4.4
       supports_vision: true
       supports_function_calling: true
       system_prompt_prefix: Formatting re-enabled

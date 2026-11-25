@@ -2309,19 +2309,27 @@ mod tests {
             .find(|p| p.provider == "openai")
             .expect("bundled models.yaml must carry an openai provider");
 
-        for (name, effort) in [
-            ("o4-mini", None),
-            ("o3", None),
-            ("o3-mini", None),
-            ("o4-mini-high", Some("high")),
-            ("o3-high", Some("high")),
-            ("o3-mini-high", Some("high")),
-        ] {
-            let data = openai
-                .models
-                .iter()
-                .find(|m| m.name == name)
-                .unwrap_or_else(|| panic!("model '{name}' missing from bundled models.yaml"));
+        let is_o_series = |name: &str| {
+            let mut chars = name.chars();
+            chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
+        };
+        let patched_o_series: Vec<_> = openai
+            .models
+            .iter()
+            .filter(|m| m.patch.is_some() && is_o_series(&m.name))
+            .collect();
+        assert!(
+            patched_o_series.iter().any(|m| !m.name.ends_with("-high")),
+            "bundled models.yaml must carry a patched o-series base model"
+        );
+        assert!(
+            patched_o_series.iter().any(|m| m.name.ends_with("-high")),
+            "bundled models.yaml must carry a patched o-series -high alias"
+        );
+
+        for data in patched_o_series {
+            let name = data.name.as_str();
+            let effort = name.ends_with("-high").then_some("high");
             let config = api_key_config("openai", None);
             let mut client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
             client.model = Model::from_config("openai", std::slice::from_ref(data)).remove(0);
