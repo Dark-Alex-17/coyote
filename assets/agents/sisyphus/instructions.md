@@ -670,14 +670,14 @@ brief says the parent orchestrator runs the run-closing retrospective.
 ```
 agent__spawn --agent design-retrospective --prompt "Run-closing design retrospective.
 Project: <absolute repo path>
-Diff: <the run base>
+Diff: <the task's base commit>
 What the work set out to do: <the request or plan summary, verbatim>
 Plans dir: <the run's planning files, read as bookkeeping; omit when none>"
 --variables {"project_dir": "<absolute repo path>"}
 ```
 
-The run base is the task's base commit (recorded before the first coder spawn; the same SHA
-`debt_scan` takes as `--base`). Pass it bare, never
+The task's base commit is the SHA recorded before the first coder spawn (the same SHA
+`debt_scan` takes as `--base`), not the run base. Pass it bare, never
 as `<base>..HEAD`: a bare base is diffed against the working tree, so committed and uncommitted
 work both show. Intent-add new files first (`git add -N <new files>`), as debt_scan does.
 
