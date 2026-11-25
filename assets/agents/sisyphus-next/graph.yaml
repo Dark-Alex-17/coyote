@@ -1992,8 +1992,8 @@ nodes:
       Read every comment the diff adds (code, doc, configuration and script
       comments) beside the code it sits on, and decide keep, cut or reduce
       against the skill's rule. A comment stays when it adds context the code
-      cannot show, documents behaviour used elsewhere, or records the decision
-      behind a choice; one that restates easily read code, repeats a name or a
+      cannot show, documents behaviour used elsewhere, or gives the reason for
+      a choice in a sentence; one that restates easily read code, repeats a name or a
       signature, or narrates the plan is cut; one sentence of real context
       buried in narration is reduced to that sentence. The repo's own comment
       standards come first: read sibling files with the tools when the diff

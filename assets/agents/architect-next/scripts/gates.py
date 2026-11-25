@@ -5065,7 +5065,7 @@ def integrate_route(state):
 HYGIENE_CRITERIA = (
     "These two are the ONLY criteria:\n"
     "- Behaviour unchanged: the full build and test suite is green and no production code path changed other than removal of "
-    "unreachable code and lapsed scaffolding; a `debris-exempt` token added to a justified line is not a code path change\n"
+    "unreachable code and lapsed scaffolding; a `debris-exempt` token added to a justified line, or a removed or shortened comment, is not a code path change\n"
     "- Debris gone: every `debris-exempt` token in the {scope} diff sits on a line the pass's own report names under its `HYGIENE:` "
     "heading, every other row under that heading cites its justification, and the {scope}-wide lint over the {SCOPE} base, "
     "`{lint_cmd}`, exits 0\n"
@@ -5090,7 +5090,7 @@ def _hygiene_brief(state, base, scope_word, ledger_lines, lint_cmd, pr_line):
         f"Run comment hygiene over the {scope_word}'s final diff per the comment-discipline skill's `## Final-diff pass`: read "
         f"every comment the same {base}..HEAD diff adds beside the code it sits on, and cut or reduce each one that does not earn "
         "its keep. It is a judgement read that follows the repo's own comment standards first, never a pattern match; a kept "
-        "comment needs no `HYGIENE:` row and is not a hit. Report the skill's `Comment hygiene:` line beside the `HYGIENE:` list.\n"
+        "comment needs no `HYGIENE:` row and is not a hit. Report comment-discipline's `Comment hygiene:` line beside the `HYGIENE:` list.\n"
         "For each hit: REMOVE it, or JUSTIFY it -- a justification must cite a repo convention at file:line or a recorded `## Quality bar` "
         "drop -- and report every kept item under a `HYGIENE:` heading (file:line, what, justification). A lint hit may be kept ONLY for "
         "the reasons the code-review skill sanctions (the glyph is the point, or the line must name the needles); such a line is marked "
