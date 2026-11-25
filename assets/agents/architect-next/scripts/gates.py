@@ -5145,6 +5145,7 @@ def retro_route(state):
                     "group": ref.get("group", ""), "unit": ref.get("unit", "run")}
             tasks.append(task)
             save_tasks(state, u, tasks)
+            snapshot(state, u, f"phase_f retro {tid}")
             for line in lines:
                 log_event(state, task, line)
             u.update({"integration_checked": False, "_next": "select_tasks"})

@@ -3816,12 +3816,14 @@ def _retro_adopted():
                                        retro_follow_ups=["Rework the poller"], integration_checked=True, retro_done=True))
     new = u["tasks"][-1] if u.get("tasks") else {}
     body = read_file(os.path.join(new.get("dir", ""), "index.md")) if new.get("dir") else ""
+    snap = json.loads(read_file(os.path.join(_retro_large()["run_dir"], "state.json")) or "{}")
     return (u["_next"] == "select_tasks" and len(u["tasks"]) == len(ts_f) + 1 and new.get("status") == "pending"
             and new.get("type") == "chore" and new.get("title") == "Run-closing design refactor"
             and new.get("blocked_by") == [T1, T2, T3] and u.get("integration_checked") is False
             and "- One table" in body and "- One owner" in body and "Behaviour unchanged: the full build and test suite is green" in body
             and "retro-declined: Split the registry -- src/a.go:3 keeps one registry on purpose" in u["decisions"]
             and any("Rework the poller" in f for f in u["follow_ups"])
+            and snap.get("phase") == f"phase_f retro {new.get('id')}"
             and any(new.get("id", "?") in l for l in u["retro_report"])), (u.get("_next"), new, body[-400:], u.get("decisions"))
 
 
