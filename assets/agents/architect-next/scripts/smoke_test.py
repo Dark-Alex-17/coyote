@@ -3854,6 +3854,17 @@ def _retro_triage_failed():
             and "One table" in saved and any("triage failed" in l for l in u["retro_report"])), (fus, u.get("retro_report"))
 
 
+def _retro_fenced_clean():
+    u = gates.retro_route(_retro_large(retro_result="```text\n" + RETRO_CLEAN + "```\n", retro_adopted=[], retro_declined=[],
+                                       retro_follow_ups=[]))
+    return (u["_next"] == "hygiene_create" and any("ran: DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"])), u.get("retro_report")
+
+
+def _retro_preambled():
+    u = gates.retro_route(_retro_large(retro_result="Here is the report.\n" + RETRO_CLEAN, retro_adopted=[]))
+    return any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report")
+
+
 def _retro_report():
     ran = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, retro_report=["- large (a new subsystem)", "- ran: CLEAN"]))["report"]
     skipped = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f))["report"]
@@ -3877,6 +3888,8 @@ guarded("retro_route: adopted -> ONE pending chore task blocked by the unit's ta
 guarded("retro_route: CLEAN -> hygiene_create, no task", _retro_clean)
 guarded("retro_route: a faulted retrospective -> hygiene_create with the fault noted, no task", _retro_fault)
 guarded("retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up pointing at the saved report", _retro_triage_failed)
+guarded("retro_route: a reply opening with one code-fence line is read past the fence", _retro_fenced_clean)
+guarded("retro_route: prose before the sentinel line is still a fault", _retro_preambled)
 guarded("final_report: a ## Design retrospective section, with the reason when it did not run", _retro_report)
 u = gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_f, pr_summary_text="Widgets were missing; we added them.", body_fix_rounds=0))
 body = read_file(u["pr_body_path"])

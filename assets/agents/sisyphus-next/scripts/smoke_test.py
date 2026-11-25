@@ -7342,6 +7342,13 @@ with scenario("retro_route: CLEAN -> observability_gate, noted as ran and clean"
     u = gates.retro_route(base_state(retro_result=RETRO_CLEAN, retro_adopted=[], retro_declined=[], retro_follow_ups=[]))
     check(name, u["_next"] == "observability_gate" and any("DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]),
           u.get("retro_report"))
+with scenario("retro_route: a reply opening with one code-fence line is read past the fence") as name:
+    u = gates.retro_route(base_state(retro_result="```\n" + RETRO_CLEAN + "```\n", retro_adopted=[], retro_declined=[],
+                                     retro_follow_ups=[]))
+    check(name, any("ran: DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]), u.get("retro_report"))
+with scenario("retro_route: prose before the sentinel line is still a fault") as name:
+    u = gates.retro_route(base_state(retro_result="Here is the report.\n" + RETRO_CLEAN, retro_adopted=[]))
+    check(name, any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report"))
 with scenario("retro_route: review rounds spent -> the adopted items become follow-ups, no coder round") as name:
     u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], review_rounds=STRIKE_LIMIT,
                                      last_node_output=RETRO_TRIAGED))

@@ -4712,6 +4712,14 @@ RETRO_PARENT_NOTE = "the parent orchestrator runs the run-closing retrospective"
 RETRO_SAVED = "design-retrospective.md"
 
 
+def _retro_sentinel_line(text):
+    """The reply's first line, read past one leading code-fence line."""
+    lines = [line.strip() for line in text.splitlines()]
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    return lines[0] if lines else ""
+
+
 def _retro_is_parents(state):
     return str(var(state, "retrospective", "run")).strip().lower() == "parent"
 
@@ -4786,7 +4794,7 @@ def retro_route(state):
     note_script_error(state, u, "retro_triage")
     report = list(as_list(state.get("retro_report")))
     text = str(state.get("retro_result") or "").strip()
-    first = text.splitlines()[0].strip() if text else ""
+    first = _retro_sentinel_line(text)
     u["_next"] = "observability_gate"
     if not RETRO_SENTINEL_RE.match(first):
         why = tail(first, 200) or "no output"

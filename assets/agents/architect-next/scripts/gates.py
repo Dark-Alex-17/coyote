@@ -5072,6 +5072,14 @@ RETRO_TITLE = "Run-closing design refactor"
 RETRO_SAVED = "design-retrospective.md"
 
 
+def _retro_sentinel_line(text):
+    """The reply's first line, read past one leading code-fence line."""
+    lines = [line.strip() for line in text.splitlines()]
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    return lines[0] if lines else ""
+
+
 def _whole_line(text):
     """The text on one line, never trimmed: a stated reason is a decision and is ledgered whole."""
     return " ".join(str(text or "").split())
@@ -5127,7 +5135,7 @@ def retro_route(state):
     note_script_error(state, u, "retro_triage")
     report = list(as_list(state.get("retro_report")))
     text = str(state.get("retro_result") or "").strip()
-    first = text.splitlines()[0].strip() if text else ""
+    first = _retro_sentinel_line(text)
     if not RETRO_SENTINEL_RE.match(first):
         why = tail(first, 200) or "no output"
         u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
