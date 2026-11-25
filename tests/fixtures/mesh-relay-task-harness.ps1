@@ -2,7 +2,10 @@
 Drives mesh-relay.ps1's Install-Service without Windows: only the relay's function
 definitions are loaded (none of its top-level code runs), and the ScheduledTask
 cmdlets are shadowed by functions over a JSON store under the scenario's temp dir.
-Every shadow appends one line to the calls log. Run by tests/mesh_relay_task.rs.
+The process table and taskkill are shadowed too. Every shadow appends one line to the
+calls log. A few scenarios drive another of the relay's functions instead (Write-Config
+on a config already there, Invoke-Native, the rnstatus shim). Run by
+tests/mesh_relay_task.rs.
 #>
 
 param(
@@ -39,8 +42,13 @@ $script:RelayHost = 'relay.example'
 $script:RelayPort = '4242'
 $script:RelayForHandEdit = $false
 $script:RnsConfig = Join-Path $script:RnsDir 'config'
+# The relay's own top-level constants the functions driven here read.
+$script:TrueValue = '(yes|true|on|1)(\s|#|$)'
 $script:StopWaitSeconds = 1
 $script:PortStaysOpen = $false
+$script:RnstatusCmd = Join-Path (Join-Path $root 'bin') 'rnstatus.cmd'
+$script:BinDirResolved = Join-Path $root 'bin'
+$script:Processes = @()
 $testUser = 'TESTHOST\tester'
 
 function Add-Call([string]$Line) {
@@ -59,6 +67,36 @@ function Wait-Ready {
 function Test-LoopbackPort {
   Add-Call 'Test-LoopbackPort'
   return $script:PortStaysOpen
+}
+
+# The host's processes, from the scenario; a real process table is never read.
+function Get-ProcessTable {
+  Add-Call 'Get-ProcessTable'
+  return $script:Processes
+}
+
+function Invoke-TreeKill {
+  [CmdletBinding(SupportsShouldProcess)]
+  param([int]$ProcessId)
+  Add-Call "Invoke-TreeKill $ProcessId"
+  if ($PSCmdlet.ShouldProcess("$ProcessId")) {
+    $script:Processes = @($script:Processes | Where-Object { $_.ProcessId -ne $ProcessId })
+  }
+}
+
+# The processes the running task left: its cmd.exe, the rnsd launcher and the python it
+# started, each with the task's --config, beside an rnsd of another config and this
+# harness's own process, whose command line names the same config.
+function Initialize-RunningRnsdProcess {
+  $config = "--config `"$script:RnsDir`""
+  $script:Processes = @(
+    [pscustomobject]@{ ProcessId = 100; CommandLine = "cmd.exe /c set `"PYTHONUNBUFFERED=1`" && `"$script:RnsdCmd`" $config >> log 2>&1" },
+    [pscustomobject]@{ ProcessId = 101; CommandLine = "`"C:\venv\Scripts\rnsd.exe`" $config" },
+    [pscustomobject]@{ ProcessId = 102; CommandLine = "`"C:\Python312\python.exe`" `"C:\venv\Scripts\rnsd.exe`" $config" },
+    [pscustomobject]@{ ProcessId = 200; CommandLine = '"C:\other\rnsd.exe" --config "C:\other\.reticulum"' },
+    [pscustomobject]@{ ProcessId = $PID; CommandLine = "pwsh -File harness.ps1 $config" },
+    [pscustomobject]@{ ProcessId = 300; CommandLine = $null }
+  )
 }
 
 # PSScriptAnalyzer wants SupportsShouldProcess on New-/Set-/Register-/Start- verbs and,
@@ -182,6 +220,41 @@ function Initialize-Store([string]$State, [string]$Arguments, [string]$TriggerCl
   }
 }
 
+# A config already there, written by this script (own) or by hand (foreign), and a run
+# without -Relay: Write-Config alone.
+if ($Scenario -in @('own-config-rerun', 'foreign-config-rerun')) {
+  $script:RelayHost = ''
+  $script:RelayPort = ''
+  New-Item -ItemType Directory -Force -Path $script:RnsDir | Out-Null
+  $text = Get-ConfigText
+  if ($Scenario -eq 'foreign-config-rerun') { $text = "# my own notes`n" + $text }
+  [IO.File]::WriteAllText($script:RnsConfig, $text)
+  Write-Config
+  exit 0
+}
+
+# A native command that writes to stderr and fails: its stderr comes back as plain text
+# on the host, and its exit code as the return value.
+if ($Scenario -eq 'native-stderr') {
+  $pwshExe = (Get-Process -Id $PID).Path
+  $code = Invoke-Native -File $pwshExe -Arguments @('-NoProfile', '-NonInteractive', '-Command', "[Console]::Error.WriteLine('Collecting rns 42%'); exit 3")
+  Write-Output "exit $code"
+  exit 0
+}
+
+# rnstatus.cmd beside rnsd.cmd: written from the rnsd the shim calls, and read back from
+# an rnsd.cmd an earlier run wrote.
+if ($Scenario -eq 'rnstatus-shim') {
+  $real = Join-Path $root 'venv Scripts'
+  New-Item -ItemType Directory -Force -Path $real, (Split-Path -Parent $script:RnsdCmd) | Out-Null
+  $rnsd = Join-Path $real 'rnsd.exe'
+  [IO.File]::WriteAllText($rnsd, '')
+  [IO.File]::WriteAllText((Join-Path $real 'rnstatus.exe'), '')
+  Write-Shim -Real $rnsd
+  Write-Output "target $(Get-ShimTarget -Path $script:RnsdCmd)"
+  exit 0
+}
+
 $desiredArguments = Get-TaskActionArgument
 switch ($Scenario) {
   'fresh' { }
@@ -189,6 +262,7 @@ switch ($Scenario) {
   'unchanged-running-relay-added' {
     Initialize-Store 'Running' $desiredArguments 'MSFT_TaskLogonTrigger'
     $script:RelayAdded = $true
+    Initialize-RunningRnsdProcess
   }
   'changed-arguments-running' { Initialize-Store 'Running' '/c stale' 'MSFT_TaskLogonTrigger' }
   'changed-arguments-running-relay-added' {

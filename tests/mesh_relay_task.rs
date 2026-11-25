@@ -197,7 +197,133 @@ impl Drop for Scenario {
     }
 }
 
-const CHANGED_NOTE: &str = "Note: the service definition changed; apply it with: Stop-ScheduledTask -TaskName 'Coyote rnsd'; Start-ScheduledTask -TaskName 'Coyote rnsd'";
+/// The restart the script prints: the task stopped, every process carrying its
+/// `--config "<dir>"` ended with its tree, the task started.
+fn restart_command(run: &Scenario) -> String {
+    format!(
+        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('--config \"{}\"') }} | ForEach-Object {{ taskkill.exe /PID $_.ProcessId /T /F }}; Start-ScheduledTask -TaskName 'Coyote rnsd'",
+        run.dir.join(".reticulum").display()
+    )
+}
+
+fn changed_note(run: &Scenario) -> String {
+    format!(
+        "Note: the service definition changed; apply it with: {}",
+        restart_command(run)
+    )
+}
+
+/// The restart after `-Relay` added a stanza ends the rnsd the running task started, its
+/// cmd.exe, launcher and python child, between stopping and starting the task, so the
+/// task started next is the one rnsd and reads the new config. An rnsd of another config
+/// and the script's own process are left alone.
+#[test]
+fn the_relay_restart_ends_the_old_rnsd_process_tree_before_starting_the_task() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "unchanged-running-relay-added");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    let order: Vec<String> = run
+        .calls()
+        .lines()
+        .filter(|line| {
+            line.starts_with("Stop-ScheduledTask")
+                || line.starts_with("Invoke-TreeKill")
+                || line.starts_with("Start-ScheduledTask")
+        })
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "Stop-ScheduledTask 'Coyote rnsd'",
+            "Invoke-TreeKill 100",
+            "Invoke-TreeKill 101",
+            "Invoke-TreeKill 102",
+            "Start-ScheduledTask 'Coyote rnsd'",
+        ],
+        "{out}"
+    );
+    let added = format!(
+        "Added [[Team Relay]] -> relay.example:4242 to {} and restarted 'Coyote rnsd'.",
+        run.dir.join(".reticulum").join("config").display()
+    );
+    assert!(run.stdout.contains(&added), "{out}");
+}
+
+/// A plain re-run on the config the script wrote says so with `(already there)` and
+/// prints no stanzas to merge; a config written by hand still gets them.
+#[test]
+fn a_rerun_on_the_scripts_own_config_says_already_there_and_prints_no_stanzas() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "own-config-rerun");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    let config = run.dir.join(".reticulum").join("config");
+    assert!(
+        run.stdout.contains(&format!(
+            "[coyote-mesh] {} is the one this script wrote (already there); not touched",
+            config.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !run.stdout.contains("already exists, not touched")
+            && !run.stdout.contains("[[Coyote Sessions]]"),
+        "{out}"
+    );
+
+    let run = Scenario::run(&pwsh, "foreign-config-rerun");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    assert!(
+        run.stdout.contains(
+            "already exists, not touched. Make sure it carries these settings and stanzas:"
+        ) && run.stdout.contains("[[Coyote Sessions]]"),
+        "{out}"
+    );
+}
+
+/// A native command's stderr reaches the user as its plain line on stdout, never as a
+/// NativeCommandError record, and its exit code is returned.
+#[test]
+fn a_native_commands_stderr_is_printed_as_plain_text() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "native-stderr");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    assert!(run.stdout.contains("Collecting rns 42%\n"), "{out}");
+    assert!(run.stdout.contains("exit 3"), "{out}");
+    assert!(
+        !run.stdout.contains("NativeCommandError") && !run.stderr.contains("NativeCommandError"),
+        "{out}"
+    );
+}
+
+/// rnstatus.cmd goes beside rnsd.cmd and runs the rnstatus next to the rnsd it calls with
+/// `PYTHONUTF8=1`, inside setlocal; an rnsd.cmd an earlier run wrote names its rnsd.
+#[test]
+fn the_rnstatus_shim_runs_rnstatus_with_utf8_output() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "rnstatus-shim");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    let scripts = run.dir.join("venv Scripts");
+    let shim = fs::read_to_string(run.dir.join("bin").join("rnstatus.cmd")).expect("rnstatus.cmd");
+    assert_eq!(
+        shim,
+        format!(
+            "@rem Written by scripts/mesh-relay.ps1 for Coyote mesh; runs rnstatus with UTF-8 output.\r\n@setlocal\r\n@set \"PYTHONUTF8=1\"\r\n@\"{}\" %*\r\n",
+            scripts.join("rnstatus.exe").display()
+        ),
+        "{out}"
+    );
+    assert!(
+        run.stdout
+            .contains(&format!("target {}", scripts.join("rnsd.exe").display())),
+        "{out}"
+    );
+}
 
 #[test]
 fn a_fresh_host_registers_the_task_once_starts_it_and_waits_for_the_listener() {
@@ -290,7 +416,7 @@ fn a_running_task_whose_definition_changed_is_restarted_when_the_relay_stanza_wa
     assert_eq!(run.call_count("Stop-ScheduledTask"), 1, "{out}");
     assert_eq!(run.call_count("Start-ScheduledTask"), 1, "{out}");
     assert_eq!(run.call_count("Wait-Ready"), 1, "{out}");
-    assert!(!run.stdout.contains(CHANGED_NOTE), "{out}");
+    assert!(!run.stdout.contains(&changed_note(&run)), "{out}");
     let added = format!(
         "Added [[Team Relay]] -> relay.example:4242 to {} and restarted 'Coyote rnsd'.",
         run.dir.join(".reticulum").join("config").display()
@@ -346,7 +472,7 @@ fn a_running_task_whose_action_or_trigger_differs_is_rewritten_in_full_and_only_
         );
         assert!(
             run.stdout.contains("Updated Scheduled Task 'Coyote rnsd'")
-                && run.stdout.contains(CHANGED_NOTE),
+                && run.stdout.contains(&changed_note(&run)),
             "{out}"
         );
         assert_eq!(run.state(), "Running", "{out}");

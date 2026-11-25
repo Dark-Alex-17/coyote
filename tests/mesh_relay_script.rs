@@ -1116,7 +1116,19 @@ fn a_present_rnsd_is_reused_and_the_config_is_written_once_owner_only() {
     let before = fs::read(&config).unwrap();
     let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(out.contains("already exists, not touched"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "[coyote-mesh] {} is the one this script wrote (already there); not touched\n",
+            config.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !out.contains("already exists, not touched")
+            && !out.contains("Make sure it carries these settings and stanzas")
+            && !out.contains("[[Coyote Sessions]]"),
+        "a re-run on the script's own config prints no stanzas to merge:\n{out}"
+    );
     assert_eq!(
         fs::read(&config).unwrap(),
         before,

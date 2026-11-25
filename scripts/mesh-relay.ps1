@@ -81,13 +81,15 @@ function Write-Failure {
 }
 
 # Runs a native command with $ErrorActionPreference relaxed so its stderr and
-# exit code come back as data instead of terminating errors. Stdout goes to the
-# host, not the output stream, so the only return value is the exit code.
+# exit code come back as data instead of terminating errors. Stdout and stderr go to
+# the host as plain lines, not the output stream, so the only return value is the exit
+# code; stderr is turned to text first, since PowerShell (under remoting above all)
+# would otherwise print a line of it as a NativeCommandError record.
 function Invoke-Native {
   param([string]$File, [string[]]$Arguments = @(), [switch]$Quiet)
   $ErrorActionPreference = 'Continue'
   try {
-    if ($Quiet) { & $File @Arguments *> $null } else { & $File @Arguments | Out-Host }
+    if ($Quiet) { & $File @Arguments *> $null } else { & $File @Arguments 2>&1 | ForEach-Object { "$_" } | Out-Host }
     return $LASTEXITCODE
   } catch {
     return 127
@@ -339,8 +341,41 @@ function Get-ConfigLinesWithoutTeamRelay {
   return ,$kept.ToArray()
 }
 
+# Stopping the task ends only its cmd.exe; the rnsd and python it started keep running
+# with the config they read. The restart ends every process whose command line carries
+# this rnsd's `--config "<dir>"`, the whole tree, before starting the task again.
 function Get-RestartCommand {
-  return "Stop-ScheduledTask -TaskName '$TaskName'; Start-ScheduledTask -TaskName '$TaskName'"
+  return "Stop-ScheduledTask -TaskName '$TaskName'; Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('--config `"$script:RnsDir`"') } | ForEach-Object { taskkill.exe /PID `$_.ProcessId /T /F }; Start-ScheduledTask -TaskName '$TaskName'"
+}
+
+# Every process on the host with its id and command line; replaced by the tests.
+function Get-ProcessTable {
+  return @(Get-CimInstance Win32_Process | Select-Object ProcessId, CommandLine)
+}
+
+# Ends one process and every process under it; replaced by the tests.
+function Invoke-TreeKill {
+  param([int]$ProcessId)
+  Invoke-Native -File 'taskkill.exe' -Arguments @('/PID', "$ProcessId", '/T', '/F') -Quiet | Out-Null
+}
+
+# The ids of the processes running this rnsd: the task's cmd.exe, the rnsd launcher and
+# its python child, each found by the `--config "<dir>"` the task passes on. This
+# script's own process is never one.
+function Select-RnsdProcessId {
+  param($Processes)
+  $needle = "--config `"$script:RnsDir`""
+  return @(@($Processes) | Where-Object {
+      $null -ne $_ -and $_.CommandLine -and $_.CommandLine.Contains($needle) -and $_.ProcessId -ne $PID
+    } | ForEach-Object { [int]$_.ProcessId } | Sort-Object -Unique)
+}
+
+# Once the task is stopped: ends the rnsd the task started, its whole process tree, so
+# the task started next is the only rnsd and reads the config as it is now.
+function Invoke-RnsdTreeKill {
+  foreach ($id in (Select-RnsdProcessId (Get-ProcessTable))) {
+    Invoke-TreeKill -ProcessId $id
+  }
 }
 
 # -Relay on a config this script wrote: the [[Team Relay]] stanza replaces the one the file
@@ -393,8 +428,19 @@ function Get-OemEncoding {
 function Write-Config {
   if (Test-Path -LiteralPath $script:RnsConfig -PathType Leaf) {
     $stanzas = Read-ExistingConfig -Path $script:RnsConfig
-    if ($script:RelayHost -and $stanzas.ServesSessions -and $stanzas.Transport -and (Test-ConfigIsOwn -Path $script:RnsConfig)) {
+    $own = $stanzas.ServesSessions -and $stanzas.Transport -and (Test-ConfigIsOwn -Path $script:RnsConfig)
+    if ($script:RelayHost -and $own) {
       Add-TeamRelay
+      return
+    }
+    if ($own) {
+      # The config this script wrote: nothing to merge, so no stanzas to print.
+      Write-Info "$script:RnsConfig is the one this script wrote (already there); not touched"
+      if ($stanzas.PublicDials -gt 0) {
+        $nodes = if ($stanzas.PublicDials -eq 1) { 'node' } else { 'nodes' }
+        Write-Info "Note: this config also dials $($stanzas.PublicDials) public Reticulum $nodes; your announces reach them (see mesh.display_name_on_public)."
+      }
+      if (Test-ConfigEnablesAutoInterface -Path $script:RnsConfig) { Write-FirewallWarning }
       return
     }
     Write-Info "$script:RnsConfig already exists, not touched. Make sure it carries these settings and stanzas:"
@@ -538,7 +584,7 @@ function Invoke-OwnerUpgrade {
   switch ($script:RnsdOwner) {
     'uv' { return Invoke-Native -File 'uv' -Arguments @('tool', 'install', '--force', '--python', '3.12', $script:RnsSpec) }
     'pipx' { return Invoke-Native -File 'pipx' -Arguments @('install', '--force', $script:RnsSpec) }
-    'venv' { return Invoke-Native -File (Join-Path $script:VenvDir 'Scripts\python.exe') -Arguments @('-m', 'pip', 'install', '--quiet', $script:RnsSpec) }
+    'venv' { return Invoke-Native -File (Join-Path $script:VenvDir 'Scripts\python.exe') -Arguments @('-m', 'pip', 'install', '--quiet', '--progress-bar', 'off', $script:RnsSpec) }
   }
   return 127
 }
@@ -617,6 +663,32 @@ function Write-Shim {
   $text = "@rem Written by scripts/mesh-relay.ps1 for Coyote mesh; runs the installed rnsd.`r`n@`"$Real`" %*`r`n"
   Write-TextFile -Path $script:RnsdCmd -Text $text -Encoding (Get-OemEncoding)
   Write-Info "Wrote shim $script:RnsdCmd -> $Real"
+  Write-RnstatusShim -Real $Real
+}
+
+# The program a shim this script wrote calls (its `@"<path>" %*` line), or '' for any
+# other file.
+function Get-ShimTarget {
+  param([string]$Path)
+  foreach ($line in [IO.File]::ReadAllLines($Path, (Get-OemEncoding))) {
+    if ($line -match '^@"(.+)" %\*$') { return $Matches[1] }
+  }
+  return ''
+}
+
+# rnstatus beside the rnsd that $Real names, run with PYTHONUTF8=1: under the default
+# cp1252 console it crashes on the arrow in its traffic column (UnicodeEncodeError).
+# setlocal keeps the variable out of the console that ran it.
+function Write-RnstatusShim {
+  param([string]$Real)
+  $realRnstatus = Join-Path (Split-Path -Parent $Real) 'rnstatus.exe'
+  if (-not (Test-Path -LiteralPath $realRnstatus -PathType Leaf)) {
+    Write-Info "No rnstatus.exe beside $Real; $script:RnstatusCmd not written"
+    return
+  }
+  $text = "@rem Written by scripts/mesh-relay.ps1 for Coyote mesh; runs rnstatus with UTF-8 output.`r`n@setlocal`r`n@set `"PYTHONUTF8=1`"`r`n@`"$realRnstatus`" %*`r`n"
+  Write-TextFile -Path $script:RnstatusCmd -Text $text -Encoding (Get-OemEncoding)
+  Write-Info "Wrote shim $script:RnstatusCmd -> $realRnstatus"
 }
 
 # An older rnsd is upgraded through its installer, or kept with the reason; a newer
@@ -650,7 +722,13 @@ function Install-Rnsd {
     'present' {
       Write-Info "rnsd already installed: $script:ExistingRnsd"
       Install-RnsdUpgrade
-      if ($script:ExistingRnsd -ne $script:RnsdCmd) { Write-Shim -Real $script:ExistingRnsd }
+      if ($script:ExistingRnsd -ne $script:RnsdCmd) {
+        Write-Shim -Real $script:ExistingRnsd
+      } elseif (-not (Test-Path -LiteralPath $script:RnstatusCmd -PathType Leaf)) {
+        # rnsd.cmd from an earlier run: rnstatus.cmd goes beside the rnsd it calls.
+        $target = Get-ShimTarget -Path $script:RnsdCmd
+        if ($target) { Write-RnstatusShim -Real $target }
+      }
     }
     'uv' {
       Write-Info "Installing $script:RnsSpec with uv (managed CPython 3.12)"
@@ -686,7 +764,7 @@ function Install-Rnsd {
         }
         Write-Info "Installing $script:RnsSpec into the venv"
         $venvPython = Join-Path $script:VenvDir 'Scripts\python.exe'
-        if ((Invoke-Native -File $venvPython -Arguments @('-m', 'pip', 'install', '--quiet', $script:RnsSpec)) -ne 0) {
+        if ((Invoke-Native -File $venvPython -Arguments @('-m', 'pip', 'install', '--quiet', '--progress-bar', 'off', $script:RnsSpec)) -ne 0) {
           Write-Failure 'pip install into the venv failed'
           exit 2
         }
@@ -850,7 +928,8 @@ function Install-Service {
     if ($script:RelayAdded) {
       Write-Info "Restarting '$TaskName' so it dials the new [[Team Relay]]..."
       Stop-ScheduledTask -TaskName $TaskName
-      # Stopping the task ends cmd.exe; the rnsd it started can outlive it and keep the port.
+      # Stopping the task ends cmd.exe; the rnsd it started outlives it with the old config.
+      Invoke-RnsdTreeKill
       if (-not (Wait-LoopbackPortClosed)) {
         Write-Info "rnsd is still running from before: 127.0.0.1:$ListenPort stayed open for $StopWaitSeconds s after Stop-ScheduledTask, so '$TaskName' was not started again. Stop that rnsd with: Stop-Process -Id (Get-NetTCPConnection -LocalPort $ListenPort -State Listen).OwningProcess, then run: Start-ScheduledTask -TaskName '$TaskName'"
         Write-Info "Logs: $script:LogFile"
@@ -859,7 +938,7 @@ function Install-Service {
       Start-ScheduledTask -TaskName $TaskName
       $script:RnsdReload = 'restarted'
     } elseif ($changed) {
-      Write-Info "Note: the service definition changed; apply it with: Stop-ScheduledTask -TaskName '$TaskName'; Start-ScheduledTask -TaskName '$TaskName'"
+      Write-Info "Note: the service definition changed; apply it with: $(Get-RestartCommand)"
     } else {
       Write-Info "'$TaskName' is already running; not restarted"
     }
@@ -884,7 +963,8 @@ function Write-NextStep {
       default { Write-Info "Added [[Team Relay]] -> $relay to $script:RnsConfig. Restart rnsd so it dials the relay: $(Get-RestartCommand)" }
     }
   }
-  Write-Info "Diagnostics: 'rnstatus' attaches to the shared instance and lists its interfaces"
+  $rnstatus = if (Test-Path -LiteralPath $script:RnstatusCmd -PathType Leaf) { $script:RnstatusCmd } else { 'rnstatus' }
+  Write-Info "Diagnostics: '$rnstatus' attaches to the shared instance and lists its interfaces; run it in Windows Terminal"
   Write-Info 'Matching coyote config (this is the shipped default; normally nothing to paste):'
   Write-Output ''
   Write-Output @"
@@ -977,6 +1057,7 @@ if (-not [System.IO.Path]::IsPathRooted($script:BinDirResolved)) {
 }
 $script:BinDirResolved = [System.IO.Path]::GetFullPath($script:BinDirResolved)
 $script:RnsdCmd = Join-Path $script:BinDirResolved 'rnsd.cmd'
+$script:RnstatusCmd = Join-Path $script:BinDirResolved 'rnstatus.cmd'
 $script:LogFile = Join-Path $env:LOCALAPPDATA 'coyote\logs\rnsd.log'
 
 Resolve-InstallRung

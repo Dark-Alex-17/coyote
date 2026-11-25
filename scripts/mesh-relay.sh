@@ -771,8 +771,23 @@ add_team_relay() {
 write_config() {
   if [[ -f "$RNS_CONFIG" ]]; then
     scan_existing_config
-    if [[ -n "$RELAY_HOST" && "$RNS_DIR_SYSTEM" -eq 0 && "$CONFIG_SERVES_SESSIONS" -eq 1 && "$CONFIG_TRANSPORT" -eq 1 ]] && config_is_own; then
+    local own=0
+    if [[ "$RNS_DIR_SYSTEM" -eq 0 && "$CONFIG_SERVES_SESSIONS" -eq 1 && "$CONFIG_TRANSPORT" -eq 1 ]] && config_is_own; then
+      own=1
+    fi
+    if [[ -n "$RELAY_HOST" && "$own" -eq 1 ]]; then
       add_team_relay
+      return 0
+    fi
+    if [[ "$own" -eq 1 ]]; then
+      # The config this script wrote: nothing to merge, so no stanzas to print.
+      log "$RNS_CONFIG is the one this script wrote (already there); not touched"
+      if [[ "$CONFIG_PUBLIC_DIALS" -gt 0 ]]; then
+        local own_nodes="nodes"
+        if [[ "$CONFIG_PUBLIC_DIALS" -eq 1 ]]; then own_nodes="node"; fi
+        log "Note: this config also dials $CONFIG_PUBLIC_DIALS public Reticulum $own_nodes; your announces reach them (see mesh.display_name_on_public)."
+      fi
+      if config_enables_autointerface; then firewall_warning; fi
       return 0
     fi
     log "$RNS_CONFIG already exists, not touched. Make sure it carries these settings and stanzas:"

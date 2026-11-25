@@ -170,6 +170,45 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
         relay_branch.contains("Stop-ScheduledTask -TaskName $TaskName"),
         "the [[Team Relay]] restart branch was not found: {relay_branch}"
     );
+    // Stopping the task ends only its cmd.exe: the rnsd and python it started keep the
+    // old config, so the restart ends their whole tree before starting the task again.
+    let stop = relay_branch
+        .find("Stop-ScheduledTask -TaskName $TaskName")
+        .unwrap();
+    let tree = relay_branch
+        .find("Invoke-RnsdTreeKill")
+        .unwrap_or_else(|| panic!("the [[Team Relay]] restart never ends rnsd's process tree: {relay_branch}"));
+    let start = relay_branch
+        .find("Start-ScheduledTask -TaskName $TaskName")
+        .expect("the restart starts the task again");
+    assert!(
+        stop < tree && tree < start,
+        "the process tree is ended between the stop and the start: {relay_branch}"
+    );
+    assert_eq!(
+        ps1.matches("Invoke-RnsdTreeKill").count(),
+        2,
+        "Invoke-RnsdTreeKill is defined once and called only from the [[Team Relay]] restart"
+    );
+    let restart = ps1
+        .split("function Get-RestartCommand {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("mesh-relay.ps1 defines Get-RestartCommand");
+    for needle in [
+        "Stop-ScheduledTask -TaskName '$TaskName'",
+        "taskkill.exe /PID `$_.ProcessId /T /F",
+        "Start-ScheduledTask -TaskName '$TaskName'",
+    ] {
+        assert!(
+            restart.contains(needle),
+            "the printed restart must end rnsd's process tree, not only stop the task: lacks {needle:?}"
+        );
+    }
+    assert!(
+        !ps1.contains("apply it with: Stop-ScheduledTask"),
+        "the changed-definition note prints Get-RestartCommand, which ends the process tree"
+    );
     let outside_relay_branch = ps1.replacen(relay_branch, "", 1);
     let stop_lines: Vec<&str> = outside_relay_branch
         .lines()
@@ -1297,12 +1336,20 @@ fn relay_scripts_stop_on_a_config_that_cannot_serve_coyote_and_edit_only_their_o
     for needle in [
         "launchctl kickstart -k \"gui/$(id -u)/$LAUNCHD_LABEL\"",
         "Would add [[Team Relay]] -> ",
+        "is the one this script wrote (already there); not touched",
     ] {
         assert!(sh.contains(needle), "mesh-relay.sh lacks {needle:?}");
     }
     for needle in [
         "Stop-ScheduledTask -TaskName $TaskName",
         "rnsd is still running from before",
+        // pip's progress on stderr surfaced as a NativeCommandError line under remoting.
+        "'--progress-bar', 'off'",
+        "& $File @Arguments 2>&1 | ForEach-Object { \"$_\" } | Out-Host",
+        // rnstatus crashes on its traffic arrow under the cp1252 console.
+        "@set `\"PYTHONUTF8=1`\"",
+        "$script:RnstatusCmd = Join-Path $script:BinDirResolved 'rnstatus.cmd'",
+        "is the one this script wrote (already there); not touched",
         "Would add [[Team Relay]] -> ",
     ] {
         assert!(ps1.contains(needle), "mesh-relay.ps1 lacks {needle:?}");
