@@ -1,7 +1,23 @@
 ---
-description: Calibrate comment density and style to the repository's existing conventions before writing code. Detects the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you already read for pattern matching, or from a declared policy in workspace instructions, then dictates when a comment is warranted. Default when signal is weak - write NO comment. Complements ai-slop-remover (which bans comments that restate code in every register).
+description: Calibrate comment density and style to the repository's existing conventions before writing code, and cut the comments that do not earn their keep from a finished diff. Detects the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you already read for pattern matching, or from a declared policy in workspace instructions, then dictates when a comment is warranted. Default when signal is weak - write NO comment. The final-diff pass is the closing judgement read orchestrators run before their last review. Complements ai-slop-remover (which bans comments that restate code in every register).
 ---
-You are about to write or modify code. LLMs systematically over-comment — narrating every block, restating signatures, banner-ing sections — and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling. Across every register, one test governs each comment you write: it must **earn its keep**. If the code already tells the reader, the comment doesn't get written — don't add comments you don't need; make the code tell them instead.
+You are about to write or modify code. LLMs systematically over-comment (narrating every block, restating signatures, banner-ing sections), and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling. Across every register, one test governs each comment you write: the rule below.
+
+## The rule: a comment earns its keep
+
+Code should strive to be self-documenting. If a comment only states what the code does, and that is
+easily discernible from reading the code, it is redundant and is removed. A comment earns its place
+when it does one of these:
+
+- adds context that cannot be determined from the code: intent, an invariant, an external
+  constraint, a workaround and the upstream issue behind it;
+- documents functionality that is not visible from the current context because it is used
+  elsewhere in the codebase: a contract a distant caller relies on, a value another module reads;
+- records the decision behind a choice: why this approach and not the obvious one, in a sentence.
+  A ledger of what a run checked belongs in the task log, not the code.
+
+Follow the codebase's existing commenting standards when it has them (Steps 0 to 2 below find
+them); otherwise fall back to these guidelines.
 
 ## Step 0: Check for a declared policy first
 
@@ -49,3 +65,25 @@ Mixed signals (e.g. doc comments everywhere + narrated private code) → combine
 - Section banners in a repo that has none.
 - Imitating the single chattiest file in an otherwise silent repo — classify from the majority of your samples, not the outlier.
 - Treating this skill as license to argue with a declared policy: COYOTE.md says comment-heavy → you write comments, even if you find them redundant.
+
+## Final-diff pass
+
+Writing-time discipline slips: a long run adds comments one at a time, and each looks harmless in
+its own hunk. An orchestrator closing a task or a run therefore reads the FINISHED diff once more,
+before its first review of the finished work, and cuts what slipped through.
+
+1. Take the whole diff from the work's base commit to HEAD, with the run's own plan files
+   excluded.
+2. Read every comment the diff adds or rewrites (code, doc, YAML and script comments) beside the
+   code it sits on, and decide one of three outcomes against the rule above:
+   - **keep**: it earns its keep, or it matches a register or declared policy the repo has;
+   - **cut**: it restates easily read code, repeats a name or a signature, or narrates the plan or
+     the implementation steps;
+   - **reduce**: one sentence of real context is buried in narration; keep that sentence.
+3. This is a judgement pass, not a pattern match: no grep result decides an outcome, because only a
+   reading of the code shows whether a comment tells the reader something new.
+4. Scope is the comments the diff added. Existing comments stay, per invariant 4 above.
+5. The cuts go through the same gates as any change: the implementer makes them, and the build,
+   the tests and the review that follows run over the result. A cut never changes code; an edit
+   that does is not a comment cut.
+6. Report one line: `Comment hygiene: <n> added comments read, <c> cut, <r> reduced`.

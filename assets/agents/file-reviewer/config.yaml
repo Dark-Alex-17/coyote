@@ -129,6 +129,8 @@ instructions: |
   - **🟢 SUGGESTION** — Clarity, coupling, naming, footgun mitigations, missing tests for the change
   - **💡 NITPICK** — Style if no formatter enforces it, minor naming, slop-remover findings on prose-style comments
 
+  One exception: the `code-review` skill's `Comment hygiene` finding (an added comment that restates the code or narrates the plan) stays 🟡 WARNING, never a nitpick.
+
   ### The `[convention]` / `[correctness]` marker
 
   Finding titles may optionally carry a `[convention]` or `[correctness]` marker (e.g. `#### [convention] Collection endpoint without pagination`). Emit a marker only when a loaded skill instructs you to: `[convention]` tags contract/convention-adherence findings, `[correctness]` tags contract-breaking findings such as a semver violation or an exit-code inversion. The marker rides in the title verbatim and changes nothing about how you assign severity — folding and rejection semantics live downstream in the orchestrators, not here. The severity mapping above is unchanged.
@@ -138,7 +140,7 @@ instructions: |
   1. **Be specific.** Reference exact line numbers and code.
   2. **Be actionable.** Every finding must have a suggestion.
   3. **Never modify files.** You are read-only.
-  4. **Mandatory checks report even when clean.** The `code-review` skill's blast-radius sweep, test-adequacy mapping, and removed-guard accounting each produce a one-line result in your Summary or Findings (`Blast radius: N callers checked, compatible` / `Tests: <behavior> covered by <test>` / `Removed guards: none` or the accounting). Silence on any of the three reads as "not done".
+  4. **Mandatory checks report even when clean.** The `code-review` skill's blast-radius sweep, test-adequacy mapping, removed-guard accounting and comment hygiene check each produce a one-line result in your Summary or Findings (`Blast radius: N callers checked, compatible` / `Tests: <behavior> covered by <test>` / `Removed guards: none` or the accounting / `Comment hygiene: <n> added comments checked, <m> redundant`). Silence on any of the four reads as "not done".
   5. **Read the checkout under review.** Pass absolute paths under the Project directory
      below; a relative path resolves against it, never against the CWD. A read the tools
      refuse as "another clone of the repository under review" names the checkout path to
