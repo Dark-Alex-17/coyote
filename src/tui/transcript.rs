@@ -134,6 +134,11 @@ pub(super) struct Transcript {
     laid_out: Vec<Option<LaidOut>>,
     /// The bytes every call's whole output in the cells keeps.
     full_output_bytes: usize,
+    /// The divider each clear of the main view started it at, oldest
+    /// first; the newest is the first cell the view draws, scrolls,
+    /// focuses and selects. The pager, the exit dump and undo still read
+    /// every cell.
+    floors: Vec<usize>,
 }
 
 impl Transcript {
@@ -157,11 +162,27 @@ impl Transcript {
             revisions: vec![1],
             laid_out: Vec::new(),
             full_output_bytes: 0,
+            floors: Vec::new(),
         }
     }
 
     pub(super) fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// The first cell the main view draws.
+    pub(super) fn view_floor(&self) -> usize {
+        self.floors.last().copied().unwrap_or(0)
+    }
+
+    /// Starts the main view afresh at cell `index`, following the bottom.
+    pub(super) fn clear_view_from(&mut self, index: usize) {
+        self.floors.push(index);
+        self.scroll_to_bottom();
+        self.anchor = None;
+        if self.focus.is_some_and(|focus| focus < index) {
+            self.focus = None;
+        }
     }
 
     pub(super) fn generation(&self) -> u64 {
@@ -453,6 +474,11 @@ impl Transcript {
             .iter()
             .filter_map(|&part| shift(Some(part)))
             .collect();
+        self.floors = self
+            .floors
+            .iter()
+            .filter_map(|&floor| shift(Some(floor)))
+            .collect();
         self.anchor = match self.anchor {
             Some(anchor) if anchor.cell == index && index < self.cells.len() => Some(Anchor {
                 cell: index,
@@ -495,6 +521,7 @@ impl Transcript {
             self.stream = None;
         }
         self.stream_parts.retain(|&part| part < len);
+        self.floors.retain(|&floor| floor < len);
         self.anchor = match self.anchor {
             Some(anchor) if anchor.gap && anchor.cell == len => {
                 len.checked_sub(1).map(|cell| Anchor {
@@ -571,6 +598,7 @@ impl Transcript {
         self.cells
             .iter()
             .enumerate()
+            .skip(self.view_floor())
             .filter(|(_, cell)| cell.collapsible())
             .map(|(index, _)| index)
     }
@@ -738,6 +766,7 @@ impl Transcript {
         let centre = self.welcome_only();
         let room = centre.then_some(area.height);
         let count = self.cells.len();
+        let floor = self.view_floor();
         self.laid_out.resize(count, None);
         // Only the cells from the view's top line down are laid out. One
         // further up counts the rows it took when last laid out at this
@@ -750,6 +779,10 @@ impl Transcript {
         let placement = loop {
             let mut rows = Vec::with_capacity(count);
             for index in 0..count {
+                if index < floor {
+                    rows.push(0);
+                    continue;
+                }
                 rows.push(match self.rows_laid_out(index, area.width, room) {
                     Some(rows) => rows,
                     None if index >= exact_from => {
@@ -800,7 +833,7 @@ impl Transcript {
 
         let mut lines = Vec::with_capacity(end - start);
         self.last_layout.clear();
-        let first = self.anchor.map_or(0, |anchor| anchor.cell);
+        let first = self.anchor.map_or(floor, |anchor| anchor.cell);
         for (index, &header) in headers.iter().enumerate().skip(first) {
             if header > end {
                 break;
@@ -891,7 +924,8 @@ impl Transcript {
     }
 
     /// Places the view over cells of `rows` each. A blank line separates
-    /// each cell from the one before. A scrolled view is held on the line
+    /// each cell after the view floor from the one before; the cells
+    /// under the floor take no lines. A scrolled view is held on the line
     /// the last frame started on; a new width re-wraps every cell, so a
     /// row inside one no longer names the same text, and the offset is
     /// kept as it was instead.
@@ -905,8 +939,9 @@ impl Transcript {
     ) -> Placement {
         let mut headers = Vec::with_capacity(rows.len());
         let mut total = 0;
-        for &cell_rows in rows {
-            if !headers.is_empty() {
+        let floor = self.view_floor();
+        for (index, &cell_rows) in rows.iter().enumerate() {
+            if index > floor {
                 total += 1;
             }
             headers.push(total);
@@ -915,7 +950,11 @@ impl Transcript {
         let height = usize::from(area.height);
         let mut offset = self.offset_from_bottom;
         if offset > 0 && !resized {
-            match self.anchor.and_then(|anchor| anchor.line(&headers, total)) {
+            match self
+                .anchor
+                .filter(|anchor| anchor.cell >= floor)
+                .and_then(|anchor| anchor.line(&headers, total))
+            {
                 Some(top) => {
                     offset = anchored_offset(
                         self.last_offset,
@@ -2036,6 +2075,47 @@ mod tests {
             1,
             "a truncation that leaves cells adds nothing"
         );
+    }
+
+    #[test]
+    fn a_cleared_view_draws_and_focuses_only_from_its_floor() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("before"));
+        transcript.push(tool("old"));
+        transcript.push(Cell::divider("left agent a".to_string()));
+        transcript.clear_view_from(2);
+        transcript.push(Cell::user("after"));
+        let shown = rows(&transcript.view(area(10), &mut renderer));
+        assert!(shown[0].contains("left agent a"), "{shown:?}");
+        assert!(shown.iter().all(|row| !row.contains("before")), "{shown:?}");
+        transcript.focus_prev();
+        assert_eq!(
+            transcript.focus(),
+            None,
+            "the old tool row is below the floor"
+        );
+        assert_eq!(transcript.cells().len(), 4);
+
+        transcript.truncate(2);
+        assert_eq!(transcript.view_floor(), 0);
+        let shown = rows(&transcript.view(area(10), &mut renderer));
+        assert!(shown.iter().any(|row| row.contains("before")), "{shown:?}");
+    }
+
+    #[test]
+    fn a_truncation_keeps_the_floors_it_does_not_reach() {
+        let (mut transcript, _) = transcript();
+        transcript.push(Cell::user("one"));
+        transcript.push(Cell::divider("left role a".to_string()));
+        transcript.clear_view_from(1);
+        transcript.push(Cell::user("two"));
+        transcript.push(Cell::divider("left role b".to_string()));
+        transcript.clear_view_from(3);
+        transcript.push(Cell::user("three"));
+        transcript.truncate(3);
+        assert_eq!(transcript.view_floor(), 1);
+        transcript.remove(0);
+        assert_eq!(transcript.view_floor(), 0);
     }
 
     /// A zero-sized area (the todo panel has the whole width) lays

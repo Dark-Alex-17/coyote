@@ -17,6 +17,7 @@ mod cells;
 mod child_live;
 mod command_timing;
 mod composer;
+mod context;
 mod control;
 mod dump;
 mod events;
@@ -60,6 +61,7 @@ use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow, elapsed_text};
 use child_live::{ChildLive, ChildThread, ToolEnd};
 use command_timing::Timing;
 use composer::Composer;
+use context::{CtxSnapshot, SAVED_SESSION_LINE, divider_text};
 use control::{ControlRequest, cancel_report, is_plain_session_id};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use events::{Clock, FrameScheduler, TermInput};
@@ -432,6 +434,12 @@ pub(crate) struct App {
     committed_end: usize,
     footer: FooterInfo,
     usage: String,
+    /// The agent, session, role and RAG the composer's top rule names,
+    /// as the REPL's prompt does.
+    context_label: Option<String>,
+    /// What was active at the last return of the context; None until
+    /// the first, so what a launch starts in gets no divider.
+    ctx_snapshot: Option<CtxSnapshot>,
     last_keystroke: Option<Instant>,
     /// When the front prompt became the front; what Enter on a text
     /// field is settled against, so typing the answer does not postpone
@@ -570,6 +578,8 @@ impl App {
             committed_end: 0,
             footer,
             usage: String::new(),
+            context_label: None,
+            ctx_snapshot: None,
             last_keystroke: None,
             selection: SelectionState::default(),
             front_since: None,
@@ -703,6 +713,8 @@ impl App {
     /// messages join the session, so it lags a turn behind.
     pub(crate) fn sync_from_ctx(&mut self, ctx: &mut RequestContext) {
         self.footer = FooterInfo::from_ctx(ctx);
+        self.context_label = ctx.context_label(&ctx.app.config);
+        self.note_context_change(CtxSnapshot::from_ctx(ctx));
         self.usage = ctx.render_prompt_right(&ctx.app.config);
         self.macros = ctx
             .visible_macro_completions()
@@ -771,6 +783,44 @@ impl App {
         self.child_root = ctx.child_session_root.clone();
         self.control = Some(Arc::new(ctx.fork_for_branch()));
         self.schedule_frame();
+    }
+
+    /// Appends a divider when the agent, role, session or RAG differs
+    /// from the last return's. A session saved on the way out says so in
+    /// the divider, which takes the place of the save line the command
+    /// printed. Leaving anything starts the main view afresh at the
+    /// divider; the pager still shows what came before it.
+    fn note_context_change(&mut self, snapshot: CtxSnapshot) {
+        let Some(old) = self.ctx_snapshot.replace(snapshot.clone()) else {
+            return;
+        };
+        let left_session = old.session.is_some() && old.session != snapshot.session;
+        let saved = left_session.then(|| self.saved_session_output()).flatten();
+        let Some(text) = divider_text(&old, &snapshot, saved.is_some()) else {
+            return;
+        };
+        if let Some((index, kept)) = saved
+            && let Some(Cell::Command { output, .. }) = self.transcript.cell_mut(index)
+        {
+            *output = kept;
+        }
+        self.transcript.push(Cell::divider(text));
+        if old.leaves_for(&snapshot) {
+            self.transcript.clear_view_from(self.transcript.len() - 1);
+        }
+    }
+
+    /// The newest line the user entered, when it is a command whose output
+    /// says the session was saved: its index, and the output without that.
+    fn saved_session_output(&self) -> Option<(usize, String)> {
+        let cells = self.transcript.cells();
+        let index = cells
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::User { .. } | Cell::Command { .. }))?;
+        let Cell::Command { output, .. } = &cells[index] else {
+            return None;
+        };
+        context::without_lines_holding(output, SAVED_SESSION_LINE).map(|kept| (index, kept))
     }
 
     fn close_stream(&mut self) {
@@ -1135,7 +1185,15 @@ impl App {
     fn copy_tool_output(&mut self) -> Option<Command> {
         let copied = match self.pager().filter(|pager| !pager.shows_root()) {
             Some(pager) => pager.focused_child_cell(&self.child_live),
-            None => cells::copy_target(self.transcript.cells(), self.transcript.focus()),
+            None => {
+                let floor = self.transcript.view_floor();
+                cells::copy_target(
+                    &self.transcript.cells()[floor..],
+                    self.transcript
+                        .focus()
+                        .and_then(|focus| focus.checked_sub(floor)),
+                )
+            }
         }
         .and_then(Cell::copied_output);
         let notice = match copied {
@@ -2497,6 +2555,7 @@ impl App {
                     PromptModal {
                         prompt,
                         theme: &self.theme,
+                        context: self.context_label.as_deref(),
                     },
                     bottom,
                 );
@@ -2540,6 +2599,7 @@ impl App {
                         &self.theme,
                         self.vi_mode == Some(ViMode::Normal),
                         state,
+                        self.context_label.as_deref(),
                     ),
                     field,
                 );

@@ -32,7 +32,9 @@ pub(super) fn transcript_text(cells: &[Cell], config: &AppConfig) -> String {
             Cell::Assistant { source, .. } => {
                 markdown(without_think_spans(source, true), markdown_setup.as_ref())
             }
-            Cell::Notice { text, .. } | Cell::Error { text, .. } => render::plain_text(text),
+            Cell::Notice { text, .. } | Cell::Error { text, .. } | Cell::Divider { text, .. } => {
+                render::plain_text(text)
+            }
             Cell::Command { name, output, .. } => {
                 let header = format!("> {}", render::plain_text(name));
                 let output = render::sanitize_ansi(output.trim_end());

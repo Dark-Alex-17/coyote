@@ -24,6 +24,35 @@ fn a_successful_undo_takes_the_last_exchange_out_of_the_transcript() {
     assert!(!frame.contains(".undo"), "{frame}");
 }
 
+/// An undo that reaches past a divider the main view was cleared at
+/// takes the view back with it: the exchange above shows again.
+#[test]
+fn an_undo_past_a_left_context_brings_back_the_rows_above_its_divider() {
+    let mut ctx = chat_ctx();
+    ctx.role = Some(crate::config::Role::new("coder", "You write code."));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    exchange(&mut harness);
+    harness.app.begin_turn("second question", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    if let Some(Cell::User { opened, .. }) = harness.app.transcript.last_mut() {
+        *opened = true;
+    }
+    ctx.role = None;
+    harness.app.sync_from_ctx(&mut ctx);
+    let frame = harness.draw();
+    assert!(!frame.contains("first question"), "{frame}");
+
+    harness.app.begin_turn(".undo", true);
+    harness.app.end_turn(true, &TurnOutcome::default());
+    harness.app.sync_from_ctx(&mut ctx);
+    assert_eq!(harness.app.transcript.view_floor(), 0);
+    let frame = harness.draw();
+    assert!(frame.contains("first question"), "{frame}");
+    assert!(!frame.contains("second question"), "{frame}");
+    assert!(!frame.contains("left role coder"), "{frame}");
+}
+
 #[test]
 fn a_failed_undo_keeps_the_transcript_and_its_command_cell() {
     let mut harness = Harness::standalone(80, 24);

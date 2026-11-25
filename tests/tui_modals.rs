@@ -5349,15 +5349,15 @@ mod binary_wizards {
     const SAVED_LINE: &[u8] = b"Saved the session to";
 
     /// `.exit session` on a dirty temp session, answered `y` and named: the
-    /// exit path's own output (the REPL's `Saved the session to '<path>'`
-    /// confirmation) lands in the transcript inside the alternate screen, on
-    /// a row below the `.exit session` command, the footer goes back to "no
-    /// session", the UI keeps taking keys, and nothing of the line leaks to
-    /// the normal screen after Ctrl+D. The transcript printed on exit would
-    /// carry the line on purpose, so it is switched off here.
+    /// transcript starts afresh at a `left session ... saved` divider, which
+    /// stands in for the REPL's `Saved the session to '<path>'` line, the
+    /// footer goes back to "no session", the UI keeps taking keys, and
+    /// nothing of the line leaks to the normal screen after Ctrl+D. The
+    /// transcript printed on exit is switched off, so the normal screen
+    /// holds only what leaked.
     #[test]
     #[serial]
-    fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
+    fn dot_exit_session_saving_on_y_says_saved_on_a_divider_over_a_fresh_view() {
         let dir = fresh_config_dir("exit-session-saved-line");
         let _guard = TempDirGuard(dir.clone());
         write_config(&dir, "tui_dump_on_exit: false\n");
@@ -5379,12 +5379,12 @@ mod binary_wizards {
         let deadline = std::time::Instant::now() + PTY_DEADLINE;
         let since = loop {
             let text = strip_ansi(&String::from_utf8_lossy(&pty.raw()[named_at..]));
-            if squeezed(&text).contains("Savedthesessionto") {
+            if squeezed(&text).contains("leftsession") {
                 break text;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the save confirmation never reached the transcript:\n{text}"
+                "the session's divider never reached the transcript:\n{text}"
             );
             pty.read_for(Duration::from_millis(200));
         };
@@ -5394,23 +5394,23 @@ mod binary_wizards {
             find(pty.raw(), LEAVE_ALT, 0).is_none(),
             "the session exit left the alternate screen:\n{since}"
         );
-        // The order is read off one full repaint: the stream before it holds
-        // cell diffs from several frames (the transcript scrolls as the footer
-        // flips), and a needle's nearest cursor move may belong to a frame
-        // other than the one that painted it.
+        // What the view holds is read off one full repaint: the stream
+        // before it holds cell diffs from several frames.
         let repaint_at = pty.raw().len();
         pty.resize(24, 81).unwrap();
         pty.read_for(Duration::from_millis(600));
-        let command_rows = painted_at(pty.raw(), b".exit session", repaint_at);
-        let saved_rows = painted_at(pty.raw(), b"Saved", repaint_at);
-        let (Some(&(command_row, _)), Some(&(saved_row, _))) =
-            (command_rows.first(), saved_rows.last())
-        else {
-            panic!("the command or its confirmation was not positioned on screen:\n{since}");
-        };
+        let repaint = &pty.raw()[repaint_at..];
         assert!(
-            saved_row > command_row,
-            "the confirmation was drawn above its command ({command_row} / {saved_row}):\n{since}"
+            !painted_at(repaint, b"saved", 0).is_empty(),
+            "the divider does not say the session was saved:\n{since}"
+        );
+        assert!(
+            find(repaint, SAVED_LINE, 0).is_none(),
+            "the save line is still drawn beside the divider:\n{since}"
+        );
+        assert!(
+            find(repaint, b".exit session", 0).is_none(),
+            "the view was not cleared at the divider:\n{since}"
         );
 
         pty.send(b".info\r").unwrap();

@@ -3811,6 +3811,12 @@ impl RequestContext {
         render_prompt(right_prompt, &variables)
     }
 
+    /// The agent, session, role and RAG part of the REPL's left prompt,
+    /// without the model or colours; see [`context_label`].
+    pub fn context_label(&self, app: &AppConfig) -> Option<String> {
+        context_label(&self.generate_prompt_context(app))
+    }
+
     pub fn select_enabled_functions(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let app = self.app.config.as_ref();
         let mut functions = vec![];
@@ -8533,6 +8539,41 @@ fn compose_summarization_request(prompt: &str, prior_summary: &str, chunk: &str)
     }
 }
 
+/// The context the default `LEFT_PROMPT` shows, read from the variables
+/// of [`RequestContext::generate_prompt_context`]: the agent and the
+/// session joined by ` > `, the role after the session as `/role` or in
+/// its place without one, then ` @rag`. None when none of them is set.
+pub fn context_label(vars: &HashMap<&str, String>) -> Option<String> {
+    let var = |key: &str| vars.get(key).map(String::as_str).filter(|v| !v.is_empty());
+    let mut label = match var("session") {
+        Some(session) => {
+            let mut label = [var("agent"), Some(session)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" > ");
+            if let Some(role) = var("role") {
+                label.push('/');
+                label.push_str(role);
+            }
+            label
+        }
+        None => [var("agent"), var("role")]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" > "),
+    };
+    if let Some(rag) = var("rag") {
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push('@');
+        label.push_str(rag);
+    }
+    (!label.is_empty()).then_some(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::mcp_factory::McpFactory;
@@ -9129,6 +9170,75 @@ mod tests {
         ctx.pending_images = vec!["/tmp/a.png".into(), "/tmp/b.png".into()];
         let vars = ctx.generate_prompt_context(&app);
         assert_eq!(vars.get("images").map(String::as_str), Some("2"));
+    }
+
+    /// The context part of the default left prompt rendered with highlight
+    /// off: the model and its `)` cut from the front, the closing `)` or
+    /// `>` from the back, and the bare `>` and `@` the REPL joins with
+    /// spaced out.
+    fn repl_context(vars: &HashMap<&str, String>) -> String {
+        let mut vars = vars.clone();
+        vars.insert("model", "m".to_string());
+        let rendered = render_prompt(LEFT_PROMPT, &vars);
+        let context = rendered
+            .strip_prefix("m)")
+            .unwrap()
+            .strip_suffix(' ')
+            .unwrap();
+        let context = context
+            .strip_suffix(')')
+            .or_else(|| context.strip_suffix('>'))
+            .unwrap();
+        context
+            .trim_end_matches('>')
+            .replace('>', " > ")
+            .replace('@', " @")
+            .trim_start()
+            .to_string()
+    }
+
+    #[test]
+    fn context_label_matches_the_repl_left_prompt_without_the_model() {
+        let cases = [
+            (vec![], None),
+            (vec![("agent", "architect")], Some("architect")),
+            (vec![("session", "coyote-tui")], Some("coyote-tui")),
+            (
+                vec![("agent", "architect"), ("session", "coyote-tui")],
+                Some("architect > coyote-tui"),
+            ),
+            (vec![("role", "coder")], Some("coder")),
+            (
+                vec![("session", "coyote-tui"), ("role", "coder")],
+                Some("coyote-tui/coder"),
+            ),
+            (
+                vec![
+                    ("agent", "architect"),
+                    ("session", "coyote-tui"),
+                    ("rag", "docs"),
+                ],
+                Some("architect > coyote-tui @docs"),
+            ),
+        ];
+        for (pairs, expected) in cases {
+            let vars: HashMap<&str, String> =
+                pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+            let label = context_label(&vars);
+            assert_eq!(label.as_deref(), expected, "{pairs:?}");
+            assert_eq!(label.unwrap_or_default(), repl_context(&vars), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn context_label_reads_the_context_s_own_variables() {
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        assert_eq!(ctx.context_label(&app), None);
+        let mut session = Session::default();
+        session.set_name("coyote-tui".to_string());
+        ctx.session = Some(session);
+        assert_eq!(ctx.context_label(&app).as_deref(), Some("coyote-tui"));
     }
 
     fn test_decl(name: &str) -> FunctionDeclaration {

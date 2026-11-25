@@ -1,5 +1,6 @@
 use super::cells::LineCache;
 use super::composer::{RULE_ROWS, wrapped_rows};
+use super::context::context_title;
 use super::keys::ModalKind;
 use super::render::Renderer;
 use super::sink::unattended_answer;
@@ -487,6 +488,8 @@ fn row_count(lines: usize) -> u16 {
 pub(super) struct PromptModal<'a> {
     pub(super) prompt: &'a PendingPrompt,
     pub(super) theme: &'a Theme,
+    /// The context label the composer's top rule would carry.
+    pub(super) context: Option<&'a str>,
 }
 
 impl Widget for PromptModal<'_> {
@@ -502,6 +505,12 @@ impl Widget for PromptModal<'_> {
         for (row, label) in [(top, label), (bottom, None)] {
             let mut block = Block::new().borders(Borders::TOP).border_style(rule);
             if let Some(label) = label {
+                if let Some(title) = self
+                    .context
+                    .and_then(|context| context_title(context, row.width, &[label]))
+                {
+                    block = block.title(Line::styled(title, self.theme.your_turn));
+                }
                 block = block.title(Line::styled(label, rule).right_aligned());
             }
             block.render(row, buf);

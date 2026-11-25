@@ -9,6 +9,7 @@ use super::{
 };
 use crate::events::NoticeKind;
 use ratatui::style::{Modifier, Style};
+use ratatui::symbols::line::HORIZONTAL;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -578,6 +579,12 @@ pub(super) enum Cell {
         sweep: Option<usize>,
         cache: LineCache<(u16, Option<u16>)>,
     },
+    /// A full-width rule marking an agent, role, session or RAG being
+    /// entered or left, with what changed in its middle.
+    Divider {
+        text: String,
+        cache: LineCache,
+    },
 }
 
 /// Whether `name` is a tool whose call is housekeeping rather than work
@@ -742,6 +749,13 @@ impl Cell {
     pub(super) fn welcome() -> Self {
         Self::Welcome {
             sweep: None,
+            cache: LineCache::default(),
+        }
+    }
+
+    pub(super) fn divider(text: String) -> Self {
+        Self::Divider {
+            text,
             cache: LineCache::default(),
         }
     }
@@ -1019,7 +1033,8 @@ impl Cell {
         | Cell::Tool { cache, .. }
         | Cell::Job { cache, .. }
         | Cell::Agent { cache, .. }
-        | Cell::Node { cache, .. } = self
+        | Cell::Node { cache, .. }
+        | Cell::Divider { cache, .. } = self
         {
             *cache = LineCache::default();
         }
@@ -1215,16 +1230,20 @@ impl Cell {
                     *sweep,
                 )
             }),
+            Cell::Divider { text, cache } => cache.get(width, || divider_lines(text, width, faded)),
         })
     }
 
     /// The cell as the pager shows it: a tool, job or agent row open,
     /// with everything its calls printed rather than the inline tail, and
-    /// all of a stray call's output. Every other cell reads as it does in
-    /// the transcript.
+    /// all of a stray call's output, and a divider as its text alone.
+    /// Every other cell reads as it does in the transcript.
     pub(super) fn full_lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
         if let Cell::Text { tail, .. } = self {
             return tail.full.lines(width).to_vec();
+        }
+        if let Cell::Divider { text, .. } = self {
+            return render::plain_lines(text, width, renderer.faded);
         }
         let tick = Some(renderer.tick);
         let Some(header) = self.summary_line(tick) else {
@@ -1531,6 +1550,22 @@ fn output_lines(lines: &[String]) -> Vec<Line<'static>> {
         return Vec::new();
     }
     render::preformatted_lines(&lines.join("\n"))
+}
+
+/// A rule across `width` with ` text ` in its middle; text too wide for
+/// one row is wrapped instead, with no rule.
+fn divider_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let label = format!(" {} ", render::plain_text(text));
+    let Some(rest) = usize::from(width).checked_sub(label.width() + 2) else {
+        return render::plain_lines(text, width, style);
+    };
+    let left = 1 + rest / 2;
+    let right = 1 + rest - rest / 2;
+    let rule = |n: usize| HORIZONTAL.repeat(n);
+    vec![Line::from(Span::styled(
+        format!("{}{label}{}", rule(left), rule(right)),
+        style,
+    ))]
 }
 
 fn dim_wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {

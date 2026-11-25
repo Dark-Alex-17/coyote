@@ -3373,6 +3373,7 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
                 PromptModal {
                     prompt: &confirm,
                     theme: &theme,
+                    context: None,
                 }
                 .render(area, buf)
             }),
@@ -3383,6 +3384,7 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
                 PromptModal {
                     prompt: &input,
                     theme: &theme,
+                    context: None,
                 }
                 .render(area, buf)
             }),
@@ -3393,6 +3395,7 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
                 PromptModal {
                     prompt: &select,
                     theme: &theme,
+                    context: None,
                 }
                 .render(area, buf)
             }),
@@ -3403,6 +3406,7 @@ fn every_custom_widget_clamps_its_area_to_the_buffer() {
                 PromptModal {
                     prompt: &checkbox,
                     theme: &theme,
+                    context: None,
                 }
                 .render(area, buf)
             }),
@@ -3767,6 +3771,233 @@ fn a_state_change_costs_one_frame_and_idle_asks_for_none() {
     harness.render();
     harness.app.frame_drawn();
     assert_eq!(harness.app.frames.due_at(), None);
+}
+
+fn active_agent(name: &str) -> crate::config::Agent {
+    crate::config::Agent::test_new(crate::config::AgentConfig {
+        name: name.to_string(),
+        ..Default::default()
+    })
+}
+
+fn session_named(name: &str) -> Session {
+    let mut session = Session::default();
+    session.set_name(name.to_string());
+    session
+}
+
+fn dividers(harness: &Harness) -> Vec<String> {
+    harness
+        .app
+        .transcript
+        .cells()
+        .iter()
+        .filter_map(|cell| match cell {
+            Cell::Divider { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The root thread in the Ctrl+T pager, from its top.
+fn pager_frame(harness: &mut Harness) -> String {
+    press_ctrl(harness, 't');
+    harness.press(KeyCode::Char('g'));
+    let frame = harness.draw();
+    harness.press(KeyCode::Char('q'));
+    frame
+}
+
+/// What a launch starts in has nothing before it to leave, so the rule
+/// names it and no divider is drawn.
+#[test]
+fn a_context_active_at_launch_is_labelled_without_a_divider() {
+    let mut ctx = chat_ctx();
+    ctx.agent = Some(active_agent("architect"));
+    ctx.session = Some(session_named("coyote-tui"));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.draw();
+    assert!(dividers(&harness).is_empty());
+    let top = row_text(&harness, COMPOSER_RULE_ROW);
+    assert!(top.starts_with(" architect > coyote-tui "), "{top:?}");
+    assert!(top.ends_with(theme::YOUR_TURN_LABEL), "{top:?}");
+}
+
+#[test]
+fn entering_an_agent_appends_a_divider_and_keeps_the_view() {
+    let mut ctx = chat_ctx();
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("before-k7m", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    ctx.agent = Some(active_agent("sisyphus"));
+    harness.app.sync_from_ctx(&mut ctx);
+    let frame = harness.draw();
+    assert_eq!(dividers(&harness), ["entered agent sisyphus"]);
+    assert!(frame.contains("before-k7m"), "{frame}");
+    assert!(frame.contains(" entered agent sisyphus "), "{frame}");
+    let top = row_text(&harness, COMPOSER_RULE_ROW);
+    assert!(top.starts_with(" sisyphus "), "{top:?}");
+}
+
+#[test]
+fn leaving_an_agent_clears_the_view_and_the_pager_keeps_what_came_before() {
+    let mut ctx = chat_ctx();
+    ctx.agent = Some(active_agent("architect"));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("before-k7m", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    ctx.agent = None;
+    harness.app.sync_from_ctx(&mut ctx);
+    let frame = harness.draw();
+    assert_eq!(dividers(&harness), ["left agent architect"]);
+    assert!(frame.contains(" left agent architect "), "{frame}");
+    assert!(!frame.contains("before-k7m"), "{frame}");
+    let top = row_text(&harness, COMPOSER_RULE_ROW);
+    assert!(!top.contains("architect"), "{top:?}");
+    let pager = pager_frame(&mut harness);
+    assert!(pager.contains("before-k7m"), "{pager}");
+    assert!(pager.contains("left agent architect"), "{pager}");
+}
+
+#[test]
+fn a_role_entered_then_left_gets_a_divider_each_and_only_leaving_clears() {
+    let mut ctx = chat_ctx();
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("before-k7m", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    ctx.role = Some(crate::config::Role::new("coder", "You write code."));
+    harness.app.sync_from_ctx(&mut ctx);
+    let frame = harness.draw();
+    assert!(frame.contains("before-k7m"), "{frame}");
+    let top = row_text(&harness, COMPOSER_RULE_ROW);
+    assert!(top.starts_with(" coder "), "{top:?}");
+
+    harness.app.begin_turn("during-k7m", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    ctx.role = None;
+    harness.app.sync_from_ctx(&mut ctx);
+    let frame = harness.draw();
+    assert_eq!(
+        dividers(&harness),
+        ["entered role coder", "left role coder"]
+    );
+    assert!(!frame.contains("before-k7m"), "{frame}");
+    assert!(!frame.contains("during-k7m"), "{frame}");
+    assert!(frame.contains(" left role coder "), "{frame}");
+}
+
+/// Leaves a session the way `.exit session` does: the command prints the
+/// save line, then the context comes back without the session.
+fn leave_saved_session(harness: &mut Harness, ctx: &mut RequestContext) {
+    harness.app.begin_turn(".exit session", true);
+    harness.app.end_turn(
+        true,
+        &TurnOutcome {
+            captured: "\u{2713} Saved the session to '/tmp/coyote-tui.yaml'.\n".to_string(),
+            ..TurnOutcome::default()
+        },
+    );
+    ctx.session = None;
+    harness.app.sync_from_ctx(ctx);
+}
+
+#[test]
+fn leaving_a_saved_session_says_saved_in_place_of_the_save_line() {
+    let mut ctx = chat_ctx();
+    ctx.session = Some(session_named("coyote-tui"));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("before-k7m", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    leave_saved_session(&mut harness, &mut ctx);
+    assert_eq!(dividers(&harness), ["left session coyote-tui saved"]);
+    let saved_line_kept = harness.app.transcript.cells().iter().any(
+        |cell| matches!(cell, Cell::Command { output, .. } if output.contains("Saved the session")),
+    );
+    assert!(!saved_line_kept);
+    let frame = harness.draw();
+    assert!(!frame.contains("before-k7m"), "{frame}");
+    let pager = pager_frame(&mut harness);
+    assert!(pager.contains("> .exit session"), "{pager}");
+    assert!(!pager.contains("Saved the session"), "{pager}");
+}
+
+/// An agent's session left saved: the rule keeps the agent alone and the
+/// fresh view holds only the divider.
+fn context_label_frame(width: u16, height: u16, no_color: bool) -> (Harness, String) {
+    let mut ctx = chat_ctx();
+    ctx.agent = Some(active_agent("architect"));
+    ctx.session = Some(session_named("coyote-tui"));
+    let mut harness = Harness::new(
+        width,
+        height,
+        Arc::clone(&ctx.app.config),
+        FooterInfo::from_ctx(&ctx),
+    );
+    harness.app.set_no_color(no_color);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("hello", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    leave_saved_session(&mut harness, &mut ctx);
+    let frame = harness.draw();
+    (harness, frame)
+}
+
+#[test]
+fn context_label_and_a_left_divider_at_80x24() {
+    let (harness, frame) = context_label_frame(80, 24, false);
+    let top = row_text(&harness, COMPOSER_RULE_ROW);
+    assert!(top.starts_with(" architect "), "{top:?}");
+    let label = &harness.terminal.backend().buffer()[(1, COMPOSER_RULE_ROW)];
+    assert_eq!(
+        label.fg,
+        harness.app.theme.your_turn.fg.unwrap_or(Color::Reset)
+    );
+    insta::assert_snapshot!("context_label_80x24", &frame);
+}
+
+#[test]
+fn context_label_and_a_left_divider_at_40x20() {
+    let (_, frame) = context_label_frame(40, 20, false);
+    insta::assert_snapshot!("context_label_40x20", &frame);
+}
+
+/// Under `NO_COLOR` the label stays, bold and uncoloured like the rule.
+#[test]
+fn context_label_under_no_color_is_bold_and_uncoloured() {
+    let (harness, frame) = context_label_frame(80, 24, true);
+    let label = &harness.terminal.backend().buffer()[(1, COMPOSER_RULE_ROW)];
+    assert_eq!(label.symbol(), "a");
+    assert_eq!(label.fg, Color::Reset);
+    assert!(label.modifier.contains(Modifier::BOLD));
+    insta::assert_snapshot!("context_label_no_color_80x24", &frame);
+}
+
+/// A question's panel stands in for the composer, its top rule naming
+/// the context too.
+#[test]
+fn an_open_question_names_the_context_on_its_top_rule() {
+    let mut ctx = chat_ctx();
+    ctx.agent = Some(active_agent("architect"));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("x", false);
+    let (reply, _answer) = mpsc::channel();
+    harness.app.handle_msg(UiMsg::Prompt {
+        req: Box::new(confirm_request(None)),
+        reply,
+    });
+    let frame = harness.draw();
+    let top = (0..24)
+        .map(|y| row_text(&harness, y))
+        .find(|row| row.ends_with(theme::YOUR_TURN_LABEL))
+        .expect("a labelled rule");
+    assert!(top.starts_with(" architect "), "{frame}");
 }
 
 /// The rows of the last drawn frame that are a full-width rule, with or

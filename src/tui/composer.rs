@@ -3,6 +3,7 @@
 //! over the field after the textarea has drawn it, green when it names
 //! something that would run and red when it does not.
 
+use super::context::context_title;
 use super::keys::ViMotion;
 use super::theme::{ComposerState, DIM, Theme};
 use crate::config::CommandPrefix;
@@ -260,6 +261,7 @@ impl Composer {
         theme: &'a Theme,
         vi_normal: bool,
         state: ComposerState,
+        context: Option<&'a str>,
     ) -> ComposerView<'a> {
         let first_line = self.textarea.lines().first().map(String::as_str);
         ComposerView {
@@ -268,6 +270,7 @@ impl Composer {
             theme,
             vi_normal,
             state,
+            context,
         }
     }
 }
@@ -360,6 +363,7 @@ pub(super) struct ComposerView<'a> {
     theme: &'a Theme,
     vi_normal: bool,
     state: ComposerState,
+    context: Option<&'a str>,
 }
 
 impl ComposerView<'_> {
@@ -405,8 +409,16 @@ impl Widget for ComposerView<'_> {
         let mut rule = Block::new()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(style);
-        if self.vi_normal {
-            rule = rule.title(NORMAL_TAG);
+        let lead = self.vi_normal.then_some(NORMAL_TAG);
+        if let Some(lead) = lead {
+            rule = rule.title(lead);
+        }
+        let taken: Vec<&str> = lead.into_iter().chain(label).collect();
+        if let Some(title) = self
+            .context
+            .and_then(|context| context_title(context, area.width, &taken))
+        {
+            rule = rule.title(Line::styled(title, self.theme.your_turn));
         }
         if let Some(label) = label {
             rule = rule.title(Line::styled(label, style).right_aligned());
@@ -451,7 +463,7 @@ mod tests {
         composer.set_text(text);
         let mut buf = Buffer::empty(AREA);
         composer
-            .view(prefix, extra_known, &theme, false, state)
+            .view(prefix, extra_known, &theme, false, state, None)
             .render(AREA, &mut buf);
         buf
     }
@@ -562,6 +574,7 @@ mod tests {
                 &Theme::fallback(false),
                 false,
                 ComposerState::Working,
+                None,
             )
             .render(AREA, &mut buf);
         assert!(composer.textarea.scroll_offset().0 > 0);
@@ -579,6 +592,7 @@ mod tests {
                 &Theme::fallback(false),
                 true,
                 ComposerState::Working,
+                None,
             )
             .render(AREA, &mut buf);
         let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
@@ -602,6 +616,7 @@ mod tests {
                     &theme,
                     true,
                     ComposerState::YourTurn,
+                    None,
                 )
                 .render(AREA, &mut buf);
             let top: String = (0..AREA.width).map(|x| buf[(x, 0)].symbol()).collect();
@@ -631,6 +646,32 @@ mod tests {
         for y in [0, AREA.height - 1] {
             assert_eq!(Some(buf[(0, y)].fg), soft);
         }
+    }
+
+    /// The context sits after the NORMAL tag in the accent, and on a rule
+    /// too narrow for all three loses its start rather than covering the
+    /// label at the right end.
+    #[test]
+    fn the_context_label_gives_way_to_the_other_titles() {
+        let theme = Theme::fallback(false);
+        let composer = Composer::new(CommandPrefix::Dot);
+        let area = Rect::new(0, 0, 30, 5);
+        let mut buf = Buffer::empty(area);
+        composer
+            .view(
+                CommandPrefix::Dot,
+                &[],
+                &theme,
+                true,
+                ComposerState::YourTurn,
+                Some("architect > coyote-tui"),
+            )
+            .render(area, &mut buf);
+        let top: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        let expected = format!("{NORMAL_TAG}{HORIZONTAL} ...-tui {HORIZONTAL}{YOUR_TURN_LABEL}");
+        assert_eq!(top, expected);
+        let at = u16::try_from(NORMAL_TAG.len() + 2).unwrap();
+        assert_eq!(Some(buf[(at, 0)].fg), theme.your_turn.fg);
     }
 
     #[test]
@@ -787,6 +828,7 @@ mod tests {
                 &Theme::fallback(false),
                 false,
                 ComposerState::Working,
+                None,
             )
             .render(area, &mut buf);
         let row = |y: u16| -> String { (0..20).map(|x| buf[(x, y)].symbol()).collect() };
@@ -849,6 +891,7 @@ mod tests {
                     &Theme::fallback(true),
                     false,
                     ComposerState::Working,
+                    None,
                 )
                 .render(area, &mut buf);
             let drawn = (1..area.height - 1)
