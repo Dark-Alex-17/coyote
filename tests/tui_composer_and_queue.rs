@@ -1776,6 +1776,47 @@ mod editor_status_history_reset_and_bare_agent {
     // Clear, Ctrl+R accept, picker prefill and unqueue end the history walk.
     // ---------------------------------------------------------------------
 
+    /// Two dry-run prompts: Ctrl+P recalls the newer and then the older,
+    /// and Ctrl+N walks forward to the newer again and then to the empty
+    /// draft past it, as Up and Down do.
+    #[test]
+    #[serial]
+    fn ctrl_p_and_ctrl_n_walk_the_history_back_and_forth() {
+        const CTRL_P: &[u8] = b"\x10";
+        const CTRL_N: &[u8] = b"\x0e";
+        let dir = fresh_config_dir("history-ctrl-p-n");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        for prompt in ["p1-c7n", "p2-c7n"] {
+            dry_run_exchange(&mut pty, prompt);
+        }
+        let footer = "dryrun:dry-model";
+        let mut toggle = false;
+        let mut walk = Vec::new();
+        for chord in [CTRL_P, CTRL_P, CTRL_N, CTRL_N] {
+            key(&mut pty, chord);
+            let frame = next_frame(&mut pty, &mut toggle);
+            let row = composer_row_with_footer(&frame, footer);
+            let draft = if shows_placeholder(&squeezed(&frame)) {
+                String::new()
+            } else {
+                row
+            };
+            walk.push(draft);
+        }
+        clear_any_draft(&mut pty);
+        quit_clearing_any_draft(&mut pty);
+        assert_eq!(
+            walk,
+            ["p2-c7n", "p1-c7n", "p2-c7n", ""],
+            "Ctrl+P, Ctrl+P, Ctrl+N, Ctrl+N"
+        );
+    }
+
     /// Three dry-run prompts `h1`, `h2`, `h3`. Up x3 reaches `h1` (a fourth
     /// Up stays there). Ctrl+C clears the composer; the next Up is `h3`,
     /// not `h1`. Back at `h1` again, Ctrl+R `h2` Enter recalls `h2` with no

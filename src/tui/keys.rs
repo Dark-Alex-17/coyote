@@ -444,7 +444,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         ),
         row(
             Composer,
-            "Up / Down",
+            "Up / Down / Ctrl+P / Ctrl+N",
             "Walk the history on a one-line composer",
         ),
         row(Composer, "Ctrl+R", "Search the history"),
@@ -913,6 +913,20 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter => Action::Submit,
             KeyCode::Up if ctx.single_line && key.modifiers.is_empty() => Action::HistoryPrev,
             KeyCode::Down if ctx.single_line && key.modifiers.is_empty() => Action::HistoryNext,
+            // Readline's history chords, as the arrows: the history on a
+            // one-line draft, the textarea's line moves on a longer one. Under
+            // a band they stay the textarea's.
+            KeyCode::Char('p' | 'n')
+                if ctx.single_line
+                    && ctx.popup.is_none()
+                    && key.modifiers == KeyModifiers::CONTROL =>
+            {
+                if code == KeyCode::Char('p') {
+                    Action::HistoryPrev
+                } else {
+                    Action::HistoryNext
+                }
+            }
             KeyCode::Char('?') if !ctrl && !alt && ctx.question_mark_opens_help() => {
                 Action::ToggleHelp
             }
@@ -1490,6 +1504,68 @@ mod tests {
             (ctrl('r'), IDLE, Action::OpenHistorySearch),
             (ctrl('r'), running, Action::OpenHistorySearch),
             (ctrl('r'), multi_line, Action::OpenHistorySearch),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// Ctrl+P and Ctrl+N do what Up and Down do in the composer: the
+    /// history on a one-line draft, a line move on a longer one; with the
+    /// palette open, in a modal or in the transcript view they keep the
+    /// meaning they had.
+    #[test]
+    fn ctrl_p_and_ctrl_n_walk_the_history_like_the_arrows() {
+        let multi_line = KeyContext {
+            single_line: false,
+            composer_empty: false,
+            ..IDLE
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..IDLE
+        };
+        let vi_normal = KeyContext {
+            vi: Some(ViMode::Normal),
+            ..IDLE
+        };
+        for ctx in [IDLE, TYPING, running, VI_INSERT, vi_normal] {
+            for (chord, arrow) in [('p', KeyCode::Up), ('n', KeyCode::Down)] {
+                assert_eq!(
+                    map_key(ctrl(chord), &ctx),
+                    map_key(plain(arrow), &ctx),
+                    "Ctrl+{chord} in {ctx:?}"
+                );
+            }
+        }
+        for (chord, arrow) in [('p', KeyCode::Up), ('n', KeyCode::Down)] {
+            assert_eq!(
+                map_key(ctrl(chord), &multi_line),
+                Action::ComposerInput(ctrl(chord))
+            );
+            assert_eq!(
+                map_key(plain(arrow), &multi_line),
+                Action::ComposerInput(plain(arrow))
+            );
+        }
+        let cases = [
+            (ctrl('p'), PALETTE, Action::ComposerInput(ctrl('p'))),
+            (ctrl('n'), PALETTE, Action::ComposerInput(ctrl('n'))),
+            (ctrl('p'), BROWSE, Action::Nothing),
+            (ctrl('n'), BROWSE, Action::Nothing),
+            (ctrl('n'), PICKER, Action::Nothing),
+            (ctrl('n'), CONFIRM, map_key(ctrl('n'), &CONFIRM)),
+            (
+                press(
+                    KeyCode::Char('p'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ),
+                IDLE,
+                Action::ComposerInput(press(
+                    KeyCode::Char('p'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                )),
+            ),
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
@@ -2736,10 +2812,12 @@ mod tests {
             ),
             (
                 H::Composer,
-                "Up / Down",
+                "Up / Down / Ctrl+P / Ctrl+N",
                 vec![
                     (plain(KeyCode::Up), IDLE, Action::HistoryPrev),
                     (plain(KeyCode::Down), IDLE, Action::HistoryNext),
+                    (ctrl('p'), IDLE, Action::HistoryPrev),
+                    (ctrl('n'), IDLE, Action::HistoryNext),
                 ],
             ),
             (
@@ -3983,8 +4061,9 @@ mod tests {
             ],
         ]
         .concat();
-        let empty_composer = [&composer[..], &["Ctrl+D", "Up", "Down"]].concat();
-        let one_line_draft = [&composer[..], &["Up", "Down"]].concat();
+        let history = ["Up", "Down", "Ctrl+P", "Ctrl+N"];
+        let empty_composer = [&composer[..], &["Ctrl+D"], &history[..]].concat();
+        let one_line_draft = [&composer[..], &history[..]].concat();
         let cases = [
             (IDLE, sorted(&empty_composer)),
             (TYPING, sorted(&one_line_draft)),
