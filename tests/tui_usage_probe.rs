@@ -218,22 +218,28 @@ mod welcome_and_footer {
         pty.read_for(std::time::Duration::from_millis(3700));
 
         // The pty starts at 100x40, so 101 columns forces a full repaint.
-        let wide = repainted_frame_after_resize(&mut pty, 40, 101);
+        let at = repaint_until(&mut pty, 40, 101, |f| {
+            shows_big_mark(f) && f.contains(version)
+        });
+        let wide = since(&pty, at);
         assert!(shows_big_mark(&wide), "no wide wordmark at 101x40:\n{wide}");
         assert!(!shows_mark(&wide), "the small wordmark at 101x40:\n{wide}");
         assert!(wide.contains(version), "no version at 101x40:\n{wide}");
 
-        let fallback = repainted_frame_after_resize(&mut pty, 24, 53);
+        let at = repaint_until(&mut pty, 24, 53, |f| shows_mark(f) && !shows_big_mark(f));
+        let fallback = since(&pty, at);
         assert!(
             shows_mark(&fallback) && !shows_big_mark(&fallback),
             "no small wordmark in place of the wide one at 53x24:\n{fallback}"
         );
 
-        let small = repainted_frame_after_resize(&mut pty, 20, 40);
+        let at = repaint_until(&mut pty, 20, 40, |f| shows_mark(f) && f.contains(version));
+        let small = since(&pty, at);
         assert!(shows_mark(&small), "no wordmark at 40x20:\n{small}");
         assert!(small.contains(version), "no version at 40x20:\n{small}");
 
-        let narrow = repainted_frame_after_resize(&mut pty, 40, 24);
+        let at = repaint_showing(&mut pty, 40, 24, &[version]);
+        let narrow = since(&pty, at);
         assert!(
             !shows_mark(&narrow) && !shows_big_mark(&narrow),
             "the wordmark is drawn at 24 columns:\n{narrow}"
@@ -243,7 +249,8 @@ mod welcome_and_footer {
             "the welcome lost its version at 24 columns:\n{narrow}"
         );
 
-        let back = repainted_frame_after_resize(&mut pty, 40, 100);
+        let at = repaint_until(&mut pty, 40, 100, shows_mark);
+        let back = since(&pty, at);
         assert!(
             shows_big_mark(&back),
             "the wordmark did not come back at 100 columns:\n{back}"
@@ -295,7 +302,7 @@ mod welcome_and_footer {
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
         // The pty starts at 100x40, so 101 columns forces a full repaint.
-        let at = repaint(&mut pty, 40, 101);
+        let at = repaint_until(&mut pty, 40, 101, shows_mark);
         let frame = since(&pty, at);
         assert!(shows_big_mark(&frame), "no wordmark at 101x40:\n{frame}");
         let colored: Vec<Vec<u16>> = sgr_params(&pty.raw()[at..])
@@ -413,7 +420,8 @@ mod elapsed_format {
         // A full repaint, since a cell-diffing frame only rewrites the
         // digits that changed.
         let late_at = pty.raw().len();
-        let late = squeezed(&repainted_frame_after_resize(&mut pty, 24, 100));
+        let at = repaint_showing(&mut pty, 24, 100, &["fixture_slow(", "Working"]);
+        let late = squeezed(&since(&pty, at));
         fs::write(&release, b"").unwrap();
         wait_for_squeezed_after(&mut pty, "slow done el4", late_at, "the reply");
 
@@ -473,7 +481,8 @@ mod elapsed_format {
         wait_for_squeezed_after(&mut pty, "fixture_slow(", turn_at, "the running row");
         pty.read_for(Duration::from_secs(3));
         let during = since(&pty, turn_at);
-        let frame = squeezed(&repainted_frame_after_resize(&mut pty, 24, 100));
+        let at = repaint_showing(&mut pty, 24, 100, &["fixture_slow(", "Working"]);
+        let frame = squeezed(&since(&pty, at));
         fs::write(&release, b"").unwrap();
         wait_for_squeezed_after(&mut pty, "slow done ws5", turn_at, "the reply");
 
@@ -923,7 +932,10 @@ mod welcome_sweep {
         for (i, rows) in (12u16..=20).enumerate() {
             // Alternate the width so no resize is coalesced away.
             let cols = if i % 2 == 0 { 80 } else { 81 };
-            let frame = repainted_frame_after_resize(&mut pty, rows, cols);
+            let at = repaint_until(&mut pty, rows, cols, |f| {
+                squeezed(f).contains(&version) && f.contains("model:") && f.contains('┌')
+            });
+            let frame = since(&pty, at);
             let flat = squeezed(&frame);
             let big = flat.contains(big_row);
             let small = flat.contains(small_row);

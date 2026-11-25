@@ -35,7 +35,10 @@
 //! `src/function/agents.rs`. The wait tools on Background-Jobs.md and
 //! Agents.md are read against `handle_wait` and the `job__start` message in
 //! `src/function/jobs.rs` and the spawn instructions in
-//! `src/config/prompts.rs`.
+//! `src/config/prompts.rs`. The agent-node `inputs:` section is read against
+//! the shared message bodies in `src/graph/mod.rs`, the unparsable-config
+//! message in `src/graph/validator.rs` and the runtime prefix in
+//! `src/function/agents.rs`.
 
 mod common;
 
@@ -109,6 +112,8 @@ const CARRY_BULLET_LEAD: &str = "- **`carry`:**";
 /// The lead of the script Environment note on what `previous_turns` does
 /// to the state size.
 const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
+/// The Graph-Agents.md subsection that documents an agent node's `inputs:`.
+const INPUTS_HEADING: &str = "### Passing state into a child agent (inputs)";
 
 /// The `agent.*` events a spawned child fires, scraped from the
 /// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
@@ -509,12 +514,13 @@ fn with_placeholders(literal: &str) -> String {
         .replace("{declared_text}", "declared: a, b, c")
 }
 
-/// The literals of a `pub const NAME: [&str; N] = [...]` in `source`.
+/// The literals of a `const NAME: [&str; N] = [...]` in `source`, whatever
+/// its visibility.
 fn const_str_array(source: &str, name: &str) -> Vec<String> {
-    let head = format!("pub const {name}: [&str; ");
+    let head = format!("const {name}: [&str; ");
     let start = source
         .find(&head)
-        .unwrap_or_else(|| panic!("src/graph/validator.rs declares {name}"));
+        .unwrap_or_else(|| panic!("the source declares {name}"));
     let body = &source[start..];
     let end = body
         .find("];")
@@ -3244,4 +3250,178 @@ fn paragraph_stops_at_a_blank_line_or_the_next_bullet() {
         paragraph("page", page, "Under a session,"),
         "Under a session, the key is seeded\nbefore any node runs."
     );
+}
+
+/// The `inputs:` subsection quotes the agent-node `inputs:` errors the
+/// runtime and the validator share, with both location prefixes, and no
+/// longer teaches that `inputs:` needs a graph agent.
+#[test]
+fn inputs_section_quotes_the_shared_inputs_errors() {
+    let graph = src(&["graph", "mod.rs"]);
+    let validator = src(&["graph", "validator.rs"]);
+    let agents = src(&["function", "agents.rs"]);
+    let rule = const_str(&graph, "CONFIG_INPUTS_RULE");
+    let bodies = string_literals(&fn_body(&graph, "pub(crate) fn agent_inputs_errors<'a>("));
+    let unparsable = string_literals(&fn_body(&validator, "fn unparsable_config_error("));
+    let quoted = |literals: &[String], literal: &str| -> String {
+        assert!(
+            literals.iter().any(|l| l == literal),
+            "no inputs message in the code is {literal:?}"
+        );
+        literal
+            .replace("{agent}", "<name>")
+            .replace("{CONFIG_INPUTS_RULE}", &rule)
+            .replace("{}", "<keys>")
+            .replace("{err:#}", "<error>")
+    };
+    let reserved = "`inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})";
+    quoted(&bodies, reserved);
+    let seeded_from = quoted(&bodies, " from `prompt:`");
+    let mut fragments: Vec<String> = const_str_array(&graph, "RESERVED_STATE_KEYS")
+        .into_iter()
+        .map(|key| {
+            let seeded = if key == "initial_prompt" {
+                seeded_from.as_str()
+            } else {
+                ""
+            };
+            reserved
+                .replace("{key}", &key)
+                .replace("{seeded_from}", seeded)
+        })
+        .collect();
+    fragments.extend([
+        quoted(
+            &bodies,
+            "`inputs:` is empty and agent '{agent}' has no graph.yaml; {CONFIG_INPUTS_RULE}",
+        ),
+        quoted(
+            &bodies,
+            "`inputs` names variable(s) agent '{agent}' does not declare: {}; {CONFIG_INPUTS_RULE}",
+        ),
+        quoted(
+            &unparsable,
+            "config.yaml of agent '{agent}' does not parse, so its declared variables are unknown: {err:#}",
+        ),
+    ]);
+    for (label, source, prefix) in [
+        (
+            "validator.rs",
+            &validator,
+            "\"agent node '{node_id}': {body}\"",
+        ),
+        ("agents.rs", &agents, "\"agent '{agent_name}': {body}\""),
+    ] {
+        assert!(
+            source.contains(prefix),
+            "{label} no longer prefixes the inputs errors with {prefix}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let inputs = flat(&section(SENTINEL_PAGE, &page, INPUTS_HEADING));
+    for fragment in &fragments {
+        assert!(
+            inputs.contains(fragment.as_str()),
+            "the inputs section does not quote {fragment:?}"
+        );
+    }
+    for prefix in ["agent node '<id>': ", "agent '<name>': "] {
+        assert!(
+            inputs.contains(prefix),
+            "the inputs section does not name the {prefix:?} prefix"
+        );
+    }
+    let flat_page = flat(&page);
+    for stale in [
+        "requires agent '<name>' to be a graph agent",
+        "only when the child is a GRAPH agent",
+        "Only valid when `agent` names a graph agent",
+        "the only thing an agent node hands to a config-only child",
+        "Passing state into a child graph agent",
+    ] {
+        assert!(
+            !flat_page.contains(stale),
+            "{SENTINEL_PAGE} still says {stale:?}"
+        );
+    }
+}
+
+/// The `///` doc comment directly above `head` in `source`, flattened.
+fn doc_comment(source: &str, head: &str) -> String {
+    let start = source
+        .find(head)
+        .unwrap_or_else(|| panic!("the source defines {head}"));
+    let mut lines: Vec<&str> = source[..start]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .take_while(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches("///"))
+        .collect();
+    lines.reverse();
+    flat(&lines.join(" "))
+}
+
+/// The `inputs:` subsection states how a child's variables are seated: it
+/// inherits the parent's, declared inputs override them, and a resume
+/// re-resolves them in the order `resolve_resumed_variables` documents and
+/// re-renders the instructions from them.
+#[test]
+fn inputs_section_states_inheritance_and_the_resume_order() {
+    let agents = src(&["function", "agents.rs"]);
+    let doc = doc_comment(&agents, "\nfn resolve_resumed_variables(");
+    let order = doc
+        .split_once("the order is: ")
+        .and_then(|(_, rest)| rest.split_once(", the last resort"))
+        .map(|(order, _)| format!("the order is: {order}"))
+        .unwrap_or_else(|| panic!("the resolve_resumed_variables doc names the order: {doc}"));
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let inputs = flat(&section(SENTINEL_PAGE, &page, INPUTS_HEADING));
+    for needle in [
+        "A child inherits the variables its parent runs with",
+        "overriding the inherited value",
+        order.as_str(),
+        "is read as all explicit",
+        "its instructions are re-rendered from the re-resolved values",
+    ] {
+        assert!(
+            inputs.contains(needle),
+            "the inputs section does not say {needle:?}"
+        );
+    }
+    assert!(
+        !inputs.contains("nothing about `inputs` persists past the child's executor start"),
+        "the inputs section still says no part of `inputs` outlives the child's start"
+    );
+}
+
+/// The `inputs:` comment on the agent node in graph.example.yaml teaches
+/// the variable side too: inheritance, seating and the resume override.
+#[test]
+fn graph_example_inputs_comment_covers_variables_and_resume() {
+    let example = read(repo_root().join("graph.example.yaml"));
+    let start = example
+        .find("    # inputs:")
+        .expect("graph.example.yaml has a commented `inputs:` on its agent node");
+    let text: Vec<&str> = example[start..]
+        .lines()
+        .map(str::trim_start)
+        .take_while(|line| line.starts_with('#'))
+        .filter_map(|line| line[1..].split_once('#').map(|(_, text)| text))
+        .collect();
+    let comment = flat(&text.join(" "));
+    for needle in [
+        "A child inherits the variables its parent runs with",
+        "is also seated as that variable",
+        "the inputs win over the values the session stored",
+    ] {
+        assert!(
+            comment.contains(needle),
+            "the graph.example.yaml `inputs:` comment does not say {needle:?}:\n{comment}"
+        );
+    }
 }

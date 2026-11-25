@@ -37,7 +37,7 @@ pub(crate) use self::agent::default_max_agent_depth;
 pub(crate) use self::agent::roster_line;
 pub use self::agent::{
     Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
-    list_agents_with_descriptions, load_agent_variables,
+    list_agents_with_descriptions, load_agent_variables, try_load_agent_variables,
 };
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;

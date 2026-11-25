@@ -5,14 +5,23 @@
 //! the swap is of fds 1 and 2; on Windows it is of the process std
 //! handles, which Rust's stdio and children spawned with `Stdio::inherit()`
 //! follow while C code writing through the CRT's cached fd 1 does not.
+//!
+//! On unix the read end is non-blocking and only read under the state
+//! lock, so `finish` empties the pipe itself and output written before it
+//! never depends on when the drain thread runs. Only a child still writing
+//! during `finish` can land in either the cell or a late notice.
 
-use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::io::Read;
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use self::unix::{PipeEnd, SavedStd, pipe, point_std_at};
+use self::unix::{Got, PipeEnd, SavedStd, pipe, point_std_at};
 #[cfg(windows)]
 use self::windows::{PipeEnd, SavedStd, pipe, point_std_at};
 
@@ -26,6 +35,9 @@ pub(crate) const QUIET_GAP: Duration = Duration::from_millis(10);
 /// cut here and the tail is counted rather than stored.
 const CAPTURE_LIMIT: usize = 1024 * 1024;
 
+#[cfg(unix)]
+const READ_CHUNK: usize = 64 * 1024;
+
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the standard outputs point into a guard's pipe right now. The
@@ -36,6 +48,11 @@ pub(crate) fn output_captured() -> bool {
 }
 
 struct Drained {
+    /// The pipe's read end, non-blocking. Every read happens under the
+    /// lock, so bytes are either still in the pipe or already in `buf`
+    /// (or forwarded), never in flight on the drain thread.
+    #[cfg(unix)]
+    reader: std::fs::File,
     buf: Vec<u8>,
     dropped: usize,
     last_read: Option<Instant>,
@@ -61,6 +78,29 @@ impl Drained {
         }
         text
     }
+
+    /// Moves what the pipe holds into `buf`. It stops after the bytes
+    /// queued when it began if more keep coming, so a child that never
+    /// stops writing cannot keep it here.
+    #[cfg(unix)]
+    fn sweep(&mut self) {
+        let queued = unix::pending(&self.reader).unwrap_or(usize::MAX);
+        let mut chunk = vec![0u8; READ_CHUNK];
+        let mut swept = 0;
+        while !self.eof {
+            match unix::read_some(&self.reader, &mut chunk) {
+                Ok(Got::Data(n)) => {
+                    self.push(&chunk[..n]);
+                    swept += n;
+                    if swept > queued {
+                        break;
+                    }
+                }
+                Ok(Got::Empty) => break,
+                Ok(Got::Eof) | Err(_) => self.eof = true,
+            }
+        }
+    }
 }
 
 struct Shared {
@@ -75,8 +115,8 @@ struct Shared {
 /// not released onto whichever target is current afterwards. The drain
 /// thread is never joined: a child the command spawned (an MCP server
 /// whose stderr is inherited) can hold the write end for the whole
-/// session, so `finish` waits for EOF only up to a bound, snapshots
-/// what has arrived, and leaves the thread to forward anything later.
+/// session, so after taking what the pipe holds `finish` waits for more
+/// only up to a bound and leaves the thread to forward anything later.
 /// A guard dropped without `finish` (the turn's future was cancelled
 /// or panicked) still puts the outputs back and hands what the pipe holds
 /// to the late-output callback, so a panic message printed into the pipe
@@ -92,12 +132,94 @@ fn flush_std_streams() {
     let _ = io::stderr().flush();
 }
 
-fn drain(read_end: PipeEnd, shared: Arc<Shared>, first_read_delay: Option<Duration>) {
+/// Sync points a test uses to hold the drain thread before its first
+/// read and to learn when it has exited.
+#[cfg(test)]
+#[derive(Default)]
+struct DrainHooks {
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+    exited: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(test)]
+impl DrainHooks {
+    fn hold_at_gate(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            let _ = gate.recv();
+        }
+    }
+
+    fn report_exit(&self) {
+        if let Some(exited) = &self.exited {
+            let _ = exited.send(());
+        }
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct DrainHooks {}
+
+#[cfg(not(test))]
+impl DrainHooks {
+    fn hold_at_gate(&mut self) {}
+
+    fn report_exit(&self) {}
+}
+
+/// Waits for the pipe without the lock and reads it with the lock held,
+/// so `finish` may already have taken what woke it.
+#[cfg(unix)]
+fn drain(fd: RawFd, shared: Arc<Shared>, mut hooks: DrainHooks) {
+    // SAFETY: `fd` is the reader inside `shared`, which this thread's Arc
+    // keeps open until the function returns.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut chunk = vec![0u8; READ_CHUNK];
+    hooks.hold_at_gate();
+    loop {
+        let ready = unix::wait_readable(fd);
+        let forward = {
+            let mut drained = shared.drained.lock().unwrap_or_else(|p| p.into_inner());
+            if drained.eof {
+                break;
+            }
+            if ready.is_err() {
+                drained.eof = true;
+                break;
+            }
+            match unix::read_some(&drained.reader, &mut chunk) {
+                Ok(Got::Empty) => None,
+                Ok(Got::Eof) | Err(_) => {
+                    drained.eof = true;
+                    break;
+                }
+                Ok(Got::Data(n)) if drained.detached => {
+                    Some(String::from_utf8_lossy(&chunk[..n]).into_owned())
+                }
+                Ok(Got::Data(n)) => {
+                    drained.push(&chunk[..n]);
+                    drained.last_read = Some(Instant::now());
+                    None
+                }
+            }
+        };
+        shared.changed.notify_all();
+        if let Some(text) = forward {
+            (shared.late)(text);
+        }
+    }
+    shared.changed.notify_all();
+    hooks.report_exit();
+}
+
+/// Windows reads with a blocking call outside the lock, so a drain thread
+/// not yet run, or bytes read but not yet pushed, can send output written
+/// before `finish` to the late callback. Overlapped-pipe fix: TASK-936.
+#[cfg(windows)]
+fn drain(read_end: PipeEnd, shared: Arc<Shared>, mut hooks: DrainHooks) {
     let mut reader = std::fs::File::from(read_end);
     let mut chunk = [0u8; 4096];
-    if let Some(delay) = first_read_delay {
-        std::thread::sleep(delay);
-    }
+    hooks.hold_at_gate();
     loop {
         let n = match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -122,6 +244,7 @@ fn drain(read_end: PipeEnd, shared: Arc<Shared>, first_read_delay: Option<Durati
     }
     shared.drained.lock().unwrap_or_else(|p| p.into_inner()).eof = true;
     shared.changed.notify_all();
+    hooks.report_exit();
 }
 
 impl FdRedirect {
@@ -129,25 +252,25 @@ impl FdRedirect {
     /// that arrives after `finish` from a writer still holding the pipe,
     /// and everything buffered when the guard is dropped unfinished.
     pub(crate) fn begin(late: impl Fn(String) + Send + Sync + 'static) -> io::Result<Self> {
-        Self::begin_with(late, None)
-    }
-
-    /// `begin` with a drain thread that sleeps before its first read,
-    /// standing in for a scheduler that has not run it yet.
-    #[cfg(all(test, unix))]
-    fn begin_with_slow_drain(
-        late: impl Fn(String) + Send + Sync + 'static,
-        first_read_delay: Duration,
-    ) -> io::Result<Self> {
-        Self::begin_with(late, Some(first_read_delay))
+        Self::begin_with(late, DrainHooks::default())
     }
 
     fn begin_with(
         late: impl Fn(String) + Send + Sync + 'static,
-        first_read_delay: Option<Duration>,
+        hooks: DrainHooks,
     ) -> io::Result<Self> {
         flush_std_streams();
         let (read_end, write_end) = pipe()?;
+        // Only the read end: fds 1 and 2 and every child share the write
+        // end's open file description and would see EAGAIN.
+        #[cfg(unix)]
+        unix::set_nonblocking(&read_end)?;
+        #[cfg(unix)]
+        let reader = std::fs::File::from(read_end);
+        #[cfg(unix)]
+        let drain_end = reader.as_raw_fd();
+        #[cfg(windows)]
+        let drain_end = read_end;
         let saved = SavedStd::save()?;
         if let Err(err) = point_std_at(&write_end) {
             Self::restore_saved(&saved);
@@ -156,6 +279,8 @@ impl FdRedirect {
         CAPTURED.store(true, Ordering::SeqCst);
         let shared = Arc::new(Shared {
             drained: Mutex::new(Drained {
+                #[cfg(unix)]
+                reader,
                 buf: Vec::new(),
                 dropped: 0,
                 last_read: None,
@@ -168,7 +293,7 @@ impl FdRedirect {
         let thread_shared = Arc::clone(&shared);
         if let Err(err) = std::thread::Builder::new()
             .name("tui-fd-drain".into())
-            .spawn(move || drain(read_end, thread_shared, first_read_delay))
+            .spawn(move || drain(drain_end, thread_shared, hooks))
         {
             Self::restore_saved(&saved);
             return Err(err);
@@ -181,18 +306,21 @@ impl FdRedirect {
     }
 
     /// Puts the standard outputs back and returns what the pipe received
-    /// so far. The write end is closed first, so the drain thread reaches
-    /// EOF as soon as it runs unless a child still holds the pipe; the
-    /// quiet-gap rule only applies once it has read since then, so a
-    /// thread the scheduler has not run yet is waited for, not given
-    /// up on.
+    /// so far. Rust's stdio is flushed and the write end closed first, so
+    /// on unix everything written before this call is already queued and
+    /// is read here under the lock, whether or not the drain thread has
+    /// run. Only a child still holding the pipe gets the grace after
+    /// that: up to the quiet gap or the settle limit, its output may land
+    /// in the cell or reach the late callback.
     pub(crate) fn finish(mut self) -> String {
         self.restore_std();
         let shared = Arc::clone(&self.shared);
 
+        let mut drained = shared.drained.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(unix)]
+        drained.sweep();
         let started = Instant::now();
         let limit = started + SETTLE_LIMIT;
-        let mut drained = shared.drained.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             let now = Instant::now();
             let deadline = match drained.last_read.filter(|read| *read >= started) {
@@ -239,6 +367,8 @@ impl Drop for FdRedirect {
                 .drained
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            #[cfg(unix)]
+            drained.sweep();
             drained.detached = true;
             drained.take_text()
         };
@@ -250,16 +380,86 @@ impl Drop for FdRedirect {
 
 #[cfg(unix)]
 mod unix {
-    use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     pub(super) type PipeEnd = OwnedFd;
+
+    pub(super) enum Got {
+        Data(usize),
+        Empty,
+        Eof,
+    }
 
     /// Both ends close-on-exec from birth, so no child forked meanwhile
     /// can inherit the capture pipe.
     pub(super) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         let (read_end, write_end) = io::pipe()?;
         Ok((read_end.into(), write_end.into()))
+    }
+
+    pub(super) fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+        // SAFETY: fcntl with F_GETFL takes no pointers; the result is checked.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl with F_SETFL takes an integer flag set, no pointers.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_some(mut reader: &File, buf: &mut [u8]) -> io::Result<Got> {
+        loop {
+            match reader.read(buf) {
+                Ok(0) => return Ok(Got::Eof),
+                Ok(n) => return Ok(Got::Data(n)),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(Got::Empty),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Bytes queued in the pipe right now.
+    pub(super) fn pending(reader: &File) -> io::Result<usize> {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one c_int through the pointer, which
+        // points at a live local of that type.
+        if unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD as _, &mut queued) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(queued).unwrap_or(0))
+    }
+
+    /// Blocks until `fd` is readable, at EOF or in error; the read that
+    /// follows tells which.
+    pub(super) fn wait_readable(fd: BorrowedFd<'_>) -> io::Result<()> {
+        let mut entry = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: `entry` is one valid pollfd and `fd` is borrowed, so open.
+            let ready = unsafe { libc::poll(&mut entry, 1, -1) };
+            if ready == -1 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if entry.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            if ready > 0 {
+                return Ok(());
+            }
+        }
     }
 
     pub(super) struct SavedStd {
@@ -399,7 +599,7 @@ mod tests {
     use crate::testing::{SavedStdout, capture_stdout, read_all, write_fd1};
     use serial_test::serial;
     use std::fs::File;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
     fn write_fd2(bytes: &[u8]) {
@@ -417,6 +617,27 @@ mod tests {
         let outside = read_all(&mut reader);
         write_fd1(outside.replacen(own_marker, "", 1).as_bytes());
         outside
+    }
+
+    /// Hooks that hold the drain thread before its first read until the
+    /// returned sender fires, and report on the receiver once it exits.
+    fn gated_hooks() -> (DrainHooks, mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (release, gate) = mpsc::channel();
+        let (exited_tx, exited) = mpsc::channel();
+        let hooks = DrainHooks {
+            gate: Some(gate),
+            exited: Some(exited_tx),
+        };
+        (hooks, release, exited)
+    }
+
+    struct KillOnDrop(libc::pid_t);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: kill takes no pointers.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
     }
 
     /// Raw writes to fds 1 and 2 inside the region come back from
@@ -460,6 +681,32 @@ mod tests {
         assert_eq!(captured.trim(), "before-r2x");
     }
 
+    /// A child that never stops writing cannot keep `finish` reading:
+    /// it takes what was queued when it began and returns within the
+    /// bound.
+    #[test]
+    #[serial]
+    fn finish_never_waits_for_a_streaming_writer() {
+        let (saved, reader) = capture_stdout();
+        let guard = FdRedirect::begin(|_| {}).unwrap();
+        let spawned = Command::new("sh")
+            .arg("-c")
+            .arg("(while :; do echo x; done) >&2 & echo $!")
+            .stderr(Stdio::inherit())
+            .output()
+            .unwrap();
+        let pid = String::from_utf8_lossy(&spawned.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        let _writer = KillOnDrop(pid);
+        let started = Instant::now();
+        guard.finish();
+        let elapsed = started.elapsed();
+        release_harness_output(saved, reader, "");
+        assert!(elapsed < Duration::from_secs(2), "finish took {elapsed:?}");
+    }
+
     /// The panic hook's view of the capture follows the guard exactly,
     /// whether it ends through `finish` or a drop.
     #[test]
@@ -476,28 +723,54 @@ mod tests {
         release_harness_output(saved, reader, "");
     }
 
-    /// A drain thread the scheduler has not run yet is waited for:
-    /// output written before `finish` lands in the cell even when the
-    /// first read comes after the quiet gap would have expired. The delay
-    /// is twice the gap, which proves the point, and stays well inside
-    /// `SETTLE_LIMIT` so a loaded host still reads before the bound.
+    /// Output written before `finish` lands in the cell even when the
+    /// drain thread has not run at all: `finish` returns while the thread
+    /// is held at its gate, and once it has exited nothing reached the
+    /// late callback.
     #[test]
     #[serial]
-    fn finish_waits_for_a_drain_thread_that_has_not_read_yet() {
+    fn pre_finish_output_never_depends_on_the_drain_thread() {
         let (saved, reader) = capture_stdout();
         let (tx, rx) = mpsc::channel();
-        let guard = FdRedirect::begin_with_slow_drain(
+        let (hooks, release, exited) = gated_hooks();
+        let guard = FdRedirect::begin_with(
             move |text| {
                 let _ = tx.send(text);
             },
-            QUIET_GAP * 2,
+            hooks,
         )
         .unwrap();
         write_fd1(b"slow-drain-r6x\n");
         let captured = guard.finish();
+        release.send(()).unwrap();
+        exited.recv_timeout(Duration::from_secs(5)).unwrap();
         release_harness_output(saved, reader, "");
         assert_eq!(captured.trim(), "slow-drain-r6x");
         assert!(rx.try_recv().is_err(), "the output went out as late output");
+    }
+
+    /// An unfinished guard dropped before the drain thread has run hands
+    /// what the pipe holds to the late callback, exactly once.
+    #[test]
+    #[serial]
+    fn dropping_a_guard_before_the_drain_runs_forwards_its_output_once() {
+        let (saved, reader) = capture_stdout();
+        let (tx, rx) = mpsc::channel();
+        let (hooks, release, exited) = gated_hooks();
+        let guard = FdRedirect::begin_with(
+            move |text| {
+                let _ = tx.send(text);
+            },
+            hooks,
+        )
+        .unwrap();
+        write_fd1(b"gated-drop-r7x\n");
+        drop(guard);
+        release.send(()).unwrap();
+        exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_harness_output(saved, reader, "");
+        let late: Vec<String> = rx.try_iter().collect();
+        assert_eq!(late, ["gated-drop-r7x\n"]);
     }
 
     /// Bytes a lingering writer sends after `finish` reach the late

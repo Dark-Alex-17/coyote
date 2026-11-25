@@ -296,3 +296,55 @@ fn every_graph_session_harness_spawn_pins_path_and_scrubs_the_memory_root_overri
         );
     }
 }
+
+/// CI runs the test binaries in two steps split on the `pty` group that
+/// `.config/nextest.toml` assigns, so the steps partition every binary only
+/// while the workflow's two filters are exact complements, and the group
+/// holds every pty suite only while each harness user is listed in it.
+#[test]
+fn the_ci_test_steps_split_every_binary_on_the_pty_group_and_the_group_lists_every_harness_user() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let nextest = read(&root.join(".config/nextest.toml"));
+    let pty_binaries: Vec<&str> = nextest
+        .split("binary(")
+        .skip(1)
+        .filter_map(|rest| rest.split_once(')').map(|(name, _)| name))
+        .collect();
+    for name in &pty_binaries {
+        assert!(
+            root.join("tests").join(format!("{name}.rs")).is_file(),
+            ".config/nextest.toml lists `binary({name})` but tests/{name}.rs does not exist"
+        );
+    }
+    for user in HARNESS_USERS {
+        let name = user.trim_end_matches(".rs");
+        assert!(
+            pty_binaries.contains(&name),
+            "{user} drives a pty but .config/nextest.toml does not put `binary({name})` in the pty group"
+        );
+    }
+
+    let workflow = read(&root.join(".github/workflows/ci.yaml"));
+    let runs: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("cargo nextest run"))
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            "run: cargo nextest run --all --profile ci -E 'not group(pty)'",
+            "run: cargo nextest run --all --profile ci-pty -E 'group(pty)' --no-tests=pass",
+        ],
+        "the CI test steps must be the complementary pty-group filters over --all"
+    );
+    let pty_step = workflow
+        .split("- name: Test (pty suites)")
+        .nth(1)
+        .and_then(|rest| rest.split("- name:").next())
+        .expect("ci.yaml has a `Test (pty suites)` step");
+    assert!(
+        pty_step.contains("if: success() || failure()"),
+        "the pty step must run whether or not the main test step passed"
+    );
+}

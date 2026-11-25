@@ -32,9 +32,9 @@ variables:
   - name: project_dir
     description: |
       Absolute path to the project directory. Defaults to "." (the directory
-      coyote was invoked from). The coder sub-agent resolves its own
-      project_dir the same way, so invoke step-runner FROM the project root
-      unless you override this for both.
+      coyote was invoked from). A value given here reaches the coder
+      sub-agent as its project_dir; without one, both resolve it from the
+      invocation directory.
     default: '.'
   - name: plans_dir
     description: |

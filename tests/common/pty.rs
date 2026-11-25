@@ -316,6 +316,11 @@ impl Pty {
 
     /// The terminal's current height in rows.
     pub fn rows(&self) -> std::io::Result<u16> {
+        Ok(self.size()?.0)
+    }
+
+    /// The terminal's current size as rows and columns.
+    pub fn size(&self) -> std::io::Result<(u16, u16)> {
         use std::os::fd::AsRawFd;
         let mut size = libc::winsize {
             ws_row: 0,
@@ -327,7 +332,7 @@ impl Pty {
         if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ as _, &mut size) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(size.ws_row)
+        Ok((size.ws_row, size.ws_col))
     }
 
     /// Whether the terminal echoes input. Termios requests on the master

@@ -431,16 +431,23 @@ mod binary_menus {
     }
 
     /// Starts the confirm flow on a `rows`x40 screen: resizes once the UI is
-    /// up, submits the prompt, waits for the tool to ask and hands back the
-    /// printable bytes since the prompt was sent after a moment for the
-    /// modal to paint.
-    fn open_confirm_on_short_screen(pty: &mut Pty, asked: &Path, rows: u16) -> String {
+    /// up, submits the prompt, waits for the tool to ask and for `legend` to
+    /// paint, and hands back the printable bytes since the prompt was sent
+    /// after a moment for the rest of the modal. The legend differs by case:
+    /// at 40 columns a question that fits leaves no room for `Esc = cancel`.
+    fn open_confirm_on_short_screen(
+        pty: &mut Pty,
+        asked: &Path,
+        rows: u16,
+        legend: &str,
+    ) -> String {
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.resize(rows, 40).unwrap();
         pty.read_for(Duration::from_millis(500));
         let before = pty.raw().len();
         pty.send(b"call the confirm tool\r").unwrap();
         wait_for_file(pty, asked, "the tool's confirm request");
+        wait_for_squeezed_after(pty, legend, before, "the confirm modal's legend");
         pty.read_for(Duration::from_millis(1000));
         strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
     }
@@ -484,7 +491,7 @@ mod binary_menus {
         );
         let mut pty = spawn_tui(&dir, &[]);
 
-        let shown = open_confirm_on_short_screen(&mut pty, &asked, 5);
+        let shown = open_confirm_on_short_screen(&mut pty, &asked, 5, "enlarge the terminal");
         let flat = squeezed(&shown);
         assert!(
             !flat.contains("linethreeq3l-c"),
@@ -572,7 +579,7 @@ mod binary_menus {
         write_tool(&dir, "fixture_confirm_rec.sh", ASKING_CONFIRM_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
-        let shown = open_confirm_on_short_screen(&mut pty, &asked, 5);
+        let shown = open_confirm_on_short_screen(&mut pty, &asked, 5, "y = yes");
         let flat = squeezed(&shown);
         assert!(
             flat.contains("Reallydoit?q9d-q"),
@@ -4779,8 +4786,9 @@ mod binary_wizards {
         pty.read_for(Duration::from_millis(800));
         // A different size from the one `answer_and_expect_session` grows to,
         // so both repaints are forced.
+        let resized_at = pty.raw().len();
         pty.resize(60, 110).unwrap();
-        pty.read_for(Duration::from_millis(800));
+        read_repaint(&mut pty, resized_at, Duration::from_millis(800));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
         assert!(
             squeezed(&since).contains("nosession"),
@@ -5396,7 +5404,7 @@ mod binary_wizards {
         // before it holds cell diffs from several frames.
         let repaint_at = pty.raw().len();
         pty.resize(24, 81).unwrap();
-        pty.read_for(Duration::from_millis(600));
+        read_repaint(&mut pty, repaint_at, Duration::from_millis(600));
         let repaint = &pty.raw()[repaint_at..];
         assert!(
             !painted_at(repaint, b"saved", 0).is_empty(),
@@ -7689,7 +7697,12 @@ mod modal_extremes_and_editor_failure {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"keep me m6k").unwrap();
-        pty.wait_for("keep me m6k", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "keep me m6k",
+            0,
+            "the typed draft never reached the composer",
+        );
         let before = pty.raw().len();
         pty.send(b"\x0f").unwrap();
         let left = pty
@@ -7738,7 +7751,12 @@ mod modal_extremes_and_editor_failure {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"keep me m6m").unwrap();
-        pty.wait_for("keep me m6m", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "keep me m6m",
+            0,
+            "the typed draft never reached the composer",
+        );
         let before = pty.raw().len();
         pty.send(b"\x0f").unwrap();
         pty.read_for(Duration::from_millis(1500));
@@ -7773,7 +7791,12 @@ mod modal_extremes_and_editor_failure {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"keep me m6s").unwrap();
-        pty.wait_for("keep me m6s", PTY_DEADLINE).unwrap();
+        wait_for_painted_after(
+            &mut pty,
+            "keep me m6s",
+            0,
+            "the typed draft never reached the composer",
+        );
         let before = pty.raw().len();
         pty.send(b"\x0f").unwrap();
         let left = pty

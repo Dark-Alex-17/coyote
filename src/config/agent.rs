@@ -1642,17 +1642,28 @@ fn load_agent_description(name: &str) -> String {
 }
 
 pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
-    if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
-        return config.variables;
+    try_load_agent_variables(name).unwrap_or_default()
+}
+
+/// The variables agent `name` declares in its config.yaml, else in its
+/// graph.yaml, else none. Unlike `load_agent_variables`, a definition file
+/// that exists but cannot be read or parsed is an error, so a caller can
+/// tell a broken agent from one that declares nothing.
+pub fn try_load_agent_variables(name: &str) -> Result<Vec<AgentVariable>> {
+    let config_path = paths::agent_config_file(name);
+    if config_path.exists() {
+        return Ok(AgentConfig::load(&config_path)?.variables);
     }
 
-    if let Ok(contents) = read_to_string(paths::agent_graph_file(name))
-        && let Ok(stub) = serde_yaml::from_str::<AgentVariablesStub>(&contents)
-    {
-        return stub.variables;
+    let graph_path = paths::agent_graph_file(name);
+    if !graph_path.exists() {
+        return Ok(Vec::new());
     }
-
-    Vec::new()
+    let contents = read_to_string(&graph_path)
+        .with_context(|| format!("Failed to read agent graph at '{}'", graph_path.display()))?;
+    let stub: AgentVariablesStub = serde_yaml::from_str(&contents)
+        .with_context(|| format!("Failed to load agent graph at '{}'", graph_path.display()))?;
+    Ok(stub.variables)
 }
 
 pub fn complete_agent_variables(
@@ -3742,6 +3753,52 @@ nodes: {}
                     );
                 }
             }
+        }
+    }
+
+    /// `agent__spawn` refuses an undeclared variable, so a lane that never
+    /// declared `project_dir` could not be pointed at the project its
+    /// spawner works in. Every bundled agent declares it unless listed here
+    /// with the reason it has no project to read.
+    #[test]
+    fn bundled_agents_declare_project_dir_unless_exempt() {
+        const EXEMPT: [(&str, &str); 5] = [
+            ("deep-research", "researches the web and its own corpus"),
+            ("demo", "a showcase agent with no project to read"),
+            ("report-writer", "polishes findings handed to it"),
+            ("sql", "works against a database DSN"),
+            ("whetstone", "edits the review suite bundle, not a project"),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let mut agents = Vec::new();
+        for entry in fs::read_dir(&root).unwrap() {
+            let dir = entry.unwrap().path();
+            let Some(file) = ["config.yaml", "graph.yaml"]
+                .into_iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.exists())
+            else {
+                continue;
+            };
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let stub: AgentVariablesStub =
+                serde_yaml::from_str(&fs::read_to_string(&file).unwrap())
+                    .unwrap_or_else(|err| panic!("{}: {err}", file.display()));
+            let declares = stub.variables.iter().any(|v| v.name == "project_dir");
+            let exempt = EXEMPT.iter().any(|(exempt, _)| *exempt == name);
+            assert!(
+                declares || exempt,
+                "bundled agent '{name}' does not declare a `project_dir` variable, so a spawner \
+                 cannot pass it its project; declare it, or add '{name}' to the exemption list \
+                 with a reason"
+            );
+            agents.push(name);
+        }
+        for (name, _) in EXEMPT {
+            assert!(
+                agents.iter().any(|agent| agent == name),
+                "exempt agent '{name}' is no longer bundled; drop it from the exemption list"
+            );
         }
     }
 }

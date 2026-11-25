@@ -17,6 +17,7 @@ jobs:
     name: All
 
     strategy:
+      fail-fast: false
       matrix:
         os:
         - ubuntu-latest
@@ -53,7 +54,11 @@ jobs:
       run: cargo test --all duckdb
 
     - name: Test
-      run: cargo nextest run --all --profile ci
+      run: cargo nextest run --all --profile ci -E 'not group(pty)'
+
+    - name: Test (pty suites)
+      if: success() || failure()
+      run: cargo nextest run --all --profile ci-pty -E 'group(pty)' --no-tests=pass
 
     - name: Clippy
       run: cargo clippy --all --all-targets -- -D warnings

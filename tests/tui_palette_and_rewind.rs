@@ -386,7 +386,7 @@ mod palette_and_rewind {
             pty.read_for(Duration::from_millis(300));
             let repaint_at = pty.raw().len();
             pty.send(b"\x0c").unwrap();
-            pty.read_for(Duration::from_millis(500));
+            read_repaint(&mut pty, repaint_at, Duration::from_millis(500));
             let repainted = since(&pty, repaint_at);
             if !repainted.contains("pending:") {
                 break;
