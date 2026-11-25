@@ -7311,6 +7311,12 @@ with scenario("retrospective: a PASS after the PR is out (published, CI fix, PR-
     check(name, all(v["_next"] == "observability_gate" and v.get("retro_done") is True
                     and any("not run" in l for l in v.get("retro_report", [])) for v in _got),
           [(v.get("_next"), v.get("retro_report")) for v in _got])
+with scenario("retrospective: no run base and no base commit -> not run, observability_gate, never a worktree diff") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        retro_done=False, run_base_sha="", base_sha=""))
+    check(name, u["_next"] == "observability_gate" and u.get("retro_done") is True
+          and u.get("retro_report") == ["- not run: the run base could not be resolved"],
+          (u.get("_next"), u.get("retro_report")))
 with scenario("retro_size_route: large -> run_retrospective with the project, the run diff and the task; ledgered") as name:
     u = gates.retro_size_route(base_state(retro_large=True, retro_large_reason="a new module other code builds on",
                                           last_node_output='{"retro_large": true}', run_base_sha=BASE, anomalies=["seen"]))

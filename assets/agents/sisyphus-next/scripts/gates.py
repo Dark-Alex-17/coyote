@@ -4749,18 +4749,23 @@ def _after_final_review(state, u):
         root = state.get("git_root") or state.get("project_dir") or "."
         base = state.get("run_base_sha") or state.get("base_sha") or ""
         u["retro_done"] = True
-        u["retro_diff_stat"] = tail(git_out(root, "diff", "--stat", base or "HEAD"), 3000)
-        u["_next"] = "retro_size"
+        if base:
+            u["retro_diff_stat"] = tail(git_out(root, "diff", "--stat", base), 3000)
+            u["_next"] = "retro_size"
+        else:
+            u["retro_report"] = ["- not run: the run base could not be resolved"]
+            ledger(state, u, "design retrospective: not run; the run base could not be resolved")
+            u["_next"] = "observability_gate"
     return u
 
 
 def _retro_prompt(state):
     root = state.get("git_root") or state.get("project_dir") or "."
-    base = state.get("run_base_sha") or state.get("base_sha") or ""
+    base = state.get("run_base_sha") or state.get("base_sha")
     lines = ["Run-closing design retrospective.",
              f"Project: {state.get('project_dir')}",
-             f"Diff: {base}..HEAD" if base else "Diff: worktree"]
-    if base and _code_tree_dirty(state, root):
+             f"Diff: {base}..HEAD"]
+    if _code_tree_dirty(state, root):
         lines.append(f"Tree state: the change is uncommitted in the worktree on top of {base}; read it with "
                      f"`git diff {base}` as well as the commits.")
     lines.append(f"What the work set out to do: {state.get('brief') or state.get('current_task') or ''}")
