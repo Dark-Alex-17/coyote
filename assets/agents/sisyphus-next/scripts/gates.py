@@ -4707,7 +4707,7 @@ def triage_route(state):
 
 
 # ====================================================================== design retrospective
-RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS \d+|CLEAN)$")
+RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS (\d+)|CLEAN)$")
 RETRO_PARENT_NOTE = "the parent orchestrator runs the run-closing retrospective"
 RETRO_SAVED = "design-retrospective.md"
 
@@ -4808,20 +4808,23 @@ def retro_route(state):
     text = str(state.get("retro_result") or "").strip()
     first = _retro_sentinel_line(text)
     u["_next"] = "observability_gate"
-    if not RETRO_SENTINEL_RE.match(first):
+    sentinel = RETRO_SENTINEL_RE.match(first)
+    if not sentinel:
         why = tail(first, 200) or "no output"
         u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
         ledger(state, u, f"design retrospective: faulted ({why}); run continues")
         return u
-    if not first.endswith("CLEAN") and not triaged:
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [_untriaged_follow_up(state, text)]
-        u["retro_report"] = report + [f"- ran: {first}; triage failed, so nothing was adopted; the items are one follow-up"]
-        ledger(state, u, f"design retrospective: triage failed; {first} kept as one follow-up; run continues")
-        return u
-    adopted = [] if first.endswith("CLEAN") else [
+    clean = sentinel.group(1) is None
+    adopted = [] if clean else [
         _whole_line(a) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]
     declined = [d for d in as_list(state.get("retro_declined")) if isinstance(d, dict) and str(d.get("item") or "").strip()]
     later = [_whole_line(f) for f in as_list(state.get("retro_follow_ups")) if isinstance(f, str) and f.strip()]
+    if not clean and int(sentinel.group(1)) > 0 and not (triaged and (adopted or declined or later)):
+        why = "triage failed" if not triaged else "triage decided none of the items"
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [_untriaged_follow_up(state, text)]
+        u["retro_report"] = report + [f"- ran: {first}; {why}, so nothing was adopted; the items are one follow-up"]
+        ledger(state, u, f"design retrospective: {why}; {first} kept as one follow-up; run continues")
+        return u
     if adopted and as_int(state.get("review_rounds")) >= STRIKE_LIMIT:
         ledger(state, u, f"design retrospective: review rounds spent; {len(adopted)} adopted item(s) become follow-ups")
         later += adopted

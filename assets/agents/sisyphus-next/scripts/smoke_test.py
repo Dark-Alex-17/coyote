@@ -7363,6 +7363,13 @@ with scenario("retro_route: a failed triage of a REFACTORS reply -> one not-tria
     check(name, u["_next"] == "observability_gate" and "fix_items" not in u and len(fus) == 1
           and fus[0].startswith("Design retrospective: ") and "One table" in saved
           and any("triage failed" in l for l in u["retro_report"]), (fus, u.get("retro_report")))
+with scenario("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                     last_node_output='{"retro_adopted": [], "retro_declined": [], "retro_follow_ups": []}',
+                                     follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    check(name, u["_next"] == "observability_gate" and "fix_items" not in u and len(fus) == 1
+          and any("triage decided none of the items" in l for l in u["retro_report"]), (fus, u.get("retro_report")))
 with scenario("retro_route: CLEAN -> observability_gate, noted as ran and clean") as name:
     u = gates.retro_route(base_state(retro_result=RETRO_CLEAN, retro_adopted=[], retro_declined=[], retro_follow_ups=[]))
     check(name, u["_next"] == "observability_gate" and any("DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]),

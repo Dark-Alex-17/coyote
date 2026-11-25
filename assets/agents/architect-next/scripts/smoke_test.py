@@ -3865,6 +3865,15 @@ def _retro_preambled():
     return any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report")
 
 
+def _retro_triage_empty():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                       last_node_output='{"retro_adopted": [], "retro_declined": [], "retro_follow_ups": []}',
+                                       follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    return (u["_next"] == "hygiene_create" and "tasks" not in u and len(fus) == 1
+            and any("triage decided none of the items" in l for l in u["retro_report"])), (fus, u.get("retro_report"))
+
+
 def _retro_rearm_integration():
     u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
                                        retro_follow_ups=[], retro_done=True, integration_checked=True, integration_amended=True,
@@ -3897,6 +3906,7 @@ def _parse_report_retro_follow_up():
             and parsed["design"] == ["introduced a WidgetStore trait in src/a.rs"]), (p.stderr[-300:], parsed)
 
 
+guarded("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up", _retro_triage_empty)
 guarded("retro_route: adopting re-arms the whole integration step, the one amendment round included", _retro_rearm_integration)
 guarded("integrate_route: amendments past the one re-seal become follow-ups, never dropped", _integrate_blocked_amendments)
 guarded("integrate_route: an integration follow-up already listed is not listed twice", _integrate_follow_up_dedup)
