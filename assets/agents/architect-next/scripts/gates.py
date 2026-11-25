@@ -5069,11 +5069,20 @@ def integrate_route(state):
 RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS \d+|CLEAN)$")
 RETRO_UNJUDGED = "no valid size judgement from integrate_findings"
 RETRO_TITLE = "Run-closing design refactor"
+RETRO_SAVED = "design-retrospective.md"
 
 
 def _whole_line(text):
     """The text on one line, never trimmed: a stated reason is a decision and is ledgered whole."""
     return " ".join(str(text or "").split())
+
+
+def _untriaged_follow_up(state, text):
+    """Saves the retrospective report a failed triage left unjudged and returns the one follow-up that points at it."""
+    run_dir = state.get("run_dir", "")
+    write_artifact(run_dir, RETRO_SAVED, text)
+    where = f"see the retrospective report at {os.path.join(run_dir, RETRO_SAVED)}" if run_dir else f"the report: {tail(text, 1500)}"
+    return f"Design retrospective: items not triaged; {where}"
 
 
 def _after_integration(state, u):
@@ -5113,6 +5122,8 @@ def retro_route(state):
     """Adopted refactor items become ONE chore task the normal task loop runs (follow-ups under per-task PRs); else hygiene."""
     u = {"retro_done": True, "_next": "hygiene_create"}
     harvest_anomalies(state, u, "retro_triage")
+    out = state.get("last_node_output")
+    triaged = isinstance(out, str) and out.lstrip().startswith("{")
     note_script_error(state, u, "retro_triage")
     report = list(as_list(state.get("retro_report")))
     text = str(state.get("retro_result") or "").strip()
@@ -5121,6 +5132,11 @@ def retro_route(state):
         why = tail(first, 200) or "no output"
         u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
         ledger(state, u, f"design retrospective: faulted ({why}); run continues")
+        return u
+    if not first.endswith("CLEAN") and not triaged:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [_untriaged_follow_up(state, text)]
+        u["retro_report"] = report + [f"- ran: {first}; triage failed, so nothing was adopted; the items are one follow-up"]
+        ledger(state, u, f"design retrospective: triage failed; {first} kept as one follow-up; run continues")
         return u
     adopted = [] if first.endswith("CLEAN") else [
         _whole_line(a) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]

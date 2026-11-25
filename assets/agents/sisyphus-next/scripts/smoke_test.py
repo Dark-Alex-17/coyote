@@ -7272,6 +7272,7 @@ with scenario("failure locations: a shared dir without the parser makes the red 
 # ---------------------------------------------------------------- design retrospective: once per run, never blocking
 RETRO_CLEAN = "DESIGN_RETROSPECTIVE: CLEAN\n"
 RETRO_REFACTORS = "DESIGN_RETROSPECTIVE: REFACTORS 2\n\n## Refactor items\n\n1. **One table**\n2. **One owner**\n"
+RETRO_TRIAGED = '{"retro_adopted": []}'
 with scenario("retrospective: a green whole-task review -> retro_size over the run diff, retro_done set first") as name:
     u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}], retro_done=False))
     check(name, u["_next"] == "retro_size" and u.get("retro_done") is True and "retro_diff_stat" in u, u.get("_next"))
@@ -7310,11 +7311,11 @@ with scenario("retro_size_route: no valid judgement (the llm node failed) -> obs
           (u.get("_next"), u.get("retro_report")))
 with scenario("retro_route: adopted items -> compose_fix with fix_source retrospective, retro_done set") as name:
     u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"], retro_declined=[],
-                                     retro_follow_ups=[], retro_done=False, review_rounds=1))
+                                     retro_follow_ups=[], retro_done=False, review_rounds=1, last_node_output=RETRO_TRIAGED))
     check(name, u["_next"] == "compose_fix" and u["fix_source"] == "retrospective"
           and u["fix_items"] == ["One table", "One owner"] and u["retro_done"] is True, (u.get("_next"), u.get("fix_items")))
 with scenario("retro_route: each decline ledgered as retro-declined, follow-ups appended to the run's list") as name:
-    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[],
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[], last_node_output=RETRO_TRIAGED,
                                      retro_declined=[{"item": "One owner", "reason": "src/a.go:3 keeps two on purpose"}],
                                      retro_follow_ups=["One table across three modules"], follow_ups=["earlier"]))
     check(name, u["_next"] == "observability_gate"
@@ -7329,12 +7330,21 @@ with scenario("retro_route: a reply without the sentinel line is a fault, not a 
     u = gates.retro_route(base_state(retro_result="I looked and it seems fine", retro_adopted=["One table"]))
     check(name, u["_next"] == "observability_gate" and "fix_items" not in u
           and any("faulted" in l for l in u["retro_report"]), u.get("retro_report"))
+with scenario("retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up pointing at the saved report") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                     last_node_output="LLM node failed: llm node timed out after 600s", follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    saved = _lib.read_file(os.path.join(base_state()["run_dir"], "design-retrospective.md"))
+    check(name, u["_next"] == "observability_gate" and "fix_items" not in u and len(fus) == 1
+          and fus[0].startswith("Design retrospective: ") and "One table" in saved
+          and any("triage failed" in l for l in u["retro_report"]), (fus, u.get("retro_report")))
 with scenario("retro_route: CLEAN -> observability_gate, noted as ran and clean") as name:
     u = gates.retro_route(base_state(retro_result=RETRO_CLEAN, retro_adopted=[], retro_declined=[], retro_follow_ups=[]))
     check(name, u["_next"] == "observability_gate" and any("DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]),
           u.get("retro_report"))
 with scenario("retro_route: review rounds spent -> the adopted items become follow-ups, no coder round") as name:
-    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], review_rounds=STRIKE_LIMIT))
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], review_rounds=STRIKE_LIMIT,
+                                     last_node_output=RETRO_TRIAGED))
     check(name, u["_next"] == "observability_gate" and "fix_items" not in u
           and any("One table" in f for f in u["follow_ups"]), (u.get("_next"), u.get("follow_ups")))
 with scenario("compose_fix: retrospective items under the behaviour-preserving refactor header") as name:

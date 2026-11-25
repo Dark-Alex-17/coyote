@@ -4709,10 +4709,19 @@ def triage_route(state):
 # ====================================================================== design retrospective
 RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS \d+|CLEAN)$")
 RETRO_PARENT_NOTE = "the parent orchestrator runs the run-closing retrospective"
+RETRO_SAVED = "design-retrospective.md"
 
 
 def _retro_is_parents(state):
     return str(var(state, "retrospective", "run")).strip().lower() == "parent"
+
+
+def _untriaged_follow_up(state, text):
+    """Saves the retrospective report a failed triage left unjudged and returns the one follow-up that points at it."""
+    run_dir = state.get("run_dir", "")
+    write_artifact(run_dir, RETRO_SAVED, text)
+    where = f"see the retrospective report at {os.path.join(run_dir, RETRO_SAVED)}" if run_dir else f"the report: {tail(text, 1500)}"
+    return f"Design retrospective: items not triaged; {where}"
 
 
 def _after_final_review(state, u):
@@ -4772,6 +4781,8 @@ def retro_size_route(state):
 def retro_route(state):
     u = {"retro_done": True}
     harvest_anomalies(state, u, "retro_triage")
+    out = state.get("last_node_output")
+    triaged = isinstance(out, str) and out.lstrip().startswith("{")
     note_script_error(state, u, "retro_triage")
     report = list(as_list(state.get("retro_report")))
     text = str(state.get("retro_result") or "").strip()
@@ -4781,6 +4792,11 @@ def retro_route(state):
         why = tail(first, 200) or "no output"
         u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
         ledger(state, u, f"design retrospective: faulted ({why}); run continues")
+        return u
+    if not first.endswith("CLEAN") and not triaged:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [_untriaged_follow_up(state, text)]
+        u["retro_report"] = report + [f"- ran: {first}; triage failed, so nothing was adopted; the items are one follow-up"]
+        ledger(state, u, f"design retrospective: triage failed; {first} kept as one follow-up; run continues")
         return u
     adopted = [] if first.endswith("CLEAN") else [
         _whole_line(a) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]

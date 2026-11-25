@@ -3845,6 +3845,15 @@ def _retro_fault():
             and any("faulted (Agent node failed: spawn error); run continues" in d for d in u["decisions"])), u.get("decisions")
 
 
+def _retro_triage_failed():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                       last_node_output="LLM node failed: llm node timed out after 600s", follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    saved = read_file(os.path.join(_retro_large()["run_dir"], "design-retrospective.md"))
+    return (u["_next"] == "hygiene_create" and "tasks" not in u and len(fus) == 1 and fus[0].startswith("Design retrospective: ")
+            and "One table" in saved and any("triage failed" in l for l in u["retro_report"])), (fus, u.get("retro_report"))
+
+
 def _retro_report():
     ran = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, retro_report=["- large (a new subsystem)", "- ran: CLEAN"]))["report"]
     skipped = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f))["report"]
@@ -3867,6 +3876,7 @@ guarded("retro_route: adopted -> ONE pending chore task blocked by the unit's ta
         _retro_adopted)
 guarded("retro_route: CLEAN -> hygiene_create, no task", _retro_clean)
 guarded("retro_route: a faulted retrospective -> hygiene_create with the fault noted, no task", _retro_fault)
+guarded("retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up pointing at the saved report", _retro_triage_failed)
 guarded("final_report: a ## Design retrospective section, with the reason when it did not run", _retro_report)
 u = gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_f, pr_summary_text="Widgets were missing; we added them.", body_fix_rounds=0))
 body = read_file(u["pr_body_path"])
