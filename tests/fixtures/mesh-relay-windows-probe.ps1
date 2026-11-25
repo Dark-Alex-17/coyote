@@ -93,10 +93,14 @@ if ($Scenario -eq 'printed-restart') {
 if ($Scenario -in @('present-rerun', 'present-no-rnstatus')) {
   $real = Join-Path $Root 'venv Scripts'
   New-Item -ItemType Directory -Force -Path $real, $script:BinDirResolved | Out-Null
-  [IO.File]::WriteAllText((Join-Path $real 'rnsd.exe'), '')
+  # The real rnsd is a batch file that prints a version: Install-Rnsd ends by running the
+  # shim, and on Windows an empty rnsd.exe would be launched as a program and can hang.
+  # The rnstatus.exe beside it is only looked for, never run.
+  $realRnsd = Join-Path $real 'rnsd.bat'
+  [IO.File]::WriteAllText($realRnsd, "@echo rnsd 1.5.2`r`n")
   if ($Scenario -eq 'present-rerun') { [IO.File]::WriteAllText((Join-Path $real 'rnstatus.exe'), '') }
   # The rnsd.cmd an earlier run (before rnstatus.cmd) wrote.
-  $old = "@rem Written by scripts/mesh-relay.ps1 for Coyote mesh; runs the installed rnsd.`r`n@`"$(Join-Path $real 'rnsd.exe')`" %*`r`n"
+  $old = "@rem Written by scripts/mesh-relay.ps1 for Coyote mesh; runs the installed rnsd.`r`n@`"$realRnsd`" %*`r`n"
   [IO.File]::WriteAllText($script:RnsdCmd, $old)
   $script:InstallRung = 'present'
   $script:ExistingRnsd = $script:RnsdCmd
