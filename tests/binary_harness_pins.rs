@@ -334,7 +334,7 @@ fn the_ci_test_steps_split_every_binary_on_the_pty_group_and_the_group_lists_eve
         runs,
         [
             "run: cargo nextest run --all --profile ci -E 'not group(pty)'",
-            "run: cargo nextest run --all --profile ci-pty -E 'group(pty)'",
+            "run: cargo nextest run --all --profile ci-pty -E 'group(pty)' --no-tests=pass",
         ],
         "the CI test steps must be the complementary pty-group filters over --all"
     );

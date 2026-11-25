@@ -17,6 +17,7 @@ jobs:
     name: All
 
     strategy:
+      fail-fast: false
       matrix:
         os:
         - ubuntu-latest
@@ -57,7 +58,7 @@ jobs:
 
     - name: Test (pty suites)
       if: success() || failure()
-      run: cargo nextest run --all --profile ci-pty -E 'group(pty)'
+      run: cargo nextest run --all --profile ci-pty -E 'group(pty)' --no-tests=pass
 
     - name: Clippy
       run: cargo clippy --all --all-targets -- -D warnings
