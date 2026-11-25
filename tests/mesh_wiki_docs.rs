@@ -4856,7 +4856,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
     for needle in [
         "systemctl --user daemon-reload && systemctl --user restart coyote-rnsd",
         "An unchanged definition restarts nothing.",
-        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--config \"<config dir>\"') } | ForEach-Object { taskkill.exe /PID $_.ProcessId /T /F }; Start-ScheduledTask -TaskName 'Coyote rnsd'",
+        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--config \"<config dir>\"') -and $_.ProcessId -ne $PID } | ForEach-Object { taskkill.exe /PID $_.ProcessId /T /F }; Start-ScheduledTask -TaskName 'Coyote rnsd'",
         "Stop-ScheduledTask 'Coyote rnsd' ends only the task's cmd.exe",
     ] {
         assert!(
@@ -11197,8 +11197,9 @@ fn the_commands_page_says_a_sync_failure_once_per_node() {
 fn the_windows_build_run_and_relay_notes_match_the_script() {
     let ps1 = read(repo_root().join("scripts/mesh-relay.ps1"));
     for piece in [
-        "return \"Stop-ScheduledTask -TaskName '$TaskName'; Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('--config `\"$script:RnsDir`\"') } | ForEach-Object { taskkill.exe /PID `$_.ProcessId /T /F }; Start-ScheduledTask -TaskName '$TaskName'\"",
+        "return \"Stop-ScheduledTask -TaskName '$TaskName'; Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('--config `\"$dir`\"') -and `$_.ProcessId -ne `$PID } | ForEach-Object { taskkill.exe /PID `$_.ProcessId /T /F }; Start-ScheduledTask -TaskName '$TaskName'\"",
         "Diagnostics: '$rnstatus' attaches to the shared instance and lists its interfaces; run it in Windows Terminal",
+        "Ended an rnsd left running on $script:RnsDir by a stopped '$TaskName'",
         "@set `\"PYTHONUTF8=1`\"",
         "is the one this script wrote (already there); not touched",
     ] {
@@ -11208,10 +11209,16 @@ fn the_windows_build_run_and_relay_notes_match_the_script() {
         );
     }
     let readme = read(repo_root().join("README.md"));
-    assert!(
-        readme.contains("wiki/Installation#building-from-source-on-windows"),
-        "README.md's Windows instructions do not link the build section"
-    );
+    for needle in [
+        "wiki/Installation#building-from-source-on-windows",
+        "install [Git for Windows](https://gitforwindows.org/)",
+        "`C:\\Program Files\\Git\\bin` (not only `\\cmd`)",
+    ] {
+        assert!(
+            flat(&readme).contains(needle),
+            "README.md's Windows instructions do not say {needle:?}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let install = flat(&read(wiki.join("Installation.md")));
@@ -11241,6 +11248,8 @@ fn the_windows_build_run_and_relay_notes_match_the_script() {
         "Run it in Windows Terminal",
         "`Diagnostics: '<bin dir>\\rnstatus.cmd' attaches to the shared instance and lists its interfaces; run it in Windows Terminal`",
         "the `rnsd.exe` and `python.exe` it started keep running with the config they read",
+        "`Ended an rnsd left running on <config dir> by a stopped 'Coyote rnsd'`",
+        "so it also works as `pwsh -Command \"<line>\"` over SSH",
     ] {
         assert!(
             deployment.contains(needle),
