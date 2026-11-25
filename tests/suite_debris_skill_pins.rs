@@ -36,7 +36,7 @@ fn code_review_skill_pins_debris_rules() {
             "Check this section on EVERY diff regardless of where the review stopped",
             "`phase N`, `step N` and bare `round N` have too many legitimate uses to lint",
             "`T-a`, `bake-off`, `hand-off`, `\"usage probe:\"`",
-            "**Earns its keep**",
+            "**Comment hygiene**",
             "**Human register, ASCII punctuation**",
             "curly quotes",
             "section signs",
@@ -122,6 +122,51 @@ fn code_review_skill_pins_design_pass() {
             "- Patterns, with or without repo precedent, whose adoption means restructuring existing code",
             "  (tier 3: ask, never do); abstractions over two similar blocks.",
         ],
+    );
+}
+
+#[test]
+fn comment_discipline_skill_pins_the_keep_rule_and_the_final_diff_pass() {
+    assert_anchors(
+        "comment-discipline",
+        &[
+            "## The rule: a comment earns its keep",
+            "Code should strive to be self-documenting",
+            "easily discernible from reading the code, it is redundant and is removed",
+            "functionality that is not visible from the current context because it is used",
+            "records the decision behind a choice",
+            "Follow the codebase's existing commenting standards when it has them",
+            "## Final-diff pass",
+            "a judgement pass, not a pattern match",
+            "`Comment hygiene: <n> added comments read, <c> cut, <r> reduced`",
+        ],
+    );
+}
+
+#[test]
+fn code_review_skill_owns_a_comment_hygiene_finding_class() {
+    assert_anchors(
+        "code-review",
+        &[
+            "**Comment hygiene** -- every comment the diff adds or rewrites",
+            "Title each finding `Comment hygiene: <file:line>`",
+            "untagged on purpose: rigor folding must not hide",
+            "`Comment hygiene: <n> added comments checked, <m> redundant`",
+        ],
+    );
+    let text = skill("code-review");
+    let section = text
+        .split("## 7. Comments and documentation")
+        .nth(1)
+        .and_then(|rest| rest.split("## 8. Design and structure").next())
+        .expect("code-review/SKILL.md has a section 7");
+    assert!(
+        section.contains("**Comment hygiene**"),
+        "the comment hygiene class must live in section 7, which runs on every diff"
+    );
+    assert!(
+        !text.contains("Comments restating the code are ai-slop-remover's territory"),
+        "restating comments are the review's own finding class, not handed to another skill"
     );
 }
 

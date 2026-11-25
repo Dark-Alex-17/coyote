@@ -851,6 +851,13 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
      above supplies it for exemptions earlier tasks justified -- or the token comes off and the
      line is fixed, so an exemption an earlier task added without justification never reaches
      the PR silently.
+   - Run comment hygiene over the run's final diff: per `comment-discipline`'s `## Final-diff pass`,
+     read every comment the run diff adds (the same `$base..HEAD` diff and plans exclude as the
+     sweep above) beside the code it sits on, and cut or reduce each one that does not earn its
+     keep. It is a judgement read that follows the repo's own comment standards first, never a
+     grep; a kept comment needs no `HYGIENE:` row and is not a hit for the next bullet. The
+     cuts ride the hygiene commits, so the gauntlet below reviews them, and the report carries the
+     skill's `Comment hygiene:` line beside the `HYGIENE:` list.
    - For each hit: REMOVE it, or JUSTIFY it -- a justification must cite a repo convention at
      file:line or a recorded `## Quality bar` drop -- and report every kept item under a
      `HYGIENE:` heading (file:line, what, justification). A lint hit may be kept ONLY for the
