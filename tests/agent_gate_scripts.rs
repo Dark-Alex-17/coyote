@@ -6555,6 +6555,7 @@ fn resolve_step_cuts_each_document_at_its_head_c_limit() {
         keys,
         [
             "_next",
+            "baseline_floor",
             "blocking_reason",
             "handoff_path",
             "notes",
@@ -6889,6 +6890,7 @@ const JQ_ARG_ALLOW_LIST: &[(&str, &[&str])] = &[
             "notes_path",
             "handoff_path",
             "blocking_reason",
+            "baseline_floor",
             "next_node",
         ],
     ),

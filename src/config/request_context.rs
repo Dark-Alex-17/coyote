@@ -24122,7 +24122,10 @@ mod tests {
             ),
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
-            ("review-gauntlet".to_string(), Vec::new()),
+            (
+                "review-gauntlet".to_string(),
+                unreachable(&["finalize_check"]),
+            ),
             (
                 "step-runner".to_string(),
                 [
@@ -32742,6 +32745,12 @@ print(json.dumps({
                 "baseline_tests",
                 "implement",
                 "no baseline: verify_tests keeps its plain exit-code verdict",
+            ),
+            (
+                "coder",
+                "impact_facts",
+                "select_fault",
+                "selection falls back to the full test command",
             ),
             (
                 "step-runner",

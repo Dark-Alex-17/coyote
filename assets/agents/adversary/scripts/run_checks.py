@@ -153,6 +153,20 @@ not told apart; the owner's own gate still has to see it green. When the
 parser cannot be loaded or git cannot list the files, the
 record gets a `carried_note` instead and is judged as if nothing were
 carried; so does every record the deadline leaves no time to match.
+
+Verification tier: `verification_tier` is '' (the default), `round` or
+`final`; any other value executes nothing and records a PIPELINE-FAULT. A
+non-empty tier adds `tier_note`, the facts the criterion checks and the
+holistic pass are given about it. At `final` no command runs at all: the
+finalize record of the worktree tree (`.shared/verify_record.py lookup
+--tier finalize`, a tree differing only under `debris_exclude` matching too)
+becomes `exec_results`, one record per result that ran, each with `source:
+"finalize record <tree> @ <recorded_at>"`, its pre-existing failures as a
+pre-existing baseline and its other reds as a regression (or not-run when
+the gate could not classify them). `full_suite_record` gets {status:
+green|red|missing, tree, line}; verdict.py forces DIVERGES on its
+`FULL-SUITE RECORD MISSING|RED: <detail>` line unless it is green. Carried
+failures are not matched at this tier: the record keeps only output tails.
 """
 
 import hashlib
@@ -200,6 +214,25 @@ DIRTY_BESIDE_COMMITS_NOTE = ", candidate tree dirty beside commits since the dif
 UNKNOWN_TREE_NOTE = ", candidate tree state unknown"
 UNKNOWN_CHANGE_NOTE = ", candidate tree dirty, whether the declared commands modified it is unknown"
 MODIFIED_TREE_NOTE = ", the declared commands modified the tree"
+FULL_SUITE_PREFIX = "FULL-SUITE RECORD "
+UNCLASSIFIED_NOTE = "not classified:"
+TIER_NOTES = {
+    "": "",
+    "round": (
+        "\n\nVerification tier: round. The full test suite and lint run at the final gate, after "
+        "this review, so the runs above are the only ones this review has. A criterion that only "
+        "the whole suite or lint can prove (the full suite passes, lint is clean) is at best "
+        "INSPECTED here, with a `no_test_reason` beginning `DEFERRED: full suite runs at the final "
+        "gate`; the deterministic verdict counts it as PARTIAL unless a recorded run is green."
+    ),
+    "final": (
+        "\n\nVerification tier: final. This review is the final gate. The runs above come from the "
+        "finalize record of this worktree tree (each names it in `source`) and were not run again; "
+        "they are recorded runs like any other, so a green one proves a criterion it covers, cited "
+        "as that record's run. Nothing is deferred at this tier: a `DEFERRED:` reason counts as "
+        "PARTIAL."
+    ),
+}
 SNAPSHOT_IDENTITY = {
     "GIT_AUTHOR_NAME": "adversary",
     "GIT_AUTHOR_EMAIL": "adversary@localhost.invalid",
@@ -900,31 +933,145 @@ def match_carried(locator, root, index, path, by_key):
     return {"carried": carried}
 
 
-def emit_pipeline_fault(state, msg):
-    """Print the fail-closed record for a malformed declaration: nothing runs."""
+def pipeline_fault_record(state, msg):
+    """The fail-closed record for a malformed declaration: nothing runs."""
     prior = state.get("pipeline_faults")
     faults = [f for f in prior if isinstance(f, str)] if isinstance(prior, list) else []
     faults.append(msg)
-    print(json.dumps({"exec_results": msg, "pipeline_faults": faults}))
+    return {"exec_results": msg, "pipeline_faults": faults}
+
+
+def recorded_run(result, source, state):
+    """The exec_results record for one result of a finalize record, judged as the finalize
+    gate judged it."""
+    cmd = result["cmd"]
+    verdict = result.get("verdict")
+    note = result.get("note") if isinstance(result.get("note"), str) else ""
+    code = -1 if verdict == "timed_out" else result.get("exit")
+    run = {
+        "cmd": cmd,
+        "role": result.get("role"),
+        "exit": code,
+        "duration_s": result.get("duration_s"),
+        "tail": tail_of(result.get("tail") if isinstance(result.get("tail"), str) else ""),
+        "source": source,
+        "pass_condition": resolve(cmd, state.get("criteria"), state.get("initial_prompt")),
+    }
+    if verdict == "pre-existing":
+        run["baseline"] = {"status": "pre-existing", "exit": None, "note": note or "the finalize gate matched it to the base suite"}
+    elif code != 0:
+        compared = verdict == "red" and not note.startswith(UNCLASSIFIED_NOTE)
+        run["baseline"] = {
+            "status": "regression" if compared else "not-run",
+            "exit": None,
+            "note": note or f"the finalize gate recorded {verdict}",
+        }
+    return run
+
+
+def failing_results(record, passing):
+    """What keeps a finalize record from being green, in one line."""
+    parts = []
+    for r in record["results"]:
+        if not isinstance(r, dict) or r.get("verdict") in passing:
+            continue
+        note = r.get("note") if isinstance(r.get("note"), str) and r.get("note") else ""
+        part = f"{r.get('role', '?')} `{r.get('cmd') or '(none)'}` {r.get('verdict', '?')}"
+        parts.append(f"{part} ({note[:300]})" if note else part)
+    return "; ".join(parts) or "no green or pre-existing test result"
+
+
+def finalize_record_runs(state):
+    """exec_results and full_suite_record from the finalize record of the reviewed tree, at
+    the final tier. Nothing runs: the finalize gate already ran the full suite on this tree.
+
+    The reviewed tree is `review_tree` when the caller recorded one before lanes running
+    beside this one could write files, else the worktree tree as it stands now."""
+    proj = os.path.expanduser((state.get("project_dir") or "").strip() or ".")
+    if SHARED_DIR not in sys.path:
+        sys.path.insert(0, SHARED_DIR)
+    import verify_record
+
+    try:
+        import debris
+
+        excludes = debris.parse_excludes(state.get("debris_exclude"))
+    except Exception:  # noqa: BLE001 -- debris_lint reports a bad value; the exact tree still matches
+        excludes = []
+
+    def missing(tree, detail):
+        line = f"{FULL_SUITE_PREFIX}MISSING: {detail}"
+        return {
+            "exec_results": f"{line}; nothing runs at the final tier, the finalize gate writes this record",
+            "full_suite_record": {"status": "missing", "tree": tree, "line": line},
+        }
+
+    review_tree = state.get("review_tree")
+    review_tree = review_tree.strip() if isinstance(review_tree, str) else ""
+    if review_tree:
+        try:
+            path = verify_record.record_path(proj, review_tree, "finalize")
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return missing(review_tree, "git could not locate the verification record store")
+        record = verify_record._read(path, "finalize")
+        if record is None or record["tree"] != review_tree:
+            return missing(review_tree, f"no finalize record for the reviewed tree {review_tree}")
+    else:
+        tree = verify_record.worktree_tree(proj)
+        if not tree:
+            return missing("", "git could not write a tree of the worktree")
+        _, record = verify_record.lookup(proj, "finalize", excludes)
+        if record is None:
+            return missing(tree, f"no finalize record for the worktree tree {tree}")
+    source = f"finalize record {record['tree']} @ {record.get('recorded_at') or '?'}"
+    runs = [
+        recorded_run(r, source, state)
+        for r in record["results"]
+        if isinstance(r, dict) and isinstance(r.get("cmd"), str) and r["cmd"] and r.get("verdict") != "not_run"
+    ]
+    suite = {"status": "green", "tree": record["tree"], "line": ""}
+    if not verify_record.is_green(record, "finalize"):
+        suite = dict(suite, status="red", line=f"{FULL_SUITE_PREFIX}RED: {source}: {failing_results(record, verify_record.PASSING)}")
+    return {"exec_results": runs, "full_suite_record": suite}
+
+
+def tiered(tier, out):
+    """`out` as the node's JSON output, with the tier's note for the criterion checks."""
+    if TIER_NOTES[tier]:
+        out = dict(out, tier_note=TIER_NOTES[tier])
+    return json.dumps(out)
 
 
 def main():
     state = load_state()
+    tier = state.get("verification_tier")
+    tier = "" if tier is None else tier
+    if not isinstance(tier, str) or tier not in TIER_NOTES:
+        msg = f"PIPELINE-FAULT: verification_tier declaration invalid: expected '', round or final, got {tier!r}"
+        print(json.dumps(pipeline_fault_record(state, msg)))
+        return
     try:
         cmds = declared_commands(state.get("verification_commands"))
     except InvalidDeclaration as e:
         msg = f"PIPELINE-FAULT: verification_commands declaration invalid — {e}"
-        emit_pipeline_fault(state, msg)
+        print(tiered(tier, pipeline_fault_record(state, msg)))
         return
     try:
         prefix = lock_prefix(state.get("build_lock"))
     except InvalidDeclaration as e:
-        emit_pipeline_fault(state, f"PIPELINE-FAULT: build_lock declaration invalid: {e}")
+        print(tiered(tier, pipeline_fault_record(state, f"PIPELINE-FAULT: build_lock declaration invalid: {e}")))
         return
     carried, carried_error = declared_carried(state.get("carried_failures"))
+    if tier == "final":
+        out = finalize_record_runs(state)
+        if carried_error:
+            out["carried_error"] = carried_error
+        print(tiered(tier, out))
+        return
     if not cmds:
         print(
-            json.dumps(
+            tiered(
+                tier,
                 {
                     "exec_results": (
                         "none declared — the caller supplied no verification_commands; "
@@ -933,7 +1080,7 @@ def main():
                         "verification_commands variable to get recorded runs."
                     ),
                     **({"carried_error": carried_error} if carried_error else {}),
-                }
+                },
             )
         )
         return
@@ -977,7 +1124,7 @@ def main():
     out = {"exec_results": results}
     if carried_error:
         out["carried_error"] = carried_error
-    print(json.dumps(out))
+    print(tiered(tier, out))
 
 
 try:

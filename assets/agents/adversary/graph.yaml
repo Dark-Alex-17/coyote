@@ -75,6 +75,28 @@ variables:
       matching is per location, so a further failure at a carried location
       is not told apart. A value that is not a JSON array counts as none.
     default: '[]'
+  - name: verification_tier
+    description: |
+      Where this review sits in the run's verification, as review-gauntlet
+      forwards it. Empty (the default) changes nothing. `round`: the criterion
+      checks are told the full suite runs at the final gate, so a criterion
+      only the whole suite can prove is at best INSPECTED with a
+      `DEFERRED: full suite runs at the final gate` reason, PARTIAL unless a
+      recorded run is green. `final`: run_checks runs nothing and takes
+      exec_results from the finalize record of the reviewed tree (see
+      review_tree); a missing,
+      other-tree or red record forces DIVERGES with a `FULL-SUITE RECORD ...`
+      line, and a DEFERRED reason always counts as PARTIAL. Any other value
+      is a PIPELINE-FAULT.
+    default: ''
+  - name: review_tree
+    description: |
+      The git tree of the worktree the review is for, recorded by the caller
+      before anything beside this review could write files (review-gauntlet
+      forwards the tree signals recorded before its lanes). At the final tier
+      run_checks looks up the finalize record of this tree instead of the
+      worktree as it stands. Empty uses the worktree as it stands.
+    default: ''
 
 settings:
   max_loop_iterations: 10
@@ -102,6 +124,7 @@ initial_state:
   diff_base: ''
   git_facts: ''
   exec_results: ''
+  tier_note: ''
   carried_error: ''
   debris_findings: []
   debris_summary: ''
@@ -397,7 +420,7 @@ nodes:
       {{git_facts}}
 
       Verification runs (recorded by the deterministic run_checks stage):
-      {{exec_results}}
+      {{exec_results}}{{tier_note}}
       {{gate_feedback}}
     tools:
       - fs_read
@@ -510,7 +533,7 @@ nodes:
       {{git_facts}}
 
       Verification runs (recorded by the deterministic run_checks stage):
-      {{exec_results}}
+      {{exec_results}}{{tier_note}}
     tools:
       - fs_read
       - fs_cat

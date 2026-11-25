@@ -35,6 +35,14 @@ execution criterion judged from the diff because no recorded run covered
 it) counts as met only when at least one recorded run is green (exit 0, not
 skipped, held to exit 0); otherwise it is PARTIAL with a complaint naming the command to
 declare, so nothing executed never conforms.
+An INSPECTED verdict whose no_test_reason starts with DEFERRED_PREFIX (a
+criterion only the whole suite can prove, left to the final gate) is held to
+the same rule, and at the final verification tier it is always PARTIAL:
+that tier is the final gate. At the final tier the
+finalize record run_checks.py looked up for the worktree tree must be green;
+a missing, other-tree or red record forces DIVERGES with its
+`FULL-SUITE RECORD MISSING|RED: <detail>` line under the header and as the
+first run complaint.
 Holistic complaints block unless they carry `blocking: false`, or are scope
 drift whose every location path lies under the configured `debris_exclude`
 dirs (the run's own planning files); both are reported as non-blocking. A
@@ -71,6 +79,8 @@ DIED_MARKER = "criterion check DIED (pipeline fault)"
 DIED_EVIDENCE_PREFIX = "PIPELINE-FAULT: criterion "
 RULED_MARKER = "(ruled by holistic: output format failed)"
 ENVIRONMENT_PREFIX = "ENVIRONMENT:"
+DEFERRED_PREFIX = "DEFERRED: full suite runs at the final gate"
+FULL_SUITE_PREFIX = "FULL-SUITE RECORD "
 DECLARE_RE = re.compile(r"^declare\s+(.+?)\s+via the verification_commands variable", re.S)
 PLANNING_DRIFT_NOTE = "not blocking: scope drift confined to the run's planning files"
 SCOPE_DRIFT_KIND_RE = re.compile(r"scope drift|out-of-scope", re.I)
@@ -240,23 +250,53 @@ def declared_command(reason):
     return (m.group(1) if m else rest).strip()
 
 
-def demote_unexecuted(verdicts, exec_results, criteria, request):
-    """PARTIAL for each ENVIRONMENT-INSPECTED verdict when no recorded run is green."""
-    if green_run(exec_results, criteria, request):
-        return verdicts
+def demote_unexecuted(verdicts, exec_results, criteria, request, tier=""):
+    """PARTIAL for each ENVIRONMENT- or DEFERRED-INSPECTED verdict when no recorded run is
+    green, and for every DEFERRED one at the final tier."""
+    green = green_run(exec_results, criteria, request)
     out = []
     for v in verdicts:
         reason = str_field(v, "no_test_reason")
-        if v.get("status") != "INSPECTED" or died(v) or not reason.startswith(ENVIRONMENT_PREFIX):
+        if v.get("status") != "INSPECTED" or died(v):
             out.append(v)
             continue
-        complaint = (
-            "judged from the diff only and nothing was executed (no recorded "
-            f"verification run is green); declare {declared_command(reason)} via the "
-            "verification_commands variable so it runs"
-        )
+        if reason.startswith(DEFERRED_PREFIX) and tier == "final":
+            complaint = (
+                "deferred to the final gate, but this review is the final gate: the finalize "
+                "record's runs must prove it"
+            )
+        elif reason.startswith(DEFERRED_PREFIX) and not green:
+            complaint = (
+                "deferred to the final gate and judged from the diff only; nothing was "
+                "executed here (no recorded verification run is green)"
+            )
+        elif reason.startswith(ENVIRONMENT_PREFIX) and not green:
+            complaint = (
+                "judged from the diff only and nothing was executed (no recorded "
+                f"verification run is green); declare {declared_command(reason)} via the "
+                "verification_commands variable so it runs"
+            )
+        else:
+            out.append(v)
+            continue
         out.append(dict(v, status="PARTIAL", complaint=complaint))
     return out
+
+
+def full_suite_line(state):
+    """The FULL-SUITE RECORD line that forces DIVERGES at the final tier, or "" when the
+    finalize record run_checks.py found for the worktree tree is green."""
+    if state.get("verification_tier") != "final":
+        return ""
+    record = state.get("full_suite_record")
+    if not isinstance(record, dict):
+        record = {}
+    if record.get("status") == "green":
+        return ""
+    line = str_field(record, "line")
+    if line.startswith(FULL_SUITE_PREFIX):
+        return line
+    return f"{FULL_SUITE_PREFIX}MISSING: run_checks recorded no finalize record lookup"
 
 
 def load_state():
@@ -638,7 +678,11 @@ def main():
     verdicts = [v for v in (state.get("crit_verdicts") or []) if isinstance(v, dict)]
     verdicts = apply_format_rulings(verdicts, state.get("format_rulings"))
     verdicts = demote_unexecuted(
-        verdicts, state.get("exec_results"), state.get("criteria"), state.get("initial_prompt")
+        verdicts,
+        state.get("exec_results"),
+        state.get("criteria"),
+        state.get("initial_prompt"),
+        state.get("verification_tier"),
     )
     holistic = [c for c in (state.get("extra_complaints") or []) if isinstance(c, dict)]
     excludes = configured_excludes(state)
@@ -663,6 +707,8 @@ def main():
     )
     n_debris, debris_hits = debris_complaints(state)
     not_run = skipped_note(state.get("exec_results"))
+    suite = full_suite_line(state)
+    run_complaints = ([suite] if suite else []) + reds
     n = len(verdicts)
 
     met = [v for v in verdicts if v.get("status") in ("MET", "INSPECTED") and not died(v)]
@@ -696,7 +742,7 @@ def main():
             i += 1
             lines.append(f"{i}. {f}")
         i = append_criterion_complaints(lines, verdicts, extra, i)
-        for c in reds:
+        for c in run_complaints:
             i += 1
             lines.append(f"{i}. {c}")
         for c in debris_hits:
@@ -717,10 +763,10 @@ def main():
             "Acceptance criteria and re-run."
         )
         i = 1
-        for c in reds + debris_hits:
+        for c in run_complaints + debris_hits:
             i += 1
             lines.append(f"{i}. {c}")
-    elif not partial and not bad and not extra and not reds and not debris_hits:
+    elif not partial and not bad and not extra and not run_complaints and not debris_hits:
         lines.append("ADVERSARIAL_REVIEW: CONFORMS")
         lines.append(
             f"Criteria: {n}/{n} met ({len(proven)} test-proven, "
@@ -752,7 +798,7 @@ def main():
         lines.append(debris_summary_line(state))
         lines.append("Complaints:")
         i = append_criterion_complaints(lines, verdicts, extra, 0)
-        for c in reds:
+        for c in run_complaints:
             i += 1
             lines.append(f"{i}. {c}")
         for c in debris_hits:
@@ -762,6 +808,9 @@ def main():
             lines.append("")
             lines.append("Non-blocking observations:")
             lines.append(observations)
+
+    if suite:
+        lines.insert(2, suite)
 
     if advisory:
         lines.append("")

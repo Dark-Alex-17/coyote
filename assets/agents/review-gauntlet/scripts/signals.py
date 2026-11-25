@@ -292,4 +292,8 @@ if _rr_spec and not out.get("signals_error"):
     except Exception as e:  # noqa: BLE001 — a broken delta must never narrow
         out["delta_summary"] = f"delta signals unavailable ({str(e)[:200]})"
 
+# The final tier's full-suite check runs on the tree recorded above, before any lane.
+if state.get("verification_tier") == "final":
+    out["_next"] = "finalize_check"
+
 print(json.dumps(out))
