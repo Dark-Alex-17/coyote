@@ -11,7 +11,7 @@ use super::session::{
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
-use super::skill_registry::SkillRegistry;
+use super::skill_registry::{AgentToolGate, SkillRegistry};
 use super::todo::TodoList;
 use super::tool_scope::{
     McpPromptCompletion, McpRuntime, ToolScope, format_prompt_arguments, sanitize_display_text,
@@ -34,8 +34,9 @@ use crate::function::{
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
-    skill::SKILL_FUNCTION_PREFIX,
+    skill::{SKILL_FUNCTION_PREFIX, report_withheld_tools},
     todo::TODO_FUNCTION_PREFIX,
+    undeclared_mcp_server_error,
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::graph::route::Branch;
@@ -2407,8 +2408,13 @@ impl RequestContext {
             prompt_split = Some(split);
         }
 
+        let agent_gate = self
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, app));
         Ok((
-            self.skill_registry.effective_role(&role, &policy),
+            self.skill_registry
+                .effective_role(&role, &policy, agent_gate.as_ref()),
             prompt_split,
         ))
     }
@@ -2933,7 +2939,7 @@ impl RequestContext {
             }
         };
 
-        if !enable && self.skill_registry.loaded_mcp_servers().contains(name) {
+        if !enable && self.skill_mcp_servers().contains(name) {
             println!(
                 "Note: '{name}' is granted by a loaded skill and will keep running until that skill is unloaded."
             );
@@ -4530,7 +4536,7 @@ impl RequestContext {
         } else {
             self.app.config.enabled_mcp_servers.clone()
         };
-        let skill_mcps = self.skill_registry.loaded_mcp_servers();
+        let skill_mcps = self.skill_mcp_servers();
 
         let mut out = String::from("MCP servers:\n");
         for name in &names {
@@ -5104,7 +5110,7 @@ impl RequestContext {
                 } else {
                     self.app.config.enabled_mcp_servers.clone()
                 };
-                let is_enabled = self.skill_registry.loaded_mcp_servers().contains(server)
+                let is_enabled = self.skill_mcp_servers().contains(server)
                     || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, server));
                 if !is_enabled {
                     bail!(
@@ -5885,6 +5891,32 @@ impl RequestContext {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
+    pub(crate) fn skill_mcp_servers(&self) -> BTreeSet<String> {
+        let agent_gate = self
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, &self.app.config));
+        self.skill_registry.loaded_mcp_servers(agent_gate.as_ref())
+    }
+
+    /// A server the user enabled on the session stays usable even when the
+    /// agent does not declare it; anything else (in practice a skill grant) is refused.
+    pub(crate) fn mcp_server_refusal(&self, server: &str) -> Option<String> {
+        let agent = self.agent.as_ref()?;
+        if AgentToolGate::new(agent, &self.app.config).allows_mcp_server(server) {
+            return None;
+        }
+        if let Some(list) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.enabled_mcp_servers())
+            && (list.iter().any(|item| item.trim() == "all") || self.mcp_list_covers(&list, server))
+        {
+            return None;
+        }
+        Some(undeclared_mcp_server_error(server, agent.name()))
+    }
+
     pub fn mcp_prompt_completion(&self, args: &[&str]) -> McpPromptCompletion {
         let app = self.app.config.as_ref();
         let enabled_ids = match &self.app.mcp_config {
@@ -5892,7 +5924,7 @@ impl RequestContext {
                 let mut servers = self
                     .enabled_mcp_servers_for_current_scope(app, true)
                     .unwrap_or_default();
-                servers.extend(self.skill_registry.loaded_mcp_servers());
+                servers.extend(self.skill_mcp_servers());
                 expand_enabled_mcp_server_ids(app, mcp_config, &servers)
             }
             None => vec![],
@@ -5933,7 +5965,7 @@ impl RequestContext {
         )?;
 
         let enabled_mcp_servers = if policy.skills_enabled && app.mcp_server_support {
-            let skill_mcps = self.skill_registry.loaded_mcp_servers();
+            let skill_mcps = self.skill_mcp_servers();
             let has_all = enabled_mcp_servers
                 .as_ref()
                 .map(|v| v.iter().any(|s| s.trim() == "all"))
@@ -6614,7 +6646,6 @@ impl RequestContext {
         if validator_warned_about_memory {
             self.graph_chat_fc_warned = true;
         }
-        self.agent_variables = None;
 
         Ok(())
     }
@@ -6761,6 +6792,9 @@ impl RequestContext {
             self.auto_continue_paused = None;
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
+            // The values the agent was started with stay seated for its
+            // children; leaving the agent ends that inheritance.
+            self.agent_variables = None;
             self.rag.take();
             // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
             // cached under `RagKey::Agent(<agent name>)`, and leaving that key behind
@@ -6920,6 +6954,11 @@ impl RequestContext {
             bail!("Skill '{name}' requires MCP servers, which are disabled");
         }
 
+        let warnings = self
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, &self.app.config).warnings(&skill))
+            .unwrap_or_default();
         self.skill_registry.insert(skill)?;
         if let Err(e) = self.refresh_tool_scope(abort_signal).await {
             if let Err(unload_err) = self.skill_registry.unload(name) {
@@ -6930,6 +6969,7 @@ impl RequestContext {
 
         skill_loaded_sink(JSON_OUTPUT.load(std::sync::atomic::Ordering::SeqCst))
             .println(format_args!("✓ Loaded skill '{name}'."));
+        report_withheld_tools(&warnings, true);
         Ok(())
     }
 
@@ -10370,6 +10410,187 @@ mod tests {
         }
     }
 
+    /// `None` runs without an agent.
+    fn skill_mcp_ctx(agent_servers: Option<&[&str]>) -> (RequestContext, Option<String>) {
+        let skill_file = paths::skill_file("grants-mcp");
+        create_dir_all(skill_file.parent().unwrap()).unwrap();
+        write(
+            &skill_file,
+            "---\ndescription: D\nenabled_mcp_servers: skillsrv\n---\nUse the server.\n",
+        )
+        .unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        let agent_name = agent_servers.map(|servers| {
+            let agent_name = unique_name("test_skill_mcp_agent");
+            let agent_dir = paths::agent_data_dir(&agent_name);
+            create_dir_all(&agent_dir).unwrap();
+            let mcp_servers: String = servers
+                .iter()
+                .map(|server| format!("  - {server}\n"))
+                .collect();
+            let mcp_block = if servers.is_empty() {
+                String::new()
+            } else {
+                format!("mcp_servers:\n{mcp_servers}")
+            };
+            write(
+                agent_dir.join("config.yaml"),
+                format!("name: {agent_name}\ninstructions: hi\n{mcp_block}"),
+            )
+            .unwrap();
+            run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+                .unwrap();
+            agent_name
+        });
+        (ctx, agent_name)
+    }
+
+    fn load_grants_mcp(ctx: &mut RequestContext) -> serde_json::Value {
+        let result = run_async(skill::handle_skill_tool(
+            ctx,
+            "skill__load",
+            &json!({"name": "grants-mcp"}),
+        ))
+        .unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        // No MCP config here, so add the meta tools a started server would have.
+        ctx.tool_scope
+            .functions
+            .append_mcp_meta_functions(vec![tools_only_features("skillsrv")]);
+        result
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_withholds_an_undeclared_mcp_server_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_mcp_ctx(Some(&[]));
+        let agent_name = agent_name.unwrap();
+
+        let result = load_grants_mcp(&mut ctx);
+
+        let warning = format!(
+            "Skill 'grants-mcp' grants MCP server 'skillsrv', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add skillsrv to {agent_name}'s mcp_servers in the agent definition."
+        );
+        assert_eq!(result["warnings"], json!([warning]), "{result}");
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        assert!(
+            ctx.skill_mcp_servers().is_empty(),
+            "the server must not be started"
+        );
+        let offered = offered_tool_names(&ctx);
+        assert!(
+            !offered.iter().any(|name| name == "mcp_invoke_skillsrv"),
+            "{offered:?}"
+        );
+
+        let refusal = format!(
+            "MCP server 'skillsrv' is not enabled for agent '{agent_name}'. To use it, add skillsrv to {agent_name}'s mcp_servers in the agent definition."
+        );
+        let output = run_async(
+            ToolCall::new(
+                "mcp_invoke_skillsrv".into(),
+                json!({"tool": "anything", "arguments": {}}),
+                Some("id1".into()),
+            )
+            .eval(&mut ctx),
+        )
+        .unwrap();
+        assert_eq!(output, json!({"tool_call_error": refusal}));
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_keeps_a_declared_mcp_server_without_warning() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_mcp_ctx(Some(&["skillsrv"]));
+
+        let result = load_grants_mcp(&mut ctx);
+
+        assert!(result.get("warnings").is_none(), "{result}");
+        assert!(ctx.skill_mcp_servers().contains("skillsrv"));
+        assert_eq!(ctx.mcp_server_refusal("skillsrv"), None);
+        let offered = offered_tool_names(&ctx);
+        assert!(
+            offered.iter().any(|name| name == "mcp_invoke_skillsrv"),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_without_an_agent_keeps_every_granted_mcp_server() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_mcp_ctx(None);
+
+        let result = load_grants_mcp(&mut ctx);
+
+        assert!(result.get("warnings").is_none(), "{result}");
+        assert!(ctx.skill_mcp_servers().contains("skillsrv"));
+        assert_eq!(ctx.mcp_server_refusal("skillsrv"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn repl_skill_load_inside_an_agent_withholds_an_undeclared_mcp_server_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_mcp_ctx(Some(&[]));
+        let agent_name = agent_name.unwrap();
+
+        run_async(ctx.load_skill_repl("grants-mcp", utils::create_abort_signal())).unwrap();
+
+        let warning = format!(
+            "Skill 'grants-mcp' grants MCP server 'skillsrv', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add skillsrv to {agent_name}'s mcp_servers in the agent definition."
+        );
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        assert!(ctx.skill_mcp_servers().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn mcp_server_refusal_honours_only_the_servers_the_session_enables() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, agent_name) = skill_mcp_ctx(Some(&[]));
+        let agent_name = agent_name.unwrap();
+        let mut session = Session::default();
+        session.set_enabled_mcp_servers(Some(vec!["skillsrv".to_string()]));
+        ctx.session = Some(session);
+
+        assert_eq!(ctx.mcp_server_refusal("skillsrv"), None);
+        assert_eq!(
+            ctx.mcp_server_refusal("othersrv"),
+            Some(format!(
+                "MCP server 'othersrv' is not enabled for agent '{agent_name}'. To use it, add othersrv to {agent_name}'s mcp_servers in the agent definition."
+            ))
+        );
+    }
+
+    #[test]
+    fn mcp_meta_server_reads_the_server_from_every_meta_prefix() {
+        for prefix in [
+            "mcp_invoke",
+            "mcp_search",
+            "mcp_describe",
+            "mcp_read",
+            "mcp_prompt",
+        ] {
+            assert_eq!(
+                crate::function::mcp_meta_server(&format!("{prefix}_skillsrv")),
+                Some("skillsrv"),
+                "{prefix}"
+            );
+        }
+        assert_eq!(crate::function::mcp_meta_server("fs_read"), None);
+        assert_eq!(crate::function::mcp_meta_server("mcp_invokeskillsrv"), None);
+    }
+
     #[test]
     #[serial]
     fn compression_notices_in_the_repl_go_to_stderr_not_the_warn_log() {
@@ -11680,6 +11901,8 @@ mod tests {
             format!("name: {agent_name}\ninstructions: hi\n"),
         )
         .unwrap();
+        let started_with = AgentVariables::from([("pr".to_string(), "7".to_string())]);
+        ctx.agent_variables = Some(started_with.clone());
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11692,12 +11915,14 @@ mod tests {
             });
 
         assert!(ctx.agent.is_some());
+        assert_eq!(ctx.agent_variables.as_ref(), Some(&started_with));
         ctx.set_last_graph_branch(graph::route::Branch::Chat, false);
         ctx.graph_chat_fc_warned = true;
 
         ctx.exit_agent(&app).unwrap();
 
         assert!(ctx.agent.is_none());
+        assert!(ctx.agent_variables.is_none());
         assert!(ctx.rag.is_none());
         assert_eq!(ctx.rag_key, None);
         assert_eq!(ctx.last_graph_branch, None);
@@ -13440,6 +13665,159 @@ mod tests {
         assert!(!names.contains(&"skill__list"));
         assert!(!names.contains(&"skill__load"));
         assert!(!names.contains(&"skill__unload"));
+    }
+
+    /// `None` runs without an agent.
+    fn skill_grant_ctx(agent_global_tools: Option<&[&str]>) -> (RequestContext, Option<String>) {
+        write_global_tool_stubs(&["fs_read", "execute_command"]);
+        let skill_file = paths::skill_file("grants-exec");
+        create_dir_all(skill_file.parent().unwrap()).unwrap();
+        write(
+            &skill_file,
+            "---\ndescription: D\nenabled_tools: fs_read, execute_command\n---\nUse the tools.\n",
+        )
+        .unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        let agent_name = agent_global_tools.map(|tools| {
+            let agent_name = unique_name("test_skill_grant_agent");
+            let agent_dir = paths::agent_data_dir(&agent_name);
+            create_dir_all(&agent_dir).unwrap();
+            let global_tools: String = tools
+                .iter()
+                .map(|tool| format!("  - {tool}.sh\n"))
+                .collect();
+            write(
+                agent_dir.join("config.yaml"),
+                format!("name: {agent_name}\ninstructions: hi\nglobal_tools:\n{global_tools}"),
+            )
+            .unwrap();
+            run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+                .unwrap();
+            agent_name
+        });
+        if agent_name.is_none() {
+            run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+        }
+        (ctx, agent_name)
+    }
+
+    fn offered_tool_names(ctx: &RequestContext) -> Vec<String> {
+        let role = ctx.extract_role(&ctx.app.config.clone()).unwrap();
+        ctx.select_functions(&role)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|function| function.name)
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_withholds_an_undeclared_global_tool_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_grant_ctx(Some(&["fs_read"]));
+        let agent_name = agent_name.unwrap();
+        assert!(
+            ctx.tool_scope.functions.contains("execute_command"),
+            "the global pool carries execute_command, so only the agent gate can withhold it"
+        );
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__load",
+            &json!({"name": "grants-exec"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        let warning = format!(
+            "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
+        );
+        assert_eq!(result["warnings"], json!([warning]), "{result}");
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        let offered = offered_tool_names(&ctx);
+        assert!(
+            !offered.iter().any(|name| name == "execute_command"),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_skill_load_inside_an_agent_withholds_an_undeclared_global_tool_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_grant_ctx(Some(&["fs_read"]));
+        let agent_name = agent_name.unwrap();
+
+        run_async(ctx.load_skill_repl("grants-exec", utils::create_abort_signal())).unwrap();
+
+        let warning = format!(
+            "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
+        );
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        let offered = offered_tool_names(&ctx);
+        assert_eq!(
+            (
+                offered.iter().any(|name| name == "fs_read"),
+                offered.iter().any(|name| name == "execute_command")
+            ),
+            (true, false),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_offers_a_declared_global_tool_without_warning() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_grant_ctx(Some(&["fs_read", "execute_command"]));
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__load",
+            &json!({"name": "grants-exec"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(result.get("warnings").is_none(), "{result}");
+        let offered = offered_tool_names(&ctx);
+        for tool in ["fs_read", "execute_command"] {
+            assert!(
+                offered.iter().any(|name| name == tool),
+                "{tool}: {offered:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_without_an_agent_offers_every_granted_global_tool() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_grant_ctx(None);
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__load",
+            &json!({"name": "grants-exec"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(result.get("warnings").is_none(), "{result}");
+        let offered = offered_tool_names(&ctx);
+        for tool in ["fs_read", "execute_command"] {
+            assert!(
+                offered.iter().any(|name| name == tool),
+                "{tool}: {offered:?}"
+            );
+        }
     }
 
     #[test]

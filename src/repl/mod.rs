@@ -1239,12 +1239,25 @@ async fn dispatch_repl_line(
                     if variables.len() != variable_pairs.len() {
                         bail!("Some variable values are not key=value pairs");
                     }
-                    if !variables.is_empty() {
-                        ctx.agent_variables = Some(variables.clone());
-                    }
+                    let was_engaged = ctx.agent.is_some();
+                    let previous = std::mem::replace(
+                        &mut ctx.agent_variables,
+                        (!variables.is_empty()).then_some(variables),
+                    );
                     let app = Arc::clone(&ctx.app.config);
-                    ctx.use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
-                        .await?;
+                    if let Err(err) = ctx
+                        .use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
+                        .await
+                    {
+                        // A refused `.agent` leaves the running agent, if
+                        // any, with the values its children inherit; an
+                        // agent left engaged by a failed seating keeps the
+                        // values it was started with.
+                        if was_engaged || ctx.agent.is_none() {
+                            ctx.agent_variables = previous;
+                        }
+                        return Err(err);
+                    }
                     ctx.top_level_agent_started();
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
@@ -4426,6 +4439,37 @@ local_hello() {\n\
             let err = repl_command(&mut ctx, ".run x").await.unwrap_err();
 
             assert_eq!(err.to_string(), "No agent");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_refused_or_failed_agent_command_keeps_the_seated_variables() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_agent_vars_kept");
+        write_config_agent(&name);
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let started = AgentVariables::from([("pr".to_string(), "7".to_string())]);
+
+            repl_command(&mut ctx, &format!(".agent {name} pr=7"))
+                .await
+                .unwrap();
+            assert_eq!(ctx.agent_variables.as_ref(), Some(&started));
+
+            for refused in [format!(".agent {name}"), format!(".agent {name} pr=9")] {
+                repl_command(&mut ctx, &refused).await.unwrap_err();
+                assert_eq!(ctx.agent_variables.as_ref(), Some(&started), "{refused}");
+            }
+
+            repl_command(&mut ctx, ".exit agent").await.unwrap();
+            assert!(ctx.agent_variables.is_none());
+
+            repl_command(&mut ctx, &format!(".agent {name}_missing pr=9"))
+                .await
+                .unwrap_err();
+            assert!(ctx.agent.is_none());
+            assert!(ctx.agent_variables.is_none());
         });
     }
 

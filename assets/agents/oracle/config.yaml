@@ -21,6 +21,7 @@ variables:
 
 mcp_servers:
   - ddg-search
+  - iwe
 global_tools:
   - web_search_coyote.sh
   - ast_grep.sh

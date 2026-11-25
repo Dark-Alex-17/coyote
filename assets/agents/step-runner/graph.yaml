@@ -15,6 +15,7 @@ max_agent_depth: 4
 global_tools:
   - ast_grep.sh
   - fs_cat.sh
+  - fs_read.sh
   - fs_grep.sh
   - fs_ls.sh
   - fs_write.sh
@@ -25,16 +26,15 @@ skills_enabled: true
 enabled_skills:
   - step-implementation
   - handoff-protocol
-  - code-review
   - ai-slop-remover
 
 variables:
   - name: project_dir
     description: |
       Absolute path to the project directory. Defaults to "." (the directory
-      coyote was invoked from). The coder sub-agent resolves its own
-      project_dir the same way, so invoke step-runner FROM the project root
-      unless you override this for both.
+      coyote was invoked from). A value given here reaches the coder
+      sub-agent as its project_dir; without one, both resolve it from the
+      invocation directory.
     default: '.'
   - name: plans_dir
     description: |
