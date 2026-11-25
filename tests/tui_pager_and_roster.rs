@@ -91,7 +91,7 @@ mod transcript {
     /// Ctrl+L, then the frame split into screen rows by following the
     /// cursor-position sequences the repaint carries. Rows are 1-based as a
     /// terminal reports them; each is the squeezed text written on it.
-    fn repaint_rows(pty: &mut Pty) -> Vec<(u16, String)> {
+    pub(super) fn repaint_rows(pty: &mut Pty) -> Vec<(u16, String)> {
         let at = pty.raw().len();
         pty.send(CTRL_L).unwrap();
         read_repaint(pty, at, Duration::from_secs(1));
@@ -3432,6 +3432,167 @@ mod binary_threads {
             opened,
             "Enter on the focused gated call does not show its output:\n{open}"
         );
+        pty.send(b"q").unwrap();
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
+    /// The screen row whose squeezed text holds `header` and the fold arrow
+    /// drawn in front of it, from a Ctrl+L repaint.
+    fn header_at(pty: &mut Pty, header: &str) -> (u16, char) {
+        let rows = super::transcript::repaint_rows(pty);
+        rows.iter()
+            .find_map(|(row, text)| {
+                let at = text.find(header)?;
+                Some((*row, text[..at].chars().last()?))
+            })
+            .unwrap_or_else(|| panic!("no screen row carries {header:?}: {rows:?}"))
+    }
+
+    /// A left press and release at `column`, `row`, sent once the keyboard
+    /// has been idle so the report is not read as part of a key.
+    fn click(pty: &mut Pty, column: u16, row: u16) {
+        pty.read_for(HOTKEY_GAP);
+        pty.send(format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").as_bytes())
+            .unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+
+    /// A key, then a pause for the UI to take it.
+    fn press(pty: &mut Pty, key: &[u8]) {
+        pty.send(key).unwrap();
+        pty.read_for(Duration::from_millis(300));
+    }
+
+    /// Whether a fresh repaint shows `output`, squeezed.
+    fn shows(pty: &mut Pty, output: &str) -> bool {
+        let at = pty.raw().len();
+        pty.send(b"\x0c").unwrap();
+        read_repaint(pty, at, Duration::from_secs(1));
+        squeezed(&strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..]))).contains(output)
+    }
+
+    const FOLDED: char = '\u{25B8}';
+    const OPEN: char = '\u{25BE}';
+    const CTRL_UP: &[u8] = b"\x1b[1;5A";
+    const CTRL_DOWN: &[u8] = b"\x1b[1;5B";
+
+    /// Every gesture that opens a tool row in the main view opens and closes
+    /// one in a child's thread, while the child still runs a call (whose
+    /// throbber has the thread laid out again on every frame) and once its
+    /// rows hold the output its saved session gives them: a click on the
+    /// arrow, a click elsewhere on the header, and Ctrl+Up / Ctrl+Down to
+    /// focus a row and Enter.
+    #[test]
+    #[serial]
+    fn every_fold_gesture_opens_and_closes_a_thread_row_live_and_saved() {
+        let scene = scene("thr-gestures", kid_in_a_blocking_tool, "");
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+        wait_for_file(
+            &mut pty,
+            &scene.dir.join("kid.gated"),
+            "the kid's gate tool",
+        );
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"\t").unwrap();
+        repainted_frame_showing(&mut pty, "Threads", "Tab did not open the picker");
+        press(&mut pty, b"\x1b[B");
+        pty.send(b"\r").unwrap();
+        let (live, thread) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+            row_after(frame, "kid_mark(").is_some_and(|row| row.contains(" ok"))
+                && row_after(frame, "kid_gate(").is_some_and(|row| row.contains("running"))
+        });
+        assert!(
+            live,
+            "the kid's thread does not show its live rows:\n{thread}"
+        );
+
+        // Live: the finished mark call while the gated one still runs.
+        let (row, arrow) = header_at(&mut pty, "kid_mark(");
+        assert_eq!(arrow, FOLDED, "the live row starts open");
+        for (column, what) in [(1, "its arrow"), (12, "its header")] {
+            click(&mut pty, column, row);
+            assert_eq!(
+                header_at(&mut pty, "kid_mark(").1,
+                OPEN,
+                "a click on {what} did not open the live row"
+            );
+            click(&mut pty, column, row);
+            assert_eq!(
+                header_at(&mut pty, "kid_mark(").1,
+                FOLDED,
+                "a second click on {what} did not close it"
+            );
+        }
+        // The clicks left the focus on the mark row: Ctrl+Down steps to the
+        // gated call and Ctrl+Up back to it.
+        press(&mut pty, CTRL_DOWN);
+        press(&mut pty, CTRL_UP);
+        press(&mut pty, b"\r");
+        assert_eq!(
+            header_at(&mut pty, "kid_mark(").1,
+            OPEN,
+            "Ctrl+Up then Enter did not open the live row"
+        );
+        press(&mut pty, b"\r");
+        assert_eq!(
+            header_at(&mut pty, "kid_mark(").1,
+            FOLDED,
+            "a second Enter did not close it"
+        );
+
+        // Saved: both calls open on what the saved session holds.
+        fs::write(&scene.kid_gate, "").unwrap();
+        let (saved, thread) = frame_until(&mut pty, Duration::from_secs(20), |frame| {
+            squeezed(frame).contains("kiddonez4p")
+        });
+        assert!(
+            saved,
+            "the kid's thread did not read back its saved reply:\n{thread}"
+        );
+        for (header, output) in [
+            ("kid_gate(", "kidgateopenk2g"),
+            ("kid_mark(", "kidmarkedk1m"),
+        ] {
+            assert!(
+                !shows(&mut pty, output),
+                "{header} is open before any gesture"
+            );
+            let (row, _) = header_at(&mut pty, header);
+            for (column, what) in [(1, "its arrow"), (12, "its header")] {
+                click(&mut pty, column, row);
+                assert!(
+                    shows(&mut pty, output),
+                    "a click on {what} did not open {header} on its output"
+                );
+                click(&mut pty, column, row);
+                assert!(
+                    !shows(&mut pty, output),
+                    "a second click on {what} did not close {header}"
+                );
+            }
+        }
+        // The fake model gives both calls one id, so focus keys cannot tell
+        // them apart past this point; Ctrl+Down from the last clicked row
+        // lands on the gated call.
+        press(&mut pty, CTRL_DOWN);
+        press(&mut pty, b"\r");
+        assert!(
+            shows(&mut pty, "kidgateopenk2g"),
+            "Ctrl+Down then Enter did not open the gated call"
+        );
+        press(&mut pty, b"\r");
+        assert!(
+            !shows(&mut pty, "kidgateopenk2g"),
+            "a second Enter did not close it"
+        );
+
         pty.send(b"q").unwrap();
         let transcript = leave(&mut pty, &scene);
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

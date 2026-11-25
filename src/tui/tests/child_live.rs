@@ -543,6 +543,32 @@ fn an_open_thread_at_its_end_follows_new_calls() {
     assert!(!frame.contains("tool_00("), "{frame}");
 }
 
+/// While a call of the child runs, every frame drops the thread's layout
+/// so the throbber is drawn anew; a click landing before the next frame
+/// still finds the row it was aimed at and opens it.
+#[test]
+fn a_click_between_frames_of_a_running_thread_still_opens_the_row() {
+    let mut harness = Harness::standalone(80, 24);
+    started(&mut harness);
+    child_tool(&mut harness, None, "call-c1", "execute_command");
+    harness.app.handle_msg(UiMsg::ChildToolOutput {
+        agent_id: AGENT.to_string(),
+        node: None,
+        call_id: "call-c1".to_string(),
+        chunk: b"compiled c1\n".to_vec(),
+    });
+    child_tool_done(&mut harness, None, "call-c1", true);
+    child_tool(&mut harness, None, "call-c2", "fs_read");
+    open_thread(&mut harness);
+    let frame = harness.draw();
+    assert!(!frame.contains("compiled c1"), "{frame}");
+    let row = screen_row(&harness, "\u{25B8} execute_command(");
+    harness.app.frame_drawn();
+    click(&mut harness, (4, row));
+    let frame = harness.draw();
+    assert!(frame.contains("compiled c1"), "{frame}");
+}
+
 /// In a child's thread Ctrl+Up focuses the last foldable row, Enter and
 /// a click open and close it; in the root thread the same keys do
 /// nothing.

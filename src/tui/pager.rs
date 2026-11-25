@@ -527,6 +527,11 @@ pub(super) struct Pager {
     /// The text as last laid out, with the width and the transcript
     /// generation it was laid out for; reused until either moves.
     laid_out: Option<(u16, u64, Arc<PagerText>)>,
+    /// The text the last frame drew, which a click or a selection is
+    /// matched against. It outlives `laid_out`: a running row of a child's
+    /// thread drops that after every frame so its throbber is drawn anew,
+    /// and a press landing before the next frame still has to find its row.
+    drawn: Option<Arc<PagerText>>,
     root_lines: RootLines,
     /// Root cells laid out since the pager opened.
     #[cfg(test)]
@@ -550,6 +555,7 @@ impl Pager {
             missed: false,
             page: 1,
             laid_out: None,
+            drawn: None,
             root_lines: RootLines::default(),
             #[cfg(test)]
             cell_layouts: 0,
@@ -715,11 +721,7 @@ impl Pager {
             return;
         }
         let line = self.top + usize::from(row - body.y);
-        let Some(index) = self
-            .laid_out
-            .as_ref()
-            .and_then(|(_, _, text)| text.cell_at(line))
-        else {
+        let Some(index) = self.drawn.as_ref().and_then(|text| text.cell_at(line)) else {
             return;
         };
         let Thread::Child(view) = &mut self.thread else {
@@ -815,7 +817,7 @@ impl Pager {
     /// last line counts as the last line's end.
     pub(super) fn pos_at(&self, column: u16, row: u16, area: Rect) -> Option<Pos> {
         let body = text_area(area);
-        let (_, _, text) = self.laid_out.as_ref()?;
+        let text = self.drawn.as_ref()?;
         if text.len() == 0 || !body.contains(Position::new(column, row)) {
             return None;
         }
@@ -831,7 +833,7 @@ impl Pager {
     /// Lines `first..=last` of the last frame's text as the selection
     /// copies them.
     pub(super) fn selection_rows(&self, first: usize, last: usize) -> Vec<selection::Row> {
-        let Some((_, _, text)) = self.laid_out.as_ref() else {
+        let Some(text) = self.drawn.as_ref() else {
             return Vec::new();
         };
         let empty = Line::default();
@@ -968,6 +970,7 @@ impl Pager {
         let text = Arc::new(text);
         self.reanchor(&text);
         self.laid_out = Some((width, generation, Arc::clone(&text)));
+        self.drawn = Some(Arc::clone(&text));
         text
     }
 
