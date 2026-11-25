@@ -1491,8 +1491,15 @@ mod transcript {
 
         pty.send(ESC).unwrap();
         pty.read_for(Duration::from_millis(300));
-        pty.send(b"q").unwrap();
-        pty.read_for(Duration::from_millis(300));
+        let back = repainted_frame_showing(
+            &mut pty,
+            "run the slow tool",
+            "Esc did not give the main screen back",
+        );
+        assert!(
+            !squeezed(&back).contains(&squeezed(PICKER)) && !back.contains("Thread: root thread"),
+            "Esc left the picker or the transcript view up:\n{back}"
+        );
         // SAFETY: kill takes a pid and a signal number and touches no memory.
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         wait_for_squeezed_after(&mut pty, "done after the tool r6k", 0, "the turn's end");
@@ -1731,9 +1738,8 @@ mod transcript {
     }
 
     /// With nothing running and no child ever started, `.threads` opens the
-    /// thread picker straight away, and so does `t` in the tasks pop-up;
-    /// leaving the picker and the transcript view opened from the pop-up
-    /// brings the pop-up back.
+    /// thread picker over the main screen straight away, and so does `t` in
+    /// the tasks pop-up; Esc on the picker goes back to where it was opened.
     #[test]
     #[serial]
     fn dot_threads_and_t_in_the_tasks_popup_open_the_thread_picker() {
@@ -1747,10 +1753,21 @@ mod transcript {
             squeezed(&picker).contains(&squeezed("No child sessions yet")),
             "the picker does not say no child has started:\n{picker}"
         );
+        assert!(
+            !picker.contains("Thread: root thread"),
+            "`.threads` opened the transcript view under the picker:\n{picker}"
+        );
         pty.send(ESC).unwrap();
         pty.read_for(Duration::from_millis(300));
-        pty.send(b"q").unwrap();
-        pty.read_for(Duration::from_millis(300));
+        let back = repainted_frame_showing(
+            &mut pty,
+            "no session",
+            "Esc did not give the main screen back",
+        );
+        assert!(
+            !squeezed(&back).contains(&squeezed(PICKER)),
+            "Esc left the picker up:\n{back}"
+        );
 
         pty.send(ALT_T).unwrap();
         repainted_frame_showing(
@@ -1766,11 +1783,14 @@ mod transcript {
         );
         pty.send(ESC).unwrap();
         pty.read_for(Duration::from_millis(300));
-        pty.send(b"q").unwrap();
-        repainted_frame_showing(
+        let tasks = repainted_frame_showing(
             &mut pty,
             "Esc = close",
-            "leaving the transcript view did not bring the tasks pop-up back",
+            "leaving the picker did not bring the tasks pop-up back",
+        );
+        assert!(
+            !squeezed(&tasks).contains(&squeezed(PICKER)),
+            "Esc left the picker up over the tasks pop-up:\n{tasks}"
         );
         pty.send(ESC).unwrap();
         pty.read_for(Duration::from_millis(300));

@@ -6491,7 +6491,7 @@ fn a_keys_macro_takes_the_keys_command_from_the_help() {
     );
 }
 
-/// `.threads` opens the transcript view on the thread picker under the
+/// `.threads` opens the threads pop-up over the main screen under the
 /// active prefix, between turns and during one, and is never handed on
 /// as a line to run or hold; the line goes to this session's history.
 #[test]
@@ -6511,8 +6511,8 @@ fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
         let frame = harness.draw();
         assert!(frame.contains("Enter open  Esc back"), "{line}: {frame}");
         assert!(frame.contains("No child sessions yet"), "{line}: {frame}");
+        assert!(!frame.contains("Thread: root thread"), "{line}: {frame}");
         harness.press(KeyCode::Esc);
-        harness.press(KeyCode::Char('q'));
         assert!(harness.app.overlay.is_none(), "{line}");
         harness.press(KeyCode::Up);
         assert_eq!(harness.app.composer_text(), line, "not in the history");
@@ -6542,10 +6542,29 @@ fn alt_s_opens_the_threads_popup_from_the_main_screen() {
         assert!(frame.contains("Enter open  Esc back"), "{draft:?}: {frame}");
         assert!(frame.contains("Threads"), "{draft:?}: {frame}");
         harness.press(KeyCode::Esc);
-        harness.press(KeyCode::Char('q'));
         assert!(harness.app.overlay.is_none(), "{draft:?}");
         assert_eq!(harness.app.composer_text(), draft);
     }
+}
+
+/// The threads pop-up opened from the main screen sits over the
+/// transcript's rows, with the transcript around it and the composer
+/// with its draft under it.
+#[test]
+fn the_threads_popup_draws_over_the_main_screen() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.transcript.push(Cell::user("count the threads"));
+    harness.app.transcript.push(Cell::assistant(
+        "There is only the main thread so far.".to_string(),
+        true,
+    ));
+    harness.type_text("half a prompt");
+    harness.app.handle_key(alt(KeyCode::Char('s')));
+    let frame = harness.draw();
+    insta::assert_snapshot!("threads_popup_over_main_80x24", &frame);
+    assert!(frame.contains("count the threads"), "{frame}");
+    assert!(frame.contains("half a prompt"), "{frame}");
+    assert!(!frame.contains("Thread: root thread"), "{frame}");
 }
 
 /// A macro named `threads` shadows the command: the line goes to the REPL

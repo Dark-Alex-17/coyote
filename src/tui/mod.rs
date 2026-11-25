@@ -39,6 +39,7 @@ mod sink;
 mod terminal;
 mod theme;
 mod thread_tree;
+mod threads;
 mod throbber;
 mod todo;
 mod transcript;
@@ -75,7 +76,7 @@ pub(crate) use lend::{
     TtyHandles, ensure_terminal_lendable, lend_terminal, notice, request_copy, show_history,
 };
 use modal::{PendingPrompt, PromptModal};
-use pager::{Pager, PagerView};
+use pager::{Pager, PagerView, text_area};
 use queued::{QueuedLine, QueuedPreview, remove_sent};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -91,13 +92,14 @@ use roster::{RosterPopup, RosterRow, RosterSources, RosterState};
 pub use run_loop::{ensure_tty, run};
 use selection::{Pos, Region, Release, SelectionState};
 use sink::{AgentOutcome, LendJob, UiMsg};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use theme::{ChromeKind, DIM, Theme, chrome_style, composer_state};
+use threads::{Threads, ThreadsPopup};
 use throbber::{THROBBER_INTERVAL, Tick};
 use todo::TodoPanel;
 use tokio::task::JoinSet;
@@ -279,10 +281,13 @@ fn footer_right(usage: &str) -> Line<'static> {
 
 /// What is drawn over the transcript while open: Ctrl+T's full-screen
 /// pager, or the key help or the tasks pop-up over the transcript's rows.
+/// The threads pop-up is drawn over the overlay it was opened from, or
+/// over the transcript's rows when there is none.
 enum Overlay {
     Pager(Box<Pager>),
     Help(Help),
     Tasks(RosterState),
+    Threads(Threads),
 }
 
 impl Overlay {
@@ -291,17 +296,44 @@ impl Overlay {
             Overlay::Pager(pager) => OverlayKind::Pager(pager.mode()),
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Tasks(_) => OverlayKind::Tasks,
+            Overlay::Threads(_) => OverlayKind::Threads,
         }
     }
 
-    fn scroll(&mut self, delta: i32) {
+    fn scroll(&mut self, delta: i32, thread_folds: &HashSet<String>) {
         match self {
             Overlay::Pager(pager) => pager.scroll(delta),
             Overlay::Help(help) => help.scroll(delta),
             // A wheel notch steps one row, as a key does, not a scroll's lines.
             Overlay::Tasks(roster) => roster.move_highlight(delta.signum()),
+            Overlay::Threads(threads) => threads.move_highlight(delta.signum(), thread_folds),
         }
     }
+}
+
+/// The overlays on screen, the bottom one first: the overlay a threads
+/// pop-up was opened from is drawn under it.
+fn on_screen<'a>(
+    overlay: &'a mut Option<Overlay>,
+    below: &'a mut [Overlay],
+) -> impl Iterator<Item = &'a mut Overlay> {
+    let below = match overlay {
+        Some(Overlay::Threads(_)) => below.last_mut(),
+        _ => None,
+    };
+    below.into_iter().chain(overlay.as_mut())
+}
+
+/// The pager on screen: the overlay, or the one a threads pop-up is open
+/// over.
+fn shown_pager<'a>(
+    overlay: &'a mut Option<Overlay>,
+    below: &'a mut [Overlay],
+) -> Option<&'a mut Pager> {
+    on_screen(overlay, below).find_map(|overlay| match overlay {
+        Overlay::Pager(pager) => Some(&mut **pager),
+        _ => None,
+    })
 }
 
 struct TurnStatus {
@@ -493,6 +525,12 @@ pub(crate) struct App {
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
     overlay: Option<Overlay>,
+    /// The overlays the open ones were opened from, the newest last;
+    /// closing an overlay gives back the one under it.
+    overlay_stack: Vec<Overlay>,
+    /// The threads folded in the threads pop-up, by fold key; kept while
+    /// the pop-up is closed.
+    thread_folds: HashSet<String>,
     /// The generation of the newest child read asked for.
     child_reads: u64,
     roster_sources: RosterSources,
@@ -605,6 +643,8 @@ impl App {
             config,
             prompt_memory,
             overlay: None,
+            overlay_stack: Vec::new(),
+            thread_folds: HashSet::new(),
             roster_sources: RosterSources::default(),
             child_live: ChildLive::default(),
             control: None,
@@ -902,18 +942,36 @@ impl App {
         )
     }
 
+    /// The pager on screen, as `shown_pager` finds it.
     fn pager(&self) -> Option<&Pager> {
-        match &self.overlay {
-            Some(Overlay::Pager(pager)) => Some(pager),
+        match (&self.overlay, self.overlay_stack.last()) {
+            (Some(Overlay::Pager(pager)), _)
+            | (Some(Overlay::Threads(_)), Some(Overlay::Pager(pager))) => Some(pager),
             _ => None,
         }
     }
 
     fn pager_mut(&mut self) -> Option<&mut Pager> {
+        shown_pager(&mut self.overlay, &mut self.overlay_stack)
+    }
+
+    fn threads_mut(&mut self) -> Option<&mut Threads> {
         match &mut self.overlay {
-            Some(Overlay::Pager(pager)) => Some(pager),
+            Some(Overlay::Threads(threads)) => Some(threads),
             _ => None,
         }
+    }
+
+    /// Opens `overlay` over the one open, which closing it gives back.
+    fn push_overlay(&mut self, overlay: Overlay) {
+        if let Some(below) = self.overlay.replace(overlay) {
+            self.overlay_stack.push(below);
+        }
+    }
+
+    /// Closes the open overlay, giving back the one it was opened from.
+    fn pop_overlay(&mut self) {
+        self.overlay = self.overlay_stack.pop();
     }
 
     fn help_mut(&mut self) -> Option<&mut Help> {
@@ -1407,9 +1465,13 @@ impl App {
                             pager.paste(&text);
                         }
                     }
-                    // The help and the tasks pop-up have the keyboard, so a
-                    // paste reaches nothing under them, as a typed key would not.
-                    Layer::Overlay(OverlayKind::Help | OverlayKind::Tasks) => return None,
+                    // The help and the pop-ups have the keyboard, so a paste
+                    // reaches nothing under them, as a typed key would not.
+                    Layer::Overlay(
+                        OverlayKind::Help | OverlayKind::Tasks | OverlayKind::Threads,
+                    ) => {
+                        return None;
+                    }
                     // A confirm has no field, and the composer is hidden
                     // under the modal: a paste there would land where the
                     // user cannot see it.
@@ -1441,13 +1503,11 @@ impl App {
                     {
                         return self.select_with_mouse(Region::Pager, mouse);
                     }
-                    Layer::Overlay(OverlayKind::Pager(PagerMode::Picker))
+                    Layer::Overlay(OverlayKind::Threads)
                         if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
                     {
-                        if let (Some(Overlay::Pager(pager)), Some(area)) =
-                            (self.overlay.as_mut(), self.frame_area)
-                        {
-                            pager.click(&mut self.child_live, mouse.column, mouse.row, area);
+                        if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                            threads.click(mouse.column, mouse.row, &mut self.thread_folds);
                         }
                     }
                     Layer::Overlay(OverlayKind::Tasks)
@@ -1464,7 +1524,7 @@ impl App {
                             _ => return None,
                         };
                         if let Some(overlay) = self.overlay.as_mut() {
-                            overlay.scroll(delta);
+                            overlay.scroll(delta, &self.thread_folds);
                         }
                     }
                     Layer::Modal(_) | Layer::Band(_) | Layer::Composer => match mouse.kind {
@@ -1753,12 +1813,13 @@ impl App {
                 None
             }
             Action::ToggleRoster => {
-                self.overlay = match self.overlay {
-                    Some(Overlay::Tasks(_)) => None,
-                    _ => Some(Overlay::Tasks(RosterState::new(
+                if let Some(Overlay::Tasks(_)) = self.overlay {
+                    self.pop_overlay();
+                } else {
+                    self.push_overlay(Overlay::Tasks(RosterState::new(
                         self.roster_sources.rows(self.tick(), chrono::Utc::now()),
-                    ))),
-                };
+                    )));
+                }
                 None
             }
             Action::ToggleHelp => {
@@ -1832,10 +1893,6 @@ impl App {
                 self.close_pager();
                 None
             }
-            Action::OpenThreadPicker => {
-                self.open_thread_picker();
-                None
-            }
             Action::ThreadPickerChoose => {
                 self.choose_thread();
                 None
@@ -1850,11 +1907,34 @@ impl App {
             Action::PagerFindNext { forward } => self.with_pager(|pager| pager.find_next(forward)),
             Action::PagerFindSubmit => self.with_pager(Pager::submit_find),
             Action::PagerFindCancel => self.with_pager(Pager::cancel_find),
-            Action::ThreadPickerMove(delta) => self.with_pager(|pager| pager.move_picker(delta)),
-            Action::ThreadPickerUnfold => self.with_pager(Pager::unfold_picked),
-            Action::ThreadPickerFold => self.with_pager(Pager::fold_picked),
-            Action::ThreadPickerToggle => self.with_pager(Pager::toggle_picked),
-            Action::CloseThreadPicker => self.with_pager(Pager::close_picker),
+            Action::ThreadPickerMove(delta) => {
+                if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                    threads.move_highlight(delta, &self.thread_folds);
+                }
+                None
+            }
+            Action::ThreadPickerUnfold => {
+                if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                    threads.unfold(&mut self.thread_folds);
+                }
+                None
+            }
+            Action::ThreadPickerFold => {
+                if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                    threads.fold(&mut self.thread_folds);
+                }
+                None
+            }
+            Action::ThreadPickerToggle => {
+                if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                    threads.toggle(&mut self.thread_folds);
+                }
+                None
+            }
+            Action::CloseThreadPicker => {
+                self.pop_overlay();
+                None
+            }
             Action::PagerFocusPrev => {
                 if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
                     pager.step_focus(&self.child_live, false);
@@ -1934,7 +2014,7 @@ impl App {
     /// The live rows of child `agent_id` changed: its thread, if on show,
     /// is laid out again at the next frame.
     fn child_rows_changed(&mut self, agent_id: &str) {
-        let Some(Overlay::Pager(pager)) = self.overlay.as_mut() else {
+        let Some(pager) = shown_pager(&mut self.overlay, &mut self.overlay_stack) else {
             return;
         };
         if pager
@@ -1948,7 +2028,7 @@ impl App {
     /// Readies the running rows of the child thread on show, if any, for
     /// the throbber's next frame; whether it has one.
     fn touch_open_child_running(&mut self) -> bool {
-        let Some(Overlay::Pager(pager)) = self.overlay.as_mut() else {
+        let Some(pager) = shown_pager(&mut self.overlay, &mut self.overlay_stack) else {
             return false;
         };
         let running = pager
@@ -1961,13 +2041,17 @@ impl App {
         running
     }
 
-    /// Closes the pager and frees the lines it laid out; a pager opened
-    /// from the tasks pop-up gives the pop-up back.
+    /// Closes the pager, giving back what it was opened from, and frees
+    /// the lines it laid out.
     fn close_pager(&mut self) {
-        let Some(pager) = self.pager_mut() else {
+        if !matches!(self.overlay, Some(Overlay::Pager(_))) {
             return;
-        };
-        self.overlay = pager.take_tasks().map(Overlay::Tasks);
+        }
+        self.pop_overlay();
+        self.release_pager_lines();
+    }
+
+    fn release_pager_lines(&mut self) {
         cells::release_full_output_caches(self.transcript.cells_for_layout().0);
         self.child_live.release_full_output_caches();
         // Rows that ran under a child's thread hold the throbber frame
@@ -1975,30 +2059,55 @@ impl App {
         self.transcript.touch_running();
     }
 
-    /// Takes the overlay's place. Over the tasks pop-up, or in place of a
-    /// pager opened from it, the pager keeps the pop-up to give back. In
-    /// place of another pager it keeps the thread pop-up's folds too.
-    fn open_pager(&mut self, mut pager: Pager) {
-        let tasks = match self.overlay.take() {
-            Some(Overlay::Tasks(roster)) => Some(roster),
-            Some(Overlay::Pager(mut previous)) => {
+    /// Opens `pager` over the tasks pop-up, which closing it gives back.
+    /// The threads pop-up, another pager or the key help it replaces, so
+    /// closing it gives back what they were opened from. A pager never
+    /// stays under another one but the root: a child's thread the
+    /// threads pop-up was opened over gives way like a pager on screen
+    /// would, as only the pager on screen follows its child's flushes.
+    /// The root chosen over the transcript view, directly or from a
+    /// child's thread opened over it, goes back to that view.
+    fn open_pager(&mut self, pager: Pager) {
+        match self.overlay.take() {
+            Some(Overlay::Pager(previous)) => {
                 // A child's thread giving way to another thread, or to
                 // the root, frees what its rows laid out.
                 if !previous.shows_root() {
                     self.child_live.release_full_output_caches();
                 }
-                pager.set_folds(previous.take_folds());
-                previous.take_tasks()
             }
-            Some(Overlay::Help(_)) | None => None,
-        };
-        pager.set_tasks(tasks);
+            Some(tasks @ Overlay::Tasks(_)) => self.overlay_stack.push(tasks),
+            Some(Overlay::Threads(_)) => match self.overlay_stack.last() {
+                Some(Overlay::Pager(origin)) if origin.shows_root() && pager.shows_root() => {
+                    self.pop_overlay();
+                    return;
+                }
+                Some(Overlay::Pager(origin)) if !origin.shows_root() => {
+                    self.overlay_stack.pop();
+                    self.child_live.release_full_output_caches();
+                    if pager.shows_root()
+                        && matches!(self.overlay_stack.last(), Some(Overlay::Pager(p)) if p.shows_root())
+                    {
+                        self.pop_overlay();
+                        return;
+                    }
+                }
+                _ => {}
+            },
+            Some(Overlay::Help(_)) | None => {}
+        }
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
     }
 
+    /// Opens the threads pop-up over what is on screen, on the child's
+    /// thread the pager shows, if it shows one.
     fn open_threads(&mut self) {
-        self.open_pager(Pager::root());
-        self.open_thread_picker();
+        let on_show = self
+            .pager()
+            .and_then(Pager::child_session)
+            .map(str::to_string);
+        let threads = self.list_threads(on_show.as_deref());
+        self.push_overlay(Overlay::Threads(threads));
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
@@ -2257,12 +2366,10 @@ impl App {
                 // same process-stamp root the App may already hold.
                 let changed = self.child_root.as_deref() != Some(&*root);
                 self.child_root = Some(root);
-                if changed
-                    && self
-                        .pager()
-                        .is_some_and(|pager| pager.mode() == PagerMode::Picker)
-                {
-                    self.open_thread_picker();
+                if changed && let Some(threads) = self.threads_mut() {
+                    let highlight = threads.highlight().to_string();
+                    let listed = self.list_threads(Some(&highlight));
+                    self.overlay = Some(Overlay::Threads(listed));
                 }
             }
             UiMsg::ChildLoaded {
@@ -2365,10 +2472,13 @@ impl App {
         Some(Line::from(spans))
     }
 
-    /// Whether the key help or the tasks pop-up is open over the
-    /// transcript, taking Esc and the panel chords.
+    /// Whether the key help or a pop-up is open over the transcript,
+    /// taking Esc and the panel chords.
     fn covers_transcript(&self) -> bool {
-        matches!(self.overlay, Some(Overlay::Help(_) | Overlay::Tasks(_)))
+        matches!(
+            self.overlay,
+            Some(Overlay::Help(_) | Overlay::Tasks(_) | Overlay::Threads(_))
+        )
     }
 
     fn bottom_pane_rows(&self, area: Rect) -> u16 {
@@ -2410,9 +2520,9 @@ impl App {
         let area = frame.area();
         self.frame_area = Some(area);
         self.renderer.tick = self.tick();
-        // Matched on the field, not through `layer`, so the pager can be
-        // borrowed beside the transcript and the renderer.
-        if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
+        // Found through the fields, not through `layer`, so the pager can
+        // be borrowed beside the transcript and the renderer.
+        if let Some(pager) = shown_pager(&mut self.overlay, &mut self.overlay_stack) {
             let generation = self.transcript.generation();
             let (cells, revisions) = self.transcript.cells_for_layout();
             let text = pager.text(
@@ -2442,16 +2552,30 @@ impl App {
                     self.theme.selection,
                 );
             }
+            if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                let body = text_area(area);
+                threads.set_area(body);
+                frame.render_widget(
+                    ThreadsPopup {
+                        threads,
+                        folds: &self.thread_folds,
+                        theme: &self.theme,
+                    },
+                    body,
+                );
+            }
             return;
         }
         // The roster is read on every frame it is up: the tasks move on
         // whether or not the context is in hand.
         let wall = chrono::Local::now();
-        if let Some(Overlay::Tasks(roster)) = self.overlay.as_mut() {
-            roster.refresh(
-                self.roster_sources
-                    .rows(self.renderer.tick, wall.with_timezone(&chrono::Utc)),
-            );
+        for overlay in on_screen(&mut self.overlay, &mut self.overlay_stack) {
+            if let Overlay::Tasks(roster) = overlay {
+                roster.refresh(
+                    self.roster_sources
+                        .rows(self.renderer.tick, wall.with_timezone(&chrono::Utc)),
+                );
+            }
         }
         if let Some(prompt) = self.prompts.front_mut() {
             prompt.layout_question(area.width, &mut self.renderer);
@@ -2520,22 +2644,35 @@ impl App {
         if let Some(todo) = todo {
             frame.render_widget(self.todo.view(&self.theme), todo);
         }
-        match self.overlay.as_mut() {
-            Some(Overlay::Help(help)) => frame.render_widget(help.view(&self.theme), upper),
-            Some(Overlay::Tasks(roster)) => {
-                roster.set_area(upper);
-                frame.render_widget(
-                    RosterPopup {
-                        state: roster,
-                        theme: &self.theme,
-                        no_color: self.renderer.no_color,
-                        now: wall.with_timezone(&chrono::Utc),
-                        offset: *wall.offset(),
-                    },
-                    upper,
-                );
+        for overlay in on_screen(&mut self.overlay, &mut self.overlay_stack) {
+            match overlay {
+                Overlay::Help(help) => frame.render_widget(help.view(&self.theme), upper),
+                Overlay::Tasks(roster) => {
+                    roster.set_area(upper);
+                    frame.render_widget(
+                        RosterPopup {
+                            state: roster,
+                            theme: &self.theme,
+                            no_color: self.renderer.no_color,
+                            now: wall.with_timezone(&chrono::Utc),
+                            offset: *wall.offset(),
+                        },
+                        upper,
+                    );
+                }
+                Overlay::Threads(threads) => {
+                    threads.set_area(upper);
+                    frame.render_widget(
+                        ThreadsPopup {
+                            threads,
+                            folds: &self.thread_folds,
+                            theme: &self.theme,
+                        },
+                        upper,
+                    );
+                }
+                Overlay::Pager(_) => {}
             }
-            Some(Overlay::Pager(_)) | None => {}
         }
 
         // A line between the transcript and the status row, so the
@@ -2637,7 +2774,10 @@ impl App {
         let rows_run = transcript_shown && self.transcript.touch_running();
         let child_runs = self.touch_open_child_running();
         let tasks_run = self.roster_sources.running_counts() != (0, 0);
-        let roster = matches!(self.overlay, Some(Overlay::Tasks(_)));
+        let roster = matches!(
+            (&self.overlay, self.overlay_stack.last()),
+            (Some(Overlay::Tasks(_)), _) | (Some(Overlay::Threads(_)), Some(Overlay::Tasks(_)))
+        );
         if self.turn.is_some() || rows_run || child_runs || (roster && tasks_run) {
             self.frames.schedule_frame_in(THROBBER_INTERVAL);
         } else if (self.welcome_sweep_from.is_some() || self.welcome_sweep_pending)

@@ -666,8 +666,7 @@ fn the_picker_lists_a_finished_child_known_only_from_its_start() {
 
 /// With no turn running, `t` in the tasks pop-up and `.threads` both open
 /// the thread picker straight away, listing a finished child. Leaving the
-/// picker opened from the pop-up goes back through the transcript view to
-/// the pop-up.
+/// picker opened from the pop-up goes straight back to the pop-up.
 #[test]
 #[serial]
 fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() {
@@ -693,8 +692,6 @@ fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() 
         assert!(frame.contains("Enter open  Esc back"), "{frame}");
         assert!(frame.contains("planner  completed"), "{frame}");
         harness.press(KeyCode::Esc);
-        assert!(harness.app.pager().is_some_and(Pager::shows_root));
-        harness.press(KeyCode::Char('q'));
         assert!(
             harness.app.roster().is_some(),
             "the pop-up did not come back"
@@ -951,14 +948,199 @@ fn ancestry_follows_parents_and_stops_at_a_loop() {
 /// A harness with a child root and the nested children started, the
 /// threads pop-up open on the root thread.
 fn nested_picker(start: u64) -> Harness {
+    let mut harness = nested_harness(start);
+    press_ctrl(&mut harness, 't');
+    harness.press(KeyCode::Tab);
+    harness
+}
+
+/// A harness with a child root and the nested children started, on the
+/// main screen.
+fn nested_harness(start: u64) -> Harness {
     let mut ctx = chat_ctx();
     ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start }));
     let mut harness = Harness::for_ctx(&ctx);
     harness.app.sync_from_ctx(&mut ctx);
     started_nested(&mut harness);
-    press_ctrl(&mut harness, 't');
-    harness.press(KeyCode::Tab);
     harness
+}
+
+fn overlay_kind(harness: &Harness) -> Option<OverlayKind> {
+    harness.app.overlay.as_ref().map(Overlay::kind)
+}
+
+/// A screen the threads pop-up opens over: its name, how it is opened
+/// with the pop-up over it, and the overlay it leaves up once the pop-up
+/// goes.
+type ThreadsOrigin = (&'static str, fn(&mut Harness), Option<OverlayKind>);
+
+fn threads_origins() -> [ThreadsOrigin; 3] {
+    [
+        (
+            "the main screen",
+            |harness| {
+                harness.app.handle_key(alt(KeyCode::Char('s')));
+            },
+            None,
+        ),
+        (
+            "the transcript view",
+            |harness| {
+                press_ctrl(harness, 't');
+                harness.press(KeyCode::Tab);
+            },
+            Some(OverlayKind::Pager(PagerMode::Browse)),
+        ),
+        (
+            "the tasks pop-up",
+            |harness| {
+                harness.app.handle_key(alt(KeyCode::Char('t')));
+                harness.press(KeyCode::Char('t'));
+            },
+            Some(OverlayKind::Tasks),
+        ),
+    ]
+}
+
+/// Each of the threads pop-up's close keys takes it back to the screen it
+/// was opened over, with nothing of the pop-up left on screen.
+#[test]
+#[serial]
+fn every_close_key_takes_the_threads_popup_back_to_where_it_was_opened() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-threads-origin-close");
+        let close_keys = [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            ctrl(KeyCode::Char('c')),
+            ctrl(KeyCode::Char('d')),
+        ];
+        for (origin, open, kind) in threads_origins() {
+            for key in close_keys {
+                let mut harness = nested_harness(23);
+                open(&mut harness);
+                let frame = harness.draw();
+                assert_eq!(
+                    overlay_kind(&harness),
+                    Some(OverlayKind::Threads),
+                    "{origin}"
+                );
+                assert!(frame.contains("Enter open  Esc back"), "{origin}: {frame}");
+                harness.app.handle_key(key);
+                assert_eq!(overlay_kind(&harness), kind, "{origin}, {key:?}");
+                let frame = harness.draw();
+                assert!(
+                    !frame.contains("Enter open  Esc back"),
+                    "{origin}, {key:?}: {frame}"
+                );
+                assert_eq!(harness.app.composer_text(), "", "{origin}, {key:?}");
+            }
+        }
+    });
+}
+
+/// A thread opened from the threads pop-up takes the pop-up's place, and
+/// Esc on it goes back to the screen the pop-up was opened over.
+#[test]
+#[serial]
+fn a_thread_opened_from_the_threads_popup_goes_back_to_where_the_popup_was_opened() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-threads-origin-thread");
+        for (origin, open, kind) in threads_origins() {
+            let mut harness = nested_harness(24);
+            open(&mut harness);
+            harness.press(KeyCode::Down);
+            harness.press(KeyCode::Enter);
+            assert_eq!(
+                harness.app.pager().and_then(Pager::child_session),
+                Some("sess_5d6e"),
+                "{origin}"
+            );
+            let top = title(&mut harness);
+            assert!(top.contains("Thread: main > planner"), "{origin}: {top}");
+            harness.press(KeyCode::Esc);
+            assert_eq!(overlay_kind(&harness), kind, "{origin}");
+            let frame = harness.draw();
+            assert!(!frame.contains("(read-only)"), "{origin}: {frame}");
+        }
+    });
+}
+
+/// A thread opened from the threads pop-up over another child's thread
+/// takes that thread's place, so going thread to thread keeps one pager
+/// over the origin and Esc still goes back to it.
+#[test]
+#[serial]
+fn going_thread_to_thread_keeps_one_pager_over_the_popups_origin() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-threads-origin-chain");
+        for (origin, open, kind) in threads_origins() {
+            let mut harness = nested_harness(25);
+            open(&mut harness);
+            let origin_depth = harness.app.overlay_stack.len();
+            harness.press(KeyCode::Down);
+            harness.press(KeyCode::Enter);
+            for _ in 0..3 {
+                harness.press(KeyCode::Tab);
+                harness.press(KeyCode::Right);
+                harness.press(KeyCode::Char('l'));
+                harness.press(KeyCode::Enter);
+                let on_show = harness.app.pager().and_then(Pager::child_session);
+                assert!(
+                    on_show.is_some_and(|session_id| session_id != "sess_5d6e"),
+                    "{origin}: {on_show:?}"
+                );
+                assert_eq!(harness.app.overlay_stack.len(), origin_depth, "{origin}");
+            }
+            harness.press(KeyCode::Esc);
+            assert_eq!(overlay_kind(&harness), kind, "{origin}");
+        }
+    });
+}
+
+/// The root thread chosen from the threads pop-up over the transcript
+/// view is that view, not a second one over it.
+#[test]
+#[serial]
+fn the_root_thread_chosen_over_the_transcript_view_is_that_view() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-threads-origin-root");
+        let mut harness = nested_picker(26);
+        harness.press(KeyCode::Enter);
+        assert!(harness.app.pager().is_some_and(Pager::shows_root));
+        assert!(harness.app.overlay_stack.is_empty());
+        harness.press(KeyCode::Esc);
+        assert_eq!(overlay_kind(&harness), None);
+    });
+}
+
+/// The root thread chosen from a child's thread opened over the
+/// transcript view goes back to that view, so one Esc reaches the main
+/// screen.
+#[test]
+#[serial]
+fn the_root_thread_chosen_from_a_child_over_the_transcript_view_is_that_view() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-threads-origin-child-root");
+        let mut harness = nested_picker(27);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Enter);
+        assert!(harness.app.pager().is_some_and(|pager| !pager.shows_root()));
+        assert!(matches!(
+            harness.app.overlay_stack.as_slice(),
+            [Overlay::Pager(origin)] if origin.shows_root()
+        ));
+
+        harness.press(KeyCode::Tab);
+        harness.press(KeyCode::Up);
+        harness.press(KeyCode::Enter);
+        assert!(harness.app.pager().is_some_and(Pager::shows_root));
+        assert!(harness.app.overlay_stack.is_empty());
+        harness.press(KeyCode::Esc);
+        assert_eq!(overlay_kind(&harness), None);
+        assert!(harness.app.overlay_stack.is_empty());
+    });
 }
 
 fn title(harness: &mut Harness) -> String {

@@ -42,8 +42,6 @@ pub(crate) enum PagerMode {
     Browse,
     /// Typing goes into the find field.
     Find,
-    /// The thread picker is open over the text.
-    Picker,
 }
 
 /// What is drawn over the transcript and takes the keys, if anything.
@@ -56,6 +54,9 @@ pub(crate) enum OverlayKind {
     /// The running tasks and the questions waiting on the user, over the
     /// transcript like the help; letters act on the highlighted row.
     Tasks,
+    /// The session's threads as a tree, over the screen it was opened
+    /// from; its keys move the highlight and fold the tree.
+    Threads,
 }
 
 /// The layer that takes the keys: whichever of these is open first, in
@@ -289,8 +290,7 @@ pub(crate) enum Action {
     /// text for `n` and `N`.
     PagerFindSubmit,
     PagerFindCancel,
-    OpenThreadPicker,
-    /// Move the thread picker's highlight by this many rows.
+    /// Move the threads pop-up's highlight by this many rows.
     ThreadPickerMove(i32),
     /// Unfold the highlighted thread, or step to its first child when it
     /// is open already.
@@ -685,7 +685,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(
             ThreadPicker,
             "q / Esc / Tab / Ctrl+C / Ctrl+D",
-            "Back to the transcript view",
+            "Close the pop-up and go back",
         ),
         row(KeyHelp, "j / k / Up / Down", "Scroll a line"),
         row(KeyHelp, "PgUp / PgDn", "Scroll a page"),
@@ -718,6 +718,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         }
         Layer::Overlay(OverlayKind::Help) => return help_key(key, code),
         Layer::Overlay(OverlayKind::Tasks) => return tasks_key(key, code),
+        Layer::Overlay(OverlayKind::Threads) => return threads_key(key, code),
         Layer::Modal(modal) => Some(modal),
         Layer::Band(_) | Layer::Composer => None,
     };
@@ -961,10 +962,10 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
     }
 }
 
-/// The pager's keys: less's motions over the text, a find field and
-/// the thread picker, and over a child's thread the transcript's fold
-/// keys. `code` is the case-folded key; `G` and `N` are told from `g`
-/// and `n` by the key as typed or by Shift.
+/// The pager's keys: less's motions over the text, a find field, Tab
+/// for the threads pop-up, and over a child's thread the transcript's
+/// fold keys. `code` is the case-folded key; `G` and `N` are told from
+/// `g` and `n` by the key as typed or by Shift.
 fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -980,22 +981,6 @@ fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) 
                 KeyCode::Char(typed) => Action::PagerFindChar(typed),
                 _ => Action::Nothing,
             },
-            _ => Action::Nothing,
-        },
-        PagerMode::Picker => match code {
-            KeyCode::Esc | KeyCode::Tab => Action::CloseThreadPicker,
-            KeyCode::Char('c' | 'd') if ctrl => Action::CloseThreadPicker,
-            KeyCode::Char('q') if !ctrl => Action::CloseThreadPicker,
-            KeyCode::Up => Action::ThreadPickerMove(-1),
-            KeyCode::Down => Action::ThreadPickerMove(1),
-            KeyCode::Char('k') if !ctrl => Action::ThreadPickerMove(-1),
-            KeyCode::Char('j') if !ctrl => Action::ThreadPickerMove(1),
-            KeyCode::Right => Action::ThreadPickerUnfold,
-            KeyCode::Left => Action::ThreadPickerFold,
-            KeyCode::Char('l') if !ctrl => Action::ThreadPickerUnfold,
-            KeyCode::Char('h') if !ctrl => Action::ThreadPickerFold,
-            KeyCode::Char(' ') if !ctrl => Action::ThreadPickerToggle,
-            KeyCode::Enter => Action::ThreadPickerChoose,
             _ => Action::Nothing,
         },
         PagerMode::Browse => match code {
@@ -1017,9 +1002,31 @@ fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) 
             KeyCode::Char('g') => Action::PagerTop,
             KeyCode::Char('/') => Action::PagerFindOpen,
             KeyCode::Char('n') => Action::PagerFindNext { forward: !upper },
-            KeyCode::Tab => Action::OpenThreadPicker,
+            KeyCode::Tab => Action::OpenThreads,
             _ => Action::Nothing,
         },
+    }
+}
+
+/// The threads pop-up's keys: they move the highlight and fold the tree,
+/// and nothing under the pop-up is reached.
+fn threads_key(key: KeyEvent, code: KeyCode) -> Action {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Esc | KeyCode::Tab => Action::CloseThreadPicker,
+        KeyCode::Char('c' | 'd') if ctrl => Action::CloseThreadPicker,
+        KeyCode::Char('q') if !ctrl => Action::CloseThreadPicker,
+        KeyCode::Up => Action::ThreadPickerMove(-1),
+        KeyCode::Down => Action::ThreadPickerMove(1),
+        KeyCode::Char('k') if !ctrl => Action::ThreadPickerMove(-1),
+        KeyCode::Char('j') if !ctrl => Action::ThreadPickerMove(1),
+        KeyCode::Right => Action::ThreadPickerUnfold,
+        KeyCode::Left => Action::ThreadPickerFold,
+        KeyCode::Char('l') if !ctrl => Action::ThreadPickerUnfold,
+        KeyCode::Char('h') if !ctrl => Action::ThreadPickerFold,
+        KeyCode::Char(' ') if !ctrl => Action::ThreadPickerToggle,
+        KeyCode::Enter => Action::ThreadPickerChoose,
+        _ => Action::Nothing,
     }
 }
 
@@ -2271,8 +2278,8 @@ mod tests {
         }
     }
 
-    /// The pager takes every key but suspend and repaint, in each of its
-    /// three modes.
+    /// The pager takes every key but suspend and repaint, in both its
+    /// modes, and so does the threads pop-up.
     #[test]
     fn pager_keys() {
         let browse = KeyContext {
@@ -2285,7 +2292,7 @@ mod tests {
             ..IDLE
         };
         let picker = KeyContext {
-            overlay: Some(OverlayKind::Pager(PagerMode::Picker)),
+            overlay: Some(OverlayKind::Threads),
             ..IDLE
         };
         let child = KeyContext {
@@ -2340,7 +2347,7 @@ mod tests {
                 browse,
                 Action::PagerFindNext { forward: false },
             ),
-            (plain(KeyCode::Tab), browse, Action::OpenThreadPicker),
+            (plain(KeyCode::Tab), browse, Action::OpenThreads),
             (plain(KeyCode::Char('x')), browse, Action::Nothing),
             (plain(KeyCode::Char('q')), find, Action::PagerFindChar('q')),
             (plain(KeyCode::Char('G')), find, Action::PagerFindChar('G')),
@@ -2505,7 +2512,7 @@ mod tests {
         ..IDLE
     };
     const PICKER: KeyContext = KeyContext {
-        overlay: Some(OverlayKind::Pager(PagerMode::Picker)),
+        overlay: Some(OverlayKind::Threads),
         ..IDLE
     };
     const HELP: KeyContext = KeyContext {
@@ -3218,7 +3225,7 @@ mod tests {
             (
                 H::Pager,
                 "Tab",
-                vec![(plain(KeyCode::Tab), BROWSE, Action::OpenThreadPicker)],
+                vec![(plain(KeyCode::Tab), BROWSE, Action::OpenThreads)],
             ),
             (
                 H::Pager,
@@ -4089,7 +4096,7 @@ mod tests {
             ctx.overlay == Some(OverlayKind::Pager(PagerMode::Find))
         }),
         ("Thread picker", |ctx| {
-            ctx.overlay == Some(OverlayKind::Pager(PagerMode::Picker))
+            ctx.overlay == Some(OverlayKind::Threads)
         }),
         ("Transcript view", |ctx| {
             ctx.overlay == Some(OverlayKind::Pager(PagerMode::Browse))

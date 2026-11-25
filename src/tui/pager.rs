@@ -3,30 +3,26 @@
 //! its calls printed; a child agent's thread is its saved session, read
 //! again each time the child writes it, merged with the tool and node
 //! rows the child's hooks report as they happen, shown read-only. A find
-//! field and the threads pop-up sit on top of the text.
+//! field takes the key legend's row, and the threads pop-up can be opened
+//! over the text.
 
-use super::bottom_pane::step_highlight;
 use super::cells::{Cell, without_think_spans};
 use super::child_live::{ChildLive, ChildThread, call_summary};
-use super::help::MARGIN;
 use super::keys::PagerMode;
 use super::render::{self, Renderer};
-use super::roster::RosterState;
 use super::selection::{self, Pos};
 use super::theme::Theme;
-use super::thread_tree::{ThreadNode, ThreadTree, popup_area, toggle_fold, window_start};
 use super::{ChromeKind, DIM, chrome_style};
 use crate::client::{Message, MessageContent, MessageContentPart, MessageRole};
 use crate::config::{RequestContext, Session};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, FixedOffset, Utc};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,10 +33,6 @@ const HINT: &str = "j/k scroll  g/G top/end  / find  n/N next/prev  Tab threads 
 /// the way out and the way to the other threads come first.
 const SHORT_HINT: &str = "q close  Tab threads  / find  n/N  j/k  g/G";
 const NARROW: u16 = 70;
-const PICKER_TITLE: &str = "Threads";
-const PICKER_HINT: &str = "j/k move  h/l fold  Enter open  Esc back";
-/// The legend of a pop-up too narrow for `PICKER_HINT`.
-const PICKER_SHORT_HINT: &str = "Enter open  Esc back";
 const CHECKPOINT_NOTE: &str =
     "Read-only. Tool calls show live; replies show up at the child's next checkpoint.";
 const ROOT_THREAD: &str = "root thread";
@@ -287,49 +279,14 @@ enum ChildRowKey {
     },
 }
 
-/// The threads pop-up: the tree and the thread highlighted in it, by
-/// fold key, so a fresh listing keeps the highlight where it was.
-struct Picker {
-    tree: ThreadTree,
-    highlight: String,
-    /// Said above the rows: why there are no children, or why they
-    /// could not be listed.
-    note: Option<String>,
-    /// What the run times are counted to and the spawn times shown in.
-    now: DateTime<Utc>,
-    offset: FixedOffset,
-}
-
-impl Picker {
-    /// The highlighted thread, or the folded ancestor hiding it.
-    fn highlighted(&self, folds: &HashSet<String>) -> usize {
-        self.tree.shown_at(&self.highlight, folds).unwrap_or(0)
-    }
-
-    fn select(&mut self, at: usize) {
-        self.highlight = self.tree.key(at).to_string();
-    }
-
-    /// Rows the pop-up holds: the note, then a row per thread on show.
-    fn height(&self, folds: &HashSet<String>) -> usize {
-        usize::from(self.note.is_some()) + self.tree.visible(folds).len()
-    }
-}
-
 /// The area the pager's text is drawn in: all of `area` but the title
 /// and hint rows, when it has room for them.
-fn text_area(area: Rect) -> Rect {
+pub(super) fn text_area(area: Rect) -> Rect {
     if area.height >= 3 {
         Rect::new(area.x, area.y + 1, area.width, area.height - 2)
     } else {
         area
     }
-}
-
-/// The threads pop-up over a pager drawn in `area`, `rows` rows tall
-/// plus its border, centred over the text.
-fn picker_area(area: Rect, rows: usize) -> Rect {
-    popup_area(text_area(area), rows)
 }
 
 /// One child entry's lines, with what they were laid out from.
@@ -565,19 +522,12 @@ pub(super) struct Pager {
     matched: Option<usize>,
     /// The last find found nothing.
     missed: bool,
-    picker: Option<Picker>,
-    /// The threads folded in the threads pop-up, by fold key; kept while
-    /// the pop-up is closed and passed on to the next pager.
-    folds: HashSet<String>,
     /// Text rows in the last frame; what a page is.
     page: usize,
     /// The text as last laid out, with the width and the transcript
     /// generation it was laid out for; reused until either moves.
     laid_out: Option<(u16, u64, Arc<PagerText>)>,
     root_lines: RootLines,
-    /// The tasks pop-up the pager was opened from, which closing the
-    /// pager brings back with its focus where it was.
-    tasks: Option<RosterState>,
     /// Root cells laid out since the pager opened.
     #[cfg(test)]
     cell_layouts: usize,
@@ -598,12 +548,9 @@ impl Pager {
             query: String::new(),
             matched: None,
             missed: false,
-            picker: None,
-            folds: HashSet::new(),
             page: 1,
             laid_out: None,
             root_lines: RootLines::default(),
-            tasks: None,
             #[cfg(test)]
             cell_layouts: 0,
             #[cfg(test)]
@@ -666,9 +613,7 @@ impl Pager {
     }
 
     pub(super) fn mode(&self) -> PagerMode {
-        if self.picker.is_some() {
-            PagerMode::Picker
-        } else if self.field.is_some() {
+        if self.field.is_some() {
             PagerMode::Find
         } else {
             PagerMode::Browse
@@ -763,13 +708,8 @@ impl Pager {
 
     /// A left click at `column`, `row` of a pager drawn over `area`: on a
     /// foldable row of the child on show, focuses it and opens or closes
-    /// it. With the threads pop-up up, a click on a thread's fold arrow
-    /// folds or unfolds it, and one elsewhere on its row highlights it.
+    /// it.
     pub(super) fn click(&mut self, live: &mut ChildLive, column: u16, row: u16, area: Rect) {
-        if self.picker.is_some() {
-            self.click_picker(column, row, area);
-            return;
-        }
         let body = text_area(area);
         if !body.contains(Position::new(column, row)) {
             return;
@@ -801,43 +741,6 @@ impl Pager {
             view.focus = key;
             self.laid_out = None;
         }
-    }
-
-    fn click_picker(&mut self, column: u16, row: u16, area: Rect) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let inner = picker_area(area, picker.height(&self.folds)).inner(MARGIN);
-        let rows = Rect {
-            y: inner.y + u16::from(picker.note.is_some()),
-            height: inner
-                .height
-                .saturating_sub(u16::from(picker.note.is_some())),
-            ..inner
-        };
-        if !rows.contains(Position::new(column, row)) {
-            return;
-        }
-        let shown = picker.tree.visible(&self.folds);
-        let highlighted = picker.highlighted(&self.folds);
-        let at = shown.iter().position(|&at| at == highlighted).unwrap_or(0);
-        let index = window_start(at, usize::from(rows.height)) + usize::from(row - rows.y);
-        let Some(&clicked) = shown.get(index) else {
-            return;
-        };
-        picker.select(clicked);
-        let arrow = usize::from(column - rows.x).checked_sub(picker.tree.arrow_column(clicked));
-        if picker.tree.has_children(clicked) && arrow.is_some_and(|offset| offset < 2) {
-            toggle_fold(&mut self.folds, picker.tree.key(clicked));
-        }
-    }
-
-    pub(super) fn set_tasks(&mut self, tasks: Option<RosterState>) {
-        self.tasks = tasks;
-    }
-
-    pub(super) fn take_tasks(&mut self) -> Option<RosterState> {
-        self.tasks.take()
     }
 
     fn open_child_view(&mut self, session_id: &str) -> Option<&mut ChildView> {
@@ -1026,106 +929,6 @@ impl Pager {
         if let Thread::Child(_) = self.thread {
             self.laid_out = None;
         }
-    }
-
-    /// Opens the threads pop-up on `tree`, its run times counted to `now`
-    /// and its spawn times shown at `offset`. Listed again while it is
-    /// up, it keeps the highlighted thread when the tree still has it;
-    /// otherwise it starts on the thread on show.
-    pub(super) fn open_picker(
-        &mut self,
-        tree: ThreadTree,
-        note: Option<String>,
-        now: DateTime<Utc>,
-        offset: FixedOffset,
-    ) {
-        let kept = self
-            .picker
-            .take()
-            .map(|picker| picker.highlight)
-            .filter(|key| tree.find(key).is_some());
-        let open = match &self.thread {
-            Thread::Root => None,
-            Thread::Child(view) => tree.find(&view.session_id),
-        };
-        let wanted = kept.unwrap_or_else(|| tree.key(open.unwrap_or(0)).to_string());
-        let shown = tree.shown_at(&wanted, &self.folds).unwrap_or(0);
-        let highlight = tree.key(shown).to_string();
-        self.picker = Some(Picker {
-            tree,
-            highlight,
-            note,
-            now,
-            offset,
-        });
-    }
-
-    pub(super) fn move_picker(&mut self, delta: i32) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let shown = picker.tree.visible(&self.folds);
-        let highlighted = picker.highlighted(&self.folds);
-        let at = shown.iter().position(|&at| at == highlighted).unwrap_or(0);
-        picker.select(shown[step_highlight(at, delta, shown.len())]);
-    }
-
-    /// Unfolds the highlighted thread; one already open hands the
-    /// highlight to its first child.
-    pub(super) fn unfold_picked(&mut self) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let at = picker.highlighted(&self.folds);
-        let Some(child) = picker.tree.first_child(at) else {
-            return;
-        };
-        if !self.folds.remove(picker.tree.key(at)) {
-            picker.select(child);
-        }
-    }
-
-    /// Folds the highlighted thread; one folded already, or with no
-    /// children, hands the highlight to its parent.
-    pub(super) fn fold_picked(&mut self) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let at = picker.highlighted(&self.folds);
-        let key = picker.tree.key(at).to_string();
-        if picker.tree.has_children(at) && !self.folds.contains(&key) {
-            self.folds.insert(key);
-        } else if let Some(parent) = picker.tree.parent(at) {
-            picker.select(parent);
-        }
-    }
-
-    pub(super) fn toggle_picked(&mut self) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let at = picker.highlighted(&self.folds);
-        if picker.tree.has_children(at) {
-            toggle_fold(&mut self.folds, picker.tree.key(at));
-        }
-    }
-
-    pub(super) fn close_picker(&mut self) {
-        self.picker = None;
-    }
-
-    /// Closes the pop-up on its highlighted thread.
-    pub(super) fn take_picked(&mut self) -> Option<ThreadNode> {
-        let picker = self.picker.take()?;
-        Some(picker.tree.node(picker.highlighted(&self.folds)).clone())
-    }
-
-    pub(super) fn set_folds(&mut self, folds: HashSet<String>) {
-        self.folds = folds;
-    }
-
-    pub(super) fn take_folds(&mut self) -> HashSet<String> {
-        std::mem::take(&mut self.folds)
     }
 
     /// Rows of text a frame `height` rows tall leaves between the title
@@ -1604,85 +1407,6 @@ impl Widget for PagerView<'_> {
             let y = body.y + u16::try_from(line - start).unwrap_or(u16::MAX);
             buf.set_style(Rect::new(body.x, y, body.width, 1), REVERSED);
         }
-        if let Some(picker) = &pager.picker {
-            PickerPopup {
-                picker,
-                folds: &pager.folds,
-                theme: self.theme,
-            }
-            .render(area, buf);
-        }
-    }
-}
-
-/// The threads pop-up over a pager drawn in `area`, framed like the
-/// tasks pop-up: the title, the note, a row per thread on show with the
-/// highlighted one reversed and kept in view, and the keys on the
-/// bottom border.
-struct PickerPopup<'a> {
-    picker: &'a Picker,
-    folds: &'a HashSet<String>,
-    theme: &'a Theme,
-}
-
-impl Widget for PickerPopup<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let picker = self.picker;
-        let popup = picker_area(area, picker.height(self.folds));
-        if popup.height < 3 || popup.width < 3 {
-            return;
-        }
-        let hint = if PICKER_HINT.width() + 2 <= usize::from(popup.width) {
-            PICKER_HINT
-        } else {
-            PICKER_SHORT_HINT
-        };
-        let block = Block::bordered()
-            .title(Span::styled(PICKER_TITLE, self.theme.heading))
-            .title_bottom(Line::styled(hint, DIM));
-        let mut inner = block.inner(popup);
-        Clear.render(popup, buf);
-        buf.set_style(popup, self.theme.surface_raised);
-        block.render(popup, buf);
-        if let Some(note) = &picker.note {
-            let line = Rect { height: 1, ..inner };
-            Paragraph::new(Span::styled(render::plain_text(note), self.theme.faded))
-                .render(line, buf);
-            inner.y += 1;
-            inner.height = inner.height.saturating_sub(1);
-        }
-        let shown = picker.tree.visible(self.folds);
-        let highlighted = picker.highlighted(self.folds);
-        let at = shown.iter().position(|&at| at == highlighted).unwrap_or(0);
-        let start = window_start(at, usize::from(inner.height));
-        let width = usize::from(inner.width);
-        let lines: Vec<Line<'static>> = shown
-            .iter()
-            .skip(start)
-            .take(usize::from(inner.height))
-            .map(|&node| {
-                picker.tree.line(
-                    node,
-                    self.folds,
-                    width,
-                    picker.now,
-                    picker.offset,
-                    self.theme,
-                )
-            })
-            .collect();
-        Paragraph::new(lines).render(inner, buf);
-        let y = inner.y + u16::try_from(at - start).unwrap_or(u16::MAX);
-        if y < inner.bottom() {
-            buf.set_style(
-                Rect {
-                    y,
-                    height: 1,
-                    ..inner
-                },
-                REVERSED,
-            );
-        }
     }
 }
 
@@ -1697,10 +1421,13 @@ mod tests {
     };
     use crate::tui::child_live::ToolEnd;
     use crate::tui::sink::ChildNodeState;
+    use crate::tui::thread_tree::{ThreadNode, ThreadTree};
+    use crate::tui::threads::{Threads, ThreadsPopup};
     use crate::tui::transcript::Transcript;
-    use chrono::{TimeZone, Utc};
+    use chrono::{FixedOffset, TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1766,13 +1493,36 @@ mod tests {
         width: u16,
         height: u16,
     ) -> String {
-        draw_terminal(pager, cells, live, &mut renderer(), width, height)
+        draw_terminal(pager, None, cells, live, &mut renderer(), width, height)
             .backend()
             .to_string()
     }
 
+    /// The pager with the threads pop-up over it, as the App draws them.
+    fn draw_with_threads(
+        pager: &mut Pager,
+        threads: &mut Threads,
+        folds: &HashSet<String>,
+        cells: &mut [Cell],
+        width: u16,
+        height: u16,
+    ) -> String {
+        draw_terminal(
+            pager,
+            Some((threads, folds)),
+            cells,
+            &mut ChildLive::default(),
+            &mut renderer(),
+            width,
+            height,
+        )
+        .backend()
+        .to_string()
+    }
+
     fn draw_terminal(
         pager: &mut Pager,
+        threads: Option<(&mut Threads, &HashSet<String>)>,
         cells: &mut [Cell],
         live: &mut ChildLive,
         renderer: &mut Renderer,
@@ -1802,6 +1552,18 @@ mod tests {
                     },
                     area,
                 );
+                if let Some((threads, folds)) = threads {
+                    let body = text_area(area);
+                    threads.set_area(body);
+                    frame.render_widget(
+                        ThreadsPopup {
+                            threads,
+                            folds,
+                            theme: &theme,
+                        },
+                        body,
+                    );
+                }
             })
             .unwrap();
         terminal
@@ -1944,10 +1706,10 @@ mod tests {
     fn the_thread_picker_lists_the_root_and_every_child_with_its_status() {
         let mut cells = root_cells();
         let mut pager = Pager::root();
-        open_tree(&mut pager);
-        assert_eq!(pager.mode(), PagerMode::Picker);
-        pager.move_picker(2);
-        let frame = draw(&mut pager, &mut cells, 80, 24);
+        let folds = HashSet::new();
+        let mut threads = open_tree(&folds);
+        threads.move_highlight(2, &folds);
+        let frame = draw_with_threads(&mut pager, &mut threads, &folds, &mut cells, 80, 24);
         insta::assert_snapshot!("thread_tree_80x24", &frame);
         let order: Vec<usize> = [
             "reviewer ",
@@ -1975,13 +1737,12 @@ mod tests {
             "{frame}"
         );
         assert!(frame.contains("scout  cancelled"), "{frame}");
-        let frame = draw(&mut pager, &mut cells, 40, 20);
+        let frame = draw_with_threads(&mut pager, &mut threads, &folds, &mut cells, 40, 20);
         insta::assert_snapshot!("thread_tree_40x20", &frame);
         assert_eq!(
-            pager.take_picked().and_then(|thread| thread.session_id),
-            Some("coder-b2".to_string())
+            threads.picked(&folds).session_id.as_deref(),
+            Some("coder-b2")
         );
-        assert_eq!(pager.mode(), PagerMode::Browse);
     }
 
     fn tree_meta(
@@ -2063,9 +1824,16 @@ mod tests {
         ])
     }
 
-    fn open_tree(pager: &mut Pager) {
+    fn open_tree(folds: &HashSet<String>) -> Threads {
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        pager.open_picker(thread_tree(), None, now, FixedOffset::east_opt(0).unwrap());
+        Threads::new(
+            thread_tree(),
+            None,
+            now,
+            FixedOffset::east_opt(0).unwrap(),
+            None,
+            folds,
+        )
     }
 
     /// The arrow keys' moves: right unfolds or steps into the first
@@ -2073,41 +1841,41 @@ mod tests {
     /// unfolds, and the folds outlast the pop-up.
     #[test]
     fn the_thread_picker_folds_unfolds_and_steps_through_the_tree() {
-        let mut pager = Pager::root();
-        open_tree(&mut pager);
-        let picked = |pager: &Pager| pager.picker.as_ref().unwrap().highlight.clone();
-        pager.unfold_picked();
-        assert_eq!(picked(&pager), "reviewer-a1");
-        pager.unfold_picked();
-        pager.unfold_picked();
-        assert_eq!(picked(&pager), "fixer-d4");
-        pager.unfold_picked();
-        assert_eq!(picked(&pager), "fixer-d4", "a leaf has nothing to unfold");
-        pager.fold_picked();
-        assert_eq!(picked(&pager), "coder-b2");
-        pager.fold_picked();
-        assert!(pager.folds.contains("coder-b2"));
-        assert_eq!(picked(&pager), "coder-b2");
-        pager.move_picker(1);
+        let mut folds = HashSet::new();
+        let mut threads = open_tree(&folds);
+        let picked = |threads: &Threads| threads.highlight().to_string();
+        threads.unfold(&mut folds);
+        assert_eq!(picked(&threads), "reviewer-a1");
+        threads.unfold(&mut folds);
+        threads.unfold(&mut folds);
+        assert_eq!(picked(&threads), "fixer-d4");
+        threads.unfold(&mut folds);
+        assert_eq!(picked(&threads), "fixer-d4", "a leaf has nothing to unfold");
+        threads.fold(&mut folds);
+        assert_eq!(picked(&threads), "coder-b2");
+        threads.fold(&mut folds);
+        assert!(folds.contains("coder-b2"));
+        assert_eq!(picked(&threads), "coder-b2");
+        threads.move_highlight(1, &folds);
         assert_eq!(
-            picked(&pager),
+            picked(&threads),
             "planner-e5",
             "a folded thread hides its children"
         );
-        pager.move_picker(-1);
-        pager.fold_picked();
-        assert_eq!(picked(&pager), "reviewer-a1");
-        pager.toggle_picked();
-        assert!(pager.folds.contains("reviewer-a1"));
-        pager.close_picker();
-        open_tree(&mut pager);
+        threads.move_highlight(-1, &folds);
+        threads.fold(&mut folds);
+        assert_eq!(picked(&threads), "reviewer-a1");
+        threads.toggle(&mut folds);
+        assert!(folds.contains("reviewer-a1"));
+        let mut threads = open_tree(&folds);
+        let mut pager = Pager::root();
         let mut cells = root_cells();
-        let frame = draw(&mut pager, &mut cells, 80, 24);
+        let frame = draw_with_threads(&mut pager, &mut threads, &folds, &mut cells, 80, 24);
         assert!(frame.contains("\u{25B8} reviewer"), "{frame}");
         assert!(!frame.contains("coder"), "{frame}");
-        pager.move_picker(1);
-        pager.toggle_picked();
-        let frame = draw(&mut pager, &mut cells, 80, 24);
+        threads.move_highlight(1, &folds);
+        threads.toggle(&mut folds);
+        let frame = draw_with_threads(&mut pager, &mut threads, &folds, &mut cells, 80, 24);
         assert!(frame.contains("\u{25B8} coder"), "{frame}");
         assert!(!frame.contains("fixer"), "{frame}");
     }
@@ -2118,9 +1886,9 @@ mod tests {
     fn a_click_on_an_arrow_folds_and_on_a_row_highlights() {
         let mut cells = root_cells();
         let mut pager = Pager::root();
-        open_tree(&mut pager);
-        let area = Rect::new(0, 0, 80, 24);
-        let frame = draw(&mut pager, &mut cells, 80, 24);
+        let mut folds = HashSet::new();
+        let mut threads = open_tree(&folds);
+        let frame = draw_with_threads(&mut pager, &mut threads, &folds, &mut cells, 80, 24);
         let at = |frame: &str, needle: &str| {
             frame
                 .lines()
@@ -2135,14 +1903,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {needle}: {frame}"))
         };
         let (column, row) = at(&frame, "tester");
-        pager.click(&mut ChildLive::default(), column + 3, row, area);
-        assert_eq!(pager.picker.as_ref().unwrap().highlight, "tester-c3");
-        assert!(pager.folds.is_empty());
+        threads.click(column + 3, row, &mut folds);
+        assert_eq!(threads.highlight(), "tester-c3");
+        assert!(folds.is_empty());
         let (column, row) = at(&frame, "\u{25BE} coder");
-        pager.click(&mut ChildLive::default(), column + 1, row, area);
-        assert_eq!(pager.picker.as_ref().unwrap().highlight, "coder-b2");
-        assert!(pager.folds.contains("coder-b2"));
-        let frame = draw(&mut pager, &mut cells, 80, 24);
+        threads.click(column + 1, row, &mut folds);
+        assert_eq!(threads.highlight(), "coder-b2");
+        assert!(folds.contains("coder-b2"));
+        let frame = draw_with_threads(&mut pager, &mut threads, &folds, &mut cells, 80, 24);
         assert!(!frame.contains("tester"), "{frame}");
     }
 
@@ -2152,11 +1920,13 @@ mod tests {
     fn the_thread_states_are_coloured_by_the_theme_and_plain_under_no_color() {
         let mut cells = root_cells();
         let mut pager = Pager::root();
-        open_tree(&mut pager);
+        let folds = HashSet::new();
+        let mut threads = open_tree(&folds);
         let mut renderer = renderer();
         renderer.no_color = false;
         let terminal = draw_terminal(
             &mut pager,
+            Some((&mut threads, &folds)),
             &mut cells,
             &mut ChildLive::default(),
             &mut renderer,
@@ -2183,6 +1953,7 @@ mod tests {
         renderer.no_color = true;
         let terminal = draw_terminal(
             &mut pager,
+            Some((&mut threads, &folds)),
             &mut cells,
             &mut ChildLive::default(),
             &mut renderer,
@@ -2664,7 +2435,15 @@ mod tests {
         let mut pager = reviewer_pager();
         let mut renderer = renderer();
         renderer.no_color = true;
-        let terminal = draw_terminal(&mut pager, &mut cells, &mut live, &mut renderer, 80, 24);
+        let terminal = draw_terminal(
+            &mut pager,
+            None,
+            &mut cells,
+            &mut live,
+            &mut renderer,
+            80,
+            24,
+        );
         let frame = terminal.backend().to_string();
         insta::assert_snapshot!("pager_child_live_no_color_80x24", &frame);
         for cell in terminal.backend().buffer().content() {
@@ -2737,9 +2516,18 @@ mod tests {
             ThreadNode::child(&meta("reviewer-a1", "reviewer"), EffectiveStatus::Running),
             ThreadNode::child(&meta("planner-b2", "planner"), EffectiveStatus::Running),
         ]);
-        pager.open_picker(tree, None, Utc::now(), FixedOffset::east_opt(0).unwrap());
-        let picked = pager.take_picked().unwrap();
-        assert_eq!(picked.session_id.as_deref(), Some("planner-b2"));
+        let threads = Threads::new(
+            tree,
+            None,
+            Utc::now(),
+            FixedOffset::east_opt(0).unwrap(),
+            pager.child_session(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            threads.picked(&HashSet::new()).session_id.as_deref(),
+            Some("planner-b2")
+        );
     }
 
     /// A thread three levels down is titled with its path from the main
@@ -3100,8 +2888,15 @@ mod tests {
     fn the_pager_clamps_to_tiny_and_empty_areas() {
         let mut cells = root_cells();
         let mut pager = Pager::root();
-        open_tree(&mut pager);
-        pager.picker.as_mut().unwrap().note = Some("no children".to_string());
+        let folds = HashSet::new();
+        let threads = Threads::new(
+            thread_tree(),
+            Some("no children".to_string()),
+            Utc::now(),
+            FixedOffset::east_opt(0).unwrap(),
+            None,
+            &folds,
+        );
         let mut renderer = renderer();
         for area in [
             Rect::new(0, 0, 1, 1),
@@ -3119,12 +2914,19 @@ mod tests {
                 &mut renderer,
             );
             pager.settle(&text, Pager::text_rows(area.height));
+            let theme = Theme::fallback(renderer.no_color);
             PagerView {
                 pager: &pager,
                 text: &text,
-                theme: &Theme::fallback(renderer.no_color),
+                theme: &theme,
             }
             .render(area, &mut buf);
+            ThreadsPopup {
+                threads: &threads,
+                folds: &folds,
+                theme: &theme,
+            }
+            .render(text_area(area), &mut buf);
         }
     }
 

@@ -6,6 +6,7 @@ use super::roster::{RosterRow, RosterSources};
 use super::run_now::{CommandOutput, run_now};
 use super::sink::UiMsg;
 use super::thread_tree::{ThreadNode, ThreadTree};
+use super::threads::Threads;
 use super::{App, CONTROL_TASK_WAIT, Overlay, TurnStatus, cells, pager, render};
 use crate::config::RequestContext;
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
@@ -634,18 +635,19 @@ impl App {
     /// Asks for a read of the child on show. Nothing is read once the
     /// exit has begun; the pager keeps what it has.
     pub(super) fn read_open_child(&mut self, session_id: String, file: PathBuf) {
-        let Some(Overlay::Pager(pager)) = self.overlay.as_mut() else {
-            return;
-        };
         if self.control.is_none() {
             return;
         }
-        self.child_reads += 1;
-        pager.child_load_started(self.child_reads);
+        let generation = self.child_reads + 1;
+        let Some(pager) = self.pager_mut() else {
+            return;
+        };
+        pager.child_load_started(generation);
+        self.child_reads = generation;
         self.control_requests.push(ControlRequest::LoadChild {
             session_id,
             file,
-            generation: self.child_reads,
+            generation,
         });
     }
 
@@ -695,22 +697,36 @@ impl App {
         (ThreadTree::new(threads), note)
     }
 
-    pub(super) fn open_thread_picker(&mut self) {
+    /// The threads pop-up on a fresh listing, starting on the thread
+    /// keyed `wanted` when it is listed.
+    pub(super) fn list_threads(&self, wanted: Option<&str>) -> Threads {
         let (tree, note) = self.thread_tree();
         let note = note.or_else(|| (tree.len() == 1).then(|| "No child sessions yet".to_string()));
         let now = chrono::Local::now();
-        if let Some(pager) = self.pager_mut() {
-            pager.open_picker(tree, note, now.with_timezone(&chrono::Utc), *now.offset());
-        }
+        Threads::new(
+            tree,
+            note,
+            now.with_timezone(&chrono::Utc),
+            *now.offset(),
+            wanted,
+            &self.thread_folds,
+        )
     }
 
+    /// Opens the highlighted thread in the pop-up's place. A child that
+    /// cannot be read closes the pop-up instead, so the notice saying why
+    /// is not left under it.
     pub(super) fn choose_thread(&mut self) {
-        let Some(thread) = self.pager_mut().and_then(Pager::take_picked) else {
+        let Some(Overlay::Threads(threads)) = &self.overlay else {
             return;
         };
+        let thread = threads.picked(&self.thread_folds).clone();
         match thread.session_id {
             Some(session_id) => self.open_child(session_id, thread.agent),
             None => self.open_pager(Pager::root()),
+        }
+        if let Some(Overlay::Threads(_)) = self.overlay {
+            self.pop_overlay();
         }
     }
 
