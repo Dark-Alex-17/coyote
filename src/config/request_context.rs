@@ -32717,7 +32717,8 @@ print(json.dumps({
     // revision through get_revision), and a fail-open scan whose downstream
     // node still runs on the failure default (step-runner's debt_scan into
     // edge_case_sweep; coder's baseline_tests into implement with no
-    // baseline).
+    // baseline; coder's impact_facts into select_fault, which widens the
+    // selection to the full test command).
     #[test]
     fn routing_gate_script_crashes_fail_closed() {
         use crate::graph::{GraphParser, NodeType, SCRIPT_FALLBACK_ERROR_KEY};
@@ -32750,7 +32751,7 @@ print(json.dumps({
                 "coder",
                 "impact_facts",
                 "select_fault",
-                "selection falls back to the full test command",
+                "no facts: select_fault runs the full test command instead",
             ),
             (
                 "step-runner",

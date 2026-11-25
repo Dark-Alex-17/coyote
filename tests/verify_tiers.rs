@@ -128,6 +128,19 @@ fn alive(pid: i64) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Starts `command` as the leader of a new process group, so the whole group
+/// can be killed the way a node is reaped.
+#[cfg(unix)]
+fn own_process_group(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0)
+}
+
+#[cfg(not(unix))]
+fn own_process_group(command: &mut Command) -> &mut Command {
+    command
+}
+
 /// Runs git in `dir` without the host's system or global config, so a
 /// fixture commit has an author and never tries to sign.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -916,7 +929,8 @@ fn round_deadline_while_pending_leaves_red_unclassified() {
     );
 }
 
-/// The job keeps running after the node that started it has exited.
+/// The job keeps running after the node that started it has exited, and a
+/// kill of that node's whole process group does not reach it.
 #[test]
 fn round_base_job_outlives_the_node_that_started_it() {
     if tools_missing() {
@@ -924,10 +938,31 @@ fn round_base_job_outlives_the_node_that_started_it() {
     }
     let root = temp_dir("outlives-node");
     let dir = committed(&root.0);
-    let out = run_script(BASELINE, &dir, &project_state(&dir), &round("sleep 3"));
+    let state_file = dir.join("state-outlives.json");
+    fs::write(&state_file, project_state(&dir).to_string()).unwrap();
+    let mut node = scrubbed(&bash_program().expect("bash resolved by tools_missing"));
+    node.arg(asset(BASELINE))
+        .current_dir(&dir)
+        .env("GRAPH_STATE_FILE", &state_file)
+        .envs(round("sleep 3"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let node = own_process_group(&mut node).spawn().expect("spawn bash");
+    let node_group = i64::from(node.id());
+    let output = node.wait_with_output().expect("wait for bash");
+    assert!(
+        output.status.success(),
+        "{BASELINE} exited {:?}",
+        output.status.code()
+    );
+    kill_group(node_group);
+    let out = parse(BASELINE, &output);
     let key = str_field(&out, "baseline_key");
     let pid = job_status(&dir, key)["pid"].as_i64().unwrap();
-    assert!(alive(pid), "the job died with baseline_tests");
+    assert!(
+        alive(pid),
+        "the job died with the process group of baseline_tests"
+    );
     await_base(&dir, key);
     wait_for("the job to mark itself done", || {
         job_status(&dir, key)["state"] == "done"
@@ -1086,7 +1121,9 @@ fn round_record_from_a_linked_worktree_is_reused_by_the_main_one() {
         ],
     );
     assert_eq!(code, Some(0), "{awaited}");
-    let common = fs::canonicalize(store(&main)).unwrap();
+    let common = fs::canonicalize(main.join(".git"))
+        .unwrap()
+        .join("coyote-baselines");
     assert!(
         Path::new(str_field(&awaited, "record")).starts_with(&common),
         "{awaited}"
