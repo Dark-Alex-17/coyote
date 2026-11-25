@@ -2015,6 +2015,7 @@ nodes:
         is the normal case.
 
       Project directory: {{project_dir}}
+      Git root (diff and marker paths are relative to it): {{git_root}}
     prompt: |
       ## Whole-task diff
       {{comment_diff}}
