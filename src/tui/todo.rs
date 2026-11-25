@@ -3,20 +3,26 @@
 //! from `TodoUpdated` events while one runs. A list longer than the panel
 //! scrolls, by Alt+PgUp / Alt+PgDn and by the wheel over it, and its
 //! borders count the lines out of view above and below.
+//! Alt+X, or a click on the panel's title, opens the whole list in a
+//! pop-up laid out like the key help, every item wrapped rather than cut.
 
+use super::help::{HINT, MARGIN};
 use super::render;
 use super::theme::{DIM, Theme};
 use crate::config::todo::TodoItem;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 /// Narrowest frame that keeps a transcript beside the panel; under it
 /// the panel takes the whole transcript area.
 const SPLIT_MIN_WIDTH: u16 = 60;
 const PANEL_MIN_WIDTH: u16 = 20;
 const PANEL_MAX_WIDTH: u16 = 40;
+/// Columns of an item's `[ ] ` marker, which its wrapped lines are
+/// indented by.
+const MARKER_WIDTH: u16 = 4;
 
 #[derive(Default)]
 pub(super) struct TodoPanel {
@@ -81,6 +87,16 @@ impl TodoPanel {
         self.visible && self.last_area.contains(Position::new(column, row))
     }
 
+    /// Whether the last frame drew the panel's top border, its title,
+    /// over this cell.
+    pub(super) fn title_contains(&self, column: u16, row: u16) -> bool {
+        let title = Rect {
+            height: self.last_area.height.min(1),
+            ..self.last_area
+        };
+        self.visible && title.contains(Position::new(column, row))
+    }
+
     /// The furthest the top can go: the last page starts there.
     fn bottom(&self) -> usize {
         self.last_total.saturating_sub(self.page)
@@ -95,6 +111,135 @@ impl TodoPanel {
 
     pub(super) fn view<'a>(&'a mut self, theme: &'a Theme) -> TodoView<'a> {
         TodoView { panel: self, theme }
+    }
+}
+
+/// The goal and every item laid out at `width`, nothing cut: an item's
+/// text wraps under itself, clear of its marker.
+fn popup_lines(goal: &str, items: &[TodoItem], width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if !goal.is_empty() {
+        lines.extend(render::plain_lines(goal, width, theme.heading));
+    }
+    if items.is_empty() {
+        lines.extend(render::plain_lines("(no todos)", width, DIM));
+    }
+    let indent = " ".repeat(usize::from(MARKER_WIDTH));
+    for item in items {
+        let (mark, style) = if item.done {
+            ("[x] ", theme.todo_done)
+        } else {
+            ("[ ] ", theme.todo_open)
+        };
+        let text = render::plain_lines(&item.desc, width.saturating_sub(MARKER_WIDTH), style);
+        for (i, line) in text.into_iter().enumerate() {
+            let lead = if i == 0 {
+                Span::styled(mark, style)
+            } else {
+                Span::raw(indent.clone())
+            };
+            let mut spans = vec![lead];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+/// Where the todo pop-up is scrolled to. The list itself is read from the
+/// panel at each frame, so an update shows while the pop-up is open.
+#[derive(Debug, Default)]
+pub(super) struct TodoPopup {
+    top: usize,
+    /// Text rows of the last frame drawn, what a page step moves by.
+    page: usize,
+    /// The last frame's text length, which the scroll is clamped to.
+    last_total: usize,
+}
+
+impl TodoPopup {
+    pub(super) fn scroll(&mut self, delta: i32) {
+        let top = self
+            .top
+            .saturating_add_signed(isize::try_from(delta).unwrap_or(0));
+        self.top = top.min(self.bottom());
+    }
+
+    pub(super) fn page(&mut self, direction: i32) {
+        let rows = i32::try_from(self.page.saturating_sub(1).max(1)).unwrap_or(i32::MAX);
+        self.scroll(direction.saturating_mul(rows));
+    }
+
+    pub(super) fn jump_to_top(&mut self) {
+        self.top = 0;
+    }
+
+    pub(super) fn jump_to_bottom(&mut self) {
+        self.top = self.bottom();
+    }
+
+    /// The highest `top` that still fills the last frame; before any
+    /// frame there is no bound yet.
+    fn bottom(&self) -> usize {
+        if self.page == 0 {
+            return usize::MAX;
+        }
+        self.last_total.saturating_sub(self.page)
+    }
+
+    pub(super) fn view<'a>(
+        &'a mut self,
+        panel: &'a TodoPanel,
+        theme: &'a Theme,
+    ) -> TodoPopupView<'a> {
+        TodoPopupView {
+            popup: self,
+            panel,
+            theme,
+        }
+    }
+}
+
+pub(super) struct TodoPopupView<'a> {
+    popup: &'a mut TodoPopup,
+    panel: &'a TodoPanel,
+    theme: &'a Theme,
+}
+
+impl Widget for TodoPopupView<'_> {
+    /// `area` is the screen above the status line, as for the key help.
+    /// With no row left for the list only the frame is drawn, so no
+    /// position names lines that cannot be seen.
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let area = area.intersection(*buf.area()).inner(MARGIN);
+        if area.is_empty() {
+            return;
+        }
+        let block = Block::bordered()
+            .title(Span::styled("Todo", self.theme.heading))
+            .title_bottom(Line::styled(HINT, DIM));
+        let inner = block.inner(area);
+        let text = popup_lines(&self.panel.goal, &self.panel.items, inner.width, self.theme);
+        let total = text.len();
+        let rows = usize::from(inner.height);
+        let popup = self.popup;
+        popup.page = rows.max(1);
+        popup.last_total = total;
+        popup.top = popup.top.min(popup.bottom());
+        Clear.render(area, buf);
+        buf.set_style(area, self.theme.surface_raised);
+        if inner.is_empty() {
+            block.render(area, buf);
+            return;
+        }
+        let start = popup.top;
+        let end = (start + rows).min(total);
+        let position = format!("{}-{end}/{total}", (start + 1).min(end));
+        block
+            .title(Line::styled(position, DIM).right_aligned())
+            .render(area, buf);
+        let visible: Vec<Line<'static>> = text.into_iter().skip(start).take(rows).collect();
+        Paragraph::new(visible).render(inner, buf);
     }
 }
 
@@ -289,7 +434,96 @@ mod tests {
                 .any(|row| row.contains("above") || row.contains("below"))
         );
         assert!(panel.contains(3, 3));
+        assert!(panel.title_contains(3, 0));
+        assert!(!panel.title_contains(3, 1), "a row under the title");
         panel.toggle();
         assert!(!panel.contains(3, 3), "a hidden panel takes no wheel");
+        assert!(!panel.title_contains(3, 0), "a hidden panel has no title");
+    }
+
+    fn texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(Line::to_string).collect()
+    }
+
+    /// The pop-up's list keeps every word of an item, wrapped under its
+    /// text and clear of the marker, with the goal first.
+    #[test]
+    fn popup_lines_wrap_items_under_their_text() {
+        let theme = Theme::fallback(false);
+        let items = vec![
+            TodoItem {
+                id: 1,
+                desc: "write the parser".to_string(),
+                done: true,
+            },
+            TodoItem {
+                id: 2,
+                desc: "wire it into the loop and test it".to_string(),
+                done: false,
+            },
+        ];
+        let lines = popup_lines("ship it", &items, 16, &theme);
+        assert_eq!(
+            texts(&lines),
+            [
+                "ship it",
+                "[x] write the",
+                "    parser",
+                "[ ] wire it into",
+                "    the loop and",
+                "    test it",
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style, theme.heading);
+        assert_eq!(lines[1].spans[0].style, theme.todo_done);
+        assert_eq!(lines[3].spans[0].style, theme.todo_open);
+        assert_eq!(texts(&popup_lines("", &[], 16, &theme)), ["(no todos)"]);
+    }
+
+    /// The pop-up drawn into a 30x8 frame: a margin and a border leave
+    /// four rows for the list.
+    fn draw_popup(popup: &mut TodoPopup, panel: &TodoPanel) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        let theme = Theme::fallback(false);
+        terminal
+            .draw(|frame| frame.render_widget(popup.view(panel, &theme), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The pop-up scrolls within its list and says where it is; the top
+    /// and bottom jumps land on either end, and it reads a hidden panel.
+    #[test]
+    fn the_popup_scrolls_within_the_list() {
+        let mut panel = TodoPanel::default();
+        panel.set("goal".to_string(), items(9));
+        let mut popup = TodoPopup::default();
+        let rows = draw_popup(&mut popup, &panel);
+        assert!(
+            rows[1].contains("Todo") && rows[1].contains("1-4/10"),
+            "{rows:#?}"
+        );
+        assert!(rows[2].contains("goal"), "{rows:#?}");
+        popup.scroll(1);
+        let rows = draw_popup(&mut popup, &panel);
+        assert!(rows[2].contains("[ ] step 1"), "{rows:#?}");
+        popup.page(1);
+        assert!(draw_popup(&mut popup, &panel)[1].contains("5-8/10"));
+        popup.jump_to_bottom();
+        let rows = draw_popup(&mut popup, &panel);
+        assert!(rows[1].contains("7-10/10"), "{rows:#?}");
+        assert!(rows[5].contains("step 9"), "{rows:#?}");
+        popup.scroll(5);
+        assert_eq!(popup.top, 6);
+        popup.jump_to_top();
+        assert!(draw_popup(&mut popup, &panel)[2].contains("goal"));
+        assert!(!panel.visible());
     }
 }

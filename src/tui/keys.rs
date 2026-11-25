@@ -57,6 +57,8 @@ pub(crate) enum OverlayKind {
     /// The session's threads as a tree, over the screen it was opened
     /// from; its keys move the highlight and fold the tree.
     Threads,
+    /// The whole todo list, over the transcript like the help.
+    Todo,
 }
 
 /// The layer that takes the keys: whichever of these is open first, in
@@ -245,6 +247,14 @@ pub(crate) enum Action {
     /// Move the todo panel's list by this many pages, down when positive;
     /// with the panel hidden, the transcript instead.
     TodoPage(i32),
+    /// Open the todo pop-up, or close it when it is open.
+    ToggleTodoPopup,
+    /// Move the todo pop-up by this many lines, down when positive.
+    TodoPopupScroll(i32),
+    /// Move the todo pop-up by this many pages, down when positive.
+    TodoPopupPage(i32),
+    TodoPopupTop,
+    TodoPopupBottom,
     /// Open the tasks pop-up, or close it when it is open.
     ToggleRoster,
     /// Open the key help, or close it when it is open.
@@ -336,6 +346,7 @@ pub(crate) enum HelpContext {
     Pager,
     PagerFind,
     ThreadPicker,
+    TodoPopup,
     KeyHelp,
 }
 
@@ -354,6 +365,7 @@ impl HelpContext {
             HelpContext::Pager => "Transcript view",
             HelpContext::PagerFind => "Transcript view find",
             HelpContext::ThreadPicker => "Thread picker",
+            HelpContext::TodoPopup => "Todo pop-up",
             HelpContext::KeyHelp => "This help",
         }
     }
@@ -454,6 +466,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(Composer, "Ctrl+T", "Open the transcript view"),
         row(Composer, "Alt+T", "Show or hide the tasks pop-up"),
         row(Composer, "Alt+S", "Open the threads pop-up"),
+        row(
+            Composer,
+            "Alt+X",
+            "Open the todo list in a pop-up; a click on the todo panel's title does the same",
+        ),
         row(Composer, "?", "Show this help, on an empty composer"),
         row(
             Composer,
@@ -687,6 +704,15 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "q / Esc / Tab / Ctrl+C / Ctrl+D",
             "Close the pop-up and go back",
         ),
+        row(TodoPopup, "j / k / Up / Down", "Scroll a line"),
+        row(TodoPopup, "PgUp / PgDn", "Scroll a page"),
+        row(TodoPopup, "Home / End", "Top or bottom"),
+        row(TodoPopup, "Mouse wheel", "Scroll"),
+        row(
+            TodoPopup,
+            "q / Esc / Ctrl+C / Ctrl+D / Alt+X",
+            "Close the pop-up and go back",
+        ),
         row(KeyHelp, "j / k / Up / Down", "Scroll a line"),
         row(KeyHelp, "PgUp / PgDn", "Scroll a page"),
         row(KeyHelp, "Mouse wheel", "Scroll"),
@@ -719,6 +745,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         Layer::Overlay(OverlayKind::Help) => return help_key(key, code),
         Layer::Overlay(OverlayKind::Tasks) => return tasks_key(key, code),
         Layer::Overlay(OverlayKind::Threads) => return threads_key(key, code),
+        Layer::Overlay(OverlayKind::Todo) => return todo_key(key, code),
         Layer::Modal(modal) => Some(modal),
         Layer::Band(_) | Layer::Composer => None,
     };
@@ -800,6 +827,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         None => match code {
             KeyCode::Char('t') if alt && !ctrl => Action::ToggleRoster,
             KeyCode::Char('s') if alt && !ctrl => Action::OpenThreads,
+            KeyCode::Char('x') if alt && !ctrl => Action::ToggleTodoPopup,
             KeyCode::Char('t') if ctrl => Action::OpenPager,
             // A band is the innermost thing open, so the quit chords
             // close it first, as Esc does.
@@ -958,6 +986,27 @@ fn tasks_key(key: KeyEvent, code: KeyCode) -> Action {
         KeyCode::Char('x') => Action::RosterCancel,
         KeyCode::Char('o') => Action::RosterOpen,
         KeyCode::Char('t') => Action::OpenThreads,
+        _ => Action::Nothing,
+    }
+}
+
+/// The todo pop-up's keys: it scrolls and closes, nothing under it is
+/// reached.
+fn todo_key(key: KeyEvent, code: KeyCode) -> Action {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match code {
+        KeyCode::Esc => Action::ToggleTodoPopup,
+        KeyCode::Char('c' | 'd') if ctrl => Action::ToggleTodoPopup,
+        KeyCode::Char('x') if alt && !ctrl => Action::ToggleTodoPopup,
+        _ if ctrl || alt => Action::Nothing,
+        KeyCode::Char('q') => Action::ToggleTodoPopup,
+        KeyCode::Down | KeyCode::Char('j') => Action::TodoPopupScroll(1),
+        KeyCode::Up | KeyCode::Char('k') => Action::TodoPopupScroll(-1),
+        KeyCode::PageDown => Action::TodoPopupPage(1),
+        KeyCode::PageUp => Action::TodoPopupPage(-1),
+        KeyCode::Home => Action::TodoPopupTop,
+        KeyCode::End => Action::TodoPopupBottom,
         _ => Action::Nothing,
     }
 }
@@ -2515,6 +2564,10 @@ mod tests {
         overlay: Some(OverlayKind::Threads),
         ..IDLE
     };
+    const TODO: KeyContext = KeyContext {
+        overlay: Some(OverlayKind::Todo),
+        ..IDLE
+    };
     const HELP: KeyContext = KeyContext {
         overlay: Some(OverlayKind::Help),
         ..IDLE
@@ -2529,7 +2582,7 @@ mod tests {
     fn swept_contexts() -> Vec<(KeyContext, Vec<HelpContext>)> {
         use HelpContext as H;
         let composer = [H::Anywhere, H::Transcript, H::Composer, H::ComposerEditing];
-        let groups: [(&[KeyContext], Vec<HelpContext>); 10] = [
+        let groups: [(&[KeyContext], Vec<HelpContext>); 11] = [
             (
                 &[
                     IDLE,
@@ -2566,6 +2619,7 @@ mod tests {
             (&[BROWSE, CHILD_BROWSE], vec![H::Anywhere, H::Pager]),
             (&[FIND], vec![H::Anywhere, H::PagerFind]),
             (&[PICKER], vec![H::Anywhere, H::ThreadPicker]),
+            (&[TODO], vec![H::Anywhere, H::TodoPopup]),
         ];
         let mut swept: Vec<(KeyContext, Vec<HelpContext>)> = groups
             .into_iter()
@@ -2733,6 +2787,14 @@ mod tests {
                     IDLE,
                     Action::OpenThreads,
                 )],
+            ),
+            (
+                H::Composer,
+                "Alt+X",
+                vec![
+                    (alt(KeyCode::Char('x')), IDLE, Action::ToggleTodoPopup),
+                    (alt(KeyCode::Char('x')), TYPING, Action::ToggleTodoPopup),
+                ],
             ),
             (
                 H::Composer,
@@ -3332,6 +3394,44 @@ mod tests {
                     (plain(KeyCode::Tab), PICKER, Action::CloseThreadPicker),
                     (ctrl('c'), PICKER, Action::CloseThreadPicker),
                     (ctrl('d'), PICKER, Action::CloseThreadPicker),
+                ],
+            ),
+            (
+                H::TodoPopup,
+                "j / k / Up / Down",
+                vec![
+                    (letter('j'), TODO, Action::TodoPopupScroll(1)),
+                    (letter('k'), TODO, Action::TodoPopupScroll(-1)),
+                    (plain(KeyCode::Up), TODO, Action::TodoPopupScroll(-1)),
+                    (plain(KeyCode::Down), TODO, Action::TodoPopupScroll(1)),
+                ],
+            ),
+            (
+                H::TodoPopup,
+                "PgUp / PgDn",
+                vec![
+                    (plain(KeyCode::PageUp), TODO, Action::TodoPopupPage(-1)),
+                    (plain(KeyCode::PageDown), TODO, Action::TodoPopupPage(1)),
+                ],
+            ),
+            (
+                H::TodoPopup,
+                "Home / End",
+                vec![
+                    (plain(KeyCode::Home), TODO, Action::TodoPopupTop),
+                    (plain(KeyCode::End), TODO, Action::TodoPopupBottom),
+                ],
+            ),
+            (H::TodoPopup, "Mouse wheel", vec![]),
+            (
+                H::TodoPopup,
+                "q / Esc / Ctrl+C / Ctrl+D / Alt+X",
+                vec![
+                    (letter('q'), TODO, Action::ToggleTodoPopup),
+                    (plain(KeyCode::Esc), TODO, Action::ToggleTodoPopup),
+                    (ctrl('c'), TODO, Action::ToggleTodoPopup),
+                    (ctrl('d'), TODO, Action::ToggleTodoPopup),
+                    (alt(KeyCode::Char('x')), TODO, Action::ToggleTodoPopup),
                 ],
             ),
             (
@@ -3963,6 +4063,61 @@ mod tests {
         assert_eq!(map_key(alt_c, &FIND), Action::PagerFindChar('c'));
     }
 
+    /// Alt+X opens the todo pop-up from the composer and its bands, as
+    /// Alt+T opens the tasks; a text field types it, and a question or
+    /// another overlay keeps it.
+    #[test]
+    fn alt_x_opens_the_todo_popup_from_the_composer() {
+        let alt_x = press(KeyCode::Char('x'), KeyModifiers::ALT);
+        for ctx in [IDLE, TYPING, RUNNING, VI_NORMAL, PALETTE, SEARCH, REWIND] {
+            assert_eq!(map_key(alt_x, &ctx), Action::ToggleTodoPopup, "{ctx:?}");
+        }
+        for ctx in [CONFIRM, SELECT, CHECKBOX, ROSTER, PICKER, HELP, BROWSE] {
+            assert_eq!(map_key(alt_x, &ctx), Action::Nothing, "{ctx:?}");
+        }
+        assert_eq!(map_key(alt_x, &INPUT), Action::ModalInput(alt_x));
+    }
+
+    /// The todo pop-up scrolls and closes; no other key reaches the
+    /// composer, the transcript or a panel under it.
+    #[test]
+    fn the_todo_popup_scrolls_closes_and_takes_every_other_key() {
+        let cases = [
+            (plain(KeyCode::Char('j')), Action::TodoPopupScroll(1)),
+            (plain(KeyCode::Char('k')), Action::TodoPopupScroll(-1)),
+            (plain(KeyCode::Down), Action::TodoPopupScroll(1)),
+            (plain(KeyCode::Up), Action::TodoPopupScroll(-1)),
+            (plain(KeyCode::PageDown), Action::TodoPopupPage(1)),
+            (plain(KeyCode::PageUp), Action::TodoPopupPage(-1)),
+            (plain(KeyCode::Home), Action::TodoPopupTop),
+            (plain(KeyCode::End), Action::TodoPopupBottom),
+            (plain(KeyCode::Esc), Action::ToggleTodoPopup),
+            (plain(KeyCode::Char('q')), Action::ToggleTodoPopup),
+            (ctrl('c'), Action::ToggleTodoPopup),
+            (ctrl('d'), Action::ToggleTodoPopup),
+            (
+                press(KeyCode::Char('x'), KeyModifiers::ALT),
+                Action::ToggleTodoPopup,
+            ),
+            (ctrl('z'), Action::Suspend),
+            (plain(KeyCode::Char('x')), Action::Nothing),
+            (plain(KeyCode::Enter), Action::Nothing),
+            (plain(KeyCode::Tab), Action::Nothing),
+            (plain(KeyCode::Char('?')), Action::Nothing),
+            (ctrl('x'), Action::Nothing),
+            (ctrl('t'), Action::Nothing),
+            (ctrl('j'), Action::Nothing),
+            (
+                press(KeyCode::Char('t'), KeyModifiers::ALT),
+                Action::Nothing,
+            ),
+            (press(KeyCode::PageDown, KeyModifiers::ALT), Action::Nothing),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(map_key(key, &TODO), expected, "{key:?}");
+        }
+    }
+
     const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
     const WIKI_PAGE: &str = "TUI.md";
 
@@ -4056,7 +4211,7 @@ mod tests {
 
     /// The contexts of the wiki's keys table, each with the test of
     /// whether a swept context is one its keys apply in.
-    const WIKI_CONTEXTS: [(&str, AppliesIn); 14] = [
+    const WIKI_CONTEXTS: [(&str, AppliesIn); 15] = [
         ("Anywhere", |_| true),
         ("Transcript", |ctx| ctx.overlay.is_none()),
         ("Confirm", |ctx| {
@@ -4098,6 +4253,7 @@ mod tests {
         ("Thread picker", |ctx| {
             ctx.overlay == Some(OverlayKind::Threads)
         }),
+        ("Todo pop-up", |ctx| ctx.overlay == Some(OverlayKind::Todo)),
         ("Transcript view", |ctx| {
             ctx.overlay == Some(OverlayKind::Pager(PagerMode::Browse))
         }),

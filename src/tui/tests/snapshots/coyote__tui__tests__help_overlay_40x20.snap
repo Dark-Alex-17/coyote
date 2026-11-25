@@ -3,7 +3,7 @@ source: src/tui/tests/mod.rs
 expression: frame
 ---
 "                                        "
-" ┌Keys─────────────────────────1-7/271┐ "
+" ┌Keys─────────────────────────1-7/287┐ "
 " │                                    │ "
 " │Anywhere                            │ "
 " │  Ctrl+Z                            │ "

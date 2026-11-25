@@ -101,7 +101,7 @@ use std::time::{Duration, Instant};
 use theme::{ChromeKind, DIM, Theme, chrome_style, composer_state};
 use threads::{Threads, ThreadsPopup};
 use throbber::{THROBBER_INTERVAL, Tick};
-use todo::TodoPanel;
+use todo::{TodoPanel, TodoPopup};
 use tokio::task::JoinSet;
 use transcript::{Transcript, WHEEL_LINES};
 
@@ -280,7 +280,8 @@ fn footer_right(usage: &str) -> Line<'static> {
 }
 
 /// What is drawn over the transcript while open: Ctrl+T's full-screen
-/// pager, or the key help or the tasks pop-up over the transcript's rows.
+/// pager, or the key help, the tasks pop-up or the todo pop-up over the
+/// transcript's rows.
 /// The threads pop-up is drawn over the overlay it was opened from, or
 /// over the transcript's rows when there is none.
 enum Overlay {
@@ -288,6 +289,7 @@ enum Overlay {
     Help(Help),
     Tasks(RosterState),
     Threads(Threads),
+    Todo(TodoPopup),
 }
 
 impl Overlay {
@@ -297,6 +299,7 @@ impl Overlay {
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Tasks(_) => OverlayKind::Tasks,
             Overlay::Threads(_) => OverlayKind::Threads,
+            Overlay::Todo(_) => OverlayKind::Todo,
         }
     }
 
@@ -307,6 +310,7 @@ impl Overlay {
             // A wheel notch steps one row, as a key does, not a scroll's lines.
             Overlay::Tasks(roster) => roster.move_highlight(delta.signum()),
             Overlay::Threads(threads) => threads.move_highlight(delta.signum(), thread_folds),
+            Overlay::Todo(popup) => popup.scroll(delta),
         }
     }
 }
@@ -1468,7 +1472,10 @@ impl App {
                     // The help and the pop-ups have the keyboard, so a paste
                     // reaches nothing under them, as a typed key would not.
                     Layer::Overlay(
-                        OverlayKind::Help | OverlayKind::Tasks | OverlayKind::Threads,
+                        OverlayKind::Help
+                        | OverlayKind::Tasks
+                        | OverlayKind::Threads
+                        | OverlayKind::Todo,
                     ) => {
                         return None;
                     }
@@ -1526,6 +1533,12 @@ impl App {
                         if let Some(overlay) = self.overlay.as_mut() {
                             overlay.scroll(delta, &self.thread_folds);
                         }
+                    }
+                    Layer::Band(_) | Layer::Composer
+                        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                            && self.todo.title_contains(mouse.column, mouse.row) =>
+                    {
+                        self.push_overlay(Overlay::Todo(TodoPopup::default()));
                     }
                     Layer::Modal(_) | Layer::Band(_) | Layer::Composer => match mouse.kind {
                         MouseEventKind::ScrollUp if self.todo.contains(mouse.column, mouse.row) => {
@@ -1812,6 +1825,38 @@ impl App {
                 }
                 None
             }
+            Action::ToggleTodoPopup => {
+                if let Some(Overlay::Todo(_)) = self.overlay {
+                    self.pop_overlay();
+                } else {
+                    self.push_overlay(Overlay::Todo(TodoPopup::default()));
+                }
+                None
+            }
+            Action::TodoPopupScroll(delta) => {
+                if let Some(Overlay::Todo(popup)) = self.overlay.as_mut() {
+                    popup.scroll(delta);
+                }
+                None
+            }
+            Action::TodoPopupPage(direction) => {
+                if let Some(Overlay::Todo(popup)) = self.overlay.as_mut() {
+                    popup.page(direction);
+                }
+                None
+            }
+            Action::TodoPopupTop => {
+                if let Some(Overlay::Todo(popup)) = self.overlay.as_mut() {
+                    popup.jump_to_top();
+                }
+                None
+            }
+            Action::TodoPopupBottom => {
+                if let Some(Overlay::Todo(popup)) = self.overlay.as_mut() {
+                    popup.jump_to_bottom();
+                }
+                None
+            }
             Action::ToggleRoster => {
                 if let Some(Overlay::Tasks(_)) = self.overlay {
                     self.pop_overlay();
@@ -2094,7 +2139,7 @@ impl App {
                 }
                 _ => {}
             },
-            Some(Overlay::Help(_)) | None => {}
+            Some(Overlay::Help(_) | Overlay::Todo(_)) | None => {}
         }
         self.overlay = Some(Overlay::Pager(Box::new(pager)));
     }
@@ -2477,7 +2522,7 @@ impl App {
     fn covers_transcript(&self) -> bool {
         matches!(
             self.overlay,
-            Some(Overlay::Help(_) | Overlay::Tasks(_) | Overlay::Threads(_))
+            Some(Overlay::Help(_) | Overlay::Tasks(_) | Overlay::Threads(_) | Overlay::Todo(_))
         )
     }
 
@@ -2647,6 +2692,9 @@ impl App {
         for overlay in on_screen(&mut self.overlay, &mut self.overlay_stack) {
             match overlay {
                 Overlay::Help(help) => frame.render_widget(help.view(&self.theme), upper),
+                Overlay::Todo(popup) => {
+                    frame.render_widget(popup.view(&self.todo, &self.theme), upper);
+                }
                 Overlay::Tasks(roster) => {
                     roster.set_area(upper);
                     frame.render_widget(

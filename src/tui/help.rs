@@ -17,7 +17,7 @@ use unicode_width::UnicodeWidthStr;
 const TITLE: &str = "Keys";
 /// Fits the bottom border of the pop-up on the 40 columns of the
 /// narrowest frame the help is drawn at.
-const HINT: &str = "j/k scroll  PgUp/Dn page  Esc close";
+pub(super) const HINT: &str = "j/k scroll  PgUp/Dn page  Esc close";
 /// The transcript left showing around the pop-up.
 pub(super) const MARGIN: Margin = Margin::new(1, 1);
 /// Columns before a row's keys.

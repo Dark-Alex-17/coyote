@@ -5025,6 +5025,220 @@ fn a_long_todo_list_scrolls_by_alt_page_keys_and_the_wheel_over_it() {
     );
 }
 
+fn numbered_todos(count: usize) -> Vec<crate::config::todo::TodoItem> {
+    (1..=count)
+        .map(|id| crate::config::todo::TodoItem {
+            id,
+            desc: format!("step {id}"),
+            done: false,
+        })
+        .collect()
+}
+
+fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> TermInput {
+    TermInput::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+/// The wheel over the todo panel scrolls the panel, with a question up
+/// as well as over the composer, and the wheel over the transcript
+/// beside it leaves the panel where it was.
+#[test]
+fn the_wheel_over_the_todo_panel_scrolls_it_under_a_question_too() {
+    let mut harness = Harness::standalone(80, 24);
+    harness
+        .app
+        .handle_msg(UiMsg::TodoUpdated(numbered_todos(30)));
+    harness.app.handle_key(ctrl(KeyCode::Char('x')));
+    harness.draw();
+    harness
+        .app
+        .handle_input(mouse_at(MouseEventKind::ScrollDown, 70, 3));
+    assert!(harness.draw().contains("(+1 above)"));
+    harness
+        .app
+        .handle_input(mouse_at(MouseEventKind::ScrollDown, 5, 3));
+    harness
+        .app
+        .handle_input(mouse_at(MouseEventKind::ScrollUp, 5, 3));
+    assert!(
+        harness.draw().contains("(+1 above)"),
+        "the wheel over the transcript moved the panel"
+    );
+
+    let (reply, _answers) = mpsc::channel();
+    harness.app.enqueue_prompt(confirm_request(None), reply);
+    harness.draw();
+    harness
+        .app
+        .handle_input(mouse_at(MouseEventKind::ScrollDown, 70, 3));
+    let frame = harness.draw();
+    assert!(frame.contains("(+2 above)"), "{frame}");
+    assert!(harness.app.overlay.is_none());
+}
+
+/// Alt+X opens the todo pop-up over the main screen without touching the
+/// panel, an update shows while it is open, and Esc, q, Ctrl+C, Ctrl+D
+/// and Alt+X each go back to the main screen with the draft as it was.
+#[test]
+fn alt_x_opens_the_todo_popup_and_its_close_keys_go_back() {
+    let close_keys = [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ctrl(KeyCode::Char('c')),
+        ctrl(KeyCode::Char('d')),
+        alt(KeyCode::Char('x')),
+    ];
+    for close in close_keys {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.todo.set("ship it".to_string(), todo_items());
+        harness.type_text("half a prompt");
+        harness.app.handle_key(alt(KeyCode::Char('x')));
+        let frame = harness.draw();
+        assert!(
+            matches!(harness.app.overlay, Some(Overlay::Todo(_))),
+            "{close:?}"
+        );
+        assert!(frame.contains("j/k scroll"), "{frame}");
+        assert!(frame.contains("[x] wire the panel"), "{frame}");
+        assert!(!harness.app.todo.visible(), "the pop-up showed the panel");
+
+        harness
+            .app
+            .handle_msg(UiMsg::TodoUpdated(numbered_todos(2)));
+        let frame = harness.draw();
+        assert!(frame.contains("[ ] step 2"), "{frame}");
+
+        harness.app.handle_key(close);
+        let frame = harness.draw();
+        assert!(harness.app.overlay.is_none(), "{close:?}");
+        assert!(harness.app.overlay_stack.is_empty(), "{close:?}");
+        assert!(!frame.contains("j/k scroll"), "{close:?}: {frame}");
+        assert_eq!(harness.app.composer_text(), "half a prompt", "{close:?}");
+        assert!(!harness.app.todo.visible(), "{close:?}");
+    }
+}
+
+/// A click on the todo panel's title opens the pop-up, a click inside
+/// the panel does not, and closing it leaves the panel shown.
+#[test]
+fn a_click_on_the_todo_panels_title_opens_the_popup() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.todo.set("ship it".to_string(), todo_items());
+    harness.app.handle_key(ctrl(KeyCode::Char('x')));
+    harness.draw();
+    let click = |row| mouse_at(MouseEventKind::Down(MouseButton::Left), 60, row);
+    harness.app.handle_input(click(1));
+    assert!(harness.app.overlay.is_none(), "a click under the title");
+    harness.app.handle_input(click(0));
+    assert!(matches!(harness.app.overlay, Some(Overlay::Todo(_))));
+    assert!(harness.draw().contains("j/k scroll"));
+    harness.press(KeyCode::Esc);
+    assert!(harness.app.overlay.is_none());
+    assert!(harness.app.todo.visible());
+}
+
+/// An item wider than the pop-up wraps under its text rather than being
+/// cut: every word of it shows, its last one too.
+#[test]
+fn a_long_todo_item_wraps_whole_in_the_popup() {
+    use crate::config::todo::TodoItem;
+    let words: Vec<String> = (1..=40).map(|n| format!("word{n:02}")).collect();
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.handle_msg(UiMsg::TodoUpdated(vec![TodoItem {
+        id: 1,
+        desc: words.join(" "),
+        done: false,
+    }]));
+    harness.app.handle_key(alt(KeyCode::Char('x')));
+    let frame = harness.draw();
+    for word in &words {
+        assert!(frame.contains(word.as_str()), "{word} missing:\n{frame}");
+    }
+    assert!(frame.contains("[ ] word01"), "{frame}");
+}
+
+/// j and k, PgDn, Home and End and the wheel scroll the pop-up's list.
+#[test]
+fn the_todo_popup_scrolls_by_keys_and_the_wheel() {
+    let mut harness = Harness::standalone(80, 24);
+    harness
+        .app
+        .handle_msg(UiMsg::TodoUpdated(numbered_todos(40)));
+    harness.app.handle_key(alt(KeyCode::Char('x')));
+    let first = "[ ] step 1 ";
+    let last = "[ ] step 40";
+    let frame = harness.draw();
+    assert!(frame.contains(first) && !frame.contains(last), "{frame}");
+    assert!(frame.contains("/40"), "{frame}");
+    harness.press(KeyCode::Char('j'));
+    assert!(!harness.draw().contains(first));
+    harness.press(KeyCode::Char('k'));
+    assert!(harness.draw().contains(first));
+    harness.press(KeyCode::PageDown);
+    assert!(!harness.draw().contains(first));
+    harness.press(KeyCode::End);
+    assert!(harness.draw().contains(last));
+    harness.press(KeyCode::Home);
+    assert!(harness.draw().contains(first));
+    harness
+        .app
+        .handle_input(mouse_at(MouseEventKind::ScrollDown, 40, 10));
+    let frame = harness.draw();
+    assert!(
+        !frame.contains(first) && frame.contains("[ ] step 2 "),
+        "{frame}"
+    );
+    harness
+        .app
+        .handle_input(mouse_at(MouseEventKind::ScrollUp, 40, 10));
+    assert!(harness.draw().contains(first));
+}
+
+/// The todo pop-up over the main screen: the goal, a done item, an open
+/// one wrapped under its text and a short one, inside a margin of the
+/// transcript with the composer under it.
+#[test]
+fn the_todo_popup_snapshots() {
+    use crate::config::todo::TodoItem;
+    for (width, height, name) in [(80, 24, "todo_popup_80x24"), (40, 20, "todo_popup_40x20")] {
+        let mut harness = Harness::standalone(width, height);
+        exchange(&mut harness);
+        harness.app.todo.set(
+            "ship the todo pop-up".to_string(),
+            vec![
+                TodoItem {
+                    id: 1,
+                    desc: "wire the panel".to_string(),
+                    done: true,
+                },
+                TodoItem {
+                    id: 2,
+                    desc: "snapshot the pop-up at two sizes, so the long item shows how \
+                           it wraps under its own text"
+                        .to_string(),
+                    done: false,
+                },
+                TodoItem {
+                    id: 3,
+                    desc: "ship it".to_string(),
+                    done: false,
+                },
+            ],
+        );
+        harness.type_text("half a prompt");
+        harness.app.handle_key(alt(KeyCode::Char('x')));
+        let frame = harness.draw();
+        insta::assert_snapshot!(name, &frame);
+        assert!(frame.contains("half a prompt"), "{frame}");
+        assert!(frame.contains("own text"), "{frame}");
+    }
+}
+
 #[test]
 fn the_welcome_greets_an_empty_transcript_until_the_first_turn() {
     let mut harness = Harness::standalone(80, 24);
