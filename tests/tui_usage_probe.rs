@@ -932,9 +932,9 @@ mod welcome_sweep {
         for (i, rows) in (12u16..=20).enumerate() {
             // Alternate the width so no resize is coalesced away.
             let cols = if i % 2 == 0 { 80 } else { 81 };
-            let at = repaint_until(&mut pty, rows, cols, |f| {
-                squeezed(f).contains(version) && f.contains("model:") && f.contains('┌')
-            });
+            // The footer is the frame's last row, so a frame that shows it
+            // has painted the welcome above it too.
+            let at = repaint_showing(&mut pty, rows, cols, &[version, "no session"]);
             let frame = since(&pty, at);
             let flat = squeezed(&frame);
             let big = flat.contains(big_row);
