@@ -2202,6 +2202,7 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         "oracle",
         "engineer",
         "whetstone",
+        "design-retrospective",
     ] {
         copy_tree(&agents_dir().join(name), &agents.join(name));
     }
@@ -5296,11 +5297,15 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("review_poll", "timeout", 900),
     ("review_route", "timeout", 120),
     ("review_triage", "timeout", 600),
+    ("retro_triage", "max_iterations", 10),
+    ("retro_triage", "timeout", 600),
     ("review_update", "timeout", 1020),
     ("run_adversary", "max_attempts", 1),
     ("run_adversary", "timeout", 7200),
     ("run_gauntlet", "max_attempts", 1),
     ("run_gauntlet", "timeout", 0),
+    ("run_retrospective", "max_attempts", 1),
+    ("run_retrospective", "timeout", 3600),
     ("run_whetstone", "max_attempts", 1),
     ("run_whetstone", "timeout", 3600),
     ("stack_gate", "timeout", 300),
@@ -5743,6 +5748,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("pr_body_fix", AnomaliesChannel::NoSchema),
     ("pr_summary", AnomaliesChannel::Plain),
     ("promote_tasks", AnomaliesChannel::NoSchema),
+    ("retro_triage", AnomaliesChannel::Plain),
     ("review_triage", AnomaliesChannel::Plain),
     ("summarize_run", AnomaliesChannel::NoSchema),
     ("task_done", AnomaliesChannel::NoSchema),
@@ -6049,6 +6055,7 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .filter(|a| !declares(a))
         .collect();
     let expected = [
+        "design-retrospective",
         "engineer",
         "explore",
         "gatekeeper",
