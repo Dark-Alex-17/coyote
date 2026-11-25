@@ -2646,7 +2646,7 @@ def apply_answer(state):
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Accepted without fix at the user's say-so: {tail(esc.get('evidence', ''), 300)}"]
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
     elif kind == "plan_defect":
         named = _named_option(answer, options)
         used = as_int(state.get("plan_defect_continues"))
@@ -2662,7 +2662,7 @@ def apply_answer(state):
                 f"Plan defect accepted unresolved at the user's say-so: {why}"]
             ledger(state, u, f"plan defect: accepted unresolved after {used}/{STRIKE_LIMIT} continues: "
                              f"{tail(why, 300)}")
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         elif bare_amend and _judge_may_rule(state, esc):
             # an automatic pick states no amendment, so the judge rules again with the amendment text or another option
             fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": PLAN_DEFECT_NO_AMENDMENT}}
@@ -2720,7 +2720,7 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 "Consumer-facing change could not be exercised locally (probe INCONCLUSIVE): "
                 "provide the local-run recipe / fixture and re-probe"]
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
     elif kind == "review_incomplete":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "accept": ["accept"]})
         if a is None:
@@ -2739,7 +2739,7 @@ def apply_answer(state):
                                        + [{"round": last.get("round"), "paths": due}]}
                 ledger(state, u, f"probe tests: adoption round {last.get('round')} accepted NEEDS-HUMAN; the "
                                  f"adoption of {_paths_of(due)} is NOT completed")
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         else:
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
@@ -2763,14 +2763,14 @@ def apply_answer(state):
         elif a == "accept":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review blockers accepted unresolved at the user's say-so ({kind}); see the gauntlet report"]
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         elif a == "proceed":
             notes = tail(state.get("oracle_result") or "", 1500) or "(the oracle left no notes)"
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Strikeout: proceeded without this change at the user's say-so; the failed attempt stays set aside "
                 f"({state.get('strikeout_stash') or 'the worktree was clean'}); the oracle's notes: {notes}"]
             ledger(state, u, f"strikeout: proceeding without the change; the oracle's notes: {tail(notes, 600)}")
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         else:
             u["failure_reason"] = f"stopped after repeated failures ({kind}); the code was left in a working state"
             u["_next"] = "end_aborted"
@@ -4737,6 +4737,13 @@ def _after_final_review(state, u):
     if _subtask_phase(state):
         u["_next"] = "next_subtask"
     elif truthy(state.get("retro_done")) or _retro_is_parents(state):
+        u["_next"] = "observability_gate"
+    elif (truthy(state.get("pr_published")) or truthy(state.get("ci_fix_active"))
+          or as_int(state.get("pr_review_rounds")) > 0):
+        # a review this late belongs to a CI or PR-review fix on a published PR; a refactor round there is too late
+        u["retro_done"] = True
+        u["retro_report"] = ["- not run: the review passed after the PR was published"]
+        ledger(state, u, "design retrospective: not run; the PR was already published")
         u["_next"] = "observability_gate"
     else:
         root = state.get("git_root") or state.get("project_dir") or "."

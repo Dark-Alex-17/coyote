@@ -7292,6 +7292,25 @@ with scenario("retrospective: every blocker rejected at the whole-task review ->
                                       triage=[{"finding": "code-review: [convention] naming", "action": "reject",
                                                "citation": "src/a.go:3"}]))
     check(name, u["_next"] == "retro_size" and u.get("retro_done") is True, u.get("_next"))
+_RETRO_ACCEPTS = [("yellow_findings", YELLOW_ACCEPT), ("plan_defect", gates.PLAN_DEFECT_ACCEPT),
+                  ("probe_gap", PROBE_SURFACE), ("review_incomplete", KIND_OPTIONS["review_incomplete"][1]),
+                  ("lane_stuck", REVIEW_OPTIONS[1]), ("review_exhausted", REVIEW_OPTIONS[1])]
+with scenario("retrospective: every whole-task accept exit of apply_answer decides the retrospective too") as name:
+    _got = {k: aa(k, a, retro_done=False) for k, a in _RETRO_ACCEPTS}
+    check(name, all(v["_next"] == "retro_size" and v.get("retro_done") is True for v in _got.values()),
+          {k: v.get("_next") for k, v in _got.items()})
+with scenario("retrospective: a yellow accept, then a CI-fix review PASS -> observability_gate, never retro_size") as name:
+    _acc = aa("yellow_findings", YELLOW_ACCEPT, retro_done=False)
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        retro_done=_acc.get("retro_done", False), ci_fix_active=True, pr_published=True))
+    check(name, u["_next"] == "observability_gate", u.get("_next"))
+with scenario("retrospective: a PASS after the PR is out (published, CI fix, PR-review round) never starts it") as name:
+    _late = [dict(pr_published=True), dict(ci_fix_active=True), dict(pr_review_rounds=1)]
+    _got = [gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                            retro_done=False, **s)) for s in _late]
+    check(name, all(v["_next"] == "observability_gate" and v.get("retro_done") is True
+                    and any("not run" in l for l in v.get("retro_report", [])) for v in _got),
+          [(v.get("_next"), v.get("retro_report")) for v in _got])
 with scenario("retro_size_route: large -> run_retrospective with the project, the run diff and the task; ledgered") as name:
     u = gates.retro_size_route(base_state(retro_large=True, retro_large_reason="a new module other code builds on",
                                           last_node_output='{"retro_large": true}', run_base_sha=BASE, anomalies=["seen"]))
