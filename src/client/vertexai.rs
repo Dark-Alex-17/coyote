@@ -164,8 +164,6 @@ pub(super) fn prepare_chat_completions(
             let mut body = openai_build_chat_completions_body(data, &self_.model);
             if let Some(body_obj) = body.as_object_mut() {
                 body_obj["model"] = strip_model_version(self_.model.real_name()).into();
-                // Vertex Mistral has no native structured-output dialect.
-                body_obj.remove("response_format");
             }
             body
         }
@@ -1157,10 +1155,11 @@ mod tests {
     #[test]
     fn mistral_body_drops_the_spec() {
         let client = mistral_client("vertex-mistral-structured-test");
+        let mut data = structured_output_data();
+        client.drop_unwritten_structured_output(&mut data);
 
         let request_data =
-            prepare_chat_completions(&client, structured_output_data(), &ModelCategory::Mistral)
-                .unwrap();
+            prepare_chat_completions(&client, data, &ModelCategory::Mistral).unwrap();
 
         assert!(
             request_data.body.get("response_format").is_none(),

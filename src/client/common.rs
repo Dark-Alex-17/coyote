@@ -60,6 +60,20 @@ pub trait Client: Sync + Send {
         None
     }
 
+    fn completion_data(&self, input: &Input, stream: bool) -> Result<ChatCompletionsData> {
+        let mut data = input.prepare_completion_data(self.model(), stream)?;
+        self.drop_unwritten_structured_output(&mut data);
+        Ok(data)
+    }
+
+    /// A client with no native dialect has no way to send the spec, so it
+    /// never reaches that client's body builder.
+    fn drop_unwritten_structured_output(&self, data: &mut ChatCompletionsData) {
+        if self.native_structured_output_dialect().is_none() {
+            data.structured_output = None;
+        }
+    }
+
     fn build_client(&self) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
@@ -92,7 +106,7 @@ pub trait Client: Sync + Send {
             return Ok(ChatCompletionsOutput::new(&content));
         }
         let client = self.build_client()?;
-        let data = input.prepare_completion_data(self.model(), false)?;
+        let data = self.completion_data(&input, false)?;
         let err = match self.chat_completions_inner(&client, data).await {
             Ok(output) => return Ok(output),
             Err(err) => err,
@@ -102,7 +116,7 @@ pub trait Client: Sync + Send {
                 "provider '{}' rejected access token (401); refreshing and retrying once",
                 self.name()
             );
-            let data = input.prepare_completion_data(self.model(), false)?;
+            let data = self.completion_data(&input, false)?;
             match self.chat_completions_inner(&client, data).await {
                 Err(retry_err) if is_auth_error(&retry_err) => Err(err),
                 ret => ret,
@@ -132,7 +146,7 @@ pub trait Client: Sync + Send {
                     return Ok(());
                 }
                 let client = self.build_client()?;
-                let data = input.prepare_completion_data(self.model(), true)?;
+                let data = self.completion_data(&input, true)?;
                 let err = match self.chat_completions_streaming_inner(&client, handler, data).await {
                     Ok(()) => return Ok(()),
                     Err(err) => err,
@@ -144,7 +158,7 @@ pub trait Client: Sync + Send {
                     "provider '{}' rejected access token (401); refreshing and retrying once",
                     self.name()
                 );
-                let data = input.prepare_completion_data(self.model(), true)?;
+                let data = self.completion_data(&input, true)?;
                 match self.chat_completions_streaming_inner(&client, handler, data).await {
                     Err(retry_err) if is_auth_error(&retry_err) => Err(err),
                     ret => ret,
@@ -394,9 +408,9 @@ pub struct ChatCompletionsData {
     /// Cache TTL for the system prompt and tool declarations (`"1h"`), or
     /// None for the provider default. Only the Anthropic clients read it.
     pub prompt_cache_ttl: Option<String>,
-    /// Set from the role's spec when the model's capability flag allows it,
-    /// ignoring the client's dialect, so it can be Some for a client with no
-    /// native dialect. Such clients must drop it from the body.
+    /// Set from the role's spec when the model's capability flag allows it
+    /// and the client has a native dialect: Some means this client writes it
+    /// into the body. See `Client::completion_data`.
     pub structured_output: Option<StructuredOutputSpec>,
 }
 
@@ -2750,6 +2764,12 @@ mod tests {
         };
         use std::str::FromStr;
 
+        fn written_data(client: &dyn Client) -> ChatCompletionsData {
+            let mut data = structured_output_data();
+            client.drop_unwritten_structured_output(&mut data);
+            data
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2782,7 +2802,7 @@ mod tests {
                 .block_on(openai::prepare_chat_completions(
                     &client,
                     &http,
-                    structured_output_data(),
+                    written_data(&client),
                 ))
                 .unwrap();
             rows.push((
@@ -2805,7 +2825,7 @@ mod tests {
             model: Model::new("so-azure", "gpt-test"),
         };
         let request_data =
-            azure_openai::prepare_chat_completions(&client, structured_output_data()).unwrap();
+            azure_openai::prepare_chat_completions(&client, written_data(&client)).unwrap();
         rows.push((
             "azure",
             Some(SchemaDialect::OpenAiStrict),
@@ -2837,7 +2857,7 @@ mod tests {
                 .block_on(openai_compatible::prepare_chat_completions(
                     &client,
                     &http,
-                    structured_output_data(),
+                    written_data(&client),
                 ))
                 .unwrap();
             rows.push((
@@ -2863,7 +2883,7 @@ mod tests {
             .block_on(claude::prepare_chat_completions(
                 &client,
                 &http,
-                structured_output_data(),
+                written_data(&client),
             ))
             .unwrap();
         rows.push((
@@ -2888,7 +2908,7 @@ mod tests {
             .block_on(gemini::prepare_chat_completions(
                 &client,
                 &http,
-                structured_output_data(),
+                written_data(&client),
             ))
             .unwrap();
         rows.push((
@@ -2932,7 +2952,7 @@ mod tests {
             };
             let category = vertexai::ModelCategory::from_str(real_name).unwrap();
             let request_data =
-                vertexai::prepare_chat_completions(&client, structured_output_data(), &category)
+                vertexai::prepare_chat_completions(&client, written_data(&client), &category)
                     .unwrap();
             rows.push((
                 label,
@@ -2955,7 +2975,7 @@ mod tests {
             model: Model::new("so-bedrock", "anthropic.claude-sonnet-4"),
         };
         let request = client
-            .chat_completions_builder(&http, structured_output_data())
+            .chat_completions_builder(&http, written_data(&client))
             .unwrap()
             .build()
             .unwrap();
@@ -2978,7 +2998,7 @@ mod tests {
             model: Model::new("so-cohere", "command-test"),
         };
         let request_data =
-            cohere::prepare_chat_completions(&client, structured_output_data()).unwrap();
+            cohere::prepare_chat_completions(&client, written_data(&client)).unwrap();
         rows.push((
             "cohere",
             None,

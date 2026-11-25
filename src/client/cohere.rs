@@ -51,12 +51,10 @@ pub(super) fn prepare_chat_completions(
 
     let url = format!("{}/chat", api_base.trim_end_matches('/'));
     let mut body = openai_build_chat_completions_body(data, &self_.model);
-    if let Some(obj) = body.as_object_mut() {
-        // Cohere has no native structured-output dialect.
-        obj.remove("response_format");
-        if let Some(top_p) = obj.remove("top_p") {
-            obj.insert("p".to_string(), top_p);
-        }
+    if let Some(obj) = body.as_object_mut()
+        && let Some(top_p) = obj.remove("top_p")
+    {
+        obj.insert("p".to_string(), top_p);
     }
 
     let mut request_data = RequestData::new(url, body);
@@ -318,7 +316,9 @@ mod tests {
             model: Model::new("cohere-test", "command-test"),
         };
 
-        let request_data = prepare_chat_completions(&client, structured_output_data()).unwrap();
+        let mut data = structured_output_data();
+        client.drop_unwritten_structured_output(&mut data);
+        let request_data = prepare_chat_completions(&client, data).unwrap();
 
         assert!(
             request_data.body.get("response_format").is_none(),
