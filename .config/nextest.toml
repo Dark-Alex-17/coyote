@@ -3,6 +3,11 @@
 [test-groups]
 pty = { max-threads = 2 }
 
+# The one list of pty binaries. Every profile inherits this override, and CI
+# selects by `group(pty)`: the main step runs `-E 'not group(pty)'` under the
+# `ci` profile, the pty step `-E 'group(pty)'` under `ci-pty`. nextest does
+# not accept `group()` in a `default-filter`, so the split lives on the
+# command line.
 [[profile.default.overrides]]
 filter = """
 binary(editor_setting_usage) | binary(prompt_protocol) | binary(pty_hygiene)
@@ -15,13 +20,6 @@ test-group = "pty"
 [profile.ci]
 fail-fast = false
 
-# Keep this filter in step with the default profile's pty override.
-[[profile.ci.overrides]]
-filter = """
-binary(editor_setting_usage) | binary(prompt_protocol) | binary(pty_hygiene)
-| binary(theme_setting_usage) | binary(tui_composer_and_queue)
-| binary(tui_lifecycle_and_signals) | binary(tui_modals) | binary(tui_pager_and_roster)
-| binary(tui_palette_and_rewind) | binary(tui_tools) | binary(tui_usage_probe)
-"""
-test-group = "pty"
+[profile.ci-pty]
+fail-fast = false
 retries = 1
