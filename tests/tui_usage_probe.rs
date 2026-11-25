@@ -933,7 +933,7 @@ mod welcome_sweep {
             // Alternate the width so no resize is coalesced away.
             let cols = if i % 2 == 0 { 80 } else { 81 };
             let at = repaint_until(&mut pty, rows, cols, |f| {
-                squeezed(f).contains(&version) && f.contains("model:") && f.contains('┌')
+                squeezed(f).contains(version) && f.contains("model:") && f.contains('┌')
             });
             let frame = since(&pty, at);
             let flat = squeezed(&frame);
