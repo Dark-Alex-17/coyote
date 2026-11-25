@@ -99,7 +99,8 @@ fn validate_spawn_variables(
     }
     if declared.is_empty() {
         return Err(format!(
-            "Agent '{agent_name}' declares no variables; remove the 'variables' argument."
+            "Agent '{agent_name}' declares no variables; remove the 'variables' argument, or \
+             declare them under the `variables:` of agent '{agent_name}' to receive them."
         ));
     }
 
@@ -109,7 +110,9 @@ fn validate_spawn_variables(
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "Unknown variable(s) {unknown:?} for agent '{agent_name}'. Declared variables: {declared_list}"
+        "Unknown variable(s) {unknown:?} for agent '{agent_name}'. Declared variables: \
+         {declared_list}. A child receives only the variables it declares: to pass another, \
+         declare it under the `variables:` of agent '{agent_name}'."
     ))
 }
 
@@ -416,7 +419,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "variables".to_string(),
                         JsonSchema {
                             type_value: Some("object".to_string()),
-                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides, per key, the values inherited from the parent (the variables the parent was started or spawned with; its declared defaults are not passed on). String values only. On a `session_id` resume the values must equal the stored ones (omitted = stored); a mismatch is refused. Discover an agent's declared variables via `agent__list_available`.".into()),
+                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides, per key, the values inherited from the parent (the variables the parent was started or spawned with; its declared defaults are not passed on). String values only. A key the agent does not declare is refused; declare it under the agent's `variables:` to receive it. On a `session_id` resume a value given explicitly at an earlier spawn must equal the stored one (omitted = stored); a mismatch is refused. Inherited values and declared defaults re-resolve on resume, and a value for any other declared key is accepted. Discover an agent's declared variables via `agent__list_available`.".into()),
                             ..Default::default()
                         },
                     ),
@@ -1212,41 +1215,24 @@ pub async fn run_agent_for_graph(
         agent.set_instructions_appendix(roster);
     }
     child_ctx.agent = Some(agent);
+    let mut node_inputs = AgentVariables::new();
     if let Some(inputs) = graph_inputs.as_ref() {
         let declared = child_ctx
             .agent
             .as_ref()
             .map(Agent::defined_variables)
             .unwrap_or_default();
-        if graph::active_agent_graph_name(&child_ctx).is_none() {
-            if inputs.is_empty() {
-                bail!(
-                    "agent '{agent_name}': `inputs:` is empty; a config agent takes only its declared variables as `inputs:`"
-                );
-            }
-            let undeclared = graph::undeclared_config_inputs(declared, inputs.keys());
-            if !undeclared.is_empty() {
-                bail!(
-                    "agent '{agent_name}': `inputs` names undeclared variable(s) {}; a config agent takes only its declared variables as `inputs:`",
-                    undeclared.join(", ")
-                );
-            }
+        let config_declared = graph::active_agent_graph_name(&child_ctx)
+            .is_none()
+            .then_some(declared);
+        if let Some(body) = graph::agent_inputs_errors(agent_name, config_declared, inputs.keys())
+            .into_iter()
+            .next()
+        {
+            bail!("agent '{agent_name}': {body}");
         }
-        for key in graph::RESERVED_STATE_KEYS {
-            if !inputs.contains_key(key) {
-                continue;
-            }
-            let seeded_from = if key == "initial_prompt" {
-                " from `prompt:`"
-            } else {
-                ""
-            };
-            bail!(
-                "agent '{agent_name}': `inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})"
-            );
-        }
-        let seated = declared_inputs_as_variables(declared, inputs);
-        merge_spawn_variables(&mut child_ctx.agent_variables, seated);
+        node_inputs = declared_inputs_as_variables(declared, inputs);
+        merge_spawn_variables(&mut child_ctx.agent_variables, node_inputs.clone());
     }
     if assigned_peer {
         child_ctx.peer_registry = peer_registry.clone();
@@ -1262,22 +1248,21 @@ pub async fn run_agent_for_graph(
         child_ctx
             .use_session(app_config.as_ref(), Some(&session), child_abort.clone())
             .await?;
+        let variables_changed = reseat_agent_session_variables(&mut child_ctx, &node_inputs)?;
         sync_agent_functions_to_ctx(&mut child_ctx)?;
         // A resumed session speaks with the System row it was stored under,
         // and that row carries the roster of the run that stored it. Peer
         // ids are minted per run, so whenever this run seats a teammate or
         // the stored row names one, the prompt and the row are re-adopted
-        // from the agent, whose appendix is this run's roster or nothing;
-        // the session keeps the variables it was resumed with.
+        // from the agent, whose appendix is this run's roster or nothing.
+        // Re-seated variables re-adopt them too, so the row names this
+        // run's values.
         let stored_roster = child_ctx
             .session
             .as_ref()
             .is_some_and(|session| roster_line(session.agent_instructions()).is_some());
-        if (seats_a_teammate || stored_roster)
-            && let (Some(session), Some(agent)) =
-                (child_ctx.session.as_mut(), child_ctx.agent.as_ref())
-        {
-            session.readopt_agent_prompt(agent);
+        if seats_a_teammate || stored_roster || variables_changed {
+            readopt_child_prompt(&mut child_ctx, variables_changed)?;
         }
     } else {
         prepare_child_runtime(&mut child_ctx, &agent_mcp_servers).await?;
@@ -1589,6 +1574,7 @@ fn seat_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
     meta: &ChildMeta,
+    explicit_keys: Vec<String>,
 ) -> Result<()> {
     let app_config = Arc::clone(&child_ctx.app.config);
     let mut session = Session::new_from_ctx(child_ctx, app_config.as_ref(), &meta.session_id)?;
@@ -1599,6 +1585,7 @@ fn seat_child_session(
     if let Some(agent) = child_ctx.agent.as_ref() {
         session.sync_agent(agent);
     }
+    session.set_explicit_variable_keys(explicit_keys);
     let parent_path = root_spawner_session_file(spawner);
     root.ensure_dir(&RootFile::seed(meta.stamp(), parent_path.as_deref()))?;
     root.save_child_meta(meta)?;
@@ -1792,6 +1779,148 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
         .collect();
     keys.sort();
     keys
+}
+
+/// The declared variables a resumed child is seated with. Per variable,
+/// the order is: this run's explicit value, then the stored explicit
+/// value, then the inherited value, then the declared default, then the
+/// stored value, the last resort for a variable nothing else gives. One
+/// that none of them gives is left out.
+fn resolve_resumed_variables(
+    declared: &[AgentVariable],
+    explicit: &AgentVariables,
+    stored: &AgentVariables,
+    stored_explicit: &[String],
+    inherited: Option<&AgentVariables>,
+) -> AgentVariables {
+    declared
+        .iter()
+        .filter_map(|variable| {
+            let name = variable.name.as_str();
+            let stored_explicit_value = stored
+                .get(name)
+                .filter(|_| stored_explicit.iter().any(|key| key == name));
+            explicit
+                .get(name)
+                .or(stored_explicit_value)
+                .or_else(|| inherited.and_then(|inherited| inherited.get(name)))
+                .or(variable.default.as_ref())
+                .or_else(|| stored.get(name))
+                .map(|value| (variable.name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+/// The variables a resumed child session is re-seated with.
+struct ResumedVariables {
+    /// What the child itself runs with.
+    seated: AgentVariables,
+    /// The stored explicit keys followed by this run's new ones.
+    explicit_keys: Vec<String>,
+    /// What the child hands its own children: the inherited variables
+    /// overlaid with the explicit ones, as a fresh spawn hands them down.
+    handed_down: Option<AgentVariables>,
+}
+
+/// The keys of `explicit` that name a declared variable. A graph agent's
+/// node inputs may also carry plain state keys, which are no variable.
+fn declared_keys<'a>(
+    declared: &'a [AgentVariable],
+    explicit: &'a AgentVariables,
+) -> impl Iterator<Item = &'a String> {
+    explicit
+        .keys()
+        .filter(|key| declared.iter().any(|variable| variable.name == **key))
+}
+
+/// Resolves a resumed `session`'s variables for an agent declaring
+/// `declared`, refusing a declared variable left without a value the way
+/// a fresh seat does.
+fn resume_variables(
+    declared: &[AgentVariable],
+    explicit: &AgentVariables,
+    session: &Session,
+    inherited: Option<&AgentVariables>,
+    no_interaction: bool,
+) -> Result<ResumedVariables> {
+    let mut explicit_keys = session.explicit_variable_keys();
+    let resolved = resolve_resumed_variables(
+        declared,
+        explicit,
+        session.agent_variables(),
+        &explicit_keys,
+        inherited,
+    );
+    let seated = Agent::init_agent_variables(declared, Some(&resolved), no_interaction, false)?;
+    for key in declared_keys(declared, explicit) {
+        if !explicit_keys.contains(key) {
+            explicit_keys.push(key.clone());
+        }
+    }
+    let overlay: AgentVariables = explicit_keys
+        .iter()
+        .filter_map(|key| seated.get(key).map(|value| (key.clone(), value.clone())))
+        .collect();
+    let mut handed_down = inherited.cloned();
+    merge_spawn_variables(&mut handed_down, overlay);
+    Ok(ResumedVariables {
+        seated,
+        explicit_keys,
+        handed_down,
+    })
+}
+
+/// Re-seats the variables of the `agent_session` an agent node's child
+/// was given: a stored one is resolved with this run's node inputs as the
+/// explicit values, a new one records those inputs as its explicit keys.
+/// Returns whether the stored session now runs with different values.
+fn reseat_agent_session_variables(
+    child_ctx: &mut RequestContext,
+    explicit: &AgentVariables,
+) -> Result<bool> {
+    let (Some(agent), Some(session)) = (child_ctx.agent.as_mut(), child_ctx.session.as_mut())
+    else {
+        return Ok(false);
+    };
+    if session.is_empty() {
+        session.set_explicit_variable_keys(
+            declared_keys(agent.defined_variables(), explicit)
+                .cloned()
+                .collect(),
+        );
+        return Ok(false);
+    }
+    let resumed = resume_variables(
+        agent.defined_variables(),
+        explicit,
+        session,
+        child_ctx.agent_variables.as_ref(),
+        child_ctx.info_flag,
+    )?;
+    let changed = resumed.seated != *session.agent_variables();
+    agent.set_session_variables(resumed.seated.clone());
+    session.set_agent_variables(resumed.seated);
+    session.set_explicit_variable_keys(resumed.explicit_keys);
+    child_ctx.agent_variables = resumed.handed_down;
+    Ok(changed)
+}
+
+/// Re-adopts a resumed child session's prompt and System row from its
+/// agent. With `rerender`, the dynamic instructions the session was
+/// resumed with are first rendered again from the agent's current
+/// variables.
+fn readopt_child_prompt(child_ctx: &mut RequestContext, rerender: bool) -> Result<()> {
+    let tool_timeout = child_ctx.app.config.tool_timeout;
+    let info_flag = child_ctx.info_flag;
+    let (Some(session), Some(agent)) = (child_ctx.session.as_mut(), child_ctx.agent.as_mut())
+    else {
+        return Ok(());
+    };
+    if rerender && !info_flag {
+        agent.update_session_dynamic_instructions(None, tool_timeout)?;
+    }
+    session.readopt_agent_prompt(agent);
+    Ok(())
 }
 
 /// How a refused resume's attempt to put the sidecar back ended.
@@ -2051,8 +2180,8 @@ async fn resume_child_session(
         app_config.as_ref(),
     )
     .await;
-    let mut session = match gated {
-        Ok(session) => session,
+    let (mut session, resumed) = match gated {
+        Ok(gated) => gated,
         Err(error) => {
             return Err(match restore.restore() {
                 SidecarRestore::Done => error,
@@ -2070,8 +2199,25 @@ async fn resume_child_session(
 
     session.set_owner_only(true);
     session.set_save_session(Some(true));
-    child_ctx.agent_variables = Some(session.agent_variables().clone());
+    let variables_changed = resumed.seated != *session.agent_variables();
+    session.set_agent_variables(resumed.seated.clone());
+    session.set_explicit_variable_keys(resumed.explicit_keys);
+    if let Some(agent) = child_ctx.agent.as_mut() {
+        agent.set_shared_variables(resumed.seated);
+    }
+    child_ctx.agent_variables = resumed.handed_down;
     child_ctx.session = Some(session);
+    // The sidecar already says running, so a failed render must mark it
+    // failed or a retry is refused until the spawner exits.
+    if variables_changed && let Err(error) = readopt_child_prompt(child_ctx, true) {
+        finish_child_meta(
+            Some(root),
+            Some(id),
+            ChildStatus::Failed,
+            Some(format!("{error:#}")),
+        );
+        return Err(error);
+    }
     // checkpoint_session_to_disk already logged a failed write-back, and the
     // stored copy stays the resume record until the child's next checkpoint.
     let _ = child_ctx.checkpoint_session_to_disk(app_config.dry_run);
@@ -2079,10 +2225,11 @@ async fn resume_child_session(
 }
 
 /// Loads a stored child session and gates it for a resume: the variables
-/// it was spawned with must match the provided ones, and its transcript
-/// must fit the model window. One over the window is compressed once; it
-/// is admitted when the result fits and refused otherwise. The session is
-/// seated on `child_ctx` only for the duration of that compression.
+/// it was explicitly spawned with must match the provided ones, every
+/// declared variable must resolve, and its transcript must fit the model
+/// window. One over the window is compressed once; it is admitted when the
+/// result fits and refused otherwise. The session is seated on `child_ctx`
+/// only for the duration of that compression.
 async fn load_and_gate(
     child_ctx: &mut RequestContext,
     path: &Path,
@@ -2090,10 +2237,16 @@ async fn load_and_gate(
     variables: Option<&AgentVariables>,
     id: &str,
     app_config: &AppConfig,
-) -> Result<Session> {
+) -> Result<(Session, ResumedVariables)> {
     let session = Session::load_from_path(path, resolved_model.clone(), child_ctx, app_config)?;
     if let Some(provided) = variables {
-        let differing = differing_variables(provided, session.agent_variables());
+        let stored_explicit = session.explicit_variable_keys();
+        let pinned: AgentVariables = provided
+            .iter()
+            .filter(|(key, _)| stored_explicit.contains(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let differing = differing_variables(&pinned, session.agent_variables());
         if !differing.is_empty() {
             bail!(
                 "'{id}' was spawned with different variables ({}); resume with the same values or spawn fresh",
@@ -2101,10 +2254,21 @@ async fn load_and_gate(
             );
         }
     }
+    let resumed = resume_variables(
+        child_ctx
+            .agent
+            .as_ref()
+            .map(Agent::defined_variables)
+            .unwrap_or_default(),
+        variables.unwrap_or(&AgentVariables::new()),
+        &session,
+        child_ctx.agent_variables.as_ref(),
+        child_ctx.info_flag,
+    )?;
     let max = resolved_model.max_input_tokens().unwrap_or(usize::MAX);
     let tokens = session.tokens();
     if tokens <= max {
-        return Ok(session);
+        return Ok((session, resumed));
     }
     if child_ctx.session.is_some() {
         bail!("internal error: the child context already holds a session before '{id}' is loaded");
@@ -2125,7 +2289,7 @@ async fn load_and_gate(
                     resolved_model.id()
                 );
             }
-            Ok(session)
+            Ok((session, resumed))
         }
         Err(err) => bail!(
             "'{id}' holds ~{tokens} tokens, over the {} window ({max}) and could not be compressed ({err:#}) - spawn fresh",
@@ -2357,8 +2521,12 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
             Supervisor::new(max_concurrent_agents, max_depth).with_max_concurrent_jobs(max_jobs),
         )));
     }
-    // On a resume the stored variables win, so the provided ones only
-    // serve the equality check made when the session is loaded.
+    // A resume resolves the provided variables against the stored ones when
+    // the session is loaded.
+    let explicit_keys: Vec<String> = variables
+        .as_ref()
+        .map(|provided| provided.keys().cloned().collect())
+        .unwrap_or_default();
     if requested_session_id.is_none()
         && let Some(provided) = variables.take()
     {
@@ -2455,7 +2623,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
                 &prompt,
                 task_id,
             );
-            seat_child_session(ctx, &mut child_ctx, &root, &meta)?;
+            seat_child_session(ctx, &mut child_ctx, &root, &meta, explicit_keys)?;
             Some(session_id)
         }
         (None, None) if seat_session => {
@@ -4525,7 +4693,7 @@ mod tests {
         assert_eq!(
             chain,
             format!(
-                "agent '{agent_name}': `inputs:` is empty; a config agent takes only its declared variables as `inputs:`"
+                "agent '{agent_name}': `inputs:` is empty and agent '{agent_name}' has no graph.yaml; a config agent takes only its declared variables as `inputs:`"
             )
         );
     }
@@ -4550,7 +4718,7 @@ mod tests {
         assert_eq!(
             chain,
             format!(
-                "agent '{agent_name}': `inputs` names undeclared variable(s) cadence, worktree; a config agent takes only its declared variables as `inputs:`"
+                "agent '{agent_name}': `inputs` names variable(s) agent '{agent_name}' does not declare: cadence, worktree; a config agent takes only its declared variables as `inputs:`"
             )
         );
     }
@@ -4589,6 +4757,81 @@ mod tests {
                 "agent '{agent_name}': `inputs.previous_turns` is reserved (the dispatcher seeds it)"
             )
         );
+    }
+
+    /// The `inputs` errors the validator reports for agent node `a` calling
+    /// `agent_name`, location prefix stripped.
+    fn validator_inputs_errors(agent_name: &str, inputs: &str) -> Vec<String> {
+        let yaml = format!(
+            "name: parent\nstart: a\nnodes:\n  a:\n    id: a\n    type: agent\n    agent: {agent_name}\n    prompt: hi\n    inputs: {inputs}\n    next: end\n  end:\n    id: end\n    type: end\n    output: done\n"
+        );
+        let dir = paths::agent_data_dir("parent");
+        let graph = graph::GraphParser::new(&dir)
+            .load_from_string(&yaml)
+            .unwrap();
+        graph::validator::GraphValidator::new(&dir)
+            .validate(&graph)
+            .errors
+            .into_iter()
+            .filter_map(|e| {
+                e.message
+                    .strip_prefix("agent node 'a': ")
+                    .filter(|body| body.starts_with("`inputs"))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_and_validator_report_the_same_inputs_errors() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let config_agent = unique_agent_name("test_inputs_parity_config");
+        write_config_agent_with_setting(
+            &config_agent,
+            "variables:\n  - name: project_dir\n    description: d\n    default: ''",
+        );
+        let graph_agent = unique_agent_name("test_inputs_parity_graph");
+        write_graph_agent(&graph_agent);
+        let cases = [
+            (&config_agent, "{}", HashMap::new()),
+            (
+                &config_agent,
+                "{project_dir: /wt, worktree: /wt, cadence: per-task}",
+                HashMap::from([
+                    ("project_dir".to_string(), json!("/wt")),
+                    ("worktree".to_string(), json!("/wt")),
+                    ("cadence".to_string(), json!("per-task")),
+                ]),
+            ),
+            (
+                &config_agent,
+                "{initial_prompt: x, project_dir: /wt}",
+                HashMap::from([
+                    ("initial_prompt".to_string(), json!("x")),
+                    ("project_dir".to_string(), json!("/wt")),
+                ]),
+            ),
+            (
+                &graph_agent,
+                "{previous_turns: x}",
+                HashMap::from([("previous_turns".to_string(), json!("x"))]),
+            ),
+        ];
+
+        for (agent_name, yaml_inputs, runtime_inputs) in cases {
+            let chain = run_agent_for_graph_error(agent_name, Some(runtime_inputs));
+            let runtime_body = chain
+                .strip_prefix(&format!("agent '{agent_name}': "))
+                .unwrap_or(&chain)
+                .to_string();
+
+            assert_eq!(
+                validator_inputs_errors(agent_name, yaml_inputs),
+                [runtime_body],
+                "inputs {yaml_inputs} on '{agent_name}'"
+            );
+        }
     }
 
     /// The child ctx must carry the parent's session flag: a session already
@@ -4691,6 +4934,227 @@ mod tests {
         let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
 
         assert_eq!(output, "");
+    }
+
+    /// An agent node re-gives its `inputs:` on every run, so a child resumed
+    /// on a stored `agent_session` seats them over the values the session
+    /// stored, and the session records them as explicit.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_child_seats_the_node_inputs_over_the_stored_values() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_graph_child_resumed_inputs");
+        write_graph_agent_that_reports_build_lock(&agent_name);
+        let _session = crate::testing::EnvVarGuard::set(
+            crate::utils::normalize_env_name(&format!("{agent_name}_agent_session")),
+            "teammate",
+        );
+        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            "model: test-seeded:test-chat\n\
+             agent_variables:\n\
+             \x20 build_lock: stored\n\
+             explicit_variable_keys:\n\
+             \x20 - build_lock\n\
+             messages:\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+        let inputs = HashMap::from([("build_lock".to_string(), json!("from-inputs"))]);
+
+        let output = run_async(run_agent_for_graph(
+            &mut ctx,
+            &agent_name,
+            "hi",
+            Some(inputs),
+        ))
+        .unwrap();
+
+        assert_eq!(output, "from-inputs");
+    }
+
+    /// A node input that re-seats a resumed `agent_session` variable
+    /// re-renders the prompt from it: the System row the child is sent
+    /// names the input, not the value the session was stored under.
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_child_re_renders_its_prompt_from_the_node_inputs() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_graph_child_resumed_prompt");
+        write_config_agent_with_variables(&agent_name);
+        let _session = crate::testing::EnvVarGuard::set(
+            crate::utils::normalize_env_name(&format!("{agent_name}_agent_session")),
+            "teammate",
+        );
+        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            "model: test-seeded:test-chat\n\
+             agent_variables:\n\
+             \x20 tone: calm\n\
+             \x20 who: them\n\
+             agent_instructions: Say calm to them\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: Say calm to them\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+        let inputs = HashMap::from([("tone".to_string(), json!("loud"))]);
+
+        let output = run_async(run_agent_for_graph(
+            &mut ctx,
+            &agent_name,
+            "hi",
+            Some(inputs),
+        ))
+        .unwrap();
+
+        let (system, users) = system_and_users(&output);
+        assert!(system.starts_with("Say loud to them"), "{system}");
+        assert_eq!(users, ["earlier", "hi"], "{output}");
+    }
+
+    /// A stored default is no answer the node gave, so when the node leaves
+    /// the key out the value the parent hands down replaces it.
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_child_seats_an_inherited_value_over_a_stored_default() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_graph_child_resumed_inherited");
+        write_config_agent_with_variables(&agent_name);
+        let _session = crate::testing::EnvVarGuard::set(
+            crate::utils::normalize_env_name(&format!("{agent_name}_agent_session")),
+            "teammate",
+        );
+        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            "model: test-seeded:test-chat\n\
+             agent_variables:\n\
+             \x20 tone: calm\n\
+             \x20 who: them\n\
+             explicit_variable_keys: []\n\
+             agent_instructions: Say calm to them\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: Say calm to them\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "tone".to_string(),
+            "loud".to_string(),
+        )]));
+        let inputs = HashMap::from([("who".to_string(), json!("you"))]);
+
+        let output = run_async(run_agent_for_graph(
+            &mut ctx,
+            &agent_name,
+            "hi",
+            Some(inputs),
+        ))
+        .unwrap();
+
+        let (system, _) = system_and_users(&output);
+        assert!(system.starts_with("Say loud to you"), "{system}");
+    }
+
+    /// A first run on an `agent_session` records the node inputs that name
+    /// declared variables as the session's explicit keys; a graph agent's
+    /// other inputs are state keys, not variables.
+    #[test]
+    fn a_first_agent_session_run_records_the_declared_node_inputs_as_explicit() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            variables: vec![AgentVariable {
+                name: "build_lock".to_string(),
+                description: String::new(),
+                default: None,
+                value: String::new(),
+            }],
+            ..AgentConfig::default()
+        }));
+        ctx.session = Some(Session::default());
+        let inputs = AgentVariables::from([
+            ("build_lock".to_string(), "from-inputs".to_string()),
+            ("topic".to_string(), "state only".to_string()),
+        ]);
+
+        assert!(!reseat_agent_session_variables(&mut ctx, &inputs).unwrap());
+
+        assert_eq!(
+            ctx.session.as_ref().unwrap().explicit_variable_keys(),
+            ["build_lock"]
+        );
+    }
+
+    /// A resumed `agent_session` child hands its own children what a fresh
+    /// seat would: the inherited variables overlaid with its explicit ones.
+    #[test]
+    fn a_resumed_agent_session_child_hands_down_the_inherited_map_overlaid_with_its_explicit_values()
+     {
+        let declared = ["tone", "who"].map(|name| AgentVariable {
+            name: name.to_string(),
+            description: String::new(),
+            default: Some("calm".to_string()),
+            value: String::new(),
+        });
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            variables: declared.to_vec(),
+            ..AgentConfig::default()
+        }));
+        ctx.session = Some(
+            serde_yaml::from_str(
+                "model: test-seeded:test-chat\n\
+                 agent_variables:\n\
+                 \x20 tone: calm\n\
+                 \x20 who: stored\n\
+                 explicit_variable_keys:\n\
+                 \x20 - who\n\
+                 messages:\n\
+                 \x20 - role: user\n\
+                 \x20   content: earlier\n",
+            )
+            .unwrap(),
+        );
+        ctx.agent_variables = Some(AgentVariables::from([
+            ("tone".to_string(), "loud".to_string()),
+            ("project_dir".to_string(), "/wt".to_string()),
+        ]));
+        let inputs = AgentVariables::from([("tone".to_string(), "quiet".to_string())]);
+
+        assert!(reseat_agent_session_variables(&mut ctx, &inputs).unwrap());
+
+        assert_eq!(
+            ctx.agent_variables,
+            Some(AgentVariables::from([
+                ("tone".to_string(), "quiet".to_string()),
+                ("who".to_string(), "stored".to_string()),
+                ("project_dir".to_string(), "/wt".to_string()),
+            ]))
+        );
     }
 
     /// The other half of the inheritance rule: `handle_spawn` builds its
@@ -7062,10 +7526,13 @@ mod tests {
             "{description}"
         );
         let variables = properties["variables"].description.as_deref().unwrap();
-        assert!(
-            variables.contains("must equal the stored ones"),
-            "{variables}"
-        );
+        for phrase in [
+            "A key the agent does not declare is refused; declare it under the agent's `variables:` to receive it.",
+            "On a `session_id` resume a value given explicitly at an earlier spawn must equal the stored one (omitted = stored); a mismatch is refused.",
+            "Inherited values and declared defaults re-resolve on resume, and a value for any other declared key is accepted.",
+        ] {
+            assert!(variables.contains(phrase), "{variables}");
+        }
         assert!(!variables.contains("take precedence"), "{variables}");
         assert_eq!(
             declaration.parameters.required.as_deref(),
@@ -7532,7 +7999,11 @@ mod tests {
         assert_eq!(session.agent_variables().get("who").unwrap(), "them");
         assert_eq!(
             child_ctx.agent_variables.as_ref(),
-            Some(session.agent_variables())
+            Some(&AgentVariables::from([(
+                "tone".to_string(),
+                "loud".to_string()
+            )])),
+            "the child hands down its explicit value, not the default it stored"
         );
         assert_eq!(session.model().id(), ctx.current_model().id());
         assert_eq!(session.name(), sid);
@@ -7558,6 +8029,170 @@ mod tests {
             read_to_string(&path)
                 .unwrap()
                 .contains(&format!("model: {}", ctx.current_model().id()))
+        );
+    }
+
+    /// The `tone` a resumed config child is seated with, the variables it
+    /// hands its own children, and the stored keys recorded as explicit.
+    fn resumed_tone(
+        ctx: &mut RequestContext,
+        args: Value,
+    ) -> (String, Option<AgentVariables>, serde_yaml::Value) {
+        let spawn = build_ready_spawn(ctx, args);
+        let sid = spawn.session_id.clone().unwrap();
+        let tone = spawn.child_ctx.agent.as_ref().unwrap().variables()["tone"].clone();
+        let handed_down = spawn.child_ctx.agent_variables.clone();
+        let stored: serde_yaml::Value = read_yaml(&spawner_root(ctx).child_session_file(&sid));
+        (tone, handed_down, stored["explicit_variable_keys"].clone())
+    }
+
+    /// A default stored on the first run is no answer the spawner gave, so a
+    /// resume re-resolves it and the value the spawner now inherits wins.
+    #[test]
+    #[serial]
+    fn resume_seats_the_inherited_value_over_a_stored_default() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_inherited_over_default");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "tone".to_string(),
+            "loud".to_string(),
+        )]));
+
+        let (tone, handed_down, explicit) = resumed_tone(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(tone, "loud");
+        assert_eq!(handed_down, ctx.agent_variables);
+        assert_eq!(explicit, serde_yaml::Value::Sequence(Vec::new()));
+    }
+
+    /// A resume that re-seats a variable re-renders the prompt from it, so
+    /// the instructions and the stored System row name the new value rather
+    /// than the one the session was stored under.
+    #[test]
+    #[serial]
+    fn resume_re_renders_the_prompt_from_the_re_seated_variables() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_re_renders_prompt");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "tone".to_string(),
+            "loud".to_string(),
+        )]));
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        assert!(
+            session.agent_instructions().starts_with("Say loud to them"),
+            "{}",
+            session.agent_instructions()
+        );
+        let head = &session.messages()[0];
+        assert!(head.role.is_system(), "{head:?}");
+        assert!(
+            head.content.to_text().starts_with("Say loud to them"),
+            "{head:?}"
+        );
+    }
+
+    /// A value given at spawn is the spawner's answer and outlives a resume
+    /// that omits it, even over a different inherited value, and the
+    /// child's own children inherit it the way a fresh spawn hands it down.
+    #[test]
+    #[serial]
+    fn resume_keeps_an_explicit_value_over_a_different_inherited_one() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_explicit_over_inherited");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+        ctx.agent_variables = Some(AgentVariables::from([
+            ("tone".to_string(), "quiet".to_string()),
+            ("project_dir".to_string(), "/wt".to_string()),
+        ]));
+
+        let (tone, handed_down, explicit) = resumed_tone(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(tone, "loud");
+        assert_eq!(
+            handed_down,
+            Some(AgentVariables::from([
+                ("tone".to_string(), "loud".to_string()),
+                ("project_dir".to_string(), "/wt".to_string()),
+            ]))
+        );
+        assert_eq!(
+            explicit,
+            serde_yaml::from_str::<serde_yaml::Value>("[tone]").unwrap()
+        );
+    }
+
+    /// A session stored before explicit keys were recorded reads as all
+    /// explicit, so a resume keeps every stored value as it did then.
+    #[test]
+    #[serial]
+    fn resume_of_a_session_without_explicit_keys_keeps_the_stored_values() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_legacy_variables");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let path = spawner_root(&ctx).child_session_file(&sid);
+        let mut stored: serde_yaml::Mapping = read_yaml(&path);
+        stored.remove("explicit_variable_keys");
+        write(&path, serde_yaml::to_string(&stored).unwrap()).unwrap();
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "tone".to_string(),
+            "loud".to_string(),
+        )]));
+
+        let (tone, _, explicit) = resumed_tone(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(tone, "calm");
+        assert_eq!(
+            explicit,
+            serde_yaml::from_str::<serde_yaml::Value>("[tone, who]").unwrap()
+        );
+    }
+
+    /// Only a stored explicit value pins a resume; a provided value for a
+    /// key the first run defaulted is accepted, wins, and is explicit from
+    /// then on.
+    #[test]
+    #[serial]
+    fn resume_accepts_a_provided_value_for_a_key_stored_from_its_default() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_provided_over_default");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+
+        let (tone, _, explicit) = resumed_tone(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid, "variables": {"tone": "loud"}}),
+        );
+
+        assert_eq!(tone, "loud");
+        assert_eq!(
+            explicit,
+            serde_yaml::from_str::<serde_yaml::Value>("[tone]").unwrap()
         );
     }
 
@@ -9613,6 +10248,54 @@ mod tests {
         provided.insert("tone".into(), "loud".into());
         assert_eq!(differing_variables(&provided, &stored), ["who"]);
         assert!(differing_variables(&AgentVariables::new(), &stored).is_empty());
+    }
+
+    #[test]
+    fn resolve_resumed_variables_ranks_explicit_stored_explicit_inherited_default_stored() {
+        let variables = |pairs: &[(&str, &str)]| -> AgentVariables {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        let declared: Vec<AgentVariable> = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|name| AgentVariable {
+                name: name.to_string(),
+                description: String::new(),
+                default: matches!(name, "a" | "b" | "c" | "d").then(|| "default".to_string()),
+                value: String::new(),
+            })
+            .collect();
+        let explicit = variables(&[("a", "explicit")]);
+        let stored = variables(&[
+            ("a", "stored"),
+            ("b", "stored"),
+            ("c", "stored"),
+            ("d", "stored"),
+            ("e", "stored"),
+        ]);
+        let stored_explicit = ["a".to_string(), "b".to_string()];
+        let inherited = variables(&[("a", "inherited"), ("b", "inherited"), ("c", "inherited")]);
+
+        let resolved = resolve_resumed_variables(
+            &declared,
+            &explicit,
+            &stored,
+            &stored_explicit,
+            Some(&inherited),
+        );
+
+        assert_eq!(
+            resolved,
+            variables(&[
+                ("a", "explicit"),
+                ("b", "stored"),
+                ("c", "inherited"),
+                ("d", "default"),
+                ("e", "stored"),
+            ])
+        );
     }
 
     #[test]
@@ -12975,7 +13658,7 @@ mod tests {
             .unwrap();
         let prepare_marked_at = build.find(marker).unwrap();
         let seated_at = build
-            .find("seat_child_session(ctx, &mut child_ctx, &root, &meta)?;")
+            .find("seat_child_session(ctx, &mut child_ctx, &root, &meta, explicit_keys)?;")
             .unwrap();
         let input_at = build
             .find("Input::from_str(&child_ctx, &prompt, None)")
@@ -15050,6 +15733,9 @@ mod tests {
             paths::agent_sessions_dir(&agent_name).join("teammate.yaml"),
             format!(
                 "model: test-seeded:test-chat\n\
+                 agent_variables:\n\
+                 \x20 tone: loud\n\
+                 \x20 who: them\n\
                  agent_instructions: {stored:?}\n\
                  messages:\n\
                  \x20 - role: system\n\
@@ -16369,8 +17055,12 @@ mod tests {
         let provided = AgentVariables::from([("typo".to_string(), "x".to_string())]);
 
         let err = validate_spawn_variables("coder", &declared, &provided).unwrap_err();
-        assert!(err.contains("typo"));
-        assert!(err.contains("pr (PR number)"));
+        assert_eq!(
+            err,
+            "Unknown variable(s) [\"typo\"] for agent 'coder'. Declared variables: pr (PR number). \
+             A child receives only the variables it declares: to pass another, declare it under \
+             the `variables:` of agent 'coder'."
+        );
     }
 
     #[test]
@@ -16379,7 +17069,11 @@ mod tests {
 
         let err = validate_spawn_variables("coder", &[], &provided).unwrap_err();
 
-        assert!(err.contains("declares no variables"));
+        assert_eq!(
+            err,
+            "Agent 'coder' declares no variables; remove the 'variables' argument, or declare \
+             them under the `variables:` of agent 'coder' to receive them."
+        );
     }
 
     #[test]
