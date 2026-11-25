@@ -5054,8 +5054,9 @@ def integrate_route(state):
     note_script_error(state, u, "integrate_findings")
     fus = list(as_list(state.get("follow_ups")))
     for f in as_list(state.get("integration_follow_ups")):
-        if isinstance(f, str) and f.strip() and f not in fus:
-            fus.append(f"(integration) {f}")
+        line = f"(integration) {f}" if isinstance(f, str) and f.strip() else ""
+        if line and line not in fus:
+            fus.append(line)
     u["follow_ups"] = fus
     amends = [a for a in as_list(state.get("integration_amendments")) if isinstance(a, str) and a.strip()]
     if amends and not truthy(state.get("integration_amended")):
@@ -5065,6 +5066,9 @@ def integrate_route(state):
         ledger(state, u, f"integrate: {len(amends)} plan amendment(s) -> amend_plan (re-seal)")
         u["_next"] = "amend_plan"
         return u
+    if amends:
+        u["follow_ups"] = fus + [line for line in (f"(integration) amendment not applied: {a}" for a in amends) if line not in fus]
+        ledger(state, u, f"integrate: {len(amends)} plan amendment(s) after this Phase F's one re-seal -> follow-ups")
     return _after_integration(state, u)
 
 
@@ -5179,7 +5183,9 @@ def retro_route(state):
             snapshot(state, u, f"phase_f retro {tid}")
             for line in lines:
                 log_event(state, task, line)
-            u.update({"integration_checked": False, "_next": "select_tasks"})
+            # the second Phase F pass judges integration afresh; retro_done keeps it from looping
+            u.update({"integration_checked": False, "integration_amended": False, "integration_follow_ups": [],
+                      "integration_amendments": [], "_next": "select_tasks"})
             task_line = f"refactor task {tid}"
             ledger(state, u, f"design retrospective: {len(adopted)} item(s) adopted -> {tid} ({RETRO_TITLE}); integration re-runs after it")
         else:

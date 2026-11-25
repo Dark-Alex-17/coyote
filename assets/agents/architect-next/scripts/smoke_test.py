@@ -3865,6 +3865,29 @@ def _retro_preambled():
     return any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report")
 
 
+def _retro_rearm_integration():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                       retro_follow_ups=[], retro_done=True, integration_checked=True, integration_amended=True,
+                                       integration_follow_ups=["flaky test"], integration_amendments=["Split the API"]))
+    return (u["_next"] == "select_tasks" and u.get("integration_amended") is False and u.get("integration_follow_ups") == []
+            and u.get("integration_amendments") == []), {k: u.get(k) for k in ("integration_amended", "integration_follow_ups",
+                                                                             "integration_amendments")}
+
+
+def _integrate_blocked_amendments():
+    u = gates.integrate_route(_retro_large(retro_done=True, integration_amended=True, integration_amendments=["Split the API"],
+                                           follow_ups=[]))
+    return (u["_next"] == "hygiene_create" and "(integration) amendment not applied: Split the API" in u["follow_ups"]
+            and any("plan amendment(s) after this Phase F's one re-seal -> follow-ups" in d for d in u["decisions"])), (
+        u.get("_next"), u.get("follow_ups"))
+
+
+def _integrate_follow_up_dedup():
+    u = gates.integrate_route(_retro_large(retro_done=True, follow_ups=["(integration) flaky test"],
+                                           integration_follow_ups=["flaky test"]))
+    return u["follow_ups"] == ["(integration) flaky test"], u.get("follow_ups")
+
+
 def _parse_report_retro_follow_up():
     st = dict(SN_STATE, follow_ups=["Design retrospective: One table", "rotate the widget key before merge"],
               retro_report=["- ran: DESIGN_RETROSPECTIVE: REFACTORS 1"])
@@ -3874,6 +3897,9 @@ def _parse_report_retro_follow_up():
             and parsed["design"] == ["introduced a WidgetStore trait in src/a.rs"]), (p.stderr[-300:], parsed)
 
 
+guarded("retro_route: adopting re-arms the whole integration step, the one amendment round included", _retro_rearm_integration)
+guarded("integrate_route: amendments past the one re-seal become follow-ups, never dropped", _integrate_blocked_amendments)
+guarded("integrate_route: an integration follow-up already listed is not listed twice", _integrate_follow_up_dedup)
 guarded("_parse_report: a FOLLOW-UPS bullet starting with Design retrospective stays in FOLLOW-UPS", _parse_report_retro_follow_up)
 
 
