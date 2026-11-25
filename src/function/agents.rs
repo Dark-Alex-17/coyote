@@ -1842,7 +1842,13 @@ fn resume_variables(
         &explicit_keys,
         inherited,
     );
-    let seated = Agent::init_agent_variables(declared, Some(&resolved), no_interaction, false)?;
+    let seated = Agent::init_agent_variables(
+        declared,
+        Some(&resolved),
+        no_interaction,
+        false,
+        &crate::prompt::HeadlessPrompter,
+    )?;
     for key in declared_keys(declared, explicit) {
         if !explicit_keys.contains(key) {
             explicit_keys.push(key.clone());
