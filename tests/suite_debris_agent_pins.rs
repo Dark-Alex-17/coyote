@@ -267,7 +267,7 @@ fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
 
     let architect = agent_file("architect/instructions.md");
     let start = architect
-        .find("2. **Run-closing hygiene pass.**")
+        .find("3. **Run-closing hygiene pass.**")
         .expect("architect has the run-closing hygiene step");
     let end = architect[start..]
         .find("Verification: run the review gauntlet")
