@@ -131,9 +131,9 @@ fi
 # restore_rewritten puts back the bytes every path fmt touched had before it
 # ran: dirty paths from the copies under $saved, clean tracked ones from the
 # index, and files fmt created are removed. Sets REWRITTEN to those paths.
-# Untracked directories that were already dirty (a moved submodule, an
-# untracked nested repository) hold no bytes of their own and are skipped; a
-# tracked submodule fmt dirtied still counts as rewritten.
+# Untracked directories that were already dirty (an untracked nested
+# repository) hold no bytes of their own and are skipped; a tracked submodule
+# fmt dirtied still counts as rewritten.
 restore_rewritten() {
   local path
   REWRITTEN=()
