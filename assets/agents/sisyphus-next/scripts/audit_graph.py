@@ -44,6 +44,8 @@ BOUNDED = {
                     "code changed or could not be verified",
     "route_gauntlet": "B11 debris_reruns<=1",
     "observability_route": "B12 obs_rounds<=1",
+    "retro_route": "retro_done once per run: set before retro_size, so the refactor round's own green review goes on to "
+                   "the observability pass",
     "ask_owner_route": "B13 owner_polls<=2",
     "parse_answer": "B14 reask_rounds<=3 per escalation, not reset by apply_answer's APPLY_REASK_MAX re-asks",
     "interpret_route": ("one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask; an "

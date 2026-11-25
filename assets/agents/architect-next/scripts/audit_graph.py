@@ -62,6 +62,8 @@ BOUNDED = {
     "checklist_gate": "checklist_done list-bounded",
     "hygiene_create": "hygiene_units list-bounded (hygiene_done)",
     "integrate_route": "integration_amended once per Phase F",
+    "retro_route": "retro_done once per run: set before run_retrospective, so the refactor task's own Phase F pass goes "
+                   "on to hygiene_create",
     "fix_done": "returns to a bounded loop",
     "stack_gate": "linked_chains once per chain",
 }

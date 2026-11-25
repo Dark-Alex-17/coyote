@@ -309,7 +309,13 @@ def walk(combo, gates, graph, world, log):
         if nid == "batch_triage":
             return {"finding_routes": [], "anomalies": []}
         if nid == "integrate_findings":
-            return {"integration_amendments": [], "integration_follow_ups": ["rotate the widget key (post-merge)"], "integration_notes": [], "anomalies": []}
+            return {"integration_amendments": [], "integration_follow_ups": ["rotate the widget key (post-merge)"], "integration_notes": [],
+                    "retro_large": True, "retro_large_reason": "a new widget service other code builds on", "anomalies": [],
+                    "last_node_output": '{"retro_large": true}'}
+        if nid == "run_retrospective":
+            return {"retro_result": "DESIGN_RETROSPECTIVE: CLEAN\n\n## Choices I would make again\n- one owner per widget seam\n"}
+        if nid == "retro_triage":
+            return {"retro_adopted": [], "retro_declined": [], "retro_follow_ups": [], "anomalies": []}
         if nid == "pr_summary":
             return {"pr_summary_text": "Widgets were missing; we added them.", "anomalies": []}
         if nid == "pr_body_fix":
@@ -551,6 +557,10 @@ def walk_combinations(tmp_home):
             problems.append("autonomous report lacks the digest")
         if not single and STACK_LINKING and "## Stacks" not in rep:
             problems.append("multi report lacks the stacks section")
+        if ("run_retrospective" in visited) != single:
+            problems.append(f"run_retrospective visited={'run_retrospective' in visited} for single={single}")
+        if "## Design retrospective" not in rep:
+            problems.append("report lacks the design retrospective section")
         check(f"combo [{label}]", not problems, " | ".join(problems))
         shutil.rmtree(world.tmp, ignore_errors=True)
 

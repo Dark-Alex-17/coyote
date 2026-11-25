@@ -374,6 +374,15 @@ initial_state:
   integration_follow_ups: []
   integration_amendments: []
   integration_amended: false
+  retro_large: false
+  retro_large_reason: ''
+  retro_done: false
+  retro_prompt: ''
+  retro_result: ''
+  retro_adopted: []
+  retro_declined: []
+  retro_follow_ups: []
+  retro_report: []
   hygiene_units: []
   hygiene_done: []
   hygiene_skipped: false
@@ -1478,7 +1487,7 @@ nodes:
     id: delegate
     type: agent
     agent: sisyphus-next
-    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag, project directory, escalation policy and build lock ride `inputs:`.
+    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag, project directory, escalation policy and build lock ride `inputs:`, and the `retrospective` input `parent` leaves the design retrospective to this run's close.
     prompt: |
       {{delegation_prompt}}
     inputs:
@@ -1487,6 +1496,7 @@ nodes:
       project_dir: '{{delegate_project_dir}}'
       escalation_policy: '{{escalation_policy}}'
       build_lock: '{{build_lock}}'
+      retrospective: 'parent'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1756,6 +1766,7 @@ nodes:
       review_cadence: '{{wtask.review_cadence}}'
       escalation_policy: '{{escalation_policy}}'
       build_lock: '{{build_lock}}'
+      retrospective: 'parent'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -2400,6 +2411,15 @@ nodes:
       - integration_follow_ups: items that are real but out of scope now
         (WHAT, WHERE, WHY, WHEN) - ledgered, never dropped.
       - integration_notes: what you dismissed and why (one line each).
+      - retro_large: whether the run as a whole is a large body of work, one
+        whose design deserves a run-closing retrospective: would the same
+        choices be made again to prioritise maintainability, cleanliness and
+        reuse? Examples of large: a new module or subsystem, several modules
+        changed together, a new abstraction or protocol, a change other code
+        will be built on. They are examples to prompt judgement, not a
+        threshold and not a list to match. Neither answer is the default when
+        unsure: weigh the plan and what landed, and decide.
+      - retro_large_reason: ONE line naming the evidence for that call.
       - anomalies: anything new you noticed.
       You may read the plan, the run directory artifacts and the repo with the tools.
     prompt: |
@@ -2435,10 +2455,12 @@ nodes:
         integration_notes:
           type: array
           items: { type: string }
+        retro_large: { type: boolean }
+        retro_large_reason: { type: string }
         anomalies:
           type: array
           items: { type: string }
-      required: [integration_amendments, integration_follow_ups]
+      required: [integration_amendments, integration_follow_ups, retro_large, retro_large_reason]
     state_updates:
       last_node_output: '{{output}}'
     fallback: integrate_route
@@ -2447,8 +2469,87 @@ nodes:
   integrate_route:
     id: integrate_route
     type: script
-    description: Amendments -> amend_plan (re-seal, once per Phase F); follow-ups -> ledger; else hygiene.
+    description: Amendments -> amend_plan (re-seal, once per Phase F); follow-ups -> ledger; at run close a large run -> run_retrospective (once per run); else hygiene.
     script: scripts/integrate_route.py
+    fallback: end_failure
+
+  run_retrospective:
+    id: run_retrospective
+    type: agent
+    agent: design-retrospective
+    description: The read-only design retrospective over the whole run diff; refactor items, never a verdict.
+    prompt: |
+      {{retro_prompt}}
+    inputs:
+      project_dir: '{{code_repo_path}}'
+    timeout: 3600
+    max_attempts: 1
+    state_updates:
+      retro_result: '{{output}}'
+    fallback: retro_triage
+    next: retro_triage
+
+  retro_triage:
+    id: retro_triage
+    type: llm
+    description: Adopt or decline each refactor item the retrospective proposed; the script routes on the result.
+    instructions: |
+      You decide what happens to each refactor item of a design retrospective
+      over a run whose tasks have all passed their reviews. Each item is your
+      judgement:
+      - retro_adopted: items that are behaviour-preserving and within the
+        plan's agreed scope; together they become ONE refactor task the run
+        implements and reviews like any other task. Carry the item's title
+        and better shape.
+      - retro_declined: an item not worth doing here, each with a CONCRETE
+        reason (evidence such as file:line, a recorded convention or plan
+        decision, or why the better shape is not better for this code). No
+        bare declines.
+      - retro_follow_ups: items too large for this run, or that would change
+        the plan's agreed interface or scope; the user owns those decisions,
+        so these are reported, never implemented.
+      A CLEAN retrospective, or one that failed or returned no items, gives
+      three empty lists.
+    prompt: |
+      ## Design retrospective
+      {{retro_result}}
+
+      ## Plan
+      {{plan_path}}
+    tools: [fs_read]
+    max_iterations: 10
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        retro_adopted:
+          type: array
+          items: { type: string }
+        retro_declined:
+          type: array
+          items:
+            type: object
+            properties:
+              item: { type: string }
+              reason: { type: string }
+            required: [item, reason]
+        retro_follow_ups:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [retro_adopted, retro_declined, retro_follow_ups]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: retro_route
+    next: retro_route
+
+  retro_route:
+    id: retro_route
+    type: script
+    description: Route on the DESIGN_RETROSPECTIVE line - a fault is noted and the run goes on; declines ledgered as retro-declined; follow-ups reported; adopted items -> ONE pending chore task blocked by the unit's tasks, integration re-armed, -> select_tasks; else hygiene.
+    script: scripts/retro_route.py
     fallback: end_failure
 
   hygiene_create:

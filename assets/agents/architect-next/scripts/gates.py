@@ -1746,7 +1746,7 @@ def _relay_escalation(state, task, d):
 def _parse_report(text):
     """The sisyphus report sections the architect ledgers; a section ends at the next one or at any markdown heading."""
     def sec(name):
-        m = re.search(rf"(?ims)^\W*{name}\s*:?\s*\n(.*?)(?=^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions|Decisions taken autonomously|Sisyphus run id)\b|^\#{{1,6}}\s|\Z)", text)
+        m = re.search(rf"(?ims)^\W*{name}\s*:?\s*\n(.*?)(?=^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions|Design retrospective|Decisions taken autonomously|Sisyphus run id)\b|^\#{{1,6}}\s|\Z)", text)
         if not m:
             m2 = re.search(rf"(?im)^\W*{name}\s*:\s*(.+)$", text)
             return [m2.group(1).strip()] if m2 and m2.group(1).strip().lower() not in ("none", "- none") else []
@@ -5044,6 +5044,9 @@ def integration_check(state):
 def integrate_route(state):
     u = {}
     harvest_anomalies(state, u, "integrate_findings")
+    out = state.get("last_node_output")
+    if not (isinstance(out, str) and out.lstrip().startswith("{") and isinstance(state.get("retro_large"), bool)):
+        u.update({"retro_large": False, "retro_large_reason": RETRO_UNJUDGED})
     note_script_error(state, u, "integrate_findings")
     fus = list(as_list(state.get("follow_ups")))
     for f in as_list(state.get("integration_follow_ups")):
@@ -5058,7 +5061,100 @@ def integrate_route(state):
         ledger(state, u, f"integrate: {len(amends)} plan amendment(s) -> amend_plan (re-seal)")
         u["_next"] = "amend_plan"
         return u
+    return _after_integration(state, u)
+
+
+RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS \d+|CLEAN)$")
+RETRO_UNJUDGED = "no valid size judgement from integrate_findings"
+RETRO_TITLE = "Run-closing design refactor"
+
+
+def _after_integration(state, u):
+    """At run close, a large run goes through the one design retrospective before the hygiene pass."""
+    s = {**state, **u}
     u["_next"] = "hygiene_create"
+    if truthy(s.get("retro_done")) or (s.get("closeout_scope") or "run") != "run":
+        return u
+    u["retro_done"] = True
+    reason = " ".join(str(s.get("retro_large_reason") or "").split()) or "no reason given"
+    if not s.get("retro_large"):
+        u["retro_report"] = [f"- not run: {reason}" if reason == RETRO_UNJUDGED else f"- not run: not a large body of work ({reason})"]
+        ledger(state, u, f"design retrospective: not run ({reason})")
+        return u
+    if not (is_single(state) or MULTI_IS_GROUPS):
+        u["retro_report"] = [f"- not run: large ({reason}), but per-task PRs have no unit to carry a refactor task"]
+        ledger(state, u, "design retrospective: skipped; per-task PRs cannot carry a run-closing refactor task")
+        return u
+    code = state.get("code_repo_path", "")
+    base = state.get("unit_base_sha") or git_out(code, "merge-base", "--end-of-options",
+                                                 f"origin/{state.get('base_branch_name') or 'main'}", "HEAD", default="")
+    if not base:
+        u["retro_report"] = [f"- not run: large ({reason}), but the run base could not be resolved"]
+        ledger(state, u, "design retrospective: skipped; the run base could not be resolved")
+        return u
+    _, body = frontmatter(read_file(state.get("plan_path", "")))
+    goal = (plan_section(body, r"Problem") + "\n\n" + plan_section(body, r"Approach")).strip() or "(the plan states no Problem/Approach)"
+    u["retro_report"] = [f"- large body of work ({reason})"]
+    u["retro_prompt"] = "\n".join([
+        "Run-closing design retrospective.", f"Project: {code}", f"Diff: {base}..HEAD", f"What the work set out to do: {goal}",
+        f"Plans dir: {state.get('plans_root') or ''} (bookkeeping, not code under review)"])
+    ledger(state, u, f"design retrospective: large ({reason})")
+    u["_next"] = "run_retrospective"
+    return u
+
+
+def retro_route(state):
+    """Adopted refactor items become ONE chore task the normal task loop runs; anything else goes on to hygiene."""
+    u = {"retro_done": True, "_next": "hygiene_create"}
+    harvest_anomalies(state, u, "retro_triage")
+    note_script_error(state, u, "retro_triage")
+    report = list(as_list(state.get("retro_report")))
+    text = str(state.get("retro_result") or "").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    if not RETRO_SENTINEL_RE.match(first):
+        why = tail(first, 200) or "no output"
+        u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
+        ledger(state, u, f"design retrospective: faulted ({why}); run continues")
+        return u
+    adopted = [] if first.endswith("CLEAN") else [
+        " ".join(a.split()) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]
+    declined = [d for d in as_list(state.get("retro_declined")) if isinstance(d, dict) and str(d.get("item") or "").strip()]
+    later = [" ".join(f.split()) for f in as_list(state.get("retro_follow_ups")) if isinstance(f, str) and f.strip()]
+    lines = [f"retro-declined: {' '.join(str(d.get('item')).split())} -- {' '.join(str(d.get('reason') or '').split()) or 'no reason stated'}"
+             for d in declined]
+    for line in lines:
+        ledger(state, u, line)
+    task_line = "no refactor task"
+    if adopted:
+        tasks = as_list(state.get("tasks"))
+        unit = (_hygiene_units(state, tasks) or [{"id": "run", "members": []}])[0]
+        members = list(unit.get("members", []))
+        criteria = "".join(f"- {a}\n" for a in adopted) + "- Behaviour unchanged: the full build and test suite is green\n"
+        body = ("## What\n\nImplement the refactors the run-closing design retrospective proposed and the orchestrator adopted.\n\n"
+                "## Acceptance criteria\n\n" + criteria)
+        tid, tdir = new_task(state, "run-refactor", RETRO_TITLE, body, blocked_by=tuple(members), task_type="chore",
+                             plan_name=os.path.basename(state.get("plan_path", "")))
+        if tid:
+            ref = (task_by_id(tasks, members[-1]) if members else None) or {}
+            task = {"id": tid, "slug": os.path.basename(tdir), "dir": tdir, "title": RETRO_TITLE, "status": "pending",
+                    "blocked_by": members, "batch": "", "protected": False, "surfaces": "", "type": "chore", "files": [],
+                    "group": ref.get("group", ""), "unit": ref.get("unit", "run")}
+            tasks.append(task)
+            save_tasks(state, u, tasks)
+            for line in lines:
+                log_event(state, task, line)
+            u.update({"integration_checked": False, "_next": "select_tasks"})
+            task_line = f"refactor task {tid}"
+            ledger(state, u, f"design retrospective: {len(adopted)} item(s) adopted -> {tid} ({RETRO_TITLE}); integration re-runs after it")
+        else:
+            later += adopted
+            ledger(state, u, f"design retrospective: could not create the refactor task: {tail(tdir, 200)}; items become follow-ups")
+    report.append(f"- ran: {first}; {len(adopted)} item(s) adopted; {task_line}")
+    report += [f"- {line}" for line in lines]
+    if later:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"(design retrospective) {f}" for f in later]
+        report.append(f"- follow-ups: {len(later)} (listed under Deferred / follow-ups)")
+    u["retro_report"] = report
     return u
 
 
@@ -6274,6 +6370,7 @@ def final_report(state):
     L += ["## Review decisions"] + ([f"- {x}" for x in _collect(state, "rejected-finding:")] or ["- none"]) + [""]
     L += ["## Hygiene pass"] + ([f"- {x}" for x in _collect(state, "HYGIENE:")] or ["- clean" if (is_single(state) or MULTI_IS_GROUPS) else "- not required (standalone PRs) / clean"]) + [""]
     L += ["## Design decisions"] + ([f"- {x}" for x in _collect(state, "design-decision")] or ["- none"]) + [""]
+    L += ["## Design retrospective"] + (as_list(state.get("retro_report")) or ["- not run (the run did not reach its run close)"]) + [""]
     if changes := _verification_change_lines(state):
         L += ["## Verification command changes"] + changes + [""]
     deferred = _collect(state, "(deferred by quality bar)")
@@ -6332,7 +6429,7 @@ def reseal_return(state):
     if where == "verify":
         u["_next"] = "verify_gate"
     elif where == "phase_f":
-        u["_next"] = "hygiene_create"
+        _after_integration(state, u)
     elif as_list(state.get("tasks")):
         u["_next"] = "select_tasks"
     else:
@@ -6365,6 +6462,7 @@ GATES = {
     "choice_reply_route": choice_reply_route, "choice_reask": choice_reask, "choice_park": choice_park,
     "choice_resume": choice_resume, "interpret_route": interpret_route,
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
+    "retro_route": retro_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,
     "flip_ready": flip_ready, "review_poll": review_poll, "review_route": review_route, "review_apply": review_apply,
@@ -6388,7 +6486,7 @@ STATE_KEY_READERS = {
               "route_delegate", "verify_gate", "route_verdict", "post_round", "fix_done", "harvest_report", "debt_assign",
               "task_done_verify", "stack_gate", "task_done_route", "wave_claim", "wave_verify_build", "wave_integrate",
               "integration_test", "wave_cleanup", "batch_gauntlet_build", "batch_fix_route", "batch_close", "phase_f_gate",
-              "integration_check", "hygiene_create", "stack_gate_final", "pr_body", "open_pr", "ci_poll", "ci_apply", "flip_ready",
+              "integration_check", "retro_route", "hygiene_create", "stack_gate_final", "pr_body", "open_pr", "ci_poll", "ci_apply", "flip_ready",
               "review_poll", "review_route", "review_apply", "review_update", "finish_plan", "final_report", "group_closeout"),
 }
 

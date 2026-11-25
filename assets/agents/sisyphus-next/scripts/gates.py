@@ -3482,6 +3482,9 @@ def compose_fix(state):
                   "rule conventions (ordinary code changes; the usual review gates apply):", state.get("obs_coder_brief") or ""]
     elif src == "probe_gap":
         lines += ["Provide the local-run recipe / fixture the usage probe needs, as the user described:", note]
+    elif src == "retrospective":
+        lines += ["Implement these design-retrospective refactors (behaviour-preserving; adopted by the orchestrator):"]
+        lines += [f"- {item}" for item in as_list(state.get("fix_items"))]
     elif src == "plan_defect_fix":
         lines += ["The adversary reported the plan as the root cause; the reply ruled the plan is not at fault. Keep "
                   "every acceptance criterion as written and apply this change:", note]
@@ -4454,7 +4457,7 @@ def route_gauntlet(state):
             ledger(state, u, f"probe tests: adoption round {n} passed")
             u["_next"] = "pr_gate"
         else:
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
     else:
         real = [b for b in blockers if not review_fault(b)]
         _escalate_size(state, u, f"review round {n} BLOCKED: {real[0][:160]}" if real else
@@ -4699,7 +4702,109 @@ def triage_route(state):
                              evidence="\n".join(str(x.get("finding", "")) for x in escalations)[:2500])
         return raise_escalation(state, u, esc)
     ledger(state, u, "review: every blocker rejected with citation or deferred by the quality bar; proceeding")
-    u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+    _after_final_review(state, u)
+    return u
+
+
+# ====================================================================== design retrospective
+RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS \d+|CLEAN)$")
+RETRO_PARENT_NOTE = "the parent orchestrator runs the run-closing retrospective"
+
+
+def _retro_is_parents(state):
+    return str(var(state, "retrospective", "run")).strip().lower() == "parent"
+
+
+def _after_final_review(state, u):
+    """A green review goes on to the next subtask, the run's one design retrospective, or the observability pass."""
+    if _subtask_phase(state):
+        u["_next"] = "next_subtask"
+    elif truthy(state.get("retro_done")) or _retro_is_parents(state):
+        u["_next"] = "observability_gate"
+    else:
+        root = state.get("git_root") or state.get("project_dir") or "."
+        base = state.get("run_base_sha") or state.get("base_sha") or ""
+        u["retro_done"] = True
+        u["retro_diff_stat"] = tail(git_out(root, "diff", "--stat", base or "HEAD"), 3000)
+        u["_next"] = "retro_size"
+    return u
+
+
+def _retro_prompt(state):
+    root = state.get("git_root") or state.get("project_dir") or "."
+    base = state.get("run_base_sha") or state.get("base_sha") or ""
+    lines = ["Run-closing design retrospective.",
+             f"Project: {state.get('project_dir')}",
+             f"Diff: {base}..HEAD" if base else "Diff: worktree"]
+    if base and _code_tree_dirty(state, root):
+        lines.append(f"Tree state: the change is uncommitted in the worktree on top of {base}; read it with "
+                     f"`git diff {base}` as well as the commits.")
+    lines.append(f"What the work set out to do: {state.get('brief') or state.get('current_task') or ''}")
+    plans = _plans_path(state, state.get("project_dir") or root)
+    if os.path.isdir(plans):
+        lines.append(f"Plans dir: {plans} (bookkeeping, not code under review)")
+    return "\n".join(lines)
+
+
+def retro_size_route(state):
+    u = {}
+    harvest_anomalies(state, u, "retro_size")
+    out = state.get("last_node_output")
+    judged = isinstance(out, str) and out.lstrip().startswith("{") and isinstance(state.get("retro_large"), bool)
+    note_script_error(state, u, "retro_size")
+    reason = _whole_line(state.get("retro_large_reason")) or "no reason given"
+    if not judged:
+        u["retro_report"] = ["- not run (no valid size judgement; the run continued)"]
+        ledger(state, u, "design retrospective: no valid size judgement; not run, run continues")
+        u["_next"] = "observability_gate"
+    elif state.get("retro_large"):
+        u["retro_report"] = [f"- large body of work ({reason})"]
+        u["retro_prompt"] = _retro_prompt(state)
+        ledger(state, u, f"design retrospective: large ({reason})")
+        u["_next"] = "run_retrospective"
+    else:
+        u["retro_report"] = [f"- not run: not a large body of work ({reason})"]
+        ledger(state, u, f"design retrospective: not large ({reason})")
+        u["_next"] = "observability_gate"
+    return u
+
+
+def retro_route(state):
+    u = {"retro_done": True}
+    harvest_anomalies(state, u, "retro_triage")
+    note_script_error(state, u, "retro_triage")
+    report = list(as_list(state.get("retro_report")))
+    text = str(state.get("retro_result") or "").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    u["_next"] = "observability_gate"
+    if not RETRO_SENTINEL_RE.match(first):
+        why = tail(first, 200) or "no output"
+        u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
+        ledger(state, u, f"design retrospective: faulted ({why}); run continues")
+        return u
+    adopted = [] if first.endswith("CLEAN") else [
+        _whole_line(a) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]
+    declined = [d for d in as_list(state.get("retro_declined")) if isinstance(d, dict) and str(d.get("item") or "").strip()]
+    later = [_whole_line(f) for f in as_list(state.get("retro_follow_ups")) if isinstance(f, str) and f.strip()]
+    if adopted and as_int(state.get("review_rounds")) >= STRIKE_LIMIT:
+        ledger(state, u, f"design retrospective: review rounds spent; {len(adopted)} adopted item(s) become follow-ups")
+        later += adopted
+        adopted = []
+    report.append(f"- ran: {first}; {len(adopted)} item(s) adopted into a refactor round")
+    report += [f"- adopted: {a}" for a in adopted]
+    for d in declined:
+        line = f"retro-declined: {_whole_line(d.get('item'))} -- {_whole_line(d.get('reason')) or 'no reason stated'}"
+        ledger(state, u, line)
+        report.append(f"- {line}")
+    if later:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Design retrospective: {f}" for f in later]
+        report.append(f"- follow-ups: {len(later)} (listed under FOLLOW-UPS)")
+    u["retro_report"] = report
+    if adopted:
+        u["fix_items"] = adopted
+        u["fix_source"] = "retrospective"
+        ledger(state, u, f"design retrospective: {len(adopted)} refactor(s) adopted -> one coder round (review gates re-run)")
+        u["_next"] = "compose_fix"
     return u
 
 
@@ -6809,6 +6914,10 @@ def _assemble_report(state, u, pre_publish=False):
     lines += ["Debris exemptions:"] + ([f"- {e}" for e in ex] or ["- none"]) + [""]
     dd = as_list(g("design_decisions", []))
     lines += ["Design decisions:"] + ([f"- {d}" for d in dd] or ["- none"]) + [""]
+    retro = as_list(g("retro_report", []))
+    if not retro:
+        retro = [f"- not run ({RETRO_PARENT_NOTE if _retro_is_parents(state) else 'no green whole-task review reached it'})"]
+    lines += ["Design retrospective:"] + retro + [""]
     if g("observability_artifact"):
         lines += [g("observability_artifact"), ""]
     fus = list(as_list(g("follow_ups", []))) + list(as_list(g("deferred_findings", [])))
@@ -6891,6 +7000,7 @@ GATES = {
     "bookkeeping_route": bookkeeping_route, "review_gate": review_gate,
     "build_gauntlet_prompt": build_gauntlet_prompt, "route_gauntlet": route_gauntlet,
     "triage_route": triage_route, "observability_gate": observability_gate,
+    "retro_size_route": retro_size_route, "retro_route": retro_route,
     "observability_route": observability_route, "whetstone_gate": whetstone_gate, "pr_gate": pr_gate,
     "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply, "base_check": base_check,
     "pr_review_poll": pr_review_poll, "pr_review_route": pr_review_route, "pr_review_apply": pr_review_apply,
