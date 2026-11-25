@@ -346,6 +346,12 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
 1. **Claim it.** Per `task-tracking`: `status: in-progress`, log `started`. Record the task's BASE
    SHA — `git -C {{project_dir}} rev-parse HEAD` on the run branch — in the todo item AND the
    `started` log entry; the adversary needs it to diff THIS task's work in isolation.
+   Before the run's FIRST task, also record the RUN base once in a todo item:
+   `git -C {{project_dir}} merge-base {{base_branch}} HEAD` (with stacked group branches, the
+   group's GROUP BASE SHA). Every Sisyphus spawn passes it as `run_base`, and the final-tier
+   review passes it as `baseline_floor`, so a red full suite is only ever judged against the
+   suite at the commit the run started from, never against a later task's base that already
+   holds an earlier task's regressions.
 
 2. **Delegate the CODE work to ONE Sisyphus.** Load `delegation-protocol`, then spawn with a
    self-contained prompt — Sisyphus has NOT seen this conversation:
@@ -448,9 +454,10 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
    "
    ```
 
-   The spawn also passes `--variables {"build_lock": "{{build_lock}}", "finalize_owner": "parent"}` so Sisyphus forwards
+   The spawn also passes `--variables {"build_lock": "{{build_lock}}", "finalize_owner": "parent", "run_base": "<the RUN base>"}` so Sisyphus forwards
    it to its coder/step-runner and review gates (`""` is an accepted value and runs them bare),
-   and leaves the single full-suite run to this run's final-tier review.
+   anchors every coder's baseline at the RUN base, and leaves the single full-suite run to this
+   run's final-tier review.
 
    Record the returned `session_id` in the task's todo item immediately.
 
@@ -693,7 +700,7 @@ every batch member belongs to the group in flight.
   ({{project_dir}}/.worktrees/task-NNN) and the branch with the task branch. Sisyphus commits and
   pushes the TASK branch. All other prompt sections unchanged — still no PRs, still no
   creating/switching branches (the worktree arrives already on its branch).
-- Spawn each batch member with `--variables {"parallel": "1", "build_lock": "{{build_lock}}", "finalize_owner": "parent", "project_dir":
+- Spawn each batch member with `--variables {"parallel": "1", "build_lock": "{{build_lock}}", "finalize_owner": "parent", "run_base": "<the RUN base>", "project_dir":
   "{{project_dir}}/.worktrees/task-NNN"}` — the `parallel` variable renders the parallel-batch
   teamwork protocol into that Sisyphus's instructions (roster contract, scope-breach stop,
   worktree-removable discipline). A sequential or standalone Sisyphus is spawned WITHOUT it and
@@ -921,8 +928,9 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
      entry states which reason applies; the token is what lets the run-wide lint exit 0 once
      every surviving hit is justified. The final-tier review below runs the full suite.
    Verification: run the review gauntlet (Phase E step 4 template, but with
-   `"verification_tier": "final"`: this is the run's single full-suite, formatter and lint run,
-   on the tree the PR will carry, and it blocks without a green full-suite record) on the hygiene
+   `"verification_tier": "final"` and `"baseline_floor": "<the RUN base>"`: this is the run's
+   single full-suite, formatter and lint run, on the tree the PR will carry, a red suite is judged
+   only against the suite at the RUN base, and it blocks without a green full-suite record) on the hygiene
    task's own commits -- `Diff: <hygiene BASE SHA>..HEAD` -- with these two criteria pasted literally as
    the plan, introduced by the sentence "These two are the ONLY criteria:": "Behaviour
    unchanged: the full build and test suite is green and no production code
@@ -936,7 +944,9 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
    debris row only covers the hygiene
    commits, so add the lint command above (same `--exclude <plans rel>` rule; over `$base`,
    the RUN base, not the hygiene BASE SHA)
-   to that spawn's `verification_commands` variable: the run-wide lint is then a recorded
+   to that spawn's `verification_commands` variable, and declare nothing else there: the full
+   suite, formatter and lint come from the gauntlet's finalize record, while every declared
+   command still runs at this tier. The run-wide lint is then a recorded
    red/green run, green exactly when every surviving hit is justified and marked. A red run
    whose tail starts `debris: error:` is an environment fault (bad spec, unusable exclude),
    never a hit: fix the command, do not send it to Sisyphus.

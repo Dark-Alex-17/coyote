@@ -75,6 +75,9 @@ variables:
   - name: finalize_owner
     description: "Who runs the final verification tier (the single full-suite, formatter and lint run before finishing or pushing): 'self' (default) or 'parent' (set by a parent orchestrator that runs it over the integrated work; every review this Sisyphus runs then stays at the round tier)."
     default: 'self'
+  - name: run_base
+    description: "The commit the parent orchestrator's run started from (the merge-base of its base branch and HEAD, recorded at its run start); every coder spawn and the final-tier review pass it as baseline_floor. Empty: this Sisyphus records its own run base before its first coder spawn."
+    default: ''
 
 mcp_servers:
   - ddg-search
