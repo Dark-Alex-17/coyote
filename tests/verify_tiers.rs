@@ -10,6 +10,7 @@
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -364,6 +365,92 @@ fn round_lookup(dir: &Path) -> Value {
         &["lookup", "--root", path_str(dir), "--tier", "round"],
     )
     .1
+}
+
+/// Runs `verify_record.py` with `args`, feeding it `stdin`.
+fn record_cli(args: &[&str], stdin: &str) -> std::process::Output {
+    let mut child = scrubbed(Path::new("python3"))
+        .arg(asset(".shared/verify_record.py"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn python3");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("wait for python3")
+}
+
+/// Writes the `tier` record of `results` for the tree of `dir` through the
+/// CLI the gates use and returns its path.
+fn write_record(dir: &Path, tier: &str, results: &Value) -> String {
+    let output = record_cli(
+        &[
+            "write",
+            "--root",
+            path_str(dir),
+            "--tier",
+            tier,
+            "--writer",
+            "verify-tiers",
+        ],
+        &results.to_string(),
+    );
+    assert!(
+        output.status.success(),
+        "verify_record.py write exited {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The `lookup` reply for the `tier` record of `dir`, which must exit 0
+/// whatever the store holds.
+fn lookup_record(dir: &Path, tier: &str) -> Value {
+    let output = record_cli(&["lookup", "--root", path_str(dir), "--tier", tier], "");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "lookup exited non-zero\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse("verify_record.py lookup", &output)
+}
+
+/// Evaluates `expr` with `verify_record` imported as `r`, the record path
+/// as `path` and the tier as `tier`, and returns its JSON value.
+fn record_py(expr: &str, path: &str, tier: &str) -> Value {
+    let program = format!(
+        "import json, sys\nsys.path.insert(0, sys.argv[1])\nimport verify_record as r\npath, tier = sys.argv[2], sys.argv[3]\nprint(json.dumps({expr}))"
+    );
+    let output = scrubbed(Path::new("python3"))
+        .args(["-B", "-c", &program])
+        .arg(asset(".shared"))
+        .args([path, tier])
+        .output()
+        .expect("spawn python3");
+    parse(expr, &output)
+}
+
+const IS_GREEN: &str = "r.is_green(json.load(open(path)), tier)";
+const READ: &str = "r._read(path, tier)";
+
+fn result_item(role: &str, verdict: &str) -> Value {
+    json!({
+        "role": role,
+        "cmd": format!("run {role}"),
+        "exit": 0,
+        "duration_s": 0,
+        "verdict": verdict,
+        "note": "",
+        "tail": "",
+    })
 }
 
 /// The tree hash `verify_record.py tree` prints for `dir`.
@@ -1277,6 +1364,89 @@ fn round_unreadable_status_or_record_is_never_green() {
         str_field(&out, "tests_output").contains("No baseline to compare with"),
         "{out}"
     );
+}
+
+/// A finalize record is green only when a test result is green or
+/// pre-existing: green fmt, check and lint with the suite not run, or with
+/// no test result at all, read as red.
+#[test]
+fn finalize_record_without_a_passing_test_result_is_not_green() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-no-test");
+    let dir = committed(&root.0);
+    let checks: Vec<Value> = ["fmt", "check", "lint"]
+        .into_iter()
+        .map(|role| result_item(role, "green"))
+        .collect();
+    let mut not_run = checks.clone();
+    not_run.push(result_item("test", "not_run"));
+    for results in [json!(not_run), json!(checks)] {
+        let path = write_record(&dir, "finalize", &results);
+        let lookup = lookup_record(&dir, "finalize");
+        assert_eq!(lookup["path"], json!(path), "{lookup}");
+        assert_eq!(str_field(&lookup, "status"), "red", "{results}: {lookup}");
+        assert_eq!(
+            record_py(IS_GREEN, &path, "finalize"),
+            json!(false),
+            "{results}"
+        );
+    }
+
+    let mut passing = checks;
+    passing.push(result_item("test", "pre-existing"));
+    let path = write_record(&dir, "finalize", &json!(passing));
+    let lookup = lookup_record(&dir, "finalize");
+    assert_eq!(str_field(&lookup, "status"), "green", "{lookup}");
+    assert_eq!(record_py(IS_GREEN, &path, "finalize"), json!(true));
+}
+
+/// A round record that ran nothing is not green.
+#[test]
+fn round_record_with_no_results_is_not_green() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("round-empty-record");
+    let dir = committed(&root.0);
+    let path = write_record(&dir, "round", &json!([]));
+    let lookup = lookup_record(&dir, "round");
+    assert_eq!(lookup["path"], json!(path), "{lookup}");
+    assert_eq!(str_field(&lookup, "status"), "red", "{lookup}");
+    assert_eq!(record_py(IS_GREEN, &path, "round"), json!(false));
+
+    let path = write_record(&dir, "round", &json!([result_item("targeted", "green")]));
+    assert_eq!(str_field(&lookup_record(&dir, "round"), "status"), "green");
+    assert_eq!(record_py(IS_GREEN, &path, "round"), json!(true));
+}
+
+/// A record that is not JSON, has another version or names no tree reads
+/// as missing, and lookup still exits 0.
+#[test]
+fn unreadable_wrong_version_or_treeless_records_read_as_missing() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("bad-record");
+    let dir = committed(&root.0);
+    let path = write_record(&dir, "round", &json!([result_item("targeted", "green")]));
+    assert_eq!(str_field(&lookup_record(&dir, "round"), "status"), "green");
+    let good: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut version = good.clone();
+    version["version"] = json!(2);
+    let mut treeless = good;
+    treeless["tree"] = json!("");
+    for (label, text) in [
+        ("garbage", "{not json".to_string()),
+        ("version 2", version.to_string()),
+        ("empty tree", treeless.to_string()),
+    ] {
+        fs::write(&path, text).unwrap();
+        let lookup = lookup_record(&dir, "round");
+        assert_eq!(str_field(&lookup, "status"), "missing", "{label}: {lookup}");
+        assert_eq!(record_py(READ, &path, "round"), Value::Null, "{label}");
+    }
 }
 
 /// The full tier, by default or by name, keeps its synchronous baseline and
