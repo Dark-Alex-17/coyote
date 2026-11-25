@@ -3883,6 +3883,19 @@ def _retro_rearm_integration():
                                                                              "integration_amendments")}
 
 
+def _retro_micro_batch():
+    st = _retro_large(task_granularity="micro", retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                      retro_follow_ups=[], retro_done=True)
+    u = gates.retro_route(st)
+    new = (u.get("tasks") or [{}])[-1]
+    index = read_file(os.path.join(new.get("dir", ""), "index.md")) if new.get("dir") else ""
+    done = [dict(t, status="complete") for t in u.get("tasks") or []]
+    closed = gates.task_done_route({**st, **u, "tasks": done, "current_task": new.get("id")})
+    return (new.get("batch") == gates.RETRO_BATCH and f"batch: {gates.RETRO_BATCH}" in index
+            and closed.get("_next") == "batch_gauntlet_build" and closed.get("current_batch") == gates.RETRO_BATCH), (
+        new.get("batch"), closed.get("_next"))
+
+
 def _integrate_blocked_amendments():
     u = gates.integrate_route(_retro_large(retro_done=True, integration_amended=True, integration_amendments=["Split the API"],
                                            follow_ups=[]))
@@ -3908,6 +3921,7 @@ def _parse_report_retro_follow_up():
 
 guarded("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up", _retro_triage_empty)
 guarded("retro_route: adopting re-arms the whole integration step, the one amendment round included", _retro_rearm_integration)
+guarded("retro_route: in micro mode the refactor task is its own batch, so it closes into a batch gauntlet", _retro_micro_batch)
 guarded("integrate_route: amendments past the one re-seal become follow-ups, never dropped", _integrate_blocked_amendments)
 guarded("integrate_route: an integration follow-up already listed is not listed twice", _integrate_follow_up_dedup)
 guarded("_parse_report: a FOLLOW-UPS bullet starting with Design retrospective stays in FOLLOW-UPS", _parse_report_retro_follow_up)

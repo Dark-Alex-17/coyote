@@ -5075,6 +5075,7 @@ def integrate_route(state):
 RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS (\d+)|CLEAN)$")
 RETRO_UNJUDGED = "no valid size judgement from integrate_findings"
 RETRO_TITLE = "Run-closing design refactor"
+RETRO_BATCH = "run-refactor"
 RETRO_SAVED = "design-retrospective.md"
 
 
@@ -5174,12 +5175,13 @@ def retro_route(state):
         criteria = "".join(f"- {a}\n" for a in adopted) + "- Behaviour unchanged: the full build and test suite is green\n"
         body = ("## What\n\nImplement the refactors the run-closing design retrospective proposed and the orchestrator adopted.\n\n"
                 "## Acceptance criteria\n\n" + criteria)
+        batch = RETRO_BATCH if is_micro(state) else ""
         tid, tdir = new_task(state, "run-refactor", RETRO_TITLE, body, blocked_by=tuple(members), task_type="chore",
-                             plan_name=os.path.basename(state.get("plan_path", "")))
+                             batch=batch, plan_name=os.path.basename(state.get("plan_path", "")))
         if tid:
             ref = (task_by_id(tasks, members[-1]) if members else None) or {}
             task = {"id": tid, "slug": os.path.basename(tdir), "dir": tdir, "title": RETRO_TITLE, "status": "pending",
-                    "blocked_by": members, "batch": "", "protected": False, "surfaces": "", "type": "chore", "files": [],
+                    "blocked_by": members, "batch": batch, "protected": False, "surfaces": "", "type": "chore", "files": [],
                     "group": ref.get("group", ""), "unit": ref.get("unit", "run")}
             tasks.append(task)
             save_tasks(state, u, tasks)
