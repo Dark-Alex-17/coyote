@@ -7299,11 +7299,16 @@ with scenario("retrospective: every whole-task accept exit of apply_answer decid
     _got = {k: aa(k, a, retro_done=False) for k, a in _RETRO_ACCEPTS}
     check(name, all(v["_next"] == "retro_size" and v.get("retro_done") is True for v in _got.values()),
           {k: v.get("_next") for k, v in _got.items()})
-with scenario("retrospective: the strikeout proceed exit goes on to the next subtask, the retrospective waits") as name:
+with scenario("retrospective: the strikeout proceed exit goes on to the next subtask, the retrospective waits; at the "
+              "whole-task review proceed is asked again, so it never skips the retrospective") as name:
     _so_go = gates.apply_answer(base_state(escalation=_so_esc, last_answer=_so_pick, oracle_result="ORACLE-NOTE",
                                            strikeout_rounds=FIX_CEIL, retro_done=False, **SO_SUBTASK))
+    _so_whole = gates.apply_answer(base_state(escalation=_so_esc, last_answer=_so_pick, oracle_result="ORACLE-NOTE",
+                                              strikeout_rounds=FIX_CEIL, retro_done=False, final_review=True,
+                                              **SO_SUBTASK))
     check(name, _so_pick and _so_go["_next"] == "next_subtask" and "retro_done" not in _so_go
-          and "retro_report" not in _so_go, (_so_pick, _so_go.get("_next")))
+          and "retro_report" not in _so_go and _so_whole["_next"] == "ask_dispatch" and "retro_done" not in _so_whole,
+          (_so_pick, _so_go.get("_next"), _so_whole.get("_next")))
 with scenario("retrospective: a yellow accept, then a CI-fix review PASS -> observability_gate, never retro_size") as name:
     _acc = aa("yellow_findings", YELLOW_ACCEPT, retro_done=False)
     u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
