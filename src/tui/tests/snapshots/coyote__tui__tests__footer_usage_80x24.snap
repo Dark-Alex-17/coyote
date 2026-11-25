@@ -1,0 +1,5 @@
+---
+source: src/tui/tests/mod.rs
+expression: row
+---
+openai:test-model . usage-x7x . agents 0 . jobs 0 .. $0.0123 N(0%)

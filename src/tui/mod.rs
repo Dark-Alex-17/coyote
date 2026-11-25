@@ -697,9 +697,13 @@ impl App {
     }
 
     /// Re-reads what the footer and the renderer take from the context;
-    /// called whenever the context is back in the UI's hands.
+    /// called whenever the context is back in the UI's hands. The usage
+    /// is rendered afresh here, as the REPL renders its right prompt at
+    /// each prompt: the one a reply publishes is read before the turn's
+    /// messages join the session, so it lags a turn behind.
     pub(crate) fn sync_from_ctx(&mut self, ctx: &mut RequestContext) {
         self.footer = FooterInfo::from_ctx(ctx);
+        self.usage = ctx.render_prompt_right(&ctx.app.config);
         self.macros = ctx
             .visible_macro_completions()
             .into_iter()

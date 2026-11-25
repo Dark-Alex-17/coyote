@@ -316,6 +316,96 @@ fn a_newline_free_tool_stream_keeps_a_bounded_tail() {
     );
 }
 
+fn footer_row(harness: &Harness) -> String {
+    let height = harness.terminal.backend().buffer().area().height;
+    row_text(harness, height - 1)
+}
+
+/// A published right prompt, colours and the cache glyph included, stays
+/// at the footer's right end beside a long left half through a turn, the
+/// todo panel, the key help and a resize.
+#[test]
+fn the_footer_keeps_the_published_usage_on_every_redraw() {
+    // The cache glyph is two columns wide, so `row_text` reads its
+    // second column as a space after it.
+    let rendered_right_prompt = "\x1b[36m\x1b[35m⚡512 $0.0123 2048(12%)\x1b[0m";
+    let usage = "512 $0.0123 2048(12%)";
+    let footer = FooterInfo {
+        who: Some("a-rather-long-agent-name".to_string()),
+        model: "openai:test-model".to_string(),
+        session: Some("a-long-session-name".to_string()),
+    };
+    let mut harness = Harness::new(80, 24, plain_config(), footer);
+    harness
+        .app
+        .handle_msg(UiMsg::UsageUpdated(rendered_right_prompt.to_string()));
+    let shows_usage = |harness: &Harness, when: &str| {
+        let row = footer_row(harness);
+        assert!(row.trim_end().ends_with(usage), "{when}: {row:?}");
+    };
+    harness.draw();
+    shows_usage(&harness, "first frame");
+    harness.app.begin_turn("work", false);
+    harness.draw();
+    shows_usage(&harness, "during a turn");
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.draw();
+    shows_usage(&harness, "after the turn");
+    harness.app.handle_msg(UiMsg::TodoUpdated(todo_items()));
+    harness.draw();
+    shows_usage(&harness, "with the todo panel");
+    harness.press(KeyCode::Char('?'));
+    harness.draw();
+    shows_usage(&harness, "with the key help open");
+    harness.resize(100, 30);
+    harness.draw();
+    shows_usage(&harness, "after a resize");
+}
+
+/// The footer reads the usage from the context handed back after a
+/// reply, so the reply's own messages count: the session's tokens, its
+/// spend and the context percentage show, where the right prompt the
+/// reply published was rendered before its messages joined the session.
+#[test]
+fn the_footer_shows_the_session_usage_once_the_context_is_back() {
+    let mut ctx = chat_ctx();
+    let mut session = Session::default();
+    session.set_name("usage-x7x".to_string());
+    session.accumulate_cost(0.0123);
+    ctx.session = Some(session);
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.handle_msg(UiMsg::UsageUpdated(
+        ctx.render_prompt_right(&ctx.app.config),
+    ));
+    let input = Input::from_str(&ctx, "a question about the footer", None).unwrap();
+    let session = ctx.session.as_mut().unwrap();
+    session
+        .add_message(&input, "an answer long enough to count")
+        .unwrap();
+    let (tokens, percent) = session.tokens_usage();
+    assert!(tokens > 0);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.draw();
+    let row = footer_row(&harness);
+    assert!(
+        row.trim_end()
+            .ends_with(&format!("$0.0123 {tokens}({percent}%)")),
+        "{row:?}"
+    );
+    // The token count varies with what else the test binary has run, and
+    // the padding before the segment with its width.
+    insta::with_settings!(
+        { filters => vec![(r" +(\$\S+) \d+\(", " .. $1 N(")] },
+        { insta::assert_snapshot!("footer_usage_80x24", row) }
+    );
+
+    ctx.session = None;
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.draw();
+    let row = footer_row(&harness);
+    assert!(!row.contains('%') && !row.contains('$'), "{row:?}");
+}
+
 #[test]
 fn text_deltas_grow_the_live_reply_in_place() {
     let mut harness = Harness::standalone(80, 24);

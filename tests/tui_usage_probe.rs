@@ -319,6 +319,47 @@ mod welcome_and_footer {
     }
 }
 
+mod footer_usage {
+    //! The right prompt's usage segment at the footer's right end.
+    use super::common::fake_llm::{FakeLlm, Reply};
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    /// Once the first reply of a session is in, the footer row shows the
+    /// session's tokens and the context percentage, counting that reply.
+    #[test]
+    #[serial]
+    fn the_footer_shows_the_session_tokens_and_percent_after_the_first_reply() {
+        let dir = fresh_config_dir("footer-usage");
+        let _guard = TempDirGuard(dir.clone());
+        let fake = FakeLlm::start(vec![Reply::Text("first reply u4a".to_string())]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.send(b".session\r").unwrap();
+        pty.wait_for("temp", PTY_DEADLINE).unwrap();
+        let sent = pty.raw().len();
+        pty.send(b"hello\r").unwrap();
+        wait_for_squeezed(&mut pty, "first reply u4a", "the first reply");
+        pty.wait_for_after("%)", sent, PTY_DEADLINE).unwrap();
+        let rows: Vec<u16> = painted_at(pty.raw(), b"%)", sent)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+        let height = pty.rows().unwrap();
+        let raw = String::from_utf8_lossy(&pty.raw()[sent..]).into_owned();
+        let footer_paints: Vec<&str> = raw
+            .match_indices(&format!("\x1b[{height};"))
+            .map(|(at, _)| &raw[at..(at + 160).min(raw.len())])
+            .collect();
+        assert!(
+            rows.contains(&height),
+            "no tokens(percent%) on the footer row {height}: {rows:?}\n{footer_paints:#?}"
+        );
+        quit_and_check(&mut pty);
+    }
+}
+
 mod elapsed_format {
     //! The elapsed time a running tool row and the status row show.
     use std::fs;
