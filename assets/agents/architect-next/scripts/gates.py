@@ -5071,6 +5071,11 @@ RETRO_UNJUDGED = "no valid size judgement from integrate_findings"
 RETRO_TITLE = "Run-closing design refactor"
 
 
+def _whole_line(text):
+    """The text on one line, never trimmed: a stated reason is a decision and is ledgered whole."""
+    return " ".join(str(text or "").split())
+
+
 def _after_integration(state, u):
     """At run close, a large run goes through the one design retrospective before the hygiene pass."""
     s = {**state, **u}
@@ -5078,7 +5083,7 @@ def _after_integration(state, u):
     if truthy(s.get("retro_done")) or (s.get("closeout_scope") or "run") != "run":
         return u
     u["retro_done"] = True
-    reason = " ".join(str(s.get("retro_large_reason") or "").split()) or "no reason given"
+    reason = _whole_line(s.get("retro_large_reason")) or "no reason given"
     if not s.get("retro_large"):
         u["retro_report"] = [f"- not run: {reason}" if reason == RETRO_UNJUDGED else f"- not run: not a large body of work ({reason})"]
         ledger(state, u, f"design retrospective: not run ({reason})")
@@ -5095,9 +5100,10 @@ def _after_integration(state, u):
     _, body = frontmatter(read_file(state.get("plan_path", "")))
     goal = (plan_section(body, r"Problem") + "\n\n" + plan_section(body, r"Approach")).strip() or "(the plan states no Problem/Approach)"
     u["retro_report"] = [f"- large body of work ({reason})"]
-    u["retro_prompt"] = "\n".join([
-        "Run-closing design retrospective.", f"Project: {code}", f"Diff: {base}..HEAD", f"What the work set out to do: {goal}",
-        f"Plans dir: {state.get('plans_root') or ''} (bookkeeping, not code under review)"])
+    lines = ["Run-closing design retrospective.", f"Project: {code}", f"Diff: {base}..HEAD", f"What the work set out to do: {goal}"]
+    if state.get("plans_root"):
+        lines.append(f"Plans dir: {state['plans_root']} (bookkeeping, not code under review)")
+    u["retro_prompt"] = "\n".join(lines)
     ledger(state, u, f"design retrospective: large ({reason})")
     u["_next"] = "run_retrospective"
     return u
@@ -5117,11 +5123,10 @@ def retro_route(state):
         ledger(state, u, f"design retrospective: faulted ({why}); run continues")
         return u
     adopted = [] if first.endswith("CLEAN") else [
-        " ".join(a.split()) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]
+        _whole_line(a) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]
     declined = [d for d in as_list(state.get("retro_declined")) if isinstance(d, dict) and str(d.get("item") or "").strip()]
-    later = [" ".join(f.split()) for f in as_list(state.get("retro_follow_ups")) if isinstance(f, str) and f.strip()]
-    lines = [f"retro-declined: {' '.join(str(d.get('item')).split())} -- {' '.join(str(d.get('reason') or '').split()) or 'no reason stated'}"
-             for d in declined]
+    later = [_whole_line(f) for f in as_list(state.get("retro_follow_ups")) if isinstance(f, str) and f.strip()]
+    lines = [f"retro-declined: {_whole_line(d.get('item'))} -- {_whole_line(d.get('reason')) or 'no reason stated'}" for d in declined]
     for line in lines:
         ledger(state, u, line)
     task_line = "no refactor task"
@@ -5157,7 +5162,7 @@ def retro_route(state):
     report.append(f"- ran: {first}; {len(adopted)} item(s) adopted; {task_line}")
     report += [f"- {line}" for line in lines]
     if later:
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"(design retrospective) {f}" for f in later]
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Design retrospective: {f}" for f in later]
         report.append(f"- follow-ups: {len(later)} (listed under Deferred / follow-ups)")
     u["retro_report"] = report
     return u

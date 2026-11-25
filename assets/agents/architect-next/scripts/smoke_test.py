@@ -3768,6 +3768,12 @@ def _retro_groups_run_base():
     return f"Diff: {CODE_BASE}..HEAD" in p and "g2base" not in p, p
 
 
+def _retro_plans_dir_line():
+    with_dir = gates.integrate_route(_retro_large(plans_root=TMP)).get("retro_prompt", "")
+    without = gates.integrate_route(_retro_large(plans_root="")).get("retro_prompt", "")
+    return f"Plans dir: {TMP} (bookkeeping" in with_dir and "Plans dir" not in without, without
+
+
 def _retro_integrate_unjudged():
     u = gates.integrate_route(_retro_large(last_node_output="llm node failed: timeout"))
     return (u["_next"] == "hygiene_create" and any("no valid size judgement" in l for l in u["retro_report"])), u.get("retro_report")
@@ -3822,7 +3828,7 @@ def _retro_adopted():
             and new.get("blocked_by") == [T1, T2, T3] and u.get("integration_checked") is False
             and "- One table" in body and "- One owner" in body and "Behaviour unchanged: the full build and test suite is green" in body
             and "retro-declined: Split the registry -- src/a.go:3 keeps one registry on purpose" in u["decisions"]
-            and any("Rework the poller" in f for f in u["follow_ups"])
+            and "Design retrospective: Rework the poller" in u["follow_ups"]
             and snap.get("phase") == f"phase_f retro {new.get('id')}"
             and any(new.get("id", "?") in l for l in u["retro_report"])), (u.get("_next"), new, body[-400:], u.get("decisions"))
 
@@ -3849,6 +3855,7 @@ def _retro_report():
 guarded("integrate_route: a large run at run close -> run_retrospective over the run diff, retro_done set first", _retro_integrate_large)
 guarded("integrate_route: not a large body of work -> hygiene_create, the reason in the report lines", _retro_integrate_not_large)
 guarded("integrate_route: a groups-mode run close diffs from the run base, never the last group's base", _retro_groups_run_base)
+guarded("integrate_route: the retrospective prompt names a Plans dir only when the run has one", _retro_plans_dir_line)
 guarded("integrate_route: no valid size judgement (the llm node failed) -> hygiene_create with a note", _retro_integrate_unjudged)
 guarded("integrate_route: retro_done -> hygiene_create (at most once per run)", _retro_integrate_done)
 guarded("integrate_route: a group close-out short of run close -> hygiene_create, the retrospective waits", _retro_group_closeout)
