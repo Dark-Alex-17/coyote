@@ -322,6 +322,7 @@ initial_state:
   comment_hygiene_done: false
   comment_diff: ''
   comment_diff_truncated: false
+  comment_files: []
   comment_cuts: []
   comment_read: 0
   comment_hygiene_line: ''

@@ -3754,6 +3754,7 @@ def review_gate(state):
             u["skipped_reviews"] = skipped
         if hyg["diff"]:
             u["comment_diff"], u["comment_diff_truncated"] = hyg["diff"], hyg["truncated"]
+            u["comment_files"] = sorted(hyg["files"])
             u["_next"] = "comment_hygiene"
             return u
         u["comment_hygiene_done"] = True
@@ -3804,12 +3805,13 @@ def review_gate(state):
 
 COMMENT_DIFF_CAP = 30000
 COMMENT_HYGIENE_FILES_CAP = 20
-COMMENT_CUT_RE = re.compile(r"[^\n]+?:\d+ -- (cut|reduce to: [^\n]{1,200})")
+COMMENT_CUT_RE = re.compile(r"([^\n]+?):(\d+) -- (cut|reduce to: [^\n]{1,200})")
 
 
 def _whole_task_diff(state):
     """The diff from the review base to the worktree as it stands, untracked files included, plans dir excluded, as
-    {"diff", "truncated", "error", "unread"}; `error` is the head of git's stderr when the diff failed.
+    {"diff", "truncated", "error", "unread", "files"}; `error` is the head of git's stderr when the diff failed and
+    `files` the paths the whole diff writes to.
 
     A truncated diff opens with a marker naming the first COMMENT_HYGIENE_FILES_CAP files whose headers fell in the
     dropped part, each with its added-line ranges, so the node reads only those lines from disk and leaves older
@@ -3821,9 +3823,10 @@ def _whole_task_diff(state):
     code, out, err = git(root, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "-U3", *spec,
                          timeout=120)
     if code != 0:
-        return {"diff": "", "truncated": False, "error": err.strip()[:200] or f"exit {code}", "unread": []}
+        return {"diff": "", "truncated": False, "error": err.strip()[:200] or f"exit {code}", "unread": [], "files": []}
+    files = list(_hunk_ranges(out)[0])
     if len(out) <= COMMENT_DIFF_CAP:
-        return {"diff": out, "truncated": False, "error": "", "unread": []}
+        return {"diff": out, "truncated": False, "error": "", "unread": [], "files": files}
     dropped_ranges, unparsed = _hunk_ranges(out[:-COMMENT_DIFF_CAP])
     dropped = list(dropped_ranges)
     code, exact, _ = git(root, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "-U0", *spec,
@@ -3838,7 +3841,8 @@ def _whole_task_diff(state):
                        for f in named) or "none"
     marker = (f"[diff truncated: the start was dropped; read only these added lines (new-file line numbers) with "
               f"the tools: {listed}]\n")
-    return {"diff": marker + out[-COMMENT_DIFF_CAP:], "truncated": True, "error": "", "unread": unread + unparsed}
+    return {"diff": marker + out[-COMMENT_DIFF_CAP:], "truncated": True, "error": "", "unread": unread + unparsed,
+            "files": files}
 
 
 _C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -3904,6 +3908,7 @@ def comment_hygiene_route(state):
     note_script_error(state, u, "comment_hygiene")
     u["comment_hygiene_done"] = True
     u["comment_diff"] = ""
+    u["comment_files"] = []
     u["_next"] = "review_gate"
     if not ran:
         ledger(state, u, "comment hygiene: the pass did not run; the review goes ahead without it")
@@ -3911,13 +3916,17 @@ def comment_hygiene_route(state):
             "comment hygiene: the pass over the final diff did not run, so added comments were not read for keep/cut/reduce"]
         return u
     items = [c.strip() for c in as_list(state.get("comment_cuts")) if isinstance(c, str) and c.strip()]
-    shaped = [(c, COMMENT_CUT_RE.fullmatch(c)) for c in items]
+    # the file group must name a file the diff wrote, so text before a path cannot steer the coder elsewhere
+    in_diff = set(as_list(state.get("comment_files")))
+    matches = [(c, COMMENT_CUT_RE.fullmatch(c)) for c in items]
+    shaped = [(c, m if m and m.group(1) in in_diff else None) for c, m in matches]
     cuts = [c for c, m in shaped if m]
     malformed = [c for c, m in shaped if not m]
     if malformed:
         ledger(state, u, f"comment hygiene: dropped {len(malformed)} cut item(s) not shaped `<file:line> -- cut` or "
-                         "`<file:line> -- reduce to: <sentence>`: " + " | ".join(c[:80] for c in malformed))
-    reduced = sum(1 for c, m in shaped if m and m.group(1) != "cut")
+                         "`<file:line> -- reduce to: <sentence>` or naming a file outside the diff: "
+                         + " | ".join(" ".join(c.split())[:80] for c in malformed))
+    reduced = sum(1 for c, m in shaped if m and m.group(3) != "cut")
     line = (f"Comment hygiene: {as_int(state.get('comment_read'))} added comments read, {len(cuts) - reduced} cut, "
             f"{reduced} reduced" + (" (diff truncated)" if truthy(state.get("comment_diff_truncated")) else ""))
     u["comment_hygiene_line"] = line
