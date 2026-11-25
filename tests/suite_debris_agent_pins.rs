@@ -107,7 +107,7 @@ fn architect_prompt_pins_debris_rules() {
     assert_anchors(
         "architect/instructions.md",
         &[
-            "2. **Run-closing hygiene pass.**",
+            "3. **Run-closing hygiene pass.**",
             "`TASK-NNN-run-hygiene`",
             "`HYGIENE:` heading (file:line, what, justification)",
             "- a **`## Hygiene pass`** section",
@@ -152,10 +152,10 @@ fn architect_prompt_pins_debris_rules() {
 fn usage_probe_architect_hygiene_pass_resolves_the_run_base_once_and_reads_lint_errors_as_faults() {
     let config = agent_file("architect/instructions.md");
     let start = config
-        .find("2. **Run-closing hygiene pass.**")
+        .find("3. **Run-closing hygiene pass.**")
         .expect("architect config has the Phase F hygiene step");
     let end = config[start..]
-        .find("3. **Roll up follow-ups")
+        .find("4. **Roll up follow-ups")
         .map(|i| start + i)
         .expect("the hygiene step is followed by the PR roll-up step");
     let pass = &config[start..end];
@@ -287,7 +287,7 @@ fn comment_hygiene_runs_while_writing_and_over_the_final_diff() {
 
     let architect = agent_file("architect/instructions.md");
     let start = architect
-        .find("2. **Run-closing hygiene pass.**")
+        .find("3. **Run-closing hygiene pass.**")
         .expect("architect has the run-closing hygiene step");
     let end = architect[start..]
         .find("Verification: run the review gauntlet")
