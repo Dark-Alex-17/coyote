@@ -3788,7 +3788,7 @@ def _retro_stack_multi():
 
 def _retro_adopted():
     u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"],
-                                       retro_declined=[{"item": "Split the store", "reason": "src/a.go:3 keeps one store on purpose"}],
+                                       retro_declined=[{"item": "Split the registry", "reason": "src/a.go:3 keeps one registry on purpose"}],
                                        retro_follow_ups=["Rework the poller"], integration_checked=True, retro_done=True))
     new = u["tasks"][-1] if u.get("tasks") else {}
     body = read_file(os.path.join(new.get("dir", ""), "index.md")) if new.get("dir") else ""
@@ -3796,7 +3796,7 @@ def _retro_adopted():
             and new.get("type") == "chore" and new.get("title") == "Run-closing design refactor"
             and new.get("blocked_by") == [T1, T2, T3] and u.get("integration_checked") is False
             and "- One table" in body and "- One owner" in body and "Behaviour unchanged: the full build and test suite is green" in body
-            and "retro-declined: Split the store -- src/a.go:3 keeps one store on purpose" in u["decisions"]
+            and "retro-declined: Split the registry -- src/a.go:3 keeps one registry on purpose" in u["decisions"]
             and any("Rework the poller" in f for f in u["follow_ups"])
             and any(new.get("id", "?") in l for l in u["retro_report"])), (u.get("_next"), new, body[-400:], u.get("decisions"))
 
