@@ -11268,6 +11268,60 @@ fn the_windows_build_run_and_relay_notes_match_the_script() {
     }
 }
 
+/// A send whose message left on a late link reports that it may have arrived, a
+/// propagation node is named by its label, and a public hub's ingress hold is told with
+/// the relay you run as the supported roaming shape; each as the source words it.
+#[test]
+fn the_pages_quote_the_late_link_send_the_node_label_and_the_hub_hold() {
+    let message = read(repo_root().join("src/mesh/message.rs"));
+    assert!(
+        message.contains(
+            "\"Sent to {who} but no acknowledgement came within {} s; it may have arrived - .mesh messaging inbox shows a reply\""
+        ),
+        "src/mesh/message.rs no longer words the late-link send"
+    );
+    let node = read(repo_root().join("src/mesh/node.rs"));
+    for piece in [
+        "\"propagation node {}{}\"",
+        "if configured { \" (configured)\" } else { \"\" }",
+    ] {
+        assert!(
+            node.contains(piece),
+            "src/mesh/node.rs no longer labels a propagation node with {piece:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for needle in [
+        "`Sent to <user> / <session> but no acknowledgement came within <n> s; it may have arrived - .mesh messaging inbox shows a reply`",
+        "it is not stored with a propagation node as well (that would deliver it twice)",
+        "names it as `propagation node <hash8>`, with `(configured)` when `mesh.propagation_nodes` lists it, never by its full hash",
+        "`The mesh link failed: no known path to propagation node 9af2fd91 (configured)`",
+    ] {
+        assert!(
+            commands.contains(needle),
+            "Mesh-Commands.md does not say {needle:?}"
+        );
+    }
+    let gotchas = flat(&section(
+        "Mesh-Deployment.md",
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## Relay gotchas",
+    ));
+    for needle in [
+        "A public hub is a transport node you do not control, and its ingress control is on: it holds back announces from a client that connected or reconnected recently.",
+        "Roaming through a hub you do not run is therefore best-effort.",
+        "The supported roaming shape is a relay you run: `scripts/mesh-relay.sh --relay <host>:4242`",
+        "sets `ingress_control = No` on the server interface that hosts dial",
+    ] {
+        assert!(
+            gotchas.contains(needle),
+            "Mesh-Deployment.md's Relay gotchas do not say {needle:?}"
+        );
+    }
+}
+
 /// The route part of "Moving between networks" and the commands page quote the stale
 /// route sentence and the far-peer error as the source words them, and the section says
 /// `rnpath -d` is no longer needed.
@@ -11304,6 +11358,8 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
         "drops the route (in rnsd's table as well as its own), asks the network for a new one once, and tries the link once more before it reports anything",
         "every route over that interface counts as stale before its next request",
         "the trusted sessions and the propagation nodes reached the long way round over another interface are asked for once more",
+        "The ask goes out at the read that first sees the upstream back, within about 15 seconds of it, with no link having to fail first, and each destination is asked once per transition",
+        "A LAN that goes from reaching nobody to reaching someone (rnsd's AutoInterface, or Coyote's own `lan`) asks the same way.",
         "A route over an interface that is up always wins over one over an interface that is down, whatever their hops.",
         "`rnpath -d` is no longer needed after a move.",
         "A route over an interface that is up, and not just asked for, gets no extra try: its failure is reported as it is.",
@@ -11348,9 +11404,19 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
     }
     let upstream = read(repo_root().join("src/mesh/upstream.rs"));
     assert!(
-        upstream.contains("const UPSTREAM_POLL: Duration = Duration::from_secs(30);"),
-        "src/mesh/upstream.rs no longer polls every 30 s"
+        upstream.contains("const UPSTREAM_POLL: Duration = Duration::from_secs(10);"),
+        "src/mesh/upstream.rs no longer polls every 10 s"
     );
+    for piece in [
+        "pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 10;",
+        "pub(crate) const SETTLE_READ: Duration = Duration::from_secs(5);",
+        "pub(crate) const SETTLE_CAP: Duration = Duration::from_secs(60);",
+    ] {
+        assert!(
+            upstream.contains(piece),
+            "src/mesh/upstream.rs no longer says {piece:?}; update the page and this test"
+        );
+    }
     let announced = "announced so other sessions can find this one again";
     let lines = [
         format!("`[mesh:relay] This host's network changed; {announced}`"),
@@ -11363,9 +11429,11 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         "## Moving between networks",
     );
     for needle in lines.iter().map(String::as_str).chain([
-        "every 30 seconds it reads the host's interface addresses (loopback and link-local left out)",
-        "share one limit of four an hour, the same number a relay reconnect is held to, and do not move the heartbeat",
-        "the next poll that finds rnsd's upstream online announces once more",
+        "every 10 seconds it reads the host's interface addresses (loopback and link-local left out)",
+        "A `private` interface to this host's own rnsd (`127.0.0.1:4242`, or one of the host's own addresses) reads the same rnsd, so a session on `type: private` greets exactly as one on `type: local` does",
+        "Coyote reads again every 5 seconds until 10 seconds pass with nothing new (60 seconds at most)",
+        "share one limit of four an hour, the same number a relay reconnect is held to, counted per transition and not per interface, and do not move the heartbeat",
+        "the next poll that finds rnsd's upstream online announces once more when that comes after the transition settled",
     ]) {
         assert!(
             moving.contains(needle),
@@ -11377,7 +11445,8 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         .iter()
         .map(String::as_str)
         .chain([
-            "These two share one limit of four greetings an hour; past it the line ends",
+            "One network switch that brings several upstreams back is one transition and one line.",
+            "These two share one limit of four greetings an hour, counted per transition; past it the line ends",
             "`; this session already sent its 4 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`",
             "`, but announcing failed; the next heartbeat will announce this session (details in the log).`",
             "A session with `mesh.announce` off prints nothing for these",
