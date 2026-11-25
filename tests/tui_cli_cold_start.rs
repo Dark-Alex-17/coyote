@@ -303,7 +303,11 @@ fn info_reports_the_resolved_ui() {
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let out = run_piped(&dir, &[], &["--info"]);
-    assert_eq!(info_ui_row(&out), "repl", "the default ui was not reported");
+    assert_eq!(
+        info_ui_row(&out),
+        "repl",
+        "the default ui with stdout piped was not reported as repl"
+    );
 
     let out = run_piped(&dir, &[], &["--tui", "--info"]);
     assert_eq!(info_ui_row(&out), "tui", "--tui was not reported");
@@ -711,7 +715,7 @@ fn a_differently_cased_ui_value_is_rejected_by_name() {
 }
 
 /// With no config file at all the `ui` row still resolves: the REPL by
-/// default, and the flag when given.
+/// default with stdout piped, and the flag when given.
 #[test]
 #[serial]
 fn a_missing_config_file_still_resolves_the_ui_row() {
@@ -915,8 +919,8 @@ fn completions_for_the_common_shells_name_both_shell_flags() {
 }
 
 /// `config.example.yaml` and the config template ship the `ui` row, and
-/// that row, taken verbatim, loads into a config whose `--info`
-/// resolves the documented default, the REPL.
+/// that row, taken verbatim, loads into a config whose `--info` resolves
+/// the documented default, which is the REPL with stdout piped.
 #[test]
 #[serial]
 fn the_documented_ui_rows_load_verbatim_and_resolve_to_the_repl() {
@@ -932,8 +936,8 @@ fn the_documented_ui_rows_load_verbatim_and_resolve_to_the_repl() {
             .collect();
         assert_eq!(rows.len(), 1, "{file} lacks the ui row:\n{text}");
         assert!(
-            rows.iter().any(|row| row.starts_with("ui: repl")),
-            "{file} documents a default other than `ui: repl`: {rows:?}"
+            rows.iter().any(|row| row.starts_with("ui: null")),
+            "{file} documents a default other than `ui: null`: {rows:?}"
         );
         assert!(
             rows.iter().all(|row| row.is_ascii()),
@@ -1020,12 +1024,11 @@ fn a_tui_preference_never_blocks_a_prompt_on_stdin() {
 }
 
 /// YAML spellings of the key: a quoted scalar is the same value as a
-/// bare one, while an absent value (`ui:` or `ui: null`) is not a
-/// shell and is refused by name with the accepted values, like any
-/// other typo, rather than silently falling back to the default.
+/// bare one, and an absent value (`ui:` or `ui: null`) leaves the shell
+/// unset, so the default applies: the REPL with stdout piped.
 #[test]
 #[serial]
-fn a_quoted_ui_value_loads_and_an_absent_one_is_refused_by_name() {
+fn a_quoted_ui_value_loads_and_an_absent_one_is_the_default() {
     let dir = fresh_config_dir("ui-yaml-spellings");
     let _guard = TempDirGuard(dir.clone());
 
@@ -1037,17 +1040,13 @@ fn a_quoted_ui_value_loads_and_an_absent_one_is_refused_by_name() {
         "a quoted `ui: \"tui\"` did not load"
     );
 
-    for (row, shown) in [("ui:", ""), ("ui: null", "null")] {
+    for row in ["ui:", "ui: null"] {
         write_config(&dir, &format!("save_session: false\n{row}\n"));
         let out = run_piped(&dir, &[], &["--info"]);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "`{row}` was accepted:\n{stdout}");
-        assert!(
-            stderr.contains(&format!(
-                "Invalid value '{shown}', expected one of: repl, tui"
-            )),
-            "`{row}` was not refused by name:\n{stderr}"
+        assert_eq!(
+            info_ui_row(&out),
+            "repl",
+            "`{row}` did not resolve to the default"
         );
     }
 }

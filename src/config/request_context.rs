@@ -1118,7 +1118,9 @@ impl RequestContext {
     /// `interrupt_policy` from the terminal's actual owner.
     pub(crate) fn ui_kind(&self) -> UiKind {
         match UiKind::current() {
-            UiKind::Repl if self.working_mode.is_repl() && self.app.config.ui == UiMode::Tui => {
+            UiKind::Repl
+                if self.working_mode.is_repl() && self.app.config.ui == Some(UiMode::Tui) =>
+            {
                 UiKind::Tui
             }
             kind => kind,
@@ -3509,7 +3511,7 @@ impl RequestContext {
             ("save", app.save.to_string()),
             ("keybindings", app.keybindings.clone()),
             ("command_prefix", app.command_prefix.to_string()),
-            ("ui", app.ui.to_string()),
+            ("ui", super::format_option_value(&app.ui)),
             ("wrap", wrap),
             ("wrap_code", app.wrap_code.to_string()),
             ("highlight", app.highlight.to_string()),
@@ -9368,13 +9370,13 @@ mod tests {
     fn set_ui_is_refused_and_not_completed() {
         let _config = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
-        assert_eq!(ctx.app.config.ui, UiMode::Repl);
+        assert_eq!(ctx.app.config.ui, None);
 
         let err = run_async(ctx.update("ui tui", utils::create_abort_signal()))
             .unwrap_err()
             .to_string();
         assert_eq!(err, "Unknown key 'ui'");
-        assert_eq!(ctx.app.config.ui, UiMode::Repl);
+        assert_eq!(ctx.app.config.ui, None);
         assert!(!SET_COMPLETION_KEYS.contains(&"ui"));
     }
 
@@ -9390,8 +9392,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("ui row missing from:\n{info}"))
                 .to_string()
         };
+        assert!(ui_row(&ctx).ends_with("null"), "{}", ui_row(&ctx));
+        ctx.update_app_config(|app| app.ui = Some(UiMode::Repl));
         assert!(ui_row(&ctx).ends_with("repl"), "{}", ui_row(&ctx));
-        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        ctx.update_app_config(|app| app.ui = Some(UiMode::Tui));
         assert!(ui_row(&ctx).ends_with("tui"), "{}", ui_row(&ctx));
     }
 
@@ -12979,7 +12983,7 @@ mod tests {
         let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
         let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
-        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        ctx.update_app_config(|app| app.ui = Some(UiMode::Tui));
         assert!(!crate::tui::active());
         assert_eq!(ctx.ui_kind(), UiKind::Tui);
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
@@ -12995,7 +12999,7 @@ mod tests {
         let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
         let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
-        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        ctx.update_app_config(|app| app.ui = Some(UiMode::Tui));
         assert_eq!(ctx.ui_kind(), UiKind::Repl);
         assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
     }

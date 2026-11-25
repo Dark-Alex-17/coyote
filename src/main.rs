@@ -33,9 +33,9 @@ use crate::client::{
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
-    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, UiMode, WorkingMode,
-    ensure_parent_exists, install_builtins, list_agents, load_env_file, macro_execute,
-    maybe_spawn_models_refresh, sync_models,
+    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
+    install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
+    sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
 use crate::events::Origin;
@@ -62,7 +62,7 @@ use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
@@ -215,11 +215,13 @@ async fn async_main() -> Result<()> {
     if cli.no_workspace_macros {
         app_config.no_workspace_macros = true;
     }
-    if cli.tui {
-        app_config.ui = UiMode::Tui;
-    } else if cli.repl {
-        app_config.ui = UiMode::Repl;
-    }
+    app_config.ui = Some(config::interactive_ui(
+        io::stdin().is_terminal(),
+        *IS_STDOUT_TERMINAL,
+        cli.tui,
+        cli.repl,
+        app_config.ui,
+    ));
     let app_config: Arc<AppConfig> = Arc::new(app_config);
     let app_state: Arc<AppState> = Arc::new(
         AppState::init(

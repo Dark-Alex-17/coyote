@@ -107,9 +107,9 @@ pub fn spawn_tui_with_args(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]
     spawn_with_args(dir, extra_env, &[&["--tui"], args].concat())
 }
 
-/// [`spawn_tui_with_args`] without `--tui`: the config's `ui:` key, or a
-/// shell flag in `args`, decides the shell, and a prompt in `args` makes
-/// a one-shot run.
+/// [`spawn_tui_with_args`] without `--tui`: a shell flag in `args`, the
+/// config's `ui:` key, or else the default for a tty (the full-screen UI)
+/// decides the shell, and a prompt in `args` makes a one-shot run.
 pub fn spawn_with_args(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> Pty {
     let args: String = args.iter().map(|arg| format!(" {arg}")).collect();
     spawn_binary_under(
@@ -192,7 +192,8 @@ pub fn wait_for_repl_prompt(pty: &mut Pty, prompt: &str, since: usize) -> usize 
 /// self-update path classifies the install by where the executable is);
 /// `args` fills the wrapper's `{args}` slot right after the binary. No
 /// shell flag is added: `args` carries `--tui` or `--repl` when the run
-/// needs one, and without either the config's `ui:` key decides.
+/// needs one, and without either the config's `ui:` key or the default
+/// for the run's terminals decides.
 pub fn spawn_binary_under(
     binary: &Path,
     dir: &Path,

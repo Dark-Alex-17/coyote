@@ -103,7 +103,7 @@ mod tests {
         let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
         let app = AppState {
             config: Arc::new(AppConfig {
-                ui: UiMode::Tui,
+                ui: Some(UiMode::Tui),
                 ..AppConfig::default()
             }),
             ..AppState::test_default()

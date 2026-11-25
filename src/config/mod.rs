@@ -90,6 +90,7 @@ pub use self::tool_scope::{
 pub(crate) use self::tool_scope::{escape_display_text, is_format_char};
 pub(crate) use self::ui_kind::UiKind;
 pub use self::ui_mode::UiMode;
+pub(crate) use self::ui_mode::interactive_ui;
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MODELS_YAML, MessageContentToolCalls, Model, ModelType,
@@ -261,7 +262,7 @@ pub struct Config {
     pub save: bool,
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
-    pub ui: UiMode,
+    pub ui: Option<UiMode>,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -367,7 +368,7 @@ impl Default for Config {
             save: false,
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
-            ui: UiMode::default(),
+            ui: None,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -1630,7 +1631,7 @@ clients:
     #[test]
     fn config_template_documents_ui() {
         assert!(CONFIG_TEMPLATE.contains(
-            "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
+            "\nui: null                         # Which shell starts for an interactive run. null = the TUI when stdin and stdout are terminals,\n                                 # the REPL otherwise. `tui` or --tui picks the TUI, `repl` or --repl the REPL\n"
         ));
         assert!(CONFIG_TEMPLATE.contains(
             "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
@@ -1658,7 +1659,7 @@ clients:
     #[test]
     fn a_config_still_holding_tui_dump_on_exit_loads() {
         let cfg = Config::load_from_str("ui: tui\ntui_dump_on_exit: true\n").unwrap();
-        assert_eq!(cfg.ui, UiMode::Tui);
+        assert_eq!(cfg.ui, Some(UiMode::Tui));
     }
 
     #[test]
@@ -1695,7 +1696,7 @@ clients:
         assert!(example.contains("command_prefix: dot"));
         assert!(example.contains("\nmemory_round_chains: supersede"));
         assert!(example.contains(
-            "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
+            "\nui: null                         # Which shell starts for an interactive run. null = the TUI when stdin and stdout are terminals,\n                                 # the REPL otherwise. `tui` or --tui picks the TUI, `repl` or --repl the REPL\n"
         ));
         assert!(example.contains(
             "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
@@ -1707,7 +1708,7 @@ clients:
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
-        assert_eq!(cfg.ui, UiMode::Repl);
+        assert_eq!(cfg.ui, None);
         assert_eq!(cfg.theme, None);
     }
 

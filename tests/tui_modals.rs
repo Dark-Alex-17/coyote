@@ -3351,9 +3351,10 @@ mod binary_menus {
 
     // ---------------------------------------------------------------------
     // Cold start: which shell an interactive run gets is decided by the
-    // `ui:` key, then `--tui` / `--repl`, in that order of increasing
-    // precedence; `COYOTE_UI` in the environment is what coyote exports to
-    // its tools, not a choice. A prompt run never starts the full-screen UI.
+    // terminal default (the full-screen UI on a tty), then the `ui:` key,
+    // then `--tui` / `--repl`, in that order of increasing precedence;
+    // `COYOTE_UI` in the environment is what coyote exports to its tools,
+    // not a choice. A prompt run never starts the full-screen UI.
     // ---------------------------------------------------------------------
     mod cold_start {
         use super::*;
@@ -3414,7 +3415,7 @@ mod binary_menus {
 
         /// `COYOTE_UI` in the environment chooses nothing: `ui: tui` still
         /// starts the full-screen UI under `COYOTE_UI=repl` or `headless`, and
-        /// with no `ui:` key `COYOTE_UI=tui` still gets the plain REPL, which
+        /// `ui: repl` under `COYOTE_UI=tui` still gets the plain REPL, which
         /// never touches the alternate screen.
         #[test]
         #[serial]
@@ -3433,10 +3434,32 @@ mod binary_menus {
 
             let dir = fresh_config_dir("env-ignored-tui");
             let _guard = TempDirGuard(dir.clone());
-            write_dry_run_config(&dir);
+            write_config(&dir, "save_session: false\nui: repl\n");
             let mut pty = spawn_with_args(&dir, &[("COYOTE_UI", "tui")], &[]);
 
-            assert_plain_repl_then_ctrl_d(&mut pty, "no ui: key under COYOTE_UI=tui");
+            assert_plain_repl_then_ctrl_d(&mut pty, "ui: repl under COYOTE_UI=tui");
+        }
+
+        #[test]
+        #[serial]
+        fn a_repl_config_key_starts_the_plain_repl() {
+            let dir = fresh_config_dir("repl-key");
+            let _guard = TempDirGuard(dir.clone());
+            write_config(&dir, "save_session: false\nui: repl\n");
+            let mut pty = spawn_with_args(&dir, &[], &[]);
+
+            assert_plain_repl_then_ctrl_d(&mut pty, "ui: repl");
+        }
+
+        #[test]
+        #[serial]
+        fn the_repl_flag_starts_the_plain_repl() {
+            let dir = fresh_config_dir("repl-flag-default");
+            let _guard = TempDirGuard(dir.clone());
+            write_dry_run_config(&dir);
+            let mut pty = spawn_with_args(&dir, &[], &["--repl"]);
+
+            assert_plain_repl_then_ctrl_d(&mut pty, "--repl");
         }
 
         #[test]
@@ -3511,15 +3534,53 @@ mod binary_menus {
             }
         }
 
+        /// With no choice made, a redirected stdout takes the REPL path, as
+        /// the default is the full-screen UI only when stdin and stdout are
+        /// both ttys, and the REPL refuses it with its own `No TTY for REPL`.
         #[test]
         #[serial]
-        fn an_interactive_start_with_no_preference_is_the_plain_repl() {
+        fn no_preference_with_a_redirected_stdout_takes_the_repl_refusal() {
+            let dir = fresh_config_dir("default-stdout-redirect");
+            let _guard = TempDirGuard(dir.clone());
+            write_dry_run_config(&dir);
+            let mut pty = spawn_binary_under(
+                built_binary(),
+                &dir,
+                &[],
+                STDOUT_TO_FILE_WRAPPER,
+                "/dev/tty",
+                "",
+            );
+            let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+            assert_eq!(exit_code(&transcript), 1, "{transcript}");
+            assert!(
+                find(pty.raw(), ENTER_ALT, 0).is_none(),
+                "the default with stdout redirected painted on the tty:\n{transcript}"
+            );
+            assert_tty_restored(&transcript);
+
+            let stdout = fs::read(dir.join("stdout.txt")).unwrap();
+            let stderr = fs::read_to_string(dir.join("stderr.txt")).unwrap();
+            assert!(
+                stdout.is_empty(),
+                "the default with stdout redirected wrote to the file: {:?}",
+                String::from_utf8_lossy(&stdout)
+            );
+            assert!(
+                stderr.contains("No TTY for REPL") && !stderr.contains("No TTY for TUI"),
+                "the default with stdout redirected did not take the REPL refusal:\n{stderr}"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn an_interactive_start_with_no_preference_is_the_full_screen_ui() {
             let dir = fresh_config_dir("no-ui-preference");
             let _guard = TempDirGuard(dir.clone());
             write_dry_run_config(&dir);
             let mut pty = spawn_with_args(&dir, &[], &[]);
 
-            assert_plain_repl_then_ctrl_d(&mut pty, "no ui preference");
+            assert_full_screen_ui_then_ctrl_d(&mut pty, "no ui preference");
         }
 
         /// The shell is chosen before the REPL is up, so `ui` is not a `.set`

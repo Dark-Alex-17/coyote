@@ -29,7 +29,7 @@ pub struct AppConfig {
     pub save: bool,
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
-    pub ui: UiMode,
+    pub ui: Option<UiMode>,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -136,7 +136,7 @@ impl Default for AppConfig {
             save: false,
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
-            ui: UiMode::default(),
+            ui: None,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -1164,14 +1164,14 @@ mod tests {
     fn from_config_copies_ui() {
         let cfg = Config {
             model_id: "test-model".to_string(),
-            ui: UiMode::Tui,
+            ui: Some(UiMode::Tui),
             clients: vec![ClientConfig::default()],
             ..Config::default()
         };
 
         let app = AppConfig::from_config(cfg).unwrap();
 
-        assert_eq!(app.ui, UiMode::Tui);
+        assert_eq!(app.ui, Some(UiMode::Tui));
     }
 
     /// `COYOTE_UI` is what coyote exports to its tools, not a setting:
@@ -1183,13 +1183,13 @@ mod tests {
         for value in ["foo", "tui"] {
             let _env = crate::testing::EnvVarGuard::set(UiKind::ENV, value);
             let mut app = AppConfig {
-                ui: UiMode::Repl,
+                ui: Some(UiMode::Repl),
                 ..AppConfig::default()
             };
 
             app.load_envs();
 
-            assert_eq!(app.ui, UiMode::Repl, "COYOTE_UI={value}");
+            assert_eq!(app.ui, Some(UiMode::Repl), "COYOTE_UI={value}");
         }
     }
 
