@@ -131,11 +131,14 @@ fi
 # restore_rewritten puts back the bytes every path fmt touched had before it
 # ran: dirty paths from the copies under $saved, clean tracked ones from the
 # index, and files fmt created are removed. Sets REWRITTEN to those paths.
+# Directories (a moved submodule, an untracked nested repository) hold no
+# bytes of their own and are skipped.
 restore_rewritten() {
   local path
   REWRITTEN=()
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
+    [[ -d "$top/$path" && ! -L "$top/$path" ]] && continue
     if printf '%s\n' "$before" | grep -Fqx -- "$path"; then
       if [[ -e "$saved/$path" || -L "$saved/$path" ]]; then
         if [[ -L "$top/$path" || -L "$saved/$path" ]] || ! cmp -s "$saved/$path" "$top/$path"; then

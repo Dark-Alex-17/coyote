@@ -2097,6 +2097,31 @@ fn finalize_gate_fails_a_committed_misformatted_file_and_restores_it() {
     assert_eq!(git(&dir, &["status", "--porcelain"]), "");
 }
 
+/// An untracked nested repository shows up as a dirty directory; fmt left it
+/// alone, so it is neither reported as rewritten nor removed.
+#[test]
+fn finalize_gate_does_not_report_an_untouched_nested_repository_as_rewritten() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-fmt-dir");
+    let dir = committed(&root.0);
+    detect_commands(&dir, "true", "");
+    let nested = dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+    assert!(git(&dir, &["status", "--porcelain", "-uall"]).contains("nested/"));
+    let out = finalize(&dir, &[("TEST_CMD", "true")]);
+    let fmt = item(&out, "fmt");
+    assert_eq!(str_field(fmt, "verdict"), "green", "{out}");
+    assert_eq!(str_field(fmt, "note"), "", "{out}");
+    assert_eq!(
+        fs::read_to_string(nested.join("inner.txt")).unwrap(),
+        "inner\n"
+    );
+}
+
 /// A detected lint runs once and lands in the record; a failing lint makes
 /// the gate red and blocks the final-tier gauntlet; a lint command that is
 /// missing (exit 127) is unavailable, never green.
