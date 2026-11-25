@@ -1,23 +1,22 @@
 ---
-description: Calibrate comment density and style to the repository's existing conventions before writing code, and cut the comments that do not earn their keep from a finished diff. Detects the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you already read for pattern matching, or from a declared policy in workspace instructions, then dictates when a comment is warranted. Default when signal is weak - write NO comment. The final-diff pass is the closing judgement read orchestrators run before their last review. Complements ai-slop-remover (which bans comments that restate code in every register).
+description: Calibrate comment density and style to the repository's existing conventions before writing code, and cut the comments that do not earn their keep from a finished diff. Detects the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you already read for pattern matching, or from a declared policy in workspace instructions, then dictates when a comment is warranted. Default when signal is weak - write NO comment. The final-diff pass is the closing judgement read orchestrators run before their first review of the finished work. Complements ai-slop-remover (which bans comments that restate code in every register).
 ---
 You are about to write or modify code. LLMs systematically over-comment (narrating every block, restating signatures, banner-ing sections), and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling. Across every register, one test governs each comment you write: the rule below.
 
 ## The rule: a comment earns its keep
 
-Code should strive to be self-documenting. If a comment only states what the code does, and that is
-easily discernible from reading the code, it is redundant and is removed. A comment earns its place
-when it does one of these:
+A comment should earn its keep. Code should strive to be self-documenting, so if a comment is just stating what the code does when that is easily discernible from reading the code, it is redundant and should be removed. Comments should add context that can't be determined from the code, document functionality that isn't easily seeable from the current context because it is used elsewhere in the codebase, or record decision context. Follow the codebase's existing commenting standards when it has them; otherwise fall back to these guidelines.
 
-- adds context that cannot be determined from the code: intent, an invariant, an external
-  constraint, a workaround and the upstream issue behind it;
-- documents functionality that is not visible from the current context because it is used
-  elsewhere in the codebase: a contract a distant caller relies on, a value another module reads;
-- records the decision behind a choice: why this approach and not the obvious one, in a sentence.
-  A ledger of what a run checked belongs in the task log, not the code.
+What the three kinds look like:
 
-Follow the codebase's existing commenting standards when it has them (Steps 0 to 2 below find
-them); otherwise fall back to these guidelines.
+- context the code cannot show: intent, an invariant, an external constraint, a workaround and the
+  upstream issue behind it;
+- functionality used elsewhere: a contract a distant caller relies on, a value another module
+  reads;
+- decision context: why this approach and not the obvious one, in a sentence beside the code it
+  explains. A ledger of what a run checked belongs in the task log, not the code.
+
+Steps 0 to 2 below find the codebase's existing standards.
 
 ## Step 0: Check for a declared policy first
 
