@@ -2153,7 +2153,8 @@ fn finalize_gate_fails_when_fmt_rewrites_a_tracked_submodule() {
         "",
     );
     assert_eq!(git(&dir, &["status", "--porcelain"]), "");
-    let out = finalize(&dir, &[("TEST_CMD", "true")]);
+    let floor = git(&dir, &["rev-parse", "HEAD"]);
+    let out = finalize_with(&dir, &["verify-tiers", &floor], &[("TEST_CMD", "true")]);
     let fmt = item(&out, "fmt");
     assert_eq!(str_field(fmt, "verdict"), "red", "{out}");
     assert!(str_field(fmt, "note").contains("sub"), "{out}");
@@ -2976,7 +2977,11 @@ fn final_tier_gauntlet_reports_a_tree_the_finalize_gate_rewrote() {
     .unwrap();
     fs::write(dir.join("src/widget.txt"), "unformatted\n").unwrap();
     let before = worktree_tree(&dir);
-    let state = json!({"project_dir": path_str(&dir), "review_tree_before": before});
+    let state = json!({
+        "project_dir": path_str(&dir),
+        "review_tree_before": before,
+        "baseline_floor": git(&dir, &["rev-parse", "HEAD"]),
+    });
     let out = run_script(FINALIZE_CHECK, &dir, &state, &[("TEST_CMD", "true")]);
     let record = &out["full_suite_record"];
     assert_eq!(str_field(record, "status"), "red", "{out}");
@@ -3209,4 +3214,188 @@ fn step_runner_seats_its_coder_at_round_and_reuses_its_finalize_record() {
         2,
         "a record green only through pre-existing failures was reused"
     );
+}
+
+/// Without a floor the gate cannot tell a committed misformatted file from
+/// one outside the change, so a rewrite leaves fmt unavailable, never green,
+/// and the file keeps its committed bytes.
+#[test]
+fn finalize_gate_without_a_floor_never_passes_a_file_fmt_rewrote() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-fmt-no-floor");
+    let dir = committed(&root.0);
+    detect_commands(
+        &dir,
+        "for f in src/*.txt; do tr a-z A-Z < \"$f\" > \"$f.t\" && mv \"$f.t\" \"$f\"; done",
+        "",
+    );
+    commit_file(&dir, "src/committed.txt");
+    let out = finalize(&dir, &[("TEST_CMD", "true")]);
+    assert_ne!(str_field(&out, "status"), "green", "{out}");
+    let fmt = item(&out, "fmt");
+    assert_eq!(str_field(fmt, "verdict"), "unavailable", "{out}");
+    let note = str_field(fmt, "note");
+    assert!(note.contains("no floor was given"), "{out}");
+    assert!(note.contains("src/committed.txt"), "{out}");
+    assert_ne!(str_field(&finalize_lookup(&dir), "status"), "green");
+    assert_eq!(
+        fs::read_to_string(dir.join("src/committed.txt")).unwrap(),
+        "src/committed.txt"
+    );
+    assert_eq!(git(&dir, &["status", "--porcelain"]), "");
+}
+
+/// finalize_check reuses a record only when it was written with the floor
+/// the review runs with: a record from a gate run without one is run again
+/// once a floor is set, and the record that run writes is then reused.
+#[test]
+fn finalize_check_reuses_a_record_only_for_the_same_floor() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-check-floor");
+    let dir = committed(&root.0);
+    let floor = git(&dir, &["rev-parse", "HEAD"]);
+    let runs = root.0.join("suite-runs.txt");
+    let suite = format!("echo ran >> '{}'", runs.display());
+    let envs = [("TEST_CMD", suite.as_str())];
+    assert_eq!(str_field(&finalize(&dir, &envs), "status"), "green");
+    assert_eq!(lines(&runs).len(), 1);
+
+    let check = |floor: &str| {
+        let state = json!({
+            "project_dir": path_str(&dir),
+            "review_tree_before": worktree_tree(&dir),
+            "baseline_floor": floor,
+        });
+        let out = run_script(FINALIZE_CHECK, &dir, &state, &envs);
+        str_field(&out["full_suite_record"], "detail").to_string()
+    };
+    let floored = check(&floor);
+    assert!(
+        floored.starts_with("finalize gate ran on tree "),
+        "{floored}"
+    );
+    assert_eq!(lines(&runs).len(), 2);
+    let again = check(&floor);
+    assert!(again.ends_with(", reused"), "{again}");
+    assert_eq!(lines(&runs).len(), 2);
+    let unfloored = check("");
+    assert!(
+        unfloored.starts_with("finalize gate ran on tree "),
+        "{unfloored}"
+    );
+}
+
+/// Every result outside verify_record's passing verdicts names itself in
+/// the blocker detail, so a lint that could not run says so.
+#[test]
+fn finalize_check_names_a_lint_that_could_not_run() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("finalize-check-lint");
+    let dir = committed(&root.0);
+    write_finalize(
+        &dir,
+        json!([
+            result_item("lint", "unavailable"),
+            result_item("test", "green")
+        ]),
+    );
+    let state = json!({
+        "project_dir": path_str(&dir),
+        "review_tree_before": worktree_tree(&dir),
+    });
+    let out = run_script(FINALIZE_CHECK, &dir, &state, &[("TEST_CMD", "true")]);
+    let record = &out["full_suite_record"];
+    assert_eq!(str_field(record, "status"), "red", "{out}");
+    assert!(
+        str_field(record, "detail").contains("lint `run lint` unavailable"),
+        "{out}"
+    );
+}
+
+/// A base job that is not alive is never signalled: its process group id
+/// may already belong to an unrelated process, which cancel and sweep leave
+/// running.
+#[cfg(unix)]
+#[test]
+fn base_suite_never_signals_the_group_of_a_job_that_is_not_alive() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("stale-cancel");
+    let dir = committed(&root.0);
+    let top = fs::canonicalize(git(&dir, &["rev-parse", "--show-toplevel"])).unwrap();
+    let mut bystander = own_process_group(Command::new("sleep").arg("60"))
+        .spawn()
+        .expect("spawn sleep");
+    let pgid = i64::from(bystander.id());
+    let key = "fedcba9876543210";
+    let job = store(&dir).join("jobs").join(key);
+    fs::create_dir_all(&job).unwrap();
+    let stale = json!({
+        "version": 1, "key": key, "base": git(&dir, &["rev-parse", "HEAD"]),
+        "state": "running", "pid": std::process::id(), "pgid": pgid, "cmd_pgid": pgid,
+        "root": path_str(&top), "timeout": 0, "started_at": "2001-01-01T00:00:00Z",
+        "heartbeat_at": "2001-01-01T00:00:00Z", "worktree": null, "error": "",
+    });
+
+    fs::write(job.join("status.json"), stale.to_string()).unwrap();
+    let (code, out) = shared_py("base_suite.py", &["cancel", "--root", path_str(&dir)]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out["cancelled"], json!([key]), "{out}");
+    assert_eq!(str_field(&job_status(&dir, key), "state"), "cancelled");
+    thread::sleep(Duration::from_millis(300));
+    let cancel_spared = bystander.try_wait().unwrap().is_none();
+
+    fs::write(job.join("status.json"), stale.to_string()).unwrap();
+    let (code, out) = shared_py("base_suite.py", &["sweep", "--root", path_str(&dir)]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(str_field(&job_status(&dir, key), "state"), "killed");
+    thread::sleep(Duration::from_millis(300));
+    let sweep_spared = bystander.try_wait().unwrap().is_none();
+
+    kill_group(pgid);
+    let _ = bystander.wait();
+    assert!(
+        cancel_spared,
+        "cancel signalled a stale job's process group"
+    );
+    assert!(sweep_spared, "sweep signalled a stale job's process group");
+}
+
+/// The step-runner's test command runs with the agent's LLM_AGENT_VAR_*
+/// variables un-exported, while the build_lock prefix they hold still
+/// applies.
+#[test]
+fn step_runner_test_command_runs_without_agent_variables() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("step-agent-vars");
+    let dir = committed(&root.0);
+    let seen = root.0.join("step-env.txt");
+    let cmd = format!("env > '{}'", seen.display());
+    let out = run_script(
+        STEP_VERIFY_TESTS,
+        &dir,
+        &project_state(&dir),
+        &[
+            ("TEST_CMD", cmd.as_str()),
+            ("LLM_AGENT_VAR_STEP_PROBE", "leaked"),
+            ("LLM_AGENT_VAR_BUILD_LOCK", "env GATE_LOCK_SEEN=1"),
+        ],
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    let env = lines(&seen);
+    assert!(env.iter().any(|l| l == "GATE_LOCK_SEEN=1"), "{env:?}");
+    let leaked: Vec<&String> = env
+        .iter()
+        .filter(|l| l.starts_with("LLM_AGENT_VAR_"))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?}");
 }

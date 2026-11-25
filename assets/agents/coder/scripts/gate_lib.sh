@@ -464,33 +464,22 @@ gate_baseline_record() {
   printf '%s' "${stores%%$'\n'*}/tests-$key.json"
 }
 
-# gate_unexport_agent_vars drops the export of every LLM_AGENT_VAR_* variable
-# of the current shell, keeping its value.
-gate_unexport_agent_vars() {
-  local name
-  for name in $(compgen -e LLM_AGENT_VAR_); do
-    export -n "$name"
-  done
-}
-
 # run_gate_until runs `cmd` through run_gate inside `dir`, writing its
 # combined output to `out`, and kills it once `secs` seconds pass (0: no
 # deadline). The command runs in its own process group so the kill reaches
 # every child (a test runner's workers, a lock wrapper) instead of leaving
-# them holding the lock. The agent's LLM_AGENT_VAR_* variables stay shell
-# variables there (run_gate still reads the lock prefix) but are not
-# exported, so a test the command runs never sees them. Returns the command's
-# status; after a kill it sets GATE_TIMED_OUT=1 and returns 124.
+# them holding the lock. Returns the command's status; after a kill it sets
+# GATE_TIMED_OUT=1 and returns 124.
 # Usage: run_gate_until "$dir" "$cmd" "$secs" "$out" || rc=$?
 run_gate_until() {
   local dir=$1 cmd=$2 secs=$3 out=$4 pid ticks=0 rc=0
   GATE_TIMED_OUT=0
   if (( secs == 0 )); then
-    (cd "$dir" && gate_unexport_agent_vars && run_gate "$cmd") >"$out" 2>&1 || rc=$?
+    (cd "$dir" && run_gate "$cmd") >"$out" 2>&1 || rc=$?
     return "$rc"
   fi
   set -m
-  (cd "$dir" && gate_unexport_agent_vars && run_gate "$cmd") >"$out" 2>&1 &
+  (cd "$dir" && run_gate "$cmd") >"$out" 2>&1 &
   pid=$!
   set +m
   while kill -0 "$pid" 2>/dev/null; do
