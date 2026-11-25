@@ -403,6 +403,10 @@ fn openai_chat_handle_chunk(
     }
     let data: Value = serde_json::from_str(payload)?;
     debug!("stream-data: {data}");
+    if let Some(usage) = openai_parse_chat_usage(&data["usage"]) {
+        debug!("token-usage: {usage:?}");
+        handler.usage(usage);
+    }
     if let Some(text) = data["choices"][0]["delta"]["content"]
         .as_str()
         .filter(|v| !v.is_empty())
@@ -720,9 +724,30 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        usage: openai_parse_chat_usage(&data["usage"]),
         ..Default::default()
     };
     Ok(output)
+}
+
+/// A chat-completions `usage` object: a server sends it on a non-streamed
+/// reply and, when it reports usage on a stream at all, on a late chunk.
+/// `prompt_tokens` already counts the cached reads under
+/// `prompt_tokens_details`, so they are taken out to keep the buckets
+/// disjoint, as for the Responses API.
+fn openai_parse_chat_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+    Some(TokenUsage {
+        input_tokens: usage["prompt_tokens"]
+            .as_u64()
+            .map(|v| v.saturating_sub(cached_tokens.unwrap_or(0))),
+        output_tokens: usage["completion_tokens"].as_u64(),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: cached_tokens.filter(|&n| n > 0),
+    })
 }
 
 fn normalize_function_id(value: &str) -> Option<String> {
@@ -1673,6 +1698,20 @@ mod tests {
     }
 
     #[test]
+    fn extract_chat_completions_parses_usage() {
+        let chat = json!({
+            "choices": [{ "message": { "content": "answer" } }],
+            "usage": { "prompt_tokens": 50, "completion_tokens": 7 },
+        });
+        let usage = openai_extract_chat_completions(&chat).unwrap().usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_read_input_tokens, None);
+        let bare = json!({ "choices": [{ "message": { "content": "answer" } }] });
+        assert!(openai_extract_chat_completions(&bare).unwrap().usage.is_none());
+    }
+
+    #[test]
     fn extract_responses_parses_usage() {
         let data = json!({
             "output": [
@@ -2584,6 +2623,31 @@ mod tests {
 
         fn chat_delta(delta: Value) -> String {
             json!({ "choices": [{ "index": 0, "delta": delta }] }).to_string()
+        }
+
+        /// A late chunk's `usage` lands on the handler, cached reads split
+        /// out of the prompt count; a stream that reports none leaves it
+        /// empty.
+        #[test]
+        #[serial_test::serial]
+        fn a_streamed_usage_chunk_reaches_the_handler() {
+            let usage = json!({ "choices": [], "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": 100 },
+            }})
+            .to_string();
+            let (_, handler) = feed_chat(&[chat_delta(json!({ "content": "hi" })), usage]);
+            let (_, _, _, usage) = handler.take();
+            let usage = usage.expect("the stream's usage");
+            assert_eq!(usage.input_tokens, Some(20));
+            assert_eq!(usage.output_tokens, Some(30));
+            assert_eq!(usage.cache_read_input_tokens, Some(100));
+            assert_eq!(usage.cache_creation_input_tokens, None);
+
+            let (_, handler) = feed_chat(&[chat_delta(json!({ "content": "hi" }))]);
+            assert!(handler.take().3.is_none());
         }
 
         #[test]

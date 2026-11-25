@@ -329,6 +329,7 @@ mod welcome_and_footer {
 mod footer_usage {
     //! The right prompt's usage segment at the footer's right end.
     use super::common::fake_llm::{FakeLlm, Reply};
+    use super::common::pty::Pty;
     use super::common::tui_harness::*;
     use serial_test::serial;
 
@@ -363,6 +364,93 @@ mod footer_usage {
             rows.contains(&height),
             "no tokens(percent%) on the footer row {height}: {rows:?}\n{footer_paints:#?}"
         );
+        quit_and_check(&mut pty);
+    }
+
+    /// A reply whose provider reports usage: prompt tokens with cached
+    /// reads among them, and output tokens, priced per million.
+    fn priced_turn(dir: &std::path::Path, text: &str) -> FakeLlm {
+        let fake = FakeLlm::start(vec![Reply::WithUsage {
+            reply: Box::new(Reply::Text(text.to_string())),
+            usage: serde_json::json!({
+                "prompt_tokens": 11000,
+                "completion_tokens": 1000,
+                "total_tokens": 12000,
+                "prompt_tokens_details": {"cached_tokens": 10000},
+            }),
+        }]);
+        write_fake_llm_config(dir, &fake);
+        let path = dir.join("config.yaml");
+        let config = std::fs::read_to_string(&path).unwrap().replace(
+            "max_input_tokens: 100000\n",
+            "max_input_tokens: 100000\n        input_price: 3\n        output_price: 15\n        cache_read_price: 0.3\n",
+        );
+        std::fs::write(&path, config).unwrap();
+        fake
+    }
+
+    /// The footer row of a forced repaint, whitespace squeezed out: from the
+    /// left half, which starts with `left`, to the end of the frame, as the
+    /// footer is the last row the repaint writes.
+    fn footer_row(pty: &mut Pty, left: &str) -> String {
+        let flat = squeezed(&repainted_frame(pty, 24, 100));
+        let left = squeezed(left);
+        let at = flat
+            .rfind(&left)
+            .unwrap_or_else(|| panic!("no footer starting {left:?}: {flat}"));
+        flat[at..].to_string()
+    }
+
+    /// On a real turn in a session with a provider that reports usage, the
+    /// footer keeps every segment it had: the model, the session and the
+    /// task counts on the left, then on the right the cached reads, the
+    /// session's spend and its tokens with the context percentage, in the
+    /// REPL right prompt's order and format.
+    #[test]
+    #[serial]
+    fn a_priced_turn_puts_cache_spend_and_context_on_the_footer() {
+        let dir = fresh_config_dir("footer-priced");
+        let _guard = TempDirGuard(dir.clone());
+        let _fake = priced_turn(&dir, "priced reply p7c");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.send(b".session\r").unwrap();
+        pty.wait_for("temp", PTY_DEADLINE).unwrap();
+        let sent = pty.raw().len();
+        pty.send(b"hello\r").unwrap();
+        wait_for_squeezed(&mut pty, "priced reply p7c", "the priced reply");
+        pty.wait_for_after("$0.0210", sent, PTY_DEADLINE).unwrap();
+        let left = squeezed("fake:fake-model . temp . agents 0 . jobs 0");
+        let footer = footer_row(&mut pty, &left);
+        let right = &footer[left.len()..];
+        let cache = right.find("\u{26a1}10000");
+        let spend = right.find("$0.0210");
+        let context = right.find("%)");
+        assert!(
+            cache.is_some() && cache < spend && spend < context,
+            "the right half is not cache, spend, tokens(percent%): {footer}"
+        );
+        assert!(right.ends_with("%)"), "{footer}");
+        quit_and_check(&mut pty);
+    }
+
+    /// Without a session the right prompt has no spend or tokens to show,
+    /// as in the REPL, but the cached reads of the last reply still show.
+    #[test]
+    #[serial]
+    fn without_a_session_the_footer_still_shows_the_cached_reads() {
+        let dir = fresh_config_dir("footer-priced-nosession");
+        let _guard = TempDirGuard(dir.clone());
+        let _fake = priced_turn(&dir, "priced reply q8d");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        let sent = pty.raw().len();
+        pty.send(b"hello\r").unwrap();
+        wait_for_squeezed(&mut pty, "priced reply q8d", "the priced reply");
+        pty.wait_for_after("\u{26a1}10000", sent, PTY_DEADLINE)
+            .unwrap();
+        let footer = footer_row(&mut pty, "fake:fake-model . no session . agents 0 . jobs 0");
+        assert!(footer.ends_with("jobs0\u{26a1}10000"), "{footer}");
         quit_and_check(&mut pty);
     }
 }

@@ -31,6 +31,13 @@ pub enum Reply {
         gate: PathBuf,
         reply: Box<Reply>,
     },
+    /// `reply` with a chat-completions `usage` object: on the message of a
+    /// non-streamed reply, or on a chunk of its own after the reply's deltas
+    /// of a streamed one, the way a provider that reports usage sends it.
+    WithUsage {
+        reply: Box<Reply>,
+        usage: Value,
+    },
 }
 
 /// How long an [`Reply::After`] waits for its gate. A case opens the gate
@@ -140,6 +147,20 @@ fn serve(
                     }
                     reply = inner;
                 }
+                if let Reply::WithUsage {
+                    reply: inner,
+                    usage,
+                } = reply
+                {
+                    let response = if body["stream"] == Value::Bool(true) {
+                        sse_response_with(inner, Some(usage))
+                    } else {
+                        json_response_with(inner, Some(usage))
+                    };
+                    let _ = stream.write_all(&response);
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
                 match (reply, body["stream"] == Value::Bool(true)) {
                     (Reply::Streamed(chunks), true) => {
                         paced_sse_response(&mut stream, chunks, stop);
@@ -218,8 +239,14 @@ fn joined_text(chunks: &[Chunk]) -> String {
 }
 
 fn json_response(reply: &Reply) -> Vec<u8> {
+    json_response_with(reply, None)
+}
+
+fn json_response_with(reply: &Reply, usage: Option<&Value>) -> Vec<u8> {
     let (message, finish_reason) = match reply {
-        Reply::After { reply, .. } => return json_response(reply),
+        Reply::After { reply, .. } | Reply::WithUsage { reply, .. } => {
+            return json_response_with(reply, usage);
+        }
         Reply::Text(text) => (json!({"role": "assistant", "content": text}), "stop"),
         Reply::Streamed(chunks) => (
             json!({"role": "assistant", "content": joined_text(chunks)}),
@@ -238,18 +265,27 @@ fn json_response(reply: &Reply) -> Vec<u8> {
             "tool_calls",
         ),
     };
-    let body = json!({
+    let mut body = json!({
         "id": "fake",
         "object": "chat.completion",
         "model": "fake-model",
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
     });
+    if let Some(usage) = usage {
+        body["usage"] = usage.clone();
+    }
     http_response(200, "application/json", body.to_string().as_bytes())
 }
 
 fn sse_response(reply: &Reply) -> Vec<u8> {
+    sse_response_with(reply, None)
+}
+
+fn sse_response_with(reply: &Reply, usage: Option<&Value>) -> Vec<u8> {
     let delta = match reply {
-        Reply::After { reply, .. } => return sse_response(reply),
+        Reply::After { reply, .. } | Reply::WithUsage { reply, .. } => {
+            return sse_response_with(reply, usage);
+        }
         Reply::Text(text) => json!({"content": text}),
         Reply::Streamed(chunks) => json!({"content": joined_text(chunks)}),
         Reply::ToolCall { name, arguments } => json!({
@@ -262,7 +298,12 @@ fn sse_response(reply: &Reply) -> Vec<u8> {
         }),
     };
     let frame = json!({"choices": [{"index": 0, "delta": delta}]});
-    let payload = format!("data: {frame}\n\ndata: [DONE]\n\n");
+    let mut payload = format!("data: {frame}\n\n");
+    if let Some(usage) = usage {
+        let frame = json!({"choices": [], "usage": usage});
+        payload.push_str(&format!("data: {frame}\n\n"));
+    }
+    payload.push_str("data: [DONE]\n\n");
     http_response(200, "text/event-stream", payload.as_bytes())
 }
 
