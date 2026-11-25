@@ -3217,8 +3217,9 @@ fn step_runner_seats_its_coder_at_round_and_reuses_its_finalize_record() {
 }
 
 /// Without a floor the gate cannot tell a committed misformatted file from
-/// one outside the change, so a rewrite leaves fmt unavailable, never green,
-/// and the file keeps its committed bytes.
+/// one outside the change, so a rewrite leaves fmt unavailable, never green.
+/// The gate and the record it writes are red, as for a lint that could not
+/// run, and the file keeps its committed bytes.
 #[test]
 fn finalize_gate_without_a_floor_never_passes_a_file_fmt_rewrote() {
     if tools_missing() {
@@ -3233,13 +3234,21 @@ fn finalize_gate_without_a_floor_never_passes_a_file_fmt_rewrote() {
     );
     commit_file(&dir, "src/committed.txt");
     let out = finalize(&dir, &[("TEST_CMD", "true")]);
-    assert_ne!(str_field(&out, "status"), "green", "{out}");
+    assert_eq!(str_field(&out, "status"), "red", "{out}");
     let fmt = item(&out, "fmt");
     assert_eq!(str_field(fmt, "verdict"), "unavailable", "{out}");
     let note = str_field(fmt, "note");
     assert!(note.contains("no floor was given"), "{out}");
     assert!(note.contains("src/committed.txt"), "{out}");
-    assert_ne!(str_field(&finalize_lookup(&dir), "status"), "green");
+    let lookup = finalize_lookup(&dir);
+    assert_eq!(str_field(&lookup, "status"), "red", "{lookup}");
+    let recorded = lookup["record"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["role"] == "fmt")
+        .unwrap_or_else(|| panic!("no fmt result: {lookup}"));
+    assert_eq!(str_field(recorded, "verdict"), "unavailable", "{lookup}");
     assert_eq!(
         fs::read_to_string(dir.join("src/committed.txt")).unwrap(),
         "src/committed.txt"
