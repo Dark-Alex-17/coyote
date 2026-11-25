@@ -441,6 +441,7 @@ mod binary_menus {
         let before = pty.raw().len();
         pty.send(b"call the confirm tool\r").unwrap();
         wait_for_file(pty, asked, "the tool's confirm request");
+        wait_for_squeezed_after(pty, "Esc = cancel", before, "the confirm modal's legend");
         pty.read_for(Duration::from_millis(1000));
         strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
     }
@@ -4779,8 +4780,9 @@ mod binary_wizards {
         pty.read_for(Duration::from_millis(800));
         // A different size from the one `answer_and_expect_session` grows to,
         // so both repaints are forced.
+        let resized_at = pty.raw().len();
         pty.resize(60, 110).unwrap();
-        pty.read_for(Duration::from_millis(800));
+        read_repaint(&mut pty, resized_at, Duration::from_millis(800));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
         assert!(
             squeezed(&since).contains("nosession"),
@@ -5400,7 +5402,7 @@ mod binary_wizards {
         // other than the one that painted it.
         let repaint_at = pty.raw().len();
         pty.resize(24, 81).unwrap();
-        pty.read_for(Duration::from_millis(600));
+        read_repaint(&mut pty, repaint_at, Duration::from_millis(600));
         let command_rows = painted_at(pty.raw(), b".exit session", repaint_at);
         let saved_rows = painted_at(pty.raw(), b"Saved", repaint_at);
         let (Some(&(command_row, _)), Some(&(saved_row, _))) =

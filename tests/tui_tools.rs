@@ -1118,6 +1118,11 @@ def run(out: str) -> str:
             "the question was cancelled.",
             "the note after Esc on the first MCP conflict modal",
         );
+        wait_for_file(
+            &mut pty,
+            &dir.join("roles").join("bundle-k7s-role.md"),
+            "the bundle's role",
+        );
         pty.read_for(Duration::from_millis(2500));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
         let since = if first_is_server {
@@ -1171,6 +1176,11 @@ def run(out: str) -> str:
             &mut pty,
             "the question was cancelled.",
             "the note after Esc on the first MCP conflict",
+        );
+        wait_for_file(
+            &mut pty,
+            &dir.join("roles").join("bundle-k7s-role.md"),
+            "the bundle's role",
         );
         pty.read_for(Duration::from_millis(2500));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
@@ -1451,8 +1461,11 @@ def run(out: str) -> str:
         pty.send(b".info agent\r").unwrap();
         pty.wait_for_after("config_file", info_at, PTY_DEADLINE)
             .expect("`.info agent` never rendered after `n` on the init RAG modal");
-        pty.read_for(Duration::from_millis(800));
-        let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+        let info = painted_after(&mut pty, info_at, |text| {
+            let flat = squeezed(text);
+            flat.contains("name:docs-agent-n7q") && flat.contains("documents:-notes.md")
+        })
+        .unwrap_or_else(|since| since);
         let flat = squeezed(&info);
         assert!(
             flat.contains("name:docs-agent-n7q") && flat.contains("documents:-notes.md"),
@@ -1745,7 +1758,11 @@ def run(out: str) -> str:
 
         pty.read_for(HOTKEY_GAP);
         pty.send(b"\r").unwrap();
-        let mut frame = repainted_frame(&mut pty, 50, 120);
+        let at = repaint_until(&mut pty, 50, 120, |f| {
+            let flat = squeezed(f);
+            RAG_WIZARD_FOLLOW_UPS.iter().any(|q| flat.contains(q)) && flat.contains("Esc=cancel")
+        });
+        let mut frame = since(&pty, at);
         assert!(
             !squeezed(&frame).contains("Selectembeddingmodel:"),
             "Enter on the Select modal did not take the highlighted embedding model:\n{frame}"
@@ -2106,7 +2123,8 @@ def run(out: str) -> str:
         pty.send(b"print forty lines\r").unwrap();
         wait_for_squeezed(&mut pty, "fixture done p9g", "the reply after the tool");
         pty.read_for(Duration::from_millis(500));
-        let inline = repainted_frame(&mut pty, 30, 100);
+        let at = repaint_until(&mut pty, 30, 100, |f| f.contains("fixture_forty({})"));
+        let inline = since(&pty, at);
         assert!(
             inline.contains("fixture_forty({})"),
             "the tool row is not in the transcript:\n{inline}"
@@ -2642,11 +2660,11 @@ mod bottom_pane {
                 .unwrap_or_else(|err| {
                     panic!("the band never listed the tool commands under {prefix}: {err}")
                 });
-            let repainted = repaint(&mut pty, 40, 101);
-            let frame = since(&pty, repainted);
             // The band pads the name to the description column, so the rows
             // are matched with whitespace squeezed out on both sides.
             let [enable, disable] = rows.map(|row| row.split_whitespace().collect::<String>());
+            let repainted = repaint_showing(&mut pty, 40, 101, &[&enable, &disable]);
+            let frame = since(&pty, repainted);
             squeezed_positions(&frame, [enable.as_str(), disable.as_str()]);
 
             // Ctrl+C closes the band first; the second one clears the draft.
@@ -2682,7 +2700,7 @@ mod bottom_pane {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"probe-bg-q9d").unwrap();
         pty.read_for(Duration::from_millis(300));
-        let repainted = repaint(&mut pty, 80, 101);
+        let repainted = repaint_showing(&mut pty, 80, 101, &["probe-bg-q9d", "> .info"]);
 
         let raw = pty.raw();
         let probe_at = find(raw, b"probe-bg-q9d", repainted).unwrap_or_else(|| {
@@ -2827,7 +2845,8 @@ mod bottom_pane {
         let modal_at = pty.raw().len();
         pty.send(b"s3cret").unwrap();
         pty.read_for(HOTKEY_GAP);
-        let repainted = repaint(&mut pty, 40, 101);
+        let repainted =
+            repaint_showing(&mut pty, 40, 101, &["fixture_password_rec asks:", "******"]);
         let field = since(&pty, repainted);
         assert!(
             field.contains("fixture_password_rec asks:"),
@@ -2871,7 +2890,7 @@ mod bottom_pane {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(300));
-        let repainted = repaint(&mut pty, 40, 101);
+        let repainted = repaint_showing(&mut pty, 40, 101, &[".info"]);
         assert!(
             !since(&pty, repainted).contains("Show system info"),
             "the palette band is still up:\n{}",
@@ -2892,7 +2911,7 @@ mod bottom_pane {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(300));
-        let repainted = repaint(&mut pty, 40, 100);
+        let repainted = repaint_showing(&mut pty, 40, 100, &[".nosuch"]);
         let at = find(pty.raw(), b".nosuch", repainted)
             .unwrap_or_else(|| panic!("`.nosuch` was not repainted:\n{}", since(&pty, repainted)));
         let style = sgr_before(pty.raw(), at);
@@ -2925,7 +2944,7 @@ mod bottom_pane {
             .expect("the palette band never showed the `.info` row");
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(300));
-        let repainted = repaint(&mut pty, 40, 101);
+        let repainted = repaint_showing(&mut pty, 40, 101, &[".in"]);
         let frame = since(&pty, repainted);
         assert!(
             !frame.contains("Show system info") && !frame.contains(".info"),
@@ -3004,7 +3023,12 @@ mod bottom_pane {
         );
         assert_eq!(fake.served(), 2);
         pty.read_for(Duration::from_millis(500));
-        let repainted = repaint(&mut pty, 40, 101);
+        let repainted = repaint_showing(
+            &mut pty,
+            40,
+            101,
+            &["tail q9d-t", "> follow-up q9d-n", "second reply q9d-s"],
+        );
         let frame = since(&pty, repainted);
         let [tail, header, second] =
             squeezed_positions(&frame, ["tailq9d-t", ">follow-upq9d-n", "secondreplyq9d-s"]);
@@ -3045,7 +3069,12 @@ mod bottom_pane {
             "the queued `.clear images` never ran",
         );
         pty.read_for(Duration::from_millis(500));
-        let repainted = repaint(&mut pty, 80, 40);
+        let repainted = repaint_showing(
+            &mut pty,
+            80,
+            40,
+            &["tail q9d-t", "> .clear images", "No pending images."],
+        );
         let frame = since(&pty, repainted);
         let [tail, header, output] =
             squeezed_positions(&frame, ["tailq9d-t", ">.clearimages", "Nopendingimages."]);
@@ -4128,8 +4157,12 @@ mod binary {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"draft to discard q9x").unwrap();
-        pty.wait_for("draft to discard q9x", PTY_DEADLINE)
-            .expect("the typed draft never reached the composer");
+        wait_for_painted_after(
+            &mut pty,
+            "draft to discard q9x",
+            0,
+            "the typed draft never reached the composer",
+        );
         pty.read_for(HOTKEY_GAP);
         let cleared_at = pty.raw().len();
         pty.send(b"\x03").unwrap();
@@ -4184,8 +4217,12 @@ mod binary {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.send(b"draft kept on ctrl-d w2v").unwrap();
-        pty.wait_for("draft kept on ctrl-d w2v", PTY_DEADLINE)
-            .expect("the typed draft never reached the composer");
+        wait_for_painted_after(
+            &mut pty,
+            "draft kept on ctrl-d w2v",
+            0,
+            "the typed draft never reached the composer",
+        );
         pty.read_for(HOTKEY_GAP);
         let pressed_at = pty.raw().len();
         pty.send(b"\x04").unwrap();
@@ -4334,8 +4371,11 @@ mod binary {
         pty.resize(38, 100).unwrap();
         pty.wait_for_after("temp", repaint_at, PTY_DEADLINE)
             .expect("the screen was not repainted after the resize");
-        pty.read_for(Duration::from_millis(500));
-        let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[repaint_at..]));
+        let repainted = painted_after(&mut pty, repaint_at, |text| {
+            squeezed(text).contains("partialtextbeforeesce5p")
+                && text.to_lowercase().contains("interrupted")
+        })
+        .unwrap_or_else(|since| since);
         let squeezed: String = repainted.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             squeezed.contains("partialtextbeforeesce5p"),
@@ -4685,7 +4725,8 @@ mod binary {
             .expect("`.list agents` did not draw its table");
         // One column wider, so the resize is real and the whole screen is
         // painted again; the table was fitted to sixty.
-        let frame = repainted_frame(&mut pty, 60, 61);
+        let at = repaint_until(&mut pty, 60, 61, |f| f.contains('\u{2534}'));
+        let frame = since(&pty, at);
         let bottom = frame
             .rfind('\u{2534}')
             .unwrap_or_else(|| panic!("the table's bottom border is off the screen:\n{frame}"));
@@ -5167,9 +5208,14 @@ mod binary {
             "the model's reply landed for a `!shell` line:\n{since}"
         );
 
+        wait_until_idle(&mut pty, "the turn of the `!shell` line");
         pty.send(b".info\r").unwrap();
-        pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
-            .expect("keys were not handled after the shell returned");
+        wait_for_painted_after(
+            &mut pty,
+            "log_path",
+            re_entered,
+            "keys were not handled after the shell returned",
+        );
         pty.send(b"\x04").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{transcript}");

@@ -1837,10 +1837,16 @@ mod suspend_and_signals {
         let typed_at = pty.raw().len();
         pty.send(b"draft-r12-d\r").unwrap();
         let after_enter = pty.read_for(Duration::from_millis(1000));
-        let mid = since(&pty, typed_at);
         assert!(
-            !mid.contains("exit=") && find(pty.raw(), LEAVE_ALT, typed_at).is_none(),
+            !since(&pty, typed_at).contains("exit=")
+                && find(pty.raw(), LEAVE_ALT, typed_at).is_none(),
             "Enter on a draft while a tool ran ended the UI (a panic or a quit):\n{after_enter}"
+        );
+        let mid = wait_for_squeezed_after(
+            &mut pty,
+            "pending: 1",
+            typed_at,
+            "the queue strip after Enter on a draft",
         );
         let queued = squeezed(&mid);
         assert!(
@@ -1882,7 +1888,7 @@ mod suspend_and_signals {
         // draft left in the field.
         let repaint_at = pty.raw().len();
         pty.send(b"\x0c").unwrap();
-        pty.read_for(Duration::from_millis(600));
+        read_repaint(&mut pty, repaint_at, Duration::from_millis(600));
         let repainted = since(&pty, repaint_at);
         assert!(
             !repainted.contains("pending:"),
@@ -2299,7 +2305,7 @@ mod suspend_and_signals {
         // of the strip's text, so the queued line is read from a fresh one.
         let repaint_at = pty.raw().len();
         pty.resize(24, 81).unwrap();
-        pty.read_for(Duration::from_millis(600));
+        read_repaint(&mut pty, repaint_at, Duration::from_millis(600));
         let mid = squeezed(&since(&pty, repaint_at));
         assert!(
             mid.contains("queued-r12-q"),
@@ -2530,12 +2536,16 @@ mod suspend_and_signals {
             "the pasted prompt in the transcript",
         );
         // The turn ends and the UI still takes keys: a command after it
-        // renders its cell.
+        // renders its cell. The table lands on rows that held pasted lines,
+        // so its stream can lack letters those lines had in the same cells.
         let info_at = pty.raw().len();
         pty.send(b".info\r").unwrap();
-        let after = pty
-            .wait_for_after("log_path", info_at, PTY_DEADLINE)
-            .expect("the turn on the pasted prompt never ended, or keys stopped being handled");
+        let after = wait_for_painted_after(
+            &mut pty,
+            "log_path",
+            info_at,
+            "the turn on the pasted prompt never ended, or keys stopped being handled",
+        );
         assert!(
             !after.contains("exit="),
             "the UI left while echoing the pasted prompt:\n{after}"

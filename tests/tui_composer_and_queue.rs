@@ -103,7 +103,8 @@ mod queue_vi_and_headless {
         pty.read_for(Duration::from_millis(500));
         pty.send(b"hello-after-agent-kq7\r").unwrap();
         pty.read_for(Duration::from_millis(800));
-        let frame = repainted_frame_after_resize(&mut pty, 40, 101);
+        let at = repaint_showing(&mut pty, 40, 101, &["pending: 2"]);
+        let frame = since(&pty, at);
         assert!(
             squeezed(&frame).contains("pending:2"),
             "the command and the text queued while the model streamed did not show `pending: 2`:\n{frame}"
@@ -188,7 +189,8 @@ mod queue_vi_and_headless {
         let info_at = pty.raw().len();
         pty.send(b".info\r").unwrap();
         wait_for_squeezed_after(&mut pty, "log_path", info_at, "the output of `.info`");
-        let frame = repainted_frame_after_resize(&mut pty, 40, 101);
+        let at = repaint_until(&mut pty, 40, 101, |f| f.contains("Esc to interrupt"));
+        let frame = since(&pty, at);
         assert!(
             frame.contains("Esc to interrupt"),
             "the turn was no longer running when `.info` showed:\n{frame}"
@@ -203,7 +205,8 @@ mod queue_vi_and_headless {
         let release_at = pty.raw().len();
         fs::write(&release, b"").unwrap();
         wait_for_squeezed_after(&mut pty, "? = keys", release_at, "the end of the turn");
-        let frame = repainted_frame_after_resize(&mut pty, 40, 100);
+        let at = repaint_showing(&mut pty, 40, 100, &["reply one ni4"]);
+        let frame = since(&pty, at);
         let frame = squeezed(&frame);
         let (above, below) = frame
             .split_once("replyoneni4")
@@ -267,7 +270,8 @@ mod queue_vi_and_headless {
         pty.send(b".info\r").unwrap();
         wait_for_squeezed_after(&mut pty, "log_path", info_at, "the idle `.info`");
         // Tall enough for the head of the output, where the setting is.
-        let info = repainted_frame_after_resize(&mut pty, 90, 101);
+        let at = repaint_showing(&mut pty, 90, 101, &["temperature 0.5"]);
+        let info = since(&pty, at);
         assert!(
             squeezed(&info).contains("temperature0.5"),
             "the setting typed during the turn did not reach the session:\n{info}"
@@ -320,7 +324,8 @@ mod queue_vi_and_headless {
         let release_at = pty.raw().len();
         fs::write(&release, b"").unwrap();
         wait_for_squeezed_after(&mut pty, "? = keys", release_at, "the end of the turn");
-        let frame = squeezed(&repainted_frame_after_resize(&mut pty, 40, 101));
+        let at = repaint_showing(&mut pty, 40, 101, &["reply one hb7"]);
+        let frame = squeezed(&since(&pty, at));
         let (above, _) = frame
             .split_once("replyonehb7")
             .unwrap_or_else(|| panic!("the rest of the reply is out of view:\n{frame}"));
@@ -333,7 +338,12 @@ mod queue_vi_and_headless {
         let info_at = pty.raw().len();
         pty.send(b".info\r").unwrap();
         wait_for_squeezed_after(&mut pty, "log_path", info_at, "the idle `.info`");
-        let info = repainted_frame_after_resize(&mut pty, 90, 101);
+        let at = repaint_until(&mut pty, 90, 101, |f| {
+            squeezed(f)
+                .rsplit_once(">.info")
+                .is_some_and(|(_, listing)| listing.contains("temperature"))
+        });
+        let info = since(&pty, at);
         let info = squeezed(&info);
         let listing = info
             .rsplit_once(">.info")
@@ -497,7 +507,8 @@ mod queue_vi_and_headless {
         let opened = since(&pty, search_at);
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(400));
-        let frame = repainted_frame_after_resize(&mut pty, 40, 101);
+        let at = repaint_showing(&mut pty, 40, 101, &["Type a prompt or a .command"]);
+        let frame = since(&pty, at);
         assert!(
             squeezed(&frame).contains("Typeapromptora.command"),
             "after Ctrl+R then Esc the composer is not back to its empty placeholder \
@@ -509,15 +520,18 @@ mod queue_vi_and_headless {
         pty.send(b"\x12").unwrap();
         pty.read_for(Duration::from_millis(600));
         pty.send(b"alpha").unwrap();
-        pty.read_for(Duration::from_millis(600));
-        let narrowed = since(&pty, search_at);
-        assert!(
-            squeezed(&narrowed).contains("alpha-history-kq7"),
-            "the history search does not list the matching prompt:\n{narrowed}"
+        wait_for_squeezed_after(
+            &mut pty,
+            "alpha-history-kq7",
+            search_at,
+            "the history search does not list the matching prompt",
         );
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(800));
-        let frame = repainted_frame_after_resize(&mut pty, 40, 102);
+        let at = repaint_until(&mut pty, 40, 102, |f| {
+            composer_row(f) == "alpha-history-kq7"
+        });
+        let frame = since(&pty, at);
         let flat = squeezed(&frame);
         assert!(
             !flat.contains("Typeapromptora.command"),
@@ -738,7 +752,7 @@ mod queue_vi_and_headless {
         let typed_at = pty.raw().len();
         pty.send(b".macro ").unwrap();
         pty.read_for(Duration::from_millis(600));
-        repaint(&mut pty, 60, 141);
+        repaint_showing(&mut pty, 60, 141, &["cold-macro-kq7"]);
         let frame = since(&pty, typed_at);
         assert!(
             squeezed(&frame).contains("cold-macro-kq7"),
@@ -747,7 +761,7 @@ mod queue_vi_and_headless {
 
         pty.send(b"col").unwrap();
         pty.read_for(Duration::from_millis(600));
-        let narrowed_at = repaint(&mut pty, 60, 140);
+        let narrowed_at = repaint_showing(&mut pty, 60, 140, &["cold-macro-kq7"]);
         let narrowed = since(&pty, narrowed_at);
         assert!(
             squeezed(&narrowed).contains("cold-macro-kq7"),
@@ -2108,7 +2122,10 @@ mod editor_status_history_reset_and_bare_agent {
         pty.read_for(Duration::from_millis(400));
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(1500));
-        let frame = repainted_frame_after_resize(&mut pty, 60, 100);
+        let at = repaint_until(&mut pty, 60, 100, |f| {
+            composer_row_with_footer(f, "dryrun:dry-model") == "before-w4a"
+        });
+        let frame = since(&pty, at);
         let flat = squeezed(&frame);
         if flat.contains("Rewindto") {
             misses.push(format!("the picker is still up after Enter:\n{frame}"));

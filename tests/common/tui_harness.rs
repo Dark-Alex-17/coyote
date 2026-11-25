@@ -981,18 +981,14 @@ pub fn cargo_installed_binary(dir: &Path) -> PathBuf {
 ///
 /// The painter writes only the cells that changed, so a modal that
 /// replaces one with the same options and legend sends only its new text,
-/// minus any letters that already sat in the same cells. When the stream
-/// has not shown every marker after [`MODAL_REPAINT_AFTER`], a repaint in
-/// place is read as well; a test whose modal paints in one go never
-/// triggers one, so its stream is unchanged.
+/// minus any letters that already sat in the same cells, which
+/// [`painted_after`] makes up for.
 pub fn wait_for_the_modal(
     pty: &mut Pty,
     before: usize,
     command: &str,
     modal_markers: &[&str],
 ) -> String {
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    let mut next_repaint = Instant::now() + MODAL_REPAINT_AFTER;
     let markers: Vec<String> = modal_markers
         .iter()
         .map(|marker| squeezed(marker))
@@ -1001,30 +997,59 @@ pub fn wait_for_the_modal(
         let flat = squeezed(text);
         markers.iter().all(|marker| flat.contains(marker.as_str())) && flat.contains("Esc=cancel")
     };
-    let modal = loop {
-        pty.read_for(Duration::from_millis(200));
-        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
-        if shows_the_modal(&since) {
-            break since;
-        }
-        if Instant::now() >= next_repaint {
-            let frame = repainted_in_place(pty);
-            if shows_the_modal(&frame) {
-                break frame;
-            }
-            next_repaint = Instant::now() + MODAL_REPAINT_AFTER;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
+    let modal = painted_after(pty, before, shows_the_modal).unwrap_or_else(|since| {
+        panic!(
             "`{command}` did not raise the modal showing {modal_markers:?} within {PTY_DEADLINE:?}:\n{since}"
-        );
-    };
+        )
+    });
     assert_eq!(
         count(pty.raw(), LEAVE_ALT),
         0,
         "the question of `{command}` released the terminal:\n{modal}"
     );
     modal
+}
+
+/// Reads the stream past `from` until `shows` holds for it, and returns
+/// what matched. A stream read can lack letters that already sat in the
+/// same cells, so whenever it has gone [`STREAM_REPAINT_AFTER`] without a
+/// match a repaint in place is read and tried too; a screen that paints in
+/// one go never triggers one, so its stream is unchanged. At
+/// [`PTY_DEADLINE`] the stream since `from` comes back as the error.
+pub fn painted_after(
+    pty: &mut Pty,
+    from: usize,
+    shows: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let deadline = Instant::now() + PTY_DEADLINE;
+    let mut next_repaint = Instant::now() + STREAM_REPAINT_AFTER;
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let stream = since(pty, from);
+        if shows(&stream) {
+            return Ok(stream);
+        }
+        if Instant::now() >= next_repaint {
+            let frame = repainted_in_place(pty);
+            if shows(&frame) {
+                return Ok(frame);
+            }
+            next_repaint = Instant::now() + STREAM_REPAINT_AFTER;
+        }
+        if Instant::now() >= deadline {
+            return Err(stream);
+        }
+    }
+}
+
+/// [`painted_after`] for `needle`, whitespace squeezed out on both sides
+/// since a cell that already held a blank is not rewritten, panicking with
+/// `what` at the deadline.
+pub fn wait_for_painted_after(pty: &mut Pty, needle: &str, from: usize, what: &str) -> String {
+    let wanted = squeezed(needle);
+    painted_after(pty, from, |text| squeezed(text).contains(&wanted)).unwrap_or_else(|since| {
+        panic!("{what}: {needle:?} was not painted within {PTY_DEADLINE:?}:\n{since}")
+    })
 }
 
 /// Esc on the modal, then a repaint forced by a resize so the frame can
@@ -1044,7 +1069,7 @@ pub fn esc_cancels_the_modal(pty: &mut Pty, command: &str) {
     };
     let resized_at = pty.raw().len();
     pty.resize(rows, 110).unwrap();
-    pty.read_for(Duration::from_millis(800));
+    read_repaint(pty, resized_at, Duration::from_millis(800));
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
     assert!(
         pty.raw().len() > resized_at,
@@ -1097,7 +1122,7 @@ pub fn answer_and_expect_session(mut pty: Pty, key: &[u8], name: &str, empty: bo
     pty.read_for(Duration::from_millis(800));
     let grown_at = pty.raw().len();
     pty.resize(120, 120).unwrap();
-    pty.read_for(Duration::from_millis(800));
+    read_repaint(&mut pty, grown_at, Duration::from_millis(800));
     let grown = strip_ansi(&String::from_utf8_lossy(&pty.raw()[grown_at..]));
     assert!(
         squeezed(&grown).contains(name),
@@ -1314,8 +1339,12 @@ pub fn write_conflicting_local_mcp_server(dir: &Path) -> String {
 pub fn assert_ui_alive_then_quit(pty: &mut Pty, after: &str) -> String {
     let info_at = pty.raw().len();
     pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("`.info` after {after} never rendered: {e:?}"));
+    wait_for_painted_after(
+        pty,
+        "log_path",
+        info_at,
+        &format!("`.info` after {after} never rendered"),
+    );
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1350,14 +1379,21 @@ pub fn read_repaint(pty: &mut Pty, from: usize, settle: Duration) {
     pty.read_for(settle);
 }
 
-/// How long [`wait_for_the_modal`] reads the stream alone before it also
-/// reads a repaint in place.
-pub const MODAL_REPAINT_AFTER: Duration = Duration::from_secs(3);
+/// How long [`painted_after`] reads the stream alone before it also reads
+/// a repaint in place.
+pub const STREAM_REPAINT_AFTER: Duration = Duration::from_secs(3);
 
 /// A full repaint at the size the pty has now: one row taller and back,
 /// since a resize to the current size is a no-op. Returns the stripped
 /// frame painted after the size is restored.
 pub fn repainted_in_place(pty: &mut Pty) -> String {
+    let from = repaint_in_place(pty);
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
+}
+
+/// [`repainted_in_place`], returning the raw offset the restored frame
+/// starts after instead of the frame.
+pub fn repaint_in_place(pty: &mut Pty) -> usize {
     let (rows, cols) = pty.size().unwrap();
     let grown = pty.raw().len();
     pty.resize(rows + 1, cols).unwrap();
@@ -1365,7 +1401,7 @@ pub fn repainted_in_place(pty: &mut Pty) -> String {
     let from = pty.raw().len();
     pty.resize(rows, cols).unwrap();
     read_repaint(pty, from, Duration::from_millis(800));
-    strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
+    from
 }
 
 /// A full repaint at 100 columns: the height flips between 30 and 32 rows
@@ -1649,16 +1685,41 @@ pub fn since(pty: &Pty, from: usize) -> String {
 pub fn repaint(pty: &mut Pty, rows: u16, cols: u16) -> usize {
     let at = pty.raw().len();
     pty.resize(rows, cols).unwrap();
-    pty.read_for(REPAINT_SETTLE);
+    read_repaint(pty, at, REPAINT_SETTLE);
     at
 }
 
 /// [`repaint`] and the stripped frame it painted. Unlike
 /// [`repainted_frame`] nothing is read before the resize, and the frame
-/// is read for [`REPAINT_SETTLE`] after it.
+/// is read for [`REPAINT_SETTLE`] once it starts.
 pub fn repainted_frame_after_resize(pty: &mut Pty, rows: u16, cols: u16) -> String {
     let at = repaint(pty, rows, cols);
     since(pty, at)
+}
+
+/// [`repaint`] to `rows` by `cols`, then repaints in place until the
+/// stripped frame satisfies `shows` or [`PTY_DEADLINE`] lapses, and
+/// returns the raw offset the last frame starts after. One repaint can
+/// come back short on a loaded runner, and a resize to the size the pty
+/// already has paints nothing, so a single read is not a frame.
+pub fn repaint_until(pty: &mut Pty, rows: u16, cols: u16, shows: impl Fn(&str) -> bool) -> usize {
+    let deadline = Instant::now() + PTY_DEADLINE;
+    let mut at = repaint(pty, rows, cols);
+    while !shows(&since(pty, at)) && Instant::now() < deadline {
+        at = repaint_in_place(pty);
+    }
+    at
+}
+
+/// [`repaint_until`] for a frame holding every one of `markers`, whitespace
+/// squeezed out on both sides.
+pub fn repaint_showing(pty: &mut Pty, rows: u16, cols: u16, markers: &[&str]) -> usize {
+    repaint_until(pty, rows, cols, |frame| {
+        let flat = squeezed(frame);
+        markers
+            .iter()
+            .all(|marker| flat.contains(&squeezed(marker)))
+    })
 }
 
 /// A fresh full frame on every call: the width alternates so the resize
@@ -1692,7 +1753,7 @@ pub fn wait_until_no_pending(pty: &mut Pty) {
         pty.read_for(Duration::from_millis(300));
         let repaint_at = pty.raw().len();
         pty.send(b"\x0c").unwrap();
-        pty.read_for(Duration::from_millis(500));
+        read_repaint(pty, repaint_at, Duration::from_millis(500));
         let repainted = since(pty, repaint_at);
         if !repainted.contains("pending:") {
             return;
@@ -1700,6 +1761,26 @@ pub fn wait_until_no_pending(pty: &mut Pty) {
         assert!(
             std::time::Instant::now() < deadline,
             "the queue strip outlived the turn:\n{repainted}"
+        );
+    }
+}
+
+/// Repaints in place until the screen shows the empty composer with no
+/// busy status row, panicking with `what` at [`PTY_DEADLINE`]. Keys sent
+/// before a turn that took the terminal back has ended can be dropped
+/// with what the terminal queued while it was released.
+pub fn wait_until_idle(pty: &mut Pty, what: &str) {
+    let deadline = Instant::now() + PTY_DEADLINE;
+    loop {
+        let frame = repainted_in_place(pty);
+        if squeezed(&frame).contains("Typeapromptora.command")
+            && !frame.contains("Esc to interrupt")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the UI was not idle within {PTY_DEADLINE:?}:\n{frame}"
         );
     }
 }
@@ -1880,8 +1961,12 @@ pub fn start_session(pty: &mut Pty, name: &str) {
 /// The composer takes a command again: `.info` renders its table.
 pub fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
     pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", after, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("keys were not handled after {what}: {e}"));
+    wait_for_painted_after(
+        pty,
+        "log_path",
+        after,
+        &format!("keys were not handled after {what}"),
+    );
     pty.read_for(Duration::from_millis(300));
 }
 

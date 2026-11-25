@@ -84,7 +84,7 @@ mod transcript {
     fn ctrl_l_repaint(pty: &mut Pty) -> String {
         let at = pty.raw().len();
         pty.send(CTRL_L).unwrap();
-        pty.read_for(Duration::from_secs(1));
+        read_repaint(pty, at, Duration::from_secs(1));
         squeezed(&strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..])))
     }
 
@@ -94,7 +94,7 @@ mod transcript {
     fn repaint_rows(pty: &mut Pty) -> Vec<(u16, String)> {
         let at = pty.raw().len();
         pty.send(CTRL_L).unwrap();
-        pty.read_for(Duration::from_secs(1));
+        read_repaint(pty, at, Duration::from_secs(1));
         let text = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
         let chars: Vec<char> = text.chars().collect();
         let mut rows: std::collections::BTreeMap<u16, String> = Default::default();
@@ -305,7 +305,7 @@ mod transcript {
 
         let at = pty.raw().len();
         pty.send(CTRL_L).unwrap();
-        pty.read_for(Duration::from_secs(1));
+        read_repaint(&mut pty, at, Duration::from_secs(1));
         let raw = &pty.raw()[at..];
         let text = strip_ansi(&String::from_utf8_lossy(raw));
         assert!(
@@ -338,8 +338,13 @@ mod transcript {
         let (_guard, mut pty) = boot_with_fake("undo", &fake);
 
         pty.send(b".session scratch\r").unwrap();
-        pty.read_for(Duration::from_secs(1));
-        let frame = ctrl_l_repaint(&mut pty);
+        let deadline = std::time::Instant::now() + PTY_DEADLINE;
+        let frame = loop {
+            let frame = ctrl_l_repaint(&mut pty);
+            if frame.contains(".scratch.") || std::time::Instant::now() >= deadline {
+                break frame;
+            }
+        };
         assert!(
             frame.contains(".scratch."),
             "the status row does not name the scratch session:\n{frame}"
@@ -815,12 +820,8 @@ mod transcript {
         let at = pty.raw().len();
         pty.read_for(HOTKEY_GAP);
         pty.send(ALT_M).unwrap();
-        pty.read_for(Duration::from_millis(400));
-        let off = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
-        assert!(
-            off.contains("\x1b[?1000l"),
-            "Alt+M did not switch the mouse reports off: {off:?}"
-        );
+        pty.wait_for_raw(b"\x1b[?1000l", at, PTY_DEADLINE)
+            .unwrap_or_else(|e| panic!("Alt+M did not switch the mouse reports off: {e}"));
         let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&squeezed("mouse select")),
@@ -830,12 +831,8 @@ mod transcript {
         let at = pty.raw().len();
         pty.read_for(HOTKEY_GAP);
         pty.send(ALT_M).unwrap();
-        pty.read_for(Duration::from_millis(400));
-        let on = String::from_utf8_lossy(&pty.raw()[at..]).into_owned();
-        assert!(
-            on.contains("\x1b[?1000h"),
-            "a second Alt+M did not ask for mouse reports again: {on:?}"
-        );
+        pty.wait_for_raw(b"\x1b[?1000h", at, PTY_DEADLINE)
+            .unwrap_or_else(|e| panic!("a second Alt+M did not ask for mouse reports again: {e}"));
         let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&squeezed("mouse scroll")),
@@ -3032,13 +3029,19 @@ mod binary_threads {
         // Let the turn wind down (the turn-end reminders run out against the
         // fake's fallback reply), then interrupt anything left and leave.
         // A Ctrl+C on an idle empty composer leaves too, so a send after the
-        // UI already left is not an error here.
+        // UI already left is not an error here. No key follows once the UI
+        // is leaving: a Ctrl+C that reaches the wrapper shell kills it before
+        // it reports the exit.
+        let start = pty.raw().len();
         pty.read_for(Duration::from_millis(3000));
-        let _ = pty.send(b"\x03");
-        pty.read_for(Duration::from_millis(800));
-        let _ = pty.send(b"\x03");
-        pty.read_for(Duration::from_millis(500));
-        let _ = pty.send(b"\x04");
+        for (key, settle) in [(b"\x03", 800), (b"\x03", 500), (b"\x04", 0)] {
+            if since(pty, start).contains("Leaving") || find(pty.raw(), LEAVE_ALT, start).is_some()
+            {
+                break;
+            }
+            let _ = pty.send(key);
+            pty.read_for(Duration::from_millis(settle));
+        }
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert!(!transcript.contains("panicked"), "{transcript}");
         assert_tty_restored(&transcript);
@@ -3085,22 +3088,18 @@ mod binary_threads {
 
         let before = pty.raw().len();
         pty.send(b"typed while the kid works t8w").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut echoed = false;
-        while Instant::now() < deadline {
-            pty.read_for(Duration::from_millis(250));
-            let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
-            if squeezed(&since).contains("typedwhilethekidworkst8w") {
-                echoed = true;
-                break;
-            }
-        }
-        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        // The spinner repaints between the draft's cells, so the stream can
+        // split the echo; the repaint in place reads it whole.
+        let echo = painted_after(&mut pty, before, |text| {
+            squeezed(text).contains("typedwhilethekidworkst8w")
+        });
         let _ = fs::write(&scene.kid_gate, "");
         let _ = fs::write(&scene.root_gate, "");
+        let echoed = echo.is_ok();
+        let since = echo.unwrap_or_else(|since| since);
         assert!(
             echoed,
-            "the UI drew nothing for 10 s while the kid sat in its tool \
+            "the UI drew nothing for {PTY_DEADLINE:?} while the kid sat in its tool \
          ({} bytes since the keys): {since:?}\nlog: {}",
             pty.raw().len() - before,
             scene.log.display()
@@ -4127,7 +4126,7 @@ mod binary_threads {
             pty.read_for(Duration::from_millis(300));
             let from = pty.raw().len();
             pty.resize(rows, 100).unwrap();
-            pty.read_for(Duration::from_millis(900));
+            read_repaint(&mut pty, from, Duration::from_millis(900));
             let raw = pty.raw()[from..].to_vec();
             assert!(
                 !raw.contains(&b'\r'),
@@ -4655,7 +4654,7 @@ mod binary_threads {
             pty.read_for(Duration::from_millis(300));
             let from = pty.raw().len();
             pty.resize(rows, 100).unwrap();
-            pty.read_for(Duration::from_millis(900));
+            read_repaint(&mut pty, from, Duration::from_millis(900));
             raw = pty.raw()[from..].to_vec();
             assert!(
                 !raw.contains(&b'\r'),
@@ -5497,7 +5496,7 @@ mod popup_colours_scroll_hold_and_child_jobs {
         pty.read_for(Duration::from_millis(400));
         let from = pty.raw().len();
         pty.send(CTRL_L).unwrap();
-        pty.read_for(Duration::from_millis(600));
+        read_repaint(pty, from, Duration::from_millis(600));
         strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
     }
 
@@ -5786,7 +5785,7 @@ mod scroll_bursts_and_cell_boundaries {
         pty.read_for(Duration::from_millis(300));
         let from = pty.raw().len();
         pty.send(CTRL_L).unwrap();
-        pty.read_for(Duration::from_millis(500));
+        read_repaint(pty, from, Duration::from_millis(500));
         let frame = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
         let rows = visible_rows(&frame);
         assert!(
