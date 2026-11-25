@@ -661,6 +661,59 @@ fn verify_smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// Each design-retrospective guard, removed from a scratch copy, turns its
+/// smoke row red: the large run's way to `run_retrospective` at run close,
+/// the adopted path that creates the refactor task, the one leading
+/// code-fence line read past, the skip when no run base resolves, and the one
+/// not-triaged follow-up a REFACTORS reply keeps when its triage fails or
+/// decides nothing.
+#[test]
+#[ignore = "five smoke battery runs take about four minutes; run with -- --ignored"] // TASK-916
+fn retrospective_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "retro-large-run",
+                "    u[\"_next\"] = \"run_retrospective\"\n",
+                "",
+                "integrate_route: a large run at run close -> run_retrospective over the run diff, \
+                 retro_done set first",
+            ),
+            (
+                "retro-adopted",
+                "    elif adopted:\n",
+                "    elif False:\n",
+                "retro_route: adopted -> ONE pending chore task blocked by the unit's tasks, \
+                 integration re-armed, -> select_tasks",
+            ),
+            (
+                "retro-fence",
+                "    if lines and lines[0].startswith(\"```\"):\n",
+                "    if False:\n",
+                "retro_route: a reply opening with one code-fence line is read past the fence",
+            ),
+            (
+                "retro-no-base",
+                "    if not base:\n        u[\"retro_report\"]",
+                "    if False:\n        u[\"retro_report\"]",
+                "integrate_route: no run base and no merge-base -> hygiene_create with a note, \
+                 never a retrospective",
+            ),
+            (
+                "retro-untriaged",
+                " and not (triaged and (adopted or declined or later)):\n",
+                " and False:\n",
+                "retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up \
+                 pointing at the saved report",
+            ),
+        ],
+    );
+}
+
 /// The rest of the intake guards, each removed from a scratch copy, turn
 /// their smoke row red: the re-check that a seed is still ready before it is
 /// consumed, the consumption at the step after a successful orientation, the

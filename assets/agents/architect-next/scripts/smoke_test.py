@@ -3774,6 +3774,14 @@ def _retro_plans_dir_line():
     return f"Plans dir: {TMP} (bookkeeping" in with_dir and "Plans dir" not in without, without
 
 
+def _retro_no_base():
+    nowhere = os.path.join(TMP, "retro-no-repo")
+    os.makedirs(nowhere, exist_ok=True)
+    u = gates.integrate_route(_retro_large(run_base_sha="", code_repo_path=nowhere))
+    return (u["_next"] == "hygiene_create" and u.get("retro_done") is True and "retro_prompt" not in u
+            and any("the run base could not be resolved" in l for l in u["retro_report"])), (u.get("_next"), u.get("retro_report"))
+
+
 def _retro_integrate_unjudged():
     u = gates.integrate_route(_retro_large(last_node_output="llm node failed: timeout"))
     return (u["_next"] == "hygiene_create" and any("no valid size judgement" in l for l in u["retro_report"])), u.get("retro_report")
@@ -3949,6 +3957,7 @@ guarded("integrate_route: a large run at run close -> run_retrospective over the
 guarded("integrate_route: not a large body of work -> hygiene_create, the reason in the report lines", _retro_integrate_not_large)
 guarded("integrate_route: a groups-mode run close diffs from the run base, never the last group's base", _retro_groups_run_base)
 guarded("integrate_route: the retrospective prompt names a Plans dir only when the run has one", _retro_plans_dir_line)
+guarded("integrate_route: no run base and no merge-base -> hygiene_create with a note, never a retrospective", _retro_no_base)
 guarded("integrate_route: no valid size judgement (the llm node failed) -> hygiene_create with a note", _retro_integrate_unjudged)
 guarded("integrate_route: retro_done -> hygiene_create (at most once per run)", _retro_integrate_done)
 guarded("integrate_route: a group close-out short of run close -> hygiene_create, the retrospective waits", _retro_group_closeout)
