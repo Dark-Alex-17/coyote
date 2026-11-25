@@ -1,5 +1,8 @@
 use crate::config::RunStatsSnapshot;
+use crate::config::{RequestContext, RunStats};
+use anyhow::Result;
 use fancy_regex::Regex;
+use log::error;
 use serde::Serialize;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -67,9 +70,71 @@ impl JsonResult {
     }
 }
 
+/// What a one-shot directive produced. The session and model are read
+/// before the directive exits its session, which clears them.
+pub struct DirectiveOutcome {
+    pub output: String,
+    pub model: String,
+    pub session_id: Option<String>,
+}
+
+impl DirectiveOutcome {
+    pub fn new(ctx: &RequestContext, output: String) -> Self {
+        Self {
+            output,
+            model: ctx.current_model().id(),
+            session_id: ctx.session.as_ref().map(|s| s.name().to_string()),
+        }
+    }
+}
+
+/// Prints the `--json` report for a finished one-shot run. On an error the
+/// report is the only stdout output; the returned error still goes to
+/// stderr through `render_error`.
+pub fn emit(
+    result: &Result<DirectiveOutcome>,
+    fallback_model: String,
+    fallback_session: Option<String>,
+    stats: &RunStats,
+    elapsed: Duration,
+) {
+    let report = report(
+        result,
+        fallback_model,
+        fallback_session,
+        stats.snapshot(),
+        elapsed,
+    );
+    match serde_json::to_string(&report) {
+        Ok(line) => println!("{line}"),
+        Err(err) => error!("Failed to serialize the --json report: {err}"),
+    }
+}
+
+/// A failed directive has no outcome, so its report falls back to the model
+/// and session read before the run started.
+fn report(
+    result: &Result<DirectiveOutcome>,
+    fallback_model: String,
+    fallback_session: Option<String>,
+    stats: RunStatsSnapshot,
+    elapsed: Duration,
+) -> JsonResult {
+    let (outcome, model, session_id) = match result {
+        Ok(outcome) => (
+            Ok(outcome.output.clone()),
+            outcome.model.clone(),
+            outcome.session_id.clone(),
+        ),
+        Err(err) => (Err(format!("{err:#}")), fallback_model, fallback_session),
+    };
+    JsonResult::new(outcome, model, session_id, stats, elapsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn success_serialises_every_key_in_order_with_nulls() {
@@ -156,5 +221,39 @@ mod tests {
             serde_json::to_string(&report).unwrap(),
             r#"{"result":null,"is_error":true,"error":"boom","model":"stub:m","session_id":"s","num_turns":1,"duration_ms":0,"usage":{"input_tokens":null,"output_tokens":null,"cache_read_input_tokens":null,"cache_creation_input_tokens":null},"total_cost_usd":0.0}"#
         );
+    }
+
+    #[test]
+    fn report_takes_model_and_session_from_the_outcome_or_the_fallback() {
+        let succeeded: Result<DirectiveOutcome> = Ok(DirectiveOutcome {
+            output: "done".into(),
+            model: "outcome:m".into(),
+            session_id: Some("outcome-session".into()),
+        });
+        let failed: Result<DirectiveOutcome> = Err(anyhow!("inner cause").context("outer failure"));
+
+        let ok = report(
+            &succeeded,
+            "fallback:m".into(),
+            Some("fallback-session".into()),
+            RunStatsSnapshot::default(),
+            Duration::ZERO,
+        );
+        let err = report(
+            &failed,
+            "fallback:m".into(),
+            Some("fallback-session".into()),
+            RunStatsSnapshot::default(),
+            Duration::ZERO,
+        );
+
+        assert_eq!(ok.result.as_deref(), Some("done"));
+        assert_eq!(ok.error, None);
+        assert_eq!(ok.model, "outcome:m");
+        assert_eq!(ok.session_id.as_deref(), Some("outcome-session"));
+        assert_eq!(err.result, None);
+        assert_eq!(err.error.as_deref(), Some("outer failure: inner cause"));
+        assert_eq!(err.model, "fallback:m");
+        assert_eq!(err.session_id.as_deref(), Some("fallback-session"));
     }
 }

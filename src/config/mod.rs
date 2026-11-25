@@ -69,7 +69,6 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
 pub use self::round_chains::RoundChains;
-#[cfg(test)]
 pub(crate) use self::run_stats::RunStats;
 pub use self::run_stats::{RunCallOutcome, RunStatsSnapshot};
 pub use self::session::{

@@ -22,7 +22,7 @@ mod vault;
 extern crate log;
 
 use crate::cli::Cli;
-use crate::cli::json_output::JsonResult;
+use crate::cli::json_output::DirectiveOutcome;
 use crate::client::{
     Client, ModelType, call_chat_completions, call_chat_completions_streaming, catalog,
     list_models, oauth,
@@ -46,7 +46,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
 use inquire::{Select, Text, set_global_render_config};
-use log::{LevelFilter, error, warn};
+use log::{LevelFilter, warn};
 use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::rolling_file::RollingFileAppender;
 use log4rs::append::rolling_file::policy::compound::CompoundPolicy;
@@ -697,28 +697,7 @@ async fn run(
             ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
             hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
             if let Some(stats) = run_stats {
-                // On an error the wrapper is the only stdout output; the
-                // returned error still goes to stderr through `render_error`.
-                let report = match &result {
-                    Ok(outcome) => JsonResult::new(
-                        Ok(outcome.output.clone()),
-                        outcome.model.clone(),
-                        outcome.session_id.clone(),
-                        stats.snapshot(),
-                        elapsed,
-                    ),
-                    Err(err) => JsonResult::new(
-                        Err(format!("{err:#}")),
-                        model,
-                        session_id,
-                        stats.snapshot(),
-                        elapsed,
-                    ),
-                };
-                match serde_json::to_string(&report) {
-                    Ok(line) => println!("{line}"),
-                    Err(err) => error!("Failed to serialize the --json report: {err}"),
-                }
+                cli::json_output::emit(&result, model, session_id, &stats, elapsed);
             }
             result.map(|_| ())
         }
@@ -730,24 +709,6 @@ async fn run(
             config::child_sessions::sweep_orphans();
             sweep_stale_pasted_images();
             start_interactive(ctx).await
-        }
-    }
-}
-
-/// What a one-shot directive produced. The session and model are read
-/// before the directive exits its session, which clears them.
-struct DirectiveOutcome {
-    output: String,
-    model: String,
-    session_id: Option<String>,
-}
-
-impl DirectiveOutcome {
-    fn new(ctx: &RequestContext, output: String) -> Self {
-        Self {
-            output,
-            model: ctx.current_model().id(),
-            session_id: ctx.session.as_ref().map(|s| s.name().to_string()),
         }
     }
 }
