@@ -4764,10 +4764,10 @@ def _retro_prompt(state):
     base = state.get("run_base_sha") or state.get("base_sha")
     lines = ["Run-closing design retrospective.",
              f"Project: {state.get('project_dir')}",
-             f"Diff: {base}..HEAD"]
+             f"Diff: {base}"]
     if _code_tree_dirty(state, root):
-        lines.append(f"Tree state: the change is uncommitted in the worktree on top of {base}; read it with "
-                     f"`git diff {base}` as well as the commits.")
+        lines.append(f"Tree state: part of the change is uncommitted in the worktree on top of {base}; "
+                     f"`get_diff --base {base}` and `get_changed_files --base {base}` include it.")
     lines.append(f"What the work set out to do: {state.get('brief') or state.get('current_task') or ''}")
     plans = _plans_path(state, state.get("project_dir") or root)
     if os.path.isdir(plans):

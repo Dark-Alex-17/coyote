@@ -7321,10 +7321,23 @@ with scenario("retro_size_route: large -> run_retrospective with the project, th
     u = gates.retro_size_route(base_state(retro_large=True, retro_large_reason="a new module other code builds on",
                                           last_node_output='{"retro_large": true}', run_base_sha=BASE, anomalies=["seen"]))
     p = u.get("retro_prompt", "")
-    check(name, u["_next"] == "run_retrospective" and f"Project: {REPO}" in p and f"Diff: {BASE}..HEAD" in p
+    check(name, u["_next"] == "run_retrospective" and f"Project: {REPO}" in p and f"Diff: {BASE}\n" in p and "..HEAD" not in p
           and "What the work set out to do: add a hello endpoint" in p
           and "design retrospective: large (a new module other code builds on)" in u["decisions"]
           and any("seen" in a for a in u["anomalies_log"]), (u.get("_next"), p, u.get("decisions")))
+with scenario("retro_size_route: a dirty tree names the agent's own diff tools; an existing plans dir is named") as name:
+    _rd = os.path.join(TMP, "retro-dirty-repo")
+    os.makedirs(os.path.join(_rd, "plans"))
+    for _cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", _rd, *_cmd], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    open(os.path.join(_rd, "a.py"), "w").write("x = 1\n")
+    u = gates.retro_size_route(base_state(project_dir=_rd, git_root=_rd, retro_large=True, retro_large_reason="a new module",
+                                          last_node_output='{"retro_large": true}', run_base_sha=BASE))
+    p = u.get("retro_prompt", "")
+    check(name, f"`get_diff --base {BASE}`" in p and f"`get_changed_files --base {BASE}`" in p and "git diff" not in p
+          and f"Plans dir: {os.path.join(_rd, 'plans')} (bookkeeping, not code under review)" in p, p)
 with scenario("retro_size_route: not large -> observability_gate, the reason in the report lines") as name:
     u = gates.retro_size_route(base_state(retro_large=False, retro_large_reason="a one-function fix",
                                           last_node_output='{"retro_large": false}'))
