@@ -3789,11 +3789,25 @@ def _retro_reseal_phase_f():
 
 
 def _retro_stack_multi():
-    u = gates.integrate_route(_retro_large(pr_strategy="multi"))
-    if MULTI_IS_GROUPS:
-        return u["_next"] == "run_retrospective", u.get("_next")
-    return (u["_next"] == "hygiene_create" and u.get("retro_done") is True
-            and any("per-task PRs" in l for l in u["retro_report"])), (u.get("_next"), u.get("retro_report"))
+    _groups = gates.MULTI_IS_GROUPS
+    gates.MULTI_IS_GROUPS = False
+    try:
+        u = gates.integrate_route(_retro_large(pr_strategy="multi"))
+    finally:
+        gates.MULTI_IS_GROUPS = _groups
+    return u["_next"] == "run_retrospective" and u.get("retro_done") is True, (u.get("_next"), u.get("retro_report"))
+
+
+def _retro_stack_multi_adopted():
+    _groups = gates.MULTI_IS_GROUPS
+    gates.MULTI_IS_GROUPS = False
+    try:
+        u = gates.retro_route(_retro_large(pr_strategy="multi", retro_result=RETRO_REFACTORS, retro_adopted=["One table"],
+                                           retro_declined=[], retro_follow_ups=[], retro_done=True))
+    finally:
+        gates.MULTI_IS_GROUPS = _groups
+    return (u["_next"] == "hygiene_create" and "tasks" not in u and any("One table" in f for f in u.get("follow_ups", []))
+            and any("per-task PRs" in l for l in u["retro_report"])), (u.get("_next"), u.get("follow_ups"), u.get("retro_report"))
 
 
 def _retro_adopted():
@@ -3837,7 +3851,9 @@ guarded("integrate_route: no valid size judgement (the llm node failed) -> hygie
 guarded("integrate_route: retro_done -> hygiene_create (at most once per run)", _retro_integrate_done)
 guarded("integrate_route: a group close-out short of run close -> hygiene_create, the retrospective waits", _retro_group_closeout)
 guarded("reseal_return: phase_f after an integration amendment -> the same retrospective decision", _retro_reseal_phase_f)
-guarded("integrate_route: per-task stacked PRs cannot carry a refactor task -> hygiene_create, skip noted", _retro_stack_multi)
+guarded("integrate_route: a large run with per-task stacked PRs still runs the retrospective", _retro_stack_multi)
+guarded("retro_route: per-task stacked PRs have no unit for a refactor task -> adopted items become follow-ups, noted",
+        _retro_stack_multi_adopted)
 guarded("retro_route: adopted -> ONE pending chore task blocked by the unit's tasks, integration re-armed, -> select_tasks",
         _retro_adopted)
 guarded("retro_route: CLEAN -> hygiene_create, no task", _retro_clean)

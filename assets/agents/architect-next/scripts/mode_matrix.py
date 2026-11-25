@@ -557,8 +557,8 @@ def walk_combinations(tmp_home):
             problems.append("autonomous report lacks the digest")
         if not single and STACK_LINKING and "## Stacks" not in rep:
             problems.append("multi report lacks the stacks section")
-        if ("run_retrospective" in visited) != single:
-            problems.append(f"run_retrospective visited={'run_retrospective' in visited} for single={single}")
+        if "run_retrospective" not in visited:
+            problems.append("a large run closed without visiting run_retrospective")
         if "## Design retrospective" not in rep:
             problems.append("report lacks the design retrospective section")
         check(f"combo [{label}]", not problems, " | ".join(problems))

@@ -5083,10 +5083,6 @@ def _after_integration(state, u):
         u["retro_report"] = [f"- not run: {reason}" if reason == RETRO_UNJUDGED else f"- not run: not a large body of work ({reason})"]
         ledger(state, u, f"design retrospective: not run ({reason})")
         return u
-    if not (is_single(state) or MULTI_IS_GROUPS):
-        u["retro_report"] = [f"- not run: large ({reason}), but per-task PRs have no unit to carry a refactor task"]
-        ledger(state, u, "design retrospective: skipped; per-task PRs cannot carry a run-closing refactor task")
-        return u
     code = state.get("code_repo_path", "")
     base = state.get("run_base_sha")
     if not base:
@@ -5108,7 +5104,7 @@ def _after_integration(state, u):
 
 
 def retro_route(state):
-    """Adopted refactor items become ONE chore task the normal task loop runs; anything else goes on to hygiene."""
+    """Adopted refactor items become ONE chore task the normal task loop runs (follow-ups under per-task PRs); else hygiene."""
     u = {"retro_done": True, "_next": "hygiene_create"}
     harvest_anomalies(state, u, "retro_triage")
     note_script_error(state, u, "retro_triage")
@@ -5129,7 +5125,11 @@ def retro_route(state):
     for line in lines:
         ledger(state, u, line)
     task_line = "no refactor task"
-    if adopted:
+    if adopted and not (is_single(state) or MULTI_IS_GROUPS):
+        later += adopted
+        task_line = "per-task PRs have no unit to carry a refactor task, so the adopted items are follow-ups"
+        ledger(state, u, f"design retrospective: {len(adopted)} item(s) adopted; per-task PRs carry no refactor task, so they become follow-ups")
+    elif adopted:
         tasks = as_list(state.get("tasks"))
         unit = (_hygiene_units(state, tasks) or [{"id": "run", "members": []}])[0]
         members = list(unit.get("members", []))
