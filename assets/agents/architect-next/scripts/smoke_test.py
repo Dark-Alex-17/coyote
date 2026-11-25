@@ -3865,6 +3865,18 @@ def _retro_preambled():
     return any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report")
 
 
+def _parse_report_retro_follow_up():
+    st = dict(SN_STATE, follow_ups=["Design retrospective: One table", "rotate the widget key before merge"],
+              retro_report=["- ran: DESIGN_RETROSPECTIVE: REFACTORS 1"])
+    p, report = sisyphus_next_report(st)
+    parsed = gates._parse_report(report)
+    return (parsed["follow_ups"] == ["Design retrospective: One table", "rotate the widget key before merge"]
+            and parsed["design"] == ["introduced a WidgetStore trait in src/a.rs"]), (p.stderr[-300:], parsed)
+
+
+guarded("_parse_report: a FOLLOW-UPS bullet starting with Design retrospective stays in FOLLOW-UPS", _parse_report_retro_follow_up)
+
+
 def _retro_report():
     ran = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, retro_report=["- large (a new subsystem)", "- ran: CLEAN"]))["report"]
     skipped = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f))["report"]

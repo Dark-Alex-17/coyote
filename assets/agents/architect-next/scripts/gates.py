@@ -1748,7 +1748,9 @@ def _relay_escalation(state, task, d):
 def _parse_report(text):
     """The sisyphus report sections the architect ledgers; a section ends at the next one or at any markdown heading."""
     def sec(name):
-        m = re.search(rf"(?ims)^\W*{name}\s*:?\s*\n(.*?)(?=^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions|Design retrospective|Decisions taken autonomously|Sisyphus run id)\b|^\#{{1,6}}\s|\Z)", text)
+        # Design retrospective ends a section only as a label line: a FOLLOW-UPS bullet starts with the same words
+        m = re.search(rf"(?ims)^\W*{name}\s*:?\s*\n(.*?)(?=^\W*(FOLLOW-UPS|Debt left behind|Debris exemptions|Design decisions|Decisions taken autonomously|Sisyphus run id)\b"
+                      rf"|^[ \t#*]*Design retrospective[ \t*]*:?[ \t*]*$|^\#{{1,6}}\s|\Z)", text)
         if not m:
             m2 = re.search(rf"(?im)^\W*{name}\s*:\s*(.+)$", text)
             return [m2.group(1).strip()] if m2 and m2.group(1).strip().lower() not in ("none", "- none") else []
