@@ -37,7 +37,7 @@ pub(crate) type ExtractorTransport<'f> = dyn for<'b> FnMut(
 
 /// A `raw` that already parses comes back unstripped: only a caller that
 /// knows the native format `raw` was written under can strip its nulls.
-pub async fn extract(
+pub(crate) async fn extract(
     raw: &str,
     schema: &Value,
     parent_ctx: &mut RequestContext,
@@ -191,25 +191,12 @@ mod tests {
     use crate::client::{ClientConfig, Model, ModelData};
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::graph::llm::quiet_transport;
-    use crate::graph::llm::test_support::boxed_completion;
+    use crate::graph::llm::test_support::{boxed_completion, transport_call};
     use crate::utils::create_abort_signal;
     use serde_json::json;
 
     fn make_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
-    }
-
-    fn format_call<F>(f: F) -> F
-    where
-        F: for<'b> FnMut(
-                &'b Input,
-                &'b dyn Client,
-                &'b mut RequestContext,
-                AbortSignal,
-            ) -> CompletionFuture<'b>
-            + Send,
-    {
-        f
     }
 
     fn api_error(status: u16, message: &str) -> anyhow::Error {
@@ -240,7 +227,7 @@ mod tests {
         let mut ctx = structured_ctx();
         let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
         let mut seen = Vec::new();
-        let mut transport = format_call(|input, _client, _ctx, _abort| {
+        let mut transport = transport_call(|input, _client, _ctx, _abort| {
             seen.push(input.role().structured_output().cloned());
             let first = seen.len() == 1;
             boxed_completion(async move {
@@ -275,7 +262,7 @@ mod tests {
         let mut ctx = structured_ctx();
         let schema = json!({"type": "object"});
         let mut seen = Vec::new();
-        let mut transport = format_call(|input, _client, _ctx, _abort| {
+        let mut transport = transport_call(|input, _client, _ctx, _abort| {
             seen.push(input.role().structured_output().cloned());
             let call = seen.len();
             boxed_completion(async move {
@@ -316,7 +303,7 @@ mod tests {
             let mut ctx = structured_ctx();
             ctx.native_format = caller.clone();
             let mut seen = Vec::new();
-            let mut transport = format_call(|_input, _client, ctx, _abort| {
+            let mut transport = transport_call(|_input, _client, ctx, _abort| {
                 seen.push(ctx.native_format.clone());
                 boxed_completion(async move {
                     if succeeds {
@@ -366,7 +353,7 @@ mod tests {
     const GROUPS_WITH_NULL: &str = r#"{"groups":[{"domain":"a","files":[],"rationale":null}]}"#;
 
     #[tokio::test]
-    async fn extract_keeps_nulls_without_a_producer_dialect() {
+    async fn extract_never_strips_a_raw_that_already_parses() {
         let mut ctx = make_ctx();
 
         let value = extract(
@@ -388,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn extractor_strips_nulls_when_its_own_call_ran_openai_strict() {
         let mut ctx = structured_ctx();
-        let mut transport = format_call(|_input, _client, _ctx, _abort| {
+        let mut transport = transport_call(|_input, _client, _ctx, _abort| {
             boxed_completion(async { Ok((GROUPS_WITH_NULL.to_string(), vec![])) })
         });
 
@@ -410,7 +397,7 @@ mod tests {
         let mut ctx = structured_ctx();
         ctx.native_format.last_dialect = Some(SchemaDialect::OpenAiStrict);
         let mut calls = 0;
-        let mut transport = format_call(|_input, _client, _ctx, _abort| {
+        let mut transport = transport_call(|_input, _client, _ctx, _abort| {
             calls += 1;
             let first = calls == 1;
             boxed_completion(async move {

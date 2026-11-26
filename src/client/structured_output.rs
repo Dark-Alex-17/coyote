@@ -87,8 +87,9 @@ impl SchemaDialect {
     /// OpenAI strict mode forces optional properties into nullable required
     /// ones, so a value it produced loses those injected nulls again.
     pub fn strip_nulls(self, value: &mut Value, schema: &Value) {
-        if self == SchemaDialect::OpenAiStrict {
-            strip_injected_nulls(value, schema);
+        match self {
+            SchemaDialect::OpenAiStrict => strip_injected_nulls(value, schema),
+            SchemaDialect::Anthropic | SchemaDialect::Gemini => {}
         }
     }
 }
@@ -128,7 +129,7 @@ pub fn sanitize_schema_name(raw: &str) -> String {
 /// optional properties, restoring the shape the original schema describes.
 /// A `null` is removed only when the original schema certainly rejects it;
 /// anything undecidable keeps the value as the model produced it.
-pub fn strip_injected_nulls(value: &mut Value, original_schema: &Value) {
+fn strip_injected_nulls(value: &mut Value, original_schema: &Value) {
     let constraint = Constraint {
         schemas: vec![original_schema],
         unions: Vec::new(),

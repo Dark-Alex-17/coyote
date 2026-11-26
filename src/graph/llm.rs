@@ -1204,8 +1204,8 @@ mod tests {
     /// An empty turn while a node-started job is still pending is not a
     /// blip to bail on: the guardrail's reminder is delivered first.
     #[tokio::test]
-    async fn run_chat_loop_delivers_the_pending_task_reminder_before_declaring_an_empty_completion()
-    {
+    async fn run_chat_turns_delivers_the_pending_task_reminder_before_declaring_an_empty_completion()
+     {
         use crate::function::jobs::RingBuf;
         use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
         use parking_lot::{Mutex, RwLock};
@@ -1476,7 +1476,7 @@ mod tests {
     /// An empty final turn after a tool round that carried text is the
     /// model concluding, not a blip: the accumulated text is the reply.
     #[tokio::test]
-    async fn run_chat_loop_accepts_an_empty_final_turn_after_a_non_empty_turn() {
+    async fn run_chat_turns_accepts_an_empty_final_turn_after_a_non_empty_turn() {
         use crate::function::ToolCall;
 
         let node = node_with(None);
@@ -1690,7 +1690,7 @@ mod tests {
     /// A call that observes the abort but still returns text must not be
     /// treated as a completed turn; the loop discards it and fails.
     #[tokio::test]
-    async fn run_chat_loop_discards_output_from_a_call_aborted_midway() {
+    async fn run_chat_turns_discards_output_from_a_call_aborted_midway() {
         let node = node_with(None);
         let mut ctx = plain_ctx();
         let abort = create_abort_signal();
@@ -1718,7 +1718,7 @@ mod tests {
     /// already-aborted graph never issues a model call and the node fails
     /// with the abort reason rather than a connection error.
     #[tokio::test]
-    async fn run_chat_loop_bails_before_first_call_when_aborted() {
+    async fn run_chat_turns_bails_before_first_call_when_aborted() {
         let node = node_with(None);
         let mut state = manager_with(&[]);
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
@@ -2551,5 +2551,72 @@ mod tests {
         assert_eq!(output, "ok");
         assert_eq!(*seen.lock().unwrap(), vec![true, false]);
         assert!(ctx.native_format.rejected);
+    }
+
+    /// The before-hook records `last_message`; taking it in each transport
+    /// call shows the hook ran once before the first call and not again
+    /// before the format-less retry.
+    #[tokio::test]
+    async fn completion_runner_runs_the_before_hook_once_across_the_format_retry() {
+        let mut ctx = openai_ctx();
+        let mut role = Role::new("r", "");
+        role.set_model(structured_model());
+        role.set_structured_output(Some(StructuredOutputSpec {
+            name: "answer".to_string(),
+            schema: json!({"type": "object"}),
+        }));
+        let input = Input::from_str(&ctx, "hi", Some(role)).unwrap();
+        let hook_ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&hook_ran);
+        let mut runner = completion_runner_with(move |input: &Input, _client, ctx, _abort| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(ctx.last_message.take().is_some());
+            let has_spec = input.role().structured_output().is_some();
+            boxed_completion(async move {
+                if has_spec {
+                    Err(Error::new(crate::client::ApiStatusError {
+                        status: 400,
+                        message: "rejected".to_string(),
+                    }))
+                } else {
+                    Ok(("ok".to_string(), vec![]))
+                }
+            })
+        });
+
+        let (output, _) = runner(&input, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(output, "ok");
+        assert_eq!(*hook_ran.lock().unwrap(), vec![true, false]);
+        assert!(ctx.native_format.rejected);
+    }
+
+    #[tokio::test]
+    async fn completion_runner_skips_the_before_hook_and_transport_when_create_client_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut ctx = plain_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let mut runner = completion_runner_with(move |_input: &Input, _client, _ctx, _abort| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            boxed_completion(async { Ok(("unreachable".to_string(), vec![])) })
+        });
+
+        let err = runner(&input, &mut ctx, create_abort_signal())
+            .await
+            .expect_err("the test AppState has no model to build a client for");
+
+        assert!(
+            format!("{err:#}").contains("Invalid model"),
+            "expected create_client to fail, got: {err:#}"
+        );
+        assert!(ctx.last_message.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -5280,6 +5280,79 @@ local_hello() {\n\
         });
     }
 
+    /// The before-hook records `last_message`; taking it in each transport
+    /// call shows the hook ran once before the first call and not again
+    /// before the format-less retry.
+    #[test]
+    fn repl_completion_runner_runs_the_before_hook_once_across_the_format_retry() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            with_app_config(&mut ctx, |config| {
+                config.clients = vec![ClientConfig::OpenAIConfig(Default::default())];
+            });
+            let mut data = ModelData::new("structured");
+            data.supports_structured_output = true;
+            let mut role = Role::new("r", "");
+            role.set_model(Model::from_config("openai", &[data]).remove(0));
+            role.set_structured_output(Some(
+                crate::client::structured_output::StructuredOutputSpec {
+                    name: "answer".to_string(),
+                    schema: json!({"type": "object"}),
+                },
+            ));
+            let input = Input::from_str(&ctx, "hi", Some(role)).unwrap();
+            let hook_ran = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&hook_ran);
+            let mut runner =
+                repl_completion_runner_with(move |input: &Input, _client, ctx, _abort| {
+                    recorded.lock().push(ctx.last_message.take().is_some());
+                    let has_spec = input.role().structured_output().is_some();
+                    boxed_completion(async move {
+                        if has_spec {
+                            Err(anyhow::Error::new(crate::client::ApiStatusError {
+                                status: 400,
+                                message: "response_format rejected".into(),
+                            }))
+                        } else {
+                            Ok(("ok".to_string(), vec![]))
+                        }
+                    })
+                });
+
+            let (output, _) = runner(&input, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+
+            assert_eq!(output, "ok");
+            assert_eq!(*hook_ran.lock(), vec![true, false]);
+            assert!(ctx.native_format.rejected);
+        });
+    }
+
+    #[test]
+    fn repl_completion_runner_skips_the_before_hook_when_create_client_fails() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let input = Input::from_str(&ctx, "hi", None).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let mut runner =
+                repl_completion_runner_with(move |_input: &Input, _client, _ctx, _abort| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    boxed_completion(async { Ok(("unreachable".to_string(), vec![])) })
+                });
+
+            let err = runner(&input, &mut ctx, create_abort_signal())
+                .await
+                .expect_err("the test AppState has no model to build a client for");
+
+            assert!(err.downcast_ref::<PreflightError>().is_some());
+            assert!(format!("{err:#}").contains("Invalid model"), "{err:#}");
+            assert!(ctx.last_message.is_none());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
+    }
+
     #[test]
     fn routing_line_names_the_branch() {
         assert!(graph::route::routing_line(Branch::Run).contains("routing: run"));
