@@ -1455,7 +1455,7 @@ mod transcript {
     #[test]
     #[serial]
     fn dot_threads_mid_turn_opens_the_picker_at_once() {
-        const PICKER: &str = "Enter open  Esc back";
+        const PICKER: &str = "Enter/o open  Esc back";
         let dir = fresh_config_dir("threads-mid-turn");
         let _guard = TempDirGuard(dir.clone());
         let tool_pid = dir.join("tool.pid");
@@ -1810,7 +1810,7 @@ mod transcript {
     #[test]
     #[serial]
     fn dot_threads_and_t_in_the_tasks_popup_open_the_thread_picker() {
-        const PICKER: &str = "Enter open  Esc back";
+        const PICKER: &str = "Enter/o open  Esc back";
         let (_guard, mut pty) = boot("threads-cmd", &[]);
 
         pty.send(b".threads\r").unwrap();
@@ -3103,7 +3103,7 @@ mod binary_threads {
             .rfind("Threads")
             .unwrap_or_else(|| panic!("the pop-up's title is not on screen:\n{frame}"));
         let band = &frame[title..];
-        &band[..band.find("Enter open").unwrap_or(band.len())]
+        &band[..band.find("Enter/o open").unwrap_or(band.len())]
     }
 
     fn leave(pty: &mut Pty, scene: &Scene) -> String {
@@ -3335,7 +3335,7 @@ mod binary_threads {
         pty.send(b"\t").unwrap();
         let picker = repainted_frame_showing(
             &mut pty,
-            "Enter open  Esc back",
+            "Enter/o open  Esc back",
             "Tab did not open the picker",
         );
         let kid_row = row_after(thread_picker_band(&picker), "kid  ").unwrap_or_else(|| {
@@ -3412,7 +3412,7 @@ mod binary_threads {
         pty.send(b"\t").unwrap();
         let picker = repainted_frame_showing(
             &mut pty,
-            "Enter open  Esc back",
+            "Enter/o open  Esc back",
             "Tab did not open the picker",
         );
         assert!(
@@ -3736,7 +3736,7 @@ mod binary_threads {
         pty.send(b"\t").unwrap();
         repainted_frame_showing(
             &mut pty,
-            "Enter open  Esc back",
+            "Enter/o open  Esc back",
             "Tab did not open the picker",
         );
         pty.send(b"\x1b[B").unwrap();
@@ -3881,7 +3881,7 @@ mod binary_threads {
         pty.send(b"\t").unwrap();
         let picker = repainted_frame_showing(
             &mut pty,
-            "Enter open  Esc back",
+            "Enter/o open  Esc back",
             "Tab did not open the picker",
         );
         assert!(
@@ -3909,7 +3909,7 @@ mod binary_threads {
         pty.send(b"\t").unwrap();
         repainted_frame_showing(
             &mut pty,
-            "Enter open  Esc back",
+            "Enter/o open  Esc back",
             "Tab did not open the picker over a malformed child",
         );
         pty.send(b"\x1b[B").unwrap();
@@ -4021,7 +4021,7 @@ mod binary_threads {
         pty.send(b"\t").unwrap();
         let picker = repainted_frame_showing(
             &mut pty,
-            "Enter open  Esc back",
+            "Enter/o open  Esc back",
             "Tab did not open the picker",
         );
         assert!(

@@ -6800,7 +6800,7 @@ fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
         assert_eq!(harness.app.composer_text(), "");
         let frame = harness.draw();
-        assert!(frame.contains("Enter open  Esc back"), "{line}: {frame}");
+        assert!(frame.contains("Enter/o open  Esc back"), "{line}: {frame}");
         assert!(frame.contains("No child sessions yet"), "{line}: {frame}");
         assert!(!frame.contains("Thread: root thread"), "{line}: {frame}");
         harness.press(KeyCode::Esc);
@@ -6813,7 +6813,7 @@ fn the_threads_command_opens_the_picker_instead_of_reaching_the_repl() {
         harness.type_text(line);
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
         assert!(harness.app.queued.is_empty(), "{line}");
-        assert!(harness.draw().contains("Enter open  Esc back"), "{line}");
+        assert!(harness.draw().contains("Enter/o open  Esc back"), "{line}");
     }
 }
 
@@ -6830,7 +6830,10 @@ fn alt_s_opens_the_threads_popup_from_the_main_screen() {
         harness.type_text(draft);
         harness.app.handle_key(alt_s);
         let frame = harness.draw();
-        assert!(frame.contains("Enter open  Esc back"), "{draft:?}: {frame}");
+        assert!(
+            frame.contains("Enter/o open  Esc back"),
+            "{draft:?}: {frame}"
+        );
         assert!(frame.contains("Threads"), "{draft:?}: {frame}");
         harness.press(KeyCode::Esc);
         assert!(harness.app.overlay.is_none(), "{draft:?}");

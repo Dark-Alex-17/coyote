@@ -715,7 +715,7 @@ fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() 
         harness.draw();
         harness.press(KeyCode::Char('t'));
         let frame = harness.draw();
-        assert!(frame.contains("Enter open  Esc back"), "{frame}");
+        assert!(frame.contains("Enter/o open  Esc back"), "{frame}");
         assert!(frame.contains("planner  completed"), "{frame}");
         harness.press(KeyCode::Esc);
         assert!(
@@ -729,7 +729,7 @@ fn t_in_the_tasks_popup_and_dot_threads_open_the_picker_with_a_finished_child() 
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(harness.app.composer_text(), "");
         let frame = harness.draw();
-        assert!(frame.contains("Enter open  Esc back"), "{frame}");
+        assert!(frame.contains("Enter/o open  Esc back"), "{frame}");
         assert!(frame.contains("planner  completed"), "{frame}");
     });
 }
@@ -1052,12 +1052,15 @@ fn every_close_key_takes_the_threads_popup_back_to_where_it_was_opened() {
                     Some(OverlayKind::Threads),
                     "{origin}"
                 );
-                assert!(frame.contains("Enter open  Esc back"), "{origin}: {frame}");
+                assert!(
+                    frame.contains("Enter/o open  Esc back"),
+                    "{origin}: {frame}"
+                );
                 harness.app.handle_key(key);
                 assert_eq!(overlay_kind(&harness), kind, "{origin}, {key:?}");
                 let frame = harness.draw();
                 assert!(
-                    !frame.contains("Enter open  Esc back"),
+                    !frame.contains("Enter/o open  Esc back"),
                     "{origin}, {key:?}: {frame}"
                 );
                 assert_eq!(harness.app.composer_text(), "", "{origin}, {key:?}");

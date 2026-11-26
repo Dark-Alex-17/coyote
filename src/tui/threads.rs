@@ -1,7 +1,7 @@
 //! The threads pop-up: every thread of the session as a tree, over the
 //! screen it was opened from (the main screen, the transcript view or the
 //! tasks pop-up), on Alt+S, `.threads`, `t` in the tasks pop-up or Tab in
-//! the transcript view. Enter opens the highlighted thread in the
+//! the transcript view. Enter or o opens the highlighted thread in the
 //! transcript view.
 
 use super::DIM;
@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = "Threads";
-const HINT: &str = "j/k move  h/l fold  Enter open  Esc back";
+const HINT: &str = "j/k move  h/l fold  Enter/o open  Esc back";
 /// The legend of a pop-up too narrow for `HINT`.
-const SHORT_HINT: &str = "Enter open  Esc back";
+const SHORT_HINT: &str = "Enter/o open  Esc back";
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 

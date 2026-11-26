@@ -493,7 +493,7 @@ fn o_and_t_work_on_a_row_under_a_spawned_agent() {
 
         harness.press(KeyCode::Char('t'));
         let frame = harness.draw();
-        assert!(frame.contains("Enter open  Esc back"), "{frame}");
+        assert!(frame.contains("Enter/o open  Esc back"), "{frame}");
         assert!(frame.contains("Threads"), "{frame}");
     });
 }

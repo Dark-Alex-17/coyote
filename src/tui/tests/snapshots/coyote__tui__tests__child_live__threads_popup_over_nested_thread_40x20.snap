@@ -14,7 +14,7 @@ expression: harness.draw()
 " │  ▾ planner  running  HH:MM:SS  Ns  │ "
 " │    ▾ coder  running  HH:MM:SS  Ns  │ "
 " │        tester  running  Ns         │ "
-" └Enter open  Esc back────────────────┘ "
+" └Enter/o open  Esc back──────────────┘ "
 "                                        "
 "                                        "
 "                                        "
