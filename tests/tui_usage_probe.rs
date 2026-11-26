@@ -177,6 +177,76 @@ mod mid_turn_commands {
     }
 }
 
+mod macro_run_on_a_terminal {
+    //! A prompt-less `--macro` run on a terminal starts no shell, so its
+    //! tools are told the REPL's `COYOTE_UI` even where a bare run would
+    //! start the full-screen UI.
+    use std::fs;
+
+    use super::common::fake_llm::{FakeLlm, Reply};
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    const UI_RECORD_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Record the UI the tool runs under.\n\
+    # @option --out! Path to write the UI name to.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   local out\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   printf '%s' \"${COYOTE_UI:-unset}\" > \"$out\"\n\
+    \x20   echo \"fixture recorded ui m3q\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+    fn ui_seen_by_a_macro_tool(scenario: &str, extra: &str) -> String {
+        let dir = fresh_config_dir(scenario);
+        let _guard = TempDirGuard(dir.clone());
+        let out = dir.join("ui-seen");
+        let fake = FakeLlm::start(vec![
+            Reply::ToolCall {
+                name: "fixture_ui".to_string(),
+                arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+            },
+            Reply::Text("macro done k8v".to_string()),
+        ]);
+        write_fake_llm_config_with(&dir, &fake, extra);
+        write_tool(&dir, "fixture_ui.sh", UI_RECORD_TOOL);
+        write_macro(&dir, "ui", &["\"call the ui tool\""]);
+        let mut pty = spawn_with_args(&dir, &[], &["--macro", "ui"]);
+        wait_for_file(&mut pty, &out, "the macro tool's COYOTE_UI record");
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+        assert_tty_restored(&transcript);
+        fs::read_to_string(&out).unwrap()
+    }
+
+    /// No `ui` key: a bare run on this terminal would be the TUI, but the
+    /// macro's tool is told `repl`.
+    #[test]
+    #[serial]
+    fn a_macro_run_on_a_tty_tells_its_tool_the_repl_by_default() {
+        let seen = ui_seen_by_a_macro_tool("probe-macro-ui-default", "");
+        assert_eq!(
+            seen, "repl",
+            "a --macro run on a tty told its tool {seen:?}"
+        );
+    }
+
+    /// `ui: tui` in the config does not make a macro run the TUI's.
+    #[test]
+    #[serial]
+    fn a_macro_run_on_a_tty_tells_its_tool_the_repl_under_ui_tui() {
+        let seen = ui_seen_by_a_macro_tool("probe-macro-ui-key", "ui: tui\n");
+        assert_eq!(
+            seen, "repl",
+            "a --macro run on a tty under `ui: tui` told its tool {seen:?}"
+        );
+    }
+}
+
 mod welcome_and_footer {
     //! The welcome wordmark at each width and under NO_COLOR.
     use super::common::tui_harness::*;
