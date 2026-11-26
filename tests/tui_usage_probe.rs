@@ -1897,7 +1897,7 @@ mod surfaces_hints_and_anchored_wordmark {
         out
     }
 
-    /// The user's ruling for the default themes: the transcript on the
+    /// The default themes' palette: the transcript on the
     /// base shade, the composer raised, the status row and footer on the
     /// chrome shade, faded text (the composer's placeholder) in its own
     /// colour; the light theme mirrors the lightness.
