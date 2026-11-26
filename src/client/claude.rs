@@ -3,6 +3,7 @@ use std::mem;
 
 use super::access_token::get_access_token;
 use super::oauth::{self, OAuthConfig};
+use super::structured_output::{SchemaDialect, StructuredOutputSpec, convert_schema};
 use super::*;
 
 use crate::function::ToolResult;
@@ -47,6 +48,10 @@ impl Client for ClaudeClient {
         self.config.auth.as_deref() == Some("oauth")
     }
 
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        Some(SchemaDialect::Anthropic)
+    }
+
     async fn chat_completions_inner(
         &self,
         client: &ReqwestClient,
@@ -69,7 +74,7 @@ impl Client for ClaudeClient {
     }
 }
 
-async fn prepare_chat_completions(
+pub(super) async fn prepare_chat_completions(
     self_: &ClaudeClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,
@@ -356,6 +361,7 @@ pub fn claude_build_chat_completions_body(
         functions,
         stream,
         prompt_cache_ttl,
+        structured_output,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -580,7 +586,13 @@ pub fn claude_build_chat_completions_body(
         body["top_p"] = v.into();
     }
     if let Some(v) = reasoning_effort {
-        body["output_config"] = json!({ "effort": v });
+        body["output_config"]["effort"] = v.into();
+    }
+    if let Some(StructuredOutputSpec { schema, .. }) = structured_output {
+        body["output_config"]["format"] = json!({
+            "type": "json_schema",
+            "schema": convert_schema(&schema, SchemaDialect::Anthropic),
+        });
     }
     if stream {
         body["stream"] = true.into();
@@ -893,6 +905,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), prompt_cache)
             .unwrap()
@@ -922,6 +935,7 @@ mod tests {
             functions: None,
             stream: false,
             prompt_cache_ttl: None,
+            structured_output: None,
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), false)
             .unwrap()
@@ -955,6 +969,7 @@ mod tests {
             functions,
             stream: false,
             prompt_cache_ttl: prompt_cache_ttl.map(str::to_string),
+            structured_output: None,
         }
     }
 
@@ -1543,19 +1558,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_structured_output_dialect_is_anthropic() {
+        let client = make_client(ClaudeConfig::default(), vec![]);
+
+        assert_eq!(
+            client.native_structured_output_dialect(),
+            Some(SchemaDialect::Anthropic)
+        );
+    }
+
     fn prepare(client: &ClaudeClient) -> Result<RequestData> {
-        let data = ChatCompletionsData {
-            messages: vec![Message::new(
-                MessageRole::User,
-                MessageContent::Text("hello".to_string()),
-            )],
-            temperature: None,
-            top_p: None,
-            reasoning_effort: None,
-            functions: None,
-            stream: false,
-            prompt_cache_ttl: None,
-        };
+        let data = plain_data(false);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1854,6 +1868,61 @@ mod tests {
         assert!(
             is_stock,
             "bundled models.yaml must not carry a claude oauth block: it would silently drop the Claude Code spoof for stock Pro/Max users"
+        );
+    }
+
+    fn structured_output_body(effort: Option<&str>, with_spec: bool) -> Value {
+        let mut data = structured_output_data();
+        data.reasoning_effort = effort.map(str::to_string);
+        if !with_spec {
+            data.structured_output = None;
+        }
+        claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), false)
+            .unwrap()
+    }
+
+    fn anthropic_format() -> Value {
+        let schema = structured_output_data().structured_output.unwrap().schema;
+        json!({
+            "type": "json_schema",
+            "schema": convert_schema(&schema, SchemaDialect::Anthropic),
+        })
+    }
+
+    #[test]
+    fn spec_and_effort_share_output_config() {
+        let body = structured_output_body(Some("high"), true);
+
+        assert_eq!(
+            body["output_config"],
+            json!({ "effort": "high", "format": anthropic_format() })
+        );
+    }
+
+    #[test]
+    fn effort_only_output_config_is_byte_identical() {
+        let body = structured_output_body(Some("high"), false);
+
+        assert_eq!(
+            body.to_string(),
+            r#"{"model":"claude-test","messages":[{"role":"user","content":"hello"}],"output_config":{"effort":"high"}}"#
+        );
+    }
+
+    #[test]
+    fn spec_only_output_config_has_only_format() {
+        let body = structured_output_body(None, true);
+
+        assert_eq!(body["output_config"], json!({ "format": anthropic_format() }));
+    }
+
+    #[test]
+    fn without_spec_or_effort_has_no_output_config() {
+        let body = structured_output_body(None, false);
+
+        assert_eq!(
+            body.to_string(),
+            r#"{"model":"claude-test","messages":[{"role":"user","content":"hello"}]}"#
         );
     }
 }

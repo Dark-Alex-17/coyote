@@ -416,12 +416,46 @@ pub(crate) fn interleaved_user_data() -> super::ChatCompletionsData {
                 image("data:image/jpeg;base64,Qg=="),
             ]),
         )],
+        ..plain_data(false)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn plain_data(stream: bool) -> super::ChatCompletionsData {
+    super::ChatCompletionsData {
+        messages: vec![Message::new(
+            MessageRole::User,
+            MessageContent::Text("hello".into()),
+        )],
         temperature: None,
         top_p: None,
         reasoning_effort: None,
         functions: None,
-        stream: false,
+        stream,
         prompt_cache_ttl: None,
+        structured_output: None,
+    }
+}
+
+/// One plain user turn carrying a structured-output spec. The optional,
+/// length-bounded `note` property is rewritten by OpenAI strict and Anthropic:
+/// both move `minLength` into the description, and OpenAI strict also makes it
+/// nullable and required. A builder that skips conversion differs from both.
+#[cfg(test)]
+pub(crate) fn structured_output_data() -> super::ChatCompletionsData {
+    super::ChatCompletionsData {
+        structured_output: Some(super::structured_output::StructuredOutputSpec {
+            name: "answer".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": { "type": "string" },
+                    "note": { "type": "string", "minLength": 1 },
+                },
+                "required": ["answer"],
+            }),
+        }),
+        ..plain_data(false)
     }
 }
 

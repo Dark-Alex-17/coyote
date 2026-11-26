@@ -46,8 +46,9 @@ use nu_ansi_term::Color;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::io;
-use std::sync::atomic::AtomicBool;
+use std::fmt::Display;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::{cmp, env, path::PathBuf};
 use syntect::highlighting::{Highlighter, Theme};
@@ -67,6 +68,61 @@ pub static SHOW_TOOL_CALLS: LazyLock<bool> = LazyLock::new(|| {
 });
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
+pub static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+pub fn json_output() -> bool {
+    JSON_OUTPUT.load(Ordering::SeqCst)
+}
+
+/// Where a human-facing line goes. Under `--json` stdout carries only the
+/// final report, so a line that would print there moves to stderr or is
+/// dropped instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSink {
+    Stdout,
+    Stderr,
+    Suppressed,
+}
+
+impl OutputSink {
+    fn pick(under_json: bool, when_json: OutputSink) -> Self {
+        if under_json { when_json } else { Self::Stdout }
+    }
+
+    /// For warnings and progress the user should still see under `--json`.
+    pub fn diagnostic() -> Self {
+        Self::diagnostic_under(json_output())
+    }
+
+    /// For lines that only narrate a run and are dropped under `--json`.
+    pub fn chatter() -> Self {
+        Self::chatter_under(json_output())
+    }
+
+    fn diagnostic_under(under_json: bool) -> Self {
+        Self::pick(under_json, Self::Stderr)
+    }
+
+    fn chatter_under(under_json: bool) -> Self {
+        Self::pick(under_json, Self::Suppressed)
+    }
+
+    pub fn println(self, line: impl Display) {
+        match self {
+            Self::Stdout => println!("{line}"),
+            Self::Stderr => eprintln!("{line}"),
+            Self::Suppressed => {}
+        }
+    }
+
+    pub fn writer(self) -> Box<dyn Write + Send> {
+        match self {
+            Self::Stdout => Box::new(io::stdout()),
+            Self::Stderr => Box::new(io::stderr()),
+            Self::Suppressed => Box::new(io::sink()),
+        }
+    }
+}
 
 static ACP_PERMISSION_QUEUE: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 
@@ -401,6 +457,33 @@ mod tests {
         assert!(!colour_for_stderr(true, true));
         assert!(!colour_for_stderr(false, false));
         assert!(!colour_for_stderr(false, true));
+    }
+
+    #[test]
+    fn sinks_are_stdout_without_json_and_the_requested_sink_under_it() {
+        let cases = [
+            (false, OutputSink::Stdout, OutputSink::Stdout),
+            (true, OutputSink::Stderr, OutputSink::Suppressed),
+        ];
+        for (under_json, diagnostic, chatter) in cases {
+            assert_eq!(
+                OutputSink::diagnostic_under(under_json),
+                diagnostic,
+                "diagnostic, under_json {under_json}"
+            );
+            assert_eq!(
+                OutputSink::chatter_under(under_json),
+                chatter,
+                "chatter, under_json {under_json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_suppressed_writer_accepts_and_drops_everything() {
+        let mut writer = OutputSink::Suppressed.writer();
+        assert_eq!(writer.write(b"dropped").unwrap(), 7);
+        writer.flush().unwrap();
     }
 
     #[test]
