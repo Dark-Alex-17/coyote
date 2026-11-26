@@ -1742,9 +1742,7 @@ pub fn wait_until_idle(pty: &mut Pty, what: &str) {
     let deadline = Instant::now() + PTY_DEADLINE;
     loop {
         let frame = repainted_in_place(pty);
-        if squeezed(&frame).contains("Typeapromptora.command")
-            && !frame.contains("Esc to interrupt")
-        {
+        if shows_placeholder(&squeezed(&frame)) && !frame.contains("Esc to interrupt") {
             return;
         }
         assert!(

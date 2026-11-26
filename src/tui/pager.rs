@@ -573,6 +573,7 @@ impl Pager {
     /// for when the renderer itself changed.
     pub(super) fn forget_layout(&mut self) {
         self.laid_out = None;
+        self.drawn = None;
         self.root_lines = RootLines::default();
         if let Thread::Child(view) = &mut self.thread {
             view.layouts.clear();

@@ -418,7 +418,7 @@ pub struct Cli {
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum, help_heading = "Shell")]
     pub completions: Option<ShellCompletion>,
-    /// Start the full-screen UI for this interactive run (already the default on a terminal)
+    /// Start the full-screen UI for this interactive run (the default when stdin and stdout are terminals and `ui` is unset)
     #[arg(long, help_heading = "Shell")]
     pub tui: bool,
     /// Start the plain line-editor REPL instead of the full-screen UI for this interactive run

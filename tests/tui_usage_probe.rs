@@ -768,8 +768,9 @@ mod footer_usage {
     /// left half, which starts with `left`, to the end of the frame, as the
     /// footer is the last row the repaint writes.
     fn footer_row(pty: &mut Pty, left: &str) -> String {
-        let flat = squeezed(&repainted_frame(pty, 24, 100));
         let left = squeezed(left);
+        let at = repaint_showing(pty, 24, 100, &[&left]);
+        let flat = squeezed(&since(pty, at));
         let at = flat
             .rfind(&left)
             .unwrap_or_else(|| panic!("no footer starting {left:?}: {flat}"));
