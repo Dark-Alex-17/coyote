@@ -109,6 +109,7 @@ pub struct AppConfig {
     pub highlight: bool,
     pub raw_markdown: bool,
     pub theme: Option<String>,
+    pub tui_chart_height: u16,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
 
@@ -208,6 +209,7 @@ impl Default for AppConfig {
             highlight: true,
             raw_markdown: false,
             theme: None,
+            tui_chart_height: 12,
             left_prompt: None,
             right_prompt: None,
 
@@ -321,6 +323,7 @@ impl AppConfig {
             highlight: config.highlight,
             raw_markdown: config.raw_markdown,
             theme: config.theme,
+            tui_chart_height: config.tui_chart_height,
             left_prompt: config.left_prompt,
             right_prompt: config.right_prompt,
 
@@ -728,6 +731,9 @@ impl AppConfig {
                 // they are neither echoed nor read as line-editor input.
                 drain_stale_tty_input();
             }
+        }
+        if let Some(Some(v)) = super::read_env_value::<u16>(&get_env_name("tui_chart_height")) {
+            self.tui_chart_height = v;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("left_prompt")) {
             self.left_prompt = v;

@@ -275,6 +275,8 @@ theme: null                      # null = ask the terminal for its background an
                                  # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.
                                  # Custom themes: place a `dark.tmTheme` or `light.tmTheme` file in the Coyote config
                                  # directory and it is used in place of the corresponding built-in.
+tui_chart_height: 12             # Rows a ```chart block in a reply takes in the TUI, from 6 to 30. A chart's own `height`
+                                 # overrides it, within the same range
 
 # ---- REPL Prompt ----
 # Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt) for more information

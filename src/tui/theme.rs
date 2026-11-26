@@ -273,6 +273,11 @@ fn from_markdown(colour: crossterm::style::Color, fallback: Color) -> Color {
     }
 }
 
+/// The markdown theme's heading colour, or the UI's own where it has none.
+pub(super) fn heading_color(markdown: &MarkdownRender) -> Color {
+    from_markdown(markdown.heading_color(), HEADING_FALLBACK)
+}
+
 /// Every style the chrome draws with, built with the renderer so a theme
 /// change or a `NO_COLOR` switch reaches both.
 pub(super) struct Theme {
@@ -335,7 +340,7 @@ impl Theme {
         let paint = |style: Style, colour: Color| {
             if no_color { style } else { style.fg(colour) }
         };
-        let heading = from_markdown(markdown.heading_color(), HEADING_FALLBACK);
+        let heading = heading_color(markdown);
         let tool_fn = from_repl(tool_fn_color(), markdown);
         let tool_key = from_repl(tool_key_color(), markdown);
         let palette = if light { &LIGHT_PALETTE } else { &DARK_PALETTE };

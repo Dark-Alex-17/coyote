@@ -38,6 +38,7 @@ use common::source_scan::{const_str, fn_body, read, repo_root, src, string_liter
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test tui_wiki_docs`";
 const PAGE: &str = "TUI.md";
+const CHARTS_HEADING: &str = "## Charts";
 const PROTOCOL_HEADING: &str = "## Prompting the user from a tool";
 const CHANNEL_HEADING: &str = "# The Prompt Channel";
 const ENV_HEADING: &str = "# UI and Prompt Related Variables";
@@ -763,6 +764,32 @@ fn environment_page_documents_the_ui_and_reply_variables() {
             .all(|row| row.first().is_none_or(|cell| cell != "`ui`")),
         "Environment-Variables.md lists `ui` as a setting {ui_env} overrides"
     );
+}
+
+/// The chart section of the TUI page names every chart type and spec
+/// field the parser reads, the setting that sizes a chart and the key
+/// that shows it as source.
+#[test]
+fn tui_page_documents_every_chart_spec_name() {
+    let chart = src(&["tui", "rich", "chart.rs"]);
+    let names = string_literals(&const_expr(&chart, "CHART_SPEC_NAMES"));
+    for name in ["line", "scatter", "bar", "sparkline", "series", "data"] {
+        assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
+    }
+    assert_eq!(template_value("tui_chart_height"), "12");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let charts = flat(&section(PAGE, &read(wiki.join(PAGE)), CHARTS_HEADING));
+    let needles = names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .chain(["`tui_chart_height`".to_string(), "`Alt+M`".to_string()]);
+    for needle in needles {
+        assert!(
+            charts.contains(&needle),
+            "{PAGE} `{CHARTS_HEADING}` names {needle}"
+        );
+    }
 }
 
 #[test]

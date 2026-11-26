@@ -437,7 +437,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(
             Transcript,
             "Alt+M",
-            "Show diagrams as their source, or drawn again",
+            "Show diagrams and charts as their source, or drawn again",
         ),
         row(
             Composer,

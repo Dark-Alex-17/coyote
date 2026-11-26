@@ -7,7 +7,9 @@
 //! itself (see [`super::rich`]) are drawn in place of their source.
 
 use super::rich::mermaid::{self, MermaidRenderer, MermaidTextBackend};
-use super::rich::{self, Block, BlockKind, CopyRegion, Rendered, RichCache, RichKey, Segment};
+use super::rich::{
+    self, Block, BlockKind, CopyRegion, Rendered, RichCache, RichKey, RichStyle, Segment, chart,
+};
 use super::throbber::Tick;
 use crate::config::is_format_char;
 use crate::render::{
@@ -334,6 +336,9 @@ pub(crate) struct Renderer {
     /// Whether a reply's rich blocks are drawn, or shown as their source;
     /// Alt+M flips it.
     pub(super) rich: bool,
+    /// The rows a chart takes unless its spec says otherwise; the App sets
+    /// it from the `tui_chart_height` setting.
+    pub(super) chart_height: u16,
     mermaid: Arc<dyn MermaidRenderer>,
     rich_cache: RichCache,
 }
@@ -359,6 +364,7 @@ impl Renderer {
             accent: super::theme::Gradient::PLAIN,
             tick: Tick { origin: now, now },
             rich: true,
+            chart_height: chart::DEFAULT_HEIGHT,
             mermaid: Arc::new(MermaidTextBackend),
             rich_cache: RichCache::default(),
         })
@@ -443,6 +449,26 @@ impl Renderer {
             BlockKind::Mermaid => mermaid::render_mermaid(self.mermaid.as_ref(), block.body, width)
                 .map(|rows| rows.into_iter().map(Line::from).collect())
                 .map_err(|err| err.note()),
+            BlockKind::Chart => {
+                chart::render_chart(block.body, width, self.chart_height, &self.rich_style())
+                    .map_err(|err| err.note())
+            }
+        }
+    }
+
+    /// The theme's colours for a drawn block: the heading colour, then the
+    /// two ends of the accent, for a chart's series in turn.
+    fn rich_style(&self) -> RichStyle {
+        let heading = super::theme::heading_color(&self.markdown);
+        let accent = |column| self.accent.style_at(column, 2, &self.markdown).fg;
+        let mut palette = vec![heading];
+        palette.extend([accent(0), accent(1)].into_iter().flatten());
+        palette.extend([Color::Cyan, Color::Magenta]);
+        RichStyle {
+            palette,
+            title: Style::new().fg(heading).add_modifier(Modifier::BOLD),
+            axis: self.faded,
+            no_color: self.no_color,
         }
     }
 

@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/rich_blocks.rs
+expression: frame
+---
+"     █                                  "
+"   ▆ █                                  "
+"   █ █ ▄                                "
+"   █▂█ █ ▂                              "
+"   ███ █ █                              "
+" █ ███ ███                              "
+" █ ███▇███                              "
+"▅█ ███████                              "
+"██▃███████                              "
+"██████████                              "
+"██████████                              "
+"That is all.                            "
+"────────────────────────────────────────"
+"? = keys  Alt+T = tasks  Alt+S = threads"
+"───────────────────────────── your turn "
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"openai:test-model . no session . agents "

@@ -601,6 +601,7 @@ impl App {
     ) -> Result<Self> {
         let options = config.render_options()?;
         let mut renderer = Renderer::new(options)?;
+        renderer.chart_height = config.tui_chart_height;
         let theme = Theme::new(
             renderer.markdown_render(),
             renderer.no_color,
@@ -806,6 +807,7 @@ impl App {
                 Ok(mut renderer) => {
                     renderer.no_color = self.renderer.no_color;
                     renderer.rich = self.renderer.rich;
+                    renderer.chart_height = config.tui_chart_height;
                     let theme = Theme::new(
                         renderer.markdown_render(),
                         renderer.no_color,

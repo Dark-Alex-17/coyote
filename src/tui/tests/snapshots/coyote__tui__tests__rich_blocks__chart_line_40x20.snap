@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/rich_blocks.rs
+expression: frame
+---
+"8  │req/s                    ⢀⠎⠒⠤⣀ ┌───┐"
+"   │                        ⡠⠃    ⠉│api│"
+"   │                       ⡔⠁      │web│"
+"   │         ⡀           ⢠⠊        └───┘"
+"4.5│      ⢀⠤⠊⠈⠑⠢⢄⡀      ⡰⠁              "
+"   │    ⣀⠔⠁      ⠈⠒⠤⣀ ⢀⠜    ⡠⠔⠊⠑⠒⠢⠤⢄⣀   "
+"   │  ⡠⠊             ⠉⠊ ⢀⠤⠒⠉         ⠉⠉⠒"
+"   │⠔⠉    ⢀⣀⡠⠤⠤⠤⠤⠤⠤⠤⠤⠤⠔⠊⠁               "
+"1  │⣀⠤⠤⠒⠒⠉⠁                       minute"
+"   └────────────────────────────────────"
+"   0                  2                4"
+"That is all.                            "
+"────────────────────────────────────────"
+"? = keys  Alt+T = tasks  Alt+S = threads"
+"───────────────────────────── your turn "
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"openai:test-model . no session . agents "

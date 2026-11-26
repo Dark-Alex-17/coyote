@@ -162,3 +162,109 @@ fn a_panicking_backend_shows_the_source() {
         "{frame}"
     );
 }
+
+const LINE_CHART: &str = "type: line\ntitle: Requests\nx_label: minute\ny_label: req/s\nseries:\n  \
+                          - name: api\n    data: [[0, 2], [1, 5], [2, 3], [3, 8], [4, 6]]\n  \
+                          - name: web\n    data: [1, 2, 2, 4, 3]";
+const BAR_CHART: &str = "type: bar\ntitle: Languages\nbars:\n  - {label: rust, value: 7}\n  \
+                         - {label: go, value: 4}\n  - {label: py, value: 5}";
+const SPARKLINE: &str =
+    r#"{"type": "sparkline", "title": "Latency", "data": [3, 5, 2, 8, 6, 9, 4, 7, 5, 6]}"#;
+
+fn chart_fenced(body: &str) -> String {
+    format!("```chart\n{body}\n```")
+}
+
+fn chart_reply(body: &str) -> String {
+    format!("Here it is:\n{}\nThat is all.", chart_fenced(body))
+}
+
+/// The rows of the last frame between the reply's lead line and its last.
+fn chart_rows(harness: &Harness) -> std::ops::Range<u16> {
+    row_with(harness, "Here it is:") + 1..row_with(harness, "That is all.")
+}
+
+/// Line, bar and sparkline charts are drawn in the transcript at a wide
+/// and a narrow screen, the sparkline from a JSON spec. Colour is set
+/// rather than taken from the test's stdout, since it picks the markers.
+#[test]
+fn charts_are_drawn_in_the_transcript() {
+    for (name, body, title) in [
+        ("line", LINE_CHART, "Requests"),
+        ("bar", BAR_CHART, "Languages"),
+        ("sparkline", SPARKLINE, "Latency"),
+    ] {
+        for (width, height) in [(80, 24), (40, 20)] {
+            let mut harness = Harness::standalone(width, height);
+            harness.app.set_no_color(false);
+            let frame = replied(&mut harness, &chart_reply(body));
+            let at = format!("{name} {width}x{height}:\n{frame}");
+            assert!(width < 80 || frame.contains(title), "{at}");
+            assert!(!frame.contains("```chart"), "{at}");
+            assert!(!frame.contains("showing source"), "{at}");
+            insta::assert_snapshot!(format!("chart_{name}_{width}x{height}"), frame);
+        }
+    }
+}
+
+/// A spec that does not check out shows its source with the note.
+#[test]
+fn an_invalid_chart_shows_its_source_and_a_note() {
+    let mut harness = Harness::standalone(80, 24);
+    let frame = replied(&mut harness, &chart_reply("type: line\nseries: []"));
+    assert!(frame.contains("```chart"), "{frame}");
+    assert!(
+        frame.contains("chart: invalid spec: no series (showing source)"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("chart_invalid_fallback", frame);
+}
+
+/// The chart is painted in the theme's colours, and under `NO_COLOR` in
+/// none, its legend still telling the series apart.
+#[test]
+fn under_no_color_a_chart_paints_no_colour() {
+    for no_color in [false, true] {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.set_no_color(no_color);
+        let frame = replied(&mut harness, &chart_reply(LINE_CHART));
+        let buffer = harness.terminal.backend().buffer();
+        let coloured = chart_rows(&harness).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.fg != Color::Reset || cell.bg != Color::Reset
+            })
+        });
+        assert_eq!(coloured, !no_color, "{frame}");
+        assert!(frame.contains("api") && frame.contains("web"), "{frame}");
+    }
+}
+
+/// Alt+M shows a chart as its source, the transcript view shows the
+/// source, and a drag over the chart copies its fenced source.
+#[test]
+fn a_chart_shows_and_copies_as_its_source() {
+    let mut harness = Harness::standalone(80, 24);
+    let body = format!("{BAR_CHART}\nheight: 8");
+    let frame = replied(&mut harness, &chart_reply(&body));
+    assert!(!frame.contains("type: bar"), "{frame}");
+    let title = row_with(&harness, "Languages");
+    assert_eq!(
+        left_drag(&mut harness, (3, title), (6, title)),
+        Some(Command::Copy {
+            text: chart_fenced(&body),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
+
+    harness.app.handle_key(alt(KeyCode::Char('m')));
+    let frame = harness.draw();
+    assert!(frame.contains("```chart"), "{frame}");
+    assert!(frame.contains("type: bar"), "{frame}");
+    harness.app.handle_key(alt(KeyCode::Char('m')));
+
+    harness.app.handle_key(ctrl(KeyCode::Char('t')));
+    let frame = harness.draw();
+    assert!(frame.contains("type: bar"), "{frame}");
+}

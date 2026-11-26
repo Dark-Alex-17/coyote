@@ -345,6 +345,7 @@ pub struct Config {
     pub highlight: bool,
     pub raw_markdown: bool,
     pub theme: Option<String>,
+    pub tui_chart_height: u16,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
 
@@ -441,6 +442,7 @@ impl Default for Config {
             highlight: true,
             raw_markdown: false,
             theme: None,
+            tui_chart_height: 12,
             left_prompt: None,
             right_prompt: None,
 
@@ -1582,6 +1584,21 @@ clients:
         assert!(example.contains("Spawned children and graph nodes always use 5m"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.prompt_cache_ttl, None);
+    }
+
+    #[test]
+    fn config_template_documents_tui_chart_height() {
+        let example = include_str!("../../config.example.yaml");
+        for text in [CONFIG_TEMPLATE, example] {
+            assert!(text.contains("\ntui_chart_height: 12 "));
+            assert!(text.contains("from 6 to 30. A chart's own `height`"));
+        }
+        assert_eq!(Config::default().tui_chart_height, 12);
+        let cfg = Config::load_from_str(example).unwrap();
+        assert_eq!(cfg.tui_chart_height, 12);
+        let cfg = Config::load_from_str("tui_chart_height: 20\n").unwrap();
+        let app = AppConfig::from_config_lenient(cfg).unwrap();
+        assert_eq!(app.tui_chart_height, 20);
     }
 
     #[test]

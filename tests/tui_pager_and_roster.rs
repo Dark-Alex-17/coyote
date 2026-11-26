@@ -51,6 +51,8 @@ mod transcript {
     //!   it again;
     //! - a mermaid fence in a reply is drawn as a box diagram and `Alt+M`
     //!   shows its source in its place;
+    //! - a chart fence in a reply is drawn as a bar chart and `Alt+M` shows
+    //!   its source in its place;
     //! - a narrower terminal re-wraps the cells in place without duplicating
     //!   a row;
     //! - Shift+G with the view at the bottom is plain typing, before a scroll
@@ -883,6 +885,49 @@ mod transcript {
         assert!(
             !source.contains("│Start│"),
             "the diagram stayed after Alt+M:\n{source}"
+        );
+
+        quit(pty);
+    }
+
+    // ---------------------------------------------------------------------
+    // A chart fence in a reply is drawn as a bar chart, and Alt+M shows its
+    // source in its place.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn a_chart_reply_is_drawn_and_alt_m_shows_its_source() {
+        let reply = "Bars:\n```chart\ntype: bar\ntitle: Langs\nbars:\n  - {label: rust, value: 7}\n  \
+                     - {label: go, value: 4}\n```\nchart-end-marker";
+        let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
+        let (_guard, mut pty) = boot_with_fake("chart", &fake);
+
+        let before = pty.raw().len();
+        pty.send(b"draw it\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "chart-end-marker", before, "the reply");
+        pty.read_for(Duration::from_millis(500));
+        let drawn = ctrl_l_repaint(&mut pty);
+        assert!(
+            drawn.contains("Langs") && drawn.contains("rust") && drawn.contains('█'),
+            "the chart is not drawn:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("type:bar"),
+            "the source shows beside the chart:\n{drawn}"
+        );
+
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_M).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let source = ctrl_l_repaint(&mut pty);
+        assert!(
+            source.contains("```chart") && source.contains("type:bar"),
+            "Alt+M did not show the source:\n{source}"
+        );
+        assert!(
+            !source.contains('█'),
+            "the chart stayed after Alt+M:\n{source}"
         );
 
         quit(pty);

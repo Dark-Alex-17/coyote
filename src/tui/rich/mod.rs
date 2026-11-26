@@ -4,20 +4,24 @@
 //! copy over its rows takes that source rather than the drawing. A block
 //! that cannot be drawn shows its source with a note saying why.
 
+pub(crate) mod chart;
 pub(crate) mod mermaid;
 
 use super::render::plain_text;
-use ratatui::style::Style;
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 /// What a fenced block is drawn as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BlockKind {
     Mermaid,
+    Chart,
 }
 
 /// A closed fence the TUI draws itself.
@@ -102,9 +106,17 @@ impl Delimiter<'_> {
     /// reads it as an indented code line.
     fn kind(self) -> Option<BlockKind> {
         match self {
-            Delimiter::Fence { indent, info } => (indent <= 3
-                && info.trim().eq_ignore_ascii_case("mermaid"))
-            .then_some(BlockKind::Mermaid),
+            Delimiter::Fence { indent, .. } if indent > 3 => None,
+            Delimiter::Fence { info, .. } => {
+                let info = info.trim();
+                if info.eq_ignore_ascii_case("mermaid") {
+                    Some(BlockKind::Mermaid)
+                } else if info.eq_ignore_ascii_case("chart") {
+                    Some(BlockKind::Chart)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -173,6 +185,69 @@ pub(crate) fn note_line(note: &str, faded: Style) -> Line<'static> {
     Line::from(Span::styled(plain_text(note), faded))
 }
 
+/// The theme a drawn block paints with.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RichStyle {
+    /// The colours of a chart's series in turn; never empty.
+    pub(crate) palette: Vec<Color>,
+    pub(crate) title: Style,
+    /// A chart's axes, their labels and its legend.
+    pub(crate) axis: Style,
+    pub(crate) no_color: bool,
+}
+
+impl RichStyle {
+    /// The colour of the `index`th series.
+    pub(crate) fn series(&self, index: usize) -> Style {
+        Style::new().fg(self.palette[index % self.palette.len()])
+    }
+}
+
+/// The rows of a buffer a widget was drawn into, as styled lines. A cell
+/// hidden under a wide symbol is skipped, runs of one style share a span,
+/// a `Reset` colour is left unset so no background is painted, and the
+/// default cells at the end of a row are dropped. Under `no_color` only
+/// the attributes stay.
+pub(crate) fn buffer_lines(buffer: &Buffer, no_color: bool) -> Vec<Line<'static>> {
+    let area = buffer.area;
+    let colour = |colour: Color| (!no_color && colour != Color::Reset).then_some(colour);
+    (area.top()..area.bottom())
+        .map(|y| {
+            let mut cells: Vec<(&str, Style)> = Vec::new();
+            let mut hidden = 0;
+            for x in area.left()..area.right() {
+                if hidden > 0 {
+                    hidden -= 1;
+                    continue;
+                }
+                let cell = &buffer[(x, y)];
+                hidden = cell.symbol().width().saturating_sub(1);
+                let style = Style {
+                    fg: colour(cell.fg),
+                    bg: colour(cell.bg),
+                    add_modifier: cell.modifier,
+                    ..Style::new()
+                };
+                cells.push((cell.symbol(), style));
+            }
+            while cells
+                .last()
+                .is_some_and(|(symbol, style)| *symbol == " " && *style == Style::new())
+            {
+                cells.pop();
+            }
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (symbol, style) in cells {
+                match spans.last_mut() {
+                    Some(span) if span.style == style => span.content.to_mut().push_str(symbol),
+                    _ => spans.push(Span::styled(symbol.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// What drawing a block gave: its rows, or the note to show under its
 /// source.
 pub(crate) type BlockResult = Result<Vec<Line<'static>>, String>;
@@ -236,6 +311,7 @@ impl RichCache {
 mod tests {
     use super::*;
     use crate::tui::render::split_stable_tail;
+    use ratatui::style::Modifier;
 
     fn blocks<'a>(segments: &[Segment<'a>]) -> Vec<Block<'a>> {
         segments
@@ -306,6 +382,19 @@ mod tests {
         assert_eq!(blocks(&segments).len(), 2);
     }
 
+    #[test]
+    fn a_closed_chart_fence_is_a_chart_block() {
+        let source = "```chart\ntype: sparkline\ndata: [1, 2]\n```\n``` Chart\n{}\n```\n";
+        let kinds: Vec<BlockKind> = blocks(&segment(source))
+            .iter()
+            .map(|block| block.kind)
+            .collect();
+        assert_eq!(kinds, [BlockKind::Chart, BlockKind::Chart]);
+        for source in ["```charts\nx\n```\n", "```chart\ntype: bar\n"] {
+            assert_eq!(segment(source), [Segment::Markdown(source)], "{source:?}");
+        }
+    }
+
     /// The stable part of every prefix of a reply and the tail after it,
     /// segmented apart, find the blocks the whole prefix holds: the split
     /// never falls inside a fence.
@@ -364,5 +453,58 @@ mod tests {
         assert!(cache.get(&key("first", 80)).is_some());
         assert!(cache.get(&key("body 1", 80)).is_none());
         assert!(cache.get(&key("first", 40)).is_none());
+    }
+
+    fn buffer(width: u16, draw: impl FnOnce(&mut Buffer)) -> Buffer {
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
+        draw(&mut buffer);
+        buffer
+    }
+
+    /// A wide symbol takes its own cell and the one it hides is not read,
+    /// and the blank cells after the text are dropped.
+    #[test]
+    fn a_wide_symbol_hides_the_cell_after_it() {
+        let buffer = buffer(8, |buffer| {
+            buffer.set_string(0, 0, "a\u{4e2d}b", Style::new());
+        });
+        assert_eq!(
+            buffer_lines(&buffer, false),
+            [Line::from(Span::raw("a\u{4e2d}b"))]
+        );
+    }
+
+    #[test]
+    fn cells_of_one_style_share_a_span_and_reset_paints_nothing() {
+        let red = Style::new().fg(Color::Red);
+        let buffer = buffer(8, |buffer| {
+            buffer.set_string(0, 0, "ab", red.bg(Color::Reset));
+            buffer.set_string(2, 0, "cd", Style::new().fg(Color::Reset));
+            buffer.set_string(4, 0, "e", red);
+        });
+        assert_eq!(
+            buffer_lines(&buffer, false),
+            [Line::from(vec![
+                Span::styled("ab", red),
+                Span::raw("cd"),
+                Span::styled("e", red),
+            ])]
+        );
+    }
+
+    /// Under `NO_COLOR` the colours go and the attributes stay, so a
+    /// coloured blank at the end is dropped like any other.
+    #[test]
+    fn no_color_keeps_only_the_attributes() {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let buffer = buffer(8, |buffer| {
+            buffer.set_string(0, 0, "ab", bold.fg(Color::Red).bg(Color::Blue));
+            buffer.set_string(2, 0, "c", Style::new().fg(Color::Green));
+            buffer.set_string(3, 0, " ", Style::new().bg(Color::Green));
+        });
+        assert_eq!(
+            buffer_lines(&buffer, true),
+            [Line::from(vec![Span::styled("ab", bold), Span::raw("c")])]
+        );
     }
 }
