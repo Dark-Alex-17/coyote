@@ -769,7 +769,8 @@ fn the_picker_lists_from_the_root_the_turn_resolves() {
 
 /// A root equal by value to the one the picker listed from, as a
 /// sessionless fork resolves in an Arc of its own, leaves the open
-/// picker as it is: no fresh listing and the highlight kept.
+/// picker on the thread it highlighted, though the next frame lists the
+/// child saved since.
 #[test]
 #[serial]
 fn an_equal_root_leaves_the_open_picker_and_its_highlight_alone() {
@@ -792,7 +793,7 @@ fn an_equal_root_leaves_the_open_picker_and_its_highlight_alone() {
             .handle_msg(UiMsg::ChildSessionRootResolved(Arc::new(root)));
         let frame = harness.draw();
         assert!(frame.contains("reviewer-e3e"), "{frame}");
-        assert!(!frame.contains("reviewer-n9n"), "{frame}");
+        assert!(frame.contains("reviewer-n9n"), "{frame}");
         harness.press(KeyCode::Enter);
         let requests = harness.app.take_control_requests();
         assert!(

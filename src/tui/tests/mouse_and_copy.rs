@@ -134,6 +134,23 @@ fn a_double_click_copies_a_word_and_a_triple_click_the_wrapped_line() {
     assert_eq!(left_click(&mut harness, at), selected(PARAGRAPH));
 }
 
+/// In the transcript view a triple click on a wrapped line's last row
+/// copies the whole line too, not just the row.
+#[test]
+fn a_triple_click_in_the_transcript_view_copies_the_wrapped_line() {
+    let mut harness = Harness::standalone(60, 24);
+    replied(&mut harness, PARAGRAPH);
+    harness.app.handle_key(ctrl(KeyCode::Char('t')));
+    harness.draw();
+    let first = row_with(&harness, "The quick brown");
+    let last = row_with(&harness, "the hills.");
+    assert!(last > first, "the paragraph did not wrap");
+    let at = (2, last);
+    assert_eq!(left_click(&mut harness, at), None);
+    left_click(&mut harness, at);
+    assert_eq!(left_click(&mut harness, at), selected(PARAGRAPH));
+}
+
 /// Presses further apart than the double-click window are two clicks.
 #[test]
 fn presses_out_of_the_window_copy_nothing() {
@@ -375,6 +392,26 @@ fn copying_a_wrapped_list_item_leaves_out_its_hanging_indent() {
     assert_eq!(
         left_drag(&mut harness, (0, first), (39, last)),
         selected(&format!("\u{2022} {PARAGRAPH}"))
+    );
+}
+
+/// A word wider than the frame is split mid-word, and its copy joins
+/// the pieces with no space.
+#[test]
+fn copying_a_word_split_by_the_wrap_rejoins_it_without_a_space() {
+    let mut harness = Harness::standalone(40, 24);
+    let word = "z".repeat(60);
+    replied(&mut harness, &word);
+    let first = row_with(&harness, "zzzz");
+    let last = first + 1;
+    let buffer = harness.terminal.backend().buffer();
+    assert!(
+        (0..buffer.area.width).any(|x| buffer[(x, last)].symbol() == "z"),
+        "the word did not wrap:\n{buffer:?}"
+    );
+    assert_eq!(
+        left_drag(&mut harness, (0, first), (39, last)),
+        selected(&word)
     );
 }
 

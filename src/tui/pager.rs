@@ -844,6 +844,27 @@ impl Pager {
         )
     }
 
+    /// The rows of the wrapped line that row `at` of the last frame's
+    /// text is part of, so a triple click can take the line whole.
+    pub(super) fn line_rows(&self, at: usize) -> Vec<selection::Row> {
+        let Some(text) = self.drawn.as_ref() else {
+            return Vec::new();
+        };
+        let wraps = |index: usize| {
+            text.line(index)
+                .is_some_and(|line| render::wrap_join(line).is_some())
+        };
+        let mut first = at;
+        while first > 0 && wraps(first) {
+            first -= 1;
+        }
+        let mut last = at;
+        while wraps(last + 1) {
+            last += 1;
+        }
+        self.selection_rows(first, last)
+    }
+
     /// Paints the lines on show in a pager drawn over `area` that fall
     /// inside `range`.
     pub(super) fn paint_selection(
@@ -1428,7 +1449,7 @@ mod tests {
     use crate::tui::thread_tree::{ThreadNode, ThreadTree};
     use crate::tui::threads::{Threads, ThreadsPopup};
     use crate::tui::transcript::Transcript;
-    use chrono::{FixedOffset, TimeZone, Utc};
+    use chrono::{DateTime, FixedOffset, TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashSet;
@@ -1564,6 +1585,8 @@ mod tests {
                             threads,
                             folds,
                             theme: &theme,
+                            now: tree_now(),
+                            offset: FixedOffset::east_opt(0).unwrap(),
                         },
                         body,
                     );
@@ -1828,16 +1851,13 @@ mod tests {
         ])
     }
 
+    /// What the threads pop-up's run times are counted to in these tests.
+    fn tree_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+    }
+
     fn open_tree(folds: &HashSet<String>) -> Threads {
-        let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        Threads::new(
-            thread_tree(),
-            None,
-            now,
-            FixedOffset::east_opt(0).unwrap(),
-            None,
-            folds,
-        )
+        Threads::new(thread_tree(), None, None, folds)
     }
 
     /// The arrow keys' moves: right unfolds or steps into the first
@@ -2520,14 +2540,7 @@ mod tests {
             ThreadNode::child(&meta("reviewer-a1", "reviewer"), EffectiveStatus::Running),
             ThreadNode::child(&meta("planner-b2", "planner"), EffectiveStatus::Running),
         ]);
-        let threads = Threads::new(
-            tree,
-            None,
-            Utc::now(),
-            FixedOffset::east_opt(0).unwrap(),
-            pager.child_session(),
-            &HashSet::new(),
-        );
+        let threads = Threads::new(tree, None, pager.child_session(), &HashSet::new());
         assert_eq!(
             threads.picked(&HashSet::new()).session_id.as_deref(),
             Some("planner-b2")
@@ -2893,14 +2906,7 @@ mod tests {
         let mut cells = root_cells();
         let mut pager = Pager::root();
         let folds = HashSet::new();
-        let threads = Threads::new(
-            thread_tree(),
-            Some("no children".to_string()),
-            Utc::now(),
-            FixedOffset::east_opt(0).unwrap(),
-            None,
-            &folds,
-        );
+        let threads = Threads::new(thread_tree(), Some("no children".to_string()), None, &folds);
         let mut renderer = renderer();
         for area in [
             Rect::new(0, 0, 1, 1),
@@ -2929,6 +2935,8 @@ mod tests {
                 threads: &threads,
                 folds: &folds,
                 theme: &theme,
+                now: Utc::now(),
+                offset: FixedOffset::east_opt(0).unwrap(),
             }
             .render(text_area(area), &mut buf);
         }

@@ -17,6 +17,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = "Threads";
@@ -35,24 +36,20 @@ pub(super) struct Threads {
     /// Said above the rows: why there are no children, or why they
     /// could not be listed.
     note: Option<String>,
-    /// What the run times are counted to and the spawn times shown in.
-    now: DateTime<Utc>,
-    offset: FixedOffset,
     /// The area the pop-up was last centred over, which a click is
     /// placed against.
     area: Rect,
+    /// When the tree was last listed afresh; None until the first frame.
+    listed_at: Option<Instant>,
 }
 
 impl Threads {
-    /// The pop-up on `tree`, its run times counted to `now` and its spawn
-    /// times shown at `offset`, starting on the thread keyed `wanted` (or
+    /// The pop-up on `tree`, starting on the thread keyed `wanted` (or
     /// the folded thread hiding it) when the tree has it, and on the main
     /// thread otherwise.
     pub(super) fn new(
         tree: ThreadTree,
         note: Option<String>,
-        now: DateTime<Utc>,
-        offset: FixedOffset,
         wanted: Option<&str>,
         folds: &HashSet<String>,
     ) -> Self {
@@ -64,10 +61,27 @@ impl Threads {
             tree,
             highlight,
             note,
-            now,
-            offset,
             area: Rect::ZERO,
+            listed_at: None,
         }
+    }
+
+    /// Whether a fresh listing is due at `now`: the child sessions are
+    /// read from disk, so no more often than `every`.
+    pub(super) fn listing_due(&self, now: Instant, every: Duration) -> bool {
+        self.listed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= every)
+    }
+
+    /// Swaps in a fresh listing. The highlight stays on its thread while
+    /// the tree still has it, and falls back to the main thread if not.
+    pub(super) fn refresh(&mut self, tree: ThreadTree, note: Option<String>, now: Instant) {
+        self.listed_at = Some(now);
+        if tree.find(&self.highlight).is_none() {
+            self.highlight = tree.key(0).to_string();
+        }
+        self.tree = tree;
+        self.note = note;
     }
 
     pub(super) fn highlight(&self) -> &str {
@@ -170,6 +184,9 @@ pub(super) struct ThreadsPopup<'a> {
     pub(super) threads: &'a Threads,
     pub(super) folds: &'a HashSet<String>,
     pub(super) theme: &'a Theme,
+    /// What the run times are counted to and the spawn times shown in.
+    pub(super) now: DateTime<Utc>,
+    pub(super) offset: FixedOffset,
 }
 
 impl Widget for ThreadsPopup<'_> {
@@ -209,14 +226,9 @@ impl Widget for ThreadsPopup<'_> {
             .skip(start)
             .take(usize::from(inner.height))
             .map(|&node| {
-                threads.tree.line(
-                    node,
-                    self.folds,
-                    width,
-                    threads.now,
-                    threads.offset,
-                    self.theme,
-                )
+                threads
+                    .tree
+                    .line(node, self.folds, width, self.now, self.offset, self.theme)
             })
             .collect();
         Paragraph::new(lines).render(inner, buf);

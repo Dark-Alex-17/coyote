@@ -1169,6 +1169,32 @@ fn the_root_thread_chosen_from_a_child_over_the_transcript_view_is_that_view() {
     });
 }
 
+/// The threads pop-up is listed again on every frame, so a running
+/// thread's run time goes on counting while the pop-up stays open, with
+/// the highlight left where it was.
+#[test]
+#[serial]
+fn an_open_threads_popup_keeps_counting_a_running_thread() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-threads-ticking");
+        let mut harness = nested_harness(28);
+        harness.app.handle_key(alt(KeyCode::Char('s')));
+        harness.press(KeyCode::Down);
+        let highlight = |harness: &Harness| match &harness.app.overlay {
+            Some(Overlay::Threads(threads)) => threads.highlight().to_string(),
+            _ => panic!("the threads pop-up is not open"),
+        };
+        let before = harness.draw();
+        let chosen = highlight(&harness);
+        assert!(!before.contains("2m 5s"), "{before}");
+
+        harness.clock.advance(Duration::from_secs(125));
+        let after = harness.draw();
+        assert!(after.contains("2m 5s"), "{after}");
+        assert_eq!(highlight(&harness), chosen);
+    });
+}
+
 fn title(harness: &mut Harness) -> String {
     harness
         .draw()

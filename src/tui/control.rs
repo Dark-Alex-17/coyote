@@ -708,17 +708,15 @@ impl App {
     /// The threads pop-up on a fresh listing, starting on the thread
     /// keyed `wanted` when it is listed.
     pub(super) fn list_threads(&self, wanted: Option<&str>) -> Threads {
+        let (tree, note) = self.noted_thread_tree();
+        Threads::new(tree, note, wanted, &self.thread_folds)
+    }
+
+    /// The tree for the threads pop-up, with the note it shows above it.
+    pub(super) fn noted_thread_tree(&self) -> (ThreadTree, Option<String>) {
         let (tree, note) = self.thread_tree();
         let note = note.or_else(|| (tree.len() == 1).then(|| "No child sessions yet".to_string()));
-        let now = chrono::Local::now();
-        Threads::new(
-            tree,
-            note,
-            now.with_timezone(&chrono::Utc),
-            *now.offset(),
-            wanted,
-            &self.thread_folds,
-        )
+        (tree, note)
     }
 
     /// Opens the highlighted thread in the pop-up's place. A child that

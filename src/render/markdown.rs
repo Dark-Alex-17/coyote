@@ -330,17 +330,31 @@ pub(crate) const SOFT_BREAK_SPACE: char = '\u{FDD0}';
 pub(crate) const SOFT_BREAK_WORD: char = '\u{FDD1}';
 
 /// Whether textwrap took out whitespace before `piece`, a row it cut from
-/// `source`. A row it copied rather than borrowed (one it indented) counts
-/// as a break at whitespace.
-pub(crate) fn broke_at_space(source: &str, piece: &str) -> bool {
-    let offset = (piece.as_ptr() as usize).wrapping_sub(source.as_ptr() as usize);
-    source
-        .get(..offset)
-        .is_none_or(|before| before.ends_with(char::is_whitespace))
+/// `source`. `cursor` is where the previous row ended in `source`, so it
+/// must see every row in order, the first included. A row textwrap copied
+/// rather than borrowed is looked up from the cursor; one found nowhere
+/// (a row it indented) counts as a break at whitespace.
+pub(crate) fn broke_at_space(source: &str, piece: &str, cursor: &mut usize) -> bool {
+    let borrowed = (piece.as_ptr() as usize)
+        .checked_sub(source.as_ptr() as usize)
+        .filter(|&offset| {
+            offset >= *cursor
+                && offset + piece.len() <= source.len()
+                && source.is_char_boundary(offset)
+        });
+    let offset = borrowed.or_else(|| {
+        let at = source.get(*cursor..)?.find(piece)?;
+        Some(*cursor + at)
+    });
+    let Some(offset) = offset else {
+        return true;
+    };
+    *cursor = offset + piece.len();
+    source[..offset].ends_with(char::is_whitespace)
 }
 
-fn soft_break_mark(source: &str, piece: &str) -> char {
-    if broke_at_space(source, piece) {
+fn soft_break_mark(broke_at_space: bool) -> char {
+    if broke_at_space {
         SOFT_BREAK_SPACE
     } else {
         SOFT_BREAK_WORD
@@ -350,10 +364,14 @@ fn soft_break_mark(source: &str, piece: &str) -> char {
 fn wrap_styled_content(styled: &str, effective_width: usize, soft_breaks: bool) -> Vec<String> {
     let effective_width = effective_width.max(1);
     let pieces = textwrap::wrap(styled, effective_width);
+    let mut cursor = 0;
     let marks: Vec<Option<char>> = pieces
         .iter()
         .enumerate()
-        .map(|(i, piece)| (soft_breaks && i > 0).then(|| soft_break_mark(styled, piece)))
+        .map(|(i, piece)| {
+            let space = broke_at_space(styled, piece, &mut cursor);
+            (soft_breaks && i > 0).then(|| soft_break_mark(space))
+        })
         .collect();
     let wrapped = reflow_ansi_state(pieces.into_iter().map(|c| c.into_owned()).collect());
     wrapped
@@ -1190,11 +1208,13 @@ fn wrap(text: &str, width: usize, soft_breaks: bool) -> String {
         .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
         .initial_indent(&text[0..indent]);
     let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
     for (i, piece) in textwrap::wrap(body, wrap_options).iter().enumerate() {
+        let space = broke_at_space(body, piece, &mut cursor);
         if i > 0 {
             out.push('\n');
             if soft_breaks {
-                out.push(soft_break_mark(body, piece));
+                out.push(soft_break_mark(space));
             }
         }
         out.push_str(piece);
@@ -3234,5 +3254,27 @@ std::error::Error>> {
         assert_eq!(styles.strikethrough, rgb(0xff, 0x00, 0x00));
         assert_eq!(styles.hrule, rgb(0x88, 0x88, 0x88));
         assert_eq!(styles.table_border, rgb(0x77, 0x77, 0x77));
+    }
+
+    #[test]
+    fn broke_at_space_finds_an_owned_row_from_the_cursor() {
+        let source = "abc def abcdef";
+        let pieces: Vec<String> = ["abc", "def", "abc", "def"].map(String::from).into();
+        let mut cursor = 0;
+        let found: Vec<bool> = pieces
+            .iter()
+            .map(|piece| broke_at_space(source, piece, &mut cursor))
+            .collect();
+        assert_eq!(found, [false, true, true, false]);
+        assert_eq!(cursor, source.len());
+    }
+
+    #[test]
+    fn broke_at_space_reads_a_borrowed_row_by_its_offset() {
+        let source = "zzzz zzzz";
+        let mut cursor = 0;
+        assert!(!broke_at_space(source, &source[..2], &mut cursor));
+        assert!(!broke_at_space(source, &source[2..4], &mut cursor));
+        assert!(broke_at_space(source, &source[5..], &mut cursor));
     }
 }

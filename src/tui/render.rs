@@ -234,12 +234,14 @@ pub(crate) fn plain_lines(text: &str, width: u16, style: Style) -> Vec<Line<'sta
     let width = usize::from(width.max(1));
     let mut lines = Vec::new();
     for line in text.split('\n') {
+        let mut cursor = 0;
         for (i, piece) in textwrap::wrap(line, width).iter().enumerate() {
             let content = Span::styled(piece.to_string(), style);
+            let space = broke_at_space(line, piece, &mut cursor);
             lines.push(if i == 0 {
                 Line::from(content)
             } else {
-                Line::from(vec![wrap_mark(broke_at_space(line, piece)), content])
+                Line::from(vec![wrap_mark(space), content])
             });
         }
     }

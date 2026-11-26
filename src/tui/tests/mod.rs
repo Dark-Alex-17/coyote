@@ -6183,7 +6183,7 @@ fn the_idle_status_names_only_keys_the_help_lists() {
 /// or a band open above the composer takes it as typing.
 #[test]
 fn the_idle_status_drops_the_help_key_where_it_types() {
-    let status = |harness: &Harness| harness.app.status_text().map(|line| line.to_string());
+    let status = |harness: &Harness| harness.app.status_text(80).map(|line| line.to_string());
     let mut harness = Harness::standalone(80, 24);
     assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS_WITH_HELP));
     harness.type_text("draft");
@@ -6198,6 +6198,29 @@ fn the_idle_status_drops_the_help_key_where_it_types() {
     assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS));
     harness.press(KeyCode::Esc);
     assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS_WITH_HELP));
+}
+
+/// A frame too narrow for the whole idle hint drops whole entries from
+/// the right rather than cutting one.
+#[test]
+fn the_idle_status_never_ends_in_a_cut_hint() {
+    let harness = Harness::standalone(80, 24);
+    let entries: Vec<&str> = IDLE_STATUS_WITH_HELP.split("  ").collect();
+    for width in 30..=60u16 {
+        let row = harness
+            .app
+            .status_text(width)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert!(row.len() <= usize::from(width), "{width}: {row:?}");
+        let kept: Vec<&str> = row.split("  ").collect();
+        assert_eq!(kept, entries[..kept.len()], "{width}: {row:?}");
+        let next = entries.get(kept.len()).map_or(0, |entry| entry.len() + 2);
+        assert!(
+            next == 0 || row.len() + next > usize::from(width),
+            "{width}: {row:?} leaves room for the next hint"
+        );
+    }
 }
 
 /// A turn's first frame rewrites every cell of the working text over

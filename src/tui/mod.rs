@@ -172,15 +172,22 @@ const THREADS_COMMAND: &str = "threads";
 /// nothing else on screen points to.
 const IDLE_STATUS: &str = "Alt+T = tasks  Alt+S = threads  Ctrl+X = todo";
 /// The status row when `?` would open the key help. The key that lists
-/// the rest comes first, so a narrow frame clips the panel chords
+/// the rest comes first, so a narrow frame drops the panel chords
 /// before it.
 const IDLE_STATUS_WITH_HELP: &str = "? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo";
 
 /// The idle hint as key and label spans: each `key = label` entry's key
-/// in one style, the rest in the other.
-fn hint_spans(hint: &'static str, theme: &Theme) -> Vec<Span<'static>> {
+/// in one style, the rest in the other. Only the leading entries that fit
+/// in `width` columns whole are kept, so the row never ends in a cut hint.
+fn hint_spans(hint: &'static str, width: usize, theme: &Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
+    let mut used = 0;
     for (i, entry) in hint.split("  ").enumerate() {
+        let gap = if i > 0 { 2 } else { 0 };
+        used += gap + entry.len();
+        if used > width {
+            break;
+        }
         if i > 0 {
             spans.push(Span::styled("  ", theme.hint_label));
         }
@@ -491,6 +498,9 @@ pub(crate) struct App {
     /// What the throbber counts its frames from, fixed at start so the
     /// frame a given instant shows depends on the clock alone.
     throbber_origin: Instant,
+    /// The wall time at `throbber_origin`, so the wall times the pop-ups
+    /// count to move with the injected clock.
+    wall_origin: chrono::DateTime<chrono::Local>,
     /// When the welcome wordmark's startup sweep began; None before it is
     /// started and once it has settled or input stopped it.
     welcome_sweep_from: Option<Instant>,
@@ -624,6 +634,7 @@ impl App {
             question_area: None,
             origin_area: None,
             throbber_origin: clock.now(),
+            wall_origin: chrono::Local::now(),
             welcome_sweep_from: None,
             welcome_sweep_pending: false,
             frames: FrameScheduler::new(Arc::clone(&clock)),
@@ -665,6 +676,14 @@ impl App {
             origin: self.throbber_origin,
             now: self.clock.now(),
         }
+    }
+
+    fn wall(&self) -> chrono::DateTime<chrono::Local> {
+        self.wall_origin
+            + self
+                .clock
+                .now()
+                .saturating_duration_since(self.throbber_origin)
     }
 
     #[cfg(test)]
@@ -1283,11 +1302,10 @@ impl App {
                 Some(pos) => {
                     let clicks = self.selection.press(region, pos, at, self.clock.now());
                     if clicks > 1 {
-                        let rows = self.selection_rows(region, pos, pos);
                         let (start, end) = if clicks == 2 {
-                            selection::word_at(&rows, pos)
+                            selection::word_at(&self.selection_rows(region, pos, pos), pos)
                         } else {
-                            selection::line_at(&rows, pos)
+                            selection::line_at(&self.line_rows(region, pos), pos)
                         };
                         self.selection.widen(start, end);
                     }
@@ -1396,6 +1414,19 @@ impl App {
             Region::Pager => self
                 .pager()
                 .map(|pager| pager.selection_rows(start.row, end.row))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Rows enough for [`selection::line_at`] to find the whole line
+    /// `pos` is on: a transcript cell holds its own wrapped lines, a
+    /// pager row needs its neighbours.
+    fn line_rows(&mut self, region: Region, pos: Pos) -> Vec<selection::Row> {
+        match region {
+            Region::Transcript => self.selection_rows(region, pos, pos),
+            Region::Pager => self
+                .pager()
+                .map(|pager| pager.line_rows(pos.row))
                 .unwrap_or_default(),
         }
     }
@@ -2318,7 +2349,7 @@ impl App {
                     session_id,
                     parent_agent_id,
                     parent_session_id,
-                    chrono::Utc::now(),
+                    self.wall().with_timezone(&chrono::Utc),
                 );
                 self.child_rows_changed(&agent_id);
                 // Only the root turn's own children get a row here; a
@@ -2454,8 +2485,8 @@ impl App {
     /// style changed, so a shared style would let a turn's first frame
     /// skip the letters it has in common with the hint and leave a torn
     /// word in the output stream. Modifiers survive `NO_COLOR`, so this
-    /// holds there too.
-    fn status_text(&self) -> Option<Line<'static>> {
+    /// holds there too. The idle hint is fitted to `width` columns.
+    fn status_text(&self, width: u16) -> Option<Line<'static>> {
         if self.exiting {
             return Some(Line::from(Span::styled(
                 "Leaving...",
@@ -2473,7 +2504,11 @@ impl App {
             } else {
                 IDLE_STATUS
             };
-            return Some(Line::from(hint_spans(status, &self.theme)));
+            return Some(Line::from(hint_spans(
+                status,
+                usize::from(width),
+                &self.theme,
+            )));
         };
         let tick = self.tick();
         let elapsed = |since: Instant| elapsed_text(tick.elapsed(since));
@@ -2546,6 +2581,19 @@ impl App {
         let area = frame.area();
         self.frame_area = Some(area);
         self.renderer.tick = self.tick();
+        // Like the roster below, the threads are listed afresh while they
+        // are up, so statuses keep moving; the listing reads the child
+        // sessions from disk, so a busy frame rate does not set its pace.
+        let wall = self.wall();
+        let now = self.clock.now();
+        if let Some(Overlay::Threads(threads)) = &self.overlay
+            && threads.listing_due(now, STATUS_TICK)
+        {
+            let (tree, note) = self.noted_thread_tree();
+            if let Some(Overlay::Threads(threads)) = self.overlay.as_mut() {
+                threads.refresh(tree, note, now);
+            }
+        }
         // Found through the fields, not through `layer`, so the pager can
         // be borrowed beside the transcript and the renderer.
         if let Some(pager) = shown_pager(&mut self.overlay, &mut self.overlay_stack) {
@@ -2586,6 +2634,8 @@ impl App {
                         threads,
                         folds: &self.thread_folds,
                         theme: &self.theme,
+                        now: wall.with_timezone(&chrono::Utc),
+                        offset: *wall.offset(),
                     },
                     body,
                 );
@@ -2594,7 +2644,6 @@ impl App {
         }
         // The roster is read on every frame it is up: the tasks move on
         // whether or not the context is in hand.
-        let wall = chrono::Local::now();
         for overlay in on_screen(&mut self.overlay, &mut self.overlay_stack) {
             if let Overlay::Tasks(roster) = overlay {
                 roster.refresh(
@@ -2696,6 +2745,8 @@ impl App {
                             threads,
                             folds: &self.thread_folds,
                             theme: &self.theme,
+                            now: wall.with_timezone(&chrono::Utc),
+                            offset: *wall.offset(),
                         },
                         upper,
                     );
@@ -2712,7 +2763,7 @@ impl App {
                 .border_style(self.theme.rule),
             rule,
         );
-        frame.render_widget(StatusStrip(self.status_text()), status);
+        frame.render_widget(StatusStrip(self.status_text(status.width)), status);
 
         let modal_areas = match self.prompts.front() {
             Some(prompt) => {
