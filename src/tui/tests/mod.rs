@@ -3929,6 +3929,54 @@ fn leaving_a_saved_session_says_saved_in_place_of_the_save_line() {
     assert!(!pager.contains("Saved the session"), "{pager}");
 }
 
+/// `.save session <name>` on a temp session renames it: the earlier
+/// turns stay in the main view, the divider says what it was saved as in
+/// place of the save line, and the view is not cleared.
+#[test]
+fn saving_a_temp_session_under_a_name_keeps_the_view() {
+    let mut ctx = chat_ctx();
+    ctx.session = Some(session_named("temp"));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("before-s9v", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    harness.draw();
+    harness.app.begin_turn(".save session notes", true);
+    harness.app.end_turn(
+        true,
+        &TurnOutcome {
+            captured: "\u{2713} Saved the session to '/tmp/notes.yaml'.\n".to_string(),
+            ..TurnOutcome::default()
+        },
+    );
+    ctx.session.as_mut().unwrap().set_name("notes".to_string());
+    harness.app.sync_from_ctx(&mut ctx);
+    assert_eq!(dividers(&harness), ["session temp saved as notes"]);
+    assert_eq!(harness.app.transcript.view_floor(), 0);
+    let frame = harness.draw();
+    assert!(frame.contains("before-s9v"), "{frame}");
+    assert!(frame.contains("> .save session notes"), "{frame}");
+    assert!(frame.contains(" session temp saved as notes "), "{frame}");
+    assert!(!frame.contains("Saved the session"), "{frame}");
+}
+
+/// A real leave clears and repaints in the frame right after it: the old
+/// turn is gone and the divider shows, with no redraw asked for.
+#[test]
+fn leaving_a_session_repaints_in_the_next_frame() {
+    let mut ctx = chat_ctx();
+    ctx.session = Some(session_named("coyote-tui"));
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("before-r2p", false);
+    harness.app.end_turn(false, &TurnOutcome::default());
+    assert!(harness.draw().contains("before-r2p"));
+    leave_saved_session(&mut harness, &mut ctx);
+    let frame = harness.draw();
+    assert!(!frame.contains("before-r2p"), "{frame}");
+    assert!(frame.contains(" left session coyote-tui saved "), "{frame}");
+}
+
 /// An agent's session left saved: the rule keeps the agent alone and the
 /// fresh view holds only the divider.
 fn context_label_frame(width: u16, height: u16, no_color: bool) -> (Harness, String) {

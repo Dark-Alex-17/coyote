@@ -617,6 +617,44 @@ mod main_screen_popups_and_chrome {
         quit_declining_save(&mut pty);
     }
 
+    /// Saving a temp session under a name, with either prefix, keeps the
+    /// conversation on screen: the divider says what it was saved as and
+    /// the line sent before the save is still drawn, with no redraw.
+    #[test]
+    #[serial]
+    fn saving_a_temp_session_under_a_name_keeps_the_conversation_on_screen() {
+        for (prefix, sigil) in [("dot", "."), ("slash", "/")] {
+            let (mut pty, _guard, _dir) = boot_dry_run(
+                &format!("probe-save-{prefix}"),
+                &format!("command_prefix: {prefix}\n"),
+            );
+            let at = pty.raw().len();
+            pty.send(format!("{sigil}session\r").as_bytes()).unwrap();
+            wait_for_squeezed_after(&mut pty, "entered session temp", at, "the enter divider");
+            dry_run_exchange(&mut pty, "kept-line-s4v");
+            let at = pty.raw().len();
+            pty.send(format!("{sigil}save session saved-s4v\r").as_bytes())
+                .unwrap();
+            wait_for_squeezed_after(
+                &mut pty,
+                "session temp saved as saved-s4v",
+                at,
+                "the rename divider",
+            );
+            let after = frame_where(&mut pty, |f| f.contains("sessiontempsavedassaved-s4v"));
+            let flat = squeezed(&after);
+            assert!(
+                flat.contains("kept-line-s4v"),
+                "{prefix}: saving the session cleared the view:\n{after}"
+            );
+            assert!(
+                !flat.contains("leftsession"),
+                "{prefix}: the save reads as a leave:\n{after}"
+            );
+            quit_declining_save(&mut pty);
+        }
+    }
+
     /// `.role probe-role` puts the role in the context label as the REPL
     /// prompt shows it with no session (`probe-role`), and an `entered
     /// role` divider; `.exit role` draws `left role` and drops the label.

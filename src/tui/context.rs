@@ -1,4 +1,4 @@
-use crate::config::RequestContext;
+use crate::config::{RequestContext, SessionInstance};
 use unicode_width::UnicodeWidthStr;
 
 /// The line a session prints when it is written to disk on the way out.
@@ -11,6 +11,9 @@ pub(super) struct CtxSnapshot {
     pub(super) agent: Option<String>,
     pub(super) role: Option<String>,
     pub(super) session: Option<String>,
+    /// The live session the name belongs to, so a save under a new name
+    /// reads as a rename rather than a leave.
+    pub(super) session_instance: Option<SessionInstance>,
     pub(super) rag: Option<String>,
 }
 
@@ -23,6 +26,7 @@ impl CtxSnapshot {
                 .session
                 .as_ref()
                 .map(|session| session.name().to_string()),
+            session_instance: ctx.session.as_ref().map(|session| session.instance()),
             rag: ctx.rag.as_ref().map(|rag| rag.name().to_string()),
         }
     }
@@ -36,23 +40,39 @@ impl CtxSnapshot {
         ]
     }
 
-    /// Whether anything active here is not in `new`.
+    /// Whether the session here goes on in `new` under another name, as
+    /// `.save session <name>` leaves it.
+    pub(super) fn renames_session_in(&self, new: &CtxSnapshot) -> bool {
+        self.session.is_some()
+            && new.session.is_some()
+            && self.session != new.session
+            && self.session_instance.is_some()
+            && self.session_instance == new.session_instance
+    }
+
+    /// Whether anything active here is not in `new`; a renamed session
+    /// is still active.
     pub(super) fn leaves_for(&self, new: &CtxSnapshot) -> bool {
+        let renamed = self.renames_session_in(new);
         self.named()
             .into_iter()
             .zip(new.named())
-            .any(|((_, was), (_, now))| was.is_some() && was != now)
+            .any(|((kind, was), (_, now))| {
+                was.is_some() && was != now && !(renamed && kind == "session")
+            })
     }
 }
 
 /// What a divider between `old` and `new` says: everything left, then
 /// everything entered, each as `<kind> <name>` joined by ` . `. A left
-/// session reads `saved` when `saved` is set. None when nothing changed.
+/// session reads `saved` when `saved` is set; a renamed one reads
+/// `session <old> saved as <new>`. None when nothing changed.
 pub(super) fn divider_text(old: &CtxSnapshot, new: &CtxSnapshot, saved: bool) -> Option<String> {
     let mut left = Vec::new();
     let mut entered = Vec::new();
+    let renamed = old.renames_session_in(new);
     for ((kind, was), (_, now)) in old.named().into_iter().zip(new.named()) {
-        if was == now {
+        if was == now || (renamed && kind == "session") {
             continue;
         }
         if let Some(name) = was {
@@ -67,11 +87,14 @@ pub(super) fn divider_text(old: &CtxSnapshot, new: &CtxSnapshot, saved: bool) ->
             entered.push(format!("{kind} {name}"));
         }
     }
-    let groups: Vec<String> = [("left", left), ("entered", entered)]
+    let mut groups: Vec<String> = [("left", left), ("entered", entered)]
         .into_iter()
         .filter(|(_, items)| !items.is_empty())
         .map(|(verb, items)| format!("{verb} {}", items.join(" . ")))
         .collect();
+    if let (true, Some(was), Some(now)) = (renamed, &old.session, &new.session) {
+        groups.push(format!("session {was} saved as {now}"));
+    }
     (!groups.is_empty()).then(|| groups.join(" . "))
 }
 
@@ -125,6 +148,7 @@ mod tests {
             agent: agent.map(str::to_string),
             role: role.map(str::to_string),
             session: session.map(str::to_string),
+            session_instance: None,
             rag: None,
         }
     }
@@ -172,6 +196,33 @@ mod tests {
         assert_eq!(
             divider_text(&old, &new, false).as_deref(),
             Some("left role coder . session one . entered role reviewer . session two . rag docs")
+        );
+    }
+
+    /// The same live session under a new name is a rename: no leave, and
+    /// the divider says what it was saved as; another session under the
+    /// new name is a leave as before.
+    #[test]
+    fn a_session_saved_under_a_new_name_is_renamed_not_left() {
+        let instance = SessionInstance::default();
+        let named = |name: &str, instance| CtxSnapshot {
+            session_instance: Some(instance),
+            ..snapshot(Some("architect"), None, Some(name))
+        };
+        let old = named("temp", instance);
+        let renamed = named("notes", instance);
+        assert!(old.renames_session_in(&renamed));
+        assert!(!old.leaves_for(&renamed));
+        assert_eq!(
+            divider_text(&old, &renamed, true).as_deref(),
+            Some("session temp saved as notes")
+        );
+        let other = named("notes", SessionInstance::default());
+        assert!(!old.renames_session_in(&other));
+        assert!(old.leaves_for(&other));
+        assert_eq!(
+            divider_text(&old, &other, false).as_deref(),
+            Some("left session temp . entered session notes")
         );
     }
 

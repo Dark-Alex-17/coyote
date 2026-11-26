@@ -354,8 +354,22 @@ pub(crate) struct ExitedSession {
     pub(crate) agent: Option<String>,
 }
 
+/// Which live session this is, never saved: a rename or a save under a
+/// new name keeps it, while a session loaded or made afresh gets its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionInstance(u64);
+
+impl Default for SessionInstance {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
+    #[serde(skip)]
+    instance: SessionInstance,
     #[serde(rename(serialize = "model", deserialize = "model"))]
     model_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -641,6 +655,10 @@ impl Session {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn instance(&self) -> SessionInstance {
+        self.instance
     }
 
     /// The file `flush` writes: where the session was loaded from, last
