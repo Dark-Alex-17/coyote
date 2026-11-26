@@ -90,8 +90,13 @@ pub(crate) enum RouteFacts {
 /// When a path rnsd holds was last heard: the later of rnsd's own learn time and this
 /// node's copy's, so a path heard again after its interface came back is fresh even when
 /// rnsd keeps the time it first learned the row.
-pub(crate) fn last_heard(rnsd: SystemTime, own: Option<SystemTime>) -> SystemTime {
-    own.map_or(rnsd, |own| own.max(rnsd))
+pub(crate) fn last_heard(
+    rnsd: SystemTime,
+    own: Option<SystemTime>,
+    own_via_rnsd: bool,
+) -> SystemTime {
+    own.filter(|_| own_via_rnsd)
+        .map_or(rnsd, |own| own.max(rnsd))
 }
 
 /// Why a path is suspect.
@@ -361,6 +366,10 @@ pub(crate) struct Routes<'a> {
     pub rnsd: Option<&'a RnsdLanReader>,
     pub transitions: &'a InterfaceTransitions,
     pub book: &'a RouteBook,
+    /// Every interface of this node reaches the destination through rnsd, so this node's
+    /// own copy of a path is rnsd's path heard again; with an interface of its own beside
+    /// rnsd, the copy may rest on that other route and says nothing of rnsd's row.
+    pub own_via_rnsd: bool,
 }
 
 /// rnsd's row for one destination, if it could be read.
@@ -417,13 +426,14 @@ impl Routes<'_> {
                     });
                     // This node's own copy arrives with the announce rnsd passes on, which
                     // rnsd may keep under the time it first learned the row; the later of
-                    // the two is when the path was last heard.
+                    // the two is when the path was last heard, when rnsd is this node's
+                    // only way in.
                     let own = self
                         .transport
                         .path_interface(destination)
                         .await
                         .map(|path| path.learned_at);
-                    let learned_at = last_heard(learned_at(row.timestamp), own);
+                    let learned_at = last_heard(learned_at(row.timestamp), own, self.own_via_rnsd);
                     // A row whose timestamp is zero was dropped and not culled yet.
                     let changed_since = row.timestamp <= 0.0
                         || self.transitions.changed_since(&row.interface, learned_at);
@@ -1080,6 +1090,7 @@ mod rnsd_tests {
             rnsd: Some(&reader),
             transitions: &transitions,
             book: &book,
+            own_via_rnsd: true,
         };
 
         let facts = routes.facts(&destination()).await;
@@ -1136,6 +1147,7 @@ mod rnsd_tests {
             rnsd: Some(&reader),
             transitions: &transitions,
             book: &book,
+            own_via_rnsd: true,
         };
         assert_eq!(
             routes.facts(&destination()).await.suspicion(),
@@ -1198,6 +1210,7 @@ mod rnsd_tests {
                 rnsd: Some(&reader),
                 transitions: &transitions,
                 book: &book,
+                own_via_rnsd: true,
             };
             let arrival = AddressHash::new_from_hex_string(&"cd".repeat(16)).unwrap();
             assert_eq!(
@@ -1274,6 +1287,7 @@ mod rnsd_tests {
             rnsd: Some(&reader),
             transitions: &transitions,
             book: &book,
+            own_via_rnsd: true,
         };
         let tries = Mutex::new(Vec::new());
         let answers = Mutex::new(VecDeque::from([first, second]));
@@ -1502,6 +1516,7 @@ mod rnsd_tests {
             rnsd: Some(&reader),
             transitions: &transitions,
             book: &book,
+            own_via_rnsd: true,
         };
         let drops = || {
             rnsd.asked()
@@ -1686,29 +1701,38 @@ mod tests {
         transitions.record(hub, TransitionKind::Up, now - Duration::from_secs(60));
         let rnsd_learned = now - Duration::from_secs(3600);
 
-        let heard = last_heard(rnsd_learned, Some(now));
+        let heard = last_heard(rnsd_learned, Some(now), true);
         assert_eq!(heard, now);
         assert!(
             !transitions.changed_since(hub, heard),
             "heard after the return"
         );
 
-        assert_eq!(last_heard(rnsd_learned, None), rnsd_learned);
+        assert_eq!(last_heard(rnsd_learned, None, true), rnsd_learned);
         assert!(
-            transitions.changed_since(hub, last_heard(rnsd_learned, None)),
+            transitions.changed_since(hub, last_heard(rnsd_learned, None, true)),
             "only heard before the return"
         );
         assert!(
             transitions.changed_since(
                 hub,
-                last_heard(rnsd_learned, Some(now - Duration::from_secs(120)))
+                last_heard(rnsd_learned, Some(now - Duration::from_secs(120)), true)
             ),
             "this node's copy too is from before the return"
         );
         assert_eq!(
-            last_heard(now, Some(rnsd_learned)),
+            last_heard(now, Some(rnsd_learned), true),
             now,
             "rnsd's later time wins over an older copy"
+        );
+        assert!(
+            transitions.changed_since(hub, last_heard(rnsd_learned, Some(now), false)),
+            "a copy over an interface of this node's own beside rnsd vouches for nothing"
+        );
+        let at_the_return = now - Duration::from_secs(60);
+        assert!(
+            transitions.changed_since(hub, at_the_return),
+            "a path last heard at the very moment of the return is from before it"
         );
     }
 

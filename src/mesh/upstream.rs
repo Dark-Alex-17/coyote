@@ -21,7 +21,9 @@ use tokio::time::{Interval, MissedTickBehavior, interval_at};
 pub(crate) const UPSTREAM_POLL: Duration = Duration::from_secs(10);
 
 /// The quiet a transition needs before it is greeted: a reconnect or address change seen
-/// within this of the last one belongs to the same transition.
+/// within this of the last one belongs to the same transition. Return home reads it too
+/// (`begin_return_home_transition`): a sighting within this of a transition's start asks
+/// nothing it already asked.
 pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 30;
 
 /// `GREETING_DEBOUNCE_SECS` as a duration.
@@ -491,13 +493,14 @@ impl InterfaceTransitions {
         self.recent.lock().iter().cloned().collect()
     }
 
-    /// Whether a path learned over the rnsd interface `interface` at `since` has seen
-    /// the network change under it: that interface came back online after `since`, or
-    /// the host's addresses changed after it, which moves every path. A transition the
-    /// record has dropped as too old is not seen.
+    /// Whether a path last heard over the rnsd interface `interface` at `since` has seen
+    /// the network change under it: that interface came back online at or after `since`,
+    /// or the host's addresses changed then, which moves every path. A path heard after
+    /// the interface's last such transition is fresh. A transition the record has dropped
+    /// as too old is not seen.
     pub(crate) fn changed_since(&self, interface: &str, since: SystemTime) -> bool {
         self.recent.lock().iter().any(|transition| {
-            transition.at > since
+            transition.at >= since
                 && match transition.kind {
                     TransitionKind::Up => transition.interface == interface,
                     TransitionKind::AddressesChanged => true,
@@ -938,6 +941,38 @@ mod tests {
         assert_eq!(settled[0].0, 45);
         assert_eq!(settled[0].1.network_changed, ["en0"]);
         assert_eq!(settled[0].1.reconnected, [RELAY, HUB]);
+    }
+
+    /// Two upstream events 15 s apart with only quiet reads between them are one
+    /// transition, which a 10 s debounce would have split in two.
+    #[test]
+    fn two_upstream_events_15_s_apart_are_one_transition() {
+        let start = tokio::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut settle = TransitionSettle::default();
+        let mut settled = Vec::new();
+        for secs in (0..=60).step_by(5) {
+            let change = match secs {
+                0 => UpstreamChange {
+                    reconnected: Vec::new(),
+                    network_changed: vec!["en0".to_string()],
+                },
+                15 => reconnect(HUB),
+                _ => UpstreamChange::default(),
+            };
+            if let Some((_, change)) = settle.observe(&change, at(secs)).settled {
+                settled.push((secs, change));
+            }
+        }
+        assert_eq!(settled.len(), 1, "{settled:?}");
+        assert_eq!(settled[0].0, 45);
+        assert_eq!(
+            (
+                settled[0].1.network_changed.clone(),
+                settled[0].1.reconnected.clone()
+            ),
+            (vec!["en0".to_string()], vec![HUB.to_string()])
+        );
     }
 
     /// An upstream that keeps flapping, a change every read, is settled `SETTLE_CAP`

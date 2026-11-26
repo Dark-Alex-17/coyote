@@ -12,9 +12,11 @@ pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 /// This node's own floor between repeated announces of one destination: heartbeats are
 /// `HEARTBEAT_PERIOD_SECS` apart, and a manual announce is never sent sooner than this after the
 /// previous one. A newly registered destination, at start or after a re-key, announces at
-/// once. Two greetings are not held to the floor and never move its reference or the
-/// heartbeat clock: a pending interface's first connect announces once, and a TCP client
-/// that reconnects announces once per reconnect, up to `RECONNECT_GREETINGS_PER_HOUR`. A
+/// once. Three greetings are not held to the floor and never move its reference or the
+/// heartbeat clock: a pending interface's first connect announces once, a TCP client
+/// that reconnects announces once per reconnect, up to `RECONNECT_GREETINGS_PER_HOUR`, and
+/// a move of this host's network announces once per settled transition, up to
+/// `MOVE_GREETINGS_PER_HOUR`. A
 /// relay drops every path it held for the socket that closed and answers path requests only
 /// from its own table, so a node that reconnected without announcing would be unreachable,
 /// path requests included, until its next heartbeat. The transport sends on every interface,
@@ -31,6 +33,13 @@ pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 /// that reconnect together, as after a network blip on this host, send N greetings, so
 /// every relay hears up to N announces for each such blip.
 pub(crate) const RECONNECT_GREETINGS_PER_HOUR: usize = 4;
+/// How many moves of this host's network within an hour are greeted with an announce, on
+/// a budget of their own: a roam drops and remakes the relay links too, and a hub that
+/// drops a cellular client every few minutes would otherwise spend the reconnect budget
+/// the move needs. A move is one settled transition, so one roam takes one greeting; a
+/// host whose addresses keep flapping stops greeting after this many, since a relay
+/// stops forwarding a destination for an hour once it passes its announce grace.
+pub(crate) const MOVE_GREETINGS_PER_HOUR: usize = 8;
 /// How often a running node re-announces so peers can tell it is still there.
 /// An hour matches the Reticulum announce-rate default: a transport node rate-limits
 /// announces per destination (RNS 1.5.2 Interfaces/Interface.py:90-92, DEFAULT_AR_TARGET

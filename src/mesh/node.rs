@@ -7,8 +7,8 @@ use crate::config::mesh_envoy::{ENVOY_QUEUE_MAX, LEFT_BEFORE_ENVOY_RAN};
 use crate::config::{ForkRekey, LivePrefix, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
-    AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
-    RECONNECT_GREETINGS_PER_HOUR, announce_app_data,
+    AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, MOVE_GREETINGS_PER_HOUR,
+    REANNOUNCE_FLOOR_SECS, RECONNECT_GREETINGS_PER_HOUR, announce_app_data,
 };
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
@@ -86,8 +86,8 @@ use crate::mesh::trust::{
     row_derives,
 };
 use crate::mesh::upstream::{
-    GREETING_DEBOUNCE, InterfaceTransitions, LanPresence, MoveGreeting, TransitionSettle,
-    UpstreamChange, UpstreamPoll, host_addresses,
+    GREETING_DEBOUNCE, InterfaceTransitions, LanPresence, MoveGreeting, SETTLE_CAP,
+    TransitionSettle, UpstreamChange, UpstreamPoll, host_addresses,
 };
 use crate::mesh::{
     PATH_REQUEST_TIMEOUT, age_text, canonical_hash, display_text, hex_lower, identity,
@@ -848,6 +848,9 @@ pub(crate) struct MeshRuntime {
     /// The node attaches to rnsd's shared instance, so its reader counts before any read
     /// reached rnsd; one built for a `private` interface counts only once one has.
     rnsd_attached: bool,
+    /// Every configured interface reaches the destination through the local rnsd, so this
+    /// node's own path copy is rnsd's path heard again (`Routes::own_via_rnsd`).
+    own_paths_via_rnsd: bool,
     /// The rnsd TCP interfaces that went offline or came back and the host interfaces
     /// whose addresses changed, with when, as the interface watcher saw them.
     interface_transitions: InterfaceTransitions,
@@ -1144,7 +1147,8 @@ impl MeshRuntime {
         let attached = joined
             .iter()
             .any(|iface| matches!(iface, JoinedInterface::Local { .. }));
-        let rnsd_lan = reads_local_rnsd(attached, config.interfaces(), &own_addresses())
+        let addresses = own_addresses();
+        let rnsd_lan = reads_local_rnsd(attached, config.interfaces(), &addresses)
             .then(|| RnsdLanReader::new(options.rnsd.clone(), &local_instance(config)));
         let runtime = Arc::new(Self {
             fingerprint,
@@ -1175,6 +1179,11 @@ impl MeshRuntime {
             interfaces: Mutex::new(joined),
             rnsd_lan,
             rnsd_attached: attached,
+            own_paths_via_rnsd: config.interfaces().iter().all(|interface| match interface {
+                MeshInterface::Local { .. } => true,
+                MeshInterface::Private { host, .. } => targets_this_host(host, &addresses),
+                MeshInterface::Lan | MeshInterface::Public { .. } => false,
+            }),
             interface_transitions: InterfaceTransitions::default(),
             route_book: RouteBook::default(),
             return_home_asked: parking_lot::Mutex::new(HashSet::new()),
@@ -1864,6 +1873,7 @@ impl MeshRuntime {
             rnsd: self.rnsd_known(),
             transitions: &self.interface_transitions,
             book: &self.route_book,
+            own_via_rnsd: self.own_paths_via_rnsd,
         }
     }
 
@@ -4475,22 +4485,41 @@ struct TcpWatch {
     greetings: GreetingBudget,
 }
 
-/// The reconnect greetings one TCP client has sent within the last hour, so a client that
-/// flaps stops greeting after `RECONNECT_GREETINGS_PER_HOUR` of them. Only reconnects take
-/// from it: a pending interface's first connect is greeted outside it. Holds at most that
-/// many instants, read against the `now` each call is given.
-#[derive(Debug, Default)]
+/// The greetings of one kind sent within the last hour: a TCP client's or rnsd's upstream
+/// reconnects, up to `RECONNECT_GREETINGS_PER_HOUR` (the default), or this host's moves,
+/// up to `MOVE_GREETINGS_PER_HOUR` (`GreetingBudget::moves`). A pending interface's first
+/// connect is greeted outside both. Holds at most `cap` instants, read against the `now`
+/// each call is given.
+#[derive(Debug)]
 struct GreetingBudget {
     greeted_at: VecDeque<Instant>,
+    cap: usize,
+}
+
+impl Default for GreetingBudget {
+    fn default() -> Self {
+        Self {
+            greeted_at: VecDeque::new(),
+            cap: RECONNECT_GREETINGS_PER_HOUR,
+        }
+    }
 }
 
 impl GreetingBudget {
+    /// The budget for moves of this host's network.
+    fn moves() -> Self {
+        Self {
+            greeted_at: VecDeque::new(),
+            cap: MOVE_GREETINGS_PER_HOUR,
+        }
+    }
+
     /// The window the budget counts greetings over.
     const WINDOW: Duration = Duration::from_secs(3600);
 
     /// Takes one greeting at `now` and returns `true`, or returns `false` and takes
-    /// nothing when the hour before `now` already holds `RECONNECT_GREETINGS_PER_HOUR`
-    /// greetings. A greeting stops counting a full hour after it was taken.
+    /// nothing when the hour before `now` already holds `cap` greetings. A greeting stops
+    /// counting a full hour after it was taken.
     fn take(&mut self, now: Instant) -> bool {
         while self
             .greeted_at
@@ -4499,7 +4528,7 @@ impl GreetingBudget {
         {
             self.greeted_at.pop_front();
         }
-        if self.greeted_at.len() >= RECONNECT_GREETINGS_PER_HOUR {
+        if self.greeted_at.len() >= self.cap {
             return false;
         }
         self.greeted_at.push_back(now);
@@ -4740,6 +4769,11 @@ async fn watch_interfaces(
     };
     let mut upstream = UpstreamPoll::new(host_addresses());
     let mut upstream_greetings = GreetingBudget::default();
+    let mut move_greetings = GreetingBudget::moves();
+    // When the latest reading saw this host's addresses change: a TCP client that
+    // reconnects within `SETTLE_CAP` of it is reconnecting because of the move, and its
+    // greeting is the move's.
+    let mut last_move_at: Option<tokio::time::Instant> = None;
     // A node with relays that greet by themselves holds a network change back a poll,
     // so one move greets once (`MoveGreeting`).
     let defers_moves = !watches.is_empty()
@@ -4768,6 +4802,9 @@ async fn watch_interfaces(
                 };
                 // The paths over what changed are marked, and return home asks, at each
                 // sighting, whether or not the greeting waits for the transition to settle.
+                if !change.network_changed.is_empty() {
+                    last_move_at = Some(tokio::time::Instant::now());
+                }
                 let step = settle.observe(&change, tokio::time::Instant::now());
                 if !change.is_empty() {
                     runtime.after_upstream_change(&change, step.opens);
@@ -4790,7 +4827,7 @@ async fn watch_interfaces(
                 }
                 tokio::select! {
                     () = cancel.cancelled() => return,
-                    () = greet_upstream_change(&runtime, &slot, &mut upstream_greetings, &change) => {}
+                    () = greet_upstream_change(&runtime, &slot, &mut upstream_greetings, &mut move_greetings, &change) => {}
                 }
                 continue;
             }
@@ -4879,9 +4916,14 @@ async fn watch_interfaces(
                     }
                 }
                 Transition::Reconnect => {
+                    let budget = if part_of_move(last_move_at, tokio::time::Instant::now()) {
+                        &mut move_greetings
+                    } else {
+                        greetings
+                    };
                     let greeting = tokio::select! {
                         () = cancel.cancelled() => return,
-                        greeting = greet(&runtime, greetings, Instant::now()) => greeting,
+                        greeting = greet(&runtime, budget, Instant::now()) => greeting,
                     };
                     if matches!(greeting, ReconnectGreeting::Announced) {
                         client_greeted_at = Some(tokio::time::Instant::now());
@@ -4906,6 +4948,12 @@ async fn watch_interfaces(
     }
 }
 
+/// Whether a TCP client's reconnect at `now` is part of a move this host made at
+/// `last_move`: within `SETTLE_CAP` of it, the time one roam takes to settle.
+fn part_of_move(last_move: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    last_move.is_some_and(|at| now.saturating_duration_since(at) <= SETTLE_CAP)
+}
+
 /// Greets after a transition that leaves this session unreachable until it announces:
 /// one announce through `announce_on_connect`, skipping the floor and leaving its
 /// reference and the heartbeat clock alone, while `budget` has a greeting left this hour.
@@ -4927,33 +4975,24 @@ async fn greet(
     }
 }
 
-/// `greet` outside any budget, for a move of this host's network.
-async fn greet_uncapped(runtime: &MeshRuntime) -> ReconnectGreeting {
-    if !runtime.announce {
-        return ReconnectGreeting::NodeDoesNotAnnounce;
-    }
-    match runtime.announce_on_connect().await {
-        Ok(()) => ReconnectGreeting::Announced,
-        Err(err) => ReconnectGreeting::Failed(err),
-    }
-}
-
 /// Greets once for one settled transition's `change`, however many interfaces it holds,
 /// and tells the user on one idle line; a node that does not announce sends and tells
-/// nothing. Only an upstream reconnect takes from `budget`: a change of this host's
-/// addresses is a move, after which nobody reaches this session until it announces, and
-/// the debounce already bounds it to one greeting per `GREETING_DEBOUNCE`.
+/// nothing. An upstream reconnect takes from `reconnects`; a change of this host's
+/// addresses is a move and takes from `moves` instead, so relay flaps never use up the
+/// greeting a roam needs.
 async fn greet_upstream_change(
     runtime: &MeshRuntime,
     slot: &MeshSlot,
-    budget: &mut GreetingBudget,
+    reconnects: &mut GreetingBudget,
+    moves: &mut GreetingBudget,
     change: &UpstreamChange,
 ) {
-    let greeting = if change.network_changed.is_empty() {
-        greet(runtime, budget, Instant::now()).await
+    let budget = if change.network_changed.is_empty() {
+        reconnects
     } else {
-        greet_uncapped(runtime).await
+        moves
     };
+    let greeting = greet(runtime, budget, Instant::now()).await;
     let Some(line) = upstream_line(change, &greeting) else {
         debug!("Mesh saw {change:?}; this session does not announce, so nothing was sent");
         return;
@@ -4976,17 +5015,23 @@ async fn greet_upstream_change(
 /// network, worded as `reconnect_line` is; a network change names itself when both came
 /// in one poll. `None` for a node that does not announce: nothing changed for its user.
 fn upstream_line(change: &UpstreamChange, greeting: &ReconnectGreeting) -> Option<String> {
-    let subject = if change.network_changed.is_empty() {
-        format!("{} reconnected upstream", change.reconnected.join(" and "))
+    let (subject, cap) = if change.network_changed.is_empty() {
+        (
+            format!("{} reconnected upstream", change.reconnected.join(" and ")),
+            RECONNECT_GREETINGS_PER_HOUR,
+        )
     } else {
-        "This host's network changed".to_string()
+        (
+            "This host's network changed".to_string(),
+            MOVE_GREETINGS_PER_HOUR,
+        )
     };
     Some(match greeting {
         ReconnectGreeting::Announced => {
             format!("{subject}; announced so other sessions can find this one again")
         }
         ReconnectGreeting::PastCap => format!(
-            "{subject}; this session already sent its {RECONNECT_GREETINGS_PER_HOUR} greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+            "{subject}; this session already sent its {cap} greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
         ),
         ReconnectGreeting::Failed(_) => format!(
             "{subject}, but announcing failed; the next heartbeat will announce this session (details in the log)."
@@ -5840,7 +5885,7 @@ pub(crate) struct MeshSlot {
     last_progress_capture: parking_lot::Mutex<Option<tokio::time::Instant>>,
     pending_progress: parking_lot::Mutex<Option<MeshSnapshot>>,
     trailing_armed: AtomicBool,
-    /// A farewell for this session's own destination was ignored and logged once.
+    /// A farewell for this session's own destination was ignored and logged, once per slot.
     own_farewell_told: AtomicBool,
     digest_hook: ArcSwapOption<Arc<dyn MeshDigestHook>>,
     #[cfg(test)]
@@ -8242,7 +8287,10 @@ impl PeerSurface for MeshSlot {
             return;
         };
         let dest8 = short(&farewell.source_destination).to_string();
-        if farewell.source_destination == runtime.current_destination_hash() {
+        if farewell
+            .source_destination
+            .eq_ignore_ascii_case(&runtime.current_destination_hash())
+        {
             if !self.own_farewell_told.swap(true, Ordering::AcqRel) {
                 debug!(
                     "Mesh farewell {} for this session's own destination {dest8} ignored: this session is running",
@@ -16486,6 +16534,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_session_never_reads_its_own_farewell() {
+        install_log_collector();
         let relay = TransportRelay::start().await;
         let mut started =
             crate::mesh::test_support::started_runtime_on("node-own-farewell", relay.port).await;
@@ -16524,6 +16573,7 @@ mod tests {
 
         let slot = Arc::new(MeshSlot::default());
         slot.install(again.clone()).unwrap();
+        let first_told = debug_snapshot().len();
         slot.note_farewell(Farewell {
             message_id: "bye".to_string(),
             source_identity: again.fingerprint().to_string(),
@@ -16537,6 +16587,31 @@ mod tests {
             None,
             "a farewell for this session while it runs is ignored"
         );
+        assert_eq!(
+            debug_snapshot()[first_told..]
+                .iter()
+                .filter(|line| line.contains("for this session's own destination"))
+                .count(),
+            1,
+            "the first is logged"
+        );
+        let before = debug_snapshot().len();
+        for id in ["bye-again", "bye-a-third-time"] {
+            slot.note_farewell(Farewell {
+                message_id: id.to_string(),
+                source_identity: again.fingerprint().to_string(),
+                source_destination: own.clone(),
+                via: PeerVia::Direct,
+                received_at: SystemTime::now(),
+                sent_at: SystemTime::now(),
+            });
+        }
+        assert_eq!(again.peers().get(&own).unwrap().left_at, None);
+        let told = debug_snapshot()[before..]
+            .iter()
+            .filter(|line| line.contains("for this session's own destination"))
+            .count();
+        assert_eq!(told, 0, "logged once, at the first: {told}");
         assert!(slot.stop().await.unwrap());
         relay.stop().await;
     }
@@ -20473,7 +20548,7 @@ mod tests {
             );
             assert_eq!(
                 upstream_line(&moved(), &ReconnectGreeting::PastCap).unwrap(),
-                "This host's network changed; this session already sent its 4 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+                "This host's network changed; this session already sent its 8 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
             );
             let failed = upstream_line(
                 &reconnected(),
@@ -20565,7 +20640,14 @@ mod tests {
                     network_changed: vec!["en0".to_string(), "utun3".to_string()],
                 };
 
-                greet_upstream_change(&runtime, &slot, &mut budget, &change).await;
+                greet_upstream_change(
+                    &runtime,
+                    &slot,
+                    &mut budget,
+                    &mut GreetingBudget::moves(),
+                    &change,
+                )
+                .await;
 
                 let line = "This host's network changed; announced so other sessions can find this one again";
                 if announce {
@@ -20587,56 +20669,95 @@ mod tests {
             }
         }
 
-        /// Five roams in an hour, each after four reconnect greetings used the budget up:
-        /// every move of the host's addresses still announces and says so, and is not
-        /// taken from the budget; a reconnect alone past the cap still waits for the
-        /// heartbeat.
+        /// Moves and reconnects draw on budgets of their own. A move leaves the reconnect
+        /// budget whole: after one, four reconnects still announce. With the reconnect
+        /// budget spent, five roams in an hour each announce and say so, with no `already
+        /// sent` line; moves stop only past `MOVE_GREETINGS_PER_HOUR`, which the line names.
         #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn an_address_change_greets_past_the_reconnect_cap() {
+        async fn a_move_greets_on_its_own_budget_past_the_reconnect_cap() {
             install_log_collector();
-            let started = started_runtime("node-upstream-move-uncapped").await;
+            let started = started_runtime("node-upstream-move-budget").await;
             let runtime = started.runtime.clone();
             let slot = Arc::new(MeshSlot::default());
             let notifier = Arc::new(RecordingSink::default());
             slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
             slot.install(runtime.clone()).unwrap();
             let hash8 = short(&runtime.current_destination_hash()).to_string();
-            let mut budget = GreetingBudget::default();
+            let mut reconnects = GreetingBudget::default();
+            let mut moves = GreetingBudget::moves();
+
+            let before = debug_snapshot().len();
+            greet_upstream_change(&runtime, &slot, &mut reconnects, &mut moves, &moved()).await;
             for _ in 0..RECONNECT_GREETINGS_PER_HOUR {
-                greet_upstream_change(&runtime, &slot, &mut budget, &reconnected()).await;
+                greet_upstream_change(&runtime, &slot, &mut reconnects, &mut moves, &reconnected())
+                    .await;
             }
+            assert_eq!(
+                announces_since(before, &hash8),
+                1 + RECONNECT_GREETINGS_PER_HOUR,
+                "the move took nothing from the reconnect budget"
+            );
+
             let before = debug_snapshot().len();
             for _ in 0..5 {
-                greet_upstream_change(&runtime, &slot, &mut budget, &moved()).await;
+                greet_upstream_change(&runtime, &slot, &mut reconnects, &mut moves, &moved()).await;
             }
-            assert_eq!(announces_since(before, &hash8), 5, "every move announced");
-            greet_upstream_change(&runtime, &slot, &mut budget, &reconnected()).await;
+            assert_eq!(announces_since(before, &hash8), 5, "every roam announced");
+            greet_upstream_change(&runtime, &slot, &mut reconnects, &mut moves, &reconnected())
+                .await;
+            for _ in 7..=MOVE_GREETINGS_PER_HOUR {
+                greet_upstream_change(&runtime, &slot, &mut reconnects, &mut moves, &moved()).await;
+            }
+            let past = debug_snapshot().len();
+            greet_upstream_change(&runtime, &slot, &mut reconnects, &mut moves, &moved()).await;
+            assert_eq!(announces_since(past, &hash8), 0, "past the move budget");
+
             let moved_line =
                 "This host's network changed; announced so other sessions can find this one again";
-            wait_until("the five move lines", || {
+            wait_until("every move line", || {
                 mesh_lines(&notifier)
                     .iter()
                     .filter(|text| text.ends_with(moved_line))
                     .count()
-                    == 5
+                    == MOVE_GREETINGS_PER_HOUR
             })
             .await;
-            wait_until("the reconnect past the cap", || {
-                mesh_lines(&notifier).iter().any(|text| {
+            wait_until("the two lines past each cap", || {
+                let lines = mesh_lines(&notifier);
+                lines.iter().any(|text| {
                     text.contains("reconnected upstream; this session already sent its 4 greetings")
+                }) && lines.iter().any(|text| {
+                    text.contains(
+                        "This host's network changed; this session already sent its 8 greetings",
+                    )
                 })
             })
             .await;
-            assert!(
-                !mesh_lines(&notifier)
+            assert_eq!(
+                mesh_lines(&notifier)
                     .iter()
-                    .any(|text| text
-                        .contains("This host's network changed; this session already sent")),
+                    .filter(|text| text.contains("already sent"))
+                    .count(),
+                2,
                 "{:?}",
                 mesh_lines(&notifier)
             );
             assert!(slot.stop().await.unwrap());
+        }
+
+        /// A TCP client's reconnect within `SETTLE_CAP` of a move is part of it, and draws
+        /// on the move budget; one later than that is a reconnect of its own.
+        #[test]
+        fn a_reconnect_soon_after_a_move_is_part_of_it() {
+            let now = tokio::time::Instant::now();
+            assert!(!part_of_move(None, now));
+            assert!(part_of_move(Some(now), now + Duration::from_secs(15)));
+            assert!(part_of_move(Some(now), now + SETTLE_CAP));
+            assert!(!part_of_move(
+                Some(now),
+                now + SETTLE_CAP + Duration::from_secs(1)
+            ));
         }
 
         /// A node that does not announce sends nothing and keeps its budget whole.
