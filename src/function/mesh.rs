@@ -1069,7 +1069,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let now = SystemTime::now();
-    let mut records = runtime.peers().snapshot();
+    let mut records = runtime.listed_peers();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
 
     let mut peers = Vec::with_capacity(records.len());

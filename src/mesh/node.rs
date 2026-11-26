@@ -52,7 +52,7 @@ use crate::mesh::message::{
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
     AnnounceStamp, FarewellTime, LeftMark, PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TTL,
-    PeerChange, PeerSighting, PeerTable,
+    PeerChange, PeerRecord, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
     Answered, CorrelationKind, Correlations, InboundKind, InboundRecord, InboundStore,
@@ -1310,6 +1310,25 @@ impl MeshRuntime {
         self.ids.read().destination_hash.clone()
     }
 
+    /// The peer table as this session shows and resolves it: every row but its own. A
+    /// sibling session sharing the home files this one as a peer in the shared table, and
+    /// the row stays there for the sibling; this session lists, offers and names from the
+    /// rest, as it would alone.
+    pub(crate) fn listed_peers(&self) -> Vec<PeerRecord> {
+        let own = self.current_destination_hash();
+        let mut rows = self.peers.snapshot();
+        rows.retain(|peer| !peer.destination_hash.eq_ignore_ascii_case(&own));
+        rows
+    }
+
+    /// `listed_peers`' row for `destination`: none for this session's own.
+    pub(crate) fn listed_peer(&self, destination: &str) -> Option<PeerRecord> {
+        if destination.eq_ignore_ascii_case(&self.current_destination_hash()) {
+            return None;
+        }
+        self.peers.get(destination)
+    }
+
     /// The sessions of yours running on this cache dir, this one included, by the
     /// destination each serves, as the instance registry lists them. A session that has
     /// gone is never among them; `address_names` still resolves its name while the
@@ -1449,8 +1468,7 @@ impl MeshRuntime {
             .map(|destination| (self.fingerprint.clone(), destination))
             .collect();
         sessions.extend(
-            self.peers()
-                .snapshot()
+            self.listed_peers()
                 .into_iter()
                 .filter(row_derives)
                 .map(|peer| (peer.identity_hash, peer.destination_hash)),
@@ -2165,7 +2183,7 @@ impl MeshRuntime {
         let reading = self.rnsd_known().map(RnsdLanReader::reading_seen);
         let (rnsd_relay, rnsd_lan) = reading.map_or((false, false), rnsd_note_inputs);
         let has_lan = rnsd_lan || interfaces.iter().any(|status| status.kind == "lan");
-        let known = knows_peers(self.peers.snapshot().iter().map(|peer| peer.last_seen), now);
+        let known = knows_peers(self.listed_peers().iter().map(|peer| peer.last_seen), now);
         let relayed = on_relay(&interfaces, rnsd_relay);
         let note = lan_silent_note(known, relayed, has_lan);
         debug!(
@@ -16525,6 +16543,25 @@ mod tests {
             runtime.return_home_asked.lock().is_empty(),
             "a sighting past the debounce is a new transition"
         );
+        runtime.shutdown().await.unwrap();
+    }
+
+    /// A lone session's table holds no row of its own, so what it lists and resolves is
+    /// the whole table, as before.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lone_session_lists_its_whole_table() {
+        let started = crate::mesh::test_support::started_runtime("node-lone-listed").await;
+        let runtime = started.runtime.clone();
+        let stranger = runtime.own_session_sighting("elsewhere", "Laptop");
+        let stranger_dest = stranger.destination_hash.clone();
+        runtime.peers().observe(stranger, SystemTime::now());
+        assert_eq!(runtime.listed_peers(), runtime.peers().snapshot());
+        assert_eq!(
+            runtime.listed_peer(&stranger_dest),
+            runtime.peers().get(&stranger_dest)
+        );
+        assert!(runtime.listed_peer(&stranger_dest).is_some());
         runtime.shutdown().await.unwrap();
     }
 

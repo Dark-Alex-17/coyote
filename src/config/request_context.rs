@@ -345,7 +345,7 @@ fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
 }
 
 fn heard_peers(runtime: &MeshRuntime) -> Vec<PeerRecord> {
-    let mut peers = runtime.peers().snapshot();
+    let mut peers = runtime.listed_peers();
     peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
     peers
 }

@@ -712,7 +712,7 @@ async fn stop_node(ctx: &mut RequestContext) -> Result<()> {
 async fn peers(ctx: &RequestContext) -> Result<()> {
     let runtime = live(ctx)?;
     let now = SystemTime::now();
-    let mut records = runtime.peers().snapshot();
+    let mut records = runtime.listed_peers();
     records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
     let sessions = runtime.registered_sessions();
     let namer = runtime.namer();
@@ -1150,7 +1150,7 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     }
     let destination = destination_hash(ctx, token)?;
     let now = SystemTime::now();
-    let mut peer = runtime.peers().get(&destination);
+    let mut peer = runtime.listed_peer(&destination);
     let knock = match runtime.knock_gate().cache().list(now) {
         Ok(knocks) => match knocks
             .into_iter()
@@ -1182,7 +1182,7 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
             identity
         }
     };
-    let table = runtime.peers().snapshot();
+    let table = runtime.listed_peers();
     let successor = peer
         .as_ref()
         .and_then(|peer| peer.successor_in(&table, now));
@@ -3345,7 +3345,7 @@ async fn heard_or_asked(
     tail: &str,
     abort_signal: &AbortSignal,
 ) -> Result<Option<PeerRecord>> {
-    if let Some(peer) = runtime.peers().get(destination) {
+    if let Some(peer) = runtime.listed_peer(destination) {
         return Ok(Some(peer));
     }
     if let Some(refusal) = unheard_denial(runtime, destination, tail) {
@@ -8507,7 +8507,7 @@ fn known_hashes(ctx: &RequestContext, kind: HashKind) -> Vec<String> {
             known.push(hash.to_string());
         }
     };
-    for peer in runtime.peers().snapshot() {
+    for peer in runtime.listed_peers() {
         push(Some(&peer.destination_hash), Some(&peer.identity_hash));
     }
     if let Ok(knocks) = runtime.knock_gate().cache().list(now) {
@@ -24583,6 +24583,105 @@ mod tests {
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         assert!(temp_slot.stop().await.unwrap());
+                        relay_handle.abort();
+                    });
+                }
+
+                /// Two sessions on one cache dir share its peer table, where each files the
+                /// other: so each session's own row is in the table too. Each lists, offers
+                /// and resolves only the other, in `.mesh people list`, `mesh__peers`,
+                /// completion and `.mesh people status`; the row stays in the table for the
+                /// sibling.
+                #[test]
+                #[serial]
+                fn two_sessions_on_one_home_each_list_only_the_other() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-own-row-hidden");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let tmp = TempDir::new("repl-mesh-own-row-hidden");
+                        let a = start_as("a", &tmp, addr.port()).await;
+                        let b = start_as("b", &tmp, addr.port()).await;
+                        let (a_dest, b_dest) =
+                            (a.current_destination_hash(), b.current_destination_hash());
+                        heard_as_you(&a, &a_dest);
+                        heard_as_you(&a, &b_dest);
+                        heard_as_you(&b, &a_dest);
+                        // Filed in other case: the own row is still told apart.
+                        heard_as_you(&b, &b_dest.to_uppercase());
+                        for (runtime, own, sibling, own_name, sibling_name) in [
+                            (&a, &a_dest, &b_dest, "a", "b"),
+                            (&b, &b_dest, &a_dest, "b", "a"),
+                        ] {
+                            let mut ctx = ctx_with(MeshConfig::default(), true);
+                            ctx.app.mesh.install(runtime.clone()).unwrap();
+                            let (own8, sibling8) = (short(own), short(sibling));
+                            assert!(
+                                runtime
+                                    .peers()
+                                    .snapshot()
+                                    .iter()
+                                    .any(|peer| peer.destination_hash.eq_ignore_ascii_case(own)),
+                                "the row stays in the table for the sibling"
+                            );
+
+                            let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
+                            let rows = table_rows(&out);
+                            let listed = |dest8: &str| {
+                                rows.iter().any(|row| {
+                                    row[6]
+                                        .to_ascii_lowercase()
+                                        .ends_with(&format!(" / {dest8}"))
+                                })
+                            };
+                            assert!(listed(sibling8), "{out}");
+                            assert!(!listed(own8), "{out}");
+
+                            let tool = crate::function::mesh::handle_mesh_tool(
+                                &mut ctx,
+                                &format!("{}peers", crate::function::mesh::MESH_FUNCTION_PREFIX),
+                                &serde_json::json!({}),
+                            )
+                            .await
+                            .unwrap();
+                            let destinations: Vec<String> = tool["peers"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|row| {
+                                    row["destination"].as_str().unwrap().to_ascii_lowercase()
+                                })
+                                .collect();
+                            assert!(destinations.contains(sibling), "{tool}");
+                            assert!(!destinations.contains(own), "{tool}");
+
+                            let offered: Vec<String> = ctx
+                                .repl_complete(".mesh", &["people", "status", ""], "")
+                                .into_iter()
+                                .map(|(value, _)| value.to_ascii_lowercase())
+                                .collect();
+                            assert!(
+                                offered.iter().any(|value| value == sibling_name),
+                                "{offered:?}"
+                            );
+                            assert!(
+                                !offered
+                                    .iter()
+                                    .any(|value| value == own_name || value == own),
+                                "{offered:?}"
+                            );
+
+                            assert!(runtime.listed_peer(own).is_none());
+                            assert!(runtime.listed_peer(&own.to_uppercase()).is_none());
+                            assert!(runtime.listed_peer(sibling).is_some());
+                            let err = run(&mut ctx, &format!(".mesh people status {own8}"))
+                                .await
+                                .unwrap_err()
+                                .to_string();
+                            assert!(!err.contains("no route"), "{err}");
+
+                            assert!(ctx.app.mesh.stop().await.unwrap());
+                        }
                         relay_handle.abort();
                     });
                 }
