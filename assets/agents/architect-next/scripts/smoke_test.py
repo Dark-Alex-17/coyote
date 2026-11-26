@@ -4896,6 +4896,8 @@ check("graph: end_discussion is an end node whose output is the script-composed 
 check("graph: choice_park and choice_resume are script nodes failing to end_failure",
       all(NODES.get(n, {}).get("type") == "script" and NODES.get(n, {}).get("script") == f"scripts/{n}.py"
           and NODES.get(n, {}).get("fallback") == "end_failure" for n in ("choice_park", "choice_resume")))
+check("graph: retro_route fails to hygiene_create, so a crash in the retrospective lane never fails the run",
+      NODES.get("retro_route", {}).get("fallback") == "hygiene_create", NODES.get("retro_route"))
 check("graph: carry is exactly discussion_run_id, seeded empty, and never snapshotted",
       GRAPH.get("carry") == ["discussion_run_id"] and SEEDS.get("discussion_run_id") == "" and "discussion_run_id" not in _lib.STATE_KEYS,
       GRAPH.get("carry"))

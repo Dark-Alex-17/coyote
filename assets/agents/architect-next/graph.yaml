@@ -2551,7 +2551,7 @@ nodes:
     type: script
     description: Route on the DESIGN_RETROSPECTIVE line - a fault is noted and the run goes on; declines ledgered as retro-declined; follow-ups reported; adopted items -> ONE pending chore task blocked by the unit's tasks, integration re-armed, -> select_tasks; else hygiene.
     script: scripts/retro_route.py
-    fallback: end_failure
+    fallback: hygiene_create
 
   hygiene_create:
     id: hygiene_create
