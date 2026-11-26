@@ -163,7 +163,15 @@ async fn prepare_chat_completions(
 
     let body = match wire {
         WireApi::Responses => openai_build_responses_body(data, &self_.model),
-        WireApi::Chat => openai_build_chat_completions_body(data, &self_.model),
+        WireApi::Chat => {
+            let mut body = openai_build_chat_completions_body(data, &self_.model);
+            // OpenAI streams a chat reply's usage only when asked to, on a
+            // last chunk of its own.
+            if body["stream"] == Value::Bool(true) {
+                body["stream_options"] = json!({ "include_usage": true });
+            }
+            body
+        }
     };
 
     let mut request_data = RequestData::new(url, body).wire(wire);
@@ -740,14 +748,15 @@ fn openai_parse_chat_usage(usage: &Value) -> Option<TokenUsage> {
         return None;
     }
     let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
-    Some(TokenUsage {
+    let usage = TokenUsage {
         input_tokens: usage["prompt_tokens"]
             .as_u64()
             .map(|v| v.saturating_sub(cached_tokens.unwrap_or(0))),
         output_tokens: usage["completion_tokens"].as_u64(),
         cache_creation_input_tokens: None,
         cache_read_input_tokens: cached_tokens.filter(|&n| n > 0),
-    })
+    };
+    (!usage.is_empty()).then_some(usage)
 }
 
 fn normalize_function_id(value: &str) -> Option<String> {
@@ -1709,6 +1718,8 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, None);
         let bare = json!({ "choices": [{ "message": { "content": "answer" } }] });
         assert!(openai_extract_chat_completions(&bare).unwrap().usage.is_none());
+        let empty = json!({ "choices": [{ "message": { "content": "answer" } }], "usage": {} });
+        assert!(openai_extract_chat_completions(&empty).unwrap().usage.is_none());
     }
 
     #[test]
@@ -2538,6 +2549,23 @@ mod tests {
             "body: {}",
             request_data.body
         );
+    }
+
+    /// A streamed chat request asks OpenAI for its usage chunk; a request
+    /// that does not stream gets usage on the reply anyway and sends no
+    /// stream options.
+    #[test]
+    fn a_streamed_chat_request_asks_for_its_usage() {
+        let config = api_key_config("openai-wire-chat-usage-test", Some(WireApi::Chat));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (streamed, _) = prepare_with_stream(&client, true).unwrap();
+        assert_eq!(
+            streamed.body["stream_options"],
+            json!({ "include_usage": true })
+        );
+        let (whole, _) = prepare_with_stream(&client, false).unwrap();
+        assert!(whole.body.get("stream_options").is_none(), "{}", whole.body);
     }
 
     #[test]
