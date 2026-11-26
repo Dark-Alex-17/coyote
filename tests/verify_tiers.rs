@@ -956,7 +956,7 @@ fn round_baseline_attaches_to_a_running_job_then_reuses_its_record() {
     }
     let root = temp_dir("attach");
     let dir = committed(&root.0);
-    let envs = round("sleep 3");
+    let envs = round("sleep 10");
     let first = run_script(BASELINE, &dir, &project_state(&dir), &envs);
     let key = str_field(&first, "baseline_key").to_string();
     let pid = job_status(&dir, &key)["pid"].clone();
