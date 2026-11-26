@@ -13,10 +13,6 @@
 //! Without the variable every test is skipped (printed as `skipping:`), so a
 //! plain `cargo test` is unaffected. With it set to a directory that has no
 //! `Unattended-Mode.md` the tests fail rather than pass against nothing.
-//!
-//! The checks read the pages as a consumer would and replay their claims
-//! against the binary: the documented conflicting flags, the quoted error
-//! sentences, the example object's keys and the exit codes.
 
 use std::env;
 use std::fs;
@@ -378,7 +374,6 @@ fn json_section_failed_run_prints_the_documented_object_with_exit_1() {
     let example: Value = serde_json::from_str(&example[..example.find("```").unwrap()]).unwrap();
     let dir = TempDir::new("failed");
 
-    // Nothing listens on the client's port: the model call fails after the run starts.
     let output = run(&dir.0, &["--json", "hi"]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();

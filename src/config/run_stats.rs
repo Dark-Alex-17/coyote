@@ -16,7 +16,6 @@ struct RunStatsInner {
     cost_unknown: bool,
 }
 
-/// The result of one attempted model call, as seen by [`RunStats`].
 #[derive(Debug, Clone, Copy)]
 pub enum RunCallOutcome<'a> {
     Succeeded {

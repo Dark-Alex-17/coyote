@@ -633,8 +633,6 @@ fn a_graph_agent_run_prints_its_output_as_the_only_object() {
     assert_eq!(report["num_turns"], json!(1), "{report}");
 }
 
-// ---- usage block, stdin and -f prompts, failed turns, rejected flags ----
-
 const USAGE_KEYS: [&str; 4] = [
     "input_tokens",
     "output_tokens",
@@ -890,8 +888,6 @@ fn loading_an_installed_skill_leaves_stdout_to_the_object() {
         combined(&output)
     );
 }
-
-// ---- script-tool relay and the loop warning ----
 
 const SCRIPT_TOOL: &str = "shout";
 const RELAYED: &str = "RELAYED-FROM-THE-TOOL";

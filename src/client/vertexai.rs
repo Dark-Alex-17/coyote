@@ -353,10 +353,10 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     Ok(output)
 }
 
-/// `promptTokenCount` includes cached content, so cached tokens are
-/// subtracted to keep the buckets disjoint. Thinking tokens are billed as
-/// output but reported apart from `candidatesTokenCount`. Gemini has no
-/// cache-creation counter.
+/// Input is `promptTokenCount` plus `toolUsePromptTokenCount`, less the cached
+/// content `promptTokenCount` includes, so the buckets stay disjoint. Thinking
+/// tokens are billed as output but reported apart from
+/// `candidatesTokenCount`. Gemini has no cache-creation counter.
 pub fn gemini_parse_usage(usage: &Value) -> Option<TokenUsage> {
     if !usage.is_object() {
         return None;

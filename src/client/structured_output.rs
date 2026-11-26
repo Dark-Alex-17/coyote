@@ -85,7 +85,7 @@ pub enum SchemaDialect {
 
 impl SchemaDialect {
     /// OpenAI strict mode forces optional properties into nullable required
-    /// ones, so a value it produced loses those injected nulls again.
+    /// ones; this removes the nulls it injected. The other dialects inject none.
     pub fn strip_nulls(self, value: &mut Value, schema: &Value) {
         match self {
             SchemaDialect::OpenAiStrict => strip_injected_nulls(value, schema),

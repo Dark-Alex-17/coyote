@@ -737,8 +737,6 @@ fn a_rejected_native_format_is_retried_without_it_and_the_rejection_counts() {
 
 const ITEM_MARKER: &str = "ITEM-MARKER";
 
-/// A map node fans an llm branch out over three items: every branch call
-/// is a model call the wrapper must count and whose usage it must sum.
 #[test]
 fn a_map_over_three_items_counts_every_branch_call() {
     let dir = TempDir::new("graph-map");
@@ -857,9 +855,6 @@ fn write_one_llm_node_graph(dir: &Path, name: &str, output: &str) {
     );
 }
 
-/// A graph whose only llm node keeps getting a provider 500: the run fails
-/// with exit 1, stdout is still exactly the wrapper, and every attempted
-/// call counts as a turn while adding no usage.
 #[test]
 fn a_failing_graph_node_prints_the_error_wrapper_and_exits_1() {
     let dir = TempDir::new("graph-500");
@@ -883,8 +878,6 @@ fn a_failing_graph_node_prints_the_error_wrapper_and_exits_1() {
     assert_no_usage_and_zero_cost(&report);
 }
 
-/// The graph's final output carries an inline think block from an llm
-/// node; `result` drops it on the graph path too.
 #[test]
 fn a_think_block_in_the_graph_output_is_stripped_from_the_result() {
     let dir = TempDir::new("graph-think");
@@ -924,13 +917,9 @@ fn a_think_block_in_the_middle_of_the_graph_output_is_stripped_too() {
     assert_turns_match_requests(&report, &model, 1);
 }
 
-// ---- late graph failures, think blocks, graph without a prompt ----
-
 const SECOND_MARKER: &str = "SECOND-MARKER";
 
-/// On the graph path the first llm node succeeds and the second gets a
-/// provider 500. Both attempted calls count, only the succeeded one adds
-/// usage, and the unpriced succeeded call leaves the cost unknown.
+/// The succeeded call is unpriced, so the run's cost is unknown.
 #[test]
 fn a_graph_failing_after_a_succeeded_node_counts_both_calls_and_one_usage() {
     let dir = TempDir::new("graph-late-500");
@@ -973,8 +962,6 @@ fn a_graph_failing_after_a_succeeded_node_counts_both_calls_and_one_usage() {
     assert_eq!(report["total_cost_usd"], Value::Null, "{report}");
 }
 
-/// On the streamed plain path every think block, wherever it sits,
-/// is dropped from `result`.
 #[test]
 fn every_think_block_is_stripped_from_a_streamed_plain_result() {
     let dir = TempDir::new("think-stream");
@@ -991,8 +978,6 @@ fn every_think_block_is_stripped_from_a_streamed_plain_result() {
     assert_eq!(report["result"], json!("one two"), "{report}");
 }
 
-/// Every think block is dropped on the graph path too, with several in the
-/// final output.
 #[test]
 fn every_think_block_is_stripped_from_a_graph_result() {
     let dir = TempDir::new("graph-think-many");
@@ -1009,7 +994,6 @@ fn every_think_block_is_stripped_from_a_graph_result() {
     assert_eq!(report["result"], json!("alpha beta"), "{report}");
 }
 
-/// `--json` with a graph agent and no prompt fails plainly before any call.
 #[test]
 fn a_graph_agent_without_a_prompt_fails_plainly_on_stderr() {
     let dir = TempDir::new("graph-no-prompt");

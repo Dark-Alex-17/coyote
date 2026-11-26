@@ -420,7 +420,6 @@ pub(crate) fn interleaved_user_data() -> super::ChatCompletionsData {
     }
 }
 
-/// One plain "hello" user turn with every option unset.
 #[cfg(test)]
 pub(crate) fn plain_data(stream: bool) -> super::ChatCompletionsData {
     super::ChatCompletionsData {

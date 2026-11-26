@@ -2003,8 +2003,6 @@ mod tests {
         assert_one_succeeded_call(&stats.snapshot());
     }
 
-    /// A succeeded call that reports no usage still counts, and leaves the
-    /// run's cost unknown.
     #[tokio::test]
     async fn a_succeeded_call_without_usage_makes_the_run_cost_unknown() {
         let (mut ctx, stats) = run_stats_ctx();
@@ -2029,8 +2027,7 @@ mod tests {
         assert_eq!(snapshot.total_cost_usd, None);
     }
 
-    /// Reported but all-zero usage is a known cost of 0, even on a model
-    /// with no prices at all.
+    /// The model has no prices at all; zero usage needs none.
     #[tokio::test]
     async fn a_succeeded_call_with_all_zero_usage_keeps_the_run_cost_known() {
         let (mut ctx, stats) = run_stats_ctx();
@@ -2191,8 +2188,6 @@ mod tests {
         assert_one_failed_call(&stats.snapshot());
     }
 
-    /// An aborted stream is a failed call, so it adds nothing to the run's
-    /// usage and leaves its cost known.
     #[tokio::test(start_paused = true)]
     async fn quiet_streaming_abort_records_one_failed_run_call() {
         let (mut ctx, stats) = run_stats_ctx();
@@ -2766,7 +2761,6 @@ mod tests {
         Model::from_config(client_name, &[data]).remove(0)
     }
 
-    /// An input whose role carries the spec of `structured_output_data`.
     fn structured_input() -> Input {
         let mut role = crate::config::Role::default();
         role.set_structured_output(structured_output_data().structured_output);

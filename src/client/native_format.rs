@@ -6,9 +6,10 @@ use log::warn;
 use std::future::Future;
 use std::pin::Pin;
 
-/// Native structured-output bookkeeping for one node run. A rejection is
-/// sticky: once the provider refuses the format, later calls in the same
-/// run go out without it.
+/// Native structured-output bookkeeping for one call sequence (see
+/// `RequestContext::native_format` for who resets it). A rejection is sticky:
+/// once the provider refuses the format, later calls in the sequence go out
+/// without it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct NativeFormatState {
     pub rejected: bool,

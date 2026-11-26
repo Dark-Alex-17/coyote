@@ -2490,8 +2490,7 @@ mod tests {
         assert_eq!(state.state().get("note"), Some(&Value::Null));
     }
 
-    /// Without a schema the node's output is the accumulated text, never
-    /// the native final turn.
+    /// The native final turn is ignored when the node has no schema.
     #[tokio::test]
     async fn finish_without_a_schema_outputs_the_accumulated_text() {
         let mut u = HashMap::new();
@@ -2553,9 +2552,8 @@ mod tests {
         assert!(ctx.native_format.rejected);
     }
 
-    /// The before-hook records `last_message`; taking it in each transport
-    /// call shows the hook ran once before the first call and not again
-    /// before the format-less retry.
+    /// The before-hook records `last_message`, so taking it in each transport
+    /// call shows which calls the hook ran before.
     #[tokio::test]
     async fn completion_runner_runs_the_before_hook_once_across_the_format_retry() {
         let mut ctx = openai_ctx();

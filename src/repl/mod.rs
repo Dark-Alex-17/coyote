@@ -1922,7 +1922,6 @@ fn repl_completion_runner()
     repl_completion_runner_with(repl_transport)
 }
 
-/// Sends one request for `input` on the transport `select_transport` picks.
 fn repl_transport<'a>(
     input: &'a Input,
     client: &'a dyn Client,
@@ -5280,9 +5279,8 @@ local_hello() {\n\
         });
     }
 
-    /// The before-hook records `last_message`; taking it in each transport
-    /// call shows the hook ran once before the first call and not again
-    /// before the format-less retry.
+    /// The before-hook records `last_message`, so taking it in each transport
+    /// call shows which calls the hook ran before.
     #[test]
     fn repl_completion_runner_runs_the_before_hook_once_across_the_format_retry() {
         run_async(async {

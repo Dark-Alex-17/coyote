@@ -581,8 +581,10 @@ pub struct RequestContext {
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
     pub in_graph_llm_node: bool,
-    /// Native structured-output state of the running graph llm node. Reset
-    /// per node run and never carried into forks or children.
+    /// Native structured-output state for the current call sequence. Graph llm
+    /// nodes and the session route reset it before their calls; the
+    /// `output_schema` extractor, used by llm and agent nodes, runs on a fresh
+    /// state and restores the caller's. Never carried into forks or children.
     pub(crate) native_format: NativeFormatState,
     /// Whether this context may write its session back to the session file.
     /// A fork never owns the session file; only the context that loaded or
