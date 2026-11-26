@@ -326,6 +326,381 @@ mod welcome_and_footer {
     }
 }
 
+mod main_screen_popups_and_chrome {
+    //! What a first-time user sees on the main screen: the idle hints, the
+    //! threads and todo pop-ups opened with their chords and closed back to
+    //! the composer, the `your turn` label around a turn, the context label
+    //! and the dividers of a session and a role, and the palette's order.
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    use super::common::fake_llm::{Chunk, FakeLlm, Reply};
+    use super::common::pty::Pty;
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    const ALT_S: &[u8] = b"\x1bs";
+    const ALT_X: &[u8] = b"\x1bx";
+
+    fn boot_dry_run(scenario: &str, extra: &str) -> (Pty, TempDirGuard, std::path::PathBuf) {
+        let dir = fresh_config_dir(scenario);
+        let guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, extra);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(HOTKEY_GAP);
+        (pty, guard, dir)
+    }
+
+    /// Repaints until `shows` holds or the deadline lapses; the last frame.
+    fn frame_where(pty: &mut Pty, shows: impl Fn(&str) -> bool) -> String {
+        let at = repaint_until(pty, 40, 100, |frame| shows(&squeezed(frame)));
+        since(pty, at)
+    }
+
+    /// What the composer's top rule starts with: the squeezed text just
+    /// before the run of rule characters that ends in `your turn`.
+    fn label_before_your_turn(frame: &str) -> String {
+        let flat = squeezed(frame);
+        let Some(at) = flat.rfind("yourturn") else {
+            return String::new();
+        };
+        flat[..at].trim_end_matches('\u{2500}').to_string()
+    }
+
+    const EMPTY_COMPOSER: &str = "Typeapromptora.command";
+
+    /// The idle hints name the thread picker's chord; Alt+S opens the
+    /// `Threads` pop-up with the root thread over the main screen, and Esc
+    /// goes back to the composer, which then quits on Ctrl+D (a pop-up
+    /// still open would take the Ctrl+D as close instead).
+    #[test]
+    #[serial]
+    fn alt_s_on_the_main_screen_opens_the_threads_popup_and_esc_goes_back() {
+        let (mut pty, _guard, _dir) = boot_dry_run("probe-alt-s", "");
+        let idle = frame_where(&mut pty, |f| f.contains("Alt+S=threads"));
+        assert!(
+            squeezed(&idle).contains("?=keysAlt+T=tasksAlt+S=threadsCtrl+X=todo"),
+            "the idle hints do not read `? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo`:\n{idle}"
+        );
+
+        pty.send(ALT_S).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let open = frame_where(&mut pty, |f| f.contains("Threads") && f.contains("main"));
+        let flat = squeezed(&open);
+        assert!(
+            flat.contains("\u{250c}Threads") && flat.contains("main"),
+            "Alt+S on the main screen did not open the Threads pop-up with `main`:\n{open}"
+        );
+        assert!(
+            flat.contains("dryrun:dry-model"),
+            "the Threads pop-up opened from the main screen did not keep the footer in view:\n{open}"
+        );
+
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let back = frame_where(&mut pty, |f| {
+            f.contains(EMPTY_COMPOSER) && !f.contains("\u{250c}Threads")
+        });
+        assert!(
+            !squeezed(&back).contains("\u{250c}Threads"),
+            "Esc did not close the Threads pop-up:\n{back}"
+        );
+        assert!(
+            squeezed(&back).contains(EMPTY_COMPOSER),
+            "Esc from the Threads pop-up did not go back to the empty composer:\n{back}"
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// Alt+X opens the todo pop-up, titled `Todo`, over the main screen;
+    /// Esc closes it and the composer has the keyboard again.
+    #[test]
+    #[serial]
+    fn alt_x_opens_the_todo_popup_and_esc_goes_back() {
+        let (mut pty, _guard, _dir) = boot_dry_run("probe-alt-x", "");
+        pty.send(ALT_X).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let open = frame_where(&mut pty, |f| f.contains("\u{250c}Todo"));
+        assert!(
+            squeezed(&open).contains("\u{250c}Todo"),
+            "Alt+X did not open the todo pop-up:\n{open}"
+        );
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let back = frame_where(&mut pty, |f| {
+            f.contains(EMPTY_COMPOSER) && !f.contains("\u{250c}Todo")
+        });
+        assert!(
+            !squeezed(&back).contains("\u{250c}Todo"),
+            "Esc did not close the todo pop-up:\n{back}"
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// Alt+X is also a close key for the todo pop-up it opened.
+    #[test]
+    #[serial]
+    fn alt_x_again_closes_the_todo_popup() {
+        let (mut pty, _guard, _dir) = boot_dry_run("probe-alt-x-toggle", "");
+        pty.send(ALT_X).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let open = frame_where(&mut pty, |f| f.contains("\u{250c}Todo"));
+        assert!(
+            squeezed(&open).contains("\u{250c}Todo"),
+            "Alt+X did not open the todo pop-up:\n{open}"
+        );
+        pty.send(ALT_X).unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let back = frame_where(&mut pty, |f| {
+            f.contains(EMPTY_COMPOSER) && !f.contains("\u{250c}Todo")
+        });
+        assert!(
+            !squeezed(&back).contains("\u{250c}Todo") && squeezed(&back).contains(EMPTY_COMPOSER),
+            "a second Alt+X did not close the todo pop-up:\n{back}"
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// In the Threads pop-up, Ctrl+P neither closes it nor reaches the
+    /// composer; q, Tab and Ctrl+C each close it back to the composer, and
+    /// Ctrl+C there does not quit the app.
+    #[test]
+    #[serial]
+    fn the_threads_popup_ignores_ctrl_p_and_closes_on_q_tab_and_ctrl_c() {
+        let (mut pty, _guard, _dir) = boot_dry_run("probe-alt-s-keys", "");
+        for (name, close) in [("q", &b"q"[..]), ("Tab", &b"\t"[..]), ("Ctrl+C", CTRL_C)] {
+            pty.send(ALT_S).unwrap();
+            pty.read_for(Duration::from_millis(500));
+            let open = frame_where(&mut pty, |f| f.contains("\u{250c}Threads"));
+            assert!(
+                squeezed(&open).contains("\u{250c}Threads"),
+                "Alt+S did not open the Threads pop-up (before {name}):\n{open}"
+            );
+            if name == "q" {
+                pty.send(b"\x10").unwrap();
+                pty.read_for(Duration::from_millis(500));
+                let still = frame_where(&mut pty, |f| f.contains("\u{250c}Threads"));
+                assert!(
+                    squeezed(&still).contains("\u{250c}Threads"),
+                    "Ctrl+P closed the Threads pop-up:\n{still}"
+                );
+            }
+            pty.send(close).unwrap();
+            pty.read_for(Duration::from_millis(500));
+            let back = frame_where(&mut pty, |f| {
+                f.contains(EMPTY_COMPOSER) && !f.contains("\u{250c}Threads")
+            });
+            let flat = squeezed(&back);
+            assert!(
+                !flat.contains("\u{250c}Threads") && flat.contains(EMPTY_COMPOSER),
+                "{name} did not close the Threads pop-up back to an empty composer:\n{back}"
+            );
+        }
+        quit_and_check(&mut pty);
+    }
+
+    /// `your turn` ends the composer's top rule on boot, is gone while the
+    /// model streams (also with a line typed mid-turn), and is back once
+    /// the reply is in.
+    #[test]
+    #[serial]
+    fn your_turn_shows_on_boot_goes_during_the_turn_and_comes_back_after() {
+        let dir = fresh_config_dir("probe-your-turn");
+        let _guard = TempDirGuard(dir.clone());
+        let release = dir.join("release");
+        let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+            Chunk::Text("held part yt9 ".to_string()),
+            Chunk::WaitFor(release.clone()),
+            Chunk::Text("reply done yt9".to_string()),
+        ])]);
+        write_fake_llm_config(&dir, &fake);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(HOTKEY_GAP);
+
+        let boot = frame_where(&mut pty, |f| f.contains("yourturn"));
+        assert!(
+            squeezed(&boot).contains("yourturn"),
+            "the composer does not say `your turn` on boot:\n{boot}"
+        );
+
+        let sent = pty.raw().len();
+        pty.send(b"hello yt9\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "held part yt9", sent, "the held stream");
+        let busy = frame_where(&mut pty, |f| f.contains("Esctointerrupt"));
+        assert!(
+            !squeezed(&busy).contains("yourturn"),
+            "`your turn` still shows while the model streams:\n{busy}"
+        );
+        pty.send(b"typing mid turn").unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let typing = frame_where(&mut pty, |f| f.contains("typingmidturn"));
+        assert!(
+            !squeezed(&typing).contains("yourturn"),
+            "`your turn` shows for a draft typed mid-turn:\n{typing}"
+        );
+        // Ctrl+U cuts the draft; Ctrl+C would interrupt the turn.
+        pty.send(b"\x15").unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        fs::write(&release, b"").unwrap();
+        wait_for_squeezed_after(&mut pty, "reply done yt9", sent, "the released reply");
+        let deadline = Instant::now() + PTY_DEADLINE;
+        let mut after = String::new();
+        while Instant::now() < deadline {
+            after = frame_where(&mut pty, |f| f.contains("yourturn"));
+            if squeezed(&after).contains("yourturn") {
+                break;
+            }
+        }
+        assert!(
+            squeezed(&after).contains("yourturn"),
+            "`your turn` did not come back once the turn ended:\n{after}"
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// `.session probe-ctx` puts the session name in the composer's context
+    /// label and draws an `entered session` divider; `.exit session` draws a
+    /// `left session` divider over a fresh view that no longer holds the
+    /// line sent inside the session.
+    #[test]
+    #[serial]
+    fn entering_and_leaving_a_session_draws_dividers_and_clears_the_view() {
+        let (mut pty, _guard, _dir) = boot_dry_run("probe-ctx-session", "");
+        let at = pty.raw().len();
+        pty.send(b".session probe-ctx\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "entered session probe-ctx",
+            at,
+            "the enter divider",
+        );
+        let inside = frame_where(&mut pty, |f| {
+            label_before_your_turn(f).ends_with("probe-ctx")
+        });
+        let label = label_before_your_turn(&inside);
+        assert!(
+            label.ends_with("probe-ctx"),
+            "the composer's top rule does not start with the session name ({label:?}):\n{inside}"
+        );
+
+        dry_run_exchange(&mut pty, "inside-line-c3x");
+        let left_at = pty.raw().len();
+        pty.send(b".exit session\r").unwrap();
+        let deadline = Instant::now() + PTY_DEADLINE;
+        loop {
+            let text = pty.read_for(Duration::from_millis(300));
+            if text.contains("Save session?") {
+                pty.read_for(HOTKEY_GAP);
+                pty.send(b"n").unwrap();
+            }
+            if squeezed(&since(&pty, left_at)).contains("leftsessionprobe-ctx") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no `left session probe-ctx` divider:\n{}",
+                since(&pty, left_at)
+            );
+        }
+        let after = frame_where(&mut pty, |f| f.contains("leftsessionprobe-ctx"));
+        let flat = squeezed(&after);
+        assert!(flat.contains("leftsessionprobe-ctx"), "{after}");
+        assert!(
+            !flat.contains("inside-line-c3x"),
+            "leaving the session did not clear the view:\n{after}"
+        );
+        quit_declining_save(&mut pty);
+    }
+
+    /// `.role probe-role` puts the role in the context label as the REPL
+    /// prompt shows it with no session (`probe-role`), and an `entered
+    /// role` divider; `.exit role` draws `left role` and drops the label.
+    #[test]
+    #[serial]
+    fn entering_and_leaving_a_role_draws_dividers_and_labels_the_composer() {
+        let dir = fresh_config_dir("probe-ctx-role");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        fs::create_dir_all(dir.join("roles")).unwrap();
+        fs::write(dir.join("roles").join("probe-role.md"), "You are terse.\n").unwrap();
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(HOTKEY_GAP);
+
+        let at = pty.raw().len();
+        pty.send(b".role probe-role\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "entered role probe-role", at, "the enter divider");
+        let inside = frame_where(&mut pty, |f| {
+            label_before_your_turn(f).ends_with("probe-role")
+        });
+        assert!(
+            label_before_your_turn(&inside).ends_with("probe-role"),
+            "the context label does not show `probe-role`:\n{inside}"
+        );
+        let left_at = pty.raw().len();
+        pty.send(b".exit role\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "left role probe-role",
+            left_at,
+            "the leave divider",
+        );
+        let after = frame_where(&mut pty, |f| {
+            f.contains("yourturn") && !label_before_your_turn(f).ends_with("probe-role")
+        });
+        assert!(
+            !label_before_your_turn(&after).ends_with("probe-role"),
+            "the context label kept the role after `.exit role`:\n{after}"
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// The palette for `.a` lists the built-ins A-Z, then the macros: a
+    /// macro named `aaa-probe` sorts after every built-in, though it would
+    /// come first in a plain A-Z of all rows.
+    #[test]
+    #[serial]
+    fn the_palette_lists_built_ins_before_a_macro_that_sorts_first() {
+        let dir = fresh_config_dir("probe-palette-order");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        write_macro(&dir, "aaa-probe", &[".info"]);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(60, 140).unwrap();
+        pty.read_for(HOTKEY_GAP);
+        pty.send(b".a").unwrap();
+        pty.read_for(Duration::from_millis(600));
+        let at = repaint_showing(&mut pty, 60, 141, &["aaa-probe", ".agent"]);
+        let frame = since(&pty, at);
+        let row_of = |needle: &str| -> Option<u16> {
+            painted_at(pty.raw(), needle.as_bytes(), at)
+                .into_iter()
+                .map(|(row, _)| row)
+                .max()
+        };
+        let agent = row_of(".agent ");
+        let mac = row_of("aaa-probe");
+        assert!(
+            agent.is_some() && mac.is_some(),
+            "the palette for `.a` lacks `.agent` or the macro (agent {agent:?}, macro {mac:?}):\n{frame}"
+        );
+        assert!(
+            mac > agent,
+            "the macro `aaa-probe` is listed above the built-in `.agent` (macro row {mac:?}, agent row {agent:?}):\n{frame}"
+        );
+        pty.send(ESC).unwrap();
+        pty.read_for(Duration::from_millis(300));
+        quit_clearing_any_draft(&mut pty);
+    }
+}
+
 mod footer_usage {
     //! The right prompt's usage segment at the footer's right end.
     use super::common::fake_llm::{FakeLlm, Reply};
