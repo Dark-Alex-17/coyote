@@ -69,6 +69,7 @@ below. Later landings add their own rows.
 | The headless judge decides a question that recommends no option | `graph.yaml` the `headless_judge` llm node (`tools: []`, `timeout: 120`, next and fallback `interpret_route`), the `judge_rulings` seed and the `parse_answer` / `interpret_route` descriptions, the `ask_review_incomplete` approval node removed, `scripts/gates.py` `parse_answer` / `_to_headless_judge` / `interpret_route` / `_judge_route` / `OWN_PROMPT_KINDS` / `_TERMINAL_PROMPTS`, `scripts/audit_graph.py`, `scripts/smoke_test.py`, `tests/candidate_sisyphus_next.rs`, `src/config/request_context.rs` | The engine's no-human reply (`HEADLESS_GUIDANCE`, matched as the exact canned text) takes the recommended option. On a question with options and none recommended, `parse_answer` now sends it to the `headless_judge` llm node, as architect-next does, instead of interpreting the canned words: the judge weighs the question's evidence and returns an option or an instruction the kind accepts, with its reason. `interpret_route` reads a judge ruling first (`reply_source` `judge`): a usable one goes through `apply_answer` and into the autonomous digest as `basis: headless judge: <reason>`, an option pick reaching `apply_answer` as `<option>: <reason>` so a branch that records the stated reason records the judge's; a faulty one (no reason, no offered option, an instruction the kind does not accept) gets one more judge turn with the fault in the escalation's data as `judge_fault`, which the judge's instructions name, then the run ends blocked with the question and its options. `judge_rulings` counts rulings per decision key (the key the failed-once rule uses), and at `STRIKE_LIMIT` the run ends blocked without the judge. A hard trigger is never judged: with no recommended option and no human it ends blocked with the question. The kinds with an approval node of their own are not judged; `review_incomplete` lost its approval node, whose first option a run with no human always took, and is asked at the typed prompt so it reaches the judge. |
 | The run's design retrospective | `graph.yaml` the `retrospective` variable, the `retro_*` seeds, the `retro_size`, `retro_size_route`, `run_retrospective`, `retro_triage` and `retro_route` nodes and the `max_loop_iterations` comment; `scripts/gates.py` `route_gauntlet` / `triage_route` / `apply_answer` / `_after_final_review` / `retro_size_route` / `retro_route` / `compose_fix` / `_assemble_report`; `scripts/retro_size_route.py`, `scripts/retro_route.py`; `scripts/_lib.py` `RUN_VARIABLES` / `STATE_KEYS`; `scripts/check_session_block.sh` `GRAPH_ONLY_VARS`; `scripts/audit_graph.py`; `scripts/smoke_test.py`; `tests/candidate_sisyphus_next.rs`; `src/config/request_context.rs` | the run-closing design retrospective (The run's design retrospective below). `retrospective` is graph-only: the prose sisyphus reads the same decision from its delegation brief. The wrapper's ignored `retrospective_smoke_rows_go_red_under_the_recorded_sabotages` tail turns the large-run, adopted, code-fence, no-base, not-triaged and after-publish rows red |
 | Comment hygiene over the final diff | `graph.yaml` `enabled_skills` (`comment-discipline`), the `comment_hygiene` llm node (`tools: [fs_read, fs_grep]`, the `comment-discipline` skill, `max_iterations: 10`, `timeout: 600`, next and fallback `comment_hygiene_route`), the `comment_hygiene_route` script node, the `comment_hygiene_done`, `comment_diff`, `comment_diff_truncated`, `comment_cuts`, `comment_read` and `comment_hygiene_line` seeds and the `review_gate` description, `scripts/comment_hygiene_route.py`, `scripts/_lib.py` `STATE_KEYS`, `scripts/gates.py` `intake` / `review_gate` / `_whole_task_diff` / `_hunk_ranges` / `comment_hygiene_route` / `compose_fix` / `_assemble_report`, `scripts/audit_graph.py`, `scripts/smoke_test.py`, `tests/candidate_sisyphus_next.rs`, `src/config/request_context.rs` | The prose sisyphus reads every comment the task's diff adds before the first review of the finished work and cuts the ones that do not earn their keep. `review_gate` now does the same once per task: at the task's final whole-task review, before its first round (never a subtask's), under every cadence and before the trivial skip, a task with changed files gets `comment_diff`, the diff from `base_sha` to the worktree tree (untracked files in, the plans dir out, `-U3`, the last 30000 characters), and goes to the `comment_hygiene` llm node, which runs `comment-discipline`'s Final-diff pass as a judgement read and returns `comment_cuts` (`<file:line> -- cut` or `<file:line> -- reduce to: <sentence>`) and `comment_read`. A longer diff sets `comment_diff_truncated` and opens with a `[diff truncated: ...]` marker naming, as `<file>: +12-40, +88`, each file whose `+++ b/` header was dropped (deletions left out) with the line ranges its new version adds, read from `git diff -U0` hunk headers; the node reads only those lines with its tools and leaves comments outside them alone. Only the first 20 such files are named (`COMMENT_HYGIENE_FILES_CAP`); the rest, or all of them when the `-U0` diff fails, get a `## Skipped reviews` entry naming them. An empty diff with changed files skips the pass from `review_gate` itself, with a ledger line and a `## Skipped reviews` entry; a failed `git diff` does the same, and its ledger line says git diff failed and carries the head of git's stderr. `comment_hygiene_route` sets `comment_hygiene_done`, clears `comment_diff`, ledgers `Comment hygiene: <n> added comments read, <c> cut, <r> reduced` (with ` (diff truncated)` after a truncated diff) and keeps it in `comment_hygiene_line`, which the report prints under Verification evidence; both survive a re-entry through `STATE_KEYS` and `intake`. Cuts go to `compose_fix` (fix source `comment_hygiene`: cut or reduce each comment as stated, change no code), so a coder fix round makes them under its build and test gates and the flow returns through bookkeeping to `review_gate`, which goes on to the review; no cuts go straight back to `review_gate`; a fault fails open with a ledger line and a `## Skipped reviews` entry. Under batch cadence the parent's batch review gates the cuts. |
+| Verification tiers and the finalize gate | `graph.yaml` the `finalize_owner` and `run_base` variables, the `review_verification_tier`, `review_baseline_floor`, `round_checks`, `finalize_runs`, `finalize_waived`, `finalize_return`, `finalize_tree` and `publish_done` seeds, the `run_coder` `verify_tier` input, the `run_gauntlet` `verification_tier` and `baseline_floor` inputs, the `pr_gate` description and the `finalize_gate` node; `scripts/_lib.py` `RUN_VARIABLES` / `detected_test_command`; `scripts/gates.py` the verification tiers section, `TYPED_PROMPT_KINDS` / `STOP_AWARE_KINDS` / `apply_answer` / `render_coder_prompt` / `route_coder_result` / `compose_fix` / `_plans_dirs` / `build_gauntlet_prompt` / `route_gauntlet` / `triage_route` / `pr_gate` / `finalize_gate` / `ci_gate` / `_assemble_report`; `scripts/finalize_gate.py`; `scripts/audit_graph.py` the `finalize_gate` BOUNDED entry; `scripts/smoke_test.py`; `tests/candidate_sisyphus_next.rs`; the bundled-validator node list in `src/config/request_context.rs` | work rounds verify at the round tier and the run runs its full suite, formatter and lint once, on the tree it is about to publish: the Verification tiers section below records the contract. `finalize_owner` and `run_base` mirror the prose `sisyphus/config.yaml` |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -122,12 +123,12 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:3482:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:3549:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:3550:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
-scripts/smoke_test.py:3761:             "make: *** [check] Error 1")
-scripts/smoke_test.py:3766:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
-scripts/smoke_test.py:3767:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
+scripts/gates.py:3507:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:3555:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:3556:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:3767:             "make: *** [check] Error 1")
+scripts/smoke_test.py:3772:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
+scripts/smoke_test.py:3773:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
 ```
 
 The lone `gates.py` hit is the English verb `make` in one prompt sentence; the five
@@ -485,6 +486,53 @@ other text before it is a fault. A CLEAN result or a fault goes on to `observabi
 The retrospective itself never blocks completion; an adopted refactor round runs under the
 normal gates and can escalate like any fix round. The run report's `Design retrospective:`
 block says whether it ran and why and lists the declines.
+
+## Verification tiers
+
+Every coder round runs at the round tier (`run_coder` passes `verify_tier: round`): its test
+gate runs the targeted and impacted tests and writes a round record for the worktree tree, and
+its baseline runs against `baseline_floor`, the parent's `run_base` when one is set, else the
+run base. `route_coder_result` adds the commands of the round record for the current tree to
+`round_checks` on every `CODER_COMPLETE`, first seen first.
+
+`build_gauntlet_prompt` picks each review round's tier and passes it to the gauntlet as
+`verification_tier`, with the same floor as `baseline_floor`. A round is final when this run
+owns the final gate (`finalize_owner` is `self`, the default; any other value but `parent`
+reads as self and is ledgered once), no subtask is under review, nothing is published yet
+(`publish_done`, `pr_published`, a CI fix, a PR review round or a base sync) and the tree is
+not waived: a run with no subtasks, the final whole-task review, the retrospective refactor
+and observability rounds and a probe-adoption round before publishing. Every other round is
+round tier: its review commands drop each command equal to the coder gates' detected full
+suite (`_lib.detected_test_command`, which asks `gate_lib.sh` through bash with the root in
+the environment) and add the round record's commands, in one `verify: round tier:` ledger
+line; a final round keeps the declared commands, and its gauntlet runs the full suite,
+formatter and lint once or reuses the finalize record for that tree. The tier is part of the
+round's reuse key and is stored in its `round_heads` entry, so a round-tier PASS is never
+reused for a final round.
+
+A final round's `FULL-SUITE RECORD RED` blocker goes to triage, which cannot reject, defer or
+drop it: it always stands as a fix. `FULL-SUITE RECORD MISSING` or `UNAVAILABLE` raises
+`finalize_unavailable`. Before anything is published, `pr_gate` looks up the finalize record
+for the current tree (the plans dir aside); with no green record it goes to the script node
+`finalize_gate` whether or not a publish was asked, and comes back once the record is green.
+`finalize_gate` runs `.shared/finalize_gate.sh <project> sisyphus-next <floor>` with
+`TEST_TIMEOUT` (default 1800) and the `build_lock` prefix, counts the run in `finalize_runs`,
+sends a red result to `compose_fix` (fix source `finalize_gate`, each failing step's header
+with its output trimmed) and an undecided one (unavailable, a timed-out step, a crash or a
+reply with no status) to `finalize_unavailable`; an undecided run is never read as green.
+`finalize_unavailable` is asked at the typed prompt: continue with the full suite not run and
+a stated reason (recommended, so a run with no human takes it), retry the finalize run, or
+stop. Continuing waives that tree (`finalize_waived`): its reviews run at the round tier and
+`pr_gate` publishes it. Accepting review blockers that include a red full suite waives the
+tree the same way.
+
+The report opens its verification with `Verification: tier <final|round|waived>; <finalize ran
+N time(s)|reused|waived: <reason>|parent-owned>; baseline mode <the coder's last Baseline
+mode>` and lists `## Round checks`, one backticked command per line; a waived tree adds `Full
+suite NOT RUN at finalize: <reason>` (or `RED` for an accepted red suite) to the report and the
+PR body. After a publish, `ci_gate` compares `HEAD^{tree}` with the finalize record's tree,
+the plans dir aside, and names the differing paths in an advisory attention line; it never
+blocks.
 
 ## Verify
 

@@ -95,7 +95,7 @@ GO_AHEAD_FILLER = frozenset((
 
 # The graph variables; a run restored from a discussion park keeps the live values of these.
 RUN_VARIABLES = ("project_dir", "observability_agent", "parallel", "auto_confirm", "escalation_policy", "build_lock",
-                 "review_cadence", "retrospective", "pr_tracking")
+                 "review_cadence", "finalize_owner", "run_base", "retrospective", "pr_tracking")
 
 
 def bare_go_ahead(text):
@@ -697,6 +697,26 @@ def added_lines_since(root, base):
     if code != 0:
         return ""
     return "\n".join(l for l in out.splitlines() if l.startswith("+") and not l.startswith("+++"))
+
+
+def detected_test_command(root):
+    """The full test command the coder gates detect for `root`, as they run it; "" when none is detected or bash fails.
+
+    `root` reaches bash through the environment: Git Bash on Windows re-parses its command line."""
+    shared = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    import base_suite
+    script = 'source "$1"; source "$2"; gate_test_command_for_run "$(gate_test_command "$SX_TEST_ROOT")"'
+    try:
+        p = subprocess.run(
+            [base_suite.bash_program(), "-c", script, "detected-test-command", base_suite.UTILS, base_suite.GATE_LIB],
+            capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=30,
+            env={**os.environ, "SX_TEST_ROOT": root},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
 
 
 # ---------------------------------------------------------------- criterion commands

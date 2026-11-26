@@ -1508,6 +1508,11 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("adversary").join("scripts"),
         &agents.join("adversary").join("scripts"),
     );
+    // the round-tier rows ask the coder's own gate_lib.sh for the detected full suite
+    copy_tree(
+        &agents_dir().join("coder").join("scripts"),
+        &agents.join("coder").join("scripts"),
+    );
     // the red-gate rows render the coder's own end_failure template, and the
     // seating rows read every child agent's declared variables
     for entry in fs::read_dir(agents_dir()).unwrap() {
@@ -3517,6 +3522,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("explore_slice_team", "max_attempts", 2),
     ("explore_slice_team", "timeout", 1800),
     ("final_report", "timeout", 60),
+    ("finalize_gate", "timeout", 3600),
     ("git_ops", "max_iterations", 20),
     ("git_ops", "timeout", 1800),
     ("headless_judge", "timeout", 120),
@@ -3582,6 +3588,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "debt_rounds",
     "design_ask_rounds",
     "draft_rounds",
+    "finalize_runs",
     "fix_round",
     "fix_strikes",
     "navigator_reasks",
@@ -6500,9 +6507,94 @@ fn run_coder_passes_the_baseline_floor_to_the_coder() {
         "{node:?}"
     );
     assert_eq!(
+        node["inputs"]["verify_tier"].as_str(),
+        Some("round"),
+        "{node:?}"
+    );
+    assert_eq!(
         shipped["initial_state"]["coder_baseline_floor"].as_str(),
         Some("")
     );
+}
+
+/// Every review round hands the gauntlet the tier `build_gauntlet_prompt`
+/// decided and the run base as its baseline floor; the seeds are the round
+/// tier and no floor.
+#[test]
+fn run_gauntlet_passes_the_review_tier_and_baseline_floor() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &shipped["nodes"]["run_gauntlet"];
+    assert_eq!(
+        node["inputs"]["verification_tier"].as_str(),
+        Some("{{review_verification_tier}}"),
+        "{node:?}"
+    );
+    assert_eq!(
+        node["inputs"]["baseline_floor"].as_str(),
+        Some("{{review_baseline_floor}}"),
+        "{node:?}"
+    );
+    let seeds = &shipped["initial_state"];
+    assert_eq!(seeds["review_verification_tier"].as_str(), Some("round"));
+    assert_eq!(seeds["review_baseline_floor"].as_str(), Some(""));
+    let gate = &shipped["nodes"]["finalize_gate"];
+    assert_eq!(gate["type"].as_str(), Some("script"), "{gate:?}");
+    assert_eq!(
+        gate["script"].as_str(),
+        Some("scripts/finalize_gate.py"),
+        "{gate:?}"
+    );
+    assert_eq!(gate["fallback"].as_str(), Some("end_failure"), "{gate:?}");
+    assert!(gate.get("inputs").is_none(), "{gate:?}");
+}
+
+/// `finalize_owner` is declared where the prose twin declares it (right
+/// after `review_cadence`, right before `run_base`) with default `self`,
+/// and the candidate's description names what `parent` changes and how any
+/// other value reads.
+#[test]
+fn finalize_owner_is_declared_at_the_prose_twins_position() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let prose = variable_list(&agents_dir().join("sisyphus/config.yaml"));
+    for (label, vars) in [("sisyphus-next", &candidate), ("sisyphus", &prose)] {
+        let names = names_of(vars);
+        let at = names
+            .iter()
+            .position(|n| *n == "finalize_owner")
+            .unwrap_or_else(|| panic!("{label} declares no finalize_owner: {names:?}"));
+        assert_eq!(
+            at.checked_sub(1).and_then(|i| names.get(i)),
+            Some(&"review_cadence"),
+            "{label}: {names:?}"
+        );
+        assert_eq!(names.get(at + 1), Some(&"run_base"), "{label}: {names:?}");
+        assert_eq!(
+            vars[at]["default"].as_str(),
+            Some("self"),
+            "{label} default"
+        );
+        assert_eq!(
+            vars[at + 1]["default"].as_str(),
+            Some(""),
+            "{label} run_base default"
+        );
+    }
+    let description = candidate
+        .iter()
+        .find(|v| v["name"].as_str() == Some("finalize_owner"))
+        .and_then(|v| v["description"].as_str())
+        .unwrap();
+    for phrase in [
+        "'parent'",
+        "every review here stays at round tier and the run does not finalize",
+        "Any other value counts as self, with a ledger note",
+    ] {
+        assert!(
+            description.contains(phrase),
+            "missing {phrase:?} in: {description}"
+        );
+    }
 }
 
 /// One run of the lifted research fan-out on the real binary (which

@@ -59,6 +59,9 @@ BOUNDED = {
                "trace, then the base_merge_failed escalation",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
     "base_check": "once per HEAD (base_checked_head): the flip it hands on to finds HEAD already checked",
+    "finalize_gate": "once per code tree: green writes the finalize record pr_gate's lookup then finds; red goes to a "
+                     "coder round whose final-tier review is bounded by B10; undecided goes to the "
+                     "finalize_unavailable escalation",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",
     "pr_review_route": "B16 REVIEW_MAX_ROUNDS fix rounds + REVIEW_CI_POLL_BUDGET",
     "merge_oracle": "oracle_retries: one retry per subtask recommended (via apply_answer), then proceeding without "

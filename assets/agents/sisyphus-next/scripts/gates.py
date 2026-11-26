@@ -9,6 +9,7 @@ and declare their degradation instead.
 
 import datetime
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -33,7 +34,7 @@ from _lib import (  # noqa: E402
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
-    set_frontmatter, criterion_commands,
+    set_frontmatter, criterion_commands, detected_test_command,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
     NAVIGATOR_REASK_MAX, names_several_options, note_script_error, now_iso, option, read_artifact, review_fault,
@@ -1565,7 +1566,7 @@ def _decision_key(state, esc):
 OWN_PROMPT_KINDS = ("handoff_confirm", "draft_confirm")
 # escalation kinds kept at the typed prompt although an option is recommended: their options ask for stated text a
 # picker reply cannot carry, and only the typed prompt's no-human reply reaches the headless judge
-TYPED_PROMPT_KINDS = ("plan_defect",)
+TYPED_PROMPT_KINDS = ("plan_defect", "finalize_unavailable")
 
 
 def normalize_choices(state, u, esc):
@@ -2310,7 +2311,8 @@ STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and 
 # the kinds whose apply_answer branch reads a whole-reply stop; only these take a bare "abort" without interpreting it
 STOP_AWARE_KINDS = ("clarify", "clarify_cap", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow",
                     "sizing_cap", "oracle_fault", "engine_fault", "plan_defect", "review_incomplete", "strikeout",
-                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment", "coder_rejected_cap")
+                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment", "coder_rejected_cap",
+                    "finalize_unavailable")
 
 
 def _whole_reply_stop(answer, options=(), stop_options=None):
@@ -2744,6 +2746,27 @@ def apply_answer(state):
         else:
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
+    elif kind == "finalize_unavailable":
+        named = _named_option(answer, options)
+        data = as_dict(esc.get("data"))
+        back = "build_gauntlet_prompt" if data.get("return") == "build_gauntlet_prompt" else "pr_gate"
+        if stop or named == FINALIZE_STOP:
+            u["failure_reason"] = (f"stopped at the user's request: the finalize gate could not show the tree green "
+                                   f"({tail(esc.get('evidence') or 'no detail', 300)})")
+            u["_next"] = "end_blocked"
+        elif named == FINALIZE_RETRY:
+            u["finalize_return"] = back
+            ledger(state, u, "finalize: retry asked -> finalize_gate")
+            u["_next"] = "finalize_gate"
+        elif named == FINALIZE_CONTINUE:
+            reason = _stated_reason(answer, options)
+            if reason == NO_STATED_REASON:
+                reason = f"{NO_STATED_REASON}; the gate reported: {tail(esc.get('evidence') or 'no detail', 300)}"
+            u["finalize_waived"] = {"tree": data.get("tree") or "", "reason": reason}
+            ledger(state, u, f"finalize: waived for tree {data.get('tree') or '(unknown)'}: {tail(reason, 300)}")
+            u["_next"] = back
+        else:
+            _unmatched(state, u, esc, answer)
     elif kind in ("strikeout", "lane_stuck", "review_exhausted"):
         a = "abort" if stop else _answered(state, {"round": ["apply", "one more", "round"], "accept": ["accept"],
                                                    "proceed": ["proceed without"]})
@@ -2764,6 +2787,7 @@ def apply_answer(state):
         elif a == "accept":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review blockers accepted unresolved at the user's say-so ({kind}); see the gauntlet report"]
+            _accept_red_suite(state, u)
             _after_final_review(state, u)
         elif a == "proceed":
             notes = tail(state.get("oracle_result") or "", 1500) or "(the oracle left no notes)"
@@ -3193,7 +3217,7 @@ def render_coder_prompt(state):
     prompt = "\n".join(parts)
     u["coder_prompt"] = prompt
     # While carried failures are pending, an earlier record would list them as failures that were already there.
-    u["coder_baseline_floor"] = "" if _carried(state) else state.get("run_base_sha") or state.get("base_sha") or ""
+    u["coder_baseline_floor"] = "" if _carried(state) else _baseline_floor(state)
     write_artifact(state.get("run_dir", ""), f"coder-prompt-{as_int(state.get('fix_round'))}.md", prompt)
     u["_next"] = "check_inbox_pre" if truthy(state.get("parallel_mode")) else "run_coder"
     return u
@@ -3355,6 +3379,7 @@ def route_coder_result(state):
             snapshot(state, u, "coder")
             return u
         u.update({"coder_sentinel": "CODER_COMPLETE", "fix_strikes": 0, "fix_instructions": "", "last_coder_error": ""})
+        _note_round_checks(state, u)
         if carried and verdict == "passed":
             u["carried_failures"] = []
             ledger(state, u, f"coder: tests passed; {len(carried)} carried test failure(s) cleared")
@@ -3489,6 +3514,8 @@ def compose_fix(state):
     elif src == "plan_defect_fix":
         lines += ["The adversary reported the plan as the root cause; the reply ruled the plan is not at fault. Keep "
                   "every acceptance criterion as written and apply this change:", note]
+    elif src == "finalize_gate":
+        lines += [FINALIZE_FIX_HEADING, note]
     elif src == "ci":
         lines += ["CI is red on the PR. Fix the failure below (evidence pack verbatim):", state.get("ci_evidence") or ""]
         if (state.get("ci_diagnosis") or "").strip():
@@ -3960,6 +3987,11 @@ def _literal(paths):
 
 def _plans_exclude(state, root):
     """The pathspec that leaves the in-repo planning store out, or [] when there is none inside root."""
+    return [f":(exclude,literal){rel}" for rel in _plans_dirs(state, root)]
+
+
+def _plans_dirs(state, root):
+    """The in-repo planning store relative to root, as a one-item list, or [] when there is none inside root."""
     plans = _plans_path(state, state.get("project_dir") or root)
     if os.path.isdir(plans):
         try:
@@ -3967,7 +3999,7 @@ def _plans_exclude(state, root):
         except ValueError:
             rel = ".."
         if rel not in (".", "..") and not rel.startswith(".." + os.sep):
-            return [f":(exclude,literal){rel}"]
+            return [rel]
     return []
 
 
@@ -4299,6 +4331,109 @@ def _strip_git_state(text):
     return "\n".join(kept), dropped
 
 
+# ====================================================================== verification tiers
+FULL_SUITE_PREFIX = "FULL-SUITE RECORD "
+FULL_SUITE_RED = FULL_SUITE_PREFIX + "RED"
+# a final-tier review with no finalize record that decides its tree; never a code finding
+FULL_SUITE_UNDECIDED = (FULL_SUITE_PREFIX + "MISSING", FULL_SUITE_PREFIX + "UNAVAILABLE")
+# the gauntlet verdict table's full-suite row when its finalize check ran the gate green instead of reusing a record
+_FULL_SUITE_RAN_RE = re.compile(r"^\|[ \t]*full-suite[ \t]*\|[^|\n]*\|[ \t]*finalize gate ran ", re.M)
+# the blocker a finalize check that ran the gate red or unavailable renders
+_FULL_SUITE_RAN_BLOCKER_RE = re.compile(r"^FULL-SUITE RECORD [A-Z]+: finalize gate ran ")
+FINALIZE_GATE_SECS = 3500    # under the finalize_gate node's 3600
+FINALIZE_TEST_SECS = 1800    # each finalize step's TEST_TIMEOUT unless the environment sets one
+FINALIZE_ITEM_CHARS = 1500   # output tail kept per failing finalize step
+FINALIZE_FIX_HEADING = "The finalize gate (full suite, formatter, lint) failed on the tree about to be published:"
+FINALIZE_CONTINUE = "Continue with the full suite NOT RUN (state a reason)"
+FINALIZE_RETRY = "Retry the finalize run"
+FINALIZE_STOP = "Stop"
+
+
+def _shared(name):
+    """The `.shared` module `name`."""
+    if SHARED_DIR not in sys.path:
+        sys.path.insert(0, SHARED_DIR)
+    return importlib.import_module(name)
+
+
+def _baseline_floor(state):
+    """The commit a red suite is judged against: the parent's run base, else this run's, else the diff base."""
+    return str(var(state, "run_base") or "").strip() or state.get("run_base_sha") or state.get("base_sha") or ""
+
+
+def _finalize_owner(state):
+    """'parent' when the spawning orchestrator runs the final full-suite gate; any other value is this run's own."""
+    return "parent" if str(var(state, "finalize_owner", "self")).strip().lower() == "parent" else "self"
+
+
+def _note_finalize_owner(state, u):
+    """Ledger, once, a finalize_owner value that is neither self nor parent: it is read as self."""
+    owner = str(var(state, "finalize_owner", "self")).strip()
+    line = f"verify: finalize_owner {owner!r} is neither self nor parent; read as self"
+    if owner.lower() not in ("self", "parent") and line not in as_list(state.get("decisions")):
+        ledger(state, u, line)
+
+
+def _published(state):
+    """True once the run's work went out: a publish step ran, or a CI fix, PR review round or base sync is under way."""
+    return (truthy(state.get("publish_done")) or truthy(state.get("pr_published")) or truthy(state.get("ci_fix_active"))
+            or as_int(state.get("pr_review_rounds")) > 0 or truthy(state.get("base_sync_active")))
+
+
+def _waived(state, root, tree):
+    """True when the finalize run was waived for a tree whose code equals `tree`."""
+    waived = as_dict(state.get("finalize_waived")).get("tree") or ""
+    return bool(waived) and _code_changed(state, root, waived, tree) == "unchanged"
+
+
+def _final_tier(state, root):
+    """True for a review round that runs the full suite: this run owns the final gate, no subtask is under review,
+    nothing is published yet and the tree is not waived."""
+    if _finalize_owner(state) != "self" or _subtask_phase(state) or _published(state):
+        return False
+    return not as_dict(state.get("finalize_waived")).get("tree") or not _waived(state, root, _worktree_tree(root))
+
+
+def _record_lookup(state, root, tier):
+    """(path, record) of the `tier` verification record for the worktree as it stands, the planning store aside;
+    (None, None) when there is none."""
+    return _shared("verify_record").lookup(state.get("project_dir") or root, tier, exclude=_plans_dirs(state, root))
+
+
+def _record_commands(record):
+    return [r["cmd"].strip() for r in as_list(as_dict(record).get("results"))
+            if isinstance(r, dict) and isinstance(r.get("cmd"), str) and r["cmd"].strip()]
+
+
+def _note_round_checks(state, u):
+    """Add the commands of the coder's round record for the current tree to round_checks, first seen first."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    _, record = _record_lookup(state, root, "round")
+    checks = list(as_list(state.get("round_checks")))
+    new = [c for c in dict.fromkeys(_record_commands(record)) if c not in checks]
+    if new:
+        u["round_checks"] = checks + new
+
+
+def _round_tier_commands(state, u, root, cmds):
+    """The review commands of a round-tier round: the detected full suite dropped, the round record's commands added."""
+    try:
+        arr = json.loads(cmds)
+    except (TypeError, json.JSONDecodeError):
+        return cmds
+    if not isinstance(arr, list):
+        return cmds
+    full = detected_test_command(state.get("project_dir") or root)
+    kept = [c for c in arr if not (full and isinstance(c, str) and c.strip() == full)]
+    _, record = _record_lookup(state, root, "round")
+    added = [c for c in dict.fromkeys(_record_commands(record)) if c != full and c not in kept]
+    if len(kept) == len(arr) and not added:
+        return cmds
+    dropped = f"dropped the full suite `{full}`" if len(kept) < len(arr) else "dropped nothing"
+    ledger(state, u, f"verify: round tier: {dropped}; added the round record command(s): {'; '.join(added) or 'none'}")
+    return json.dumps(kept + added)
+
+
 def build_gauntlet_prompt(state):
     u = {}
     root = state.get("git_root") or state.get("project_dir") or "."
@@ -4370,6 +4505,12 @@ def build_gauntlet_prompt(state):
             cmds = json.dumps(arr + extra)
             over = f" ({capped} more dropped by the cap)" if capped else ""
             ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
+    _note_finalize_owner(state, u)
+    tier = "final" if _final_tier(state, root) else "round"
+    if tier == "round":
+        cmds = _round_tier_commands(state, u, root, cmds)
+    u["review_verification_tier"] = tier
+    u["review_baseline_floor"] = _baseline_floor(state)
     u["review_verification_commands"] = cmds
     carried = _carried(state) if _subtask_phase(state) else []
     owed = _owed_carried(state, carried)
@@ -4409,7 +4550,7 @@ def build_gauntlet_prompt(state):
         lines += ["Local-run recipe / usage suites:", note]
     u["gauntlet_prompt"] = "\n".join(lines)
     tree = _worktree_tree(root)
-    key = _inputs_key(tree, u["gauntlet_prompt"], cmds, u["review_carried_failures"])
+    key = _inputs_key(tree, u["gauntlet_prompt"], cmds, u["review_carried_failures"], tier)
     u["head_sha"] = head
     u["prior_review_decisions"] = "\n".join(_review_decisions(state))
     last = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}
@@ -4419,8 +4560,8 @@ def build_gauntlet_prompt(state):
                          "and it passed")
         u["_next"] = "route_gauntlet"
         return u
-    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": tree, "review_key": key, "started": now_iso(),
-                                  **({"adoption": True, "adoption_due": due} if adopting else {})}]
+    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": tree, "review_key": key, "tier": tier,
+                                  "started": now_iso(), **({"adoption": True, "adoption_due": due} if adopting else {})}]
     if adopting:
         # only this round reviews them as an adoption round; a BLOCKED one leaves later rounds normal
         u["probe_adoption"] = {**adoption, "due": []}
@@ -4600,6 +4741,11 @@ def route_gauntlet(state):
     rounds = as_list(state.get("round_heads"))
     n = (rounds[-1].get("round") if rounds and isinstance(rounds[-1], dict) else None) or len(rounds)
     if rounds and isinstance(rounds[-1], dict):
+        # a reused round is routed again with its verdict already recorded; its finalize run was counted then
+        ran = (_FULL_SUITE_RAN_RE.search(_gauntlet_header(text))
+               or any(_FULL_SUITE_RAN_BLOCKER_RE.match(str(b)) for b in blockers))
+        if "verdict" not in rounds[-1] and ran:
+            u["finalize_runs"] = as_int(state.get("finalize_runs")) + 1
         lane_blockers = {}
         for b in blockers:
             lane_blockers.setdefault(_lane_of({}, b), []).append(b)
@@ -4628,6 +4774,10 @@ def route_gauntlet(state):
         real = [b for b in blockers if not review_fault(b)]
         _escalate_size(state, u, f"review round {n} BLOCKED: {real[0][:160]}" if real else
                        f"review round {n} incomplete ({', '.join(incomplete or ['pipeline'])})")
+        undecided = [b for b in real if b.startswith(FULL_SUITE_UNDECIDED)]
+        if undecided:
+            snapshot(state, u, "gauntlet")
+            return _finalize_unavailable(state, u, "build_gauntlet_prompt", "\n".join(undecided))
         if real:
             u["gauntlet_blockers"] = real
             u["_next"] = "triage_findings"
@@ -4743,6 +4893,11 @@ def triage_route(state):
     triage = [t for t in as_list(state.get("triage")) if isinstance(t, dict) and t.get("finding")]
     if not triage:
         triage = [{"finding": b, "action": "fix"} for b in blockers]
+    judged = {str(t.get("finding")) for t in triage}
+    for b in blockers:
+        if str(b).startswith(FULL_SUITE_RED) and str(b) not in judged:
+            triage.append({"finding": str(b), "action": "fix"})
+            ledger(state, u, f"triage: an untriaged FULL-SUITE RECORD RED blocker stands as a fix: {tail(str(b), 120)}")
     rigor = (state.get("quality_rigor") or "production").lower()
     fixes, escalations = [], []
     rejected = list(as_list(state.get("rejected_findings")))
@@ -4751,6 +4906,10 @@ def triage_route(state):
     for t in triage:
         finding = str(t.get("finding", ""))
         action = t.get("action") or "fix"
+        if finding.startswith(FULL_SUITE_RED) and action != "fix":
+            ledger(state, u, f"triage: {action} overridden, a FULL-SUITE RECORD RED blocker is always fixed: "
+                             f"{tail(finding, 120)}")
+            action = "fix"
         sev = (str(t.get("severity") or "") + " " + finding).lower()
         critical = "🔴" in sev or "critical" in sev or "[correctness]" in sev
         citation = str(t.get("citation") or "")
@@ -5253,6 +5412,149 @@ def _adoption_publish_text(state, u):
     return text
 
 
+def _finalize_due(state, u):
+    """True when the tree about to be published needs the finalize run; a green record for it is noted instead."""
+    if _finalize_owner(state) != "self" or _published(state):
+        return False
+    root = state.get("git_root") or state.get("project_dir") or "."
+    tree = _worktree_tree(root)
+    if _waived(state, root, tree):
+        return False
+    # a green run whose record could not be written still covers its tree; without this pr_gate would loop back
+    green = state.get("finalize_tree") or ""
+    if green and _code_changed(state, root, green, tree) == "unchanged":
+        return False
+    _, record = _record_lookup(state, root, "finalize")
+    if record is not None and _shared("verify_record").is_green(record, "finalize"):
+        u["finalize_tree"] = record["tree"]
+        return False
+    ledger(state, u, "finalize: no green finalize record covers the tree about to be published -> finalize_gate")
+    return True
+
+
+def _finalize_item(item):
+    """One finalize step that did not pass: its header line, then its output tail trimmed to FINALIZE_ITEM_CHARS."""
+    head = f"{item.get('role')} `{item.get('cmd') or '(none)'}`: {item.get('verdict')} (exit {item.get('exit')})"
+    if str(item.get("note") or "").strip():
+        head += f"; {str(item['note']).strip()}"
+    out = str(item.get("tail") or "").strip()
+    return head + (f"\n{tail(out, FINALIZE_ITEM_CHARS)}" if out else "")
+
+
+def _last_json(text):
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    try:
+        found = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError:
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _finalize_unavailable(state, u, back, detail):
+    """Ask how to go on when the finalize run could not decide the tree; an undecided run is never read as green."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    tree = _worktree_tree(root)
+    u["finalize_return"] = back
+    ledger(state, u, f"finalize: undecided on tree {tree or '(unknown)'} ({tail(detail, 300)}); never read as green")
+    return raise_escalation(state, u, escalation(
+        "finalize_unavailable",
+        "The finalize gate (full suite, formatter, lint) could not show the tree about to be published green, and "
+        "an undecided run is never read as green. Continue with the full suite not run for this tree, retry the "
+        "run, or stop?",
+        [option(FINALIZE_CONTINUE, True, "the report and the PR body say the full suite was not run, with the "
+                                         "stated reason; the run goes on"),
+         option(FINALIZE_RETRY, False, "runs the finalize gate again on the same tree"),
+         option(FINALIZE_STOP)],
+        evidence=tail(detail, 2500), data={"decision": f"finalize_unavailable:{tree}", "tree": tree, "return": back}))
+
+
+def finalize_gate(state):
+    u = {}
+    root = state.get("git_root") or state.get("project_dir") or "."
+    back = "build_gauntlet_prompt" if state.get("finalize_return") == "build_gauntlet_prompt" else "pr_gate"
+    runs = as_int(state.get("finalize_runs")) + 1
+    u["finalize_runs"] = runs
+    env = {**os.environ, "TEST_TIMEOUT": os.environ.get("TEST_TIMEOUT") or str(FINALIZE_TEST_SECS)}
+    lock = str(var(state, "build_lock") or "")
+    if lock:
+        env["LLM_AGENT_VAR_BUILD_LOCK"] = lock
+    script = os.path.join(SHARED_DIR, "finalize_gate.sh")
+    try:
+        p = subprocess.run([_shared("base_suite").bash_program(), script, state.get("project_dir") or root,
+                            "sisyphus-next", _baseline_floor(state)],
+                           capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                           timeout=FINALIZE_GATE_SECS, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _finalize_unavailable(state, u, back, f"the finalize gate did not finish: {e}")
+    summary = _last_json(p.stdout)
+    status = summary.get("status")
+    if p.returncode != 0 or status not in ("green", "red", "unavailable"):
+        return _finalize_unavailable(state, u, back, f"the finalize gate exited {p.returncode} with no status: "
+                                                     f"{tail(p.stderr or p.stdout or 'no output', 600)}")
+    items = [i for i in as_list(summary.get("items")) if isinstance(i, dict)]
+    tree = summary.get("tree") or ""
+    if status == "unavailable" or any(i.get("verdict") == "timed_out" for i in items):
+        shown = [_finalize_item(i) for i in items if i.get("verdict") not in ("green", "pre-existing")]
+        return _finalize_unavailable(state, u, back, "\n\n".join(shown) or tail(p.stderr, 600) or "no detail")
+    if status == "green":
+        u["finalize_tree"] = tree
+        ledger(state, u, f"finalize: run {runs} green on tree {tree or '(unknown)'}")
+        u["_next"] = "build_gauntlet_prompt" if back == "build_gauntlet_prompt" else "pr_gate"
+        return u
+    failing = [i for i in items if i.get("verdict") not in _shared("verify_record").PASSING]
+    u.update(fix_source="finalize_gate", fix_note="\n\n".join(_finalize_item(i) for i in failing) or tail(p.stdout, 1500))
+    ledger(state, u, f"finalize: run {runs} red on tree {tree or '(unknown)'} "
+                     f"({', '.join(str(i.get('role')) for i in failing) or 'no failing step named'}) -> coder round")
+    u["_next"] = "compose_fix"
+    return u
+
+
+def _accept_red_suite(state, u):
+    """A review whose FULL-SUITE RECORD RED blocker is accepted unresolved owes no finalize run on that tree."""
+    red = [str(f) for f in as_list(state.get("fix_items")) if str(f).startswith(FULL_SUITE_RED)]
+    if not red:
+        return
+    tree = _worktree_tree(state.get("git_root") or state.get("project_dir") or ".")
+    u["finalize_waived"] = {"tree": tree, "red": True,
+                            "reason": f"accepted unresolved at the user's say-so: {tail(red[0], 300)}"}
+    ledger(state, u, f"finalize: the red full suite on tree {tree or '(unknown)'} was accepted unresolved")
+
+
+def _note_published_tree(state, u):
+    """Name the paths where the published tree differs from the finalize record's. Advisory: the run goes on."""
+    recorded = state.get("finalize_tree") or ""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    published = git_out(root, "rev-parse", "HEAD^{tree}")
+    if not recorded or not published or _code_changed(state, root, recorded, published) != "changed":
+        return
+    exclude = _plans_exclude(state, root)
+    paths = _nul_names(git_out(root, "diff-tree", "-r", "-z", "--name-only", recorded, published,
+                               *(["--", ".", *exclude] if exclude else [])))
+    shown = ", ".join(paths[:10]) + (f" (and {len(paths) - 10} more)" if len(paths) > 10 else "")
+    line = (f"the published tree {published} differs from the finalize record's tree {recorded}: "
+            f"{shown or 'paths unknown'}")
+    ledger(state, u, f"publish: {line}; advisory, the run goes on")
+    u["attention_notes"] = list(as_list(state.get("attention_notes"))) + [line]
+
+
+def _verification_lines(state, g):
+    """The report's Verification line, and the not-run or red-accepted line a waived finalize adds to the PR body."""
+    waived = as_dict(g("finalize_waived", {}))
+    mode = re.findall(r"^Baseline mode:[ \t]*(.*?)[ \t]*$", str(g("coder_result") or ""), re.M)
+    if _finalize_owner(state) == "parent":
+        tier, finalize = "round", "parent-owned"
+    elif waived.get("tree"):
+        tier, finalize = "waived", f"waived: {waived.get('reason') or 'no reason recorded'}"
+    else:
+        runs = as_int(g("finalize_runs", 0))
+        tier, finalize = "final", f"finalize ran {runs} time(s)" if runs else "reused"
+    lines = [f"Verification: tier {tier}; {finalize}; baseline mode {mode[-1] if mode else 'not reported'}"]
+    if tier == "waived":
+        what = "RED" if truthy(waived.get("red")) else "NOT RUN"
+        lines.append(f"Full suite {what} at finalize: {waived.get('reason') or 'no reason recorded'}")
+    return lines
+
+
 def _note_tree_after_review(state, u):
     """Name the paths that changed after the last passing review round. Advisory: the run goes on either way."""
     passed = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict) and r.get("verdict") == "PASS"]
@@ -5287,6 +5589,10 @@ def pr_gate(state):
     if _start_probe_adoption(state, u):
         return u
     _note_tree_after_review(state, u)
+    if _finalize_due(state, u):
+        u["finalize_return"] = "pr_gate"
+        u["_next"] = "finalize_gate"
+        return u
     actions = as_dict(state.get("git_actions"))
     wanted = any(truthy(actions.get(k)) for k in ("commit", "push", "open_pr"))
     if not wanted:
@@ -5505,6 +5811,7 @@ def ci_gate(state):
         u["_next"] = "final_report"
         return u
     if task.get("kind") == "publish":
+        u["publish_done"] = True
         u["ci_fix_active"] = False
         rows = _publish_checks(state)
         failed = [r for r in rows if not r[1]]
@@ -5528,6 +5835,7 @@ def ci_gate(state):
             # a later CI fix on this PR then goes out as a plain push that posts only the rounds after these
             u["pr_published"] = bool(task.get("open_pr"))
             u["review_rounds_posted"] = len([r for r in as_list(state.get("round_heads")) if isinstance(r, dict)])
+        _note_published_tree(state, u)
     owns = task.get("open_pr") and not truthy(state.get("delegated"))
     u["ci_owner"] = bool(owns)
     linked = owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or "")
@@ -7059,6 +7367,7 @@ def _assemble_report(state, u, pre_publish=False):
         else:
             lines.append(f"Changed during review and NOT adopted: {paths} (review round {s.get('round')}, "
                          f"{s.get('kind')})")
+    lines += _verification_lines(state, g)
     lines.append("")
     subs = as_list(g("subtasks", []))
     if len(subs) > 1:
@@ -7111,6 +7420,7 @@ def _assemble_report(state, u, pre_publish=False):
         lines.append(f"- PR review watch: {g('pr_review_status') or 'not started'} after "
                      f"{as_int(g('pr_review_rounds', 0))} fix round(s)")
     lines.append("")
+    lines += ["## Round checks"] + ([f"- `{c}`" for c in as_list(g("round_checks", []))] or ["- none"]) + [""]
     digest = as_list(g("autonomous_digest", []))
     if digest:
         lines += ["## Decisions taken autonomously"] + [f"- {d}" for d in digest] + [""]
@@ -7223,7 +7533,8 @@ GATES = {
     "triage_route": triage_route, "observability_gate": observability_gate,
     "retro_size_route": retro_size_route, "retro_route": retro_route,
     "observability_route": observability_route, "whetstone_gate": whetstone_gate, "pr_gate": pr_gate,
-    "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply, "base_check": base_check,
+    "finalize_gate": finalize_gate, "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply,
+    "base_check": base_check,
     "pr_review_poll": pr_review_poll, "pr_review_route": pr_review_route, "pr_review_apply": pr_review_apply,
     "pr_review_resolve": pr_review_resolve, "pr_review_reply": pr_review_reply,
     "final_report": final_report,

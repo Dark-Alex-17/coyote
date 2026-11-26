@@ -65,6 +65,12 @@ variables:
   - name: review_cadence
     description: "When the post-coder review passes run: 'task' (default: this Sisyphus runs the review gauntlet on its own work) or 'batch' (set by a parent orchestrator running micro-granularity tasks: coder verification only; the orchestrator runs the full review panel once over the whole batch). Never set 'batch' for a standalone run."
     default: 'task'
+  - name: finalize_owner
+    description: "Who runs the final full-suite gate (the single full suite, formatter and lint run on the tree about to be published): 'self' (default: this run's final review rounds run it and the publish step waits for a green record) or 'parent': the spawning orchestrator runs the final full-suite gate, so every review here stays at round tier and the run does not finalize. Any other value counts as self, with a ledger note."
+    default: 'self'
+  - name: run_base
+    description: "The commit the parent orchestrator's run started from; when set, the coder's baseline_floor, the review's baseline_floor and the finalize gate's floor use it, so a red suite is judged only against the suite at that commit. Empty: this run's own run base."
+    default: ''
   - name: retrospective
     description: "Who runs the run-closing design retrospective: 'run' (default: this Sisyphus runs it once after a green whole-task review of work it judges large) or 'parent' (set by a parent orchestrator such as architect-next that runs it once over its whole run, so this run skips it). Graph-only, absent from the prose sisyphus."
     default: 'run'
@@ -350,6 +356,14 @@ initial_state:
   debris_exemptions_new: []
   prior_review_decisions: ''
   debris_exclude: ''
+  # --- verification tiers ---
+  review_verification_tier: 'round'
+  review_baseline_floor: ''
+  round_checks: []
+  finalize_runs: 0
+  finalize_waived: {}
+  finalize_return: ''
+  finalize_tree: ''
   # --- design retrospective ---
   retro_done: false
   retro_diff_stat: ''
@@ -377,6 +391,7 @@ initial_state:
   publish_retries: 0
   publish_checks: []
   pr_published: false
+  publish_done: false
   ci_fix_active: false
   review_rounds_posted: 0
   push_fix_retries: 0
@@ -1809,6 +1824,7 @@ nodes:
       baseline_floor: '{{coder_baseline_floor}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'
+      verify_tier: 'round'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -2083,6 +2099,8 @@ nodes:
       verification_commands: '{{review_verification_commands}}'
       carried_failures: '{{review_carried_failures}}'
       debris_exclude: '{{debris_exclude}}'
+      verification_tier: '{{review_verification_tier}}'
+      baseline_floor: '{{review_baseline_floor}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'
     timeout: 0
@@ -2405,8 +2423,16 @@ nodes:
   pr_gate:
     id: pr_gate
     type: script
-    description: First, once per run, one review round over the tests the last passing round's probe lane wrote (they become part of the reviewed change); then commit/push/PR only when the brief asked for it, naming the adopted tests; parallel mode drains the inbox before the final push.
+    description: First, once per run, one review round over the tests the last passing round's probe lane wrote (they become part of the reviewed change); then, before anything is published, a tree with no green finalize record goes to finalize_gate (asked to publish or not); then commit/push/PR only when the brief asked for it, naming the adopted tests; parallel mode drains the inbox before the final push.
     script: scripts/pr_gate.py
+    fallback: end_failure
+
+  finalize_gate:
+    id: finalize_gate
+    type: script
+    description: The run's single full suite, formatter and lint on the tree about to be published, when no green finalize record covers it; red goes to a coder round, unavailable to an escalation.
+    script: scripts/finalize_gate.py
+    timeout: 3600
     fallback: end_failure
 
   check_inbox_final:

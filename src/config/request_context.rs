@@ -24379,6 +24379,7 @@ mod tests {
                             "explore_slice_solo",
                             "explore_slice_team",
                             "final_report",
+                            "finalize_gate",
                             "git_ops",
                             "headless_judge",
                             "inbox_route_pre",
