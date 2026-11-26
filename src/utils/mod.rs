@@ -81,18 +81,26 @@ pub enum OutputSink {
 }
 
 impl OutputSink {
-    pub fn pick(json_output: bool, when_json: OutputSink) -> Self {
+    fn pick(json_output: bool, when_json: OutputSink) -> Self {
         if json_output { when_json } else { Self::Stdout }
     }
 
     /// For warnings and progress the user should still see under `--json`.
     pub fn diagnostic() -> Self {
-        Self::pick(json_output(), Self::Stderr)
+        Self::diagnostic_under(json_output())
     }
 
     /// For lines that only narrate a run and are dropped under `--json`.
     pub fn chatter() -> Self {
-        Self::pick(json_output(), Self::Suppressed)
+        Self::chatter_under(json_output())
+    }
+
+    fn diagnostic_under(json_output: bool) -> Self {
+        Self::pick(json_output, Self::Stderr)
+    }
+
+    fn chatter_under(json_output: bool) -> Self {
+        Self::pick(json_output, Self::Suppressed)
     }
 
     pub fn println(self, line: impl Display) {
@@ -407,20 +415,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pick_is_stdout_without_json_and_the_requested_sink_under_it() {
-        let cases = [
-            (false, OutputSink::Stdout, OutputSink::Stdout),
-            (false, OutputSink::Stderr, OutputSink::Stdout),
-            (false, OutputSink::Suppressed, OutputSink::Stdout),
-            (true, OutputSink::Stdout, OutputSink::Stdout),
-            (true, OutputSink::Stderr, OutputSink::Stderr),
-            (true, OutputSink::Suppressed, OutputSink::Suppressed),
+    fn sinks_are_stdout_without_json_and_the_requested_sink_under_it() {
+        type SinkUnder = fn(bool) -> OutputSink;
+        let pick_stdout: SinkUnder = |json| OutputSink::pick(json, OutputSink::Stdout);
+        let pick_stderr: SinkUnder = |json| OutputSink::pick(json, OutputSink::Stderr);
+        let pick_suppressed: SinkUnder = |json| OutputSink::pick(json, OutputSink::Suppressed);
+        let cases: [(&str, SinkUnder, bool, OutputSink); 10] = [
+            ("pick stdout", pick_stdout, false, OutputSink::Stdout),
+            ("pick stderr", pick_stderr, false, OutputSink::Stdout),
+            (
+                "pick suppressed",
+                pick_suppressed,
+                false,
+                OutputSink::Stdout,
+            ),
+            ("pick stdout", pick_stdout, true, OutputSink::Stdout),
+            ("pick stderr", pick_stderr, true, OutputSink::Stderr),
+            (
+                "pick suppressed",
+                pick_suppressed,
+                true,
+                OutputSink::Suppressed,
+            ),
+            (
+                "diagnostic",
+                OutputSink::diagnostic_under,
+                false,
+                OutputSink::Stdout,
+            ),
+            (
+                "diagnostic",
+                OutputSink::diagnostic_under,
+                true,
+                OutputSink::Stderr,
+            ),
+            (
+                "chatter",
+                OutputSink::chatter_under,
+                false,
+                OutputSink::Stdout,
+            ),
+            (
+                "chatter",
+                OutputSink::chatter_under,
+                true,
+                OutputSink::Suppressed,
+            ),
         ];
-        for (json_output, when_json, expected) in cases {
+        for (label, sink_under, json_output, expected) in cases {
             assert_eq!(
-                OutputSink::pick(json_output, when_json),
+                sink_under(json_output),
                 expected,
-                "json_output {json_output}, when_json {when_json:?}"
+                "{label}, json_output {json_output}"
             );
         }
     }

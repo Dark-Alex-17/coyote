@@ -679,11 +679,11 @@ async fn run(
     ctx.top_level_agent_started();
     match is_repl {
         false => {
-            let json_output = json_output();
-            if json_output {
+            let json_report = json_output();
+            if json_report {
                 ctx.render_mode = RenderMode::Silent;
             }
-            let run_stats = json_output.then(|| ctx.begin_run_stats());
+            let run_stats = json_report.then(|| ctx.begin_run_stats());
             let started_at = Instant::now();
             let model = ctx.current_model().id();
             let session_id = ctx.session.as_ref().map(|s| s.name().to_string());

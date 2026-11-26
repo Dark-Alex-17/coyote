@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_body_drops_the_spec() {
+    fn chat_body_has_no_format_key_once_the_spec_is_cleared() {
         let client = CohereClient {
             app_config: Arc::new(AppConfig::default()),
             config: CohereConfig {
@@ -302,8 +302,10 @@ mod tests {
             model: Model::new("cohere-test", "command-test"),
         };
 
-        let mut data = structured_output_data();
-        client.drop_unwritten_structured_output(&mut data);
+        let data = ChatCompletionsData {
+            structured_output: None,
+            ..structured_output_data()
+        };
         let request_data = prepare_chat_completions(&client, data).unwrap();
 
         assert!(

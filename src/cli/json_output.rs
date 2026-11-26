@@ -1,6 +1,4 @@
-use crate::config::RunStatsSnapshot;
-use crate::config::{RequestContext, RunStats};
-use anyhow::Result;
+use crate::config::{RequestContext, RunStats, RunStatsSnapshot};
 use fancy_regex::Regex;
 use log::error;
 use serde::Serialize;
@@ -92,7 +90,7 @@ impl DirectiveOutcome {
 /// report is the only stdout output; the returned error still goes to
 /// stderr through `render_error`.
 pub fn emit(
-    result: &Result<DirectiveOutcome>,
+    result: &anyhow::Result<DirectiveOutcome>,
     fallback_model: String,
     fallback_session: Option<String>,
     stats: &RunStats,
@@ -114,7 +112,7 @@ pub fn emit(
 /// A failed directive has no outcome, so its report falls back to the model
 /// and session read before the run started.
 fn report(
-    result: &Result<DirectiveOutcome>,
+    result: &anyhow::Result<DirectiveOutcome>,
     fallback_model: String,
     fallback_session: Option<String>,
     stats: RunStatsSnapshot,
@@ -225,12 +223,13 @@ mod tests {
 
     #[test]
     fn report_takes_model_and_session_from_the_outcome_or_the_fallback() {
-        let succeeded: Result<DirectiveOutcome> = Ok(DirectiveOutcome {
+        let succeeded: anyhow::Result<DirectiveOutcome> = Ok(DirectiveOutcome {
             output: "done".into(),
             model: "outcome:m".into(),
             session_id: Some("outcome-session".into()),
         });
-        let failed: Result<DirectiveOutcome> = Err(anyhow!("inner cause").context("outer failure"));
+        let failed: anyhow::Result<DirectiveOutcome> =
+            Err(anyhow!("inner cause").context("outer failure"));
 
         let ok = report(
             &succeeded,

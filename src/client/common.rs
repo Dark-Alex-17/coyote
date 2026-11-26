@@ -61,16 +61,8 @@ pub trait Client: Sync + Send {
 
     fn completion_data(&self, input: &Input, stream: bool) -> Result<ChatCompletionsData> {
         let mut data = input.prepare_completion_data(self.model(), stream)?;
-        self.drop_unwritten_structured_output(&mut data);
+        drop_unwritten_structured_output(self.native_structured_output_dialect(), &mut data);
         Ok(data)
-    }
-
-    /// A client with no native dialect has no way to send the spec, so it
-    /// never reaches that client's body builder.
-    fn drop_unwritten_structured_output(&self, data: &mut ChatCompletionsData) {
-        if self.native_structured_output_dialect().is_none() {
-            data.structured_output = None;
-        }
     }
 
     fn build_client(&self) -> Result<ReqwestClient> {
@@ -288,6 +280,17 @@ pub trait Client: Sync + Send {
                 return;
             }
         }
+    }
+}
+
+/// A client with no native dialect has no way to send the spec, so it
+/// never reaches that client's body builder.
+fn drop_unwritten_structured_output(
+    dialect: Option<SchemaDialect>,
+    data: &mut ChatCompletionsData,
+) {
+    if dialect.is_none() {
+        data.structured_output = None;
     }
 }
 
@@ -2733,6 +2736,125 @@ mod tests {
         "/outputConfig/textFormat",
     ];
 
+    fn structured_model(client_name: &str, name: &str) -> Model {
+        let mut data = ModelData::new(name);
+        data.supports_structured_output = true;
+        Model::from_config(client_name, &[data]).remove(0)
+    }
+
+    /// An input whose role carries the spec of `structured_output_data`.
+    fn structured_input() -> Input {
+        let mut role = crate::config::Role::default();
+        role.set_structured_output(structured_output_data().structured_output);
+        Input::from_str(&quiet_ctx(), "hello", Some(role)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn completion_data_keeps_the_spec_only_for_a_client_with_a_dialect() {
+        use super::super::{cohere, openai, vertexai};
+
+        let input = structured_input();
+        let http = ReqwestClient::new();
+        let prepared_has_spec = |client: &dyn Client| {
+            input
+                .prepare_completion_data(client.model(), false)
+                .unwrap()
+                .structured_output
+                .is_some()
+        };
+        // Label, spec present before the client step, spec present after it,
+        // and the request body built from the client's data.
+        let mut rows: Vec<(&str, bool, bool, Value)> = vec![];
+
+        let config = openai::OpenAIConfig {
+            name: Some("spec-openai".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let client = OpenAIClient {
+            app_config: Arc::new(AppConfig {
+                clients: vec![ClientConfig::OpenAIConfig(config.clone())],
+                ..AppConfig::default()
+            }),
+            config,
+            model: structured_model("spec-openai", "gpt-test"),
+        };
+        let data = client.completion_data(&input, false).unwrap();
+        let kept = data.structured_output.is_some();
+        let (request_data, _) = openai::prepare_chat_completions(&client, &http, data)
+            .await
+            .unwrap();
+        rows.push((
+            "openai",
+            prepared_has_spec(&client),
+            kept,
+            request_data.body,
+        ));
+
+        let client = CohereClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: cohere::CohereConfig {
+                name: Some("spec-cohere".into()),
+                api_key: Some("co-key".into()),
+                ..Default::default()
+            },
+            model: structured_model("spec-cohere", "command-test"),
+        };
+        let data = client.completion_data(&input, false).unwrap();
+        let kept = data.structured_output.is_some();
+        let request_data = cohere::prepare_chat_completions(&client, data).unwrap();
+        rows.push((
+            "cohere",
+            prepared_has_spec(&client),
+            kept,
+            request_data.body,
+        ));
+
+        set_access_token(
+            "spec-vertex",
+            "vertex-at".into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        let client = VertexAIClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: vertexai::VertexAIConfig {
+                name: Some("spec-vertex".into()),
+                project_id: Some("project".into()),
+                location: Some("us-central1".into()),
+                ..Default::default()
+            },
+            model: structured_model("spec-vertex", "mistral-large"),
+        };
+        let data = client.completion_data(&input, false).unwrap();
+        let kept = data.structured_output.is_some();
+        let request_data =
+            vertexai::prepare_chat_completions(&client, data, &vertexai::ModelCategory::Mistral)
+                .unwrap();
+        rows.push((
+            "vertex mistral",
+            prepared_has_spec(&client),
+            kept,
+            request_data.body,
+        ));
+
+        let expected = [
+            ("openai", true, true, true),
+            ("cohere", true, false, false),
+            ("vertex mistral", true, false, false),
+        ];
+        let actual: Vec<_> = rows
+            .iter()
+            .map(|(label, prepared, kept, body)| {
+                let has_format = NATIVE_FORMAT_POINTERS
+                    .into_iter()
+                    .any(|pointer| body.pointer(pointer).is_some());
+                (*label, *prepared, *kept, has_format)
+            })
+            .collect();
+        assert_eq!(actual, expected, "bodies: {rows:?}");
+    }
+
     /// Label, expected dialect, expected format pointer, the client's
     /// reported dialect, and the request body it built.
     type NativeFormatRow = (
@@ -2751,9 +2873,7 @@ mod tests {
         use std::str::FromStr;
 
         fn written_data(client: &dyn Client) -> ChatCompletionsData {
-            let mut data = structured_output_data();
-            client.drop_unwritten_structured_output(&mut data);
-            data
+            client.completion_data(&structured_input(), false).unwrap()
         }
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2782,7 +2902,7 @@ mod tests {
             let client = OpenAIClient {
                 app_config: app_config(vec![ClientConfig::OpenAIConfig(config.clone())]),
                 config,
-                model: Model::new("so-openai", "gpt-test"),
+                model: structured_model("so-openai", "gpt-test"),
             };
             let (request_data, _) = runtime
                 .block_on(openai::prepare_chat_completions(
@@ -2808,7 +2928,7 @@ mod tests {
                 api_key: Some("azure-key".into()),
                 ..Default::default()
             },
-            model: Model::new("so-azure", "gpt-test"),
+            model: structured_model("so-azure", "gpt-test"),
         };
         let request_data =
             azure_openai::prepare_chat_completions(&client, written_data(&client)).unwrap();
@@ -2837,7 +2957,7 @@ mod tests {
                     wire_api,
                     ..Default::default()
                 },
-                model: Model::new("so-compat", "gpt-test"),
+                model: structured_model("so-compat", "gpt-test"),
             };
             let (request_data, _) = runtime
                 .block_on(openai_compatible::prepare_chat_completions(
@@ -2863,7 +2983,7 @@ mod tests {
         let client = ClaudeClient {
             app_config: app_config(vec![ClientConfig::ClaudeConfig(config.clone())]),
             config,
-            model: Model::new("so-claude", "claude-test"),
+            model: structured_model("so-claude", "claude-test"),
         };
         let request_data = runtime
             .block_on(claude::prepare_chat_completions(
@@ -2888,7 +3008,7 @@ mod tests {
         let client = GeminiClient {
             app_config: app_config(vec![ClientConfig::GeminiConfig(config.clone())]),
             config,
-            model: Model::new("so-gemini", "gemini-test"),
+            model: structured_model("so-gemini", "gemini-test"),
         };
         let request_data = runtime
             .block_on(gemini::prepare_chat_completions(
@@ -2934,7 +3054,7 @@ mod tests {
                     location: Some("us-central1".into()),
                     ..Default::default()
                 },
-                model: Model::new("so-vertex", real_name),
+                model: structured_model("so-vertex", real_name),
             };
             let category = vertexai::ModelCategory::from_str(real_name).unwrap();
             let request_data =
@@ -2958,7 +3078,7 @@ mod tests {
                 region: Some("us-east-1".into()),
                 ..Default::default()
             },
-            model: Model::new("so-bedrock", "anthropic.claude-sonnet-4"),
+            model: structured_model("so-bedrock", "anthropic.claude-sonnet-4"),
         };
         let request = client
             .chat_completions_builder(&http, written_data(&client))
@@ -2981,7 +3101,7 @@ mod tests {
                 api_key: Some("co-key".into()),
                 ..Default::default()
             },
-            model: Model::new("so-cohere", "command-test"),
+            model: structured_model("so-cohere", "command-test"),
         };
         let request_data =
             cohere::prepare_chat_completions(&client, written_data(&client)).unwrap();

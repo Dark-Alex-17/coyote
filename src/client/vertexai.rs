@@ -1137,10 +1137,12 @@ mod tests {
     }
 
     #[test]
-    fn mistral_body_drops_the_spec() {
+    fn mistral_body_has_no_format_key_once_the_spec_is_cleared() {
         let client = mistral_client("vertex-mistral-structured-test");
-        let mut data = structured_output_data();
-        client.drop_unwritten_structured_output(&mut data);
+        let data = ChatCompletionsData {
+            structured_output: None,
+            ..structured_output_data()
+        };
 
         let request_data =
             prepare_chat_completions(&client, data, &ModelCategory::Mistral).unwrap();
