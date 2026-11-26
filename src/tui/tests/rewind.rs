@@ -24,6 +24,64 @@ fn a_successful_undo_takes_the_last_exchange_out_of_the_transcript() {
     assert!(!frame.contains(".undo"), "{frame}");
 }
 
+/// Every row a turn drew after its prompt goes with an `.undo`: its tool
+/// rows, a spawned agent's row, a notice and the reply, and the `.undo`
+/// line itself, in the frame drawn next.
+#[test]
+fn an_undo_takes_the_tool_agent_and_notice_rows_of_the_exchange_too() {
+    let mut harness = Harness::standalone(80, 24);
+    exchange(&mut harness);
+    harness.app.begin_turn("second prompt w2t", false);
+    narrate(
+        &mut harness,
+        "call-w2t",
+        "Call web_search_w2t {\"q\":\"x\"}",
+    );
+    finish_tool(&mut harness, "call-w2t", true, None);
+    harness.app.handle_msg(UiMsg::AgentStarted {
+        agent_id: "agent_kid_w2t".to_string(),
+        name: "kid-w2t".to_string(),
+        session_id: None,
+        parent_agent_id: None,
+        parent_session_id: None,
+    });
+    harness.app.handle_msg(UiMsg::AgentFinished {
+        agent_id: "agent_kid_w2t".to_string(),
+        outcome: crate::tui::sink::AgentOutcome::Completed,
+    });
+    harness.app.handle_msg(UiMsg::Notice {
+        kind: NoticeKind::ToolWarning,
+        text: "notice w2t".to_string(),
+    });
+    harness
+        .app
+        .handle_msg(UiMsg::AssistantText("second reply w2t".to_string()));
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let frame = harness.draw();
+    for shown in [
+        "web_search_w2t",
+        "kid-w2t",
+        "notice w2t",
+        "second reply w2t",
+    ] {
+        assert!(frame.contains(shown), "{shown}: {frame}");
+    }
+    harness.app.begin_turn(".undo", true);
+    harness.app.end_turn(true, &TurnOutcome::default());
+    let frame = harness.draw();
+    for gone in [
+        "second prompt w2t",
+        "web_search_w2t",
+        "kid-w2t",
+        "notice w2t",
+        "second reply w2t",
+        ".undo",
+    ] {
+        assert!(!frame.contains(gone), "{gone} is still drawn: {frame}");
+    }
+    assert!(frame.contains("first question"), "{frame}");
+}
+
 /// A session whose one turn took a line mid-way, and the transcript of
 /// it: the prompt, the reply up to the line, the line, the reply after.
 fn mid_turn_turn() -> (RequestContext, Harness) {

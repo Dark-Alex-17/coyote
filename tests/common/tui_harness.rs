@@ -2072,3 +2072,111 @@ pub fn suspend_and_check_handback(pty: &mut Pty, before_suspend: usize) -> usize
     }
     stopped_marker
 }
+
+/// The screen the bytes from `from` on leave behind, row by row, on a
+/// `rows` x `cols` terminal that was blank at `from`: cursor moves, erases
+/// and text are applied, every other sequence is skipped. It reads what
+/// the UI drew of its own accord, with no forced repaint, so a check on it
+/// sees the frames the user saw.
+pub fn screen_after(raw: &[u8], from: usize, rows: u16, cols: u16) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let (rows, cols) = (usize::from(rows), usize::from(cols));
+    let mut grid = vec![vec![' '; cols]; rows];
+    let (mut row, mut col) = (0usize, 0usize);
+    let text = String::from_utf8_lossy(&raw[from.min(raw.len())..]).into_owned();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\x1b' => match chars.get(i + 1) {
+                Some('[') => {
+                    let start = i + 2;
+                    let mut end = start;
+                    while chars
+                        .get(end)
+                        .is_some_and(|c| ('\x20'..='\x3f').contains(c))
+                    {
+                        end += 1;
+                    }
+                    let Some(&finale) = chars.get(end) else { break };
+                    let params: String = chars[start..end].iter().collect();
+                    let private = params.starts_with('?');
+                    let nums: Vec<usize> = params
+                        .trim_start_matches('?')
+                        .split(';')
+                        .map(|n| n.parse().unwrap_or(0))
+                        .collect();
+                    let n = |k: usize, default: usize| {
+                        nums.get(k).copied().filter(|&v| v > 0).unwrap_or(default)
+                    };
+                    match finale {
+                        'H' | 'f' => {
+                            row = (n(0, 1) - 1).min(rows - 1);
+                            col = (n(1, 1) - 1).min(cols - 1);
+                        }
+                        'J' if nums.first() == Some(&2) || nums.first() == Some(&3) => {
+                            grid.iter_mut().for_each(|line| line.fill(' '));
+                        }
+                        'J' => {
+                            grid[row][col..].fill(' ');
+                            grid[row + 1..].iter_mut().for_each(|line| line.fill(' '));
+                        }
+                        'K' => grid[row][col..].fill(' '),
+                        'h' | 'l' if private && params.contains("1049") => {
+                            grid.iter_mut().for_each(|line| line.fill(' '));
+                        }
+                        'A' => row = row.saturating_sub(n(0, 1)),
+                        'B' => row = (row + n(0, 1)).min(rows - 1),
+                        'C' => col = (col + n(0, 1)).min(cols - 1),
+                        'D' => col = col.saturating_sub(n(0, 1)),
+                        'G' => col = (n(0, 1) - 1).min(cols - 1),
+                        _ => {}
+                    }
+                    i = end + 1;
+                }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    let mut j = i + 2;
+                    while j < chars.len()
+                        && chars[j] != '\x07'
+                        && !(chars[j] == '\x1b' && chars.get(j + 1) == Some(&'\\'))
+                    {
+                        j += 1;
+                    }
+                    i = if chars.get(j) == Some(&'\x07') {
+                        j + 1
+                    } else {
+                        j + 2
+                    };
+                }
+                Some(_) => i += 2,
+                None => break,
+            },
+            '\r' => {
+                col = 0;
+                i += 1;
+            }
+            '\n' => {
+                row = (row + 1).min(rows - 1);
+                i += 1;
+            }
+            c if c.is_control() => i += 1,
+            c => {
+                let width = c.width().unwrap_or(0);
+                if width > 0 && col < cols {
+                    grid[row][col] = c;
+                    for k in 1..width {
+                        if col + k < cols {
+                            grid[row][col + k] = ' ';
+                        }
+                    }
+                    col = (col + width).min(cols);
+                }
+                i += 1;
+            }
+        }
+    }
+    grid.into_iter()
+        .map(|line| line.into_iter().collect::<String>().trim_end().to_string())
+        .collect()
+}

@@ -2398,6 +2398,7 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
     use std::time::{Duration, Instant};
 
     use super::common::fake_llm::{FakeLlm, Reply};
+    use super::common::pty::Pty;
     use super::common::tui_harness::*;
     use serial_test::serial;
 
@@ -2665,6 +2666,128 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
             misses.len(),
             misses.join("\n\n")
         );
+    }
+
+    /// Under the slash prefix, after a session was left (so the view starts
+    /// below a divider), a tool turn takes a line while its tool sleeps.
+    /// Read off the screen the UI drew by itself, with no repaint forced:
+    /// the first `/undo` takes the line, the reply after it and the `/undo`
+    /// line off and puts the line in the composer; the second takes the
+    /// prompt and its tool row off and puts the prompt in the composer.
+    #[test]
+    #[serial]
+    fn slash_undo_takes_a_tool_turn_off_the_screen_it_drew_below_a_left_session() {
+        let dir = fresh_config_dir("slash-undo-tool-turn");
+        let _guard = TempDirGuard(dir.clone());
+        let tool_a = dir.join("tool-a");
+        let fake = FakeLlm::start(vec![
+            Reply::Text("before-reply-s4u".to_string()),
+            sleep_call(&tool_a),
+            Reply::Text("tool-reply-s4u".to_string()),
+        ]);
+        write_fake_llm_config_with(&dir, &fake, "command_prefix: slash\n");
+        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let (rows, cols) = pty.size().unwrap();
+
+        // A session left behind: the view starts afresh below its divider.
+        let at = pty.raw().len();
+        pty.send(b"/session\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "entered session temp", at, "the first session");
+        let at = pty.raw().len();
+        pty.send(b"before-s4u\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "before-reply-s4u", at, "the first reply");
+        wait_until_no_pending(&mut pty);
+        let at = pty.raw().len();
+        pty.send(b"/exit session\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "left session temp", at, "the leave divider");
+        let at = pty.raw().len();
+        pty.send(b"/session\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "entered session temp", at, "the second session");
+
+        let turn_at = pty.raw().len();
+        pty.send(b"opener-s4u\r").unwrap();
+        wait_for_file(
+            &mut pty,
+            &dir.join("tool-a-started"),
+            "the sleep tool's start marker",
+        );
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"midline-s4u\r").unwrap();
+        pty.read_for(Duration::from_millis(800));
+        fs::write(dir.join("tool-a-release"), b"").unwrap();
+        wait_for_squeezed_after(&mut pty, "tool-reply-s4u", turn_at, "the tool turn's reply");
+        wait_until_no_pending(&mut pty);
+
+        // The grid is replayed from the start at one size, so nothing in this
+        // test may resize the terminal after the first resize above.
+        let screen = |pty: &Pty| {
+            assert_eq!(
+                pty.size().unwrap(),
+                (rows, cols),
+                "the terminal was resized"
+            );
+            screen_after(pty.raw(), 0, rows, cols).join("\n")
+        };
+        let before = screen(&pty);
+        for shown in [">opener-s4u", "fixture_sleep(", "tool-reply-s4u"] {
+            assert!(
+                squeezed(&before).contains(shown),
+                "{shown} before /undo:\n{before}"
+            );
+        }
+        assert!(
+            !squeezed(&before).contains("before-reply-s4u"),
+            "the left session's rows are still in view:\n{before}"
+        );
+
+        let footer = "fake:fake-model";
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            // Ctrl+U empties the one-line draft without a repaint, which the
+            // screen read below must not get.
+            pty.send(b"\x15").unwrap();
+            pty.read_for(Duration::from_millis(300));
+            pty.send(b"/undo\r").unwrap();
+            pty.read_for(Duration::from_millis(1500));
+            let frame = screen(&pty);
+            drawn.push((
+                composer_row_with_footer(&frame, footer),
+                squeezed(&above_rule(&frame)),
+                frame,
+            ));
+        }
+        quit_declining_save(&mut pty);
+
+        let (draft, above, frame) = &drawn[0];
+        assert_eq!(draft, "midline-s4u", "the first undo's prefill:\n{frame}");
+        assert!(
+            above.contains(">opener-s4u"),
+            "the first undo took the prompt:\n{frame}"
+        );
+        for gone in ["tool-reply-s4u", ">midline-s4u", ">/undo"] {
+            assert!(
+                !above.contains(gone),
+                "the first undo left {gone} drawn:\n{frame}"
+            );
+        }
+        let (draft, above, frame) = &drawn[1];
+        assert_eq!(draft, "opener-s4u", "the second undo's prefill:\n{frame}");
+        for gone in [
+            ">opener-s4u",
+            "fixture_sleep(",
+            "tool-reply-s4u",
+            ">midline-s4u",
+            ">/undo",
+        ] {
+            assert!(
+                !above.contains(gone),
+                "the second undo left {gone} drawn:\n{frame}"
+            );
+        }
     }
 
     /// In a session, a tool turn takes a line while its tool sleeps. The
