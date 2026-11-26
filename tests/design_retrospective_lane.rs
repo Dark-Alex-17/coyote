@@ -250,12 +250,23 @@ fn architect_runs_the_retrospective_before_the_hygiene_pass() {
         "`TASK-NNN-run-refactor`",
         "agent__spawn --agent design-retrospective",
         "`retro-declined: <item> -- <reason>`",
+        "Run it ONCE per run (per group under multi)",
+        "a `retro-ran:` line already there",
     ] {
         assert!(
             retro.contains(anchor),
             "architect design retrospective step lost anchor {anchor:?}"
         );
     }
+    assert!(
+        text.contains(
+            "`blocked_by` every other implementation task in the group; the hygiene task is"
+        ) && text
+            .contains("`blocked_by` every other task in the group, the refactor task included.")
+            && !text.contains("each `blocked_by` every other task in the group"),
+        "under multi the refactor task waits on the implementation tasks and the hygiene task on \
+         the refactor task, never the two on each other"
+    );
     let hygiene = section(
         &text,
         "3. **Run-closing hygiene pass.**",

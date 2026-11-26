@@ -783,8 +783,9 @@ these substitutions:
   the GROUP's tasks into the GROUP's PR body.
 - `$base` (steps 2 and 3) = the group's GROUP BASE SHA recorded at branch creation -- NOT
   `merge-base {{base_branch}} HEAD`, which on a stacked branch reaches back through earlier
-  groups' work and re-sweeps their diffs. The refactor task is `TASK-NNN-g<N>-refactor` and the
-  hygiene task `TASK-NNN-g<N>-hygiene`, each `blocked_by` every other task in the group.
+  groups' work and re-sweeps their diffs. The refactor task is `TASK-NNN-g<N>-refactor`,
+  `blocked_by` every other implementation task in the group; the hygiene task is
+  `TASK-NNN-g<N>-hygiene`, `blocked_by` every other task in the group, the refactor task included.
 - The PR (step 4) goes from the group branch to its PR-strategy target: group 1 ->
   {{base_branch}}; group N+1 → group N's branch while that PR is unmerged. Title:
   `PLAN-<slug> [g<N>/<total>]: <group title>`. The body's task checklist lists the GROUP's tasks,
@@ -842,6 +843,11 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
    - **`DESIGN_RETROSPECTIVE: CLEAN`, or the step was skipped** -> no task; one line in the
      report.
    A retrospective that faults never blocks the run: note it in the report and go on to step 3.
+   Run it ONCE per run (per group under multi): the refactor task it produced does not get a
+   second retrospective. Whatever the outcome, record one line in the PLAN file,
+   `retro-ran: <judgement> -- <CLEAN | REFACTORS <n> | not run: <reason>>` (tagged `(g<N>)` under
+   multi like the declines), and when you re-enter this step, a `retro-ran:` line already there
+   means the step is done: go on to step 3.
 3. **Run-closing hygiene pass.** Debris reviewed per task is never reviewed per run: a marker
    one task left "for a later task" looks fine in that task's diff and is only visible as debt
    across the whole run. Per `task-tracking`, create ONE task `TASK-NNN-run-hygiene` (`type:
