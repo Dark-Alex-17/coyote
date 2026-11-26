@@ -1,7 +1,7 @@
 //! Real-process checks of commands typed during a turn, the welcome
-//! screen and the footer, the elapsed time a long turn shows, and the mouse
-//! reports. Every module drives the binary through the shared pty harness
-//! in `common`, so the file is unix-only.
+//! screen and the footer, the elapsed time a long turn shows, the mouse
+//! reports, and undo and rename in a session. Every module drives the binary
+//! through the shared pty harness in `common`, so the file is unix-only.
 #![cfg(unix)]
 
 mod common;
@@ -1584,5 +1584,269 @@ mod mouse {
             );
         }
         quit_and_check(&mut pty);
+    }
+}
+
+mod session_undo_and_rename {
+    //! What the model is sent after `.undo` takes back a line sent mid-turn,
+    //! and what a named session's rename and later leave draw.
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    use super::common::fake_llm::{FakeLlm, Reply};
+    use super::common::pty::Pty;
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    /// The messages of a request body, as (role, text, tool_call ids,
+    /// tool_call_id) rows.
+    fn messages(body: &str) -> Vec<(String, String, Vec<String>, Option<String>)> {
+        let json: serde_json::Value = serde_json::from_str(body).expect("a JSON request body");
+        json["messages"]
+            .as_array()
+            .expect("a messages array")
+            .iter()
+            .map(|m| {
+                let text = match &m["content"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let calls = m["tool_calls"]
+                    .as_array()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter_map(|c| c["id"].as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    text,
+                    calls,
+                    m["tool_call_id"].as_str().map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// After a tool turn that took a line mid-turn, one `.undo` puts the line
+    /// back in the composer; sending it again goes to the model once, as a
+    /// user prompt after the kept opener, with nothing of the reply that
+    /// followed the line and every tool call still answered by its result.
+    #[test]
+    #[serial]
+    fn a_resent_line_after_undo_reaches_the_model_once_without_the_undone_reply() {
+        let dir = fresh_config_dir("probe-undo-resend");
+        let _guard = TempDirGuard(dir.clone());
+        let tool_a = dir.join("tool-a");
+        let fake = FakeLlm::start(vec![
+            sleep_call(&tool_a),
+            Reply::Text("undone-reply-p7q".to_string()),
+            Reply::Text("fresh-reply-p7q".to_string()),
+        ]);
+        write_fake_llm_config(&dir, &fake);
+        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let at = pty.raw().len();
+        pty.send(b".session\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "entered session temp", at, "the session");
+
+        let turn_at = pty.raw().len();
+        pty.send(b"opener-p7q\r").unwrap();
+        wait_for_file(
+            &mut pty,
+            &dir.join("tool-a-started"),
+            "the sleep tool's start",
+        );
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"midline-p7q\r").unwrap();
+        pty.read_for(Duration::from_millis(800));
+        fs::write(dir.join("tool-a-release"), b"").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "undone-reply-p7q",
+            turn_at,
+            "the tool turn's reply",
+        );
+        wait_until_no_pending(&mut pty);
+        assert_eq!(
+            fake.served(),
+            2,
+            "the mid-turn line went out as its own turn"
+        );
+
+        clear_any_draft(&mut pty);
+        pty.send(b".undo\r").unwrap();
+        pty.read_for(Duration::from_millis(1500));
+        let mut toggle = false;
+        let frame = next_frame(&mut pty, &mut toggle);
+        let draft = composer_row_with_footer(&frame, "fake:fake-model");
+        assert_eq!(
+            draft, "midline-p7q",
+            "the undo did not put the line back:\n{frame}"
+        );
+
+        let sent_at = pty.raw().len();
+        pty.send(b"\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "fresh-reply-p7q",
+            sent_at,
+            "the resent line's reply",
+        );
+        pty.read_for(Duration::from_millis(800));
+        quit_declining_save(&mut pty);
+
+        let bodies = fake.bodies();
+        assert_eq!(bodies.len(), 3, "{bodies:?}");
+        let last = &bodies[2];
+        let rows = messages(last);
+        let users: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.0 == "user")
+            .map(|r| r.1.as_str())
+            .collect();
+        assert!(
+            users.iter().any(|t| t.contains("opener-p7q")),
+            "the kept opener is not in the next request: {rows:?}"
+        );
+        assert_eq!(
+            last.matches("midline-p7q").count(),
+            1,
+            "the resent line is not in the request exactly once: {rows:?}"
+        );
+        assert!(
+            users.last().is_some_and(|t| t.contains("midline-p7q")),
+            "the resent line is not the last user prompt: {rows:?}"
+        );
+        assert!(
+            !last.contains("undone-reply-p7q"),
+            "the reply that followed the undone line still reached the model: {rows:?}"
+        );
+        let called: Vec<&String> = rows.iter().flat_map(|r| r.2.iter()).collect();
+        let answered: Vec<&String> = rows.iter().filter_map(|r| r.3.as_ref()).collect();
+        for id in &called {
+            assert!(
+                answered.contains(id),
+                "tool call {id} has no result in the request: {rows:?}"
+            );
+        }
+    }
+
+    /// Waits for `marker` after `from`, answering a save question `n`.
+    fn wait_declining(pty: &mut Pty, marker: &str, from: usize) -> String {
+        let deadline = Instant::now() + PTY_DEADLINE;
+        loop {
+            let text = pty.read_for(Duration::from_millis(300));
+            if text.contains("Save session?") {
+                pty.read_for(HOTKEY_GAP);
+                pty.send(b"n").unwrap();
+            }
+            let shown = since(pty, from);
+            if squeezed(&shown).contains(&squeezed(marker)) {
+                return shown;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{marker:?} never appeared:\n{shown}"
+            );
+        }
+    }
+
+    fn frame_where(pty: &mut Pty, shows: impl Fn(&str) -> bool) -> String {
+        let at = repaint_until(pty, 40, 100, |frame| shows(&squeezed(frame)));
+        since(pty, at)
+    }
+
+    /// A named session saved under a new name says `session <old> saved as
+    /// <new>`, keeps the conversation on screen and writes the new file; a
+    /// re-save under its own name keeps the view too; a later `.exit
+    /// session` leaves under the new name and clears the view.
+    #[test]
+    #[serial]
+    fn renaming_a_named_session_keeps_the_view_and_a_later_leave_clears_it() {
+        let dir = fresh_config_dir("probe-rename-named");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(HOTKEY_GAP);
+
+        let at = pty.raw().len();
+        pty.send(b".session alpha-r9\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "entered session alpha-r9",
+            at,
+            "the enter divider",
+        );
+        dry_run_exchange(&mut pty, "kept-line-r9");
+
+        let at = pty.raw().len();
+        pty.send(b".save session\r").unwrap();
+        pty.read_for(Duration::from_millis(1500));
+        let resaved = frame_where(&mut pty, |f| f.contains("kept-line-r9"));
+        let flat = squeezed(&resaved);
+        assert!(
+            flat.contains("kept-line-r9") && !squeezed(&since(&pty, at)).contains("leftsession"),
+            "re-saving under the same name cleared the view or read as a leave:\n{resaved}"
+        );
+
+        let at = pty.raw().len();
+        pty.send(b".save session beta-r9\r").unwrap();
+        wait_for_squeezed_after(
+            &mut pty,
+            "session alpha-r9 saved as beta-r9",
+            at,
+            "the rename divider",
+        );
+        let renamed = frame_where(&mut pty, |f| f.contains("sessionalpha-r9savedasbeta-r9"));
+        let flat = squeezed(&renamed);
+        assert!(
+            flat.contains("kept-line-r9"),
+            "the rename cleared the view:\n{renamed}"
+        );
+        assert!(
+            !squeezed(&since(&pty, at)).contains("leftsession"),
+            "the rename reads as a leave:\n{renamed}"
+        );
+        let saved: Vec<String> = walk(&dir)
+            .into_iter()
+            .filter(|p| p.contains("beta-r9"))
+            .collect();
+        assert!(
+            !saved.is_empty(),
+            "no file for the session saved as beta-r9"
+        );
+
+        let left_at = pty.raw().len();
+        pty.send(b".exit session\r").unwrap();
+        wait_declining(&mut pty, "left session beta-r9", left_at);
+        let after = frame_where(&mut pty, |f| f.contains("leftsessionbeta-r9"));
+        assert!(
+            !squeezed(&after).contains("kept-line-r9"),
+            "leaving the renamed session did not clear the view:\n{after}"
+        );
+        quit_declining_save(&mut pty);
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walk(&path));
+                } else {
+                    out.push(path.display().to_string());
+                }
+            }
+        }
+        out
     }
 }
