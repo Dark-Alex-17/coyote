@@ -1850,3 +1850,244 @@ mod session_undo_and_rename {
         out
     }
 }
+
+mod surfaces_hints_and_anchored_wordmark {
+    //! What the main screen looks like on a truecolor terminal and while
+    //! typing: each region on its own shade of the dark or light theme,
+    //! no fills under NO_COLOR, idle hints that are never cut mid-hint,
+    //! and a welcome wordmark that holds its rows while the command
+    //! palette opens and closes above the composer.
+    use std::time::Duration;
+
+    use super::common::pty::Pty;
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
+    fn boot(scenario: &str, extra: &str, env: &[(&str, &str)]) -> (Pty, TempDirGuard) {
+        let dir = fresh_config_dir(scenario);
+        let guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, extra);
+        let mut pty = spawn_tui(&dir, env);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.read_for(HOTKEY_GAP);
+        (pty, guard)
+    }
+
+    /// Whether some SGR from `from` on sets `kind` (38 foreground, 48
+    /// background) to the exact truecolor `rgb`.
+    fn sets_rgb(raw: &[u8], from: usize, kind: u16, rgb: (u16, u16, u16)) -> bool {
+        let wanted = [kind, 2, rgb.0, rgb.1, rgb.2];
+        sgr_params(&raw[from..])
+            .iter()
+            .any(|params| params.windows(5).any(|w| w == wanted))
+    }
+
+    /// Every truecolor background set from `from` on.
+    fn backgrounds(raw: &[u8], from: usize) -> Vec<(u16, u16, u16)> {
+        let mut out = Vec::new();
+        for params in sgr_params(&raw[from..]) {
+            for w in params.windows(5) {
+                if w[0] == 48 && w[1] == 2 && !out.contains(&(w[2], w[3], w[4])) {
+                    out.push((w[2], w[3], w[4]));
+                }
+            }
+        }
+        out
+    }
+
+    /// The user's ruling for the default themes: the transcript on the
+    /// base shade, the composer raised, the status row and footer on the
+    /// chrome shade, faded text (the composer's placeholder) in its own
+    /// colour; the light theme mirrors the lightness.
+    #[test]
+    #[serial]
+    fn each_theme_draws_the_ruled_surface_shades_on_a_truecolor_terminal() {
+        for (theme, base, raised, chrome, faded) in [
+            (
+                "dark",
+                (30, 34, 48),
+                (42, 48, 66),
+                (22, 25, 34),
+                (154, 165, 191),
+            ),
+            (
+                "light",
+                (236, 239, 245),
+                (221, 226, 236),
+                (246, 247, 250),
+                (86, 96, 122),
+            ),
+        ] {
+            let (mut pty, _guard) = boot(
+                &format!("probe-surfaces-{theme}"),
+                &format!("theme: {theme}\n"),
+                &[("COLORTERM", "truecolor")],
+            );
+            let at = repaint_until(&mut pty, 24, 80, |f| {
+                squeezed(f).contains("nosession") && f.contains(VERSION)
+            });
+            let raw = pty.raw();
+            for (what, kind, rgb) in [
+                ("the transcript's base background", 48, base),
+                ("the composer's raised background", 48, raised),
+                ("the status and footer chrome background", 48, chrome),
+                ("the faded placeholder text", 38, faded),
+            ] {
+                assert!(
+                    sets_rgb(raw, at, kind, rgb),
+                    "theme {theme}: {what} is not rgb{rgb:?}; backgrounds drawn: {:?}\n{}",
+                    backgrounds(raw, at),
+                    since(&pty, at)
+                );
+            }
+            quit_and_check(&mut pty);
+        }
+    }
+
+    /// NO_COLOR on a truecolor terminal fills no region: no background
+    /// colour is set anywhere on the main screen.
+    #[test]
+    #[serial]
+    fn no_color_on_a_truecolor_terminal_fills_no_surface() {
+        let (mut pty, _guard) = boot(
+            "probe-surfaces-no-color",
+            "theme: dark\n",
+            &[("COLORTERM", "truecolor"), ("NO_COLOR", "1")],
+        );
+        let at = repaint_until(&mut pty, 24, 80, |f| {
+            squeezed(f).contains("nosession") && f.contains(VERSION)
+        });
+        let fills: Vec<Vec<u16>> = sgr_params(&pty.raw()[at..])
+            .into_iter()
+            .filter(|p| {
+                p.iter()
+                    .any(|&n| n == 48 || (40..=47).contains(&n) || (100..=107).contains(&n))
+            })
+            .collect();
+        assert!(
+            fills.is_empty(),
+            "NO_COLOR still fills a background: {fills:?}\n{}",
+            since(&pty, at)
+        );
+        quit_and_check(&mut pty);
+    }
+
+    /// The idle hints, whatever the width: every hint drawn is whole
+    /// (`Alt+S = threads`, never `Alt+S = thr` or a bare `Alt+S`), and at
+    /// 80 columns all four show in order.
+    #[test]
+    #[serial]
+    fn the_idle_hints_are_whole_at_every_width() {
+        let (mut pty, _guard) = boot("probe-hints-widths", "", &[]);
+        let full = repaint_until(&mut pty, 24, 80, |f| squeezed(f).contains("Ctrl+X=todo"));
+        let frame = squeezed(&since(&pty, full));
+        assert!(
+            frame.contains("?=keysAlt+T=tasksAlt+S=threadsCtrl+X=todo"),
+            "at 80 columns the idle hints are not `? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo`:\n{frame}"
+        );
+        let mut drafted = false;
+        for (draft, cols) in [
+            ("", 60),
+            ("", 50),
+            ("", 44),
+            ("", 40),
+            ("", 33),
+            ("", 28),
+            ("x", 50),
+            ("x", 40),
+            ("x", 30),
+        ] {
+            if !draft.is_empty() && !drafted {
+                drafted = true;
+                pty.send(draft.as_bytes()).unwrap();
+                pty.read_for(Duration::from_millis(400));
+            }
+            let at = repaint_until(&mut pty, 20, cols, |f| f.contains(VERSION));
+            let flat = squeezed(&since(&pty, at));
+            for (key, word) in [
+                ("?=", "keys"),
+                ("Alt+T", "=tasks"),
+                ("Alt+S", "=threads"),
+                ("Ctrl+X", "=todo"),
+            ] {
+                for (hit, _) in flat.match_indices(key) {
+                    assert!(
+                        flat[hit + key.len()..].starts_with(word),
+                        "draft {draft:?} at {cols} columns: a hint is cut after {key:?}: {:?}\n{flat}",
+                        &flat[hit..(hit + key.len() + 12).min(flat.len())]
+                    );
+                }
+            }
+        }
+        quit_clearing_any_draft(&mut pty);
+    }
+
+    /// The screen rows `needle` was painted on from `from` on.
+    fn rows_of(pty: &Pty, needle: &str, from: usize) -> Vec<u16> {
+        let mut rows: Vec<u16> = painted_at(pty.raw(), needle.as_bytes(), from)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// The user's report: the wordmark jumped while the completion list
+    /// above the composer grew and shrank. Typing `.` (the palette opens),
+    /// then `.ag` (it narrows), then erasing it all (it closes) leaves the
+    /// version line under the wordmark on the row it started on, and the
+    /// diff paints in between never draw the wordmark or the version
+    /// anywhere else.
+    #[test]
+    #[serial]
+    fn the_welcome_wordmark_keeps_its_rows_while_the_palette_comes_and_goes() {
+        let (mut pty, _guard) = boot("probe-wordmark-anchor", "", &[("NO_COLOR", "1")]);
+        let at = repaint_until(&mut pty, 40, 101, |f| f.contains(VERSION));
+        let home = rows_of(&pty, VERSION, at);
+        assert_eq!(
+            home.len(),
+            1,
+            "the version is not on one row: {home:?}\n{}",
+            since(&pty, at)
+        );
+
+        let mut typed_from = pty.raw().len();
+        for (keys, palette_up) in [
+            (&b"."[..], true),
+            (&b"ag"[..], true),
+            (&b"\x7f\x7f"[..], true),
+            (&b"\x7f"[..], false),
+        ] {
+            pty.send(keys).unwrap();
+            pty.read_for(Duration::from_millis(700));
+            let moved = rows_of(&pty, VERSION, typed_from);
+            assert!(
+                moved.iter().all(|row| home.contains(row)),
+                "after {keys:?} the version line was drawn on rows {moved:?}, not {home:?}:\n{}",
+                since(&pty, typed_from)
+            );
+            let at = repaint_until(&mut pty, 40, 101, |f| {
+                f.contains(VERSION) && (f.contains(".agent") == palette_up)
+            });
+            let frame = since(&pty, at);
+            assert_eq!(
+                frame.contains(".agent"),
+                palette_up,
+                "after {keys:?} the palette is not {}:\n{frame}",
+                if palette_up { "open" } else { "closed" }
+            );
+            let now = rows_of(&pty, VERSION, at);
+            assert_eq!(
+                now,
+                home,
+                "after {keys:?} (palette {}) the version under the wordmark moved:\n{frame}",
+                if palette_up { "open" } else { "closed" }
+            );
+            typed_from = pty.raw().len();
+        }
+        quit_clearing_any_draft(&mut pty);
+    }
+}
