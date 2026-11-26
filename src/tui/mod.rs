@@ -1200,7 +1200,7 @@ impl App {
             self.history.push(&line);
         }
         if name == KEYS_COMMAND {
-            self.overlay = Some(Overlay::Help(Help::default()));
+            self.push_overlay(Overlay::Help(Help::default()));
         } else {
             self.open_threads();
         }
@@ -1894,10 +1894,11 @@ impl App {
                 None
             }
             Action::ToggleHelp => {
-                self.overlay = match self.overlay {
-                    Some(Overlay::Help(_)) => None,
-                    _ => Some(Overlay::Help(Help::default())),
-                };
+                if matches!(self.overlay, Some(Overlay::Help(_))) {
+                    self.pop_overlay();
+                } else {
+                    self.push_overlay(Overlay::Help(Help::default()));
+                }
                 None
             }
             Action::HelpScroll(delta) => {

@@ -422,15 +422,42 @@ impl Supervisor {
         rows
     }
 
+    /// Adds this supervisor's rows under `parent_id`, then walks each
+    /// agent's child supervisor with its read lock released before the
+    /// walk goes a level deeper, as `owner_of` does.
     fn collect_task_tree(&self, parent_id: Option<&str>, rows: &mut Vec<TaskRow>) {
         rows.extend(self.task_snapshot().into_iter().map(|row| TaskRow {
             parent_id: parent_id.map(str::to_string),
             ..row
         }));
-        for agent in self.agents() {
-            if let Some(child_sup) = agent.child_supervisor.as_ref() {
-                child_sup.read().collect_task_tree(Some(&agent.id), rows);
-            }
+        let mut children: Vec<(String, Arc<RwLock<Supervisor>>)> = self
+            .agents()
+            .filter_map(|agent| {
+                Some((
+                    agent.id.clone(),
+                    Arc::clone(agent.child_supervisor.as_ref()?),
+                ))
+            })
+            .collect();
+        // A stack popped from its end: reversed, it walks the agents in order.
+        children.reverse();
+        while let Some((parent, child_sup)) = children.pop() {
+            let deeper: Vec<(String, Arc<RwLock<Supervisor>>)> = {
+                let sup = child_sup.read();
+                rows.extend(sup.task_snapshot().into_iter().map(|row| TaskRow {
+                    parent_id: Some(parent.clone()),
+                    ..row
+                }));
+                sup.agents()
+                    .filter_map(|agent| {
+                        Some((
+                            agent.id.clone(),
+                            Arc::clone(agent.child_supervisor.as_ref()?),
+                        ))
+                    })
+                    .collect()
+            };
+            children.extend(deeper.into_iter().rev());
         }
     }
 

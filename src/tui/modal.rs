@@ -6,7 +6,7 @@ use super::render::Renderer;
 use super::sink::unattended_answer;
 use super::theme::{ComposerState, Theme};
 use super::{
-    App, DIM, FIXED_ROWS, TRANSCRIPT_MIN_ROWS, escalation_kind, new_field, render, roster,
+    App, DIM, FIXED_ROWS, Overlay, TRANSCRIPT_MIN_ROWS, escalation_kind, new_field, render, roster,
 };
 use crate::events::{NoticeKind, Origin};
 use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, input_default_text};
@@ -670,7 +670,13 @@ impl App {
         self.close_view();
         // A question is never left waiting behind the pager, the help or
         // a pop-up, nor behind what closing one of them gives back.
-        if self.pager().is_some() {
+        // A pager under a pop-up counts too, as clearing the stack drops it.
+        if self
+            .overlay
+            .iter()
+            .chain(&self.overlay_stack)
+            .any(|overlay| matches!(overlay, Overlay::Pager(_)))
+        {
             self.release_pager_lines();
         }
         self.overlay = None;

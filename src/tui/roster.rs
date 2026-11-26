@@ -129,7 +129,7 @@ impl TreeItem for TaskNode {
     fn status(&self) -> Option<(&'static str, StatusClass)> {
         Some(match self.task.status {
             TaskRowStatus::Running => ("running", StatusClass::Running),
-            TaskRowStatus::Finished => ("finished", StatusClass::Completed),
+            TaskRowStatus::Finished => ("finished", StatusClass::Ended),
             TaskRowStatus::Completed => ("completed", StatusClass::Completed),
             TaskRowStatus::Failed => ("failed", StatusClass::Failed),
         })
@@ -567,6 +567,22 @@ pub(super) mod tests {
         status: TaskRowStatus,
     ) -> RosterRow {
         task_under(id, kind, name, status, None, 75)
+    }
+
+    /// A finished task, whose outcome is unknown, takes neither the
+    /// completed nor the failed colour.
+    #[test]
+    fn a_finished_task_is_neither_completed_nor_failed() {
+        let RosterRow::Task(node) = task("a1", TaskKind::Agent, "kid", TaskRowStatus::Finished)
+        else {
+            unreachable!()
+        };
+        assert_eq!(node.status(), Some(("finished", StatusClass::Ended)));
+        let RosterRow::Task(node) = task("a2", TaskKind::Agent, "kid", TaskRowStatus::Completed)
+        else {
+            unreachable!()
+        };
+        assert_eq!(node.status(), Some(("completed", StatusClass::Completed)));
     }
 
     pub(in crate::tui) fn ask(id: &str, agent: &str, question: &str) -> RosterRow {

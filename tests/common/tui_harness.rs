@@ -1652,6 +1652,11 @@ pub fn since(pty: &Pty, from: usize) -> String {
 /// Forces a full repaint by resizing and returns the raw offset it starts
 /// after.
 pub fn repaint(pty: &mut Pty, rows: u16, cols: u16) -> usize {
+    // A resize to the size it already has raises no SIGWINCH, so the UI
+    // would paint nothing and the wait would run out.
+    if pty.size().is_ok_and(|size| size == (rows, cols)) {
+        return repaint_in_place(pty);
+    }
     let at = pty.raw().len();
     pty.resize(rows, cols).unwrap();
     read_repaint(pty, at, REPAINT_SETTLE);

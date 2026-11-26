@@ -68,6 +68,9 @@ pub(super) enum StatusClass {
     Running,
     Completed,
     Failed,
+    /// Ended with no word on how; neither the success nor the failure
+    /// colour, so a crashed task does not read as a good one.
+    Ended,
 }
 
 impl StatusClass {
@@ -76,6 +79,7 @@ impl StatusClass {
             StatusClass::Running => theme.thread_running,
             StatusClass::Completed => theme.thread_completed,
             StatusClass::Failed => theme.thread_failed,
+            StatusClass::Ended => theme.faded,
         }
     }
 }

@@ -1495,6 +1495,11 @@ impl Session {
         origin: Origin,
     ) -> Result<Option<String>> {
         let save_session = self.effective_save_session();
+        // Unsaved changes under `save_session: false` mean the file on disk,
+        // if any, is not what this exit leaves behind.
+        if self.dirty && save_session == Some(false) {
+            return Ok(None);
+        }
         if self.dirty && save_session != Some(false) {
             let mut save_dir = session_dir.to_path_buf();
             let mut session_name = self.name().to_string();
@@ -3622,6 +3627,40 @@ last_run:
     fn exit_without_a_file_on_disk_names_nothing() {
         let (dir, sessions_dir) = unique_sessions_dir("exit-no-file");
         let mut session = Session::default();
+        session.set_save_session(Some(false));
+        session.mark_dirty();
+
+        let name = session
+            .exit(
+                &sessions_dir,
+                true,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
+            .unwrap();
+
+        assert_eq!(name, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A session saved before, with changes since that `save_session:
+    /// false` keeps off disk, names nothing on exit: its file is not what
+    /// the exit leaves behind.
+    #[test]
+    #[serial]
+    fn exit_with_unsaved_changes_under_save_session_false_names_nothing() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-unsaved-false");
+        let mut session = dirty_unsaved_session();
+        session.set_save_session(Some(true));
+        let saved = session
+            .exit(
+                &sessions_dir,
+                true,
+                &ScriptedPrompter::refusing(),
+                Origin::detached(),
+            )
+            .unwrap();
+        assert!(saved.is_some());
         session.set_save_session(Some(false));
         session.mark_dirty();
 

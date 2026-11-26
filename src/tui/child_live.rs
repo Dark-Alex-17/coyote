@@ -499,17 +499,17 @@ impl ChildLive {
             }) else {
                 continue;
             };
-            cell.forget_wrapped_lines();
             let Some(tail) = cell.nth_output_for(call_id, left) else {
                 continue;
             };
             // A call that printed, or whose output the budget took, keeps
-            // what it has.
+            // what it has, and its laid-out lines with it.
             if !tail.full.text().is_empty() || tail.full.dropped() > 0 {
                 continue;
             }
             let text = cells::append_output(tail, output.as_bytes());
             grew += tail.full.push(&text) + tail.full.settle();
+            cell.forget_wrapped_lines();
         }
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }

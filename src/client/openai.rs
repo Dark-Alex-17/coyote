@@ -165,7 +165,12 @@ async fn prepare_chat_completions(
         WireApi::Responses => openai_build_responses_body(data, &self_.model),
         WireApi::Chat => {
             let mut body = openai_build_chat_completions_body(data, &self_.model);
-            ask_for_stream_usage(&mut body);
+            // Only api.openai.com is known to take it; a custom `api_base`
+            // may be a gateway that rejects unknown keys, and opts in with
+            // a patch.
+            if stock_openai_without_api_base {
+                ask_for_stream_usage(&mut body);
+            }
             body
         }
     };
@@ -2574,7 +2579,7 @@ mod tests {
     #[test]
     fn a_streamed_chat_request_asks_for_its_usage() {
         let config = api_key_config("openai-wire-chat-usage-test", Some(WireApi::Chat));
-        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config.clone())]);
 
         let (streamed, _) = prepare_with_stream(&client, true).unwrap();
         assert_eq!(
@@ -2583,6 +2588,13 @@ mod tests {
         );
         let (whole, _) = prepare_with_stream(&client, false).unwrap();
         assert!(whole.body.get("stream_options").is_none(), "{}", whole.body);
+
+        // A custom endpoint may be a gateway that rejects the key.
+        let mut gateway = config;
+        gateway.api_base = Some("https://gateway.example/v1".to_string());
+        let client = make_client(gateway.clone(), vec![ClientConfig::OpenAIConfig(gateway)]);
+        let (streamed, _) = prepare_with_stream(&client, true).unwrap();
+        assert!(streamed.body.get("stream_options").is_none(), "{}", streamed.body);
     }
 
     #[test]

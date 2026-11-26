@@ -107,11 +107,7 @@ async fn prepare_chat_completions(
     };
     let body = match wire {
         WireApi::Responses => openai_build_responses_body(data, &self_.model),
-        WireApi::Chat => {
-            let mut body = openai_build_chat_completions_body(data, &self_.model);
-            ask_for_stream_usage(&mut body);
-            body
-        }
+        WireApi::Chat => openai_build_chat_completions_body(data, &self_.model),
     };
     let mut request_data = RequestData::new(url, body).wire(wire);
 
@@ -354,18 +350,15 @@ mod tests {
         );
     }
 
-    /// A streamed chat request asks for its usage chunk, as the shared
-    /// chunk handler reads it; a request that does not stream does not.
+    /// A compatible server may be a gateway that rejects unknown keys, so
+    /// no request asks for a usage chunk; a model patch opts in.
     #[test]
-    fn a_streamed_chat_request_asks_for_its_usage() {
+    fn no_chat_request_asks_for_a_usage_chunk() {
         let client = make_client(compat_config(None));
-        let (streamed, _) = prepare(&client, true).unwrap();
-        assert_eq!(
-            streamed.body["stream_options"],
-            json!({ "include_usage": true })
-        );
-        let (whole, _) = prepare(&client, false).unwrap();
-        assert!(whole.body.get("stream_options").is_none(), "{}", whole.body);
+        for stream in [true, false] {
+            let (request, _) = prepare(&client, stream).unwrap();
+            assert!(request.body.get("stream_options").is_none(), "{}", request.body);
+        }
     }
 
     #[test]
