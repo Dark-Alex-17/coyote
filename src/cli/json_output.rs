@@ -32,9 +32,9 @@ pub struct JsonUsage {
 }
 
 impl JsonResult {
-    /// `outcome` is the final assistant text, or the rendered error. Every
-    /// `<think>` block is dropped from the text, wherever it appears, and
-    /// surrounding whitespace is trimmed.
+    /// `outcome` is the final assistant text, or the error's flattened cause
+    /// chain. Every `<think>` block is dropped from the text, wherever it
+    /// appears, and surrounding whitespace is trimmed.
     pub fn new(
         outcome: Result<String, String>,
         model: String,
@@ -69,7 +69,8 @@ impl JsonResult {
 }
 
 /// What a one-shot directive produced. The session and model are read
-/// before the directive exits its session, which clears them.
+/// before the directive exits its session: exiting drops the session, and the
+/// model then falls back to the agent's, the role's or the default.
 pub struct DirectiveOutcome {
     pub output: String,
     pub model: String,
