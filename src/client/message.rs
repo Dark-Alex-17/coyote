@@ -416,13 +416,7 @@ pub(crate) fn interleaved_user_data() -> super::ChatCompletionsData {
                 image("data:image/jpeg;base64,Qg=="),
             ]),
         )],
-        temperature: None,
-        top_p: None,
-        reasoning_effort: None,
-        functions: None,
-        stream: false,
-        prompt_cache_ttl: None,
-        structured_output: None,
+        ..plain_data(false)
     }
 }
 

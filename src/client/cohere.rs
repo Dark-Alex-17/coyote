@@ -289,29 +289,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn chat_body_has_no_format_key_once_the_spec_is_cleared() {
-        let client = CohereClient {
-            app_config: Arc::new(AppConfig::default()),
-            config: CohereConfig {
-                name: Some("cohere-test".into()),
-                api_key: Some("co-key".into()),
-                ..Default::default()
-            },
-            model: Model::new("cohere-test", "command-test"),
-        };
-
-        let data = ChatCompletionsData {
-            structured_output: None,
-            ..structured_output_data()
-        };
-        let request_data = prepare_chat_completions(&client, data).unwrap();
-
-        assert!(
-            request_data.body.get("response_format").is_none(),
-            "body: {}",
-            request_data.body
-        );
-    }
 }

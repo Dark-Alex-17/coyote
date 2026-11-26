@@ -451,7 +451,7 @@ impl TokenUsage {
 
     /// Prompt-side tokens the API reported for one request: fresh input plus
     /// cache writes and cache reads. The buckets are disjoint (see
-    /// [`Self::cost_usd`]), so the terms sum without adjustment.
+    /// [`Self::billed_cost_usd`]), so the terms sum without adjustment.
     pub fn total_prompt_tokens(&self) -> u64 {
         self.input_tokens.unwrap_or(0)
             + self.cache_creation_input_tokens.unwrap_or(0)
@@ -476,20 +476,19 @@ impl TokenUsage {
         );
     }
 
-    /// USD cost of this usage at the given model's prices (USD per 1M
-    /// tokens). The four buckets are disjoint on both Anthropic direct and
-    /// Bedrock Converse (`input_tokens` excludes cache tokens), so the terms
-    /// sum without adjustment. Strict on missing prices: any nonzero
-    /// component without a price yields `None` rather than a silent
-    /// undercount. A zero total is also `None`: nothing billed, nothing to
-    /// show.
+    /// [`Self::billed_cost_usd`] for display: a zero total is `None`,
+    /// nothing billed, nothing to show.
     pub fn cost_usd(&self, model: &Model) -> Option<f64> {
         self.billed_cost_usd(model).filter(|total| *total > 0.0)
     }
 
-    /// The cost of one call for run accounting. Unlike [`Self::cost_usd`],
-    /// which hides zero costs from display, a zero total is a known cost:
-    /// only a nonzero token bucket without a price leaves the cost unknown.
+    /// USD cost of this usage at the given model's prices (USD per 1M
+    /// tokens), used for run accounting. The four buckets are disjoint on
+    /// both Anthropic direct and Bedrock Converse (`input_tokens` excludes
+    /// cache tokens), so the terms sum without adjustment. Strict on missing
+    /// prices: any nonzero component without a price yields `None` rather
+    /// than a silent undercount. Unlike [`Self::cost_usd`], a zero total is a
+    /// known cost.
     pub fn billed_cost_usd(&self, model: &Model) -> Option<f64> {
         fn term(tokens: Option<u64>, price: Option<f64>) -> Option<f64> {
             match tokens.unwrap_or(0) {
@@ -1247,7 +1246,7 @@ mod tests {
     use crate::config::{RunStats, RunStatsSnapshot};
     use anyhow::Error;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::Instant;
 
     fn catch_error_message(data: &Value, status: u16) -> String {
@@ -1525,14 +1524,17 @@ mod tests {
     /// Fake provider whose streaming path emits `PACED_DELTAS` text chunks
     /// 60s apart, then one thinking block and one tool call, and whose
     /// non-streaming path returns that same reply in one piece when
-    /// `nonstream_replies` is set (and bails otherwise). Exercises the real
-    /// trait defaults (build_client, prepare_completion_data, abort
-    /// `select!`) with no network.
+    /// `nonstream_replies` is set (and bails otherwise). While `reject_once`
+    /// is set, the next request on either path fails with a 401 instead.
+    /// Exercises the real trait defaults (build_client, completion_data,
+    /// abort `select!`) with no network. It has no dialect, so every request
+    /// asserts the spec was dropped.
     struct PacedStreamClient {
         config: AppConfig,
         model: Model,
         stall_forever: bool,
         nonstream_replies: bool,
+        reject_once: AtomicBool,
         streaming_calls: AtomicUsize,
         usage: Option<TokenUsage>,
     }
@@ -1557,6 +1559,13 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         }
+    }
+
+    fn paced_auth_error() -> Error {
+        Error::new(ApiStatusError {
+            status: 401,
+            message: "error (status: 401)".to_string(),
+        })
     }
 
     #[async_trait::async_trait]
@@ -1587,6 +1596,13 @@ mod tests {
             data: ChatCompletionsData,
         ) -> Result<ChatCompletionsOutput> {
             assert!(!data.stream, "non-streaming path must not request a stream");
+            assert!(
+                data.structured_output.is_none(),
+                "spec reached a dialect-less client"
+            );
+            if self.reject_once.swap(false, Ordering::SeqCst) {
+                return Err(paced_auth_error());
+            }
             if !self.nonstream_replies {
                 bail!("the quiet transport must not take the non-streaming path");
             }
@@ -1609,6 +1625,13 @@ mod tests {
         ) -> Result<()> {
             self.streaming_calls.fetch_add(1, Ordering::SeqCst);
             assert!(data.stream, "trait default must request a stream");
+            assert!(
+                data.structured_output.is_none(),
+                "spec reached a dialect-less client"
+            );
+            if self.reject_once.swap(false, Ordering::SeqCst) {
+                return Err(paced_auth_error());
+            }
             for i in 0..PACED_DELTAS {
                 tokio::time::sleep(PACED_GAP).await;
                 handler.text(&format!("chunk{i} "))?;
@@ -1630,6 +1653,7 @@ mod tests {
             model: Model::default(),
             stall_forever,
             nonstream_replies: false,
+            reject_once: AtomicBool::new(false),
             streaming_calls: AtomicUsize::new(0),
             usage: None,
         }
@@ -2747,6 +2771,40 @@ mod tests {
         let mut role = crate::config::Role::default();
         role.set_structured_output(structured_output_data().structured_output);
         Input::from_str(&quiet_ctx(), "hello", Some(role)).unwrap()
+    }
+
+    /// Each path's first request is rejected with a 401, so the paced
+    /// client's no-spec assertion checks both the first attempt and the
+    /// auth retry of the non-streaming and the streaming path.
+    #[tokio::test(start_paused = true)]
+    async fn a_dialect_less_client_gets_no_spec_on_the_first_attempt_or_the_auth_retry() {
+        let mut ctx = quiet_ctx();
+        let input = structured_input();
+        let mut client = paced_client(false);
+        client.model = structured_model("paced-stream", "structured-test");
+        client.nonstream_replies = true;
+        assert!(
+            input
+                .prepare_completion_data(client.model(), false)
+                .unwrap()
+                .structured_output
+                .is_some()
+        );
+
+        cache_token("paced-stream", "paced-at");
+        client.reject_once.store(true, Ordering::SeqCst);
+        let output = client.chat_completions(input.clone()).await.unwrap();
+        assert_eq!(output.text, paced_text());
+        assert!(!client.reject_once.load(Ordering::SeqCst));
+
+        cache_token("paced-stream", "paced-at-2");
+        client.reject_once.store(true, Ordering::SeqCst);
+        let (text, _) =
+            call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+        assert_eq!(text, paced_text());
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
