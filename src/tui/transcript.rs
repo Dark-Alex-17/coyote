@@ -727,8 +727,8 @@ impl Transcript {
         let width = self.last_area.width;
         let last = last.min(self.cells.len().saturating_sub(1));
         let mut lines = Vec::new();
-        for index in first..=last {
-            let cell_lines = self.cells[index].cached_lines(width, None, renderer);
+        for (index, cell) in self.cells.iter_mut().enumerate().take(last + 1).skip(first) {
+            let cell_lines = cell.cached_lines(width, None, renderer);
             lines.extend(
                 cell_lines
                     .iter()
