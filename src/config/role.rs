@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::client::structured_output::StructuredOutputSpec;
 use crate::client::{Message, MessageContent, MessageRole, Model};
 use crate::config::builtin_manifest;
 use crate::config::conflict::{self, InstallMode, StickyMode};
@@ -110,6 +111,8 @@ pub struct Role {
 
     #[serde(skip)]
     model: Model,
+    #[serde(skip)]
+    structured_output: Option<StructuredOutputSpec>,
 }
 
 impl Role {
@@ -435,6 +438,14 @@ impl Role {
         self.prompt.push_str(text);
     }
 
+    pub fn structured_output(&self) -> Option<&StructuredOutputSpec> {
+        self.structured_output.as_ref()
+    }
+
+    pub fn set_structured_output(&mut self, value: Option<StructuredOutputSpec>) {
+        self.structured_output = value;
+    }
+
     pub fn echo_messages(&self, input: &Input) -> String {
         let input_markdown = input.render();
         if self.is_empty_prompt() {
@@ -689,6 +700,33 @@ pub(crate) fn install_and_reconcile_role_hooks(
 mod tests {
     use super::*;
     use crate::client::{ImageUrl, MessageContentPart};
+
+    #[test]
+    fn role_front_matter_cannot_set_structured_output() {
+        let content =
+            "---\nstructured_output:\n  name: answer\n  schema:\n    type: object\n---\nPrompt";
+
+        let role = Role::new("test", content);
+
+        assert!(role.structured_output().is_none());
+        assert_eq!(role.prompt(), "Prompt");
+    }
+
+    #[test]
+    fn role_serialization_omits_structured_output() {
+        let mut role = Role::new("test", "Prompt");
+        role.set_structured_output(Some(StructuredOutputSpec {
+            name: "answer".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        }));
+
+        let json = serde_json::to_value(&role).unwrap();
+        let yaml = serde_yaml::to_string(&role).unwrap();
+
+        assert!(json.get("structured_output").is_none());
+        assert!(!yaml.contains("structured_output"));
+        assert!(!role.export().contains("structured_output"));
+    }
 
     #[test]
     fn role_new_parses_prompt() {
