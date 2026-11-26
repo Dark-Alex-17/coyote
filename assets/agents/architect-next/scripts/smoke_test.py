@@ -3907,6 +3907,17 @@ def _retro_triage_empty():
             and any("triage decided none of the items" in l for l in u["retro_report"])), (fus, u.get("retro_report"))
 
 
+def _retro_triage_partial():
+    saved_path = os.path.join(_retro_large()["run_dir"], "design-retrospective.md")
+    if os.path.exists(saved_path):
+        os.remove(saved_path)
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                       retro_follow_ups=[], retro_done=True, follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    return (u["_next"] == "select_tasks" and len(fus) == 1 and "One owner" in read_file(saved_path)
+            and any("triage decided 1 of the 2 items" in d for d in u["decisions"])), (fus, u.get("decisions"))
+
+
 def _retro_rearm_integration():
     u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
                                        retro_follow_ups=[], retro_done=True, integration_checked=True, integration_amended=True,
@@ -3980,6 +3991,8 @@ def _parse_report_retro_follow_up():
 
 
 guarded("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up", _retro_triage_empty)
+guarded("retro_route: a triage that decides only some of the REFACTORS n items -> the report kept as one not-triaged "
+        "follow-up beside what it did decide", _retro_triage_partial)
 guarded("retro_route: adopting re-arms the whole integration step, the one amendment round included", _retro_rearm_integration)
 guarded("retro_route: the snapshot is taken last, holding the report, follow-ups and ledger lines", _retro_snapshot_last)
 guarded("retro_route: in micro mode the refactor task is its own batch, so it closes into a batch gauntlet", _retro_micro_batch)

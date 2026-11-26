@@ -7399,6 +7399,17 @@ with scenario("retro_route: REFACTORS n with a triage that decided nothing -> th
     fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
     check(name, u["_next"] == "observability_gate" and "fix_items" not in u and len(fus) == 1
           and any("triage decided none of the items" in l for l in u["retro_report"]), (fus, u.get("retro_report")))
+with scenario("retro_route: a triage that decides only some of the REFACTORS n items -> the report kept as one "
+              "not-triaged follow-up beside what it did decide") as name:
+    _saved = os.path.join(base_state()["run_dir"], "design-retrospective.md")
+    if os.path.exists(_saved):
+        os.remove(_saved)
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                     retro_follow_ups=[], review_rounds=1, last_node_output=RETRO_TRIAGED, follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    check(name, u["_next"] == "compose_fix" and u.get("fix_items") == ["One table"] and len(fus) == 1
+          and "One owner" in _lib.read_file(_saved)
+          and any("triage decided 1 of the 2 items" in d for d in u["decisions"]), (fus, u.get("decisions")))
 with scenario("retro_route: CLEAN -> observability_gate, noted as ran and clean") as name:
     u = gates.retro_route(base_state(retro_result=RETRO_CLEAN, retro_adopted=[], retro_declined=[], retro_follow_ups=[]))
     check(name, u["_next"] == "observability_gate" and any("DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]),

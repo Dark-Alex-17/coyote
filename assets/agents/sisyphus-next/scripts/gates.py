@@ -4890,7 +4890,7 @@ def _retro_is_parents(state):
 
 
 def _untriaged_follow_up(state, text):
-    """Saves the retrospective report a failed triage left unjudged and returns the one follow-up that points at it."""
+    """Saves the retrospective report a triage left wholly or partly unjudged and returns the one follow-up that points at it."""
     run_dir = state.get("run_dir", "")
     write_artifact(run_dir, RETRO_SAVED, text)
     where = f"see the retrospective report at {os.path.join(run_dir, RETRO_SAVED)}" if run_dir else f"the report: {tail(text, 1500)}"
@@ -4990,6 +4990,11 @@ def retro_route(state):
         u["retro_report"] = report + [f"- ran: {first}; {why}, so nothing was adopted; the items are one follow-up"]
         ledger(state, u, f"design retrospective: {why}; {first} kept as one follow-up; run continues")
         return u
+    gap = ""
+    decided = len(adopted) + len(declined) + len(later)
+    if not clean and decided != int(sentinel.group(1)):
+        gap = f"triage decided {decided} of the {sentinel.group(1)} items; the report is kept as one follow-up"
+        ledger(state, u, f"design retrospective: {gap}")
     if adopted and as_int(state.get("review_rounds")) >= STRIKE_LIMIT:
         ledger(state, u, f"design retrospective: review rounds spent; {len(adopted)} adopted item(s) become follow-ups")
         later += adopted
@@ -5000,8 +5005,12 @@ def retro_route(state):
         line = f"retro-declined: {_whole_line(d.get('item'))} -- {_whole_line(d.get('reason')) or 'no reason stated'}"
         ledger(state, u, line)
         report.append(f"- {line}")
+    if gap:
+        report.append(f"- {gap}")
+    fus = ([_untriaged_follow_up(state, text)] if gap else []) + [f"Design retrospective: {f}" for f in later]
+    if fus:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + fus
     if later:
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Design retrospective: {f}" for f in later]
         report.append(f"- follow-ups: {len(later)} (listed under FOLLOW-UPS)")
     u["retro_report"] = report
     if adopted:

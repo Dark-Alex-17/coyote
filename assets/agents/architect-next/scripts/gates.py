@@ -5094,7 +5094,7 @@ def _whole_line(text):
 
 
 def _untriaged_follow_up(state, text):
-    """Saves the retrospective report a failed triage left unjudged and returns the one follow-up that points at it."""
+    """Saves the retrospective report a triage left wholly or partly unjudged and returns the one follow-up that points at it."""
     run_dir = state.get("run_dir", "")
     write_artifact(run_dir, RETRO_SAVED, text)
     where = f"see the retrospective report at {os.path.join(run_dir, RETRO_SAVED)}" if run_dir else f"the report: {tail(text, 1500)}"
@@ -5161,6 +5161,11 @@ def retro_route(state):
         u["retro_report"] = report + [f"- ran: {first}; {why}, so nothing was adopted; the items are one follow-up"]
         ledger(state, u, f"design retrospective: {why}; {first} kept as one follow-up; run continues")
         return u
+    gap = ""
+    decided = len(adopted) + len(declined) + len(later)
+    if not clean and decided != int(sentinel.group(1)):
+        gap = f"triage decided {decided} of the {sentinel.group(1)} items; the report is kept as one follow-up"
+        ledger(state, u, f"design retrospective: {gap}")
     lines = [f"retro-declined: {_whole_line(d.get('item'))} -- {_whole_line(d.get('reason')) or 'no reason stated'}" for d in declined]
     for line in lines:
         ledger(state, u, line)
@@ -5198,8 +5203,12 @@ def retro_route(state):
             ledger(state, u, f"design retrospective: could not create the refactor task: {tail(tdir, 200)}; items become follow-ups")
     report.append(f"- ran: {first}; {len(adopted)} item(s) adopted; {task_line}")
     report += [f"- {line}" for line in lines]
+    if gap:
+        report.append(f"- {gap}")
+    fus = ([_untriaged_follow_up(state, text)] if gap else []) + [f"Design retrospective: {f}" for f in later]
+    if fus:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + fus
     if later:
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Design retrospective: {f}" for f in later]
         report.append(f"- follow-ups: {len(later)} (listed under Deferred / follow-ups)")
     u["retro_report"] = report
     if tid:
