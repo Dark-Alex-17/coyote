@@ -318,7 +318,8 @@ def intake(state):
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
                   "probe_adoption", "base_syncs", "base_integrated", "attention_notes", "autonomous_decisions",
-                  "judge_rulings", "answered_decisions", "comment_hygiene_done", "comment_hygiene_line"):
+                  "judge_rulings", "answered_decisions", "retro_done", "retro_report", "comment_hygiene_done",
+                  "comment_hygiene_line"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")

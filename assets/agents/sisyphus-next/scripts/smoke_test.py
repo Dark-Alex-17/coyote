@@ -7333,6 +7333,16 @@ with scenario("retrospective: no run base and no base commit -> not run, observa
     check(name, u["_next"] == "observability_gate" and u.get("retro_done") is True
           and u.get("retro_report") == ["- not run: the run base could not be resolved"],
           (u.get("_next"), u.get("retro_report")))
+with scenario("retrospective: a re-entered run keeps retro_done and retro_report, so a green review goes on to "
+              "observability_gate") as name:
+    _rst = gates.intake({"initial_prompt": "add a guard", "project_dir": REPO})
+    _rlines = ["- large body of work (a new module)", "- ran: DESIGN_RETROSPECTIVE: CLEAN"]
+    _lib.snapshot(_rst, {"retro_done": True, "retro_report": _rlines}, "review")
+    _rre = gates.intake({"initial_prompt": f"Fix the failure\nSisyphus run id: {_rst['run_id']}", "project_dir": REPO})
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        retro_done=_rre.get("retro_done", False)))
+    check(name, _rre.get("retro_done") is True and _rre.get("retro_report") == _rlines
+          and u["_next"] == "observability_gate", (_rre.get("retro_done"), _rre.get("retro_report"), u.get("_next")))
 with scenario("retro_size_route: large -> run_retrospective with the project, the run diff and the task; ledgered") as name:
     u = gates.retro_size_route(base_state(retro_large=True, retro_large_reason="a new module other code builds on",
                                           last_node_output='{"retro_large": true}', run_base_sha=BASE, anomalies=["seen"]))
