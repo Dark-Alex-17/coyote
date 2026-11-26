@@ -1,10 +1,13 @@
 //! Blocks of a reply drawn as something other than markdown. The
 //! segmenter splits a reply into markdown runs and closed fences of a
-//! kind the TUI draws itself; a drawn block keeps its fenced source, so a
-//! copy over its rows takes that source rather than the drawing. A block
-//! that cannot be drawn shows its source with a note saying why.
+//! kind the TUI draws itself, and display math on lines of its own; a
+//! drawn block keeps its fenced source, so a copy over its rows takes that
+//! source rather than the drawing. A block that cannot be drawn shows its
+//! source with a note saying why.
 
 pub(crate) mod chart;
+pub(crate) mod math;
+pub(crate) mod math_render;
 pub(crate) mod mermaid;
 
 use super::render::plain_text;
@@ -22,16 +25,17 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) enum BlockKind {
     Mermaid,
     Chart,
+    DisplayMath,
 }
 
-/// A closed fence the TUI draws itself.
+/// A closed fence or display formula the TUI draws itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Block<'a> {
     pub(crate) kind: BlockKind,
-    /// The whole fence, opening and closing lines included, without the
-    /// newline after the closing one.
+    /// The whole fence or formula, opening and closing lines included,
+    /// without the newline after the closing one.
     pub(crate) fenced: &'a str,
-    /// The lines between the fences.
+    /// The lines between the fences, or the TeX between the delimiters.
     pub(crate) body: &'a str,
 }
 
@@ -41,13 +45,21 @@ pub(crate) enum Segment<'a> {
     Block(Block<'a>),
 }
 
-/// Rows of a rendered reply that a copy does not take as drawn.
+/// Parts of a rendered reply that a copy does not take as drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CopyRegion {
     /// Any selection touching these rows copies `source` once, in place
     /// of the rows; an empty source copies nothing.
     Block {
         rows: Range<usize>,
+        source: Arc<str>,
+    },
+    /// Any selection touching these columns of the row copies `source`
+    /// once, in place of the characters there; an empty source copies
+    /// nothing.
+    Inline {
+        row: usize,
+        cols: Range<usize>,
         source: Arc<str>,
     },
 }
@@ -57,6 +69,11 @@ impl CopyRegion {
         match self {
             CopyRegion::Block { rows, source } => CopyRegion::Block {
                 rows: rows.start + by..rows.end + by,
+                source,
+            },
+            CopyRegion::Inline { row, cols, source } => CopyRegion::Inline {
+                row: row + by,
+                cols,
                 source,
             },
         }
@@ -98,6 +115,9 @@ pub(crate) enum Delimiter<'a> {
     /// A code fence: the columns of indent in front of it and the info
     /// string after the backticks.
     Fence { indent: usize, info: &'a str },
+    /// The opener of display math: the closer it waits for and the byte
+    /// of the line its TeX starts at.
+    Math { closer: &'static str, body: usize },
 }
 
 impl Delimiter<'_> {
@@ -117,6 +137,7 @@ impl Delimiter<'_> {
                     None
                 }
             }
+            Delimiter::Math { .. } => Some(BlockKind::DisplayMath),
         }
     }
 }
@@ -124,54 +145,143 @@ impl Delimiter<'_> {
 /// The delimiter `line` is, if any. Every line whose text starts with
 /// three backticks counts as a fence, opening or closing, as it does for
 /// the markdown renderer, so the stable split and the segmenter agree on
-/// what is inside a fence.
+/// what is inside a fence. A line starting with `$$` or `\[` behind at
+/// most three columns of indent opens display math.
 pub(crate) fn block_delimiter(line: &str) -> Option<Delimiter<'_>> {
     let text = line.trim_start();
-    if !text.starts_with("```") {
-        return None;
-    }
     let indent = line[..line.len() - text.len()]
         .chars()
         .map(|c| if c == '\t' { 4 } else { 1 })
         .sum();
-    let info = text.trim_start_matches('`').trim_end_matches(['\n', '\r']);
-    Some(Delimiter::Fence { indent, info })
+    if text.starts_with("```") {
+        let info = text.trim_start_matches('`').trim_end_matches(['\n', '\r']);
+        return Some(Delimiter::Fence { indent, info });
+    }
+    if indent > 3 {
+        return None;
+    }
+    math::DELIMITERS
+        .iter()
+        .find(|(opener, _, display)| *display && text.starts_with(opener))
+        .map(|(opener, closer, _)| Delimiter::Math {
+            closer,
+            body: line.len() - text.len() + opener.len(),
+        })
 }
 
-/// Splits `source` into markdown runs and the closed fences drawn as
-/// blocks. A fence of another language, one indented as code, and one
-/// not yet closed stay in their run, so a block still streaming shows as
-/// source until its closing fence arrives. A run before a block keeps the
-/// newline that ends it: the markdown renderer draws no row for a final
-/// newline, so the rows of the runs and blocks add up to those of the
-/// whole reply drawn as source.
+/// What is open at a line of a reply read from the top: a code fence or
+/// display math.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BlockScan {
+    open: Option<Open>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Open {
+    /// `kind` is None for a fence drawn as code.
+    Fence {
+        at: usize,
+        body: usize,
+        kind: Option<BlockKind>,
+    },
+    Math {
+        at: usize,
+        body: usize,
+        closer: &'static str,
+    },
+}
+
+/// A block a line closed: the byte it opens at, the bytes of its body and
+/// its kind.
+pub(crate) struct Closed {
+    at: usize,
+    body: Range<usize>,
+    kind: BlockKind,
+}
+
+impl BlockScan {
+    /// Reads `line`, which starts at byte `start` of the reply, and hands
+    /// back the block it closes, if any. Inside a fence only a fence line
+    /// counts, and inside display math only its closer. Display math must
+    /// close with nothing but blanks after the closer on its line, and a
+    /// blank line before the closer ends it unclosed, as TeX would: either
+    /// way its lines stay prose.
+    pub(crate) fn line(&mut self, line: &str, start: usize) -> Option<Closed> {
+        let is_fence = |line| matches!(block_delimiter(line), Some(Delimiter::Fence { .. }));
+        // The math left open, and the part of this line its closer is
+        // looked for in, with the byte of the reply that part starts at.
+        let (at, body, closer, text, offset) = match self.open.take() {
+            None => match block_delimiter(line)? {
+                fence @ Delimiter::Fence { .. } => {
+                    self.open = Some(Open::Fence {
+                        at: start,
+                        body: start + line.len(),
+                        kind: fence.kind(),
+                    });
+                    return None;
+                }
+                Delimiter::Math { closer, body } => {
+                    (start, start + body, closer, &line[body..], start + body)
+                }
+            },
+            Some(Open::Fence { at, body, kind }) if is_fence(line) => {
+                return kind.map(|kind| Closed {
+                    at,
+                    body: body..start,
+                    kind,
+                });
+            }
+            Some(Open::Math { .. }) if line.trim().is_empty() => return None,
+            Some(Open::Math { at, body, closer }) => (at, body, closer, line, start),
+            still_open => {
+                self.open = still_open;
+                return None;
+            }
+        };
+        let Some((end, alone)) = math::display_closer(text, closer) else {
+            self.open = Some(Open::Math { at, body, closer });
+            return None;
+        };
+        alone.then(|| Closed {
+            at,
+            body: body..offset + end - closer.len(),
+            kind: BlockKind::DisplayMath,
+        })
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+}
+
+/// Splits `source` into markdown runs and the closed fences and display
+/// formulas drawn as blocks. A fence of another language, one indented as
+/// code, and a block not yet closed stay in their run, so a block still
+/// streaming shows as source until its closer arrives. A run before a
+/// block keeps the newline that ends it: the markdown renderer draws no
+/// row for a final newline, so the rows of the runs and blocks add up to
+/// those of the whole reply drawn as source.
 pub(crate) fn segment(source: &str) -> Vec<Segment<'_>> {
     let mut segments = Vec::new();
     let mut run_start = 0;
     let mut offset = 0;
-    let mut open: Option<(usize, usize, Option<BlockKind>)> = None;
+    let mut scan = BlockScan::default();
     for line in source.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
-        let Some(delimiter) = block_delimiter(line) else {
+        let Some(closed) = scan.line(line, start) else {
             continue;
         };
-        match open.take() {
-            None => open = Some((start, offset, delimiter.kind())),
-            Some((opened_at, body_start, Some(kind))) => {
-                if run_start < opened_at {
-                    segments.push(Segment::Markdown(&source[run_start..opened_at]));
-                }
-                let fenced = &source[opened_at..offset];
-                segments.push(Segment::Block(Block {
-                    kind,
-                    fenced: fenced.strip_suffix('\n').unwrap_or(fenced),
-                    body: &source[body_start..start],
-                }));
-                run_start = offset;
-            }
-            Some((_, _, None)) => {}
+        if run_start < closed.at {
+            segments.push(Segment::Markdown(&source[run_start..closed.at]));
         }
+        let fenced = &source[closed.at..offset];
+        segments.push(Segment::Block(Block {
+            kind: closed.kind,
+            fenced: fenced.strip_suffix('\n').unwrap_or(fenced),
+            body: &source[closed.body],
+        }));
+        run_start = offset;
     }
     if run_start < source.len() {
         segments.push(Segment::Markdown(&source[run_start..]));
@@ -397,12 +507,14 @@ mod tests {
 
     /// The stable part of every prefix of a reply and the tail after it,
     /// segmented apart, find the blocks the whole prefix holds: the split
-    /// never falls inside a fence.
+    /// never falls inside a fence or display math.
     #[test]
     fn segmenting_the_stable_part_and_the_tail_apart_finds_the_same_blocks() {
         let reply = "Intro line.\n\n```mermaid\nflowchart TD\n\nA-->B\n```\n\n\
                      Some prose.\n\n```rust\nlet x = 1;\n\n```\n\n    ```mermaid\nx\n\n    ```\n\n\
-                     ```mermaid\nsequenceDiagram\nA->>B: hi\n```\nend\n";
+                     ```mermaid\nsequenceDiagram\nA->>B: hi\n```\nend\n\n\
+                     $$\n\\frac{a}{b}\n$$\n\nso $x$ and\n\\[ y \\]\n\n$$ open\n\nlate $$\n\n\
+                     \\[\n```mermaid\nA\n```\n\\]\n\n$$x$$ junk\n\n```\n$$\n```\n$$z$$\n";
         let ends = reply.char_indices().map(|(i, _)| i).chain([reply.len()]);
         for end in ends {
             let prefix = &reply[..end];
@@ -410,6 +522,60 @@ mod tests {
             let mut apart = blocks(&segment(&prefix[..split]));
             apart.extend(blocks(&segment(&prefix[split..])));
             assert_eq!(apart, blocks(&segment(prefix)), "{prefix:?}");
+        }
+        let kinds: Vec<BlockKind> = blocks(&segment(reply)).iter().map(|b| b.kind).collect();
+        use BlockKind::{DisplayMath, Mermaid};
+        assert_eq!(
+            kinds,
+            [
+                Mermaid,
+                Mermaid,
+                DisplayMath,
+                DisplayMath,
+                DisplayMath,
+                DisplayMath
+            ]
+        );
+    }
+
+    #[test]
+    fn display_math_on_lines_of_its_own_is_a_block() {
+        let source = "before\n$$\n\\frac{a}{b}\n$$\n  \\[ x^2 \\]  \nafter";
+        assert_eq!(
+            segment(source),
+            [
+                Segment::Markdown("before\n"),
+                Segment::Block(Block {
+                    kind: BlockKind::DisplayMath,
+                    fenced: "$$\n\\frac{a}{b}\n$$",
+                    body: "\n\\frac{a}{b}\n",
+                }),
+                Segment::Block(Block {
+                    kind: BlockKind::DisplayMath,
+                    fenced: "  \\[ x^2 \\]  ",
+                    body: " x^2 ",
+                }),
+                Segment::Markdown("after"),
+            ]
+        );
+    }
+
+    /// Display math with text after its closer, or behind an indent of
+    /// four columns, or not yet closed, or cut by a blank line, or inside
+    /// a fence, stays markdown; so does an escaped closer.
+    #[test]
+    fn other_display_math_stays_in_the_markdown_run() {
+        for source in [
+            "$$x$$ and more\n",
+            "$$\nx\n$$ and more\n",
+            "    $$x$$\n",
+            "$$\n\\frac{a}{b}\n",
+            "\\[\nx\n\nstill\n\\]\n",
+            "```\n$$x$$\n```\n",
+            "$$x\\$$\n",
+            "a $$x$$\n",
+        ] {
+            assert_eq!(segment(source), [Segment::Markdown(source)], "{source:?}");
         }
     }
 

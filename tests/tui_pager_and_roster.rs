@@ -53,6 +53,8 @@ mod transcript {
     //!   shows its source in its place;
     //! - a chart fence in a reply is drawn as a bar chart and `Alt+M` shows
     //!   its source in its place;
+    //! - display and inline math in a reply are drawn and `Alt+M` shows
+    //!   their source in their place;
     //! - a narrower terminal re-wraps the cells in place without duplicating
     //!   a row;
     //! - Shift+G with the view at the bottom is plain typing, before a scroll
@@ -928,6 +930,48 @@ mod transcript {
         assert!(
             !source.contains('█'),
             "the chart stayed after Alt+M:\n{source}"
+        );
+
+        quit(pty);
+    }
+
+    // ---------------------------------------------------------------------
+    // Display and inline math in a reply are drawn, and Alt+M shows their
+    // source in their place.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn a_math_reply_is_drawn_and_alt_m_shows_its_source() {
+        let reply = "Math:\n$$\\frac{a+b}{c}$$\nwhere $x^2$ holds\nmath-end-marker";
+        let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
+        let (_guard, mut pty) = boot_with_fake("math", &fake);
+
+        let before = pty.raw().len();
+        pty.send(b"draw it\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "math-end-marker", before, "the reply");
+        pty.read_for(Duration::from_millis(500));
+        let drawn = ctrl_l_repaint(&mut pty);
+        assert!(
+            drawn.contains("a+b") && drawn.contains("wherex²holds"),
+            "the math is not drawn:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("\\frac") && !drawn.contains("$x^2$"),
+            "the source shows beside the math:\n{drawn}"
+        );
+
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_M).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let source = ctrl_l_repaint(&mut pty);
+        assert!(
+            source.contains("$$\\frac{a+b}{c}$$") && source.contains("$x^2$"),
+            "Alt+M did not show the source:\n{source}"
+        );
+        assert!(
+            !source.contains("x²"),
+            "the math stayed after Alt+M:\n{source}"
         );
 
         quit(pty);

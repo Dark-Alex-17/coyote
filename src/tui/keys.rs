@@ -201,7 +201,7 @@ pub(crate) enum Action {
     ScheduleFrame,
     /// Put the focused tool row's whole output on the clipboard.
     CopyToolOutput,
-    /// Show the replies' rich blocks as source, or drawn again.
+    /// Show the replies' rich blocks and math as source, or drawn again.
     ToggleRichView,
     /// Read the clipboard into the composer: its text, or a placeholder
     /// for each image on it.
@@ -437,7 +437,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(
             Transcript,
             "Alt+M",
-            "Show diagrams and charts as their source, or drawn again",
+            "Show diagrams, charts and math as their source, or drawn again",
         ),
         row(
             Composer,

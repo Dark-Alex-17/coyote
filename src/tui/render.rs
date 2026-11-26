@@ -4,11 +4,14 @@
 //! that is not a colour or attribute and parsed back into styled spans. A
 //! streaming reply is split into a stable part, rendered once per width,
 //! and a live tail. A reply's closed fences of a kind the TUI draws
-//! itself (see [`super::rich`]) are drawn in place of their source.
+//! itself (see [`super::rich`]) are drawn in place of their source, and
+//! so is its LaTeX math.
 
+use super::rich::math_render::{self, MathRenderer, TermMathsBackend};
 use super::rich::mermaid::{self, MermaidRenderer, MermaidTextBackend};
 use super::rich::{
-    self, Block, BlockKind, CopyRegion, Rendered, RichCache, RichKey, RichStyle, Segment, chart,
+    self, Block, BlockKind, CopyRegion, Delimiter, Rendered, RichCache, RichKey, RichStyle,
+    Segment, chart, math,
 };
 use super::throbber::Tick;
 use crate::config::is_format_char;
@@ -340,6 +343,7 @@ pub(crate) struct Renderer {
     /// it from the `tui_chart_height` setting.
     pub(super) chart_height: u16,
     mermaid: Arc<dyn MermaidRenderer>,
+    math: Arc<dyn MathRenderer>,
     rich_cache: RichCache,
 }
 
@@ -366,6 +370,7 @@ impl Renderer {
             rich: true,
             chart_height: chart::DEFAULT_HEIGHT,
             mermaid: Arc::new(MermaidTextBackend),
+            math: Arc::new(TermMathsBackend),
             rich_cache: RichCache::default(),
         })
     }
@@ -381,9 +386,16 @@ impl Renderer {
         self.rich_cache = RichCache::default();
     }
 
+    /// Swaps the math backend, dropping the blocks the old one drew.
+    #[cfg(test)]
+    pub(super) fn set_math_backend(&mut self, backend: Arc<dyn MathRenderer>) {
+        self.math = backend;
+        self.rich_cache = RichCache::default();
+    }
+
     /// A reply laid out at `width`: with `rich`, its rich blocks drawn and
-    /// the rows they take recorded for the copy; without, all of it as
-    /// markdown source.
+    /// its inline math drawn, and the rows and columns they take recorded
+    /// for the copy; without, all of it as markdown source.
     pub(crate) fn render_reply(&mut self, source: &str, width: u16, rich: bool) -> Rendered {
         if !rich {
             return Rendered::plain(self.markdown_run(source, width));
@@ -391,13 +403,21 @@ impl Renderer {
         let mut rendered = Rendered::default();
         for segment in rich::segment(source) {
             match segment {
-                Segment::Markdown(run) => {
-                    rendered.append(Rendered::plain(self.markdown_run(run, width)));
-                }
+                Segment::Markdown(run) => rendered.append(self.prose_run(run, width)),
                 Segment::Block(block) => rendered.append(self.rich_block(&block, width)),
             }
         }
         rendered
+    }
+
+    /// A markdown run with each inline formula that draws on one row drawn
+    /// in place of its source.
+    fn prose_run(&mut self, run: &str, width: u16) -> Rendered {
+        let room = self.wrap_cap.map_or(width, |cap| width.min(cap)).max(1);
+        let backend = Arc::clone(&self.math);
+        let (masked, formulas) = math::mask_inline(run, room, backend.as_ref());
+        let (lines, regions) = math::unmask(self.markdown_run(&masked, width), &formulas);
+        Rendered { lines, regions }
     }
 
     /// Markdown with every block shown as source: what the transcript
@@ -451,6 +471,15 @@ impl Renderer {
                 .map_err(|err| err.note()),
             BlockKind::Chart => {
                 chart::render_chart(block.body, width, self.chart_height, &self.rich_style())
+                    .map_err(|err| err.note())
+            }
+            BlockKind::DisplayMath => {
+                math_render::math_rows(self.math.as_ref(), block.body.trim(), width)
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| Line::from(format!("  {row}")))
+                            .collect()
+                    })
                     .map_err(|err| err.note())
             }
         }
@@ -538,7 +567,7 @@ fn take_soft_break(line: Line<'static>) -> Line<'static> {
 }
 
 fn is_fence(line: &str) -> bool {
-    rich::block_delimiter(line).is_some()
+    matches!(rich::block_delimiter(line), Some(Delimiter::Fence { .. }))
 }
 
 fn fence_open(source: &str) -> bool {
@@ -557,16 +586,15 @@ pub(super) fn open_fence_line(source: &str) -> Option<&str> {
 }
 
 /// Byte offset where the live tail of a streaming reply begins: the last
-/// blank line outside a code fence. Everything before it is complete
-/// paragraphs that render the same on every frame.
+/// blank line outside a code fence or display math. Everything before it
+/// is complete paragraphs that render the same on every frame.
 pub(crate) fn split_stable_tail(source: &str) -> usize {
     let mut split = 0;
     let mut offset = 0;
-    let mut in_fence = false;
+    let mut scan = rich::BlockScan::default();
     for line in source.split_inclusive('\n') {
-        if is_fence(line) {
-            in_fence = !in_fence;
-        } else if !in_fence && line.trim().is_empty() && line.ends_with('\n') {
+        scan.line(line, offset);
+        if !scan.is_open() && line.trim().is_empty() && line.ends_with('\n') {
             split = offset;
         }
         offset += line.len();
@@ -657,6 +685,7 @@ impl RenderCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::rich::math_render::FakeMath;
     use crate::tui::rich::mermaid::{FakeMermaid, MermaidError};
     use crate::utils::decode_bin;
     use syntect::highlighting::Theme;
@@ -1274,5 +1303,176 @@ mod tests {
         assert!(rendered.regions.is_empty());
         assert_eq!(rendered.lines, renderer.markdown_source(open, 40));
         assert_eq!(fake.calls(), 0);
+    }
+
+    fn math_faked(
+        respond: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (Renderer, Arc<FakeMath>) {
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let fake = Arc::new(FakeMath::new(respond));
+        renderer.set_math_backend(fake.clone());
+        (renderer, fake)
+    }
+
+    /// Display math is drawn two columns in, its TeX trimmed, and its rows
+    /// copy as the formula's source.
+    #[test]
+    fn display_math_is_drawn_indented_and_copies_as_source() {
+        let (mut renderer, _) = math_faked(|tex| {
+            assert_eq!(tex, "\\frac{a}{b}");
+            " a\n───\n b".to_string()
+        });
+        let formula = "$$\n\\frac{a}{b}\n$$";
+        let rendered = renderer.render_reply(&format!("before\n{formula}\nafter"), 40, true);
+        assert_eq!(
+            texts(&rendered.lines),
+            ["before", "   a", "  ───", "   b", "after"]
+        );
+        assert_eq!(
+            rendered.regions,
+            [CopyRegion::Block {
+                rows: 1..4,
+                source: Arc::from(formula),
+            }]
+        );
+    }
+
+    #[test]
+    fn display_math_that_cannot_be_drawn_shows_its_source_and_why() {
+        let (mut renderer, fake) = math_faked(|_| "drawn".to_string());
+        let formula = "$$\\begin{align*} a &= b \\end{align*}$$";
+        let rendered = renderer.render_reply(formula, 40, true);
+        let mut expected = renderer.markdown_source(formula, 40);
+        let note = "math: \\begin{align*} is not supported (showing source)";
+        expected.push(Line::from(Span::styled(note, renderer.faded)));
+        assert_eq!(rendered.lines, expected);
+        assert_eq!(fake.calls(), 0);
+    }
+
+    /// An inline formula is drawn in its sentence by the real markdown
+    /// renderer, styled as the words around it, and its columns copy as
+    /// its source; without rich blocks the sentence is its source.
+    #[test]
+    fn inline_math_is_drawn_in_its_sentence() {
+        let (mut renderer, _) = math_faked(|tex| {
+            assert_eq!(tex, "x^2");
+            "x²".to_string()
+        });
+        let source = "the **value $x^2$ here** and `$y$`";
+        let rendered = renderer.render_reply(source, 80, true);
+        assert_eq!(texts(&rendered.lines), ["the value x² here and $y$"]);
+        let drawn = every_span(&rendered.lines)
+            .find(|span| span.content.contains('²'))
+            .unwrap();
+        assert!(
+            drawn.style.add_modifier.contains(Modifier::BOLD),
+            "{drawn:?}"
+        );
+        assert_eq!(
+            rendered.regions,
+            [CopyRegion::Inline {
+                row: 0,
+                cols: 10..12,
+                source: Arc::from("$x^2$"),
+            }]
+        );
+        let plain = renderer.render_reply(source, 80, false);
+        assert!(texts(&plain.lines)[0].contains("$x^2$"), "{plain:?}");
+    }
+
+    /// A formula glued to a word too long for a row is cut by the wrap
+    /// with the word, each piece drawn where it lands and only the first
+    /// copying as the source.
+    #[test]
+    fn an_inline_formula_split_by_the_wrap_is_drawn_on_both_rows() {
+        let (mut renderer, _) = math_faked(|_| "abcdefghijklmnop".to_string());
+        let word = "w".repeat(20);
+        let rendered = renderer.render_reply(&format!("{word}$x$"), 24, true);
+        assert_eq!(
+            texts(&rendered.lines),
+            [format!("{word}abcd"), "efghijklmnop".to_string()]
+        );
+        assert_eq!(
+            rendered.regions,
+            [
+                CopyRegion::Inline {
+                    row: 0,
+                    cols: 20..24,
+                    source: Arc::from("$x$"),
+                },
+                CopyRegion::Inline {
+                    row: 1,
+                    cols: 0..12,
+                    source: Arc::from(""),
+                },
+            ]
+        );
+    }
+
+    /// LLM-style replies mixing math, prices, code and broken TeX, drawn by
+    /// the real crate at a narrow, a middling and a wide pane: nothing
+    /// panics, and without rich blocks each reply is drawn as before.
+    #[test]
+    fn a_corpus_of_math_replies_never_panics() {
+        let deep = format!("$${}$$", "{".repeat(200));
+        let long = format!("${}$", "x^".repeat(3000));
+        let corpus = [
+            "The area is $\\pi r^2$.",
+            "Euler: $e^{i\\pi} + 1 = 0$",
+            "$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$",
+            "$$\n\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}\n$$",
+            "\\[ \\lim_{x \\to 0} \\frac{\\sin x}{x} = 1 \\]",
+            "Inline \\(a^2 + b^2 = c^2\\) works.",
+            "It costs $5 and $10, or $3.50 each.",
+            "Set $HOME and $PATH, then run `echo $x$`.",
+            "Use ${VAR} or $(cmd) in shell.",
+            "```bash\necho \"$HOME $PATH\"\n```",
+            "```\n$$\nnot math\n$$\n```",
+            "$$\\begin{align*} a &= b \\\\ c &= d \\end{align*}$$",
+            "$$\\sqrt[3]{x}$$",
+            "$$\\frac{a}{$$",
+            "$\\frac{1}{2$ unclosed brace",
+            "$x$$y$",
+            "$$$$",
+            "$ $",
+            "\\(\\)",
+            "$\\unknowncommand{x}$",
+            "$$\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}$$",
+            "$$f(x) = \\begin{cases} 1 & x > 0 \\\\ 0 & \\text{else} \\end{cases}$$",
+            "- item with $\\alpha$\n- item with $\\beta_1$",
+            "> quoted $x + y$ math",
+            "| a | b |\n|---|---|\n| $x$ | $y^2$ |",
+            "# Heading with $E = mc^2$",
+            "A [link](https://e.com/$x$) and ![img](a$b$.png)",
+            "<span title=\"$x$\">$y$</span>",
+            "Escaped \\$5 and \\\\$x$",
+            "$\\mathbb{R}^n \\to \\mathbb{R}$",
+            "Matrix $\\begin{bmatrix} a & b \\end{bmatrix}$ inline",
+            "Long $a_1 + a_2 + a_3 + a_4 + a_5 + a_6 + a_7 + a_8 + a_9 + a_{10}$ sum",
+            "$$\n\\frac{\n",
+            "\\[\nx\n\nnever closed",
+            "Wide $\\text{\u{4e2d}\u{6587}} + x$ glyphs",
+            "Icon \u{E000} glyph and $x$ math \u{E001}",
+            "Nested $\\frac{\\frac{a}{b}}{\\frac{c}{d}}$ fraction",
+            "$\\left( \\frac{a}{b} \\right)$",
+            deep.as_str(),
+            long.as_str(),
+            "Dollar at end $",
+            "$100 + $200 = $300",
+            "\\$\\$ and $$ alone",
+        ];
+        assert!(corpus.len() >= 40);
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let mut before = Renderer::new(RenderOptions::default()).unwrap();
+        for reply in corpus {
+            for width in [20, 40, 80] {
+                renderer.render_reply(reply, width, true);
+                assert_eq!(
+                    renderer.render_reply(reply, width, false),
+                    Rendered::plain(before.markdown_run(reply, width)),
+                    "{reply:?} at {width}"
+                );
+            }
+        }
     }
 }

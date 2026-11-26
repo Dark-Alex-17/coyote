@@ -1843,6 +1843,7 @@ dependencies = [
  "syntect",
  "sys-locale",
  "sysinfo",
+ "term-maths",
  "terminal-colorsaurus",
  "textwrap",
  "time",
@@ -6129,6 +6130,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-latex-parser"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d8acd59feae81354fa3e31bb843418e76d83c49941f417ae5fbaa8a6c97fac5"
+
+[[package]]
 name = "rust-stemmers"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7173,6 +7180,17 @@ dependencies = [
  "futf",
  "mac",
  "utf-8",
+]
+
+[[package]]
+name = "term-maths"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26ccccf7b1e429ef47ef4a82726346feefdb67169e6a9d8d97fc6d3707640a05"
+dependencies = [
+ "rust-latex-parser",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

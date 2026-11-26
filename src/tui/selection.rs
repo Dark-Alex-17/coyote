@@ -11,6 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Line;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -61,6 +62,9 @@ pub(super) struct Row {
     /// The block the row was drawn for, by its first row, and the source
     /// a copy takes in place of the block's rows.
     block: Option<(usize, Arc<str>)>,
+    /// The columns of inline formulas drawn in the row, and the source a
+    /// copy takes in place of each.
+    inline: Vec<(Range<usize>, Arc<str>)>,
 }
 
 impl Row {
@@ -90,20 +94,33 @@ pub(super) fn rows<'a>(lines: impl IntoIterator<Item = (Pos, &'a Line<'a>)>) -> 
             gutter: gutter_width(line),
             before: wrap_join(line).unwrap_or("\n"),
             block: None,
+            inline: Vec::new(),
         })
         .collect()
 }
 
 /// Marks the rows of one cell that `regions` cover, so a copy takes each
-/// region's source once rather than the rows drawn for it.
+/// region's source once rather than the rows or columns drawn for it.
 pub(super) fn mark_regions(rows: &mut [Row], regions: &[CopyRegion]) {
     for region in regions {
-        let CopyRegion::Block {
-            rows: covered,
-            source,
-        } = region;
-        for row in rows.iter_mut().filter(|row| covered.contains(&row.row)) {
-            row.block = Some((covered.start, Arc::clone(source)));
+        match region {
+            CopyRegion::Block {
+                rows: covered,
+                source,
+            } => {
+                for row in rows.iter_mut().filter(|row| covered.contains(&row.row)) {
+                    row.block = Some((covered.start, Arc::clone(source)));
+                }
+            }
+            CopyRegion::Inline {
+                row: at,
+                cols,
+                source,
+            } => {
+                for row in rows.iter_mut().filter(|row| row.row == *at) {
+                    row.inline.push((cols.clone(), Arc::clone(source)));
+                }
+            }
         }
     }
 }
@@ -134,15 +151,25 @@ fn gutter_width(line: &Line) -> usize {
     leading.max(before_mark)
 }
 
-/// The characters of `text` that start in columns `from..to`.
-fn columns(text: &str, from: usize, to: usize) -> String {
+/// The characters of `text` that start in columns `from..to`, with the
+/// source of each of `swaps` whose columns the range touches given once
+/// in place of the characters in those columns.
+fn columns(text: &str, from: usize, to: usize, swaps: &[(Range<usize>, Arc<str>)]) -> String {
     let mut column = 0;
     let mut out = String::new();
+    let mut swapped = None;
     for c in text.chars() {
         if column >= to {
             break;
         }
-        if column >= from {
+        let swap = swaps.iter().position(|(cols, _)| cols.contains(&column));
+        if let Some(at) = swap {
+            let (cols, source) = &swaps[at];
+            if swapped != Some(at) && cols.start < to && from < cols.end {
+                out.push_str(source);
+                swapped = Some(at);
+            }
+        } else if column >= from {
             out.push(c);
         }
         column += c.width().unwrap_or(0);
@@ -186,7 +213,7 @@ pub(super) fn extract(rows: &[Row], start: Pos, end: Pos) -> String {
                 } else {
                     usize::MAX
                 };
-                columns(&row.text, from.max(row.gutter), to)
+                columns(&row.text, from.max(row.gutter), to, &row.inline)
                     .trim_end()
                     .to_string()
             }
@@ -579,6 +606,51 @@ mod tests {
             "```mermaid\nA\n```"
         );
         assert_eq!(extract(&rows, Pos::new(0, 7, 0), Pos::new(0, 7, 9)), "");
+    }
+
+    /// A range touching any column of an inline formula copies its source
+    /// once in place of the drawing; the piece a wrap moved to the next
+    /// row copies nothing, and the text around is cut as usual.
+    #[test]
+    fn an_inline_formula_copies_its_source_once() {
+        let mut rows = laid_out(&[
+            (0, line(&["the value x² + y² here, and ab"])),
+            (0, wrapped(&[], false, "cd done")),
+        ]);
+        mark_regions(
+            &mut rows,
+            &[
+                CopyRegion::Inline {
+                    row: 0,
+                    cols: 10..17,
+                    source: Arc::from("$x^2 + y^2$"),
+                },
+                CopyRegion::Inline {
+                    row: 0,
+                    cols: 28..30,
+                    source: Arc::from("\\(abcd\\)"),
+                },
+                CopyRegion::Inline {
+                    row: 1,
+                    cols: 0..2,
+                    source: Arc::from(""),
+                },
+            ],
+        );
+        let all = extract(&rows, Pos::new(0, 0, 0), Pos::new(0, 1, usize::MAX));
+        assert_eq!(all, "the value $x^2 + y^2$ here, and \\(abcd\\) done");
+        assert_eq!(
+            extract(&rows, Pos::new(0, 0, 12), Pos::new(0, 0, 12)),
+            "$x^2 + y^2$"
+        );
+        assert_eq!(
+            extract(&rows, Pos::new(0, 0, 4), Pos::new(0, 0, 10)),
+            "value $x^2 + y^2$"
+        );
+        assert_eq!(
+            extract(&rows, Pos::new(0, 1, 0), Pos::new(0, 1, 6)),
+            " done"
+        );
     }
 
     /// Presses on one cell inside the window count up to three and then

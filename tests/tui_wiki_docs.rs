@@ -39,6 +39,7 @@ const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test tui_wiki_docs`";
 const PAGE: &str = "TUI.md";
 const CHARTS_HEADING: &str = "## Charts";
+const MATH_HEADING: &str = "## Math";
 const PROTOCOL_HEADING: &str = "## Prompting the user from a tool";
 const CHANNEL_HEADING: &str = "# The Prompt Channel";
 const ENV_HEADING: &str = "# UI and Prompt Related Variables";
@@ -788,6 +789,29 @@ fn tui_page_documents_every_chart_spec_name() {
         assert!(
             charts.contains(&needle),
             "{PAGE} `{CHARTS_HEADING}` names {needle}"
+        );
+    }
+}
+
+/// The math section of the TUI page names every delimiter the detector
+/// reads and the key that shows math as source.
+#[test]
+fn tui_page_documents_every_math_delimiter() {
+    let math = src(&["tui", "rich", "math.rs"]);
+    let mut delimiters = string_literals(&const_expr(&math, "DELIMITERS"));
+    delimiters.dedup();
+    assert_eq!(delimiters, ["$$", "\\[", "\\]", "\\(", "\\)", "$"]);
+
+    let Some(wiki) = wiki_dir() else { return };
+    let section = flat(&section(PAGE, &read(wiki.join(PAGE)), MATH_HEADING));
+    let needles = delimiters
+        .iter()
+        .map(|delimiter| format!("`{delimiter}`"))
+        .chain(["`Alt+M`".to_string()]);
+    for needle in needles {
+        assert!(
+            section.contains(&needle),
+            "{PAGE} `{MATH_HEADING}` names {needle}"
         );
     }
 }

@@ -1,5 +1,6 @@
 use super::mouse_and_copy::{left_drag, row_with};
 use super::*;
+use crate::tui::rich::math_render::FakeMath;
 use crate::tui::rich::mermaid::{FakeMermaid, MermaidError};
 
 const FLOWCHART_TD: &str = "flowchart TD\n    A[Start] --> B[Ship]";
@@ -267,4 +268,129 @@ fn a_chart_shows_and_copies_as_its_source() {
     harness.app.handle_key(ctrl(KeyCode::Char('t')));
     let frame = harness.draw();
     assert!(frame.contains("type: bar"), "{frame}");
+}
+
+const FRACTION: &str = "$$\\frac{a+b}{c}$$";
+const SUM: &str = "$$\\sum_{i=1}^{n} i^2$$";
+const MATRIX: &str = "$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$";
+const CASES: &str = "$$\nf(x) = \\begin{cases} x & x > 0 \\\\ -x & x \\le 0 \\end{cases}\n$$";
+
+fn math_reply(formula: &str) -> String {
+    format!("Here it is:\n{formula}\nThat is all.")
+}
+
+/// A fraction, a sum with limits, a matrix and cases are drawn by the
+/// crate in the transcript, at a wide and a narrow screen.
+#[test]
+fn display_math_is_drawn_in_the_transcript() {
+    for (name, formula) in [
+        ("fraction", FRACTION),
+        ("sum", SUM),
+        ("matrix", MATRIX),
+        ("cases", CASES),
+    ] {
+        for (width, height) in [(80, 24), (40, 20)] {
+            let mut harness = Harness::standalone(width, height);
+            let frame = replied(&mut harness, &math_reply(formula));
+            let at = format!("{name} {width}x{height}:\n{frame}");
+            assert!(!frame.contains("$$"), "{at}");
+            assert!(!frame.contains("showing source"), "{at}");
+            insta::assert_snapshot!(format!("math_{name}_{width}x{height}"), frame);
+        }
+    }
+}
+
+const INLINE: &str = "the value $x^2 + y^2$ here";
+
+/// An inline formula that draws on one row is drawn in its sentence, and
+/// a drag over the sentence copies the formula's source.
+#[test]
+fn inline_math_is_drawn_in_its_sentence_and_copies_as_source() {
+    let mut harness = Harness::standalone(80, 24);
+    let frame = replied(&mut harness, INLINE);
+    assert!(frame.contains("the value x² + y² here"), "{frame}");
+    insta::assert_snapshot!("math_inline_80x24", frame);
+    let row = row_with(&harness, "the value");
+    assert_eq!(
+        left_drag(&mut harness, (0, row), (79, row)),
+        Some(Command::Copy {
+            text: INLINE.to_string(),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
+}
+
+/// A construct the crate draws wrongly shows its source with the note.
+#[test]
+fn display_math_that_cannot_be_drawn_shows_its_source_and_a_note() {
+    let mut harness = Harness::standalone(80, 24);
+    let formula = "$$\\begin{align*} a &= b \\\\ c &= d \\end{align*}$$";
+    let frame = replied(&mut harness, &math_reply(formula));
+    assert!(frame.contains("\\begin{align*}"), "{frame}");
+    assert!(
+        frame.contains("math: \\begin{align*} is not supported (showing source)"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("math_fallback_80x24", frame);
+}
+
+/// Alt+M shows display and inline math as source, the transcript view
+/// shows the source, and a drag over a drawn formula copies its source.
+#[test]
+fn math_shows_and_copies_as_its_source() {
+    let mut harness = Harness::standalone(80, 24);
+    let reply = format!("{}\n{INLINE}", math_reply(FRACTION));
+    let frame = replied(&mut harness, &reply);
+    assert!(!frame.contains("\\frac"), "{frame}");
+    let bar = row_with(&harness, "───");
+    assert_eq!(
+        left_drag(&mut harness, (3, bar), (5, bar)),
+        Some(Command::Copy {
+            text: FRACTION.to_string(),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
+
+    harness.app.handle_key(alt(KeyCode::Char('m')));
+    let frame = harness.draw();
+    assert!(frame.contains("\\frac{a+b}{c}"), "{frame}");
+    assert!(frame.contains("$x^2 + y^2$"), "{frame}");
+    assert!(!frame.contains("a + b") && !frame.contains('²'), "{frame}");
+    harness.app.handle_key(alt(KeyCode::Char('m')));
+    let frame = harness.draw();
+    assert!(frame.contains("x² + y²"), "{frame}");
+
+    harness.app.handle_key(ctrl(KeyCode::Char('t')));
+    let frame = harness.draw();
+    assert!(frame.contains("\\frac{a+b}{c}"), "{frame}");
+    assert!(frame.contains("$x^2 + y^2$"), "{frame}");
+}
+
+/// Display math in a streaming reply is drawn once its closer arrives,
+/// and the backend is asked once however many frames the tail takes.
+#[test]
+fn display_math_in_a_streaming_reply_is_drawn_once_closed() {
+    let mut harness = Harness::standalone(80, 24);
+    let fake = Arc::new(FakeMath::new(|_| "DRAWN".to_string()));
+    harness.app.renderer.set_math_backend(fake.clone());
+    harness.app.begin_turn("draw it", false);
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("Intro\n\n$$\n\\frac{a}{b}".to_string()));
+    let frame = harness.draw();
+    assert!(frame.contains("\\frac{a}{b}"), "{frame}");
+    assert!(!frame.contains("DRAWN"), "{frame}");
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta("\n$$\nstill".to_string()));
+    let frame = harness.draw();
+    assert!(frame.contains("DRAWN"), "{frame}");
+    harness
+        .app
+        .handle_msg(UiMsg::TextDelta(" going".to_string()));
+    let frame = harness.draw();
+    assert!(frame.contains("still going"), "{frame}");
+    assert_eq!(fake.calls(), 1);
 }
