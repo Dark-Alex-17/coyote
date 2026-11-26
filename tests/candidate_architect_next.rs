@@ -661,6 +661,59 @@ fn verify_smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// Each design-retrospective guard, removed from a scratch copy, turns its
+/// smoke row red: the large run's way to `run_retrospective` at run close,
+/// the adopted path that creates the refactor task, the one leading
+/// code-fence line read past, the skip when no run base resolves, and the one
+/// not-triaged follow-up a REFACTORS reply keeps when its triage fails or
+/// decides nothing.
+#[test]
+#[ignore = "five smoke battery runs take about four minutes; run with -- --ignored"] // TASK-916
+fn retrospective_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "retro-large-run",
+                "    u[\"_next\"] = \"run_retrospective\"\n",
+                "",
+                "integrate_route: a large run at run close -> run_retrospective over the run diff, \
+                 retro_done set first",
+            ),
+            (
+                "retro-adopted",
+                "    elif adopted:\n",
+                "    elif False:\n",
+                "retro_route: adopted -> ONE pending chore task blocked by the unit's tasks, \
+                 integration re-armed, -> select_tasks",
+            ),
+            (
+                "retro-fence",
+                "    if lines and lines[0].startswith(\"```\"):\n",
+                "    if False:\n",
+                "retro_route: a reply opening with one code-fence line is read past the fence",
+            ),
+            (
+                "retro-no-base",
+                "    if not base:\n        u[\"retro_report\"]",
+                "    if False:\n        u[\"retro_report\"]",
+                "integrate_route: no run base and no merge-base -> hygiene_create with a note, \
+                 never a retrospective",
+            ),
+            (
+                "retro-untriaged",
+                " and not (triaged and (adopted or declined or later)):\n",
+                " and False:\n",
+                "retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up \
+                 pointing at the saved report",
+            ),
+        ],
+    );
+}
+
 /// The rest of the intake guards, each removed from a scratch copy, turn
 /// their smoke row red: the re-check that a seed is still ready before it is
 /// consumed, the consumption at the step after a successful orientation, the
@@ -2202,6 +2255,7 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         "oracle",
         "engineer",
         "whetstone",
+        "design-retrospective",
     ] {
         copy_tree(&agents_dir().join(name), &agents.join(name));
     }
@@ -3107,10 +3161,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![52, 5086, 5099],
+        vec![52, 5241, 5254],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [5086, 5099] {
+    for line in [5241, 5254] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -5296,11 +5350,15 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("review_poll", "timeout", 900),
     ("review_route", "timeout", 120),
     ("review_triage", "timeout", 600),
+    ("retro_triage", "max_iterations", 10),
+    ("retro_triage", "timeout", 600),
     ("review_update", "timeout", 1020),
     ("run_adversary", "max_attempts", 1),
     ("run_adversary", "timeout", 7200),
     ("run_gauntlet", "max_attempts", 1),
     ("run_gauntlet", "timeout", 0),
+    ("run_retrospective", "max_attempts", 1),
+    ("run_retrospective", "timeout", 3600),
     ("run_whetstone", "max_attempts", 1),
     ("run_whetstone", "timeout", 3600),
     ("stack_gate", "timeout", 300),
@@ -5743,6 +5801,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("pr_body_fix", AnomaliesChannel::NoSchema),
     ("pr_summary", AnomaliesChannel::Plain),
     ("promote_tasks", AnomaliesChannel::NoSchema),
+    ("retro_triage", AnomaliesChannel::Plain),
     ("review_triage", AnomaliesChannel::Plain),
     ("summarize_run", AnomaliesChannel::NoSchema),
     ("task_done", AnomaliesChannel::NoSchema),
@@ -6049,6 +6108,7 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .filter(|a| !declares(a))
         .collect();
     let expected = [
+        "design-retrospective",
         "engineer",
         "explore",
         "gatekeeper",

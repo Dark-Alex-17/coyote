@@ -46,7 +46,7 @@ SHA_RE = re.compile(
 )
 HEX_WORDS = {"deadbeef", "cafebabe"}
 # Tags that open an entry; an entry stops at the next of these on its line or below it.
-ENTRY_TAGS = ("rejected-finding:", "design-decision", "Follow-ups:", "HYGIENE:")
+ENTRY_TAGS = ("rejected-finding:", "design-decision", "Follow-ups:", "HYGIENE:", "retro-declined")
 BULLET_RE = re.compile(r"^\s*[-*]\s+")
 
 

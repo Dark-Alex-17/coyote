@@ -1082,6 +1082,10 @@ check("replay 08/1: the shortfall still there after the retry -> ledgered and re
 u = gates.branch_setup(base_state(**PS))
 check("branch_setup: single -> run branch created + pushed", u["_next"] == "select_tasks" and u["run_branch"] == "feat/PLAN-widgets" and git(CODE, "branch", "--show-current") == "feat/PLAN-widgets"
       and git(CODE, "rev-parse", "--verify", "origin/feat/PLAN-widgets"))
+check("branch_setup: the first branch records the run base", u.get("run_base_sha") == u["unit_base_sha"] != "", u.get("run_base_sha"))
+u = gates.branch_setup(base_state(run_base_sha="r0base", **PS))
+check("branch_setup: a recorded run base is never overwritten by a later branch", "run_base_sha" not in u and u["unit_base_sha"],
+      u.get("run_base_sha"))
 u = gates.branch_setup(base_state(**PS))
 check("branch_setup: existing run branch -> checkout, never recreated", u["_next"] == "select_tasks" and any("existing" in d for d in u["decisions"]))
 u = gates.branch_setup(base_state(pr_strategy="multi", **PS))
@@ -3740,6 +3744,296 @@ check("hygiene_create: no units -> pr_summary (single)", gates.hygiene_create(ba
 check("hygiene_create: no units -> stack_gate_final (multi)", MULTI_IS_GROUPS or gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=ts_f, hygiene_units=[], pr_strategy="multi"))["_next"] == "stack_gate_final")
 u = gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_chain), pr_strategy="multi", hygiene_units=[{"id": "chain-" + T1, "members": [T1, T2], "top_branch": "feat/nonexistent"}]))
 check("hygiene_create: chain base unresolvable -> escalation hygiene_base_missing (STOP, never a vacuous clean)", MULTI_IS_GROUPS or u["escalation"]["kind"] == "hygiene_base_missing")
+
+# ---------------------------------------------------------------- design retrospective: once per run, never blocking
+RETRO_JUDGED = '{"integration_amendments": []}'
+RETRO_CLEAN = "DESIGN_RETROSPECTIVE: CLEAN\n"
+RETRO_REFACTORS = "DESIGN_RETROSPECTIVE: REFACTORS 2\n\n## Refactor items\n\n1. **One table**\n2. **One owner**\n"
+
+
+def _retro_large(**over):
+    return base_state(**{"plan_path": PROMOTED, "tasks": copy.deepcopy(ts_f), "retro_large": True,
+                         "retro_large_reason": "a new subsystem", "last_node_output": RETRO_JUDGED, "run_base_sha": CODE_BASE,
+                         "closeout_scope": "run", **over})
+
+
+def _retro_integrate_large():
+    u = gates.integrate_route(_retro_large())
+    p = u.get("retro_prompt", "")
+    return (u["_next"] == "run_retrospective" and u.get("retro_done") is True and f"Project: {CODE}" in p
+            and f"Diff: {CODE_BASE}..HEAD" in p and "What the work set out to do:" in p
+            and "design retrospective: large (a new subsystem)" in u["decisions"]), (u.get("_next"), p, u.get("decisions"))
+
+
+def _retro_integrate_not_large():
+    u = gates.integrate_route(_retro_large(**{"retro_large": False, "retro_large_reason": "one small task"}))
+    return (u["_next"] == "hygiene_create" and u.get("retro_done") is True
+            and any("one small task" in l for l in u["retro_report"])), (u.get("_next"), u.get("retro_report"))
+
+
+def _retro_groups_run_base():
+    u = gates.integrate_route(_retro_large(pr_strategy="multi", group_index=2, unit_base_sha="g2base"))
+    p = u.get("retro_prompt", "")
+    return f"Diff: {CODE_BASE}..HEAD" in p and "g2base" not in p, p
+
+
+def _retro_plans_dir_line():
+    with_dir = gates.integrate_route(_retro_large(plans_root=TMP)).get("retro_prompt", "")
+    without = gates.integrate_route(_retro_large(plans_root="")).get("retro_prompt", "")
+    return f"Plans dir: {TMP} (bookkeeping" in with_dir and "Plans dir" not in without, without
+
+
+def _retro_no_base():
+    nowhere = os.path.join(TMP, "retro-no-repo")
+    os.makedirs(nowhere, exist_ok=True)
+    u = gates.integrate_route(_retro_large(run_base_sha="", code_repo_path=nowhere))
+    return (u["_next"] == "hygiene_create" and u.get("retro_done") is True and "retro_prompt" not in u
+            and any("the run base could not be resolved" in l for l in u["retro_report"])), (u.get("_next"), u.get("retro_report"))
+
+
+def _retro_no_code_repo():
+    cwds, real = [], gates.git
+
+    def recording(cwd, *args, **kw):
+        cwds.append(cwd)
+        return real(cwd, *args, **kw)
+    gates.git = recording
+    try:
+        u = gates.integrate_route(_retro_large(run_base_sha="", code_repo_path=""))
+    finally:
+        gates.git = real
+    readers = gates.STATE_KEY_READERS["code_repo_path"]
+    return ("" not in cwds and "integrate_route" in readers and "reseal_return" in readers and u["_next"] == "hygiene_create"
+            and any("the run base could not be resolved" in l for l in u["retro_report"])), (cwds, u.get("retro_report"))
+
+
+def _retro_integrate_unjudged():
+    u = gates.integrate_route(_retro_large(last_node_output="llm node failed: timeout"))
+    return (u["_next"] == "hygiene_create" and any("no valid size judgement" in l for l in u["retro_report"])), u.get("retro_report")
+
+
+def _retro_integrate_done():
+    u = gates.integrate_route(_retro_large(retro_done=True))
+    return u["_next"] == "hygiene_create" and "retro_prompt" not in u, u.get("_next")
+
+
+def _retro_group_closeout():
+    u = gates.integrate_route(_retro_large(closeout_scope="group"))
+    return u["_next"] == "hygiene_create" and "retro_done" not in u, u.get("_next")
+
+
+def _retro_reseal_phase_f():
+    u = gates.reseal_return(_retro_large(after_reseal="phase_f"))
+    return u["_next"] == "run_retrospective", u.get("_next")
+
+
+def _retro_stack_multi():
+    _groups = gates.MULTI_IS_GROUPS
+    gates.MULTI_IS_GROUPS = False
+    try:
+        u = gates.integrate_route(_retro_large(pr_strategy="multi"))
+    finally:
+        gates.MULTI_IS_GROUPS = _groups
+    return u["_next"] == "run_retrospective" and u.get("retro_done") is True, (u.get("_next"), u.get("retro_report"))
+
+
+def _retro_stack_multi_adopted():
+    _groups = gates.MULTI_IS_GROUPS
+    gates.MULTI_IS_GROUPS = False
+    try:
+        u = gates.retro_route(_retro_large(pr_strategy="multi", retro_result=RETRO_REFACTORS, retro_adopted=["One table"],
+                                           retro_declined=[], retro_follow_ups=[], retro_done=True))
+    finally:
+        gates.MULTI_IS_GROUPS = _groups
+    return (u["_next"] == "hygiene_create" and "tasks" not in u and any("One table" in f for f in u.get("follow_ups", []))
+            and any("per-task PRs" in l for l in u["retro_report"])), (u.get("_next"), u.get("follow_ups"), u.get("retro_report"))
+
+
+def _retro_adopted():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"],
+                                       retro_declined=[{"item": "Split the registry", "reason": "src/a.go:3 keeps one registry on purpose"}],
+                                       retro_follow_ups=["Rework the poller"], integration_checked=True, retro_done=True))
+    new = u["tasks"][-1] if u.get("tasks") else {}
+    body = read_file(os.path.join(new.get("dir", ""), "index.md")) if new.get("dir") else ""
+    snap = json.loads(read_file(os.path.join(_retro_large()["run_dir"], "state.json")) or "{}")
+    return (u["_next"] == "select_tasks" and len(u["tasks"]) == len(ts_f) + 1 and new.get("status") == "pending"
+            and new.get("type") == "chore" and new.get("title") == "Run-closing design refactor"
+            and new.get("blocked_by") == [T1, T2, T3] and u.get("integration_checked") is False
+            and "- One table" in body and "- One owner" in body and "Behaviour unchanged: the full build and test suite is green" in body
+            and "retro-declined: Split the registry -- src/a.go:3 keeps one registry on purpose" in u["decisions"]
+            and "Design retrospective: Rework the poller" in u["follow_ups"]
+            and snap.get("phase") == f"task {new.get('id')}"
+            and any(new.get("id", "?") in l for l in u["retro_report"])), (u.get("_next"), new, body[-400:], u.get("decisions"))
+
+
+def _retro_clean():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_CLEAN, retro_adopted=[], retro_declined=[], retro_follow_ups=[]))
+    return (u["_next"] == "hygiene_create" and "tasks" not in u
+            and any("DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"])), (u.get("_next"), u.get("retro_report"))
+
+
+def _retro_fault():
+    u = gates.retro_route(_retro_large(retro_result="Agent node failed: spawn error", retro_adopted=["One table"]))
+    return (u["_next"] == "hygiene_create" and "tasks" not in u
+            and any("faulted (Agent node failed: spawn error); run continues" in d for d in u["decisions"])), u.get("decisions")
+
+
+def _retro_triage_failed():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                       last_node_output="LLM node failed: llm node timed out after 600s", follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    saved = read_file(os.path.join(_retro_large()["run_dir"], "design-retrospective.md"))
+    return (u["_next"] == "hygiene_create" and "tasks" not in u and len(fus) == 1 and fus[0].startswith("Design retrospective: ")
+            and "One table" in saved and any("triage failed" in l for l in u["retro_report"])), (fus, u.get("retro_report"))
+
+
+def _retro_fenced_clean():
+    u = gates.retro_route(_retro_large(retro_result="```text\n" + RETRO_CLEAN + "```\n", retro_adopted=[], retro_declined=[],
+                                       retro_follow_ups=[]))
+    return (u["_next"] == "hygiene_create" and any("ran: DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"])), u.get("retro_report")
+
+
+def _retro_preambled():
+    u = gates.retro_route(_retro_large(retro_result="Here is the report.\n" + RETRO_CLEAN, retro_adopted=[]))
+    return any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report")
+
+
+def _retro_triage_empty():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                       last_node_output='{"retro_adopted": [], "retro_declined": [], "retro_follow_ups": []}',
+                                       follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    return (u["_next"] == "hygiene_create" and "tasks" not in u and len(fus) == 1
+            and any("triage decided none of the items" in l for l in u["retro_report"])), (fus, u.get("retro_report"))
+
+
+def _retro_triage_partial():
+    saved_path = os.path.join(_retro_large()["run_dir"], "design-retrospective.md")
+    if os.path.exists(saved_path):
+        os.remove(saved_path)
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                       retro_follow_ups=[], retro_done=True, follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    return (u["_next"] == "select_tasks" and len(fus) == 1 and "One owner" in read_file(saved_path)
+            and any("triage decided 1 of the 2 items" in d for d in u["decisions"])), (fus, u.get("decisions"))
+
+
+def _retro_rearm_integration():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                       retro_follow_ups=[], retro_done=True, integration_checked=True, integration_amended=True,
+                                       integration_follow_ups=["flaky test"], integration_amendments=["Split the API"]))
+    return (u["_next"] == "select_tasks" and u.get("integration_amended") is False and u.get("integration_follow_ups") == []
+            and u.get("integration_amendments") == []), {k: u.get(k) for k in ("integration_amended", "integration_follow_ups",
+                                                                             "integration_amendments")}
+
+
+def _retro_snapshot_last():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                       retro_follow_ups=["Rework the poller"], retro_done=True))
+    snap = json.loads(read_file(os.path.join(_retro_large()["run_dir"], "state.json")) or "{}")
+    tid = (u.get("tasks") or [{}])[-1].get("id", "?")
+    return (snap.get("retro_report") == u.get("retro_report") and any(tid in l for l in snap.get("retro_report") or [])
+            and "Design retrospective: Rework the poller" in (snap.get("follow_ups") or [])
+            and snap.get("decisions") == u.get("decisions")), snap.get("retro_report")
+
+
+def _retro_resume_runs_refactor():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"], retro_declined=[],
+                                       retro_follow_ups=[], retro_done=True))
+    snap = json.loads(read_file(os.path.join(_retro_large()["run_dir"], "state.json")) or "{}")
+    r = gates.resume_route(_retro_large(resume_phase=snap.get("phase", ""), tasks=u.get("tasks"), retro_done=True))
+    return r.get("_next") == "select_tasks", (snap.get("phase"), r.get("_next"))
+
+
+def _retro_micro_batch():
+    st = _retro_large(task_granularity="micro", retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                      retro_follow_ups=[], retro_done=True)
+    u = gates.retro_route(st)
+    new = (u.get("tasks") or [{}])[-1]
+    index = read_file(os.path.join(new.get("dir", ""), "index.md")) if new.get("dir") else ""
+    done = [dict(t, status="complete") for t in u.get("tasks") or []]
+    closed = gates.task_done_route({**st, **u, "tasks": done, "current_task": new.get("id")})
+    return (new.get("batch") == gates.RETRO_BATCH and f"batch: {gates.RETRO_BATCH}" in index
+            and closed.get("_next") == "batch_gauntlet_build" and closed.get("current_batch") == gates.RETRO_BATCH), (
+        new.get("batch"), closed.get("_next"))
+
+
+def _integrate_blocked_amendments():
+    u = gates.integrate_route(_retro_large(retro_done=True, integration_amended=True, integration_amendments=["Split the API"],
+                                           follow_ups=[]))
+    return (u["_next"] == "hygiene_create" and "(integration) amendment not applied: Split the API" in u["follow_ups"]
+            and any("plan amendment(s) after this Phase F's one re-seal -> follow-ups" in d for d in u["decisions"])), (
+        u.get("_next"), u.get("follow_ups"))
+
+
+def _integrate_stale_amendments():
+    reseal = gates.integrate_route(_retro_large(integration_amended=False, integration_amendments=["Split the API"]))
+    u = gates.integrate_route(_retro_large(retro_done=True, integration_amended=True, integration_amendments=["Split the API"],
+                                           follow_ups=[], last_node_output="integrate_findings failed"))
+    return (reseal.get("integration_amendments") == [] and u["_next"] == "hygiene_create"
+            and not any("amendment not applied" in f for f in u["follow_ups"])), (reseal.get("integration_amendments"),
+                                                                                    u.get("follow_ups"))
+
+
+def _integrate_follow_up_dedup():
+    u = gates.integrate_route(_retro_large(retro_done=True, follow_ups=["(integration) flaky test"],
+                                           integration_follow_ups=["flaky test"]))
+    return u["follow_ups"] == ["(integration) flaky test"], u.get("follow_ups")
+
+
+def _parse_report_retro_follow_up():
+    st = dict(SN_STATE, follow_ups=["Design retrospective: One table", "rotate the widget key before merge"],
+              retro_report=["- ran: DESIGN_RETROSPECTIVE: REFACTORS 1"])
+    p, report = sisyphus_next_report(st)
+    parsed = gates._parse_report(report)
+    return (parsed["follow_ups"] == ["Design retrospective: One table", "rotate the widget key before merge"]
+            and parsed["design"] == ["introduced a WidgetStore trait in src/a.rs"]), (p.stderr[-300:], parsed)
+
+
+guarded("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up", _retro_triage_empty)
+guarded("retro_route: a triage that decides only some of the REFACTORS n items -> the report kept as one not-triaged "
+        "follow-up beside what it did decide", _retro_triage_partial)
+guarded("retro_route: adopting re-arms the whole integration step, the one amendment round included", _retro_rearm_integration)
+guarded("retro_route: the snapshot is taken last, holding the report, follow-ups and ledger lines", _retro_snapshot_last)
+guarded("retro_route: in micro mode the refactor task is its own batch, so it closes into a batch gauntlet", _retro_micro_batch)
+guarded("integrate_route: amendments past the one re-seal become follow-ups, never dropped", _integrate_blocked_amendments)
+guarded("integrate_route: the re-seal consumes its amendments; a failed integrate pass never turns stale ones into "
+        "follow-ups", _integrate_stale_amendments)
+guarded("integrate_route: an integration follow-up already listed is not listed twice", _integrate_follow_up_dedup)
+guarded("_parse_report: a FOLLOW-UPS bullet starting with Design retrospective stays in FOLLOW-UPS", _parse_report_retro_follow_up)
+
+
+def _retro_report():
+    ran = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, retro_report=["- large (a new subsystem)", "- ran: CLEAN"]))["report"]
+    skipped = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f))["report"]
+    return ("## Design retrospective\n- large (a new subsystem)\n- ran: CLEAN" in ran
+            and "## Design retrospective\n- not run (" in skipped), skipped[-1200:]
+
+
+guarded("integrate_route: a large run at run close -> run_retrospective over the run diff, retro_done set first", _retro_integrate_large)
+guarded("integrate_route: not a large body of work -> hygiene_create, the reason in the report lines", _retro_integrate_not_large)
+guarded("integrate_route: a groups-mode run close diffs from the run base, never the last group's base", _retro_groups_run_base)
+guarded("integrate_route: the retrospective prompt names a Plans dir only when the run has one", _retro_plans_dir_line)
+guarded("integrate_route: no run base and no merge-base -> hygiene_create with a note, never a retrospective", _retro_no_base)
+guarded("integrate_route: no code repo path -> no git call in the current directory, hygiene_create with the no-base note",
+        _retro_no_code_repo)
+guarded("integrate_route: no valid size judgement (the llm node failed) -> hygiene_create with a note", _retro_integrate_unjudged)
+guarded("integrate_route: retro_done -> hygiene_create (at most once per run)", _retro_integrate_done)
+guarded("integrate_route: a group close-out short of run close -> hygiene_create, the retrospective waits", _retro_group_closeout)
+guarded("reseal_return: phase_f after an integration amendment -> the same retrospective decision", _retro_reseal_phase_f)
+guarded("integrate_route: a large run with per-task stacked PRs still runs the retrospective", _retro_stack_multi)
+guarded("retro_route: per-task stacked PRs have no unit for a refactor task -> adopted items become follow-ups, noted",
+        _retro_stack_multi_adopted)
+guarded("retro_route: adopted -> ONE pending chore task blocked by the unit's tasks, integration re-armed, -> select_tasks",
+        _retro_adopted)
+guarded("retro_route: a run re-entered after adopting resumes into select_tasks, so the refactor task runs",
+        _retro_resume_runs_refactor)
+guarded("retro_route: CLEAN -> hygiene_create, no task", _retro_clean)
+guarded("retro_route: a faulted retrospective -> hygiene_create with the fault noted, no task", _retro_fault)
+guarded("retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up pointing at the saved report", _retro_triage_failed)
+guarded("retro_route: a reply opening with one code-fence line is read past the fence", _retro_fenced_clean)
+guarded("retro_route: prose before the sentinel line is still a fault", _retro_preambled)
+guarded("final_report: a ## Design retrospective section, with the reason when it did not run", _retro_report)
 u = gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_f, pr_summary_text="Widgets were missing; we added them.", body_fix_rounds=0))
 body = read_file(u["pr_body_path"])
 check("pr_body: assemble_pr_body (core tool) -> body with summary + task checklist + hygiene section; NOTE lines -> one fix round (B17 side 1)",
@@ -4298,31 +4592,31 @@ def render_inputs(node, state, nodes=None):
 
 
 check("graph: delegate and wave_delegate run sisyphus-next; wave_delegate keeps teammates; their inputs are exactly review_cadence / parallel / "
-      "project_dir / escalation_policy / build_lock",
+      "project_dir / escalation_policy / build_lock / retrospective",
       all(NODES.get(n, {}).get("agent") == "sisyphus-next"
-          and sorted(NODES.get(n, {}).get("inputs") or {}) == ["build_lock", "escalation_policy", "parallel", "project_dir", "review_cadence"]
+          and sorted(NODES.get(n, {}).get("inputs") or {}) == ["build_lock", "escalation_policy", "parallel", "project_dir", "retrospective", "review_cadence"]
           for n in ("delegate", "wave_delegate")) and NODES.get("wave_delegate", {}).get("teammates") is True
       and all(SEEDS.get(k) is not None for k in ("delegate_review_cadence", "delegate_parallel", "delegate_project_dir")),
       {n: (NODES.get(n, {}).get("agent"), NODES.get(n, {}).get("inputs")) for n in ("delegate", "wave_delegate")})
 check("graph: delegate inputs - sequential standard -> review_cadence=task, parallel=0, project_dir=the code repo",
       render_inputs("delegate", {**base_state(), **U_SEQ}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE,
-                                                               "escalation_policy": "interactive", "build_lock": ""},
+                                                               "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
       render_inputs("delegate", {**base_state(), **U_SEQ}))
 check("graph: delegate inputs - micro -> review_cadence=batch, parallel=0, project_dir=the code repo",
       render_inputs("delegate", {**base_state(), **U_MICRO}) == {"review_cadence": "batch", "parallel": "0", "project_dir": CODE,
-                                                                 "escalation_policy": "interactive", "build_lock": ""},
+                                                                 "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
       render_inputs("delegate", {**base_state(), **U_MICRO}))
 check("graph: wave_delegate inputs - wave item -> parallel=1, project_dir=the item's worktree, review_cadence=the item's (task)",
       render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}) == {"parallel": "1", "project_dir": WAVE[0]["worktree"], "review_cadence": "task",
-                                                                             "escalation_policy": "interactive", "build_lock": ""},
+                                                                             "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
       render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}))
 check("graph: delegate inputs - a relay resume carries the same inputs as the delegation it resumes (code repo, task cadence, parallel=0)",
       render_inputs("delegate", {**base_state(), **U_RESUME}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE,
-                                                                  "escalation_policy": "interactive", "build_lock": ""},
+                                                                  "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
       render_inputs("delegate", {**base_state(), **U_RESUME}))
 check("graph: delegate inputs - a wave member retried sequentially keeps its worktree as project_dir",
       render_inputs("delegate", {**base_state(), **U_RETRY}) == {"review_cadence": "task", "parallel": "0", "project_dir": WAVE[0]["worktree"],
-                                                                 "escalation_policy": "interactive", "build_lock": ""},
+                                                                 "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
       render_inputs("delegate", {**base_state(), **U_RETRY}))
 LOCK = "flock -w 9 /tmp/x.lock"
 policy_in = {(n, p): render_inputs(n, {**base_state(escalation_policy=p, build_lock=LOCK), **U_SEQ, "wtask": WAVE[0]})
@@ -4643,6 +4937,8 @@ check("graph: end_discussion is an end node whose output is the script-composed 
 check("graph: choice_park and choice_resume are script nodes failing to end_failure",
       all(NODES.get(n, {}).get("type") == "script" and NODES.get(n, {}).get("script") == f"scripts/{n}.py"
           and NODES.get(n, {}).get("fallback") == "end_failure" for n in ("choice_park", "choice_resume")))
+check("graph: retro_route fails to hygiene_create, so a crash in the retrospective lane never fails the run",
+      NODES.get("retro_route", {}).get("fallback") == "hygiene_create", NODES.get("retro_route"))
 check("graph: carry is exactly discussion_run_id, seeded empty, and never snapshotted",
       GRAPH.get("carry") == ["discussion_run_id"] and SEEDS.get("discussion_run_id") == "" and "discussion_run_id" not in _lib.STATE_KEYS,
       GRAPH.get("carry"))
@@ -6612,7 +6908,7 @@ u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids
 micro_wave = [render_inputs("wave_delegate", {**base_state(), "wtask": w}) for w in u["wave"]]
 micro_wave_ok = (len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
                  and micro_wave == [{"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch", "escalation_policy": "interactive",
-                                     "build_lock": ""} for w in u["wave"]]
+                                     "build_lock": "", "retrospective": "parent"} for w in u["wave"]]
                  and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
 check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree", micro_wave_ok, micro_wave)
 

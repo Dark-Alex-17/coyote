@@ -64,6 +64,9 @@ AXES = {
     "pr_strategy": ["multi", "single"], "parallel_tasks": ["0", "1"], "task_granularity": ["standard", "micro"],
     "autonomy": ["full", "plan-gate", "phase-gate"], "escalation_policy": ["interactive", "autonomous"],
 }
+# The combos whose retrospective adopts one refactor item: one standard and one micro run.
+RETRO_ADOPT_COMBO = {"pr_strategy": "single", "parallel_tasks": "0", "autonomy": "full", "escalation_policy": "interactive"}
+RETRO_ADOPTED = "Fold the two widget registries into one"
 RESULTS = []
 
 
@@ -265,6 +268,7 @@ def walk(combo, gates, graph, world, log):
     state["initial_prompt"] = f"Implement the design doc at {world.design}"
     cur, steps, visited = graph["start"], 0, []
     asserts = {}
+    adopts = all(combo[k] == v for k, v in RETRO_ADOPT_COMBO.items())
 
     def canned(nid, st):
         """Island outputs per node id (state updates applied directly)."""
@@ -309,7 +313,15 @@ def walk(combo, gates, graph, world, log):
         if nid == "batch_triage":
             return {"finding_routes": [], "anomalies": []}
         if nid == "integrate_findings":
-            return {"integration_amendments": [], "integration_follow_ups": ["rotate the widget key (post-merge)"], "integration_notes": [], "anomalies": []}
+            return {"integration_amendments": [], "integration_follow_ups": ["rotate the widget key (post-merge)"], "integration_notes": [],
+                    "retro_large": True, "retro_large_reason": "a new widget service other code builds on", "anomalies": [],
+                    "last_node_output": '{"retro_large": true}'}
+        if nid == "run_retrospective":
+            return {"retro_result": f"DESIGN_RETROSPECTIVE: REFACTORS 1\n\n1. **{RETRO_ADOPTED}**\n" if adopts else "DESIGN_RETROSPECTIVE: CLEAN\n"}
+        if nid == "retro_triage":
+            adopted = [RETRO_ADOPTED] if adopts else []
+            return {"retro_adopted": adopted, "retro_declined": [], "retro_follow_ups": [], "anomalies": [],
+                    "last_node_output": json.dumps({"retro_adopted": adopted})}
         if nid == "pr_summary":
             return {"pr_summary_text": "Widgets were missing; we added them.", "anomalies": []}
         if nid == "pr_body_fix":
@@ -551,6 +563,16 @@ def walk_combinations(tmp_home):
             problems.append("autonomous report lacks the digest")
         if not single and STACK_LINKING and "## Stacks" not in rep:
             problems.append("multi report lacks the stacks section")
+        if "run_retrospective" not in visited:
+            problems.append("a large run closed without visiting run_retrospective")
+        if "## Design retrospective" not in rep:
+            problems.append("report lacks the design retrospective section")
+        if all(combo[k] == v for k, v in RETRO_ADOPT_COMBO.items()):
+            refactor = [t for t in gates.as_list(st.get("tasks")) if t.get("title") == gates.RETRO_TITLE]
+            if [t.get("status") for t in refactor] != ["complete"]:
+                problems.append(f"the adopted retrospective item's refactor task did not complete: {refactor}")
+            if visited.count("integration_check") < 2:
+                problems.append("Phase F did not run again after the refactor task")
         check(f"combo [{label}]", not problems, " | ".join(problems))
         shutil.rmtree(world.tmp, ignore_errors=True)
 

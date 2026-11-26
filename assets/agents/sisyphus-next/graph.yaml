@@ -65,6 +65,9 @@ variables:
   - name: review_cadence
     description: "When the post-coder review passes run: 'task' (default: this Sisyphus runs the review gauntlet on its own work) or 'batch' (set by a parent orchestrator running micro-granularity tasks: coder verification only; the orchestrator runs the full review panel once over the whole batch). Never set 'batch' for a standalone run."
     default: 'task'
+  - name: retrospective
+    description: "Who runs the run-closing design retrospective: 'run' (default: this Sisyphus runs it once after a green whole-task review of work it judges large) or 'parent' (set by a parent orchestrator such as architect-next that runs it once over its whole run, so this run skips it). Graph-only, absent from the prose sisyphus."
+    default: 'run'
   - name: pr_tracking
     description: "What a run keeps watching on a PR it opens: 'ci' (default: watches CI only, today's behaviour; the run reports once CI is green and the PR is flipped to ready) or 'review' (keeps watching review activity after CI is green on a PR this run owns: new review comments go through a coder fix round, a push and a CI re-watch; it stops on approval, an external close or merge, or a cap). Graph-only, absent from the prose sisyphus. A parent that owns the PR lifecycle (architect-next) never passes 'review' down."
     default: 'ci'
@@ -74,8 +77,9 @@ settings:
   # The most-visited node is ci_poll: it revisits itself up to CI_MAX_ROUNDS (CI_WALL_SECS / CI_POLL_SLEEP = 240)
   # times per watch, and the run-wide POLL_VISIT_BUDGET (1 initial watch + STRIKE_LIMIT CI fix re-watches + 1 watch
   # of headroom = 5 x 240 = 1200) stops it by name first. One more watch granted at that budget still fits
-  # (1200 + 240 = 1440). run_gauntlet peaks at 42 (1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
-  # per review, x7 reviews: SUBTASK_MAX subtasks + the final whole-task review), and pr_review_poll at
+  # (1200 + 240 = 1440). run_gauntlet peaks at 43 (1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
+  # per review, x7 reviews: SUBTASK_MAX subtasks + the final whole-task review, + 1 design retrospective round once
+  # per run), and pr_review_poll at
   # REVIEW_MAX_POLLS (80); user-driven retries ride the headroom. _lib.ENGINE_VISIT_CAP mirrors this value.
   max_loop_iterations: 1500
   log_state_snapshots: true
@@ -346,6 +350,17 @@ initial_state:
   debris_exemptions_new: []
   prior_review_decisions: ''
   debris_exclude: ''
+  # --- design retrospective ---
+  retro_done: false
+  retro_diff_stat: ''
+  retro_large: false
+  retro_large_reason: ''
+  retro_prompt: ''
+  retro_result: ''
+  retro_adopted: []
+  retro_declined: []
+  retro_follow_ups: []
+  retro_report: []
   # --- observability / whetstone ---
   operational_surface: false
   obs_inventory_note: ''
@@ -2166,6 +2181,131 @@ nodes:
     description: Enforce non-rejectable classes and citations; round bounds (B10); lane re-run-once rule; probe INCONCLUSIVE is an environment gap.
     script: scripts/triage_route.py
     fallback: end_failure
+
+  # =====================================================================
+  # Design retrospective (once per run, after the green whole-task review)
+  # =====================================================================
+  retro_size:
+    id: retro_size
+    type: llm
+    description: The size judgement - is the finished task a large body of work that earns a run-closing design retrospective?
+    instructions: |
+      The task below has passed its whole-task review. Judge whether it is
+      a large body of work, one whose design deserves a step back: would the
+      same choices be made again to prioritise maintainability, cleanliness and
+      reuse? Examples of large: a new module or subsystem, several modules
+      changed together, a new abstraction or protocol, a change other code will
+      be built on. They are examples to prompt judgement, not a threshold and
+      not a list to match. Neither answer is the default when unsure: weigh the
+      task and the diff stat and decide.
+      retro_large_reason is ONE line naming the evidence for the call either way.
+    prompt: |
+      ## Task
+      {{brief}}
+
+      ## Acceptance criteria
+      {{spec_text}}
+
+      ## Diff stat (run base to the working tree)
+      {{retro_diff_stat}}
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        retro_large: { type: boolean }
+        retro_large_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [retro_large, retro_large_reason]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: retro_size_route
+    next: retro_size_route
+
+  retro_size_route:
+    id: retro_size_route
+    type: script
+    description: Large -> the retrospective prompt (project, run diff, the task, plans dir) and run_retrospective; not large or no valid judgement -> observability_gate with the reason noted.
+    script: scripts/retro_size_route.py
+    fallback: observability_gate
+
+  run_retrospective:
+    id: run_retrospective
+    type: agent
+    agent: design-retrospective
+    description: The read-only design retrospective over the whole run diff; refactor items, never a verdict.
+    prompt: |
+      {{retro_prompt}}
+    inputs:
+      project_dir: '{{project_dir}}'
+    timeout: 3600
+    max_attempts: 1
+    state_updates:
+      retro_result: '{{output}}'
+    fallback: retro_triage
+    next: retro_triage
+
+  retro_triage:
+    id: retro_triage
+    type: llm
+    description: Adopt or decline each refactor item the retrospective proposed; the script routes on the result.
+    instructions: |
+      You decide what happens to each refactor item of a design retrospective
+      over a task that has already passed its reviews. Each item is your
+      judgement:
+      - retro_adopted: items that are behaviour-preserving and within the
+        task's scope; each is implemented in this run by one coder round under
+        the normal review gates. Carry the item's title and better shape.
+      - retro_declined: an item not worth doing here, each with a CONCRETE
+        reason (evidence such as file:line, a recorded convention, or why the
+        better shape is not better for this code). No bare declines.
+      - retro_follow_ups: items too large for this run, or that would
+        restructure code outside the task's scope; the user owns code the task
+        did not set out to touch, so these are reported, never implemented.
+      A CLEAN retrospective, or one that failed or returned no items, gives
+      three empty lists.
+    prompt: |
+      ## Design retrospective
+      {{retro_result}}
+
+      ## Task
+      {{brief}}
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        retro_adopted:
+          type: array
+          items: { type: string }
+        retro_declined:
+          type: array
+          items:
+            type: object
+            properties:
+              item: { type: string }
+              reason: { type: string }
+            required: [item, reason]
+        retro_follow_ups:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [retro_adopted, retro_declined, retro_follow_ups]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: retro_route
+    next: retro_route
+
+  retro_route:
+    id: retro_route
+    type: script
+    description: Route on the DESIGN_RETROSPECTIVE line - a fault is noted and the run goes on; declines ledgered as retro-declined; follow-ups reported; adopted items -> ONE coder round (compose_fix, fix source retrospective) under the normal review gates.
+    script: scripts/retro_route.py
+    fallback: observability_gate
 
   observability_gate:
     id: observability_gate

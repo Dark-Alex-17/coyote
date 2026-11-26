@@ -30,7 +30,7 @@ for v in $(yq '.variables[].name' "$G"); do
 done
 # variables mirror the prose sisyphus: names + defaults exactly
 # Graph-only variables are declared by the graph and absent from the prose twin.
-GRAPH_ONLY_VARS='pr_tracking'
+GRAPH_ONLY_VARS='retrospective pr_tracking'
 skip=""
 for v in $GRAPH_ONLY_VARS; do skip+=" | select(.name != \"$v\")"; done
 CORE="$(dirname "$0")/../../sisyphus/config.yaml"

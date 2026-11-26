@@ -359,6 +359,7 @@ STATE_KEYS = (
     "deferred_findings",
     "skipped_reviews",
     "design_decisions", "hygiene_items", "anomalies_log", "closeout_scope", "verification_commands", "verification_changes",
+    "retro_done", "retro_report", "run_base_sha",
     "quality_rigor", "quality_surfaces", "round_log", "open_questions", "carried_questions",
     "rigor_proposal", "surfaces_proposal", "quality_evidence", "quality_recorded",
     "checklist_labels", "checklist_findings", "checklist_items", "checklist_done",

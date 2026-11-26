@@ -97,6 +97,9 @@ def base_state(**over):
          "run_dir": os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], "x"), "decisions": [], "anomalies": [],
          "anomalies_log": [], "escalation_policy": "interactive", "review_cadence": "task", "parallel": "0",
          "current_task": "add a hello endpoint", "brief": "add a hello endpoint"}
+    # the run's one design retrospective is behind it, so a passing review goes on to the publish tail as before;
+    # the retrospective rows clear it
+    s["retro_done"] = True
     s.update(over)
     # a fixture's subtask position is in step unless the row says otherwise, and its own list is the run's sealed
     # list, so an earlier row's seal in the shared run dir never heals it into another list
@@ -7271,6 +7274,200 @@ with scenario("failure locations: a shared dir without the parser makes the red 
     check(name, _cu["_next"] == "compose_fix" and not _cu.get("carried_failures")
           and "unclassified: failure locator unavailable" in _cu.get("last_coder_error", ""),
           (_cu.get("_next"), _cu.get("last_coder_error")))
+
+# ---------------------------------------------------------------- design retrospective: once per run, never blocking
+RETRO_CLEAN = "DESIGN_RETROSPECTIVE: CLEAN\n"
+RETRO_REFACTORS = "DESIGN_RETROSPECTIVE: REFACTORS 2\n\n## Refactor items\n\n1. **One table**\n2. **One owner**\n"
+RETRO_TRIAGED = '{"retro_adopted": []}'
+with scenario("retrospective: a green whole-task review -> retro_size over the run diff, retro_done set first") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}], retro_done=False))
+    check(name, u["_next"] == "retro_size" and u.get("retro_done") is True and "retro_diff_stat" in u, u.get("_next"))
+with scenario("retrospective: a passing subtask review -> next_subtask, the retrospective waits for the whole task") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}], retro_done=False,
+                                        subtasks=SUBS7, subtask_index=2))
+    check(name, u["_next"] == "next_subtask" and "retro_done" not in u, u.get("_next"))
+with scenario("retrospective: retro_done -> observability_gate (at most once per run)") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}], retro_done=True))
+    check(name, u["_next"] == "observability_gate", u.get("_next"))
+with scenario("retrospective: a child whose parent runs the retrospective (retrospective=parent) -> observability_gate") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}], retro_done=False,
+                                        retrospective="parent"))
+    check(name, u["_next"] == "observability_gate" and "retro_done" not in u, u.get("_next"))
+with scenario("retrospective: every blocker rejected at the whole-task review -> retro_size") as name:
+    u = gates.triage_route(base_state(gauntlet_blockers=["code-review: [convention] naming"], retro_done=False,
+                                      triage=[{"finding": "code-review: [convention] naming", "action": "reject",
+                                               "citation": "src/a.go:3"}]))
+    check(name, u["_next"] == "retro_size" and u.get("retro_done") is True, u.get("_next"))
+_RETRO_ACCEPTS = [("yellow_findings", YELLOW_ACCEPT), ("plan_defect", gates.PLAN_DEFECT_ACCEPT),
+                  ("probe_gap", PROBE_SURFACE), ("review_incomplete", KIND_OPTIONS["review_incomplete"][1]),
+                  ("lane_stuck", REVIEW_OPTIONS[1]), ("review_exhausted", REVIEW_OPTIONS[1])]
+with scenario("retrospective: every whole-task accept exit of apply_answer decides the retrospective too") as name:
+    _got = {k: aa(k, a, retro_done=False) for k, a in _RETRO_ACCEPTS}
+    check(name, all(v["_next"] == "retro_size" and v.get("retro_done") is True for v in _got.values()),
+          {k: v.get("_next") for k, v in _got.items()})
+with scenario("retrospective: the strikeout proceed exit goes on to the next subtask, the retrospective waits; at the "
+              "whole-task review proceed is asked again, so it never skips the retrospective") as name:
+    _so_go = gates.apply_answer(base_state(escalation=_so_esc, last_answer=_so_pick, oracle_result="ORACLE-NOTE",
+                                           strikeout_rounds=FIX_CEIL, retro_done=False, **SO_SUBTASK))
+    _so_whole = gates.apply_answer(base_state(escalation=_so_esc, last_answer=_so_pick, oracle_result="ORACLE-NOTE",
+                                              strikeout_rounds=FIX_CEIL, retro_done=False, final_review=True,
+                                              **SO_SUBTASK))
+    check(name, _so_pick and _so_go["_next"] == "next_subtask" and "retro_done" not in _so_go
+          and "retro_report" not in _so_go and _so_whole["_next"] == "ask_dispatch" and "retro_done" not in _so_whole,
+          (_so_pick, _so_go.get("_next"), _so_whole.get("_next")))
+with scenario("retrospective: a yellow accept, then a CI-fix review PASS -> observability_gate, never retro_size") as name:
+    _acc = aa("yellow_findings", YELLOW_ACCEPT, retro_done=False)
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        retro_done=_acc.get("retro_done", False), ci_fix_active=True, pr_published=True))
+    check(name, u["_next"] == "observability_gate", u.get("_next"))
+with scenario("retrospective: a PASS after the PR is out (published, CI fix, PR-review round) never starts it") as name:
+    _late = [dict(pr_published=True), dict(ci_fix_active=True), dict(pr_review_rounds=1)]
+    _got = [gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                            retro_done=False, **s)) for s in _late]
+    check(name, all(v["_next"] == "observability_gate" and v.get("retro_done") is True
+                    and any("not run" in l for l in v.get("retro_report", [])) for v in _got),
+          [(v.get("_next"), v.get("retro_report")) for v in _got])
+with scenario("retrospective: no run base and no base commit -> not run, observability_gate, never a worktree diff") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        retro_done=False, run_base_sha="", base_sha=""))
+    check(name, u["_next"] == "observability_gate" and u.get("retro_done") is True
+          and u.get("retro_report") == ["- not run: the run base could not be resolved"],
+          (u.get("_next"), u.get("retro_report")))
+with scenario("retrospective: a re-entered run keeps retro_done and retro_report, so a green review goes on to "
+              "observability_gate") as name:
+    _rst = gates.intake({"initial_prompt": "add a guard", "project_dir": REPO})
+    _rlines = ["- large body of work (a new module)", "- ran: DESIGN_RETROSPECTIVE: CLEAN"]
+    _lib.snapshot(_rst, {"retro_done": True, "retro_report": _rlines}, "review")
+    _rre = gates.intake({"initial_prompt": f"Fix the failure\nSisyphus run id: {_rst['run_id']}", "project_dir": REPO})
+    u = gates.route_gauntlet(base_state(gauntlet_result=PASS_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        retro_done=_rre.get("retro_done", False)))
+    check(name, _rre.get("retro_done") is True and _rre.get("retro_report") == _rlines
+          and u["_next"] == "observability_gate", (_rre.get("retro_done"), _rre.get("retro_report"), u.get("_next")))
+with scenario("retro_size_route: large -> run_retrospective with the project, the run diff and the task; ledgered") as name:
+    u = gates.retro_size_route(base_state(retro_large=True, retro_large_reason="a new module other code builds on",
+                                          last_node_output='{"retro_large": true}', run_base_sha=BASE, anomalies=["seen"]))
+    p = u.get("retro_prompt", "")
+    check(name, u["_next"] == "run_retrospective" and f"Project: {REPO}" in p and f"Diff: {BASE}\n" in p and "..HEAD" not in p
+          and "What the work set out to do: add a hello endpoint" in p
+          and "design retrospective: large (a new module other code builds on)" in u["decisions"]
+          and any("seen" in a for a in u["anomalies_log"]), (u.get("_next"), p, u.get("decisions")))
+with scenario("retro_size_route: a dirty tree names the agent's own diff tools; an existing plans dir is named") as name:
+    _rd = os.path.join(TMP, "retro-dirty-repo")
+    os.makedirs(os.path.join(_rd, "plans"))
+    for _cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", _rd, *_cmd], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    open(os.path.join(_rd, "a.py"), "w").write("x = 1\n")
+    u = gates.retro_size_route(base_state(project_dir=_rd, git_root=_rd, retro_large=True, retro_large_reason="a new module",
+                                          last_node_output='{"retro_large": true}', run_base_sha=BASE))
+    p = u.get("retro_prompt", "")
+    check(name, f"`get_diff --base {BASE}`" in p and f"`get_changed_files --base {BASE}`" in p and "git diff" not in p
+          and f"Plans dir: {os.path.join(_rd, 'plans')} (bookkeeping, not code under review)" in p, p)
+with scenario("retro_size_route: not large -> observability_gate, the reason in the report lines") as name:
+    u = gates.retro_size_route(base_state(retro_large=False, retro_large_reason="a one-function fix",
+                                          last_node_output='{"retro_large": false}'))
+    check(name, u["_next"] == "observability_gate" and any("a one-function fix" in l for l in u["retro_report"])
+          and "design retrospective: not large (a one-function fix)" in u["decisions"], (u.get("_next"), u.get("retro_report")))
+with scenario("retro_size_route: no valid judgement (the llm node failed) -> observability_gate with a note, never a crash") as name:
+    u = gates.retro_size_route(base_state(retro_large=False, retro_large_reason="", last_node_output="llm node failed: timeout"))
+    check(name, u["_next"] == "observability_gate" and any("no valid size judgement" in l for l in u["retro_report"]),
+          (u.get("_next"), u.get("retro_report")))
+with scenario("retro_route: adopted items -> compose_fix with fix_source retrospective, retro_done set") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"], retro_declined=[],
+                                     retro_follow_ups=[], retro_done=False, review_rounds=1, last_node_output=RETRO_TRIAGED))
+    check(name, u["_next"] == "compose_fix" and u["fix_source"] == "retrospective"
+          and u["fix_items"] == ["One table", "One owner"] and u["retro_done"] is True, (u.get("_next"), u.get("fix_items")))
+with scenario("retro_route: each decline ledgered as retro-declined, follow-ups appended to the run's list") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[], last_node_output=RETRO_TRIAGED,
+                                     retro_declined=[{"item": "One owner", "reason": "src/a.go:3 keeps two on purpose"}],
+                                     retro_follow_ups=["One table across three modules"], follow_ups=["earlier"]))
+    check(name, u["_next"] == "observability_gate"
+          and "retro-declined: One owner -- src/a.go:3 keeps two on purpose" in u["decisions"]
+          and u["follow_ups"][0] == "earlier" and any("One table across three modules" in f for f in u["follow_ups"])
+          and any("retro-declined: One owner" in l for l in u["retro_report"]), (u.get("decisions"), u.get("follow_ups")))
+with scenario("retro_route: a faulted retrospective -> observability_gate with the fault noted, nothing adopted") as name:
+    u = gates.retro_route(base_state(retro_result="Agent node failed: spawn error", retro_adopted=["One table"]))
+    check(name, u["_next"] == "observability_gate" and u["retro_done"] is True and "fix_items" not in u
+          and any("faulted (Agent node failed: spawn error); run continues" in d for d in u["decisions"]), u.get("decisions"))
+with scenario("retro_route: a reply without the sentinel line is a fault, not a CLEAN") as name:
+    u = gates.retro_route(base_state(retro_result="I looked and it seems fine", retro_adopted=["One table"]))
+    check(name, u["_next"] == "observability_gate" and "fix_items" not in u
+          and any("faulted" in l for l in u["retro_report"]), u.get("retro_report"))
+with scenario("retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up pointing at the saved report") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                     last_node_output="LLM node failed: llm node timed out after 600s", follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    saved = _lib.read_file(os.path.join(base_state()["run_dir"], "design-retrospective.md"))
+    check(name, u["_next"] == "observability_gate" and "fix_items" not in u and len(fus) == 1
+          and fus[0].startswith("Design retrospective: ") and "One table" in saved
+          and any("triage failed" in l for l in u["retro_report"]), (fus, u.get("retro_report")))
+with scenario("retro_route: REFACTORS n with a triage that decided nothing -> the same one not-triaged follow-up") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=[], retro_declined=[], retro_follow_ups=[],
+                                     last_node_output='{"retro_adopted": [], "retro_declined": [], "retro_follow_ups": []}',
+                                     follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    check(name, u["_next"] == "observability_gate" and "fix_items" not in u and len(fus) == 1
+          and any("triage decided none of the items" in l for l in u["retro_report"]), (fus, u.get("retro_report")))
+with scenario("retro_route: a triage that decides only some of the REFACTORS n items -> the report kept as one "
+              "not-triaged follow-up beside what it did decide") as name:
+    _saved = os.path.join(base_state()["run_dir"], "design-retrospective.md")
+    if os.path.exists(_saved):
+        os.remove(_saved)
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], retro_declined=[],
+                                     retro_follow_ups=[], review_rounds=1, last_node_output=RETRO_TRIAGED, follow_ups=[]))
+    fus = [f for f in u.get("follow_ups", []) if "not triaged" in f]
+    check(name, u["_next"] == "compose_fix" and u.get("fix_items") == ["One table"] and len(fus) == 1
+          and "One owner" in _lib.read_file(_saved)
+          and any("triage decided 1 of the 2 items" in d for d in u["decisions"]), (fus, u.get("decisions")))
+with scenario("retro_route: CLEAN -> observability_gate, noted as ran and clean") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_CLEAN, retro_adopted=[], retro_declined=[], retro_follow_ups=[]))
+    check(name, u["_next"] == "observability_gate" and any("DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]),
+          u.get("retro_report"))
+with scenario("retro_route: a reply opening with one code-fence line is read past the fence") as name:
+    u = gates.retro_route(base_state(retro_result="```\n" + RETRO_CLEAN + "```\n", retro_adopted=[], retro_declined=[],
+                                     retro_follow_ups=[]))
+    check(name, any("ran: DESIGN_RETROSPECTIVE: CLEAN" in l for l in u["retro_report"]), u.get("retro_report"))
+with scenario("retro_route: prose before the sentinel line is still a fault") as name:
+    u = gates.retro_route(base_state(retro_result="Here is the report.\n" + RETRO_CLEAN, retro_adopted=[]))
+    check(name, any("faulted (Here is the report.)" in l for l in u["retro_report"]), u.get("retro_report"))
+with scenario("retro_route: review rounds spent -> the adopted items become follow-ups, no coder round") as name:
+    u = gates.retro_route(base_state(retro_result=RETRO_REFACTORS, retro_adopted=["One table"], review_rounds=STRIKE_LIMIT,
+                                     last_node_output=RETRO_TRIAGED))
+    check(name, u["_next"] == "observability_gate" and "fix_items" not in u
+          and any("One table" in f for f in u["follow_ups"]), (u.get("_next"), u.get("follow_ups")))
+with scenario("strikeout: a failed refactor round after a green final review sets aside only the refactor's paths, "
+              "the review-green work kept") as name:
+    _sr = os.path.join(TMP, "retro-strikeout-repo")
+    os.makedirs(_sr)
+    for _cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", _sr, *_cmd], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    open(os.path.join(_sr, "subtasks.go"), "w").write("package usage // every subtask's work\n")
+    _sr_state = base_state(project_dir=_sr, git_root=_sr, final_review=True, run_id="retro-strikeout",
+                           subtask_tree=gates._worktree_tree(_sr),
+                           subtask_head=subprocess.run(["git", "-C", _sr, "rev-parse", "HEAD"], capture_output=True,
+                                                       text=True).stdout.strip())
+    open(os.path.join(_sr, "review_fix.go"), "w").write("package usage // the final review's fix, now green\n")
+    _ru = gates.retro_route(dict(_sr_state, retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"],
+                                 retro_declined=[], retro_follow_ups=[], review_rounds=1, last_node_output=RETRO_TRIAGED))
+    open(os.path.join(_sr, "refactor.go"), "w").write("package usage // the broken refactor\n")
+    _so = gates.strikeout({**_sr_state, **_ru, "last_coder_error": "boom"})
+    check(name, _ru.get("_next") == "compose_fix" and os.path.exists(os.path.join(_sr, "subtasks.go"))
+          and os.path.exists(os.path.join(_sr, "review_fix.go")) and not os.path.exists(os.path.join(_sr, "refactor.go")),
+          (_ru.get("_next"), _so.get("decisions")))
+with scenario("compose_fix: retrospective items under the behaviour-preserving refactor header") as name:
+    u = gates.compose_fix(base_state(fix_source="retrospective", fix_items=["One table"], fix_round=1))
+    check(name, u["fix_instructions"].startswith("Implement these design-retrospective refactors (behaviour-preserving; "
+                                                 "adopted by the orchestrator):") and "- One table" in u["fix_instructions"],
+          u.get("fix_instructions"))
+with scenario("final_report: a Design retrospective block, with the reason when it did not run") as name:
+    ran = gates.final_report(base_state(retro_report=["- large (a new module)", "- ran: DESIGN_RETROSPECTIVE: CLEAN"]))["report"]
+    skipped = gates.final_report(base_state(retrospective="parent"))["report"]
+    check(name, "Design retrospective:\n- large (a new module)\n- ran: DESIGN_RETROSPECTIVE: CLEAN" in ran
+          and "Design retrospective:\n- not run (the parent orchestrator runs the run-closing retrospective)" in skipped,
+          skipped[-1500:])
 
 # ---------------------------------------------------------------- comment hygiene over the final diff
 HYG = os.path.join(TMP, "hygiene")

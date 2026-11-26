@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.24.0
+version: 3.25.0
 
 agent_session: temp
 auto_continue: true
@@ -22,6 +22,7 @@ spawnable_agents:
   - probe
   - review-gauntlet
   - architecture-reviewer
+  - design-retrospective
   - step-runner
   - whetstone
 max_concurrent_agents: 40

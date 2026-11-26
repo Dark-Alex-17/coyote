@@ -23936,6 +23936,7 @@ mod tests {
             ("code-reviewer", 5),
             ("domain-reviewer", 6),
             ("architecture-reviewer", 4),
+            ("design-retrospective", 4),
         ] {
             assert_eq!(
                 bundled_agent_config(name).max_agent_depth,
@@ -23948,7 +23949,7 @@ mod tests {
         // for now. Remove it from this list when `can_spawn_agents: true` is added.
         const DOCUMENTED_BUT_UNWIRED: &[&str] = &["domain-reviewer"];
 
-        let chains: [&[&str]; 4] = [
+        let chains: [&[&str]; 6] = [
             &[
                 "architect",
                 "sisyphus",
@@ -23973,6 +23974,8 @@ mod tests {
                 "finding-verifier",
             ],
             &["architect", "sisyphus", "architecture-reviewer", "explore"],
+            &["architect", "sisyphus", "design-retrospective", "explore"],
+            &["architect", "design-retrospective", "explore"],
         ];
         for chain in chains {
             for (i, pair) in chain.windows(2).enumerate() {
@@ -24228,6 +24231,8 @@ mod tests {
                             "reseal_return",
                             "research_dispatch",
                             "resume_route",
+                            "retro_route",
+                            "retro_triage",
                             "review_apply",
                             "review_poll",
                             "review_route",
@@ -24237,6 +24242,7 @@ mod tests {
                             "route_verdict",
                             "run_adversary",
                             "run_gauntlet",
+                            "run_retrospective",
                             "run_whetstone",
                             "select_tasks",
                             "stack_gate",
@@ -24406,11 +24412,16 @@ mod tests {
                             "research_dispatch",
                             "research_fanout_solo",
                             "research_fanout_team",
+                            "retro_route",
+                            "retro_size",
+                            "retro_size_route",
+                            "retro_triage",
                             "review_gate",
                             "route_coder_result",
                             "route_gauntlet",
                             "run_coder",
                             "run_gauntlet",
+                            "run_retrospective",
                             "run_step",
                             "run_whetstone",
                             "scope_check",

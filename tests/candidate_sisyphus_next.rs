@@ -765,7 +765,8 @@ fn session_block_check_passes_under_mikefarah_yq() {
             .any(|l| l.starts_with("ok variables mirror sisyphus")),
         "{report}"
     );
-    let graph_only = "ok variables mirror sisyphus (names + defaults; graph-only: pr_tracking)";
+    let graph_only =
+        "ok variables mirror sisyphus (names + defaults; graph-only: retrospective, pr_tracking)";
     assert!(stdout.lines().any(|l| l == graph_only), "{report}");
 }
 
@@ -1378,7 +1379,10 @@ fn pr_tracking_is_a_graph_only_variable_declared_last_with_default_ci() {
     );
     let check = fs::read_to_string(candidate_dir().join("scripts/check_session_block.sh")).unwrap();
     assert!(
-        check.lines().any(|l| l == "GRAPH_ONLY_VARS='pr_tracking'"),
+        check.lines().any(|l| l
+            .strip_prefix("GRAPH_ONLY_VARS='")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .is_some_and(|names| names.split(' ').any(|n| n == "pr_tracking"))),
         "check_session_block.sh does not list pr_tracking as graph-only"
     );
 }
@@ -1695,6 +1699,64 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
         ),
     ];
     run_smoke_sabotages(&python, &sabotages);
+}
+
+/// Each design-retrospective guard, removed from a scratch copy, turns its
+/// smoke row red: the large run's way to `run_retrospective`, the adopted
+/// path into one refactor round, the one leading code-fence line read past,
+/// the skip when no run base resolves, the one not-triaged follow-up a
+/// REFACTORS reply keeps when its triage fails or decides nothing, and no
+/// retrospective once the PR is out.
+#[test]
+#[ignore = "six smoke battery runs take about ten minutes; run with -- --ignored"] // TASK-916
+fn retrospective_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    run_smoke_sabotages(
+        &python,
+        &[
+            (
+                "retro-large-run",
+                "        u[\"_next\"] = \"run_retrospective\"\n",
+                "        u[\"_next\"] = \"observability_gate\"\n",
+                "retro_size_route: large -> run_retrospective with the project, the run diff and \
+                 the task; ledgered",
+            ),
+            (
+                "retro-adopted",
+                "    if adopted:\n        u[\"fix_items\"] = adopted\n",
+                "    if False:\n        u[\"fix_items\"] = adopted\n",
+                "retro_route: adopted items -> compose_fix with fix_source retrospective, \
+                 retro_done set",
+            ),
+            (
+                "retro-fence",
+                "    if lines and lines[0].startswith(\"```\"):\n",
+                "    if False:\n",
+                "retro_route: a reply opening with one code-fence line is read past the fence",
+            ),
+            (
+                "retro-no-base",
+                "        if base:\n            u[\"retro_diff_stat\"]",
+                "        if True:\n            u[\"retro_diff_stat\"]",
+                "retrospective: no run base and no base commit -> not run, observability_gate, \
+                 never a worktree diff",
+            ),
+            (
+                "retro-untriaged",
+                " and not (triaged and (adopted or declined or later)):\n",
+                " and False:\n",
+                "retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up \
+                 pointing at the saved report",
+            ),
+            (
+                "retro-after-publish",
+                "    elif (truthy(state.get(\"pr_published\")) or truthy(state.get(\"ci_fix_active\"))\n          or as_int(state.get(\"pr_review_rounds\")) > 0):\n",
+                "    elif False:\n",
+                "retrospective: a PASS after the PR is out (published, CI fix, PR-review round) \
+                 never starts it",
+            ),
+        ],
+    );
 }
 
 /// The guards behind the CI reading, the flip, the subtask list and the
@@ -3478,10 +3540,14 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("pr_review_triage", "timeout", 600),
     ("research_answer", "max_iterations", 45),
     ("research_answer", "timeout", 3600),
+    ("retro_size", "timeout", 300),
+    ("retro_triage", "timeout", 300),
     ("run_coder", "max_attempts", 1),
     ("run_coder", "timeout", 0),
     ("run_gauntlet", "max_attempts", 1),
     ("run_gauntlet", "timeout", 0),
+    ("run_retrospective", "max_attempts", 1),
+    ("run_retrospective", "timeout", 3600),
     ("run_step", "max_attempts", 1),
     ("run_step", "timeout", 0),
     ("run_whetstone", "max_attempts", 1),
@@ -4084,6 +4150,8 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("plan_subtasks", AnomaliesChannel::Plain),
     ("pr_review_triage", AnomaliesChannel::Plain),
     ("research_answer", AnomaliesChannel::NoSchema),
+    ("retro_size", AnomaliesChannel::Plain),
+    ("retro_triage", AnomaliesChannel::Plain),
     ("send_breach_notice", AnomaliesChannel::NoSchema),
     ("summarize_run", AnomaliesChannel::NoSchema),
     ("synthesize_context", AnomaliesChannel::Plain),
@@ -5463,6 +5531,8 @@ fn a_narrowed_lane_reports_skipped_and_is_settled_for_one_round_only() {
         assert!(reply2.lines().any(|l| l == row), "{row} missing:\n{reply2}");
     }
     state["gauntlet_result"] = json!(reply2);
+    // The run's one design retrospective is behind it, so a PASS goes on to observability.
+    state["retro_done"] = json!(true);
     let routed2 = gate_json("route_gauntlet", &state, &scratch);
     assert_eq!(routed2["gauntlet_verdict"], json!("PASS"), "{routed2}");
     assert_eq!(routed2["_next"], json!("observability_gate"), "{routed2}");
@@ -5669,6 +5739,7 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .collect();
     let expected = [
         "architecture-reviewer",
+        "design-retrospective",
         "engineer",
         "explore",
         "librarian",
@@ -5706,7 +5777,7 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .expect("README has a build_lock threading row");
     for clause in [
         "a child that declares no `build_lock` does not consume it",
-        "does not consume it: the inherited value reaches those six, but nothing in them runs \
+        "does not consume it: the inherited value reaches those seven, but nothing in them runs \
          a build under it (no file of theirs names `build_lock`, `gate_prefix` or `run_gate`)",
     ] {
         assert!(

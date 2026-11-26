@@ -318,7 +318,8 @@ def intake(state):
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
                   "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
                   "probe_adoption", "base_syncs", "base_integrated", "attention_notes", "autonomous_decisions",
-                  "judge_rulings", "answered_decisions", "comment_hygiene_done", "comment_hygiene_line"):
+                  "judge_rulings", "answered_decisions", "retro_done", "retro_report", "comment_hygiene_done",
+                  "comment_hygiene_line"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -2646,7 +2647,7 @@ def apply_answer(state):
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Accepted without fix at the user's say-so: {tail(esc.get('evidence', ''), 300)}"]
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
     elif kind == "plan_defect":
         named = _named_option(answer, options)
         used = as_int(state.get("plan_defect_continues"))
@@ -2662,7 +2663,7 @@ def apply_answer(state):
                 f"Plan defect accepted unresolved at the user's say-so: {why}"]
             ledger(state, u, f"plan defect: accepted unresolved after {used}/{STRIKE_LIMIT} continues: "
                              f"{tail(why, 300)}")
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         elif bare_amend and _judge_may_rule(state, esc):
             # an automatic pick states no amendment, so the judge rules again with the amendment text or another option
             fixed = {**esc, "data": {**as_dict(esc.get("data")), "judge_fault": PLAN_DEFECT_NO_AMENDMENT}}
@@ -2720,7 +2721,7 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 "Consumer-facing change could not be exercised locally (probe INCONCLUSIVE): "
                 "provide the local-run recipe / fixture and re-probe"]
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
     elif kind == "review_incomplete":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "accept": ["accept"]})
         if a is None:
@@ -2739,7 +2740,7 @@ def apply_answer(state):
                                        + [{"round": last.get("round"), "paths": due}]}
                 ledger(state, u, f"probe tests: adoption round {last.get('round')} accepted NEEDS-HUMAN; the "
                                  f"adoption of {_paths_of(due)} is NOT completed")
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         else:
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
@@ -2763,14 +2764,14 @@ def apply_answer(state):
         elif a == "accept":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review blockers accepted unresolved at the user's say-so ({kind}); see the gauntlet report"]
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         elif a == "proceed":
             notes = tail(state.get("oracle_result") or "", 1500) or "(the oracle left no notes)"
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Strikeout: proceeded without this change at the user's say-so; the failed attempt stays set aside "
                 f"({state.get('strikeout_stash') or 'the worktree was clean'}); the oracle's notes: {notes}"]
             ledger(state, u, f"strikeout: proceeding without the change; the oracle's notes: {tail(notes, 600)}")
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
         else:
             u["failure_reason"] = f"stopped after repeated failures ({kind}); the code was left in a working state"
             u["_next"] = "end_aborted"
@@ -3482,6 +3483,9 @@ def compose_fix(state):
                   "rule conventions (ordinary code changes; the usual review gates apply):", state.get("obs_coder_brief") or ""]
     elif src == "probe_gap":
         lines += ["Provide the local-run recipe / fixture the usage probe needs, as the user described:", note]
+    elif src == "retrospective":
+        lines += ["Implement these design-retrospective refactors (behaviour-preserving; adopted by the orchestrator):"]
+        lines += [f"- {item}" for item in as_list(state.get("fix_items"))]
     elif src == "plan_defect_fix":
         lines += ["The adversary reported the plan as the root cause; the reply ruled the plan is not at fault. Keep "
                   "every acceptance criterion as written and apply this change:", note]
@@ -4619,7 +4623,7 @@ def route_gauntlet(state):
             ledger(state, u, f"probe tests: adoption round {n} passed")
             u["_next"] = "pr_gate"
         else:
-            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+            _after_final_review(state, u)
     else:
         real = [b for b in blockers if not review_fault(b)]
         _escalate_size(state, u, f"review round {n} BLOCKED: {real[0][:160]}" if real else
@@ -4864,7 +4868,161 @@ def triage_route(state):
                              evidence="\n".join(str(x.get("finding", "")) for x in escalations)[:2500])
         return raise_escalation(state, u, esc)
     ledger(state, u, "review: every blocker rejected with citation or deferred by the quality bar; proceeding")
-    u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+    _after_final_review(state, u)
+    return u
+
+
+# ====================================================================== design retrospective
+RETRO_SENTINEL_RE = re.compile(r"^DESIGN_RETROSPECTIVE: (?:REFACTORS (\d+)|CLEAN)$")
+RETRO_PARENT_NOTE = "the parent orchestrator runs the run-closing retrospective"
+RETRO_SAVED = "design-retrospective.md"
+
+
+def _retro_sentinel_line(text):
+    """The reply's first line, read past one leading code-fence line."""
+    lines = [line.strip() for line in text.splitlines()]
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    return lines[0] if lines else ""
+
+
+def _retro_is_parents(state):
+    return str(var(state, "retrospective", "run")).strip().lower() == "parent"
+
+
+def _untriaged_follow_up(state, text):
+    """Saves the retrospective report a triage left wholly or partly unjudged and returns the one follow-up that points at it."""
+    run_dir = state.get("run_dir", "")
+    write_artifact(run_dir, RETRO_SAVED, text)
+    where = f"see the retrospective report at {os.path.join(run_dir, RETRO_SAVED)}" if run_dir else f"the report: {tail(text, 1500)}"
+    return f"Design retrospective: items not triaged; {where}"
+
+
+def _after_final_review(state, u):
+    """A green review goes on to the next subtask, the run's one design retrospective, or the observability pass."""
+    if _subtask_phase(state):
+        u["_next"] = "next_subtask"
+    elif truthy(state.get("retro_done")) or _retro_is_parents(state):
+        u["_next"] = "observability_gate"
+    elif (truthy(state.get("pr_published")) or truthy(state.get("ci_fix_active"))
+          or as_int(state.get("pr_review_rounds")) > 0):
+        # a review this late belongs to a CI or PR-review fix on a published PR; a refactor round there is too late
+        u["retro_done"] = True
+        u["retro_report"] = ["- not run: the review passed after the PR was published"]
+        ledger(state, u, "design retrospective: not run; the PR was already published")
+        u["_next"] = "observability_gate"
+    else:
+        root = state.get("git_root") or state.get("project_dir") or "."
+        base = state.get("run_base_sha") or state.get("base_sha") or ""
+        u["retro_done"] = True
+        if base:
+            u["retro_diff_stat"] = tail(git_out(root, "diff", "--stat", base), 3000)
+            u["_next"] = "retro_size"
+        else:
+            u["retro_report"] = ["- not run: the run base could not be resolved"]
+            ledger(state, u, "design retrospective: not run; the run base could not be resolved")
+            u["_next"] = "observability_gate"
+    return u
+
+
+def _retro_prompt(state):
+    root = state.get("git_root") or state.get("project_dir") or "."
+    base = state.get("run_base_sha") or state.get("base_sha")
+    lines = ["Run-closing design retrospective.",
+             f"Project: {state.get('project_dir')}",
+             f"Diff: {base}"]
+    if _code_tree_dirty(state, root):
+        lines.append(f"Tree state: part of the change is uncommitted in the worktree on top of {base}; "
+                     f"`get_diff --base {base}` and `get_changed_files --base {base}` include it.")
+    lines.append(f"What the work set out to do: {state.get('brief') or state.get('current_task') or ''}")
+    plans = _plans_path(state, state.get("project_dir") or root)
+    if os.path.isdir(plans):
+        lines.append(f"Plans dir: {plans} (bookkeeping, not code under review)")
+    return "\n".join(lines)
+
+
+def retro_size_route(state):
+    u = {}
+    harvest_anomalies(state, u, "retro_size")
+    out = state.get("last_node_output")
+    judged = isinstance(out, str) and out.lstrip().startswith("{") and isinstance(state.get("retro_large"), bool)
+    note_script_error(state, u, "retro_size")
+    reason = _whole_line(state.get("retro_large_reason")) or "no reason given"
+    if not judged:
+        u["retro_report"] = ["- not run (no valid size judgement; the run continued)"]
+        ledger(state, u, "design retrospective: no valid size judgement; not run, run continues")
+        u["_next"] = "observability_gate"
+    elif state.get("retro_large"):
+        u["retro_report"] = [f"- large body of work ({reason})"]
+        u["retro_prompt"] = _retro_prompt(state)
+        ledger(state, u, f"design retrospective: large ({reason})")
+        u["_next"] = "run_retrospective"
+    else:
+        u["retro_report"] = [f"- not run: not a large body of work ({reason})"]
+        ledger(state, u, f"design retrospective: not large ({reason})")
+        u["_next"] = "observability_gate"
+    return u
+
+
+def retro_route(state):
+    u = {"retro_done": True}
+    harvest_anomalies(state, u, "retro_triage")
+    out = state.get("last_node_output")
+    triaged = isinstance(out, str) and out.lstrip().startswith("{")
+    note_script_error(state, u, "retro_triage")
+    report = list(as_list(state.get("retro_report")))
+    text = str(state.get("retro_result") or "").strip()
+    first = _retro_sentinel_line(text)
+    u["_next"] = "observability_gate"
+    sentinel = RETRO_SENTINEL_RE.match(first)
+    if not sentinel:
+        why = tail(first, 200) or "no output"
+        u["retro_report"] = report + [f"- faulted ({why}); the run continued"]
+        ledger(state, u, f"design retrospective: faulted ({why}); run continues")
+        return u
+    clean = sentinel.group(1) is None
+    adopted = [] if clean else [
+        _whole_line(a) for a in as_list(state.get("retro_adopted")) if isinstance(a, str) and a.strip()]
+    declined = [d for d in as_list(state.get("retro_declined")) if isinstance(d, dict) and str(d.get("item") or "").strip()]
+    later = [_whole_line(f) for f in as_list(state.get("retro_follow_ups")) if isinstance(f, str) and f.strip()]
+    if not clean and int(sentinel.group(1)) > 0 and not (triaged and (adopted or declined or later)):
+        why = "triage failed" if not triaged else "triage decided none of the items"
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [_untriaged_follow_up(state, text)]
+        u["retro_report"] = report + [f"- ran: {first}; {why}, so nothing was adopted; the items are one follow-up"]
+        ledger(state, u, f"design retrospective: {why}; {first} kept as one follow-up; run continues")
+        return u
+    gap = ""
+    decided = len(adopted) + len(declined) + len(later)
+    if not clean and decided != int(sentinel.group(1)):
+        gap = f"triage decided {decided} of the {sentinel.group(1)} items; the report is kept as one follow-up"
+        ledger(state, u, f"design retrospective: {gap}")
+    if adopted and as_int(state.get("review_rounds")) >= STRIKE_LIMIT:
+        ledger(state, u, f"design retrospective: review rounds spent; {len(adopted)} adopted item(s) become follow-ups")
+        later += adopted
+        adopted = []
+    report.append(f"- ran: {first}; {len(adopted)} item(s) adopted into a refactor round")
+    report += [f"- adopted: {a}" for a in adopted]
+    for d in declined:
+        line = f"retro-declined: {_whole_line(d.get('item'))} -- {_whole_line(d.get('reason')) or 'no reason stated'}"
+        ledger(state, u, line)
+        report.append(f"- {line}")
+    if gap:
+        report.append(f"- {gap}")
+    fus = ([_untriaged_follow_up(state, text)] if gap else []) + [f"Design retrospective: {f}" for f in later]
+    if fus:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + fus
+    if later:
+        report.append(f"- follow-ups: {len(later)} (listed under FOLLOW-UPS)")
+    u["retro_report"] = report
+    if adopted:
+        u["fix_items"] = adopted
+        u["fix_source"] = "retrospective"
+        # a strikeout in the refactor round puts back only the paths it changed, keeping the review-green work
+        root = state.get("git_root") or state.get("project_dir") or "."
+        u.update({"subtask_tree": _worktree_tree(root), "subtask_head": git_out(root, "rev-parse", "HEAD", default=""),
+                  "subtask_started_at": int(time.time())})
+        ledger(state, u, f"design retrospective: {len(adopted)} refactor(s) adopted -> one coder round (review gates re-run)")
+        u["_next"] = "compose_fix"
     return u
 
 
@@ -6976,6 +7134,10 @@ def _assemble_report(state, u, pre_publish=False):
     lines += ["Debris exemptions:"] + ([f"- {e}" for e in ex] or ["- none"]) + [""]
     dd = as_list(g("design_decisions", []))
     lines += ["Design decisions:"] + ([f"- {d}" for d in dd] or ["- none"]) + [""]
+    retro = as_list(g("retro_report", []))
+    if not retro:
+        retro = [f"- not run ({RETRO_PARENT_NOTE if _retro_is_parents(state) else 'no green whole-task review reached it'})"]
+    lines += ["Design retrospective:"] + retro + [""]
     if g("observability_artifact"):
         lines += [g("observability_artifact"), ""]
     fus = list(as_list(g("follow_ups", []))) + list(as_list(g("deferred_findings", [])))
@@ -7059,6 +7221,7 @@ GATES = {
     "comment_hygiene_route": comment_hygiene_route,
     "build_gauntlet_prompt": build_gauntlet_prompt, "route_gauntlet": route_gauntlet,
     "triage_route": triage_route, "observability_gate": observability_gate,
+    "retro_size_route": retro_size_route, "retro_route": retro_route,
     "observability_route": observability_route, "whetstone_gate": whetstone_gate, "pr_gate": pr_gate,
     "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply, "base_check": base_check,
     "pr_review_poll": pr_review_poll, "pr_review_route": pr_review_route, "pr_review_apply": pr_review_apply,

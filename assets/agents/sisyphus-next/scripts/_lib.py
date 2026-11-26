@@ -95,7 +95,7 @@ GO_AHEAD_FILLER = frozenset((
 
 # The graph variables; a run restored from a discussion park keeps the live values of these.
 RUN_VARIABLES = ("project_dir", "observability_agent", "parallel", "auto_confirm", "escalation_policy", "build_lock",
-                 "review_cadence", "pr_tracking")
+                 "review_cadence", "retrospective", "pr_tracking")
 
 
 def bare_go_ahead(text):
@@ -278,6 +278,7 @@ STATE_KEYS = (
     "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests", "probe_adoption",
     "base_syncs", "base_integrated", "base_checked_head",
     "attention_notes", "autonomous_decisions", "judge_rulings", "answered_decisions",
+    "retro_done", "retro_report",
     "comment_hygiene_done", "comment_hygiene_line",
 )
 

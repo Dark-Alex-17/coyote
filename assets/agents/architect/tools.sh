@@ -66,7 +66,7 @@ collect_ledger_lines() {
         /^[[:space:]]*$/ || /^## / { exit }
         !/^[[:space:]]/ && !/^[-*][[:space:]]/ { exit }
         { head = $0; sub(/^[[:space:]]*([-*][[:space:]]+)?/, "", head) }
-        head ~ /^(rejected-finding:|design-decision|Follow-ups:|HYGIENE:)/ { exit }
+        head ~ /^(rejected-finding:|design-decision|Follow-ups:|HYGIENE:|retro-declined)/ { exit }
         { print "  " $0 }
       ' < "${d}/log.md" >> "$LLM_OUTPUT"
     done < <(grep -nIF -- "${tag}" "${d}/log.md" 2>/dev/null || true)

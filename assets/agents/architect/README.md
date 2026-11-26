@@ -44,9 +44,9 @@ flowchart TD
 
     taskdone --> more{"More tasks?"}
     more -->|"yes"| claim
-    more -->|"no"| finish["Phase F: full build + tests<br/>on the integrated run branch<br/>+ run-closing hygiene pass (one chore task,<br/>sweeps the whole run diff for debris)"]
+    more -->|"no"| finish["Phase F: full build + tests<br/>on the integrated run branch<br/>+ run-closing design retrospective (one refactor<br/>task when items are adopted)<br/>+ run-closing hygiene pass (one chore task,<br/>sweeps the whole run diff for debris)"]
 
-    finish --> pr["ONE DRAFT PR: run branch -> base_branch<br/>(never marked ready; user reviews first)<br/>body: task checklist + Hygiene pass + Design decisions + Follow-up / manual actions"]
+    finish --> pr["ONE DRAFT PR: run branch -> base_branch<br/>(never marked ready; user reviews first)<br/>body: task checklist + Hygiene pass + Design decisions<br/>+ Design retrospective + Follow-up / manual actions"]
     pr --> checks{"PR runs/checks<br/>green?"}
     checks -->|"failure — resume responsible<br/>sisyphus session, fix, push"| checks
     checks -->|"external flake /<br/>broken base branch"| escalate
@@ -119,6 +119,10 @@ history does not.
   lint's `debris-exempt` token on its line so the run-wide lint goes green, and kept items land in
   the PR's `## Hygiene pass` section. The same task reads every comment the run added and cuts
   comments that restate the code or narrate the plan.
+- **Run-closing design retrospective** -- before the hygiene pass, a run the architect judges to be
+  a large body of work gets one higher-level design review of the whole run diff; adopted refactor items
+  become one refactor task run like any other, each decline is logged with a reason, and the
+  outcome lands in the PR's `## Design retrospective` section. It never blocks the run.
 
 ## Usage
 
@@ -225,10 +229,11 @@ draft PR:
   `base_branch`; group N+1 forks from group N's branch tip (or from `base_branch` once group N's
   PR has merged).
 - When a group's last task completes, the architect runs the Phase F close-out scoped to the group
-  — final green build, a hygiene pass over the group's own diff, a draft PR targeting the branch
-  the group forked from, CI checks watched to green — before forking the next group.
+  -- final green build, a design retrospective and a hygiene pass over the group's own diff, a
+  draft PR targeting the branch the group forked from, CI checks watched to green -- before
+  forking the next group.
 - Group PR bodies carry the same sections as the single-PR body (task checklist, Hygiene pass,
-  Design decisions, Follow-up / manual actions), scoped to the group, plus the stack position.
+  Design decisions, Design retrospective, Follow-up / manual actions), scoped to the group, plus the stack position.
 - The architect never merges a group PR; when you merge a parent, it retargets the child PR to
   `base_branch` and rebases. The final report lists every group PR URL in stack order.
 
@@ -244,6 +249,7 @@ draft PR:
 | [`librarian`](../librarian/README.md) | External docs / OSS examples for unfamiliar libraries. |
 | [`whetstone`](../whetstone/README.md) | Continuous improvement — spawned once before the final report when the run addressed PR review feedback from outside its own lanes; converts review misses into user-approved suite edits / ledger entries. Never blocks the run. |
 | [`review-gauntlet`](../review-gauntlet/README.md) | Preferred per-task conformance gate — one spawn running adversary (+ probe for consumer-facing tasks) with a machine-parsed GAUNTLET: PASS/BLOCKED verdict; a `GAUNTLET_REVIEW_INCOMPLETE:` line is an infrastructure fault escalated to the user (retry / accept NEEDS-HUMAN / abort), never a divergence; direct adversary/probe spawns remain the fallback. |
+| [`design-retrospective`](../design-retrospective/README.md) | Run-closing design retrospective -- spawned once in Phase F, before the hygiene pass, when the run is a large body of work. Adopted refactor items become one refactor task implemented like any other task; declined items are logged with a reason. Never a gate. |
 
 ## Related skills
 
