@@ -49,6 +49,8 @@ mod transcript {
     //! - a bookkeeping call (`job__list`) takes one line with no status;
     //! - a mouse click on a folded tool row opens it and a second click folds
     //!   it again;
+    //! - a mermaid fence in a reply is drawn as a box diagram and `Alt+M`
+    //!   shows its source in its place;
     //! - a narrower terminal re-wraps the cells in place without duplicating
     //!   a row;
     //! - Shift+G with the view at the bottom is plain typing, before a scroll
@@ -836,9 +838,52 @@ mod transcript {
             !after.contains("\x1b[?1000l"),
             "Alt+M switched the mouse reports off: {after:?}"
         );
-        // Whatever the unbound chord left in the composer goes, so Ctrl+D
-        // quits rather than deleting.
+        // Whatever the chord left in the composer goes, so Ctrl+D quits
+        // rather than deleting.
         pty.send(b"\x15").unwrap();
+
+        quit(pty);
+    }
+
+    // ---------------------------------------------------------------------
+    // A mermaid fence in a reply is drawn as a box diagram, and Alt+M shows
+    // its source in its place.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn a_mermaid_reply_is_drawn_and_alt_m_shows_its_source() {
+        let reply =
+            "Flow:\n```mermaid\nflowchart LR\n    A[Start] --> B[Ship]\n```\nmermaid-end-marker";
+        let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
+        let (_guard, mut pty) = boot_with_fake("mermaid", &fake);
+
+        let before = pty.raw().len();
+        pty.send(b"draw it\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "mermaid-end-marker", before, "the reply");
+        pty.read_for(Duration::from_millis(500));
+        let drawn = ctrl_l_repaint(&mut pty);
+        assert!(
+            drawn.contains("│Start│") && drawn.contains("│Ship│"),
+            "the diagram is not drawn:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("flowchartLR"),
+            "the source shows beside the diagram:\n{drawn}"
+        );
+
+        pty.read_for(HOTKEY_GAP);
+        pty.send(ALT_M).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let source = ctrl_l_repaint(&mut pty);
+        assert!(
+            source.contains("```mermaid") && source.contains("flowchartLR"),
+            "Alt+M did not show the source:\n{source}"
+        );
+        assert!(
+            !source.contains("│Start│"),
+            "the diagram stayed after Alt+M:\n{source}"
+        );
 
         quit(pty);
     }

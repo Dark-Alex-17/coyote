@@ -337,9 +337,9 @@ fn dot_keys_with_an_argument_or_a_second_line_does_not_open_the_help() {
 }
 
 /// Paging through the key help reaches the terminal's own selection and
-/// the copy chord, each with its description.
+/// the copy and diagram chords, each with its description.
 #[test]
-fn the_key_help_lists_the_terminal_selection_and_the_copy_chord() {
+fn the_key_help_lists_the_terminal_selection_and_the_copy_and_diagram_chords() {
     let mut harness = Harness::standalone(80, 24);
     harness.press(KeyCode::Char('?'));
     let frame = harness.draw();
@@ -354,6 +354,7 @@ fn the_key_help_lists_the_terminal_selection_and_the_copy_chord() {
             "Shift+drag / Option+drag Select with the terminal instead",
         ),
         ("Alt+C", "Alt+C Copy the focused tool call"),
+        ("Alt+M", "Alt+M Show diagrams as their source"),
     ] {
         assert!(
             help.contains(&squeezed(row)),

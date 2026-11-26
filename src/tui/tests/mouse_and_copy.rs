@@ -42,14 +42,18 @@ fn left_click(harness: &mut Harness, at: (u16, u16)) -> Option<Command> {
     mouse_at(harness, MouseEventKind::Up(MouseButton::Left), at)
 }
 
-fn left_drag(harness: &mut Harness, from: (u16, u16), to: (u16, u16)) -> Option<Command> {
+pub(super) fn left_drag(
+    harness: &mut Harness,
+    from: (u16, u16),
+    to: (u16, u16),
+) -> Option<Command> {
     mouse_at(harness, MouseEventKind::Down(MouseButton::Left), from);
     mouse_at(harness, MouseEventKind::Drag(MouseButton::Left), to);
     mouse_at(harness, MouseEventKind::Up(MouseButton::Left), to)
 }
 
 /// The first screen row of the last frame that holds `needle`.
-fn row_with(harness: &Harness, needle: &str) -> u16 {
+pub(super) fn row_with(harness: &Harness, needle: &str) -> u16 {
     let buffer = harness.terminal.backend().buffer();
     (0..buffer.area.height)
         .find(|&y| {
@@ -446,13 +450,21 @@ fn under_no_color_a_selection_is_reversed() {
 }
 
 #[test]
-fn the_footer_names_no_mouse_mode_and_alt_m_does_nothing() {
+fn the_footer_names_no_mouse_mode_and_alt_m_toggles_the_rich_view() {
     let mut harness = Harness::standalone(80, 24);
+    assert_eq!(harness.app.handle_key(alt_char('m')), None);
+    assert!(!harness.app.renderer.rich);
     harness.app.handle_key(ctrl(KeyCode::Char('t')));
     assert_eq!(harness.app.handle_key(alt_char('m')), None);
+    assert!(
+        !harness.app.renderer.rich,
+        "the transcript view keeps Alt+M"
+    );
     harness
         .app
         .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    harness.app.handle_key(alt_char('m'));
+    assert!(harness.app.renderer.rich);
     let frame = harness.draw();
     assert!(!frame.contains("mouse"), "{frame}");
 }

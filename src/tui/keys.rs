@@ -201,6 +201,8 @@ pub(crate) enum Action {
     ScheduleFrame,
     /// Put the focused tool row's whole output on the clipboard.
     CopyToolOutput,
+    /// Show the replies' rich blocks as source, or drawn again.
+    ToggleRichView,
     /// Read the clipboard into the composer: its text, or a placeholder
     /// for each image on it.
     PasteImage,
@@ -431,6 +433,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             Transcript,
             "Alt+C",
             "Copy the focused tool call's output, or the newest open one's",
+        ),
+        row(
+            Transcript,
+            "Alt+M",
+            "Show diagrams as their source, or drawn again",
         ),
         row(
             Composer,
@@ -752,6 +759,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     match code {
         KeyCode::Char('x') if ctrl => return Action::ToggleTodo,
         KeyCode::Char('c') if alt && !ctrl => return Action::CopyToolOutput,
+        KeyCode::Char('m') if alt && !ctrl => return Action::ToggleRichView,
         KeyCode::PageUp if alt => return Action::TodoPage(-1),
         KeyCode::PageDown if alt => return Action::TodoPage(1),
         KeyCode::PageUp => return Action::ScrollPage(-1),
@@ -2826,6 +2834,14 @@ mod tests {
                 vec![
                     (alt(KeyCode::Char('c')), FOCUSED, Action::CopyToolOutput),
                     (alt(KeyCode::Char('c')), CONFIRM, Action::CopyToolOutput),
+                ],
+            ),
+            (
+                H::Transcript,
+                "Alt+M",
+                vec![
+                    (alt(KeyCode::Char('m')), TYPING, Action::ToggleRichView),
+                    (alt(KeyCode::Char('m')), CONFIRM, Action::ToggleRichView),
                 ],
             ),
             (

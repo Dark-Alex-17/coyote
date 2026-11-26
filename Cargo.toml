@@ -48,6 +48,7 @@ ansi-to-tui = "8"
 ratatui-textarea = { version = "0.9", default-features = false, features = [
   "crossterm",
 ] }
+mermaid-text = "=0.58.0"
 chrono = "0.4.23"
 bincode = { version = "2.0.0", features = [
   "serde",

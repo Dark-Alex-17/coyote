@@ -2,6 +2,7 @@
 //! and the rules for how a tool, job or agent row collapses to one line.
 
 use super::render::{self, RenderCache, Renderer};
+use super::rich::CopyRegion;
 use super::theme::{SWEEP_HIGHLIGHT, ToolHeaderStyles, notice_style};
 use super::throbber::{self, Tick};
 use super::{
@@ -1124,18 +1125,21 @@ impl Cell {
                 source,
                 done: true,
                 cache,
-            } => cache.finished_lines(without_think_spans(source, true), width, renderer),
+            } => {
+                &cache
+                    .finished(without_think_spans(source, true), width, renderer)
+                    .lines
+            }
             Cell::Assistant {
                 source,
                 done,
                 cache,
             } => {
-                return Cow::Owned(cache.lines(
-                    without_think_spans(source, *done),
-                    *done,
-                    width,
-                    renderer,
-                ));
+                return Cow::Owned(
+                    cache
+                        .rendered(without_think_spans(source, *done), *done, width, renderer)
+                        .lines,
+                );
             }
             Cell::Notice { kind, text, cache } => {
                 let style = notice_style(*kind, faded, no_color);
@@ -1281,11 +1285,40 @@ impl Cell {
         })
     }
 
+    /// The rows of the cell's lines at `width` that a copy maps back to
+    /// source; only a reply's drawn blocks have any.
+    pub(super) fn copy_regions(&mut self, width: u16, renderer: &mut Renderer) -> Vec<CopyRegion> {
+        match self {
+            Cell::Assistant {
+                source,
+                done: true,
+                cache,
+            } => cache
+                .finished(without_think_spans(source, true), width, renderer)
+                .regions
+                .clone(),
+            Cell::Assistant {
+                source,
+                done,
+                cache,
+            } => {
+                cache
+                    .rendered(without_think_spans(source, *done), *done, width, renderer)
+                    .regions
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The cell as the pager shows it: a tool, job or agent row open,
     /// with everything its calls printed rather than the inline tail, and
-    /// all of a stray call's output, and a divider as its text alone.
-    /// Every other cell reads as it does in the transcript.
+    /// all of a stray call's output, a divider as its text alone, and a
+    /// reply with its rich blocks shown as source. Every other cell reads
+    /// as it does in the transcript.
     pub(super) fn full_lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
+        if let Cell::Assistant { source, done, .. } = self {
+            return renderer.markdown_source(without_think_spans(source, *done), width);
+        }
         if let Cell::Text { tail, .. } = self {
             return tail.full.lines(width).to_vec();
         }

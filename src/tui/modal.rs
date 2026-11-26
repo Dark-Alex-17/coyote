@@ -271,7 +271,7 @@ impl PendingPrompt {
         }
         let source = self.question_source();
         self.question_markdown.get(width, || {
-            render::hard_wrap(renderer.markdown(&source, width), width)
+            render::hard_wrap(renderer.markdown_source(&source, width), width)
                 .into_iter()
                 .filter(|line| !line.to_string().trim().is_empty())
                 .collect()

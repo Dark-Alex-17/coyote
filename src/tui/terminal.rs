@@ -72,6 +72,16 @@ static ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
 static SCREEN_ENTERED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 
+thread_local! {
+    /// How many `catch_quietly` calls this thread is inside; the panic hook
+    /// leaves the terminal alone while it is above zero.
+    static QUIET_PANICS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The message of the last panic the hook let pass quietly, for the
+    /// `catch_quietly` that catches it.
+    static QUIET_MESSAGE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// One terminal mode toggled on enter and back off on leave. The `bool` is
 /// the state the step moves the terminal to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +538,17 @@ pub(crate) fn install_panic_hook() -> bool {
     PANIC_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            if QUIET_PANICS.try_with(|q| q.get() > 0).unwrap_or(false) {
+                let message =
+                    super::render::plain_text(info.payload_as_str().unwrap_or("panicked"));
+                let at = info
+                    .location()
+                    .map(|at| format!(" at {at}"))
+                    .unwrap_or_default();
+                warn!("Recovered from a panic{at}: {message}");
+                let _ = QUIET_MESSAGE.try_with(|m| *m.borrow_mut() = Some(message));
+                return;
+            }
             restore_from_static();
             echo_panic_past_capture(info);
             previous(info);
@@ -535,6 +556,40 @@ pub(crate) fn install_panic_hook() -> bool {
         installed = true;
     });
     installed
+}
+
+/// Counts this thread into `QUIET_PANICS` for as long as it lives, so the
+/// count comes back down however the call it guards ends.
+struct QuietGuard;
+
+impl QuietGuard {
+    fn enter() -> Self {
+        QUIET_PANICS.with(|q| q.set(q.get() + 1));
+        Self
+    }
+}
+
+impl Drop for QuietGuard {
+    fn drop(&mut self) {
+        QUIET_PANICS.with(|q| q.set(q.get() - 1));
+    }
+}
+
+/// Runs `f`, turning a panic in it into an error carrying the panic's
+/// message. The panic hook leaves such a panic to the caller: the screen
+/// is not handed back and nothing is echoed, so a recovered failure does
+/// not flash the terminal. It is logged instead.
+pub(crate) fn catch_quietly<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    let guard = QuietGuard::enter();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    drop(guard);
+    caught.map_err(|payload| {
+        QUIET_MESSAGE
+            .with(|m| m.borrow_mut().take())
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panicked".to_string())
+    })
 }
 
 /// The terminal behind the descriptor `enter` recorded, or None before
@@ -1528,6 +1583,30 @@ mod tests {
         install_panic_hook();
         assert!(PANIC_HOOK.is_completed());
         assert!(!install_panic_hook());
+    }
+
+    /// A panic inside comes back as an error with its message, through
+    /// the hook, and the count of quiet calls is back at zero after each
+    /// call, nested or not.
+    #[test]
+    fn catch_quietly_returns_the_panic_message_and_unwinds_the_count() {
+        install_panic_hook();
+        let depth = || QUIET_PANICS.with(std::cell::Cell::get);
+        assert_eq!(catch_quietly(|| 7), Ok(7));
+        assert_eq!(
+            catch_quietly(|| -> u8 { panic!("drawing failed: {}", 3) }),
+            Err("drawing failed: 3".to_string())
+        );
+        assert_eq!(depth(), 0);
+        let nested = catch_quietly(|| {
+            let inner = catch_quietly(|| -> u8 { panic!("inner") });
+            assert_eq!(depth(), 1);
+            assert_eq!(inner, Err("inner".to_string()));
+            panic!("outer")
+        });
+        assert_eq!(nested, Err::<(), _>("outer".to_string()));
+        assert_eq!(depth(), 0);
+        assert_eq!(QUIET_MESSAGE.with(|m| m.borrow().clone()), None);
     }
 
     fn units_of(text: &str) -> Vec<u16> {

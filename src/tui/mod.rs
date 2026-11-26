@@ -30,6 +30,7 @@ mod queued;
 mod redirect;
 mod render;
 mod rewind;
+mod rich;
 mod roster;
 mod run_loop;
 mod run_now;
@@ -706,6 +707,25 @@ impl App {
         self.theme = theme;
     }
 
+    /// Drops every laid-out line, so the next frame renders it all with
+    /// the renderer as it is now.
+    fn relayout_all(&mut self) {
+        self.transcript.forget_layout();
+        self.child_live.forget_layout();
+        for prompt in &mut self.prompts {
+            prompt.forget_question_layout();
+        }
+        if let Some(pager) = self.pager_mut() {
+            pager.forget_layout();
+        }
+    }
+
+    /// Switches every reply's rich blocks between drawn and source.
+    fn toggle_rich_view(&mut self) {
+        self.renderer.rich = !self.renderer.rich;
+        self.relayout_all();
+    }
+
     /// Starts the welcome wordmark's sweep from the next frame drawn, while
     /// the greeting is all the transcript holds; under `NO_COLOR` it stays
     /// still.
@@ -785,6 +805,7 @@ impl App {
             match config.render_options().and_then(Renderer::new) {
                 Ok(mut renderer) => {
                     renderer.no_color = self.renderer.no_color;
+                    renderer.rich = self.renderer.rich;
                     let theme = Theme::new(
                         renderer.markdown_render(),
                         renderer.no_color,
@@ -792,14 +813,7 @@ impl App {
                     );
                     self.renderer = renderer;
                     self.set_theme(theme);
-                    self.transcript.forget_layout();
-                    self.child_live.forget_layout();
-                    for prompt in &mut self.prompts {
-                        prompt.forget_question_layout();
-                    }
-                    if let Some(pager) = self.pager_mut() {
-                        pager.forget_layout();
-                    }
+                    self.relayout_all();
                 }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }
@@ -1680,6 +1694,10 @@ impl App {
             Action::OpenEditor => Some(Command::OpenEditor),
             Action::ScheduleFrame => Some(Command::Redraw),
             Action::CopyToolOutput => self.copy_tool_output(),
+            Action::ToggleRichView => {
+                self.toggle_rich_view();
+                None
+            }
             Action::PasteImage => Some(Command::PasteImage),
             Action::Answer(answer) => {
                 self.answer_front(answer);

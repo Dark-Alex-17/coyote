@@ -150,7 +150,9 @@ fn entry_lines(entry: &ChildEntry, width: u16, renderer: &mut Renderer) -> Vec<L
     match entry {
         ChildEntry::Compressed => render::plain_lines(COMPRESSED_DIVIDER, width, DIM),
         ChildEntry::User(text) => render::plain_lines(&format!("> {text}"), width, BOLD),
-        ChildEntry::Assistant(text) => renderer.markdown(without_think_spans(text, true), width),
+        ChildEntry::Assistant(text) => {
+            renderer.markdown_source(without_think_spans(text, true), width)
+        }
         ChildEntry::Tool { .. } => Vec::new(),
     }
 }

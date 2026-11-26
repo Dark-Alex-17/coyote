@@ -6,10 +6,12 @@
 
 use super::cells::{BODY_INDENT, COLLAPSED_ARROW, EXPANDED_ARROW};
 use super::render::{is_wrap_mark, wrap_join};
+use super::rich::CopyRegion;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Line;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -56,6 +58,9 @@ pub(super) struct Row {
     /// A newline, or for a row wrapped from the one above, nothing (a
     /// break inside a word) or the space the wrap took out.
     before: &'static str,
+    /// The block the row was drawn for, by its first row, and the source
+    /// a copy takes in place of the block's rows.
+    block: Option<(usize, Arc<str>)>,
 }
 
 impl Row {
@@ -84,8 +89,23 @@ pub(super) fn rows<'a>(lines: impl IntoIterator<Item = (Pos, &'a Line<'a>)>) -> 
                 .collect(),
             gutter: gutter_width(line),
             before: wrap_join(line).unwrap_or("\n"),
+            block: None,
         })
         .collect()
+}
+
+/// Marks the rows of one cell that `regions` cover, so a copy takes each
+/// region's source once rather than the rows drawn for it.
+pub(super) fn mark_regions(rows: &mut [Row], regions: &[CopyRegion]) {
+    for region in regions {
+        let CopyRegion::Block {
+            rows: covered,
+            source,
+        } = region;
+        for row in rows.iter_mut().filter(|row| covered.contains(&row.row)) {
+            row.block = Some((covered.start, Arc::clone(source)));
+        }
+    }
 }
 
 /// The columns the fold arrow and the body indent take at the start of
@@ -131,30 +151,51 @@ fn columns(text: &str, from: usize, to: usize) -> String {
 }
 
 /// The text from `start` to `end`, both columns included: no gutter, and
-/// a wrapped row joined back onto the row it was wrapped from.
+/// a wrapped row joined back onto the row it was wrapped from. A block's
+/// rows give its source once, however many of them the range touches.
 pub(super) fn extract(rows: &[Row], start: Pos, end: Pos) -> String {
     let mut out = String::new();
     let mut first = true;
+    let mut last_block = None;
     for row in rows
         .iter()
         .filter(|row| start.key() <= row.key() && row.key() <= end.key())
     {
-        let from = if row.key() == start.key() {
-            start.column
-        } else {
-            0
+        let block = row
+            .block
+            .as_ref()
+            .map(|(at, source)| ((row.cell, *at), source));
+        let piece = match block {
+            Some((id, _)) if last_block == Some(id) => continue,
+            Some((id, source)) => {
+                last_block = Some(id);
+                if source.is_empty() {
+                    continue;
+                }
+                source.to_string()
+            }
+            None => {
+                last_block = None;
+                let from = if row.key() == start.key() {
+                    start.column
+                } else {
+                    0
+                };
+                let to = if row.key() == end.key() {
+                    end.column.saturating_add(1)
+                } else {
+                    usize::MAX
+                };
+                columns(&row.text, from.max(row.gutter), to)
+                    .trim_end()
+                    .to_string()
+            }
         };
-        let to = if row.key() == end.key() {
-            end.column.saturating_add(1)
-        } else {
-            usize::MAX
-        };
-        let piece = columns(&row.text, from.max(row.gutter), to);
         if !first {
             out.push_str(row.before);
         }
         first = false;
-        out.push_str(piece.trim_end());
+        out.push_str(&piece);
     }
     out
 }
@@ -498,6 +539,46 @@ mod tests {
         assert_eq!(extract(&rows, start, end), "");
         let (start, end) = line_at(&rows, Pos::new(1, 2, 1));
         assert_eq!(extract(&rows, start, end), "the quick brown fox jumps");
+    }
+
+    /// A range touching any row of a drawn block copies the block's whole
+    /// source once; the note under a block shown as source copies nothing,
+    /// and the source rows above the note copy as drawn.
+    #[test]
+    fn a_block_copies_its_source_once_and_a_note_copies_nothing() {
+        let mut rows = laid_out(&[
+            (0, line(&["before"])),
+            (0, line(&["┌───┐"])),
+            (0, line(&["│ A │"])),
+            (0, line(&["└───┘"])),
+            (0, line(&["```mermaid"])),
+            (0, line(&["bad"])),
+            (0, line(&["```"])),
+            (0, line(&["mermaid: parse error (showing source)"])),
+            (0, line(&["after"])),
+        ]);
+        mark_regions(
+            &mut rows,
+            &[
+                CopyRegion::Block {
+                    rows: 1..4,
+                    source: Arc::from("```mermaid\nA\n```"),
+                },
+                CopyRegion::Block {
+                    rows: 7..8,
+                    source: Arc::from(""),
+                },
+            ],
+        );
+        assert_eq!(
+            extract(&rows, Pos::new(0, 0, 3), Pos::new(0, 8, 2)),
+            "ore\n```mermaid\nA\n```\n```mermaid\nbad\n```\naft"
+        );
+        assert_eq!(
+            extract(&rows, Pos::new(0, 2, 3), Pos::new(0, 2, 3)),
+            "```mermaid\nA\n```"
+        );
+        assert_eq!(extract(&rows, Pos::new(0, 7, 0), Pos::new(0, 7, 9)), "");
     }
 
     /// Presses on one cell inside the window count up to three and then

@@ -3,8 +3,11 @@
 //! surfaces paint the same way; the result is scrubbed of every escape
 //! that is not a colour or attribute and parsed back into styled spans. A
 //! streaming reply is split into a stable part, rendered once per width,
-//! and a live tail.
+//! and a live tail. A reply's closed fences of a kind the TUI draws
+//! itself (see [`super::rich`]) are drawn in place of their source.
 
+use super::rich::mermaid::{self, MermaidRenderer, MermaidTextBackend};
+use super::rich::{self, Block, BlockKind, CopyRegion, Rendered, RichCache, RichKey, Segment};
 use super::throbber::Tick;
 use crate::config::is_format_char;
 use crate::render::{
@@ -14,6 +17,7 @@ use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use std::sync::Arc;
 use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
@@ -327,6 +331,11 @@ pub(crate) struct Renderer {
     /// The instant the frame being laid out is drawn for: what a running
     /// row's throbber and elapsed time read. The App sets it each frame.
     pub(super) tick: Tick,
+    /// Whether a reply's rich blocks are drawn, or shown as their source;
+    /// Alt+M flips it.
+    pub(super) rich: bool,
+    mermaid: Arc<dyn MermaidRenderer>,
+    rich_cache: RichCache,
 }
 
 impl Renderer {
@@ -349,11 +358,92 @@ impl Renderer {
             faded: super::theme::DIM,
             accent: super::theme::Gradient::PLAIN,
             tick: Tick { origin: now, now },
+            rich: true,
+            mermaid: Arc::new(MermaidTextBackend),
+            rich_cache: RichCache::default(),
         })
     }
 
     pub(super) fn markdown_render(&self) -> &MarkdownRender {
         &self.markdown
+    }
+
+    /// Swaps the mermaid backend, dropping the blocks the old one drew.
+    #[cfg(test)]
+    pub(super) fn set_mermaid_backend(&mut self, backend: Arc<dyn MermaidRenderer>) {
+        self.mermaid = backend;
+        self.rich_cache = RichCache::default();
+    }
+
+    /// A reply laid out at `width`: with `rich`, its rich blocks drawn and
+    /// the rows they take recorded for the copy; without, all of it as
+    /// markdown source.
+    pub(crate) fn render_reply(&mut self, source: &str, width: u16, rich: bool) -> Rendered {
+        if !rich {
+            return Rendered::plain(self.markdown_run(source, width));
+        }
+        let mut rendered = Rendered::default();
+        for segment in rich::segment(source) {
+            match segment {
+                Segment::Markdown(run) => {
+                    rendered.append(Rendered::plain(self.markdown_run(run, width)));
+                }
+                Segment::Block(block) => rendered.append(self.rich_block(&block, width)),
+            }
+        }
+        rendered
+    }
+
+    /// Markdown with every block shown as source: what the transcript
+    /// view, a child's thread and a question draw, so what they show and
+    /// copy is the text the model wrote.
+    pub(crate) fn markdown_source(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
+        self.render_reply(source, width, false).lines
+    }
+
+    /// A block drawn at `width`, from the cache when it was drawn before.
+    /// One that cannot be drawn is its fenced source, highlighted as in a
+    /// markdown run, with a faded note under it that a copy leaves out.
+    fn rich_block(&mut self, block: &Block, width: u16) -> Rendered {
+        let width = self.wrap_cap.map_or(width, |cap| width.min(cap)).max(1);
+        let key = RichKey::new(block, width, self.no_color);
+        let drawn = match self.rich_cache.get(&key) {
+            Some(drawn) => drawn,
+            None => {
+                let drawn = Arc::new(self.draw_block(block, width));
+                self.rich_cache.insert(key, Arc::clone(&drawn));
+                drawn
+            }
+        };
+        match &*drawn {
+            Ok(lines) => Rendered {
+                lines: lines.clone(),
+                regions: vec![CopyRegion::Block {
+                    rows: 0..lines.len(),
+                    source: Arc::from(block.fenced),
+                }],
+            },
+            Err(note) => {
+                let mut lines = self.markdown_run(block.fenced, width);
+                let row = lines.len();
+                lines.push(rich::note_line(note, self.faded));
+                Rendered {
+                    lines,
+                    regions: vec![CopyRegion::Block {
+                        rows: row..row + 1,
+                        source: Arc::from(""),
+                    }],
+                }
+            }
+        }
+    }
+
+    fn draw_block(&self, block: &Block, width: u16) -> rich::BlockResult {
+        match block.kind {
+            BlockKind::Mermaid => mermaid::render_mermaid(self.mermaid.as_ref(), block.body, width)
+                .map(|rows| rows.into_iter().map(Line::from).collect())
+                .map_err(|err| err.note()),
+        }
     }
 
     /// Markdown laid out at `width` by the renderer itself: it wraps prose
@@ -363,7 +453,7 @@ impl Renderer {
     /// view. A numeric `wrap` setting caps the width below the pane's, as
     /// it caps the REPL's below the terminal's. Each row a wrap continued
     /// is led by a [`wrap_mark`].
-    pub(crate) fn markdown(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
+    fn markdown_run(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
         if source.is_empty() {
             return Vec::new();
         }
@@ -422,7 +512,7 @@ fn take_soft_break(line: Line<'static>) -> Line<'static> {
 }
 
 fn is_fence(line: &str) -> bool {
-    line.trim_start().starts_with("```")
+    rich::block_delimiter(line).is_some()
 }
 
 fn fence_open(source: &str) -> bool {
@@ -458,50 +548,51 @@ pub(crate) fn split_stable_tail(source: &str) -> usize {
     split
 }
 
-struct StableLines {
+struct StableRender {
     width: u16,
     stable_len: usize,
-    lines: Vec<Line<'static>>,
+    rendered: Rendered,
 }
 
-/// Rendered lines of one reply, cached per width for the stable part. The
-/// two most recently used widths stay cached so a resize and back costs
-/// nothing.
+/// One reply rendered with the renderer's `rich` setting, cached per width
+/// for the stable part. The two most recently used widths stay cached so a
+/// resize and back costs nothing.
 #[derive(Default)]
 pub(crate) struct RenderCache {
-    entries: Vec<StableLines>,
+    entries: Vec<StableRender>,
 }
 
 impl RenderCache {
-    /// A reply's lines: the cached stable part copied, with a streaming
+    /// A reply rendered: the cached stable part copied, with a streaming
     /// tail past it rendered anew.
-    pub(crate) fn lines(
+    pub(crate) fn rendered(
         &mut self,
         source: &str,
         done: bool,
         width: u16,
         renderer: &mut Renderer,
-    ) -> Vec<Line<'static>> {
+    ) -> Rendered {
         let split = if done {
             source.len()
         } else {
             split_stable_tail(source)
         };
-        let mut lines = self.stable(source, split, width, renderer).to_vec();
+        let mut rendered = self.stable(source, split, width, renderer).clone();
         if split < source.len() {
-            lines.extend(renderer.markdown(&source[split..], width));
+            let rich = renderer.rich;
+            rendered.append(renderer.render_reply(&source[split..], width, rich));
         }
-        lines
+        rendered
     }
 
-    /// A finished reply's lines, borrowed from the cache: the whole
+    /// A finished reply rendered, borrowed from the cache: the whole
     /// source is its stable part.
-    pub(crate) fn finished_lines(
+    pub(crate) fn finished(
         &mut self,
         source: &str,
         width: u16,
         renderer: &mut Renderer,
-    ) -> &[Line<'static>] {
+    ) -> &Rendered {
         self.stable(source, source.len(), width, renderer)
     }
 
@@ -511,17 +602,17 @@ impl RenderCache {
         split: usize,
         width: u16,
         renderer: &mut Renderer,
-    ) -> &[Line<'static>] {
+    ) -> &Rendered {
         let entry = match self.entries.iter().position(|e| e.width == width) {
             Some(index) => self.entries.remove(index),
             None => {
                 if self.entries.len() >= 2 {
                     self.entries.remove(0);
                 }
-                StableLines {
+                StableRender {
                     width,
                     stable_len: usize::MAX,
-                    lines: Vec::new(),
+                    rendered: Rendered::default(),
                 }
             }
         };
@@ -529,16 +620,18 @@ impl RenderCache {
         let index = self.entries.len() - 1;
         let entry = &mut self.entries[index];
         if entry.stable_len != split {
-            entry.lines = renderer.markdown(&source[..split], width);
+            let rich = renderer.rich;
+            entry.rendered = renderer.render_reply(&source[..split], width, rich);
             entry.stable_len = split;
         }
-        &entry.lines
+        &entry.rendered
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::rich::mermaid::{FakeMermaid, MermaidError};
     use crate::utils::decode_bin;
     use syntect::highlighting::Theme;
 
@@ -559,15 +652,18 @@ mod tests {
             ..RenderOptions::default()
         })
         .unwrap();
-        assert!(widest(&capped.markdown(&prose, 80)) <= 30);
-        assert!(widest(&capped.markdown(&prose, 20)) <= 20);
+        assert!(widest(&capped.markdown_source(&prose, 80)) <= 30);
+        assert!(widest(&capped.markdown_source(&prose, 20)) <= 20);
         for setting in ["auto", "no"] {
             let mut uncapped = Renderer::new(RenderOptions {
                 wrap: Some(setting.to_string()),
                 ..RenderOptions::default()
             })
             .unwrap();
-            assert!(widest(&uncapped.markdown(&prose, 80)) > 30, "{setting}");
+            assert!(
+                widest(&uncapped.markdown_source(&prose, 80)) > 30,
+                "{setting}"
+            );
         }
     }
 
@@ -684,7 +780,7 @@ mod tests {
     #[test]
     fn without_a_theme_bold_survives_and_no_colour_is_painted() {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
-        let lines = renderer.markdown("plain **bold** text", 80);
+        let lines = renderer.markdown_source("plain **bold** text", 80);
         let bold: Vec<&Span<'_>> = every_span(&lines)
             .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
             .collect();
@@ -703,7 +799,7 @@ mod tests {
     fn a_replys_own_characters_never_mark_a_wrap() {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
         let source = format!("icon \u{E000} here and {SOFT_BREAK_SPACE}x{SOFT_BREAK_WORD}y");
-        let lines = renderer.markdown(&source, 80);
+        let lines = renderer.markdown_source(&source, 80);
         let text: String = lines.iter().map(Line::to_string).collect();
         assert!(text.contains("icon \u{E000} here and xy"), "{text:?}");
         assert!(
@@ -726,7 +822,7 @@ mod tests {
             ..RenderOptions::default()
         })
         .unwrap();
-        let lines = renderer.markdown(
+        let lines = renderer.markdown_source(
             "# Title\n\n1. one **bold** `code` [x](https://e.com)\n\n```rust\nfn main() {}\n```\n",
             80,
         );
@@ -751,7 +847,7 @@ mod tests {
         use ratatui::widgets::{Paragraph, Widget};
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
         renderer.no_color = true;
-        let markdown = renderer.markdown(
+        let markdown = renderer.markdown_source(
             "# Title\n\n1. one **bold** `code` [x](https://e.com)\n\n```rust\nfn main() {}\n```\n",
             40,
         );
@@ -790,7 +886,7 @@ mod tests {
             ..RenderOptions::default()
         };
         let mut renderer = Renderer::new(options).unwrap();
-        let lines = renderer.markdown(
+        let lines = renderer.markdown_source(
             "# Title\n\nSome `code` and a link [x](https://e.com)\n\n```rust\nfn main() {}\n```\n",
             80,
         );
@@ -808,7 +904,7 @@ mod tests {
     #[test]
     fn wrapping_measures_text_not_escapes() {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
-        let lines = renderer.markdown("one two **three** four five six seven", 12);
+        let lines = renderer.markdown_source("one two **three** four five six seven", 12);
         assert!(lines.len() >= 3, "{lines:?}");
         for line in &lines {
             assert!(line.width() <= 12, "{line:?}");
@@ -825,7 +921,7 @@ mod tests {
                       |---|---|---|\n\
                       | alpha | the first of the three columns | ok |\n\
                       | beta | the second one, longer than the view | fine |\n";
-        let lines = renderer.markdown(source, 30);
+        let lines = renderer.markdown_source(source, 30);
         assert!(lines.len() >= 5, "{lines:?}");
         for line in &lines {
             let text = line.to_string();
@@ -853,7 +949,7 @@ mod tests {
         .unwrap();
         let value = "v".repeat(40);
         let source = format!("```rust\nlet name = \"{value}\";\n```");
-        let lines = renderer.markdown(&source, 20);
+        let lines = renderer.markdown_source(&source, 20);
         let code: Vec<&Line<'static>> = lines
             .iter()
             .filter(|line| !line.to_string().starts_with("```"))
@@ -926,13 +1022,13 @@ mod tests {
     #[test]
     fn markdown_prose_marks_soft_wraps() {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
-        let prose = renderer.markdown("one two three four five six", 10);
+        let prose = renderer.markdown_source("one two three four five six", 10);
         assert_eq!(joins(&prose), [None, Some(" "), Some(" ")], "{prose:?}");
-        let list = renderer.markdown("- alpha beta gamma delta", 12);
+        let list = renderer.markdown_source("- alpha beta gamma delta", 12);
         assert_eq!(joins(&list), [None, Some(" "), Some(" ")], "{list:?}");
-        let word = renderer.markdown(&"x".repeat(25), 10);
+        let word = renderer.markdown_source(&"x".repeat(25), 10);
         assert_eq!(joins(&word), [None, Some(""), Some("")], "{word:?}");
-        let quote = renderer.markdown("> first line\n> second", 40);
+        let quote = renderer.markdown_source("> first line\n> second", 40);
         assert_eq!(joins(&quote), [None, None], "{quote:?}");
         for line in prose.iter().chain(&list).chain(&word) {
             let text = line.to_string();
@@ -960,8 +1056,8 @@ mod tests {
     #[test]
     fn an_open_fence_does_not_leak_into_the_next_render() {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
-        let _ = renderer.markdown("```rust\nfn main() {}", 80);
-        let lines = renderer.markdown("plain **bold**", 80);
+        let _ = renderer.markdown_source("```rust\nfn main() {}", 80);
+        let lines = renderer.markdown_source("plain **bold**", 80);
         assert!(
             every_span(&lines).any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
             "{lines:?}"
@@ -973,25 +1069,184 @@ mod tests {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
         let mut cache = RenderCache::default();
         let source = "first paragraph\n\nsecond paragraph still streaming";
-        let wide = cache.lines(source, false, 80, &mut renderer);
-        let narrow = cache.lines(source, false, 10, &mut renderer);
+        let wide = cache.rendered(source, false, 80, &mut renderer).lines;
+        let narrow = cache.rendered(source, false, 10, &mut renderer).lines;
         assert_eq!(cache.entries.len(), 2);
         assert!(narrow.len() > wide.len());
         let longer = format!("{source} and more");
-        let again = cache.lines(&longer, false, 80, &mut renderer);
+        let again = cache.rendered(&longer, false, 80, &mut renderer).lines;
         assert_eq!(cache.entries.len(), 2);
         assert_eq!(again[0], wide[0]);
-        cache.lines(&longer, false, 40, &mut renderer);
+        cache.rendered(&longer, false, 40, &mut renderer);
         assert_eq!(cache.entries.len(), 2);
         assert!(cache.entries.iter().all(|e| e.width != 10));
-        let done = cache.lines(&longer, true, 80, &mut renderer);
+        let done = cache.rendered(&longer, true, 80, &mut renderer).lines;
         assert!(
             done.iter()
                 .any(|line| line.to_string().contains("and more")),
             "{done:?}"
         );
         assert_eq!(cache.entries.last().unwrap().stable_len, longer.len());
-        assert_eq!(cache.finished_lines(&longer, 80, &mut renderer), done);
+        assert_eq!(cache.finished(&longer, 80, &mut renderer).lines, done);
         assert_eq!(cache.entries.len(), 2);
+    }
+
+    const DIAGRAM: &str = "```mermaid\nflowchart TD\nA-->B\n```";
+
+    fn faked(
+        respond: impl Fn(&str, u16) -> Result<String, MermaidError> + Send + Sync + 'static,
+    ) -> (Renderer, Arc<FakeMermaid>) {
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let fake = Arc::new(FakeMermaid::new(respond));
+        renderer.set_mermaid_backend(fake.clone());
+        (renderer, fake)
+    }
+
+    fn texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(Line::to_string).collect()
+    }
+
+    /// Without rich blocks a reply takes the markdown path whole, and a
+    /// reply with no block draws the same either way.
+    #[test]
+    fn without_rich_blocks_a_reply_renders_as_plain_markdown() {
+        let (mut renderer, fake) = faked(|_, _| Ok("drawn".to_string()));
+        let source = format!("intro **bold**\n{DIAGRAM}\n- item");
+        let plain = renderer.render_reply(&source, 40, false);
+        assert!(plain.regions.is_empty());
+        assert_eq!(plain.lines, renderer.markdown_source(&source, 40));
+        assert!(texts(&plain.lines).contains(&"flowchart TD".to_string()));
+        assert_eq!(fake.calls(), 0);
+        let no_block =
+            "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn x() {}\n```\n- one";
+        assert_eq!(
+            renderer.render_reply(no_block, 40, true),
+            renderer.render_reply(no_block, 40, false)
+        );
+    }
+
+    /// A drawn block takes the rows between its neighbours with no blank
+    /// row added, and those rows copy as the fenced source.
+    #[test]
+    fn a_drawn_block_sits_between_its_neighbours_and_copies_as_source() {
+        let (mut renderer, fake) = faked(|source, width| {
+            assert_eq!(source, "flowchart TD\nA-->B\n");
+            assert_eq!(width, 40);
+            Ok("┌───┐\n│ A │\n└───┘\n".to_string())
+        });
+        let rendered = renderer.render_reply(&format!("before\n{DIAGRAM}\nafter"), 40, true);
+        assert_eq!(
+            texts(&rendered.lines),
+            ["before", "┌───┐", "│ A │", "└───┘", "after"]
+        );
+        assert_eq!(
+            rendered.regions,
+            [CopyRegion::Block {
+                rows: 1..4,
+                source: Arc::from(DIAGRAM),
+            }]
+        );
+        assert_eq!(fake.calls(), 1);
+    }
+
+    /// A table just before a block and a list just after it are laid out
+    /// as they are with the block shown as source.
+    #[test]
+    fn a_table_before_and_a_list_after_a_block_render_as_in_source() {
+        let (mut renderer, _) = faked(|_, _| Ok("drawn".to_string()));
+        let source = format!("| a | b |\n|---|---|\n| 1 | 2 |\n{DIAGRAM}\n- one\n- two");
+        let rich = texts(&renderer.render_reply(&source, 40, true).lines);
+        let plain = texts(&renderer.render_reply(&source, 40, false).lines);
+        let fence = plain
+            .iter()
+            .position(|line| line.starts_with("```mermaid"))
+            .unwrap();
+        assert!(fence > 3, "{plain:?}");
+        assert_eq!(rich.iter().position(|line| line == "drawn"), Some(fence));
+        assert_eq!(rich[..fence], plain[..fence]);
+        assert_eq!(rich[fence + 1..], plain[fence + 4..]);
+    }
+
+    /// Every way the backend can fail shows the fenced source as it is
+    /// highlighted in a markdown run, with one faded note under it that
+    /// copies as nothing.
+    #[test]
+    fn each_failure_shows_the_source_and_a_note() {
+        type Respond = fn(&str, u16) -> Result<String, MermaidError>;
+        let failures: [(&str, Respond); 7] = [
+            ("empty diagram", |_, _| Err(MermaidError::Empty)),
+            ("unsupported diagram \"gantt\"", |_, _| {
+                Err(MermaidError::Unsupported("gantt".to_string()))
+            }),
+            ("parse error: no arrow", |_, _| {
+                Err(MermaidError::Parse("no arrow".to_string()))
+            }),
+            ("diagram needs 99 columns, 40 available", |_, _| {
+                Err(MermaidError::TooWide {
+                    needed: 99,
+                    available: 40,
+                })
+            }),
+            ("renderer failed: boom", |_, _| panic!("boom")),
+            ("diagram needs 41 columns, 40 available", |_, _| {
+                Ok("x".repeat(41))
+            }),
+            ("diagram longer than 400 lines or 16 KiB", |_, _| {
+                Ok("drawn".to_string())
+            }),
+        ];
+        for (why, respond) in failures {
+            let (mut renderer, _) = faked(respond);
+            let source = if why.contains("longer") {
+                format!("```mermaid\n{}```", "A-->B\n".repeat(401))
+            } else {
+                DIAGRAM.to_string()
+            };
+            let rendered = renderer.render_reply(&source, 40, true);
+            let mut expected = renderer.markdown_source(&source, 40);
+            let note = format!("mermaid: {why} (showing source)");
+            expected.push(Line::from(Span::styled(note, renderer.faded)));
+            assert_eq!(rendered.lines, expected, "{why}");
+            let row = expected.len() - 1;
+            assert_eq!(
+                rendered.regions,
+                [CopyRegion::Block {
+                    rows: row..row + 1,
+                    source: Arc::from(""),
+                }],
+                "{why}"
+            );
+        }
+    }
+
+    /// A closed block in the streaming tail is drawn once and taken from
+    /// the cache on later frames; a new width draws it again.
+    #[test]
+    fn a_block_in_the_streaming_tail_is_drawn_once_per_width() {
+        let (mut renderer, fake) = faked(|_, _| Ok("drawn".to_string()));
+        let mut cache = RenderCache::default();
+        let source = format!("intro\n\n{DIAGRAM}\nstill");
+        let first = cache.rendered(&source, false, 40, &mut renderer);
+        let second = cache.rendered(&format!("{source} going"), false, 40, &mut renderer);
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(first.regions, second.regions);
+        assert!(texts(&second.lines).contains(&"drawn".to_string()));
+        cache.rendered(&source, false, 30, &mut renderer);
+        assert_eq!(fake.calls(), 2);
+        let (mut failing, fake) = faked(|_, _| Err(MermaidError::Empty));
+        failing.render_reply(DIAGRAM, 40, true);
+        failing.render_reply(DIAGRAM, 40, true);
+        assert_eq!(fake.calls(), 1, "a failure is cached too");
+    }
+
+    /// A fence still streaming shows as source until it closes.
+    #[test]
+    fn an_unclosed_block_shows_as_source() {
+        let (mut renderer, fake) = faked(|_, _| Ok("drawn".to_string()));
+        let open = "```mermaid\nflowchart TD\nA-->B";
+        let rendered = renderer.render_reply(open, 40, true);
+        assert!(rendered.regions.is_empty());
+        assert_eq!(rendered.lines, renderer.markdown_source(open, 40));
+        assert_eq!(fake.calls(), 0);
     }
 }

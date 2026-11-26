@@ -717,7 +717,8 @@ impl Transcript {
     }
 
     /// The rows of cells `first..=last` as the selection copies them, at
-    /// the width of the last frame.
+    /// the width of the last frame; the rows of a reply's drawn block copy
+    /// as the block's source.
     pub(super) fn selection_rows(
         &mut self,
         first: usize,
@@ -726,17 +727,20 @@ impl Transcript {
     ) -> Vec<selection::Row> {
         let width = self.last_area.width;
         let last = last.min(self.cells.len().saturating_sub(1));
-        let mut lines = Vec::new();
+        let mut rows = Vec::new();
         for (index, cell) in self.cells.iter_mut().enumerate().take(last + 1).skip(first) {
+            let regions = cell.copy_regions(width, renderer);
             let cell_lines = cell.cached_lines(width, None, renderer);
-            lines.extend(
+            let mut cell_rows = selection::rows(
                 cell_lines
                     .iter()
                     .enumerate()
-                    .map(|(row, line)| (Pos::new(index, row, 0), line.clone())),
+                    .map(|(row, line)| (Pos::new(index, row, 0), line)),
             );
+            selection::mark_regions(&mut cell_rows, &regions);
+            rows.extend(cell_rows);
         }
-        selection::rows(lines.iter().map(|(pos, line)| (*pos, line)))
+        rows
     }
 
     /// Paints the rows of the last frame that fall inside `range`.

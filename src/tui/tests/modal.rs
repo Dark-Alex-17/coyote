@@ -1672,7 +1672,7 @@ fn only_a_question_without_a_tool_is_rendered_as_markdown() {
         let expected: Vec<String> = harness
             .app
             .renderer
-            .markdown(source, 80)
+            .markdown_source(source, 80)
             .iter()
             .map(|line| line.to_string().trim_end().to_string())
             .collect();

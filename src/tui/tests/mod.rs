@@ -7,6 +7,7 @@ mod lend;
 mod modal;
 mod mouse_and_copy;
 mod rewind;
+mod rich_blocks;
 mod run_loop;
 
 use super::*;
