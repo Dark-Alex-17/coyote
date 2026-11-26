@@ -424,11 +424,13 @@ fn graph_agents_native_section_pins_the_call_sites_fallback_and_parse_order() {
     }
     assert!(text.contains("tools and functions are sent exactly as"));
 
-    let source = read(&repo_root().join("src/graph/structured.rs"));
+    let source = read(&repo_root().join("src/client/native_format.rs"));
     let open = "warn!(\"";
     let start = source
         .find(&format!("{open}provider rejected the native"))
-        .expect("src/graph/structured.rs no longer has the native-format rejection warn! literal")
+        .expect(
+            "src/client/native_format.rs no longer has the native-format rejection warn! literal",
+        )
         + open.len();
     let warning = &source[start..start + source[start..].find('"').unwrap()];
     let (prefix, suffix) = warning
