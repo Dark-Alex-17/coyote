@@ -826,6 +826,22 @@ fn verify_tier_defaults_to_full_and_declares_the_round_route() {
         "full (verify_tier \"rounds\" is neither round nor full, so the full tier ran)",
         "{out}"
     );
+    let forged = format!("rounds\r\nTier: forged\n{}", "y".repeat(200));
+    let out = run_script(
+        "coder/scripts/resolve_paths.sh",
+        &dir,
+        &Value::Null,
+        &[("LLM_AGENT_VAR_VERIFY_TIER", forged.as_str())],
+    );
+    let echoed: String = format!("rounds Tier: forged {}", "y".repeat(200))
+        .chars()
+        .take(120)
+        .collect();
+    assert_eq!(
+        str_field(&out, "tests_tier"),
+        format!("full (verify_tier \"{echoed}\" is neither round nor full, so the full tier ran)"),
+        "{out}"
+    );
 
     let build = |tier: &str| {
         run_script(

@@ -39,4 +39,5 @@ jq -nc \
     "_next": "analyze_request"
   }
   + (if $tier == "" or $tier == "round" or $tier == "full" then {}
-    else {"tests_tier": ("full (verify_tier \"" + $tier + "\" is neither round nor full, so the full tier ran)")} end)'
+    else {"tests_tier": ("full (verify_tier \"" + ($tier | gsub("\\s+"; " ") | .[0:120])
+      + "\" is neither round nor full, so the full tier ran)")} end)'

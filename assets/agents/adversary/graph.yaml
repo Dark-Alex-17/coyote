@@ -82,12 +82,12 @@ variables:
       checks are told the full suite runs at the final gate, so a criterion
       only the whole suite can prove is at best INSPECTED with a
       `DEFERRED: full suite runs at the final gate` reason, PARTIAL unless a
-      recorded run is green. `final`: run_checks runs nothing and takes
-      exec_results from the finalize record of the reviewed tree (see
-      review_tree); a missing,
-      other-tree or red record forces DIVERGES with a `FULL-SUITE RECORD ...`
-      line, and a DEFERRED reason always counts as PARTIAL. Any other value
-      is a PIPELINE-FAULT.
+      recorded run is green. `final`: run_checks takes exec_results from the
+      finalize record of the reviewed tree (see review_tree) and runs the
+      declared commands after them, so declare only what the finalize gate
+      does not cover; a missing, other-tree or red record forces DIVERGES
+      with a `FULL-SUITE RECORD ...` line, and a DEFERRED reason always
+      counts as PARTIAL. Any other value is a PIPELINE-FAULT.
     default: ''
   - name: review_tree
     description: |
