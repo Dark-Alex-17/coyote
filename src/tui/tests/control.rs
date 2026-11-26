@@ -290,7 +290,12 @@ fn x_cancels_a_running_job_and_refuses_a_finished_agent() {
         let tasks = supervisor();
         tasks.write().register(running_job("job-x7x")).unwrap();
         tasks.write().register(finished_agent("agent-x7x")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while tasks.read().is_finished("agent-x7x") != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent-x7x never finished"
+            );
             tokio::task::yield_now().await;
         }
         ctx.supervisor = Some(Arc::clone(&tasks));
@@ -442,7 +447,12 @@ fn x_refuses_a_finished_task_under_a_spawned_agent() {
         let _guard = TestConfigDirGuard::new("tui-roster-cancel-nested-done");
         let mut ctx = chat_ctx();
         let (tasks, lead_sup, _, _) = nested_tasks();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while lead_sup.read().is_finished("agent_done_4d5e") != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent_done_4d5e never finished"
+            );
             tokio::task::yield_now().await;
         }
         ctx.supervisor = Some(tasks);

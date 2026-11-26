@@ -1210,7 +1210,14 @@ fn wrap(text: &str, width: usize, soft_breaks: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
     for (i, piece) in textwrap::wrap(body, wrap_options).iter().enumerate() {
-        let space = broke_at_space(body, piece, &mut cursor);
+        // The first row carries the indent, which `body` does not: it is
+        // looked up without it so the cursor moves past that row.
+        let found = if i == 0 {
+            piece.strip_prefix(&text[..indent]).unwrap_or(piece)
+        } else {
+            piece
+        };
+        let space = broke_at_space(body, found, &mut cursor);
         if i > 0 {
             out.push('\n');
             if soft_breaks {
@@ -1482,6 +1489,24 @@ impl MarkdownStyles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An indented line marks each wrap where it really broke: at the
+    /// spaces between words, and inside a word too long for the row.
+    #[test]
+    fn an_indented_line_marks_its_soft_breaks_where_it_broke() {
+        let wrapped = wrap("  ab ab cd", 5, true);
+        let rows: Vec<&str> = wrapped.split('\n').collect();
+        assert_eq!(rows[0], "  ab", "{wrapped:?}");
+        for row in &rows[1..] {
+            assert!(row.starts_with(SOFT_BREAK_SPACE), "{row:?} in {wrapped:?}");
+        }
+        let wrapped = wrap("  abcdefgh", 5, true);
+        let rows: Vec<&str> = wrapped.split('\n').collect();
+        assert!(
+            rows[1..].iter().all(|row| row.starts_with(SOFT_BREAK_WORD)),
+            "{wrapped:?}"
+        );
+    }
 
     const TEXT: &str = r#"
 To unzip a file in Rust, you can use the `zip` crate. Here's an example code that shows how to unzip a file:

@@ -740,6 +740,47 @@ mod tests {
         assert!(bgs[1..].iter().all(Option::is_none), "{painted:?}");
     }
 
+    /// Under `NO_COLOR` no region is filled, so dropping a reset background
+    /// changes no cell: the markdown a `NO_COLOR` renderer draws, and SGR
+    /// text with resets in it, paint the same symbols, colours and
+    /// attributes as the parser's lines with the reset kept.
+    #[test]
+    fn under_no_color_dropping_a_reset_background_draws_the_same_cells() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::{Paragraph, Widget};
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        renderer.no_color = true;
+        let markdown = renderer.markdown(
+            "# Title\n\n1. one **bold** `code` [x](https://e.com)\n\n```rust\nfn main() {}\n```\n",
+            40,
+        );
+        let area = Rect::new(0, 0, 40, 12);
+        let draw = |lines: Vec<Line<'static>>| {
+            let mut buf = Buffer::empty(area);
+            Paragraph::new(lines).render(area, &mut buf);
+            buf
+        };
+        let kept = |lines: &[Line<'static>]| -> Vec<Line<'static>> {
+            lines
+                .iter()
+                .cloned()
+                .map(|mut line| {
+                    for span in &mut line.spans {
+                        if span.style.bg.is_none() {
+                            span.style.bg = Some(Color::Reset);
+                        }
+                    }
+                    line
+                })
+                .collect()
+        };
+        assert_eq!(draw(markdown.clone()), draw(kept(&markdown)));
+        let sgr = "\x1b[1mbold\x1b[0m plain \x1b[49mback \x1b[2mdim\x1b[0m";
+        let raw: Vec<Line<'static>> = sgr.into_text().unwrap().lines;
+        assert_eq!(draw(preformatted_lines(sgr)), draw(raw));
+    }
+
     #[test]
     fn a_theme_without_truecolor_paints_no_rgb() {
         let theme: Theme = decode_bin(DARK_THEME).unwrap();
