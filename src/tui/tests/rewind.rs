@@ -85,6 +85,12 @@ fn an_undo_takes_the_tool_agent_and_notice_rows_of_the_exchange_too() {
 /// A session whose one turn took a line mid-way, and the transcript of
 /// it: the prompt, the reply up to the line, the line, the reply after.
 fn mid_turn_turn() -> (RequestContext, Harness) {
+    mid_turn_turn_with(&["mid line u5m"])
+}
+
+/// [`mid_turn_turn`] with `lines` sent mid-way, all taken in one drain:
+/// one cell each, and one tool result carrying them all.
+fn mid_turn_turn_with(lines: &[&str]) -> (RequestContext, Harness) {
     let mut ctx = chat_ctx();
     let mut session = Session::default();
     session.set_name("temp".to_string());
@@ -95,9 +101,11 @@ fn mid_turn_turn() -> (RequestContext, Harness) {
     harness
         .app
         .handle_msg(UiMsg::AssistantText("partial reply u5m".to_string()));
-    harness
-        .app
-        .handle_msg(UiMsg::QueuedInputSent("mid line u5m".to_string()));
+    for line in lines {
+        harness
+            .app
+            .handle_msg(UiMsg::QueuedInputSent(line.to_string()));
+    }
     harness
         .app
         .handle_msg(UiMsg::AssistantText("later reply u5m".to_string()));
@@ -112,10 +120,13 @@ fn mid_turn_turn() -> (RequestContext, Harness) {
                 ),
                 serde_json::json!({
                     "output": "ok",
-                    "system_notifications": [{"event": "user_message", "text": "mid line u5m"}],
+                    "system_notifications": lines
+                        .iter()
+                        .map(|line| serde_json::json!({"event": "user_message", "text": line}))
+                        .collect::<Vec<_>>(),
                 }),
             );
-            result.user_messages = vec!["mid line u5m".to_string()];
+            result.user_messages = lines.iter().map(|line| line.to_string()).collect();
             result
         }],
         "partial reply u5m".to_string(),
@@ -158,6 +169,30 @@ fn turn_texts(harness: &Harness) -> Vec<String> {
 /// followed it, in the transcript and in the session, keeps the prompt
 /// with the reply up to the line, and puts the line in the composer; the
 /// next `.undo` takes back the prompt.
+/// Two lines taken mid-turn in one drain are one undo step, as the
+/// session takes them back together: one `.undo` removes both cells and
+/// gives both lines back; the next takes back the prompt.
+#[test]
+fn two_mid_turn_lines_taken_together_are_one_undo_step() {
+    let (mut ctx, mut harness) = mid_turn_turn_with(&["line one u5m", "line two u5m"]);
+    for (undone, kept) in [
+        (
+            "line one u5m\nline two u5m",
+            vec!["first prompt u5m", "partial reply u5m"],
+        ),
+        ("first prompt u5m", vec![]),
+    ] {
+        harness.app.begin_turn(".undo", true);
+        ctx.undo_last_exchange().unwrap();
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.sync_from_ctx(&mut ctx);
+        assert_eq!(harness.app.composer_text(), undone);
+        assert_eq!(turn_texts(&harness), kept);
+        harness.app.set_composer_text("");
+    }
+    assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+}
+
 #[test]
 fn an_undo_after_a_mid_turn_line_takes_back_only_that_line() {
     let (mut ctx, mut harness) = mid_turn_turn();

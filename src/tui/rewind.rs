@@ -50,36 +50,67 @@ pub(super) fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) 
     }
 }
 
-/// Whether one `.undo` takes the session back to just before the cell:
-/// an exchange's opener, or a line sent mid-turn, which the session undoes
-/// on its own ahead of the turn it rode in on.
-fn starts_undo_step(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
-    undo_step_text(cell, prefix).is_some()
+/// Whether one `.undo` takes the session back to just before cell `at`:
+/// an exchange's opener, or the first of a run of lines sent mid-turn.
+/// The lines of one run were handed to the model together, so the
+/// session takes them back in one step, ahead of the turn they rode in on.
+fn starts_undo_step(cells: &[Cell], at: usize, prefix: crate::config::CommandPrefix) -> bool {
+    let cell = &cells[at];
+    opens_exchange(cell, prefix)
+        || (is_mid_turn(cell)
+            && at
+                .checked_sub(1)
+                .is_none_or(|before| !is_mid_turn(&cells[before])))
 }
 
-/// What the composer gets back when the transcript is taken back to the
-/// cell: the line typed, or the command; None for a cell that starts no
+fn is_mid_turn(cell: &Cell) -> bool {
+    matches!(cell, Cell::User { mid_turn: true, .. })
+}
+
+/// What the composer gets back when the transcript is taken back to cell
+/// `at`: the line typed, the command, or every line of a mid-turn run,
+/// one per line as the session joins them; None for a cell that starts no
 /// undo step.
-fn undo_step_text(cell: &Cell, prefix: crate::config::CommandPrefix) -> Option<&str> {
-    let starts = opens_exchange(cell, prefix) || matches!(cell, Cell::User { mid_turn: true, .. });
-    match cell {
-        Cell::User { text, .. } if starts => Some(text),
-        Cell::Command { name, .. } if starts => Some(name),
+fn undo_step_text(
+    cells: &[Cell],
+    at: usize,
+    prefix: crate::config::CommandPrefix,
+) -> Option<String> {
+    if !starts_undo_step(cells, at, prefix) {
+        return None;
+    }
+    match &cells[at] {
+        Cell::User { mid_turn: true, .. } => Some(
+            cells[at..]
+                .iter()
+                .map_while(|cell| match cell {
+                    Cell::User {
+                        text,
+                        mid_turn: true,
+                        ..
+                    } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Cell::User { text, .. } => Some(text.clone()),
+        Cell::Command { name, .. } => Some(name.clone()),
         _ => None,
     }
 }
 
 /// Index of the cell a `.undo` at `undo` takes the transcript back to:
-/// the latest opener or mid-turn line before it, scanning back past any
+/// the latest opener or mid-turn run before it, scanning back past any
 /// reply.
 pub(super) fn undo_opener(
     cells: &[Cell],
     undo: usize,
     prefix: crate::config::CommandPrefix,
 ) -> Option<usize> {
-    cells[..undo]
-        .iter()
-        .rposition(|cell| starts_undo_step(cell, prefix))
+    (0..undo)
+        .rev()
+        .find(|&at| starts_undo_step(cells, at, prefix))
 }
 
 /// The cells each `.undo` from the end would take the transcript back to,
@@ -91,7 +122,7 @@ fn undo_steps_from(
 ) -> Vec<usize> {
     (oldest..cells.len())
         .rev()
-        .filter(|&index| starts_undo_step(&cells[index], prefix))
+        .filter(|&index| starts_undo_step(cells, index, prefix))
         .collect()
 }
 
@@ -165,9 +196,7 @@ pub(super) fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: Rewi
     };
     app.sync_from_ctx(ctx);
     if let Some(&at) = cut.checked_sub(1).and_then(|last| steps.get(last)) {
-        let title = undo_step_text(&app.transcript.cells()[at], prefix)
-            .unwrap_or_default()
-            .to_string();
+        let title = undo_step_text(app.transcript.cells(), at, prefix).unwrap_or_default();
         app.transcript.truncate(at);
         app.set_composer_text(&title);
         app.pasted_images.clear();
