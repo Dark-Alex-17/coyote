@@ -3862,7 +3862,7 @@ def _retro_adopted():
             and "- One table" in body and "- One owner" in body and "Behaviour unchanged: the full build and test suite is green" in body
             and "retro-declined: Split the registry -- src/a.go:3 keeps one registry on purpose" in u["decisions"]
             and "Design retrospective: Rework the poller" in u["follow_ups"]
-            and snap.get("phase") == f"phase_f retro {new.get('id')}"
+            and snap.get("phase") == f"task {new.get('id')}"
             and any(new.get("id", "?") in l for l in u["retro_report"])), (u.get("_next"), new, body[-400:], u.get("decisions"))
 
 
@@ -3924,6 +3924,14 @@ def _retro_snapshot_last():
     return (snap.get("retro_report") == u.get("retro_report") and any(tid in l for l in snap.get("retro_report") or [])
             and "Design retrospective: Rework the poller" in (snap.get("follow_ups") or [])
             and snap.get("decisions") == u.get("decisions")), snap.get("retro_report")
+
+
+def _retro_resume_runs_refactor():
+    u = gates.retro_route(_retro_large(retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"], retro_declined=[],
+                                       retro_follow_ups=[], retro_done=True))
+    snap = json.loads(read_file(os.path.join(_retro_large()["run_dir"], "state.json")) or "{}")
+    r = gates.resume_route(_retro_large(resume_phase=snap.get("phase", ""), tasks=u.get("tasks"), retro_done=True))
+    return r.get("_next") == "select_tasks", (snap.get("phase"), r.get("_next"))
 
 
 def _retro_micro_batch():
@@ -4005,6 +4013,8 @@ guarded("retro_route: per-task stacked PRs have no unit for a refactor task -> a
         _retro_stack_multi_adopted)
 guarded("retro_route: adopted -> ONE pending chore task blocked by the unit's tasks, integration re-armed, -> select_tasks",
         _retro_adopted)
+guarded("retro_route: a run re-entered after adopting resumes into select_tasks, so the refactor task runs",
+        _retro_resume_runs_refactor)
 guarded("retro_route: CLEAN -> hygiene_create, no task", _retro_clean)
 guarded("retro_route: a faulted retrospective -> hygiene_create with the fault noted, no task", _retro_fault)
 guarded("retro_route: a failed triage of a REFACTORS reply -> one not-triaged follow-up pointing at the saved report", _retro_triage_failed)

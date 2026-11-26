@@ -5203,7 +5203,8 @@ def retro_route(state):
         report.append(f"- follow-ups: {len(later)} (listed under Deferred / follow-ups)")
     u["retro_report"] = report
     if tid:
-        snapshot(state, u, f"phase_f retro {tid}")
+        # a task phase resumes into select_tasks, so a re-entered run still runs the pending refactor task
+        snapshot(state, u, f"task {tid}")
     return u
 
 
