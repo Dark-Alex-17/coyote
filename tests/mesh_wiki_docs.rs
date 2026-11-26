@@ -11317,6 +11317,7 @@ fn the_pages_quote_the_late_link_send_the_node_label_and_the_hub_hold() {
         "Roaming through a hub you do not run is therefore best-effort.",
         "The supported roaming shape is a relay you run: `scripts/mesh-relay.sh --relay <host>:4242`",
         "sets `ingress_control = No` on the server interface that hosts dial",
+        "After your relay's connection to a hub is dropped and remade, the hub may keep routing to the old connection until it hears your next announce, so peers can see your path yet fail to bring a link up for some minutes.",
     ] {
         assert!(
             gotchas.contains(needle),
@@ -11409,7 +11410,7 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         "src/mesh/upstream.rs no longer polls every 10 s"
     );
     for piece in [
-        "pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 10;",
+        "pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 30;",
         "pub(crate) const SETTLE_READ: Duration = Duration::from_secs(5);",
         "pub(crate) const SETTLE_CAP: Duration = Duration::from_secs(60);",
     ] {
@@ -11432,8 +11433,8 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
     for needle in lines.iter().map(String::as_str).chain([
         "every 10 seconds it reads the host's interface addresses (loopback and link-local left out)",
         "A `private` interface to this host's own rnsd (`127.0.0.1:4242`, or one of the host's own addresses) reads the same rnsd, so a session on `type: private` greets exactly as one on `type: local` does",
-        "Coyote reads again every 5 seconds until 10 seconds pass with nothing new (60 seconds at most)",
-        "share one limit of four an hour, the same number a relay reconnect is held to, counted per transition and not per interface, and do not move the heartbeat",
+        "Coyote reads again every 5 seconds until 30 seconds pass with nothing new (60 seconds at most)",
+        "The reconnect greetings share one limit of four an hour, the same number a relay reconnect is held to, counted per transition and not per interface; a change of the host's addresses is not counted against it, so every move greets, at most once per 30 seconds.",
         "the next poll that finds rnsd's upstream online announces once more when that comes after the transition settled",
         "The ask goes out at the read that first sees the upstream back, within about 15 seconds of it, with no link having to fail first, and each destination is asked once per transition",
         "A LAN that goes from reaching nobody to reaching someone (rnsd's AutoInterface, or Coyote's own `lan`) asks the same way.",
@@ -11449,7 +11450,7 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         .map(String::as_str)
         .chain([
             "One network switch that brings several upstreams back is one transition and one line.",
-            "These two share one limit of four greetings an hour, counted per transition; past it the line ends",
+            "The reconnect line shares one limit of four greetings an hour, counted per transition, and the network line is not counted against it; past it the reconnect line ends",
             "`; this session already sent its 4 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`",
             "`, but announcing failed; the next heartbeat will announce this session (details in the log).`",
             "A session with `mesh.announce` off prints nothing for these",
