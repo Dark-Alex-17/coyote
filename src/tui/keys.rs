@@ -698,7 +698,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Space",
             "Fold or unfold the thread; a click on its arrow does the same",
         ),
-        row(ThreadPicker, "Enter", "Open the thread, at any depth"),
+        row(ThreadPicker, "Enter / o", "Open the thread, at any depth"),
         row(
             ThreadPicker,
             "q / Esc / Tab / Ctrl+C / Ctrl+D",
@@ -1088,7 +1088,9 @@ fn threads_key(key: KeyEvent, code: KeyCode) -> Action {
         KeyCode::Char('l') if !ctrl => Action::ThreadPickerUnfold,
         KeyCode::Char('h') if !ctrl => Action::ThreadPickerFold,
         KeyCode::Char(' ') if !ctrl => Action::ThreadPickerToggle,
+        // `o` opens, as in the tasks pop-up.
         KeyCode::Enter => Action::ThreadPickerChoose,
+        KeyCode::Char('o') if !ctrl => Action::ThreadPickerChoose,
         _ => Action::Nothing,
     }
 }
@@ -2486,6 +2488,17 @@ mod tests {
             ),
             (plain(KeyCode::Up), picker, Action::ThreadPickerMove(-1)),
             (plain(KeyCode::Enter), picker, Action::ThreadPickerChoose),
+            (
+                plain(KeyCode::Char('o')),
+                picker,
+                Action::ThreadPickerChoose,
+            ),
+            (
+                plain(KeyCode::Char('O')),
+                picker,
+                Action::ThreadPickerChoose,
+            ),
+            (ctrl('o'), picker, Action::Nothing),
             (plain(KeyCode::Esc), picker, Action::CloseThreadPicker),
             (plain(KeyCode::Tab), picker, Action::CloseThreadPicker),
             (plain(KeyCode::Right), picker, Action::ThreadPickerUnfold),
@@ -3460,8 +3473,11 @@ mod tests {
             ),
             (
                 H::ThreadPicker,
-                "Enter",
-                vec![(plain(KeyCode::Enter), PICKER, Action::ThreadPickerChoose)],
+                "Enter / o",
+                vec![
+                    (plain(KeyCode::Enter), PICKER, Action::ThreadPickerChoose),
+                    (letter('o'), PICKER, Action::ThreadPickerChoose),
+                ],
             ),
             (
                 H::ThreadPicker,

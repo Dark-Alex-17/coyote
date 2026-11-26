@@ -1208,6 +1208,26 @@ fn title(harness: &mut Harness) -> String {
 /// opens under its path. Left and h step back up and fold, Space folds
 /// and unfolds, and the folds outlast the pop-up closing and the thread
 /// changing; Enter on a hidden thread opens the folded one hiding it.
+/// `o` opens the highlighted thread, as Enter does and as `o` does in
+/// the tasks pop-up.
+#[test]
+#[serial]
+fn o_in_the_thread_popup_opens_the_highlighted_thread() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-tree-o");
+        let mut harness = nested_picker(21);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Char('o'));
+        assert_eq!(
+            harness.app.pager().and_then(Pager::child_session),
+            Some("sess_3f4a")
+        );
+    });
+}
+
 #[test]
 #[serial]
 fn the_thread_popup_keys_fold_step_and_open_a_thread_three_levels_down() {
