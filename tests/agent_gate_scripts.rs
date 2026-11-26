@@ -1573,6 +1573,30 @@ fn assemble_pr_body_reads_ledger_blocks_whole() {
     );
 }
 
+/// A retrospective decline written as a bullet right under a `Follow-ups:`
+/// block ends that block, so it never turns into a follow-up task.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_ends_a_follow_ups_block_at_a_retro_decline() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body-retro-decline",
+        "Follow-ups:\n\
+         - kept item\n\
+         - retro-declined: merge the two parsers -- they diverge on purpose\n\n",
+    );
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let followups: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("- [ ] (TASK-1) "))
+        .collect();
+    assert_eq!(followups, ["- [ ] (TASK-1) kept item"], "{stdout}");
+}
+
 /// A complete task whose index.md has no `plan:` or no `status:` field is
 /// listed in the body and named in a NOTE with the missing field, the same
 /// sentence the ledger tool prints, so the leniency is visible on both
