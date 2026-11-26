@@ -887,7 +887,7 @@
     max_input_tokens: 262144
     input_price: 0.0
     output_price: 0.0
-    cache_read_price: 0.0425
+    cache_read_price: 0.05
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -7976,10 +7976,10 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.06
-    output_price: 0.18
-    cache_read_price: 0.015
-    max_output_tokens: 384000
+    input_price: 0.047
+    output_price: 0.3
+    cache_read_price: 0.035
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
     type: chat
@@ -8483,8 +8483,9 @@
     type: chat
     max_input_tokens: 131072
     input_price: 0.08
-    output_price: 0.16
-    max_output_tokens: 16384
+    output_price: 0.45
+    cache_read_price: 0.04
+    max_output_tokens: 117964
     supports_vision: true
     supports_function_calling: true
   - name: google/gemma-3-4b-it
@@ -8498,9 +8499,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0765
-    output_price: 0.255
-    cache_read_price: 0.0425
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8827,9 +8828,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -10791,10 +10792,10 @@
   - name: qwen/qwen3.8-27b
     type: chat
     max_input_tokens: 1024000
-    input_price: 0.035
-    output_price: 1.5
-    cache_read_price: 0.0175
-    max_output_tokens: 131072
+    input_price: 0.06
+    output_price: 1.96
+    cache_read_price: 0.059
+    max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.8-27b:batch
@@ -11398,10 +11399,10 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.12
-    output_price: 0.38
-    cache_read_price: 0.02
-    max_output_tokens: 943718
+    input_price: 0.15
+    output_price: 0.5
+    cache_read_price: 0.03
+    max_output_tokens: 943717
     supports_vision: true
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash:batch
@@ -11508,10 +11509,10 @@
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0999
-    output_price: 5.0
-    cache_read_price: 0.0999
-    max_output_tokens: 393216
+    input_price: 0.111
+    output_price: 4.44
+    cache_read_price: 0.097
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
