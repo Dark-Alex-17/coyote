@@ -24,6 +24,113 @@ fn a_successful_undo_takes_the_last_exchange_out_of_the_transcript() {
     assert!(!frame.contains(".undo"), "{frame}");
 }
 
+/// A session whose one turn took a line mid-way, and the transcript of
+/// it: the prompt, the reply up to the line, the line, the reply after.
+fn mid_turn_turn() -> (RequestContext, Harness) {
+    let mut ctx = chat_ctx();
+    let mut session = Session::default();
+    session.set_name("temp".to_string());
+    ctx.session = Some(session);
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.begin_turn("first prompt u5m", false);
+    harness
+        .app
+        .handle_msg(UiMsg::AssistantText("partial reply u5m".to_string()));
+    harness
+        .app
+        .handle_msg(UiMsg::QueuedInputSent("mid line u5m".to_string()));
+    harness
+        .app
+        .handle_msg(UiMsg::AssistantText("later reply u5m".to_string()));
+    harness.app.end_turn(false, &TurnOutcome::default());
+    let tool_calls = crate::client::MessageContentToolCalls::new(
+        vec![crate::function::ToolResult::new(
+            crate::function::ToolCall::new("read".into(), serde_json::json!({}), Some("c1".into())),
+            serde_json::json!({
+                "output": "ok",
+                "system_notifications": [{"event": "user_message", "text": "mid line u5m"}],
+            }),
+        )],
+        "partial reply u5m".to_string(),
+    );
+    let session = ctx.session.as_mut().unwrap();
+    session.push_test_messages(vec![
+        crate::client::Message::new(
+            crate::client::MessageRole::User,
+            crate::client::MessageContent::Text("first prompt u5m".into()),
+        ),
+        crate::client::Message::new(
+            crate::client::MessageRole::Tool,
+            crate::client::MessageContent::ToolCalls(tool_calls),
+        ),
+        crate::client::Message::new(
+            crate::client::MessageRole::Assistant,
+            crate::client::MessageContent::Text("later reply u5m".into()),
+        ),
+    ]);
+
+    (ctx, harness)
+}
+
+/// The user lines and replies the transcript holds, in order.
+fn turn_texts(harness: &Harness) -> Vec<String> {
+    harness
+        .app
+        .transcript
+        .cells()
+        .iter()
+        .filter_map(|cell| match cell {
+            Cell::User { text, .. } => Some(text.clone()),
+            Cell::Assistant { source, .. } => Some(source.trim().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A turn that took a line mid-way: `.undo` takes back that line and what
+/// followed it, in the transcript and in the session, keeps the prompt
+/// with the reply up to the line, and puts the line in the composer; the
+/// next `.undo` takes back the prompt.
+#[test]
+fn an_undo_after_a_mid_turn_line_takes_back_only_that_line() {
+    let (mut ctx, mut harness) = mid_turn_turn();
+    for (undone, kept) in [
+        (
+            "mid line u5m",
+            vec!["first prompt u5m", "partial reply u5m"],
+        ),
+        ("first prompt u5m", vec![]),
+    ] {
+        harness.app.begin_turn(".undo", true);
+        ctx.undo_last_exchange().unwrap();
+        harness.app.end_turn(true, &TurnOutcome::default());
+        harness.app.sync_from_ctx(&mut ctx);
+        assert_eq!(harness.app.composer_text(), undone);
+        assert_eq!(turn_texts(&harness), kept);
+        let frame = harness.draw();
+        for text in &kept {
+            assert!(frame.contains(text), "{text}: {frame}");
+        }
+        harness.app.set_composer_text("");
+    }
+    assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+}
+
+/// The rewind picker offers the turn's prompt, not the mid-turn line, and
+/// choosing it takes back both from the session, as two `.undo`s would.
+#[test]
+fn rewinding_past_a_mid_turn_line_takes_the_whole_turn_from_the_session() {
+    let (mut ctx, mut harness) = mid_turn_turn();
+    let target = choose_rewind(&mut harness, 0);
+    assert_eq!(target.rows.len(), 1);
+    apply_rewind(&mut harness.app, &mut ctx, target);
+    assert_eq!(turn_texts(&harness), Vec::<String>::new());
+    assert_eq!(harness.app.composer_text(), "first prompt u5m");
+    assert!(!ctx.session.as_ref().unwrap().has_user_messages());
+    assert!(!harness.draw().contains("Rewind stopped"));
+}
+
 /// An undo that reaches past a divider the main view was cleared at
 /// takes the view back with it: the exchange above shows again.
 #[test]

@@ -50,8 +50,16 @@ pub(super) fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) 
     }
 }
 
-/// Index of the cell that opened the exchange a `.undo` at `undo` takes
-/// back: the latest opener before it, scanning back past any reply.
+/// Whether one `.undo` takes the session back to just before the cell:
+/// an exchange's opener, or a line sent mid-turn, which the session undoes
+/// on its own ahead of the turn it rode in on.
+fn starts_undo_step(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
+    opens_exchange(cell, prefix) || matches!(cell, Cell::User { mid_turn: true, .. })
+}
+
+/// Index of the cell a `.undo` at `undo` takes the transcript back to:
+/// the latest opener or mid-turn line before it, scanning back past any
+/// reply.
 pub(super) fn undo_opener(
     cells: &[Cell],
     undo: usize,
@@ -59,7 +67,20 @@ pub(super) fn undo_opener(
 ) -> Option<usize> {
     cells[..undo]
         .iter()
-        .rposition(|cell| opens_exchange(cell, prefix))
+        .rposition(|cell| starts_undo_step(cell, prefix))
+}
+
+/// The cells each `.undo` from the end would take the transcript back to,
+/// newest first, down to `oldest`.
+fn undo_steps_from(
+    cells: &[Cell],
+    oldest: usize,
+    prefix: crate::config::CommandPrefix,
+) -> Vec<usize> {
+    (oldest..cells.len())
+        .rev()
+        .filter(|&index| starts_undo_step(&cells[index], prefix))
+        .collect()
 }
 
 /// What stops the rewind picker at a command line, under the macros
@@ -111,27 +132,34 @@ pub(super) fn rewind_exchanges(
 
 /// Takes the chosen exchanges out of the session and the transcript and
 /// gives the oldest one's prompt back to the composer. Every offered row
-/// sits above the newest macro turn, so each one is a single exchange
-/// and popping one per row keeps the session and the transcript in
-/// step; the transcript goes back only as far as the session did, and a
+/// sits above the newest macro turn, so each one is a single exchange;
+/// a line sent mid-turn is one more `.undo` for the session, so popping
+/// one per opener and one per such line keeps the session and the
+/// transcript in step. The transcript goes back only as far as the session did, and a
 /// stop short of the choice is said. Without a session there is nothing
 /// to pop and the transcript is the whole of the rewind. The composer
 /// gets the row's own text, not the session's prefill: a command row
 /// holds the command, which the session never did.
 pub(super) fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
-    let chosen = target.rows.len();
+    let Some(oldest) = target.rows.last() else {
+        return;
+    };
+    let prefix = app.config.command_prefix;
+    let steps = undo_steps_from(app.transcript.cells(), oldest.opener, prefix);
     let (cut, stopped) = if ctx.session.is_some() {
-        rewind_exchanges(ctx, chosen)
+        rewind_exchanges(ctx, steps.len())
     } else {
-        (chosen, None)
+        (steps.len(), None)
     };
     app.sync_from_ctx(ctx);
-    if let Some(row) = cut
-        .checked_sub(1)
-        .and_then(|oldest| target.rows.get(oldest))
-    {
-        app.transcript.truncate(row.opener);
-        app.set_composer_text(&row.title);
+    if let Some(&at) = cut.checked_sub(1).and_then(|last| steps.get(last)) {
+        let title = match &app.transcript.cells()[at] {
+            Cell::User { text, .. } => text.clone(),
+            Cell::Command { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        app.transcript.truncate(at);
+        app.set_composer_text(&title);
         app.pasted_images.clear();
     }
     app.refresh_palette(Some(ctx));

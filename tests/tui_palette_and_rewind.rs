@@ -2667,6 +2667,86 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
         );
     }
 
+    /// In a session, a tool turn takes a line while its tool sleeps. The
+    /// first `.undo` takes back only that line and what followed it: the
+    /// prompt stays on screen and the line comes back to the composer. The
+    /// second `.undo` takes back the prompt.
+    #[test]
+    #[serial]
+    fn undo_after_a_mid_turn_line_takes_back_only_that_line_first() {
+        let dir = fresh_config_dir("mid-turn-undo");
+        let _guard = TempDirGuard(dir.clone());
+        let tool_a = dir.join("tool-a");
+        let fake = FakeLlm::start(vec![
+            sleep_call(&tool_a),
+            Reply::Text("tool-reply-u6n".to_string()),
+        ]);
+        write_fake_llm_config(&dir, &fake);
+        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let at = pty.raw().len();
+        pty.send(b".session\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "entered session temp", at, "the session");
+
+        let turn_at = pty.raw().len();
+        pty.send(b"opener-u6n\r").unwrap();
+        wait_for_file(
+            &mut pty,
+            &dir.join("tool-a-started"),
+            "the sleep tool's start marker",
+        );
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"midline-u6n\r").unwrap();
+        pty.read_for(Duration::from_millis(800));
+        fs::write(dir.join("tool-a-release"), b"").unwrap();
+        wait_for_squeezed_after(&mut pty, "tool-reply-u6n", turn_at, "the tool turn's reply");
+        wait_until_no_pending(&mut pty);
+        assert!(
+            fake.bodies()
+                .last()
+                .is_some_and(|body| body.contains("midline-u6n")),
+            "the mid-turn line did not ride the tool round"
+        );
+
+        let footer = "fake:fake-model";
+        let mut toggle = false;
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            clear_any_draft(&mut pty);
+            pty.send(b".undo\r").unwrap();
+            pty.read_for(Duration::from_millis(1500));
+            let frame = next_frame(&mut pty, &mut toggle);
+            seen.push((
+                composer_row_with_footer(&frame, footer),
+                squeezed(&above_rule(&frame)),
+            ));
+        }
+        quit_declining_save(&mut pty);
+        let (draft, above) = &seen[0];
+        assert_eq!(draft, "midline-u6n", "the first undo's prefill: {seen:?}");
+        assert!(
+            above.contains(">opener-u6n"),
+            "the first undo took the prompt: {above}"
+        );
+        assert!(
+            !above.contains("tool-reply-u6n"),
+            "the first undo kept the reply after the line: {above}"
+        );
+        assert!(
+            !above.contains("midline-u6n"),
+            "the first undo kept the line: {above}"
+        );
+        let (draft, above) = &seen[1];
+        assert_eq!(draft, "opener-u6n", "the second undo's prefill: {seen:?}");
+        assert!(
+            !above.contains(">opener-u6n"),
+            "the second undo kept the prompt: {above}"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Rewind barriers are decided when the command cell is committed.
     // ---------------------------------------------------------------------

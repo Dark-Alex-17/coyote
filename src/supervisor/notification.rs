@@ -4,6 +4,10 @@ use std::collections::HashSet;
 use std::fmt;
 
 pub(crate) const USER_MESSAGE_EVENT: &str = "user_message";
+/// What a tool result's notifications tell the model when background tasks
+/// have finished.
+pub(crate) const TASK_NOTIFICATION_INSTRUCTION: &str =
+    "Background tasks have finished; collect each result with its next_action command.";
 
 /// One entry of the `system_notifications` channel, delivered to the context
 /// that owns the queue by merging onto the last tool result of a batch.

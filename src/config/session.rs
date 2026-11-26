@@ -9,11 +9,12 @@ use crate::graph::LastRun;
 use crate::hooks::HooksMap;
 use crate::prompt::{PromptAction, PromptRequest, Prompter, ask};
 use crate::render::MarkdownRender;
+use crate::supervisor::notification::{TASK_NOTIFICATION_INSTRUCTION, USER_MESSAGE_EVENT};
 
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{OpenOptions, read_to_string, remove_file, rename};
@@ -757,6 +758,11 @@ impl Session {
             run
         });
         self.dirty = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_test_messages(&mut self, messages: Vec<Message>) {
+        self.messages.extend(messages);
     }
 
     pub fn has_user_messages(&self) -> bool {
@@ -1715,7 +1721,13 @@ impl Session {
         self.update_tokens();
     }
 
+    /// Takes back the newest thing the user said and all that followed: a
+    /// message sent while the last turn ran when there is one, else the
+    /// last prompt with its reply. Returns what the user had typed.
     pub fn pop_last_exchange(&mut self) -> Option<String> {
+        if let Some(text) = self.pop_mid_turn_message() {
+            return Some(text);
+        }
         let user_idx = self.messages.iter().rposition(|m| m.role.is_user())?;
         let user_text = self.messages[user_idx].content.as_text()?.to_string();
         self.messages.truncate(user_idx);
@@ -1733,6 +1745,42 @@ impl Session {
             self.last_run = None;
         }
         Some(user_text)
+    }
+
+    /// Takes back the newest message the user sent while the last turn
+    /// ran, and everything after it: the turn keeps its prompt and the
+    /// tool rounds up to the one the message rode in on, minus the
+    /// message, and closes as an interrupted turn. None when the last
+    /// turn took no such message.
+    fn pop_mid_turn_message(&mut self) -> Option<String> {
+        let user_idx = self.messages.iter().rposition(|m| m.role.is_user())?;
+        let (at, result) = self.messages[user_idx + 1..]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(offset, message)| match &message.content {
+                MessageContent::ToolCalls(calls) => calls
+                    .tool_results
+                    .iter()
+                    .rposition(|result| !mid_turn_texts(&result.output).is_empty())
+                    .map(|result| (user_idx + 1 + offset, result)),
+                _ => None,
+            })?;
+        self.messages.truncate(at + 1);
+        let MessageContent::ToolCalls(calls) = &mut self.messages[at].content else {
+            unreachable!("the message found holds tool calls");
+        };
+        calls.tool_results.truncate(result + 1);
+        calls.round_starts.retain(|&start| start <= result);
+        let text = mid_turn_texts(&calls.tool_results[result].output).join("\n");
+        drop_mid_turn_messages(&mut calls.tool_results[result].output);
+        self.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text(TURN_INTERRUPTED_TEXT.to_string()),
+        ));
+        self.dirty = true;
+        self.update_tokens();
+        Some(text)
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
@@ -1784,6 +1832,44 @@ impl Session {
     /// one giant exchange compression just folded away comes straight back.
     fn reattach_fits(&self, exchange: &[Message], app: &AppConfig) -> bool {
         self.model().total_tokens(exchange) <= self.keep_tail_token_budget(app)
+    }
+}
+
+/// The texts of the messages the user sent mid-turn that ride on a tool
+/// result's output, in the order they were sent.
+fn mid_turn_texts(output: &Value) -> Vec<String> {
+    output["system_notifications"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["event"] == USER_MESSAGE_EVENT)
+        .filter_map(|entry| entry["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Takes the user's mid-turn messages off a tool result's output, with
+/// the instruction that came with them when nothing else is left.
+fn drop_mid_turn_messages(output: &mut Value) {
+    let Some(map) = output.as_object_mut() else {
+        return;
+    };
+    let kept: Vec<Value> = map
+        .get("system_notifications")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["event"] != USER_MESSAGE_EVENT)
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        map.remove("system_notifications");
+        map.remove("notification_instruction");
+    } else {
+        map.insert("system_notifications".into(), Value::Array(kept));
+        map.insert(
+            "notification_instruction".into(),
+            json!(TASK_NOTIFICATION_INSTRUCTION),
+        );
     }
 }
 
@@ -2608,6 +2694,121 @@ last_run:
         assert_eq!(session.pop_last_exchange().as_deref(), Some("run"));
         assert_eq!(session.last_run(), None);
         assert!(!session.has_user_messages());
+    }
+
+    /// A tool round's result carrying `notifications`, the way the tool
+    /// loop hands them to the model.
+    fn round(call: &str, output: Value) -> ToolResult {
+        let mut result = ToolResult::new(
+            ToolCall::new(call.to_string(), json!({}), Some(call.to_string())),
+            output,
+        );
+        result.text = Some(format!("narrating {call}"));
+        result
+    }
+
+    fn mid_turn(text: &str) -> Value {
+        json!({"event": USER_MESSAGE_EVENT, "text": text})
+    }
+
+    /// A turn that took a message mid-way: the first undo takes back only
+    /// that message and the rounds after it, keeping the prompt and the
+    /// reply up to it; the second takes back the prompt.
+    #[test]
+    fn undo_takes_back_a_mid_turn_message_before_the_prompt() {
+        let mut session = Session::default();
+        session
+            .messages
+            .push(text(MessageRole::User, "first prompt"));
+        let mut calls =
+            MessageContentToolCalls::new(vec![round("read", json!("ok"))], String::new());
+        calls.merge(
+            vec![round(
+                "list",
+                json!({
+                    "output": "files",
+                    "system_notifications": [
+                        {"event": "job_completed", "id": "job_1"},
+                        mid_turn("and the tests too"),
+                    ],
+                    "notification_instruction": "both",
+                }),
+            )],
+            String::new(),
+        );
+        calls.merge(vec![round("test", json!("passed"))], String::new());
+        session.messages.push(Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(calls),
+        ));
+        session
+            .messages
+            .push(text(MessageRole::Assistant, "done with tests"));
+
+        assert_eq!(
+            session.pop_last_exchange().as_deref(),
+            Some("and the tests too")
+        );
+        let [user, tool, closing] = &session.messages[..] else {
+            panic!("{:?}", session.messages);
+        };
+        assert_eq!(user.content.to_text(), "first prompt");
+        let MessageContent::ToolCalls(calls) = &tool.content else {
+            panic!("{tool:?}");
+        };
+        let names: Vec<&str> = calls
+            .tool_results
+            .iter()
+            .map(|r| r.call.name.as_str())
+            .collect();
+        assert_eq!(names, ["read", "list"]);
+        assert_eq!(calls.round_starts, [1]);
+        let output = &calls.tool_results[1].output;
+        assert_eq!(output["output"], "files");
+        assert_eq!(
+            output["system_notifications"],
+            json!([{"event": "job_completed", "id": "job_1"}])
+        );
+        assert_eq!(
+            output["notification_instruction"],
+            TASK_NOTIFICATION_INSTRUCTION
+        );
+        assert_eq!(closing.content.to_text(), TURN_INTERRUPTED_TEXT);
+        assert!(session.dirty());
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("first prompt"));
+        assert!(session.messages.is_empty());
+    }
+
+    /// A mid-turn message that was the only notification leaves no trace
+    /// on the result it rode in on.
+    #[test]
+    fn undoing_a_lone_mid_turn_message_drops_its_notification_keys() {
+        let mut session = Session::default();
+        session.messages.push(text(MessageRole::User, "go"));
+        session.messages.push(Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![round(
+                    "read",
+                    json!({
+                        "output": "ok",
+                        "system_notifications": [mid_turn("stop there")],
+                        "notification_instruction": "read it",
+                    }),
+                )],
+                String::new(),
+            )),
+        ));
+        session
+            .messages
+            .push(text(MessageRole::Assistant, "stopped"));
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("stop there"));
+        let MessageContent::ToolCalls(calls) = &session.messages[1].content else {
+            panic!("{:?}", session.messages);
+        };
+        assert_eq!(calls.tool_results[0].output, json!({"output": "ok"}));
     }
 
     #[test]

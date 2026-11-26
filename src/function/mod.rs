@@ -29,7 +29,9 @@ use crate::mcp::{
 };
 use crate::parsers::{bash, python, typescript};
 use crate::prompt::{PromptMemory, Prompter};
-use crate::supervisor::notification::{SystemNotification, USER_MESSAGE_EVENT};
+use crate::supervisor::notification::{
+    SystemNotification, TASK_NOTIFICATION_INSTRUCTION, USER_MESSAGE_EVENT,
+};
 use crate::turn::UiSink;
 use crate::utils::fs::TempFileGuard;
 use agents::AGENT_FUNCTION_PREFIX;
@@ -512,8 +514,7 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
 
     let escalation_instruction = "Child agents are BLOCKED waiting for your reply. \
         Call agent__reply_escalation for each pending escalation to unblock them.";
-    let task_instruction =
-        "Background tasks have finished; collect each result with its next_action command.";
+    let task_instruction = TASK_NOTIFICATION_INSTRUCTION;
     let user_message_instruction =
         "The user sent a message while you were working; read it before continuing.";
     let has_tasks = notifications
