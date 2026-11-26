@@ -67,7 +67,11 @@ get_diff() {
     paths=("${argc_path}")
   fi
   local diff_output
-  diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv "${REPLY}" -- "${paths[@]}" 2>&1) || true
+  if ((${#paths[@]})); then
+    diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv "${REPLY}" -- "${paths[@]}" 2>&1) || true
+  else
+    diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv "${REPLY}" -- 2>&1) || true
+  fi
   if [[ -z "${diff_output}" ]]; then
     echo "No changes found in ${project_dir} against '${argc_base}'." >> "$LLM_OUTPUT"
     return 0

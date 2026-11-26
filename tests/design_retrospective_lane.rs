@@ -341,9 +341,18 @@ mod git_tools {
     /// Runs one tool with the argc variables in `envs`, returning
     /// (exit code, stdout, stderr).
     fn run_tool(project: &Path, function: &str, envs: &[(&str, &str)]) -> (i32, String, String) {
+        run_tool_with("bash", project, function, envs)
+    }
+
+    fn run_tool_with(
+        bash: &str,
+        project: &Path,
+        function: &str,
+        envs: &[(&str, &str)],
+    ) -> (i32, String, String) {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let agent = assets.join("agents/design-retrospective");
-        let output = Command::new("bash")
+        let output = Command::new(bash)
             .arg("-c")
             .arg(format!(
                 "source '{}'; {function}",
@@ -416,6 +425,20 @@ mod git_tools {
             out.contains("+feature body"),
             "get_diff --path feature.txt must show that file's change: {out}"
         );
+
+        // macOS ships bash 3.2 as /bin/bash, where an empty array under `set -u` aborts.
+        for bash in ["bash", "/bin/bash"] {
+            if bash.starts_with('/') && !Path::new(bash).exists() {
+                continue;
+            }
+            let (code, out, err) =
+                run_tool_with(bash, &repo, "get_diff", &[("argc_base", "start")]);
+            assert_eq!(code, 0, "{bash}: get_diff failed: {err}");
+            assert!(
+                out.contains("+feature body"),
+                "{bash}: get_diff without --path must show the whole change: out={out} err={err}"
+            );
+        }
 
         let target = scratch.0.join("written-by-git");
         let option_base = format!("--output={}", target.display());
