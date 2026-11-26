@@ -2264,3 +2264,156 @@ mod surfaces_hints_and_anchored_wordmark {
         quit_clearing_any_draft(&mut pty);
     }
 }
+
+mod drained_undo_and_unsaved_exit {
+    //! Two lines sent mid-turn that reach the model together are taken back
+    //! by one `.undo`, on screen and in the session; and a named session
+    //! that is never saved leaves no resume note on the normal screen.
+    use std::fs;
+    use std::time::Duration;
+
+    use super::common::fake_llm::{FakeLlm, Reply};
+    use super::common::tui_harness::*;
+    use serial_test::serial;
+
+    /// A tool sleeps while two lines are typed, so both ride the request
+    /// after its result. The first `.undo` takes both lines and the reply
+    /// that followed them off the screen, keeps the opener, and hands the
+    /// lines back in the composer; the second takes the opener back. A line
+    /// sent next reaches the model with none of the undone text.
+    #[test]
+    #[serial]
+    fn one_undo_takes_back_two_lines_sent_in_one_drain_then_the_opener() {
+        let dir = fresh_config_dir("probe-undo-drain");
+        let _guard = TempDirGuard(dir.clone());
+        let tool_a = dir.join("tool-a");
+        let fake = FakeLlm::start(vec![
+            sleep_call(&tool_a),
+            Reply::Text("after-reply-d4n".to_string()),
+            Reply::Text("fresh-reply-d4n".to_string()),
+        ]);
+        write_fake_llm_config(&dir, &fake);
+        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(Duration::from_millis(400));
+        let at = pty.raw().len();
+        pty.send(b".session\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "entered session temp", at, "the session");
+
+        let turn_at = pty.raw().len();
+        pty.send(b"opener-d4n\r").unwrap();
+        wait_for_file(&mut pty, &dir.join("tool-a-started"), "the tool's start");
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"mid-one-d4n\r").unwrap();
+        pty.read_for(Duration::from_millis(500));
+        pty.send(b"mid-two-d4n\r").unwrap();
+        pty.read_for(Duration::from_millis(600));
+        let mut toggle = false;
+        let frame = next_frame(&mut pty, &mut toggle);
+        assert!(
+            squeezed(&frame).contains("pending:2"),
+            "the two lines were not both queued:\n{frame}"
+        );
+        fs::write(dir.join("tool-a-release"), b"").unwrap();
+        wait_for_squeezed_after(&mut pty, "after-reply-d4n", turn_at, "the reply");
+        wait_until_no_pending(&mut pty);
+        assert_eq!(fake.served(), 2, "the two lines did not ride one request");
+
+        clear_any_draft(&mut pty);
+        pty.send(b".undo\r").unwrap();
+        pty.read_for(Duration::from_millis(1500));
+        let frame = next_frame(&mut pty, &mut toggle);
+        let draft = composer_row_with_footer(&frame, "fake:fake-model");
+        let flat = squeezed(&frame);
+        assert!(
+            draft.contains("mid-one-d4n") && draft.contains("mid-two-d4n"),
+            "one undo did not hand both drained lines back: {draft:?}\n{frame}"
+        );
+        assert!(
+            !flat.contains("after-reply-d4n")
+                && flat.matches("mid-one-d4n").count() == 1
+                && flat.matches("mid-two-d4n").count() == 1,
+            "one undo left a drained line or its reply on screen:\n{frame}"
+        );
+        assert!(
+            flat.contains("opener-d4n"),
+            "one undo took the opener too:\n{frame}"
+        );
+
+        clear_any_draft(&mut pty);
+        pty.send(b".undo\r").unwrap();
+        pty.read_for(Duration::from_millis(1500));
+        let frame = next_frame(&mut pty, &mut toggle);
+        let draft = composer_row_with_footer(&frame, "fake:fake-model");
+        assert_eq!(
+            draft, "opener-d4n",
+            "the second undo did not hand the opener back:\n{frame}"
+        );
+
+        clear_any_draft(&mut pty);
+        let sent_at = pty.raw().len();
+        pty.send(b"fresh-d4n\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "fresh-reply-d4n", sent_at, "the fresh reply");
+        pty.read_for(Duration::from_millis(600));
+        quit_declining_save(&mut pty);
+
+        let bodies = fake.bodies();
+        assert_eq!(bodies.len(), 3, "{bodies:?}");
+        let last = &bodies[2];
+        for undone in [
+            "opener-d4n",
+            "mid-one-d4n",
+            "mid-two-d4n",
+            "after-reply-d4n",
+        ] {
+            assert!(
+                !last.contains(undone),
+                "{undone:?} reached the model after both undos: {last}"
+            );
+        }
+        assert!(last.contains("fresh-d4n"), "{last}");
+    }
+
+    /// `-s <name>` under `save_session: false`: a turn dirties the session,
+    /// Ctrl+D asks nothing, writes no session file, and the normal screen
+    /// holds no resume note naming it.
+    #[test]
+    #[serial]
+    fn an_unsaved_named_session_exit_prints_no_resume_note() {
+        let dir = fresh_config_dir("probe-exit-unsaved");
+        let _guard = TempDirGuard(dir.clone());
+        let fake = FakeLlm::start(vec![Reply::Text("reply-u7x".to_string())]);
+        write_fake_llm_config(&dir, &fake);
+        let config = fs::read_to_string(dir.join("config.yaml")).unwrap();
+        assert!(config.contains("save_session: false"), "{config}");
+        let mut pty = spawn_tui_with_args(&dir, &[], &["-s", "notes-u7x"]);
+        pty.wait_for("notes-u7x", PTY_DEADLINE).unwrap();
+        pty.send(b"prompt-u7x\r").unwrap();
+        wait_for_squeezed(&mut pty, "reply-u7x", "the reply");
+        pty.read_for(Duration::from_millis(800));
+        let quit_at = pty.raw().len();
+        pty.send(CTRL_D).unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+        assert!(
+            !since(&pty, quit_at).contains("Save session?"),
+            "save_session: false still asked to save"
+        );
+        let printed = printed_after_the_leave(&pty);
+        assert!(
+            printed.trim().is_empty(),
+            "an unsaved session's exit printed: {:?}",
+            printed.trim()
+        );
+        let files: Vec<_> = walk(&dir)
+            .into_iter()
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "yaml")
+                    && p.display().to_string().contains("notes-u7x")
+            })
+            .collect();
+        assert!(files.is_empty(), "a session file was written: {files:?}");
+    }
+}
