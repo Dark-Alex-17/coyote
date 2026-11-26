@@ -1908,6 +1908,7 @@ fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
 /// report's Verification line and `## Round checks`, the published-tree note
 /// and `publish_done`.
 #[test]
+#[ignore = "thirty-three smoke battery runs take about an hour; run with -- --ignored"] // TASK-942
 fn verification_tier_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     let tier_guard =
