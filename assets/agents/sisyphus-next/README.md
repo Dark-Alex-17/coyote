@@ -122,7 +122,7 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:3481:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/gates.py:3482:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
 scripts/smoke_test.py:3549:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
 scripts/smoke_test.py:3550:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 scripts/smoke_test.py:3761:             "make: *** [check] Error 1")
