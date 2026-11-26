@@ -695,9 +695,8 @@ fn verification_tier_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "integration-round-checks",
-                "cmds += [c for c in as_list(checks.get(tid)) if isinstance(c, str) and c != full \
-                 and c not in cmds]",
-                "cmds += []",
+                "    cmds += [c for c in allowed if c not in cmds]",
+                "    cmds += []",
                 "integration_test: the declared commands minus the full suite plus the merged \
                  tasks' round checks, ledgered; an unmerged task's checks do not run",
             ),
@@ -743,6 +742,53 @@ fn verification_tier_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "    r[\"round_checks\"] = []\n",
                 "_parse_report: ## Round checks yields its commands once each; an absent, none or \
                  empty section yields none",
+            ),
+        ],
+    );
+}
+
+/// Each guard on a child's round checks and on an undecided finalize run,
+/// removed from a scratch copy, turns its smoke row red: the rules a reported
+/// round check must meet before it is stored or run, the green finalize run
+/// that names no tree, the waiver that covers any tree when git named none,
+/// and the skipped hygiene pass that leaves the finalize gate to
+/// `integration_check`.
+#[test]
+fn round_check_and_finalize_guard_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "round-check-rules",
+                "    kept, rejected = round_check_commands(checks, code, declared)\n",
+                "    kept, rejected = list(dict.fromkeys(checks)), []\n",
+                "route_delegate: a round check with shell metacharacters, a leading assignment, a \
+                 program outside the allowlist, or past the cap of 8 is left out of \
+                 task_round_checks, one ledger line each",
+            ),
+            (
+                "finalize-green-without-tree",
+                "    if status == \"green\" and not tree:\n",
+                "    if False:\n",
+                "integration_check: a green finalize run that names no tree is undecided -> \
+                 finalize_unavailable, never green",
+            ),
+            (
+                "finalize-any-tree-waiver",
+                "    if truthy(waived.get(\"any_tree\")):\n        return True\n",
+                "    if False:\n        return True\n",
+                "finalize waiver: given when git named no tree it covers any tree; open_pr passes \
+                 and the PR body carries the NOT RUN line",
+            ),
+            (
+                "hygiene-skipped",
+                "                u[\"hygiene_skipped\"] = True\n",
+                "                pass\n",
+                "hygiene skipped: with no hygiene review to run the full suite, integration_check \
+                 runs finalize_gate.sh itself",
             ),
         ],
     );
@@ -3250,10 +3296,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![54, 5536, 5550],
+        vec![54, 5588, 5602],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [5536, 5550] {
+    for line in [5588, 5602] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
