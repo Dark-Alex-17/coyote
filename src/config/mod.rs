@@ -91,7 +91,7 @@ pub use self::tool_scope::{
 pub(crate) use self::tool_scope::{escape_display_text, is_format_char};
 pub(crate) use self::ui_kind::UiKind;
 pub use self::ui_mode::UiMode;
-pub(crate) use self::ui_mode::interactive_ui;
+pub(crate) use self::ui_mode::run_ui;
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MODELS_YAML, MessageContentToolCalls, Model, ModelType,

@@ -38,6 +38,24 @@ pub(crate) fn interactive_ui(
     }
 }
 
+/// The shell a run is recorded as having: a prompt-less `--macro` run
+/// starts none, so its tools are told the REPL's, whatever the terminals
+/// and the `ui` key say; every other run gets [`interactive_ui`].
+pub(crate) fn run_ui(
+    macro_run: bool,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    cli_tui: bool,
+    cli_repl: bool,
+    config: Option<UiMode>,
+) -> UiMode {
+    if macro_run {
+        UiMode::Repl
+    } else {
+        interactive_ui(stdin_tty, stdout_tty, cli_tui, cli_repl, config)
+    }
+}
+
 impl FromStr for UiMode {
     type Err = anyhow::Error;
 
@@ -128,6 +146,24 @@ mod tests {
                     pick(false, true),
                     UiMode::Repl,
                     "{stdin_tty} {stdout_tty} {config:?}"
+                );
+            }
+        }
+    }
+
+    /// A `--macro` run starts no shell: it is the REPL's under every
+    /// terminal and `ui` key, and any other run takes `interactive_ui`.
+    #[test]
+    fn a_macro_run_is_the_repl_whatever_the_terminal_or_the_key() {
+        for (stdin_tty, stdout_tty) in [(true, true), (false, false)] {
+            for config in [None, Some(UiMode::Tui)] {
+                assert_eq!(
+                    run_ui(true, stdin_tty, stdout_tty, false, false, config),
+                    UiMode::Repl
+                );
+                assert_eq!(
+                    run_ui(false, stdin_tty, stdout_tty, false, false, config),
+                    interactive_ui(stdin_tty, stdout_tty, false, false, config)
                 );
             }
         }

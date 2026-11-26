@@ -3464,7 +3464,7 @@ mod binary_threads {
             "Tab did not open the picker",
         );
         assert!(
-            row_after(thread_picker_band(&picker), "kid").is_some(),
+            row_after(thread_picker_band(&picker), "kid  ").is_some(),
             "the picker does not list the kid:\n{picker}"
         );
         pty.send(b"\x1b[B").unwrap();
@@ -3933,7 +3933,7 @@ mod binary_threads {
             "Tab did not open the picker",
         );
         assert!(
-            row_after(&picker, "kid").is_some(),
+            row_after(thread_picker_band(&picker), "kid  ").is_some(),
             "the idle picker does not list the kid the turn spawned (files: {:?}):\n{picker}",
             children_files(&dir.join("cache"))
         );

@@ -1211,6 +1211,29 @@ fn title(harness: &mut Harness) -> String {
 /// opens under its path. Left and h step back up and fold, Space folds
 /// and unfolds, and the folds outlast the pop-up closing and the thread
 /// changing; Enter on a hidden thread opens the folded one hiding it.
+/// Over a child's thread with nothing running and no turn, the open
+/// threads pop-up still asks for its next tick, so its times and states
+/// move.
+#[test]
+#[serial]
+fn the_threads_popup_over_an_idle_child_thread_keeps_ticking() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-tree-tick");
+        let mut harness = nested_picker(23);
+        harness.press(KeyCode::Right);
+        harness.press(KeyCode::Char('o'));
+        assert!(harness.app.pager().and_then(Pager::child_session).is_some());
+        harness.press(KeyCode::Tab);
+        assert_eq!(overlay_kind(&harness), Some(OverlayKind::Threads));
+        harness.draw();
+        harness.app.frame_drawn();
+        assert_eq!(
+            harness.app.frames.due_at(),
+            Some(harness.clock.now() + STATUS_TICK)
+        );
+    });
+}
+
 /// `o` opens the highlighted thread, as Enter does and as `o` does in
 /// the tasks pop-up.
 #[test]

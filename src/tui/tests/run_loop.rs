@@ -283,6 +283,15 @@ fn no_session_leaves_no_line() {
     assert_eq!(saved_session_line(None), None);
 }
 
+/// A session or agent name carrying escapes reaches the restored terminal
+/// as plain text: no clear, no colour, no cursor move.
+#[test]
+fn the_resume_line_drops_escapes_in_the_names() {
+    let line = saved_session_line(Some(&exited("a\x1b[2Jb", Some("c\x1b[31md")))).unwrap();
+    assert!(!line.contains('\x1b'), "{line:?}");
+    assert!(line.contains("-a cd -s ab"), "{line:?}");
+}
+
 /// The keyboard-enhancement probe inside `Screen::enter` reads the tty
 /// and blocks, so the screen is entered before the signal streams are
 /// armed (a hang-up during the probe must still kill the process) and

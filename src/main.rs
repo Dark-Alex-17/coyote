@@ -215,7 +215,8 @@ async fn async_main() -> Result<()> {
     if cli.no_workspace_macros {
         app_config.no_workspace_macros = true;
     }
-    app_config.ui = Some(config::interactive_ui(
+    app_config.ui = Some(config::run_ui(
+        cli.macro_name.is_some(),
         io::stdin().is_terminal(),
         *IS_STDOUT_TERMINAL,
         cli.tui,
@@ -757,10 +758,11 @@ async fn run(
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
+            // Both shells save pasted images to the same cache.
+            sweep_stale_pasted_images();
             if full_screen {
                 return tui::run(ctx).await;
             }
-            sweep_stale_pasted_images();
             start_interactive(ctx).await
         }
     }

@@ -5440,7 +5440,7 @@ mod binary_wizards {
         pty.send(b"y").unwrap();
         pty.wait_for("ession name", PTY_DEADLINE).unwrap();
         let named_at = pty.raw().len();
-        answer_field_modal(&mut pty, "saved-w9-session");
+        answer_field_modal(&mut pty, "kept-w9-session");
         // The painter skips cells that were already blank, so the words of a
         // line can reach the stream without the spaces between them.
         let deadline = std::time::Instant::now() + PTY_DEADLINE;
@@ -5495,8 +5495,8 @@ mod binary_wizards {
         assert!(
             walk(&dir)
                 .into_iter()
-                .any(|p| p.file_name().is_some_and(|n| n == "saved-w9-session.yaml")),
-            "no saved-w9-session.yaml was written under {dir:?}:\n{transcript}"
+                .any(|p| p.file_name().is_some_and(|n| n == "kept-w9-session.yaml")),
+            "no kept-w9-session.yaml was written under {dir:?}:\n{transcript}"
         );
     }
 

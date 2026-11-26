@@ -290,6 +290,9 @@ fn x_cancels_a_running_job_and_refuses_a_finished_agent() {
         let tasks = supervisor();
         tasks.write().register(running_job("job-x7x")).unwrap();
         tasks.write().register(finished_agent("agent-x7x")).unwrap();
+        while tasks.read().is_finished("agent-x7x") != Some(true) {
+            tokio::task::yield_now().await;
+        }
         ctx.supervisor = Some(Arc::clone(&tasks));
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);

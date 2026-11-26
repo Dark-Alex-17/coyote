@@ -551,13 +551,16 @@ fn write_to_terminal(text: &str) {
 }
 
 /// The line the exit leaves on the restored terminal for a session it left
-/// on disk; nothing for no session or a discarded one.
+/// on disk; nothing for no session or a discarded one. The names are the
+/// user's text, so they are cleaned as the rest of the exit output is.
 pub(super) fn saved_session_line(session: Option<&ExitedSession>) -> Option<String> {
-    session.map(|ExitedSession { name, agent }| match agent {
-        Some(agent) => {
-            format!("Session saved: {name} (resume: {BINARY_NAME} -a {agent} -s {name})")
-        }
-        None => format!("Session saved: {name} (resume: {BINARY_NAME} -s {name})"),
+    session.map(|ExitedSession { name, agent }| {
+        render::plain_text(&match agent {
+            Some(agent) => {
+                format!("Session saved: {name} (resume: {BINARY_NAME} -a {agent} -s {name})")
+            }
+            None => format!("Session saved: {name} (resume: {BINARY_NAME} -s {name})"),
+        })
     })
 }
 

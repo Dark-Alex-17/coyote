@@ -2865,7 +2865,12 @@ impl App {
             && self.pager().is_none()
         {
             self.frames.schedule_frame_in(WELCOME_SWEEP_INTERVAL);
-        } else if roster || (self.pager().is_none() && tasks_run) {
+        } else if roster
+            || matches!(self.overlay, Some(Overlay::Threads(_)))
+            || (self.pager().is_none() && tasks_run)
+        {
+            // The threads pop-up re-lists on its tick so its times and
+            // states move, over whatever screen it was opened from.
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }

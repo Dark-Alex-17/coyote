@@ -1075,9 +1075,11 @@ fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode, child_thread: bool) 
 /// and nothing under the pop-up is reached.
 fn threads_key(key: KeyEvent, code: KeyCode) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match code {
         KeyCode::Esc | KeyCode::Tab => Action::CloseThreadPicker,
         KeyCode::Char('c' | 'd') if ctrl => Action::CloseThreadPicker,
+        _ if ctrl || alt => Action::Nothing,
         KeyCode::Char('q') if !ctrl => Action::CloseThreadPicker,
         KeyCode::Up => Action::ThreadPickerMove(-1),
         KeyCode::Down => Action::ThreadPickerMove(1),
@@ -2499,6 +2501,26 @@ mod tests {
                 Action::ThreadPickerChoose,
             ),
             (ctrl('o'), picker, Action::Nothing),
+            (
+                press(KeyCode::Char('o'), KeyModifiers::ALT),
+                picker,
+                Action::Nothing,
+            ),
+            (
+                press(KeyCode::Char(' '), KeyModifiers::ALT),
+                picker,
+                Action::Nothing,
+            ),
+            (
+                press(KeyCode::Char('j'), KeyModifiers::ALT),
+                picker,
+                Action::Nothing,
+            ),
+            (
+                press(KeyCode::Char('q'), KeyModifiers::ALT),
+                picker,
+                Action::Nothing,
+            ),
             (plain(KeyCode::Esc), picker, Action::CloseThreadPicker),
             (plain(KeyCode::Tab), picker, Action::CloseThreadPicker),
             (plain(KeyCode::Right), picker, Action::ThreadPickerUnfold),
