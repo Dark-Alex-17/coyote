@@ -5017,6 +5017,10 @@ def retro_route(state):
     if adopted:
         u["fix_items"] = adopted
         u["fix_source"] = "retrospective"
+        # a strikeout in the refactor round puts back only the paths it changed, keeping the review-green work
+        root = state.get("git_root") or state.get("project_dir") or "."
+        u.update({"subtask_tree": _worktree_tree(root), "subtask_head": git_out(root, "rev-parse", "HEAD", default=""),
+                  "subtask_started_at": int(time.time())})
         ledger(state, u, f"design retrospective: {len(adopted)} refactor(s) adopted -> one coder round (review gates re-run)")
         u["_next"] = "compose_fix"
     return u

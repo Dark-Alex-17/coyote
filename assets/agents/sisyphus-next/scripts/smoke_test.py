@@ -7436,6 +7436,27 @@ with scenario("retro_route: review rounds spent -> the adopted items become foll
                                      last_node_output=RETRO_TRIAGED))
     check(name, u["_next"] == "observability_gate" and "fix_items" not in u
           and any("One table" in f for f in u["follow_ups"]), (u.get("_next"), u.get("follow_ups")))
+with scenario("strikeout: a failed refactor round after a green final review sets aside only the refactor's paths, "
+              "the review-green work kept") as name:
+    _sr = os.path.join(TMP, "retro-strikeout-repo")
+    os.makedirs(_sr)
+    for _cmd in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", _sr, *_cmd], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    open(os.path.join(_sr, "subtasks.go"), "w").write("package usage // every subtask's work\n")
+    _sr_state = base_state(project_dir=_sr, git_root=_sr, final_review=True, run_id="retro-strikeout",
+                           subtask_tree=gates._worktree_tree(_sr),
+                           subtask_head=subprocess.run(["git", "-C", _sr, "rev-parse", "HEAD"], capture_output=True,
+                                                       text=True).stdout.strip())
+    open(os.path.join(_sr, "review_fix.go"), "w").write("package usage // the final review's fix, now green\n")
+    _ru = gates.retro_route(dict(_sr_state, retro_result=RETRO_REFACTORS, retro_adopted=["One table", "One owner"],
+                                 retro_declined=[], retro_follow_ups=[], review_rounds=1, last_node_output=RETRO_TRIAGED))
+    open(os.path.join(_sr, "refactor.go"), "w").write("package usage // the broken refactor\n")
+    _so = gates.strikeout({**_sr_state, **_ru, "last_coder_error": "boom"})
+    check(name, _ru.get("_next") == "compose_fix" and os.path.exists(os.path.join(_sr, "subtasks.go"))
+          and os.path.exists(os.path.join(_sr, "review_fix.go")) and not os.path.exists(os.path.join(_sr, "refactor.go")),
+          (_ru.get("_next"), _so.get("decisions")))
 with scenario("compose_fix: retrospective items under the behaviour-preserving refactor header") as name:
     u = gates.compose_fix(base_state(fix_source="retrospective", fix_items=["One table"], fix_round=1))
     check(name, u["fix_instructions"].startswith("Implement these design-retrospective refactors (behaviour-preserving; "
