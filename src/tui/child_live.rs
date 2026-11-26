@@ -115,6 +115,7 @@ impl ChildThread {
                     grew += settle_folded_calls(&mut row.calls, error, now);
                     if matches!(row.status, NodeStatus::Running { .. }) {
                         row.status = NodeStatus::Failed(error.to_string());
+                        row.fold_when_finished();
                     }
                 }
                 _ => {}
@@ -557,6 +558,7 @@ impl ChildLive {
         };
         let grew = thread.node_row(&node_id).map_or(0, |row| {
             row.status = status;
+            row.fold_when_finished();
             settle_folded_calls(&mut row.calls, &error, now)
         });
         thread.forget_wrapped_lines();

@@ -1,0 +1,28 @@
+---
+source: src/tui/tests/child_live.rs
+expression: harness.draw()
+---
+"Thread: main > planner (read-only) sess_5d6e                               1-5/5"
+"Read-only. Tool calls show live; replies show up at the child's next checkpoint."
+"                                                                                "
+"> build it                                                                      "
+"                                                                                "
+"▸ node plan llm  completed in 0s  4 tool calls                                  "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"j/k scroll  g/G top/end  / find  n/N next/prev  Tab threads  q close            "

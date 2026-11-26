@@ -2,6 +2,7 @@ use super::*;
 use crate::tui::cells::{FoldedCall, NodeStatus};
 use crate::tui::child_live::{CHILD_ROW_LIMIT, ChildLive, ChildThread};
 use crate::tui::pager::ChildEntry;
+use crate::tui::selection::MULTI_CLICK;
 use crate::tui::sink::ChildNodeState;
 
 const AGENT: &str = "agent_graph_5d6e";
@@ -1560,28 +1561,280 @@ fn a_finished_childs_saved_row_folds_once_its_live_thread_is_gone() {
     });
 }
 
-/// A graph child's node row folds and opens on its call's whole output,
-/// printed live or only saved.
+/// Starts graph node `plan` of the child and makes `calls` calls in it
+/// that end ok, call `n` printing `node-out-<n>` as it runs when it
+/// `prints`; the node then ends when it `ends`.
+fn node_with_calls(harness: &mut Harness, calls: usize, prints: bool, ends: bool) {
+    child_node(harness, "plan", ChildNodeState::Started);
+    for n in 0..calls {
+        let call_id = format!("call-n{n}");
+        child_tool_of(harness, AGENT, Some("plan"), &call_id, "execute_command");
+        if prints {
+            harness.app.handle_msg(UiMsg::ChildToolOutput {
+                agent_id: AGENT.to_string(),
+                node: Some("plan".to_string()),
+                call_id: call_id.clone(),
+                chunk: format!("node-out-{n}\n").into_bytes(),
+            });
+        }
+        child_tool_done_of(harness, AGENT, Some("plan"), &call_id, true);
+    }
+    if ends {
+        child_node(
+            harness,
+            "plan",
+            ChildNodeState::Completed {
+                duration_ms: Some(10),
+                route: None,
+            },
+        );
+    }
+}
+
+/// Opens the child's thread and gives it a read of its saved session,
+/// which holds the `calls` calls of `node_with_calls` with their output.
+fn open_saved_node(harness: &mut Harness, calls: usize) {
+    harness
+        .app
+        .open_child("sess_5d6e".to_string(), "planner".to_string());
+    let Some(ControlRequest::LoadChild {
+        session_id,
+        generation,
+        ..
+    }) = harness.app.take_control_requests().pop()
+    else {
+        panic!("opening the child asks for a read");
+    };
+    let mut entries = vec![ChildEntry::User("build it".to_string())];
+    entries.extend((0..calls).map(|n| ChildEntry::Tool {
+        call_id: format!("call-n{n}"),
+        name: "execute_command".to_string(),
+        args: "{\"path\":\"src/lib.rs\"}".to_string(),
+        output: format!("node-out-{n}\n"),
+    }));
+    harness.app.handle_msg(UiMsg::ChildLoaded {
+        session_id,
+        generation,
+        result: Ok(entries),
+    });
+}
+
+/// Whether a whole thread shows the call lines and output of each of
+/// `calls` calls under the node, or none of them.
+fn node_shows(thread: &str, calls: usize) -> Option<bool> {
+    let shown = (0..calls)
+        .filter(|n| thread.contains(&format!("node-out-{n}")))
+        .count();
+    let call_lines = thread.matches("execute_command  ").count();
+    match (shown, call_lines) {
+        (0, 0) => Some(false),
+        (all, lines) if all == calls && lines >= calls => Some(true),
+        _ => None,
+    }
+}
+
+/// The node row the thread on show starts with: open or folded, as its
+/// arrow and its calls agree, with its count of calls in its header.
+fn node_state(harness: &mut Harness, calls: usize) -> bool {
+    let thread = whole_thread(harness);
+    let count = if calls == 1 {
+        "1 tool call".to_string()
+    } else {
+        format!("{calls} tool calls")
+    };
+    let header = thread
+        .lines()
+        .find(|line| line.contains("node plan"))
+        .unwrap_or_else(|| panic!("no node row: {thread}"));
+    assert!(header.contains(&count), "{thread}");
+    let open = header.contains(cells::EXPANDED_ARROW.trim_end());
+    assert_eq!(node_shows(&thread, calls), Some(open), "{thread}");
+    open
+}
+
+/// Each fold gesture on node `plan`, the only foldable row of the thread
+/// on show, turns it over and then back, its calls hidden and shown with
+/// it: Ctrl+Down and Enter, Ctrl+Up and Enter, a click on its arrow and
+/// a click on its header.
+fn assert_every_gesture_folds_the_node(harness: &mut Harness, calls: usize) {
+    let start = node_state(harness, calls);
+    let assert_open = |harness: &mut Harness, open: bool, after: &str| {
+        let thread = whole_thread(harness);
+        assert_eq!(
+            node_shows(&thread, calls),
+            Some(open),
+            "after {after}: {thread}"
+        );
+    };
+    for key in [KeyCode::Down, KeyCode::Up] {
+        harness
+            .app
+            .handle_key(KeyEvent::new(key, KeyModifiers::CONTROL));
+        harness.press(KeyCode::Enter);
+        assert_open(harness, !start, &format!("Ctrl+{key:?} and Enter"));
+        harness.press(KeyCode::Enter);
+        assert_open(harness, start, &format!("Ctrl+{key:?} and a second Enter"));
+    }
+    harness.draw();
+    let (column, row) = screen_at(harness, "node plan");
+    for (at, what) in [(column - 2, "its arrow"), (column + 2, "its header")] {
+        for (open, which) in [(!start, "a click"), (start, "a second click")] {
+            // Apart enough not to make a double click, which selects a word.
+            harness.clock.advance(MULTI_CLICK * 2);
+            harness.draw();
+            click(harness, (at, row));
+            assert_open(harness, open, &format!("{which} on {what}"));
+        }
+    }
+}
+
+/// A graph child's finished node row starts open with up to three calls
+/// and folded with more, its header counting them, and every gesture
+/// folds and opens it on its calls' output, printed live or only saved.
 #[test]
 #[serial]
 fn a_graph_childs_node_row_folds() {
     run_async(async {
         let _guard = TestConfigDirGuard::new("tui-thread-node-row-folds");
         for prints in [true, false] {
-            let mut harness = thread_harness(34);
-            child_node(&mut harness, "plan", ChildNodeState::Started);
-            long_call(&mut harness, AGENT, Some("plan"), prints);
-            child_node(
-                &mut harness,
-                "plan",
-                ChildNodeState::Completed {
-                    duration_ms: Some(10),
-                    route: None,
-                },
-            );
-            open_saved(&mut harness, "sess_5d6e", "planner");
-            assert_the_row_folds(&mut harness, "node plan");
+            for (calls, open) in [(1, true), (3, true), (4, false)] {
+                let mut harness = thread_harness(34);
+                node_with_calls(&mut harness, calls, prints, true);
+                open_saved_node(&mut harness, calls);
+                assert_eq!(node_state(&mut harness, calls), open, "{calls} calls");
+                assert_every_gesture_folds_the_node(&mut harness, calls);
+            }
         }
+    });
+}
+
+/// A running node row stays open whatever it has called, and folds once
+/// it ends with more than three calls; a row the user folded or opened
+/// while it ran is left as it was when it ends.
+#[test]
+#[serial]
+fn a_running_node_row_stays_open_until_it_ends_unless_toggled() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-running-node-folds");
+        let mut harness = thread_harness(38);
+        node_with_calls(&mut harness, 4, true, false);
+        open_saved_node(&mut harness, 4);
+        assert!(node_state(&mut harness, 4));
+        assert_every_gesture_folds_the_node(&mut harness, 4);
+        child_node(
+            &mut harness,
+            "plan",
+            ChildNodeState::Completed {
+                duration_ms: Some(10),
+                route: None,
+            },
+        );
+        assert!(
+            node_state(&mut harness, 4),
+            "a toggled row folded on its end"
+        );
+
+        let mut harness = thread_harness(39);
+        node_with_calls(&mut harness, 4, true, false);
+        open_saved_node(&mut harness, 4);
+        assert!(node_state(&mut harness, 4));
+        child_node(
+            &mut harness,
+            "plan",
+            ChildNodeState::Completed {
+                duration_ms: Some(10),
+                route: None,
+            },
+        );
+        assert!(
+            !node_state(&mut harness, 4),
+            "an ended node with four calls did not fold"
+        );
+    });
+}
+
+/// Once a graph child the roster lists has finished, its thread is read
+/// back from the saved session with its node rows kept: a node it left
+/// running ends failed and folds past three calls as a completed one
+/// does, and every gesture folds and opens it on its saved output.
+#[test]
+#[serial]
+fn a_finished_childs_node_row_folds_in_its_read_back_thread() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-finished-node-folds");
+        for (calls, ends, open) in [(4, true, false), (4, false, false), (2, false, true)] {
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 40 }));
+            let tasks = supervisor();
+            tasks.write().register(finished_agent(AGENT)).unwrap();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            started(&mut harness);
+            node_with_calls(&mut harness, calls, false, ends);
+            harness.app.handle_msg(UiMsg::AgentFinished {
+                agent_id: AGENT.to_string(),
+                outcome: AgentOutcome::Completed,
+            });
+            assert!(harness.app.child_live.by_agent(AGENT).is_some());
+            open_saved_node(&mut harness, calls);
+            assert_eq!(node_state(&mut harness, calls), open, "{calls} {ends}");
+            assert_every_gesture_folds_the_node(&mut harness, calls);
+        }
+    });
+}
+
+/// A node row lives only in the live thread: a saved session has no node
+/// in it, so once an unlisted finished child's live thread is dropped its
+/// read-back thread has no node row, and any of the node's calls the
+/// session holds show as tool rows of their own.
+#[test]
+#[serial]
+fn a_dropped_childs_read_back_thread_has_no_node_rows() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-dropped-node");
+        let mut harness = thread_harness(41);
+        node_with_calls(&mut harness, 4, false, true);
+        for agent_id in [GREAT_GRANDCHILD, GRANDCHILD, AGENT] {
+            harness.app.handle_msg(UiMsg::AgentFinished {
+                agent_id: agent_id.to_string(),
+                outcome: AgentOutcome::Completed,
+            });
+        }
+        assert!(harness.app.child_live.by_agent(AGENT).is_none());
+        open_saved_node(&mut harness, 4);
+        let thread = harness.draw();
+        assert!(!thread.contains("node plan"), "{thread}");
+        assert_eq!(
+            thread
+                .matches(&format!("{}execute_command(", cells::COLLAPSED_ARROW))
+                .count(),
+            4,
+            "{thread}"
+        );
+    });
+}
+
+/// A finished node row with four calls, folded on its count of calls
+/// and then open on each call and its output.
+#[test]
+#[serial]
+fn a_folded_node_row_draws_its_count_and_opens_on_its_calls() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-node-snapshot");
+        let mut harness = thread_harness(42);
+        node_with_calls(&mut harness, 4, true, true);
+        open_saved_node(&mut harness, 4);
+        insta::assert_snapshot!("child_thread_node_folded_80x24", harness.draw());
+        harness.resize(40, 20);
+        insta::assert_snapshot!("child_thread_node_folded_40x20", harness.draw());
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        harness.press(KeyCode::Enter);
+        insta::assert_snapshot!("child_thread_node_expanded_40x20", harness.draw());
+        harness.resize(80, 24);
+        insta::assert_snapshot!("child_thread_node_expanded_80x24", harness.draw());
     });
 }
 
@@ -1620,10 +1873,6 @@ fn a_node_row_whose_calls_share_an_id_gets_each_saved_output() {
             generation,
             result: Ok(vec![saved("first-saved-out"), saved("second-saved-out")]),
         });
-        harness
-            .app
-            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
-        harness.press(KeyCode::Enter);
         let thread = whole_thread(&mut harness);
         assert!(thread.contains("first-saved-out"), "{thread}");
         assert!(thread.contains("second-saved-out"), "{thread}");

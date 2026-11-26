@@ -440,6 +440,9 @@ pub(super) struct TaskRow<S> {
     pub(super) status: S,
     pub(super) calls: Vec<FoldedCall>,
     pub(super) expanded: bool,
+    /// The row was opened or closed by hand, so the fold a node takes
+    /// when it ends leaves it as it is.
+    pub(super) user_toggled: bool,
 }
 
 impl<S> TaskRow<S> {
@@ -448,6 +451,24 @@ impl<S> TaskRow<S> {
             status,
             calls: Vec::new(),
             expanded: false,
+            user_toggled: false,
+        }
+    }
+}
+
+/// A finished node row with more calls than this starts folded.
+const LONG_NODE_CALLS: usize = 3;
+
+impl TaskRow<NodeStatus> {
+    /// A node that has ended folds when it made more than
+    /// `LONG_NODE_CALLS` calls, unless its row was opened or closed by
+    /// hand; a shorter one stays as it was.
+    pub(super) fn fold_when_finished(&mut self) {
+        if !self.user_toggled
+            && !matches!(self.status, NodeStatus::Running { .. })
+            && self.calls.len() > LONG_NODE_CALLS
+        {
+            self.expanded = false;
         }
     }
 }
@@ -760,11 +781,15 @@ impl Cell {
         }
     }
 
+    /// A node's row starts open, so its calls show as they run.
     pub(super) fn node(node_id: String, node_type: String, since: Instant) -> Self {
         Self::Node {
             node_id,
             node_type,
-            row: TaskRow::new(NodeStatus::Running { since }),
+            row: TaskRow {
+                expanded: true,
+                ..TaskRow::new(NodeStatus::Running { since })
+            },
             cache: LineCache::default(),
         }
     }
@@ -804,23 +829,42 @@ impl Cell {
                 bookkeeping: false,
                 cache,
                 ..
+            } => {
+                *expanded = !*expanded;
+                *cache = LineCache::default();
             }
-            | Cell::Job {
-                row: TaskRow { expanded, .. },
+            Cell::Job {
+                row:
+                    TaskRow {
+                        expanded,
+                        user_toggled,
+                        ..
+                    },
                 cache,
                 ..
             }
             | Cell::Agent {
-                row: TaskRow { expanded, .. },
+                row:
+                    TaskRow {
+                        expanded,
+                        user_toggled,
+                        ..
+                    },
                 cache,
                 ..
             }
             | Cell::Node {
-                row: TaskRow { expanded, .. },
+                row:
+                    TaskRow {
+                        expanded,
+                        user_toggled,
+                        ..
+                    },
                 cache,
                 ..
             } => {
                 *expanded = !*expanded;
+                *user_toggled = true;
                 *cache = LineCache::default();
             }
             _ => {}
@@ -1186,6 +1230,7 @@ impl Cell {
                     name: tool,
                     id: job_id,
                     state: job_state(&row.status, tick),
+                    summary: folded_summary(&row.calls),
                 };
                 row_lines(header, row, width, &styles)
             }),
@@ -1201,6 +1246,7 @@ impl Cell {
                     name,
                     id: agent_id,
                     state: agent_state(&row.status, tick),
+                    summary: folded_summary(&row.calls),
                 };
                 row_lines(header, row, width, &styles)
             }),
@@ -1216,6 +1262,7 @@ impl Cell {
                     name: node_id,
                     id: node_type,
                     state: node_state(&row.status, tick),
+                    summary: call_count(&row.calls),
                 };
                 row_lines(header, row, width, &styles)
             }),
@@ -1357,33 +1404,33 @@ impl Cell {
             } => format!("{name}({args})  {}", tool_state(status, tick)),
             Cell::Job {
                 job_id, tool, row, ..
-            } => with_folded(
+            } => with_summary(
                 format!("job {tool} {job_id}  {}", job_state(&row.status, tick).0),
-                &row.calls,
+                &folded_summary(&row.calls),
             ),
             Cell::Agent {
                 agent_id,
                 name,
                 row,
                 ..
-            } => with_folded(
+            } => with_summary(
                 format!(
                     "agent {name} {agent_id}  {}",
                     agent_state(&row.status, tick).0
                 ),
-                &row.calls,
+                &folded_summary(&row.calls),
             ),
             Cell::Node {
                 node_id,
                 node_type,
                 row,
                 ..
-            } => with_folded(
+            } => with_summary(
                 format!(
                     "node {node_id} {node_type}  {}",
                     node_state(&row.status, tick).0
                 ),
-                &row.calls,
+                &call_count(&row.calls),
             ),
             _ => return None,
         };
@@ -1493,8 +1540,7 @@ fn node_state(status: &NodeStatus, tick: Option<Tick>) -> (String, Option<&str>)
     }
 }
 
-fn with_folded(header: String, calls: &[FoldedCall]) -> String {
-    let summary = folded_summary(calls);
+fn with_summary(header: String, summary: &str) -> String {
     if summary.is_empty() {
         header
     } else {
@@ -1620,20 +1666,23 @@ fn printed(full: &FullOutput) -> bool {
     !full.text().is_empty() || full.dropped() > 0
 }
 
-/// What a job's or agent's header names: `<kind> <name> <id>  <state>`,
-/// and the whole error of a failed one.
+/// What a job's, agent's or node's header names: `<kind> <name> <id>
+/// <state>  <summary>`, and the whole error of a failed one.
 struct RowHeader<'a> {
     kind: &'static str,
     name: &'a str,
     id: &'a str,
     state: (String, Option<&'a str>),
+    /// What the header says of the calls under it; empty for nothing.
+    summary: String,
 }
 
-/// A job's or agent's row: one header line behind the fold arrow, in the
-/// colours of a tool row's, with its folded calls summarised and clipped
-/// by the view rather than wrapped; when open, the whole error and then
-/// each folded call's output, indented under the header. The header is
-/// the row's own text, so it is scrubbed rather than parsed for colour.
+/// A job's, agent's or node's row: one header line behind the fold arrow,
+/// in the colours of a tool row's, with its folded calls summarised and
+/// clipped by the view rather than wrapped; when open, the whole error
+/// and then each folded call's output, indented under the header. The
+/// header is the row's own text, so it is scrubbed rather than parsed for
+/// colour.
 fn row_lines<S>(
     header: RowHeader<'_>,
     row: &TaskRow<S>,
@@ -1645,6 +1694,7 @@ fn row_lines<S>(
         name,
         id,
         state: (state, error),
+        summary,
     } = header;
     let arrow = if row.expanded {
         EXPANDED_ARROW
@@ -1666,7 +1716,6 @@ fn row_lines<S>(
         Span::styled(format!("{rest}  "), styles.muted),
     ];
     spans.extend(state_spans(&state, state_style, styles.throbber));
-    let summary = folded_summary(&row.calls);
     if !summary.is_empty() {
         spans.push(Span::styled(
             format!("  {}", render::plain_text(&summary)),
@@ -1689,6 +1738,17 @@ fn row_lines<S>(
         }));
     }
     lines
+}
+
+/// `3 tool calls`: what a node's header says of the calls it made, which
+/// are tools of every kind rather than verbs on one job or agent; empty
+/// for none.
+fn call_count(calls: &[FoldedCall]) -> String {
+    match calls.len() {
+        0 => String::new(),
+        1 => "1 tool call".to_string(),
+        count => format!("{count} tool calls"),
+    }
 }
 
 /// `checked 2, collected`: the folded calls by verb, in the order first seen.
@@ -2406,6 +2466,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_nodes_calls_are_counted_rather_than_summarised_by_verb() {
+        let call = |name: &str| FoldedCall::new(String::new(), name.to_string());
+        assert_eq!(call_count(&[]), "");
+        assert_eq!(call_count(&[call("job__check")]), "1 tool call");
+        assert_eq!(
+            call_count(&[call("job__check"), call("fs_read")]),
+            "2 tool calls"
+        );
+    }
+
+    /// A node row starts open; once it ends it folds when it made more
+    /// than three calls and was never opened or closed by hand.
+    #[test]
+    fn a_finished_node_folds_past_three_calls_unless_toggled() {
+        let since = Instant::now();
+        let node = |calls: usize, toggles: usize| {
+            let mut cell = Cell::node("plan".to_string(), "llm".to_string(), since);
+            for _ in 0..toggles {
+                cell.toggle();
+            }
+            let Cell::Node { row, .. } = &mut cell else {
+                unreachable!("a node cell");
+            };
+            row.calls = (0..calls)
+                .map(|n| FoldedCall::running(format!("c{n}"), "fs_read".to_string(), None, since))
+                .collect();
+            row.fold_when_finished();
+            let running = row.expanded;
+            row.status = NodeStatus::Completed {
+                elapsed: None,
+                route: None,
+            };
+            row.fold_when_finished();
+            (running, row.expanded)
+        };
+        assert_eq!(node(4, 0), (true, false));
+        assert_eq!(node(3, 0), (true, true));
+        assert_eq!(node(0, 0), (true, true));
+        assert_eq!(node(4, 2), (true, true));
+        assert_eq!(node(4, 1), (false, false));
+        assert_eq!(node(2, 1), (false, false));
+    }
+
     /// The header takes the name and arguments it is given, drawn plain,
     /// whatever styling the summary line carries.
     #[test]
@@ -2802,7 +2906,6 @@ mod tests {
                 failed,
             ];
         }
-        cell.toggle();
         let lines = cell.thread_lines(80, &mut renderer);
         let text: Vec<String> = lines.iter().map(Line::to_string).collect();
         assert_eq!(

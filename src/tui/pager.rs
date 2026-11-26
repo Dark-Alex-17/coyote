@@ -2347,8 +2347,6 @@ mod tests {
             ]),
         );
         let mut cells = Vec::new();
-        pager.step_focus(&live, true);
-        pager.toggle_focused(&mut live);
         let frame = draw_live(&mut pager, &mut cells, &mut live, 80, 24);
         insta::assert_snapshot!("pager_child_graph_80x24", &frame);
         let plan = frame.find("node plan").expect("a plan row");
@@ -2438,8 +2436,6 @@ mod tests {
             PathBuf::from("/nonexistent/planner-b2.yaml"),
         );
         deliver(&mut pager, "planner-b2", Ok(entries));
-        pager.step_focus(&live, true);
-        pager.toggle_focused(&mut live);
         let frame = draw_live(&mut pager, &mut Vec::new(), &mut live, 80, 24);
         assert!(!frame.contains("fs_read("), "{frame}");
         assert!(!frame.contains("done"), "{frame}");

@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/child_live.rs
+expression: harness.draw()
+---
+"Thread: ... > planner (ro) se...6e 1-6/6"
+"Read-only. Tool calls show live; replies"
+"show up at the child's next checkpoint. "
+"                                        "
+"> build it                              "
+"                                        "
+"▸ node plan llm  completed in 0s  4 tool"
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"q close  Tab threads  / find  n/N  j/k  "

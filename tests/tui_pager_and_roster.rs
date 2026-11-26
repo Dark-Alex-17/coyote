@@ -3743,8 +3743,8 @@ mod binary_threads {
 
     /// A spawned graph agent's thread, opened while its second node sits in
     /// the gated call, shows one row per node it ran, in start order, with
-    /// the calls folded under them; opening the running node's row shows
-    /// its call, live.
+    /// the calls under them and a count of them in the header; the running
+    /// node's row is open on its call, live, and closes on Enter.
     #[test]
     #[serial]
     fn a_graph_kids_thread_shows_a_row_per_node_with_its_calls_folded_under() {
@@ -3803,19 +3803,34 @@ mod binary_threads {
         assert_eq!(
             thread.matches("kid_gate").count(),
             1,
-            "the waiter node's call is not folded under its node row (only its header names it):\n{thread}"
+            "the waiter node's call does not show once, under its node row:\n{thread}"
+        );
+        assert!(
+            row_after(&thread, "node waiter").is_some_and(|row| row.contains("1 tool call")),
+            "the waiter node's header does not count its call:\n{thread}"
+        );
+        assert!(
+            row_after(&thread, "kid_gate").is_some_and(|row| row.contains("running")),
+            "the running node row does not start open on its running call:\n{thread}"
         );
 
         pty.send(b"\x1b[1;5A").unwrap();
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\r").unwrap();
+        let (closed, folded) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
+            !frame.contains("kid_gate") && frame.contains("node waiter")
+        });
+        assert!(
+            closed,
+            "closing the focused node row does not hide its running call:\n{folded}"
+        );
+        pty.send(b"\r").unwrap();
         let (opened, open) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
-            frame.matches("kid_gate").count() >= 2
-                && row_after(frame, "kid_gate").is_some_and(|row| row.contains("running"))
+            row_after(frame, "kid_gate").is_some_and(|row| row.contains("running"))
         });
         assert!(
             opened,
-            "opening the focused node row does not show its running call:\n{open}"
+            "opening the node row again does not show its running call:\n{open}"
         );
 
         // The kid finishes and saves: the live rows and the saved session
@@ -3828,7 +3843,7 @@ mod binary_threads {
             settled,
             "the waiter node did not turn completed in the open thread:\n{after}"
         );
-        for (needle, want) in [("node scout", 1), ("node waiter", 1), ("kid_gate", 2)] {
+        for (needle, want) in [("node scout", 1), ("node waiter", 1), ("kid_gate", 1)] {
             assert_eq!(
                 after.matches(needle).count(),
                 want,
@@ -3836,6 +3851,155 @@ mod binary_threads {
                 after.matches(needle).count()
             );
         }
+        pty.send(b"q").unwrap();
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
+    /// Whether the node row headed `header` (squeezed) is open, from a
+    /// repaint, its arrow and `output` showing agreeing on it.
+    fn node_open(pty: &mut Pty, header: &str, output: &str) -> bool {
+        let open = header_at(pty, header).1 == OPEN;
+        let shown = shows(pty, output);
+        assert_eq!(
+            shown,
+            open,
+            "{header} is drawn {} but {output} is {}",
+            if open { "open" } else { "folded" },
+            if shown { "shown" } else { "hidden" }
+        );
+        open
+    }
+
+    /// A click on the arrow of the node row headed `header`, and one on
+    /// its name, each turn it over and a second click turns it back.
+    fn assert_clicks_fold_node(pty: &mut Pty, header: &str, output: &str, phase: &str) {
+        let start = node_open(pty, header, output);
+        for (column, what) in [(1, "its arrow"), (12, "its header")] {
+            for (want, which) in [(!start, "a click"), (start, "a second click")] {
+                let (row, _) = header_at(pty, header);
+                click(pty, column, row);
+                assert_eq!(
+                    node_open(pty, header, output),
+                    want,
+                    "{phase}: {which} on {what} did not turn {header} over"
+                );
+            }
+        }
+    }
+
+    /// Enter turns the focused node row headed `header` over, and a second
+    /// Enter turns it back.
+    fn assert_enter_folds_node(pty: &mut Pty, header: &str, output: &str, phase: &str) {
+        let start = node_open(pty, header, output);
+        for (want, which) in [(!start, "Enter"), (start, "a second Enter")] {
+            press(pty, b"\r");
+            assert_eq!(
+                node_open(pty, header, output),
+                want,
+                "{phase}: {which} did not turn {header} over"
+            );
+        }
+    }
+
+    /// Every gesture that folds a tool row folds a graph kid's node row in
+    /// its thread, while the kid runs and once it has ended and its thread
+    /// is read back: a click on the arrow, a click on the header, and
+    /// Ctrl+Up / Ctrl+Down to focus a row and Enter. The scout node
+    /// made four calls, so it is folded once it ends, on a count of them;
+    /// the waiter node is open on its call while it runs, and stays open
+    /// when it ends with its one call.
+    #[test]
+    #[serial]
+    fn every_fold_gesture_folds_a_graph_kids_node_row_live_and_saved() {
+        let scene = scene(
+            "thr-node-gestures",
+            |_| {
+                let call = |name: &str| Reply::ToolCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                };
+                let mut replies: Vec<Reply> = (0..4).map(|_| call("kid_mark")).collect();
+                replies.push(Reply::Text("scout done g1n".to_string()));
+                replies.push(call("kid_gate"));
+                replies.push(Reply::Text("waiter done g2n".to_string()));
+                replies
+            },
+            "",
+        );
+        write_graph_kid(&scene.dir);
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+        wait_for_file(
+            &mut pty,
+            &scene.dir.join("kid.gated"),
+            "the kid's gate tool",
+        );
+        pty.send(b"\x14").unwrap();
+        repainted_frame_showing(
+            &mut pty,
+            "Thread: root thread",
+            "Ctrl+T did not open the pager",
+        );
+        pty.send(b"\t").unwrap();
+        repainted_frame_showing(&mut pty, "Threads", "Tab did not open the picker");
+        press(&mut pty, b"\x1b[B");
+        pty.send(b"\r").unwrap();
+        let (live, thread) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+            row_after(frame, "node scout")
+                .is_some_and(|row| row.contains("completed") && row.contains("4 tool calls"))
+                && row_after(frame, "node waiter").is_some_and(|row| row.contains("running"))
+        });
+        assert!(
+            live,
+            "the graph kid's thread does not show a finished scout node with four calls and a running waiter node:\n{thread}\nlog: {}",
+            scene.log.display()
+        );
+
+        // Live: the finished scout node and the running waiter node.
+        assert!(
+            !node_open(&mut pty, "nodescout", "kid_mark"),
+            "the finished scout node with four calls is not folded"
+        );
+        assert!(
+            node_open(&mut pty, "nodewaiter", "kid_gate"),
+            "the running waiter node is not open"
+        );
+        assert_clicks_fold_node(&mut pty, "nodescout", "kid_mark", "live");
+        assert_clicks_fold_node(&mut pty, "nodewaiter", "kid_gate", "live");
+        // The clicks left the focus on the waiter row.
+        press(&mut pty, CTRL_UP);
+        assert_enter_folds_node(&mut pty, "nodescout", "kid_mark", "live, Ctrl+Up");
+        press(&mut pty, CTRL_DOWN);
+        assert_enter_folds_node(&mut pty, "nodewaiter", "kid_gate", "live, Ctrl+Down");
+
+        // Saved: the kid has ended and its thread is read back. A graph
+        // kid's saved session holds its prompt and its output, not its
+        // calls, so the node rows are the live ones it kept, now ended.
+        fs::write(&scene.kid_gate, "").unwrap();
+        let (saved, thread) = frame_until(&mut pty, Duration::from_secs(20), |frame| {
+            squeezed(frame).contains("graphkidoverg9k")
+                && row_after(frame, "node waiter").is_some_and(|row| row.contains("completed"))
+        });
+        assert!(
+            saved,
+            "the kid's thread did not read back its saved output with the waiter node ended:\n{thread}"
+        );
+        assert!(
+            !node_open(&mut pty, "nodescout", "kid_mark"),
+            "the scout node did not stay folded once the kid saved"
+        );
+        assert!(
+            node_open(&mut pty, "nodewaiter", "kid_gate"),
+            "the waiter node with one call did not stay open when it ended"
+        );
+        assert_clicks_fold_node(&mut pty, "nodescout", "kid_mark", "saved");
+        assert_clicks_fold_node(&mut pty, "nodewaiter", "kid_gate", "saved");
+        press(&mut pty, CTRL_UP);
+        assert_enter_folds_node(&mut pty, "nodescout", "kid_mark", "saved, Ctrl+Up");
+        press(&mut pty, CTRL_DOWN);
+        assert_enter_folds_node(&mut pty, "nodewaiter", "kid_gate", "saved, Ctrl+Down");
+
         pty.send(b"q").unwrap();
         let transcript = leave(&mut pty, &scene);
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
