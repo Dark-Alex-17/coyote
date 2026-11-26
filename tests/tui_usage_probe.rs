@@ -1885,9 +1885,9 @@ mod session_undo_and_rename {
             !squeezed(&since(&pty, at)).contains("leftsession"),
             "the rename reads as a leave:\n{renamed}"
         );
-        let saved: Vec<String> = walk(&dir)
+        let saved: Vec<_> = walk(&dir)
             .into_iter()
-            .filter(|p| p.contains("beta-r9"))
+            .filter(|p| p.display().to_string().contains("beta-r9"))
             .collect();
         assert!(
             !saved.is_empty(),
@@ -1903,21 +1903,6 @@ mod session_undo_and_rename {
             "leaving the renamed session did not clear the view:\n{after}"
         );
         quit_declining_save(&mut pty);
-    }
-
-    fn walk(dir: &std::path::Path) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    out.extend(walk(&path));
-                } else {
-                    out.push(path.display().to_string());
-                }
-            }
-        }
-        out
     }
 
     /// A saved session of two exchanges on the fake model, numbered so
