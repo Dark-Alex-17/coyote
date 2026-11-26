@@ -1854,6 +1854,74 @@ fn impact_facts_reports_every_section_for_a_changed_source_file() {
     );
 }
 
+/// impact_facts hands the state to gate_lib through the environment, never
+/// as a bash argument, which Git Bash on Windows re-parses and mangles. A
+/// state holding a backslash, a double quote and a newline still finds the
+/// project dir; on unix a bash shim first on PATH logs every argument, and
+/// none may carry the state.
+#[test]
+fn impact_facts_keeps_the_state_off_the_bash_command_line() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("impact-facts-argv");
+    let dir = committed(&root.0);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    let tricky = "back\\slash \"quoted\"\nnext line";
+    let state = json!({
+        "project_dir": path_str(&dir),
+        "baseline_base": head,
+        "targeted": [tricky],
+        "impacted": [],
+        "reason": tricky,
+    });
+    let argv_log = root.0.join("bash-argv.log");
+    let mut path_var = None;
+    // Windows finds no extensionless shim through PATHEXT and cannot run a
+    // shebang script, so only unix logs the arguments.
+    if cfg!(unix) {
+        let shims = root.0.join("shims");
+        fs::create_dir_all(&shims).unwrap();
+        let shim = shims.join("bash");
+        let real = bash_program().expect("bash resolved by tools_missing");
+        fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+                argv_log.display(),
+                real.display()
+            ),
+        )
+        .unwrap();
+        Command::new("chmod")
+            .args(["+x", path_str(&shim)])
+            .status()
+            .unwrap();
+        let rest = env::var_os("PATH").unwrap_or_default();
+        let paths = std::iter::once(shims).chain(env::split_paths(&rest));
+        path_var = Some(env::join_paths(paths).unwrap().into_string().unwrap());
+    }
+    let mut envs = vec![("TEST_CMD", "run-suite")];
+    if let Some(path) = &path_var {
+        envs.push(("PATH", path.as_str()));
+    }
+    let out = run_py("coder/scripts/impact_facts.py", &dir, &state, &envs);
+    let facts = str_field(&out, "impact_facts");
+    let runs_in = facts
+        .lines()
+        .find_map(|l| l.strip_prefix("  runs in: "))
+        .unwrap_or_else(|| panic!("{facts}"));
+    assert!(Path::new(runs_in).ends_with("proj"), "{facts}");
+    if cfg!(unix) {
+        let logged = fs::read_to_string(&argv_log).expect("the bash shim ran");
+        let words: Vec<&str> = logged.split('\0').collect();
+        assert!(
+            words.iter().all(|w| !w.contains("\"project_dir\"")),
+            "the state reached bash as an argument: {words:?}"
+        );
+    }
+}
+
 /// A job status or base record that cannot be read gives a lazy or no
 /// baseline, and an unreadable verification record counts as missing;
 /// none of them ever passes a red run.

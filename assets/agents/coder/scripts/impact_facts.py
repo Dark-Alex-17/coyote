@@ -39,16 +39,20 @@ def load_state():
 
 
 def gate_facts(state):
-    """(directory the gates run in, the full test command as they run it), from gate_lib."""
+    """(directory the gates run in, the full test command as they run it), from gate_lib.
+
+    The state goes through the environment because Git Bash on Windows
+    re-parses its command line and mangles the quotes and backslashes of JSON."""
     script = (
-        'source "$1"; source "$2"; dir=$(gate_workdir "$3"); '
+        'source "$1"; source "$2"; dir=$(gate_workdir "$IMPACT_FACTS_STATE"); '
         'cmd=$(gate_test_command_for_run "$(gate_test_command "$dir")"); '
         'jq -nc --arg dir "$dir" --arg cmd "$cmd" \'{dir: $dir, cmd: $cmd}\''
     )
     r = subprocess.run(
         [bash_program(), "-c", script, "impact-facts", os.path.join(SHARED, "utils.sh"),
-         os.path.join(HERE, "gate_lib.sh"), json.dumps(state)],
+         os.path.join(HERE, "gate_lib.sh")],
         capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+        env={**os.environ, "IMPACT_FACTS_STATE": json.dumps(state)},
     )
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip()[:300] or f"gate_lib exited {r.returncode}")
