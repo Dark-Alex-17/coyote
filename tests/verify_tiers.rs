@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BASELINE: &str = "coder/scripts/baseline_tests.sh";
 const VERIFY_TESTS: &str = "coder/scripts/verify_tests.sh";
@@ -329,6 +331,7 @@ fn store(dir: &Path) -> PathBuf {
     dir.join(".git/coyote-baselines")
 }
 
+#[cfg(unix)]
 fn job_status(dir: &Path, key: &str) -> Value {
     let text = fs::read_to_string(store(dir).join("jobs").join(key).join("status.json"))
         .unwrap_or_else(|e| panic!("status.json of job {key}: {e}"));
@@ -353,6 +356,32 @@ fn await_base(dir: &Path, key: &str) -> Value {
             key,
             "--until",
             &until.to_string(),
+        ],
+    );
+    assert_eq!(code, Some(0), "{out}");
+    serde_json::from_str(&fs::read_to_string(str_field(&out, "record")).unwrap()).unwrap()
+}
+
+/// The base record of `cmd` that baseline_tests' reply `base` leads to. On
+/// unix the background job takes it; elsewhere no job runs, so a lazy run at
+/// the same base takes it now, the way verify_tests would on demand.
+fn settle_base(dir: &Path, base: &Value, cmd: &str) -> Value {
+    let mode = str_field(base, "baseline_mode");
+    if cfg!(unix) {
+        assert!(mode.starts_with("background"), "{base}");
+        return await_base(dir, str_field(base, "baseline_key"));
+    }
+    assert!(mode.starts_with("lazy ("), "{base}");
+    let (code, out) = shared_py(
+        "base_suite.py",
+        &[
+            "run",
+            "--root",
+            path_str(dir),
+            "--base",
+            str_field(base, "baseline_base"),
+            "--cmd",
+            cmd,
         ],
     );
     assert_eq!(code, Some(0), "{out}");
@@ -536,7 +565,7 @@ fn round_green_lap_reports_passed_and_its_tier_and_records_the_tree() {
     let lookup = round_lookup(&dir);
     assert_eq!(str_field(&lookup, "status"), "green", "{lookup}");
     assert!(Path::new(str_field(&lookup, "path")).is_file(), "{lookup}");
-    await_base(&dir, str_field(&base, "baseline_key"));
+    settle_base(&dir, &base, "true");
 }
 
 /// A red targeted command that the green base does not share stops the lap:
@@ -550,7 +579,7 @@ fn round_red_targeted_command_leaves_the_impacted_commands_unrun() {
     let dir = committed(&root.0);
     let envs = round("true");
     let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
-    await_base(&dir, str_field(&base, "baseline_key"));
+    settle_base(&dir, &base, "true");
     let red = "printf 'test fresh ... FAILED\\n'; exit 101";
     let state = lap_state(&dir, &base, &[red], &["touch impacted.txt"]);
     let out = run_script(VERIFY_TESTS, &dir, &state, &envs);
@@ -588,7 +617,7 @@ fn round_narrow_command_passes_only_on_identified_base_failures() {
     let full = "printf 'test known_a ... FAILED\\ntest known_b ... FAILED\\n'; exit 101";
     let envs = round(full);
     let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
-    await_base(&dir, str_field(&base, "baseline_key"));
+    settle_base(&dir, &base, full);
 
     let subset = "printf 'test known_a ... FAILED\\n'; exit 1";
     let out = run_script(
@@ -712,7 +741,7 @@ fn round_empty_selection_is_not_run() {
         "{out}"
     );
     assert!(!dir.join("ran.txt").exists(), "a test ran in the live tree");
-    await_base(&dir, str_field(&base, "baseline_key"));
+    settle_base(&dir, &base, "touch ran.txt");
 }
 
 /// verify_tier defaults to full; any other value than round runs the full
@@ -797,6 +826,22 @@ fn verify_tier_defaults_to_full_and_declares_the_round_route() {
         "full (verify_tier \"rounds\" is neither round nor full, so the full tier ran)",
         "{out}"
     );
+    let forged = format!("rounds\r\nTier: forged\n{}", "y".repeat(200));
+    let out = run_script(
+        "coder/scripts/resolve_paths.sh",
+        &dir,
+        &Value::Null,
+        &[("LLM_AGENT_VAR_VERIFY_TIER", forged.as_str())],
+    );
+    let echoed: String = format!("rounds Tier: forged {}", "y".repeat(200))
+        .chars()
+        .take(120)
+        .collect();
+    assert_eq!(
+        str_field(&out, "tests_tier"),
+        format!("full (verify_tier \"{echoed}\" is neither round nor full, so the full tier ran)"),
+        "{out}"
+    );
 
     let build = |tier: &str| {
         run_script(
@@ -831,6 +876,7 @@ fn verify_tier_defaults_to_full_and_declares_the_round_route() {
 
 /// The round baseline returns before the base suite finishes, with the job
 /// recorded in status.json, and the suite never runs in the live tree.
+#[cfg(unix)] // asserts the background job, which runs only where it gets its own process group
 #[test]
 fn round_baseline_returns_at_once_and_leaves_the_live_tree_alone() {
     if tools_missing() {
@@ -874,6 +920,7 @@ fn round_baseline_returns_at_once_and_leaves_the_live_tree_alone() {
 
 /// An edit already in the tree does not reach the base suite: it runs in a
 /// detached worktree of HEAD, which the record names.
+#[cfg(unix)] // asserts the background job, which runs only where it gets its own process group
 #[test]
 fn round_baseline_on_a_dirty_tree_records_the_green_base() {
     if tools_missing() {
@@ -901,6 +948,7 @@ fn round_baseline_on_a_dirty_tree_records_the_green_base() {
 
 /// A second start while the job runs attaches to it; once it is done the
 /// record is reused.
+#[cfg(unix)] // asserts attaching to the background job, which runs only where it gets its own process group
 #[test]
 fn round_baseline_attaches_to_a_running_job_then_reuses_its_record() {
     if tools_missing() {
@@ -908,7 +956,7 @@ fn round_baseline_attaches_to_a_running_job_then_reuses_its_record() {
     }
     let root = temp_dir("attach");
     let dir = committed(&root.0);
-    let envs = round("sleep 3");
+    let envs = round("sleep 10");
     let first = run_script(BASELINE, &dir, &project_state(&dir), &envs);
     let key = str_field(&first, "baseline_key").to_string();
     let pid = job_status(&dir, &key)["pid"].clone();
@@ -929,6 +977,7 @@ fn round_baseline_attaches_to_a_running_job_then_reuses_its_record() {
 
 /// A red command while the base suite still runs waits for it, and a
 /// failure the base shares is pre-existing.
+#[cfg(unix)] // asserts waiting on the background job, which runs only where it gets its own process group
 #[test]
 fn round_red_run_while_pending_waits_and_classifies_pre_existing() {
     if tools_missing() {
@@ -1007,6 +1056,7 @@ fn round_killed_job_reruns_only_the_red_command_at_the_base() {
 
 /// A base suite still running at the lap's deadline leaves a red command
 /// unclassified, which is red, never passed.
+#[cfg(unix)] // asserts the deadline of the background job, which runs only where it gets its own process group
 #[test]
 fn round_deadline_while_pending_leaves_red_unclassified() {
     if tools_missing() {
@@ -1157,8 +1207,11 @@ fn round_base_job_waits_for_the_selected_commands_under_build_lock() {
         .args(["+x", path_str(&wrapper)])
         .status()
         .unwrap();
+    // run_gate evals build_lock as shell words, which would drop the
+    // backslashes of a Windows path.
+    let lock = path_str(&wrapper).replace('\\', "/");
     let mut envs = round("true");
-    envs.push(("LLM_AGENT_VAR_BUILD_LOCK", path_str(&wrapper)));
+    envs.push(("LLM_AGENT_VAR_BUILD_LOCK", &lock));
     let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
     assert_eq!(
         str_field(&base, "baseline_mode"),
@@ -1176,11 +1229,16 @@ fn round_base_job_waits_for_the_selected_commands_under_build_lock() {
     );
     assert_eq!(str_field(&out, "tests_verdict"), "passed", "{out}");
     let report = str_field(&out, "baseline_report");
+    if !cfg!(unix) {
+        // The deferred job needs its own process group, so none starts here.
+        assert!(
+            last_line(report).starts_with("Baseline mode: lazy ("),
+            "{report}"
+        );
+        return;
+    }
     assert!(
-        report.contains(&format!(
-            "Base suite runs under build_lock `{}`",
-            wrapper.display()
-        )),
+        report.contains(&format!("Base suite runs under build_lock `{lock}`")),
         "{report}"
     );
     assert_eq!(
@@ -1197,19 +1255,15 @@ fn round_base_job_waits_for_the_selected_commands_under_build_lock() {
         .into_string()
         .unwrap();
     let record = await_base(&dir, &key);
-    assert_eq!(
-        str_field(&record, "lock_prefix"),
-        path_str(&wrapper),
-        "{record}"
-    );
+    assert_eq!(str_field(&record, "lock_prefix"), lock, "{record}");
     let ran = lines(&log);
     assert_eq!(ran.len(), 2, "{ran:?}");
     assert!(!ran[0].contains("coyote-base-"), "{ran:?}");
     assert!(ran[1].contains("coyote-base-"), "{ran:?}");
 }
 
-/// A record the job of a linked worktree stored is in the common git dir,
-/// so the main worktree reuses it.
+/// A base record taken from a linked worktree is in the common git dir, so
+/// the main worktree reuses it.
 #[test]
 fn round_record_from_a_linked_worktree_is_reused_by_the_main_one() {
     if tools_missing() {
@@ -1225,31 +1279,14 @@ fn round_record_from_a_linked_worktree_is_reused_by_the_main_one() {
     let envs = round("true");
     let out = run_script(BASELINE, &linked, &project_state(&linked), &envs);
     let key = str_field(&out, "baseline_key").to_string();
-    let until = (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 60)
-        .to_string();
-    let (code, awaited) = shared_py(
-        "base_suite.py",
-        &[
-            "await",
-            "--root",
-            path_str(&linked),
-            "--key",
-            &key,
-            "--until",
-            &until,
-        ],
-    );
-    assert_eq!(code, Some(0), "{awaited}");
+    settle_base(&linked, &out, "true");
     let common = fs::canonicalize(main.join(".git"))
         .unwrap()
         .join("coyote-baselines");
     assert!(
-        Path::new(str_field(&awaited, "record")).starts_with(&common),
-        "{awaited}"
+        common.join(format!("tests-{key}.json")).is_file(),
+        "no record for {key} in {}",
+        common.display()
     );
     let reused = run_script(BASELINE, &main, &project_state(&main), &envs);
     assert_eq!(str_field(&reused, "baseline_mode"), "reused", "{reused}");
@@ -1361,7 +1398,7 @@ fn round_red_command_is_judged_at_the_fixed_base_after_head_moves() {
     let cmd = "if [ -e broken.txt ]; then printf 'test known ... FAILED\\n'; exit 101; fi";
     let envs = round(cmd);
     let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
-    let record = await_base(&dir, str_field(&base, "baseline_key"));
+    let record = settle_base(&dir, &base, cmd);
     assert_eq!(str_field(&record, "status"), "green", "{record}");
     commit_file(&dir, "broken.txt");
     let out = run_script(
@@ -1401,7 +1438,7 @@ fn round_drops_selected_commands_holding_line_breaks() {
         "{out}"
     );
     assert!(!dir.join("forged.txt").exists(), "a dropped command ran");
-    await_base(&dir, str_field(&base, "baseline_key"));
+    settle_base(&dir, &base, "true");
 }
 
 /// Neither a lap's selected commands nor the base suite job see the agent's
@@ -1419,7 +1456,7 @@ fn round_commands_and_the_base_job_run_without_agent_variables() {
     let mut envs = round(&base_cmd);
     envs.push(("LLM_AGENT_VAR_TEST_TIMEOUT", "120"));
     let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
-    await_base(&dir, str_field(&base, "baseline_key"));
+    settle_base(&dir, &base, &base_cmd);
     let lap = format!("env > '{}'", lap_env.display());
     let out = run_script(
         VERIFY_TESTS,
@@ -1608,31 +1645,89 @@ fn base_run_stores_nothing_from_a_vanished_or_symlinked_worktree() {
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
 }
 
-/// base_suite.py imports and kills nothing where the platform has no
-/// process groups.
+/// Where the platform has no process groups, base_suite.py imports and kills
+/// nothing, and the round tier starts no job: baseline_tests and a deferred
+/// start in verify_tests report the lazy mode with the reason. A
+/// sitecustomize strips the process group calls, so unix runs the branch
+/// Windows takes.
 #[test]
 fn base_suite_imports_without_process_groups() {
     if tools_missing() {
         return;
     }
-    let program = "import json, os, signal, sys\n\
-        for name in ('getpgid', 'killpg'):\n    delattr(os, name)\n\
-        del signal.SIGKILL\n\
+    let root = temp_dir("no-groups");
+    let dir = committed(&root.0);
+    let site = root.0.join("site");
+    fs::create_dir_all(&site).unwrap();
+    fs::write(
+        site.join("sitecustomize.py"),
+        "import os, signal\n\
+         for name in ('getpgid', 'killpg'):\n    if hasattr(os, name):\n        delattr(os, name)\n\
+         if hasattr(signal, 'SIGKILL'):\n    del signal.SIGKILL\n",
+    )
+    .unwrap();
+    let program = "import json, sys\n\
         sys.path.insert(0, sys.argv[1])\n\
         import base_suite\n\
         base_suite.kill_group(999999999)\n\
-        print(json.dumps(base_suite.own_group()))";
+        print(json.dumps([base_suite.own_group(), base_suite.start(sys.argv[2], 'true')]))";
     let output = scrubbed(Path::new("python3"))
         .args(["-B", "-c", program])
         .arg(asset(".shared"))
+        .arg(&dir)
+        .env("PYTHONPATH", &site)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("spawn python3");
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    let reason =
+        "this platform has no process groups, so the base suite cannot run as a background job";
     assert_eq!(
         parse("base_suite import", &output),
-        Value::Null,
+        json!([null, {
+            "key": head_key(&dir, "true"),
+            "base": head,
+            "mode": "lazy",
+            "state": "unsupported",
+            "error": reason,
+        }]),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!store(&dir).join("jobs").exists(), "a job was claimed");
+
+    let site = path_str(&site);
+    let mut envs = round("true");
+    envs.extend([("PYTHONPATH", site), ("PYTHONDONTWRITEBYTECODE", "1")]);
+    let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    let mode = format!("lazy ({reason})");
+    assert_eq!(str_field(&base, "baseline_mode"), mode, "{base}");
+    assert!(
+        str_field(&base, "baseline_note").starts_with("No background base suite was started"),
+        "{base}"
+    );
+    assert!(!store(&dir).join("jobs").exists(), "a job was claimed");
+
+    envs.push(("LLM_AGENT_VAR_BUILD_LOCK", "env"));
+    let deferred = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    let out = run_script(
+        VERIFY_TESTS,
+        &dir,
+        &lap_state(&dir, &deferred, &["true"], &[]),
+        &envs,
+    );
+    assert_eq!(str_field(&out, "tests_verdict"), "passed", "{out}");
+    assert_eq!(str_field(&out, "baseline_mode"), mode, "{out}");
+    let report = str_field(&out, "baseline_report");
+    assert!(
+        report.contains(&format!("No background base suite was started ({reason})")),
+        "{report}"
+    );
+    assert!(
+        !report.contains("Base suite runs under build_lock"),
+        "{report}"
+    );
+    assert!(!store(&dir).join("jobs").exists(), "a job was claimed");
 }
 
 /// cancel kills the live base suite jobs started from this worktree and
@@ -1741,10 +1836,10 @@ fn impact_facts_reports_every_section_for_a_changed_source_file() {
     let suite: Vec<&str> = sections[3].lines().collect();
     assert_eq!(suite[0], "Full test command and base suite:", "{facts}");
     assert_eq!(suite[1], "  command: run-suite", "{facts}");
-    assert!(
-        suite[2].starts_with("  runs in: ") && suite[2].ends_with("/proj"),
-        "{facts}"
-    );
+    let runs_in = suite[2]
+        .strip_prefix("  runs in: ")
+        .unwrap_or_else(|| panic!("{facts}"));
+    assert!(Path::new(runs_in).ends_with("proj"), "{facts}");
     assert_eq!(
         &suite[3..],
         [
@@ -1776,7 +1871,11 @@ fn round_unreadable_status_or_record_is_never_green() {
     fs::create_dir_all(&job).unwrap();
     fs::write(job.join("status.json"), "{not json").unwrap();
     let base = run_script(BASELINE, &dir, &project_state(&dir), &envs);
-    assert_eq!(str_field(&base, "baseline_mode"), "lazy", "{base}");
+    let mode = str_field(&base, "baseline_mode");
+    assert!(
+        mode == "lazy" || (!cfg!(unix) && mode.starts_with("lazy (")),
+        "{base}"
+    );
     fs::write(dir.join("broken.txt"), "edit").unwrap();
     let out = run_script(
         VERIFY_TESTS,

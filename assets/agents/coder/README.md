@@ -255,6 +255,8 @@ the untouched tree and the whole test command every lap.
   The job keeps its state in
   `$(git rev-parse --git-common-dir)/coyote-baselines/jobs/<key>/status.json`
   and writes its record where `full` runs do.
+  The job needs process groups; without them (Windows) no job starts and the
+  round tier runs the lazy baseline, reported as `Baseline mode: lazy (...)`.
 - After `verify_build`, `impact_facts` gathers the changed paths since the
   base, the test files that mention a changed file's stem or sit beside it,
   the full test command with the base suite's duration, and the previous

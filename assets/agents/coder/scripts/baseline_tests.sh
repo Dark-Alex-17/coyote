@@ -173,8 +173,13 @@ if [[ $(gate_verify_tier) == "round" ]]; then
       BASELINE_NOTE="The baseline is pending: the base suite runs in the background in a detached worktree at $short_base, and failures are classified against it when a test goes red."
       ;;
     lazy)
-      BASELINE_MODE=lazy
-      BASELINE_NOTE="The background base suite at $short_base did not finish ($error); a red test is re-run at the base when it needs classifying."
+      if [[ $(jq -r '.state // ""' <<<"$started") == unsupported ]]; then
+        BASELINE_MODE="lazy ($error)"
+        BASELINE_NOTE="No background base suite was started at $short_base ($error); a red test is re-run at the base when it needs classifying."
+      else
+        BASELINE_MODE=lazy
+        BASELINE_NOTE="The background base suite at $short_base did not finish ($error); a red test is re-run at the base when it needs classifying."
+      fi
       ;;
     *)
       BASELINE_MODE=none

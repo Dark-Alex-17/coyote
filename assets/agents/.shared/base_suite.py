@@ -16,6 +16,8 @@ A lazy run takes the same claim, so two callers never run the same command
 at the same base at once; one that loses to a dead job runs unclaimed. A job
 is alive while its pid exists and its heartbeat is under STALE_SECS old, so
 a reused pid does not keep a dead job alive.
+Where the platform has no process groups (Windows) no job is started: start
+reports the lazy mode and why, and callers re-run what they need at the base.
 Each run gets its own 0700 worktree directory (mkdtemp) under
 `coyote-baselines/worktrees/`; nothing outside that directory is ever
 removed, and a run whose worktree vanished stores no record.
@@ -58,7 +60,20 @@ CLAIM_GRACE_SECS = 60
 AWAIT_POLL_SECS = 2
 LIVE = ("claimed", "running")
 KILLED_ERROR = "the job process is gone and left no record"
+NO_GROUPS_ERROR = "this platform has no process groups, so the base suite cannot run as a background job"
 AGENT_VAR_PREFIX = "LLM_AGENT_VAR_"
+
+
+def bash_program():
+    """The first bash on PATH outside System32.
+
+    Windows resolves a bare `bash` in System32 before PATH, and that bash is
+    the WSL launcher, not the Git Bash the gate scripts run under."""
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        found = shutil.which("bash", path=directory) if directory else None
+        if found and "system32" not in found.replace("\\", "/").lower().split("/"):
+            return found
+    return "bash"
 
 
 def git(root, *args, timeout=GIT_SECS):
@@ -168,6 +183,8 @@ def write_status(root, key, status):
 def pid_alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -177,6 +194,36 @@ def pid_alive(pid):
     except OSError:
         return False
     return True
+
+
+def _windows_pid_alive(pid):
+    """Asks Windows whether `pid` is running; os.kill there would terminate it."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    process_query_limited_information = 0x1000
+    error_access_denied = 5
+    still_active = 259
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def has_process_groups():
+    return hasattr(os, "killpg") and hasattr(os, "getpgid")
 
 
 def _age(stamp):
@@ -367,6 +414,8 @@ def start(root, cmd, floor="", timeout=0, base=""):
         return {**out, "mode": "reused", "record": record}
     if corrupt:
         return {**out, "mode": "none", "error": f"the stored baseline {corrupt} cannot be read"}
+    if not has_process_groups():
+        return {**out, "mode": "lazy", "state": "unsupported", "error": NO_GROUPS_ERROR}
     directory = job_dir(root, key)
     os.makedirs(os.path.dirname(directory), exist_ok=True)
     try:
@@ -403,7 +452,7 @@ def classify(output_file):
         'gate_failing_tests "$2" | jq -Rnc --arg h "$hash" --arg r "$reason" '
         "'{ids: [inputs | select(. != \"\")], hash: $h, reason: $r}'"
     )
-    r = subprocess.run(["bash", "-c", script, "classify", GATE_LIB, output_file],
+    r = subprocess.run([bash_program(), "-c", script, "classify", GATE_LIB, output_file],
                        capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise RuntimeError(f"the failures could not be read: {r.stderr.strip()[:300]}")
@@ -418,7 +467,7 @@ def run_command(cwd, cmd, timeout, output_file, lock_prefix, on_spawn=None, on_t
     env = agent_free_env(GATE_BASE_CMD=cmd, GATE_BASE_LOCK=lock_prefix)
     with open(output_file, "wb") as out:
         proc = subprocess.Popen(
-            ["bash", "-c",
+            [bash_program(), "-c",
              'source "$1"; source "$2"; LLM_AGENT_VAR_BUILD_LOCK=$GATE_BASE_LOCK; unset GATE_BASE_LOCK; '
              '(cd "$3" && run_gate "$GATE_BASE_CMD")',
              "base-suite", UTILS, GATE_LIB, cwd],

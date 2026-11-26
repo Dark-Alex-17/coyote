@@ -493,6 +493,8 @@ const OUTLIVES_DEADLINE: &str =
 /// grandchild is dead, and neither it nor the step after it wrote a file.
 /// The 30 s bound is half the sleep, so a loaded host cannot trip it while
 /// an ignored deadline still does.
+/// Where the grandchild's death cannot be probed (no recorded pid, or no
+/// `kill -0`), the check waits past its write point before looking for files.
 fn assert_cut_short(label: &str, dir: &Path, started: Instant) {
     let elapsed = started.elapsed();
     assert!(
@@ -500,12 +502,32 @@ fn assert_cut_short(label: &str, dir: &Path, started: Instant) {
         "{label}: the deadline did not cut the gate short ({elapsed:?})"
     );
     let pid_file = dir.join("grandchild.pid");
-    let pid = fs::read_to_string(&pid_file)
-        .unwrap_or_else(|e| panic!("{label}: the grandchild never started: {e}"));
-    let pid = pid.trim().to_string();
+    let probed = match fs::read_to_string(&pid_file) {
+        Ok(pid) => {
+            fs::remove_file(&pid_file).unwrap();
+            grandchild_died(label, pid.trim())
+        }
+        Err(_) => false,
+    };
+    if !probed {
+        let past_write = Duration::from_secs(65);
+        if let Some(rest) = past_write.checked_sub(started.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
+    for file in ["after.txt", "late.txt"] {
+        assert!(
+            !dir.join(file).exists(),
+            "{label}: {file} was written after the deadline"
+        );
+    }
+}
+
+#[cfg(unix)] // the gate kills its whole process group, so the grandchild must die with it
+fn grandchild_died(label: &str, pid: &str) -> bool {
     let gone = Instant::now();
     while Command::new("kill")
-        .args(["-0", &pid])
+        .args(["-0", pid])
         .output()
         .is_ok_and(|o| o.status.success())
     {
@@ -515,13 +537,12 @@ fn assert_cut_short(label: &str, dir: &Path, started: Instant) {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    for file in ["after.txt", "late.txt"] {
-        assert!(
-            !dir.join(file).exists(),
-            "{label}: {file} was written after the deadline"
-        );
-    }
-    fs::remove_file(pid_file).unwrap();
+    true
+}
+
+#[cfg(not(unix))] // no process groups or kill -0 to probe the grandchild with
+fn grandchild_died(_label: &str, _pid: &str) -> bool {
+    false
 }
 
 /// A gate that outlives its deadline is killed with its whole process group

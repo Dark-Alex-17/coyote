@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SHARED = os.path.join(HERE, "..", "..", ".shared")
 sys.path.insert(0, SHARED)
 
-from base_suite import find_record  # noqa: E402
+from base_suite import bash_program, find_record  # noqa: E402
 from diff_signals import TESTS_RE  # noqa: E402
 
 MAX_ITEMS = 20
@@ -46,7 +46,7 @@ def gate_facts(state):
         'jq -nc --arg dir "$dir" --arg cmd "$cmd" \'{dir: $dir, cmd: $cmd}\''
     )
     r = subprocess.run(
-        ["bash", "-c", script, "impact-facts", os.path.join(SHARED, "utils.sh"),
+        [bash_program(), "-c", script, "impact-facts", os.path.join(SHARED, "utils.sh"),
          os.path.join(HERE, "gate_lib.sh"), json.dumps(state)],
         capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
     )
