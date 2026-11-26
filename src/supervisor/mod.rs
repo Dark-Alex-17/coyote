@@ -434,6 +434,24 @@ impl Supervisor {
         }
     }
 
+    /// The supervisor under `root`, at any depth, whose own handles hold
+    /// `id`. Each read lock is released before the walk goes a level
+    /// deeper, and none is held on return.
+    pub fn owner_of(root: &Arc<RwLock<Supervisor>>, id: &str) -> Option<Arc<RwLock<Supervisor>>> {
+        let children: Vec<Arc<RwLock<Supervisor>>> = {
+            let sup = root.read();
+            if sup.handles.contains_key(id) {
+                return Some(Arc::clone(root));
+            }
+            sup.agents()
+                .filter_map(|agent| agent.child_supervisor.clone())
+                .collect()
+        };
+        children
+            .iter()
+            .find_map(|child| Supervisor::owner_of(child, id))
+    }
+
     /// How many agents and how many jobs are `Running`, as `task_snapshot`
     /// reports it, here and in every agent's child supervisor below.
     pub fn running_counts(&self) -> (usize, usize) {
@@ -901,6 +919,42 @@ mod tests {
             ]
         );
         assert_eq!(sup.task_snapshot().len(), 1);
+    }
+
+    /// The owner search reaches every child supervisor below the root
+    /// and names the one whose handles hold the id.
+    #[test]
+    fn owner_of_finds_the_supervisor_holding_a_task_at_any_depth() {
+        let grandchild_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
+        grandchild_sup
+            .write()
+            .register(make_handle("a_grandchild", "explore", 3))
+            .unwrap();
+        let child_sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+        ));
+        let mut middle = make_handle("a_middle", "explore", 2);
+        middle.child_supervisor = Some(Arc::clone(&grandchild_sup));
+        child_sup.write().register(middle).unwrap();
+        child_sup
+            .write()
+            .register(make_job("j_middle", create_abort_signal()))
+            .unwrap();
+        let root = Arc::new(RwLock::new(Supervisor::new(4, 3)));
+        let mut top = make_handle("a_top", "explore", 1);
+        top.child_supervisor = Some(Arc::clone(&child_sup));
+        root.write().register(top).unwrap();
+
+        let owner = |id: &str| Supervisor::owner_of(&root, id);
+        assert!(Arc::ptr_eq(&owner("a_top").unwrap(), &root));
+        assert!(Arc::ptr_eq(&owner("j_middle").unwrap(), &child_sup));
+        assert!(Arc::ptr_eq(&owner("a_middle").unwrap(), &child_sup));
+        assert!(Arc::ptr_eq(
+            &owner("a_grandchild").unwrap(),
+            &grandchild_sup
+        ));
+        assert!(owner("a_unknown").is_none());
+        assert!(root.try_write().is_some(), "a lock is still held");
     }
 
     #[test]

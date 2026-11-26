@@ -12,7 +12,7 @@ use crate::config::RequestContext;
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
 use crate::events::NoticeKind;
 use crate::repl::{EXIT_CANCEL_WAIT, run_repl_command};
-use crate::supervisor::{TaskKind, TaskRow, TaskRowStatus};
+use crate::supervisor::{Supervisor, TaskKind, TaskRow, TaskRowStatus};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{AbortSignal, wait_abort_signal};
 use anyhow::Result;
@@ -214,14 +214,26 @@ pub(super) enum ControlRequest {
 
 /// The fork of the control context a roster cancel runs on: it carries
 /// the child session root the UI holds, so cancelling a child the running
-/// turn spawned finishes that child's record under the right root.
+/// turn spawned finishes that child's record under the right root, and
+/// the supervisor that holds task `id`, which for a task a spawned agent
+/// started is that agent's child supervisor rather than the root one.
+/// `agent__cancel` and `job__cancel` only look in the supervisor they
+/// are handed; a model's call is kept to its own children.
 pub(super) fn cancel_context(
     control: &RequestContext,
+    id: &str,
     child_root: Option<Arc<ChildSessionRoot>>,
 ) -> RequestContext {
     let mut ctx = control.fork_for_branch();
     if child_root.is_some() {
         ctx.child_session_root = child_root;
+    }
+    if let Some(owner) = ctx
+        .supervisor
+        .as_ref()
+        .and_then(|root| Supervisor::owner_of(root, id))
+    {
+        ctx.supervisor = Some(owner);
     }
     ctx
 }
@@ -240,7 +252,7 @@ pub(super) fn spawn_control_request(
             kind,
             child_root,
         } => {
-            let mut ctx = cancel_context(&control, child_root);
+            let mut ctx = cancel_context(&control, &id, child_root);
             tasks.spawn(async move {
                 let args = serde_json::json!({ "id": id });
                 let result = catch_cancel(async {

@@ -3,6 +3,7 @@ use crate::tui::control::{
     cancel_context, catch_cancel, catch_child_load, settle_control_tasks, spawn_exit,
 };
 use crate::tui::run_loop::{EXIT_TEARDOWN_WAIT, Join, join_unattended};
+use crate::utils::AbortSignal;
 
 /// The exit waits for control tasks only up to its bound: one that
 /// finishes in time is joined, one that never does is aborted, and
@@ -326,6 +327,175 @@ fn x_cancels_a_running_job_and_refuses_a_finished_agent() {
     });
 }
 
+/// The tasks under `agent_lead_1a2b`'s child supervisor: a running job,
+/// a running agent whose task ends when it is aborted, and a finished
+/// agent. Returns the root supervisor, the child one and the two abort
+/// signals.
+fn nested_tasks() -> (
+    Arc<parking_lot::RwLock<crate::supervisor::Supervisor>>,
+    Arc<parking_lot::RwLock<crate::supervisor::Supervisor>>,
+    AbortSignal,
+    AbortSignal,
+) {
+    use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+    let job = running_job("job-n4q");
+    let job_signal = job.abort_signal.clone();
+    let agent_signal = create_abort_signal();
+    let watched = agent_signal.clone();
+    let lead_sup = supervisor();
+    lead_sup.write().register(job).unwrap();
+    lead_sup
+        .write()
+        .register(AgentHandle {
+            abort_signal: agent_signal.clone(),
+            join_handle: tokio::spawn(async move {
+                while !watched.aborted() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(AgentResult {
+                    id: "agent_review_2b3c".to_string(),
+                    agent_name: "review".to_string(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                    session_id: None,
+                })
+            }),
+            ..agent_named("agent_review_2b3c", "review", Some("review-n4q"))
+        })
+        .unwrap();
+    lead_sup
+        .write()
+        .register(finished_agent("agent_done_4d5e"))
+        .unwrap();
+    let tasks = supervisor();
+    tasks
+        .write()
+        .register(AgentHandle {
+            child_supervisor: Some(Arc::clone(&lead_sup)),
+            ..agent_named("agent_lead_1a2b", "lead", None)
+        })
+        .unwrap();
+    (tasks, lead_sup, job_signal, agent_signal)
+}
+
+/// Opens the tasks pop-up if it is closed and moves the focus down to
+/// the row `id`.
+fn focus_task(harness: &mut Harness, id: &str) {
+    if harness.app.roster().is_none() {
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+    }
+    harness.draw();
+    for _ in 0..8 {
+        if harness.app.focused_task().is_some_and(|task| task.id == id) {
+            return;
+        }
+        harness.press(KeyCode::Char('j'));
+    }
+    panic!("no row {id} in {}", harness.draw());
+}
+
+/// `x` on a job or an agent run by a spawned agent's own supervisor
+/// cancels it there: the cancel goes to the supervisor that holds it,
+/// not to the root one, which does not.
+#[test]
+#[serial]
+fn x_cancels_a_running_job_and_agent_under_a_spawned_agent() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-roster-cancel-nested");
+        let mut ctx = chat_ctx();
+        let (tasks, lead_sup, job_signal, agent_signal) = nested_tasks();
+        ctx.supervisor = Some(tasks);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+
+        focus_task(&mut harness, "job-n4q");
+        harness.press(KeyCode::Char('x'));
+        run_control_requests(&mut harness).await;
+        assert!(job_signal.aborted());
+        assert!(!lead_sup.read().has_job("job-n4q"));
+
+        focus_task(&mut harness, "agent_review_2b3c");
+        harness.press(KeyCode::Char('x'));
+        run_control_requests(&mut harness).await;
+        assert!(agent_signal.aborted());
+        assert!(!lead_sup.read().has_agent("agent_review_2b3c"));
+
+        harness.press(KeyCode::Esc);
+        let frame = harness.draw();
+        assert!(frame.contains("Cancelled job-n4q"), "{frame}");
+        assert!(frame.contains("Cancelled agent 'review'"), "{frame}");
+        assert!(!frame.contains("refused"), "{frame}");
+    });
+}
+
+/// `x` on a finished row under a spawned agent is refused with the
+/// notice and sends no cancel.
+#[test]
+#[serial]
+fn x_refuses_a_finished_task_under_a_spawned_agent() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-roster-cancel-nested-done");
+        let mut ctx = chat_ctx();
+        let (tasks, lead_sup, _, _) = nested_tasks();
+        while lead_sup.read().is_finished("agent_done_4d5e") != Some(true) {
+            tokio::task::yield_now().await;
+        }
+        ctx.supervisor = Some(tasks);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+
+        focus_task(&mut harness, "agent_done_4d5e");
+        harness.press(KeyCode::Char('x'));
+        assert!(harness.app.take_control_requests().is_empty());
+        assert!(lead_sup.read().has_agent("agent_done_4d5e"));
+        harness.press(KeyCode::Esc);
+        let frame = harness.draw();
+        assert!(
+            frame.contains("Task agent_done_4d5e has finished; there is nothing to cancel"),
+            "{frame}"
+        );
+    });
+}
+
+/// `o` on an agent under a spawned agent opens that agent's thread, and
+/// `t` with such a row focused opens the threads pop-up.
+#[test]
+#[serial]
+fn o_and_t_work_on_a_row_under_a_spawned_agent() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-roster-open-nested");
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 7 }));
+        let (tasks, _, _, _) = nested_tasks();
+        ctx.supervisor = Some(tasks);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+
+        focus_task(&mut harness, "agent_review_2b3c");
+        harness.press(KeyCode::Char('o'));
+        assert!(harness.app.pager().is_some_and(|pager| !pager.shows_root()));
+        let requests = harness.app.take_control_requests();
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [ControlRequest::LoadChild { session_id, .. }] if session_id == "review-n4q"
+            ),
+            "{requests:?}"
+        );
+        harness.draw();
+        harness.press(KeyCode::Char('q'));
+        assert_eq!(
+            harness.app.focused_task().map(|task| task.id).as_deref(),
+            Some("agent_review_2b3c")
+        );
+
+        harness.press(KeyCode::Char('t'));
+        let frame = harness.draw();
+        assert!(frame.contains("Enter open  Esc back"), "{frame}");
+        assert!(frame.contains("Threads"), "{frame}");
+    });
+}
+
 /// A focused row that leaves the roster takes the focus with it: `x`
 /// then cancels nothing until a move picks a row.
 #[test]
@@ -395,9 +565,13 @@ fn a_roster_cancel_runs_with_the_child_root_the_turn_reported() {
         assert_eq!(child_root.as_deref(), Some(&*root));
         let control = harness.app.control.clone().expect("a control context");
         assert!(control.child_session_root.is_none());
-        let fork = cancel_context(&control, child_root.clone());
+        let fork = cancel_context(&control, "job_0a1b2c3d", child_root.clone());
         assert_eq!(fork.child_session_root.as_deref(), Some(&*root));
-        assert!(cancel_context(&control, None).child_session_root.is_none());
+        assert!(
+            cancel_context(&control, "job_0a1b2c3d", None)
+                .child_session_root
+                .is_none()
+        );
     });
 }
 
