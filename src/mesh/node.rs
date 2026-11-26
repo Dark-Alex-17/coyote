@@ -1114,6 +1114,14 @@ impl MeshRuntime {
             }
         }
         let self_trust_granted = seed_own_grant(&trust, &fingerprint, minted);
+        // A sibling session sharing this home may have filed the farewell of this
+        // session's previous run; this session is here, so its own row is never left.
+        if peers.clear_left(&hash.to_hex_string()) {
+            debug!(
+                "Mesh cleared the farewell filed for this session's own destination {}; it has joined again",
+                short(&hash.to_hex_string())
+            );
+        }
         debug!(
             "Started mesh node {} (instance {instance_id}) as destination {}",
             short(&fingerprint),
@@ -4706,8 +4714,9 @@ fn reconcile_tcp_after_lag(
 /// of the host's addresses, leaves everyone who knew this session unable to reach it.
 /// What it sees is settled into one transition (`TransitionSettle`, reading every
 /// `SETTLE_READ` until `GREETING_DEBOUNCE` passes with nothing new), which is greeted
-/// once through `greet`, every transition sharing one budget of
-/// `RECONNECT_GREETINGS_PER_HOUR`. Each sighting marks the paths over what changed and
+/// once: an upstream reconnect through `greet`, every one sharing one budget of
+/// `RECONNECT_GREETINGS_PER_HOUR`, and a change of the host's addresses outside it
+/// (`greet_upstream_change`). Each sighting marks the paths over what changed and
 /// asks return home's destinations at once, each once per transition, and a LAN that
 /// reaches hosts again asks the same way (`LanPresence`). Each transition is recorded on
 /// the node (`interface_transitions`).
@@ -4918,15 +4927,33 @@ async fn greet(
     }
 }
 
-/// Greets once for one poll's `change`, however many transitions it holds, and tells the
-/// user on one idle line; a node that does not announce sends and tells nothing.
+/// `greet` outside any budget, for a move of this host's network.
+async fn greet_uncapped(runtime: &MeshRuntime) -> ReconnectGreeting {
+    if !runtime.announce {
+        return ReconnectGreeting::NodeDoesNotAnnounce;
+    }
+    match runtime.announce_on_connect().await {
+        Ok(()) => ReconnectGreeting::Announced,
+        Err(err) => ReconnectGreeting::Failed(err),
+    }
+}
+
+/// Greets once for one settled transition's `change`, however many interfaces it holds,
+/// and tells the user on one idle line; a node that does not announce sends and tells
+/// nothing. Only an upstream reconnect takes from `budget`: a change of this host's
+/// addresses is a move, after which nobody reaches this session until it announces, and
+/// the debounce already bounds it to one greeting per `GREETING_DEBOUNCE`.
 async fn greet_upstream_change(
     runtime: &MeshRuntime,
     slot: &MeshSlot,
     budget: &mut GreetingBudget,
     change: &UpstreamChange,
 ) {
-    let greeting = greet(runtime, budget, Instant::now()).await;
+    let greeting = if change.network_changed.is_empty() {
+        greet(runtime, budget, Instant::now()).await
+    } else {
+        greet_uncapped(runtime).await
+    };
     let Some(line) = upstream_line(change, &greeting) else {
         debug!("Mesh saw {change:?}; this session does not announce, so nothing was sent");
         return;
@@ -5813,6 +5840,8 @@ pub(crate) struct MeshSlot {
     last_progress_capture: parking_lot::Mutex<Option<tokio::time::Instant>>,
     pending_progress: parking_lot::Mutex<Option<MeshSnapshot>>,
     trailing_armed: AtomicBool,
+    /// A farewell for this session's own destination was ignored and logged once.
+    own_farewell_told: AtomicBool,
     digest_hook: ArcSwapOption<Arc<dyn MeshDigestHook>>,
     #[cfg(test)]
     progress_without_node: bool,
@@ -8213,6 +8242,15 @@ impl PeerSurface for MeshSlot {
             return;
         };
         let dest8 = short(&farewell.source_destination).to_string();
+        if farewell.source_destination == runtime.current_destination_hash() {
+            if !self.own_farewell_told.swap(true, Ordering::AcqRel) {
+                debug!(
+                    "Mesh farewell {} for this session's own destination {dest8} ignored: this session is running",
+                    farewell.message_id
+                );
+            }
+            return;
+        }
         let time = match farewell.via {
             PeerVia::Direct => FarewellTime::Arrived(farewell.received_at),
             PeerVia::StoreAndForward => FarewellTime::Stamped(farewell.sent_at),
@@ -16442,6 +16480,67 @@ mod tests {
         runtime.shutdown().await.unwrap();
     }
 
+    /// A session that joins again under its own destination, in a home whose peer table a
+    /// running sibling filed that destination's farewell in, finds its own row not left;
+    /// a farewell for its own destination heard while it runs changes nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_never_reads_its_own_farewell() {
+        let relay = TransportRelay::start().await;
+        let mut started =
+            crate::mesh::test_support::started_runtime_on("node-own-farewell", relay.port).await;
+        let first = started.runtime.clone();
+        let own = first.current_destination_hash();
+        let sighting = first.own_session_sighting(&first.current_instance_id(), "me");
+        first
+            .peers()
+            .observe(sighting, SystemTime::now() - Duration::from_secs(600));
+        assert_eq!(
+            first.peers().mark_left(
+                &own,
+                FarewellTime::Arrived(SystemTime::now() - Duration::from_secs(60))
+            ),
+            LeftMark::Marked,
+            "the sibling filed this session's farewell"
+        );
+        first.peers().persist_if_dirty().unwrap();
+        first.shutdown().await.unwrap();
+
+        started.restart_on(relay.port).await;
+        let again = started.runtime.clone();
+        assert_eq!(
+            again.current_destination_hash(),
+            own,
+            "the same destination"
+        );
+        assert!(
+            again
+                .peers()
+                .get(&own)
+                .is_some_and(|row| row.left_at.is_none()),
+            "own row not left: {:?}",
+            again.peers().get(&own)
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(again.clone()).unwrap();
+        slot.note_farewell(Farewell {
+            message_id: "bye".to_string(),
+            source_identity: again.fingerprint().to_string(),
+            source_destination: own.clone(),
+            via: PeerVia::Direct,
+            received_at: SystemTime::now(),
+            sent_at: SystemTime::now(),
+        });
+        assert_eq!(
+            again.peers().get(&own).unwrap().left_at,
+            None,
+            "a farewell for this session while it runs is ignored"
+        );
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+    }
+
     /// A node whose only interface is `private` to a relay on this host's loopback reads
     /// the local rnsd, as a `local` node does, so its upstream watch can greet.
     #[cfg(unix)]
@@ -20486,6 +20585,58 @@ mod tests {
                 assert_eq!(announces_since(before, &hash8), usize::from(announce));
                 assert!(slot.stop().await.unwrap());
             }
+        }
+
+        /// Five roams in an hour, each after four reconnect greetings used the budget up:
+        /// every move of the host's addresses still announces and says so, and is not
+        /// taken from the budget; a reconnect alone past the cap still waits for the
+        /// heartbeat.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_address_change_greets_past_the_reconnect_cap() {
+            install_log_collector();
+            let started = started_runtime("node-upstream-move-uncapped").await;
+            let runtime = started.runtime.clone();
+            let slot = Arc::new(MeshSlot::default());
+            let notifier = Arc::new(RecordingSink::default());
+            slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+            slot.install(runtime.clone()).unwrap();
+            let hash8 = short(&runtime.current_destination_hash()).to_string();
+            let mut budget = GreetingBudget::default();
+            for _ in 0..RECONNECT_GREETINGS_PER_HOUR {
+                greet_upstream_change(&runtime, &slot, &mut budget, &reconnected()).await;
+            }
+            let before = debug_snapshot().len();
+            for _ in 0..5 {
+                greet_upstream_change(&runtime, &slot, &mut budget, &moved()).await;
+            }
+            assert_eq!(announces_since(before, &hash8), 5, "every move announced");
+            greet_upstream_change(&runtime, &slot, &mut budget, &reconnected()).await;
+            let moved_line =
+                "This host's network changed; announced so other sessions can find this one again";
+            wait_until("the five move lines", || {
+                mesh_lines(&notifier)
+                    .iter()
+                    .filter(|text| text.ends_with(moved_line))
+                    .count()
+                    == 5
+            })
+            .await;
+            wait_until("the reconnect past the cap", || {
+                mesh_lines(&notifier).iter().any(|text| {
+                    text.contains("reconnected upstream; this session already sent its 4 greetings")
+                })
+            })
+            .await;
+            assert!(
+                !mesh_lines(&notifier)
+                    .iter()
+                    .any(|text| text
+                        .contains("This host's network changed; this session already sent")),
+                "{:?}",
+                mesh_lines(&notifier)
+            );
+            assert!(slot.stop().await.unwrap());
         }
 
         /// A node that does not announce sends nothing and keeps its budget whole.

@@ -22,7 +22,7 @@ pub(crate) const UPSTREAM_POLL: Duration = Duration::from_secs(10);
 
 /// The quiet a transition needs before it is greeted: a reconnect or address change seen
 /// within this of the last one belongs to the same transition.
-pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 10;
+pub(crate) const GREETING_DEBOUNCE_SECS: u64 = 30;
 
 /// `GREETING_DEBOUNCE_SECS` as a duration.
 pub(crate) const GREETING_DEBOUNCE: Duration = Duration::from_secs(GREETING_DEBOUNCE_SECS);
@@ -872,21 +872,21 @@ mod tests {
         }
         assert!(
             settle
-                .observe(&UpstreamChange::default(), at(25))
+                .observe(&UpstreamChange::default(), at(45))
                 .settled
                 .is_none(),
-            "5 s of quiet is not yet the debounce"
+            "25 s of quiet is not yet the debounce"
         );
-        let settled = settle.observe(&UpstreamChange::default(), at(30));
+        let settled = settle.observe(&UpstreamChange::default(), at(50));
         assert!(!settled.opens);
-        let (since, change) = settled.settled.expect("10 s of quiet settles it");
+        let (since, change) = settled.settled.expect("30 s of quiet settles it");
         assert_eq!(since, at(0), "the first sighting");
         assert_eq!(change.network_changed, ["en0"]);
         assert_eq!(change.reconnected, [RELAY, PN, HUB], "each interface once");
         assert!(!settle.is_open());
         assert!(
             settle
-                .observe(&UpstreamChange::default(), at(40))
+                .observe(&UpstreamChange::default(), at(60))
                 .settled
                 .is_none(),
             "nothing is settled twice"
@@ -895,13 +895,49 @@ mod tests {
         let again = settle.observe(&reconnect(RELAY), at(600));
         assert!(again.opens, "a later switch opens a transition of its own");
         let (since, change) = settle
-            .observe(&UpstreamChange::default(), at(610))
+            .observe(&UpstreamChange::default(), at(630))
             .settled
             .unwrap();
         assert_eq!(
             (since, change.reconnected),
             (at(600), vec![RELAY.to_string()])
         );
+    }
+
+    /// The live roam: the address changes, then the upstreams it took down come back 10
+    /// and 15 s later. All of it is one transition, settled once 30 s pass with nothing new.
+    #[test]
+    fn an_address_change_and_the_reconnects_it_causes_15_s_later_are_one_transition() {
+        let start = tokio::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut settle = TransitionSettle::default();
+        let mut settled = Vec::new();
+        let readings = [
+            (
+                0,
+                UpstreamChange {
+                    reconnected: Vec::new(),
+                    network_changed: vec!["en0".to_string()],
+                },
+            ),
+            (5, UpstreamChange::default()),
+            (10, reconnect(RELAY)),
+            (15, reconnect(HUB)),
+            (20, UpstreamChange::default()),
+            (30, UpstreamChange::default()),
+            (40, UpstreamChange::default()),
+            (45, UpstreamChange::default()),
+            (55, UpstreamChange::default()),
+        ];
+        for (secs, change) in readings {
+            if let Some((_, change)) = settle.observe(&change, at(secs)).settled {
+                settled.push((secs, change));
+            }
+        }
+        assert_eq!(settled.len(), 1, "{settled:?}");
+        assert_eq!(settled[0].0, 45);
+        assert_eq!(settled[0].1.network_changed, ["en0"]);
+        assert_eq!(settled[0].1.reconnected, [RELAY, HUB]);
     }
 
     /// An upstream that keeps flapping, a change every read, is settled `SETTLE_CAP`
@@ -942,7 +978,7 @@ mod tests {
                     greetings += 1;
                 }
             }
-            for quiet in [15, 20, 25] {
+            for quiet in [15, 25, 35, 40] {
                 if settle
                     .observe(
                         &UpstreamChange::default(),
@@ -965,7 +1001,7 @@ mod tests {
     /// does.
     #[test]
     fn the_watch_reads_often_enough_for_the_debounce_and_return_home() {
-        assert_eq!(GREETING_DEBOUNCE_SECS, 10);
+        assert_eq!(GREETING_DEBOUNCE_SECS, 30);
         assert!(UPSTREAM_POLL <= Duration::from_secs(10));
         assert!(SETTLE_READ < GREETING_DEBOUNCE);
         assert!(SETTLE_CAP > GREETING_DEBOUNCE);

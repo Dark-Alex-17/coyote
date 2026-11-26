@@ -87,6 +87,13 @@ pub(crate) enum RouteFacts {
     },
 }
 
+/// When a path rnsd holds was last heard: the later of rnsd's own learn time and this
+/// node's copy's, so a path heard again after its interface came back is fresh even when
+/// rnsd keeps the time it first learned the row.
+pub(crate) fn last_heard(rnsd: SystemTime, own: Option<SystemTime>) -> SystemTime {
+    own.map_or(rnsd, |own| own.max(rnsd))
+}
+
 /// Why a path is suspect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SuspectWhy {
@@ -408,7 +415,15 @@ impl Routes<'_> {
                             .find(|state| state.name == row.interface)
                             .map(|state| state.online)
                     });
-                    let learned_at = learned_at(row.timestamp);
+                    // This node's own copy arrives with the announce rnsd passes on, which
+                    // rnsd may keep under the time it first learned the row; the later of
+                    // the two is when the path was last heard.
+                    let own = self
+                        .transport
+                        .path_interface(destination)
+                        .await
+                        .map(|path| path.learned_at);
+                    let learned_at = last_heard(learned_at(row.timestamp), own);
                     // A row whose timestamp is zero was dropped and not culled yet.
                     let changed_since = row.timestamp <= 0.0
                         || self.transitions.changed_since(&row.interface, learned_at);
@@ -1656,6 +1671,46 @@ mod rnsd_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live hub flap: the hub's interface came back, and a minute later the announce
+    /// for a session arrived. rnsd kept the row under the time it first learned it, before
+    /// the flap, but this node heard the announce after it, so the path is fresh: no
+    /// transition after it was last heard. A path last heard before the return is suspect.
+    #[test]
+    fn a_path_heard_after_its_interface_came_back_is_not_suspect() {
+        use crate::mesh::upstream::TransitionKind;
+        let hub = "TCPInterface[Public Hub/reticulum.nepamesh.com:4242]";
+        let now = SystemTime::now();
+        let transitions = InterfaceTransitions::default();
+        transitions.record(hub, TransitionKind::Down, now - Duration::from_secs(200));
+        transitions.record(hub, TransitionKind::Up, now - Duration::from_secs(60));
+        let rnsd_learned = now - Duration::from_secs(3600);
+
+        let heard = last_heard(rnsd_learned, Some(now));
+        assert_eq!(heard, now);
+        assert!(
+            !transitions.changed_since(hub, heard),
+            "heard after the return"
+        );
+
+        assert_eq!(last_heard(rnsd_learned, None), rnsd_learned);
+        assert!(
+            transitions.changed_since(hub, last_heard(rnsd_learned, None)),
+            "only heard before the return"
+        );
+        assert!(
+            transitions.changed_since(
+                hub,
+                last_heard(rnsd_learned, Some(now - Duration::from_secs(120)))
+            ),
+            "this node's copy too is from before the return"
+        );
+        assert_eq!(
+            last_heard(now, Some(rnsd_learned)),
+            now,
+            "rnsd's later time wins over an older copy"
+        );
+    }
 
     fn known(online: Option<bool>, changed_since: bool) -> RouteFacts {
         RouteFacts::Known {
