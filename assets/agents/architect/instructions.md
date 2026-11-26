@@ -540,7 +540,9 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      - "Accept NEEDS-HUMAN: proceed without the <lane or pipeline> review (recorded in the report / PR body)"
      - "Abort this task"
      Retry → a FRESH gauntlet run. Accept → close the task and record the skipped review (lane
-     names or `pipeline`) in the task's `log.md`, the Phase F digest, and the PR body. Abort →
+     names or `pipeline`) in the task's `log.md`, the Phase F digest, and the PR body; accepted at
+     the final-tier review of the run-closing hygiene pass, it also leaves the run's one full suite
+     unrun, recorded per that step's `Full suite NOT RUN at the final review:` rule. Abort →
      leave the task `in-progress`, log the abort in its `log.md`, and stop to report. Findings AND
      incomplete on the same output → fix the findings first, then re-run the gauntlet (the re-run
      retries the lane) — escalate only if the line persists.
@@ -953,6 +955,10 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
    Route findings per the Phase E rules
    (resume the SAME Sisyphus session, then a FRESH gauntlet run). Copy the `HYGIENE:` items into
    the hygiene task's `log.md` and mark it complete per Phase E step 5.
+   This review is the run's only full-suite run, so when it ends at the NEEDS-HUMAN escalation
+   and the user accepts it, write `Full suite NOT RUN at the final review: <reason>` (the lanes
+   or pipeline fault that stood, in the user's words when they gave a reason) in the hygiene
+   task's `log.md`, the PR body (step 4) and the step-9 report.
 4. **Roll up follow-ups once the final-tier review passed, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
    `feat/PLAN-<slug>` -> {{base_branch}}. Every "Follow-ups:" line from the completed tasks'
    `log.md` files -- findings tagged `(deferred by quality bar)` ride this rollup unchanged -- and
@@ -970,6 +976,8 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
      omit the section entirely when there are none,
    - a **`## Hygiene pass`** section: one line per item the hygiene pass kept (file:line, what,
      justification), or "clean" when the sweep left nothing behind,
+   - the `Full suite NOT RUN at the final review: <reason>` line from step 3, whenever the user
+     accepted NEEDS-HUMAN at the final-tier review,
    - a **`## Design decisions`** section: one line per `design-decision` entry collected from the
      completed tasks' `log.md` files (the pattern, the files it lives in, the call sites it
      touched); omit the section entirely when there are none,
@@ -1036,7 +1044,8 @@ At the current group's close-out (and, for steps 6-9, after the last group's):
 8. Run the `task-tracking` consistency checks; fix anything you introduced.
 9. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
    the follow-up TASKs created (with their WHEN), the design retrospective outcome (ran or
-   skipped and why, the refactor task, the declined items), and anything deferred/escalated.
+   skipped and why, the refactor task, the declined items), the `Full suite NOT RUN at the final
+   review: <reason>` line when step 3 wrote one, and anything deferred/escalated.
 <!-- when:escalation_policy=autonomous -->
    Include the `## Decisions taken autonomously` rollup when the escalation policy resolved
    anything.

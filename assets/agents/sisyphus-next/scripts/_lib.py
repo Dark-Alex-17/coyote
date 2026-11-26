@@ -700,14 +700,16 @@ def added_lines_since(root, base):
 
 
 def detected_test_command(root):
-    """The full test command the coder gates detect for `root`, as they run it; "" when none is detected or bash fails.
+    """(as run, as detected): the full test command the coder gates detect for `root`, after and before
+    gate_test_command_for_run rewrites it; ("", "") when none is detected or bash fails.
 
     `root` reaches bash through the environment: Git Bash on Windows re-parses its command line."""
     shared = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
     if shared not in sys.path:
         sys.path.insert(0, shared)
     import base_suite
-    script = 'source "$1"; source "$2"; gate_test_command_for_run "$(gate_test_command "$SX_TEST_ROOT")"'
+    script = ('source "$1"; source "$2"; bare=$(gate_test_command "$SX_TEST_ROOT"); '
+              'printf "%s\\0%s" "$(gate_test_command_for_run "$bare")" "$bare"')
     try:
         p = subprocess.run(
             [base_suite.bash_program(), "-c", script, "detected-test-command", base_suite.UTILS, base_suite.GATE_LIB],
@@ -715,8 +717,11 @@ def detected_test_command(root):
             env={**os.environ, "SX_TEST_ROOT": root},
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return p.stdout.strip() if p.returncode == 0 else ""
+        return "", ""
+    if p.returncode != 0:
+        return "", ""
+    run, _, bare = p.stdout.partition("\0")
+    return run.strip(), bare.strip()
 
 
 # ---------------------------------------------------------------- criterion commands

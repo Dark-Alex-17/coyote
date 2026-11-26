@@ -693,6 +693,65 @@ fn orchestrators_review_work_rounds_at_round_and_run_one_final_review() {
     );
 }
 
+/// The architect's final-tier review is the run's only full-suite run, so a
+/// NEEDS-HUMAN accepted there writes the not-run line into the hygiene log,
+/// the PR body and the closing report, and the accept rule points at it.
+#[test]
+fn architect_records_a_full_suite_not_run_at_the_final_review() {
+    const LINE: &str = "`Full suite NOT RUN at the final review: <reason>`";
+    let architect = agent_file("architect/instructions.md");
+    let section = |start: &str, end: &str| {
+        let from = architect
+            .find(start)
+            .unwrap_or_else(|| panic!("architect has {start:?}"));
+        let rest = &architect[from..];
+        flat(
+            &rest[..rest
+                .find(end)
+                .unwrap_or_else(|| panic!("{start:?} ends at {end:?}"))],
+        )
+    };
+
+    let hygiene = section(
+        "3. **Run-closing hygiene pass.**",
+        "4. **Roll up follow-ups",
+    );
+    assert!(
+        hygiene.contains(&format!(
+            "when it ends at the NEEDS-HUMAN escalation and the user accepts it, write {LINE}"
+        )) && hygiene
+            .contains("in the hygiene task's `log.md`, the PR body (step 4) and the step-9 report"),
+        "{hygiene}"
+    );
+    let body = section(
+        "4. **Roll up follow-ups",
+        "Build the body with `assemble_pr_body",
+    );
+    assert!(
+        body.contains(&format!(
+            "- the {LINE} line from step 3, whenever the user accepted NEEDS-HUMAN at the final-tier review"
+        )),
+        "{body}"
+    );
+    let report = section("9. Report:", "Then STOP.");
+    assert!(
+        report.contains(&format!("the {LINE} line when step 3 wrote one")),
+        "{report}"
+    );
+    let accept = section(
+        "names or `pipeline`) in the task's `log.md`, the Phase F digest",
+        "leave the task `in-progress`",
+    );
+    assert!(
+        accept.contains(
+            "accepted at the final-tier review of the run-closing hygiene pass, it also leaves the \
+             run's one full suite unrun, recorded per that step's `Full suite NOT RUN at the final \
+             review:` rule"
+        ),
+        "{accept}"
+    );
+}
+
 /// The baseline every coder and the final-tier review judge failures by sits
 /// at the commit the run started from: Sisyphus records that run base (or
 /// takes it from its parent) and passes it as baseline_floor, and architect

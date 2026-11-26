@@ -123,17 +123,19 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:3507:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:3555:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:3556:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
-scripts/smoke_test.py:3767:             "make: *** [check] Error 1")
-scripts/smoke_test.py:3772:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
-scripts/smoke_test.py:3773:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
+scripts/gates.py:3509:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:3556:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:3557:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:3768:             "make: *** [check] Error 1")
+scripts/smoke_test.py:3773:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
+scripts/smoke_test.py:3774:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
+scripts/smoke_test.py:7823:    _as_detected, _as_run = "cargo test --workspace", "cargo test --no-fail-fast --workspace"
 ```
 
-The lone `gates.py` hit is the English verb `make` in one prompt sentence; the five
+The lone `gates.py` hit is the English verb `make` in one prompt sentence; the six
 `smoke_test.py` hits are battery fixtures (two English `make`, three a stand-in runner's
-output in the carried-failure rows). No gate names a toolchain command. The wrapper test `no_gate_names_a_toolchain_command`
+output in the carried-failure rows, one the round-tier row's suite that the coder gates
+rewrite). No gate names a toolchain command. The wrapper test `no_gate_names_a_toolchain_command`
 keeps it that way with a `make`-less variant of the pattern: it matches
 `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b` against every
 line of `graph.yaml` and of each `scripts/*.py` except `smoke_test.py`, and fails on any hit.
@@ -503,36 +505,40 @@ reads as self and is ledgered once), no subtask is under review, nothing is publ
 not waived: a run with no subtasks, the final whole-task review, the retrospective refactor
 and observability rounds and a probe-adoption round before publishing. Every other round is
 round tier: its review commands drop each command equal to the coder gates' detected full
-suite (`_lib.detected_test_command`, which asks `gate_lib.sh` through bash with the root in
-the environment) and add the round record's commands, in one `verify: round tier:` ledger
-line; a final round keeps the declared commands, and its gauntlet runs the full suite,
-formatter and lint once or reuses the finalize record for that tree. The tier is part of the
-round's reuse key and is stored in its `round_heads` entry, so a round-tier PASS is never
-reused for a final round.
+suite, either as detected or as the gates run it (`_lib.detected_test_command`, which asks
+`gate_lib.sh` through bash with the root in the environment and returns both forms), and add
+the round record's commands, in one `verify: round tier:` ledger line; a detected suite that
+no review command names is ledgered too. A final round keeps the declared commands, and its
+gauntlet runs the full suite, formatter and lint once or reuses the finalize record for that
+tree. The tier is part of the round's reuse key and is stored in its `round_heads` entry, so a
+round-tier PASS is never reused for a final round.
 
 A final round's `FULL-SUITE RECORD RED` blocker goes to triage, which cannot reject, defer or
 drop it: it always stands as a fix. `FULL-SUITE RECORD MISSING` or `UNAVAILABLE` raises
 `finalize_unavailable`. Before anything is published, `pr_gate` looks up the finalize record
-for the current tree (the plans dir aside); with no green record it goes to the script node
-`finalize_gate` whether or not a publish was asked, and comes back once the record is green.
-`finalize_gate` runs `.shared/finalize_gate.sh <project> sisyphus-next <floor>` with
-`TEST_TIMEOUT` (default 1800) and the `build_lock` prefix, counts the run in `finalize_runs`,
-sends a red result to `compose_fix` (fix source `finalize_gate`, each failing step's header
-with its output trimmed) and an undecided one (unavailable, a timed-out step, a crash or a
-reply with no status) to `finalize_unavailable`; an undecided run is never read as green.
-`finalize_unavailable` is asked at the typed prompt: continue with the full suite not run and
-a stated reason (recommended, so a run with no human takes it), retry the finalize run, or
-stop. Continuing waives that tree (`finalize_waived`): its reviews run at the round tier and
-`pr_gate` publishes it. Accepting review blockers that include a red full suite waives the
-tree the same way.
+for the current tree (the plans dir aside); a record written at another floor is a miss. With
+no green record at the run's floor it goes to the script node `finalize_gate` whether or not a
+publish was asked, and comes back once the record is green. `finalize_gate` runs
+`.shared/finalize_gate.sh <project> sisyphus-next <floor>`, its arguments passed through the
+environment, with `TEST_TIMEOUT` (default 1800) and the `build_lock` prefix, counts the run in
+`finalize_runs`, sends a red result to `compose_fix` (fix source `finalize_gate`, each failing
+step's header with its output trimmed) and an undecided one (unavailable, a timed-out step, a
+crash, a reply with no status, or a green one that names no tree) to `finalize_unavailable`;
+an undecided run is never read as green. `finalize_unavailable` is a hard trigger asked at the
+typed prompt, with no option recommended: continue with the full suite not run and a stated
+reason, retry the finalize run, or stop. An autonomous run asks the owner, and a run with no
+human stops and reports, so the full suite is never waived without one. Continuing waives that
+tree (`finalize_waived`): its reviews run at the round tier and `pr_gate` publishes it. When
+git could not name the tree, the waiver covers any tree (`any_tree`). Accepting review
+blockers that include a red full suite waives the tree the same way.
 
 The report opens its verification with `Verification: tier <final|round|waived>; <finalize ran
 N time(s)|reused|waived: <reason>|parent-owned>; baseline mode <the coder's last Baseline
 mode>` and lists `## Round checks`, one backticked command per line; a waived tree adds `Full
 suite NOT RUN at finalize: <reason>` (or `RED` for an accepted red suite) to the report and the
-PR body. After a publish, `ci_gate` compares `HEAD^{tree}` with the finalize record's tree,
-the plans dir aside, and names the differing paths in an advisory attention line; it never
-blocks.
+PR body, whatever the tree. After a publish, `ci_gate` compares `HEAD^{tree}` with the
+finalize record's tree, the plans dir aside, and names the differing paths in an advisory
+attention line; it never blocks.
 
 ## Verify
 

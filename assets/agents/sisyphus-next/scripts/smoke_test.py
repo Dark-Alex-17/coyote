@@ -1719,7 +1719,8 @@ check("build_gauntlet: a subtask criterion's exit-code git diff is declared afte
       and f"verify: declared 1 criterion command(s) as verification runs: {CC_DIFF}" in u["decisions"], u)
 u = gates.build_gauntlet_prompt(base_state(spec_text="AC1: hello endpoint", verification_commands='["true x"]'))
 check("build_gauntlet: no command in the criteria -> review_verification_commands is verification_commands",
-      u["review_verification_commands"] == '["true x"]' and not any(d.startswith("verify:") for d in u["decisions"]), u)
+      u["review_verification_commands"] == '["true x"]'
+      and not any(d.startswith("verify: declared") for d in u["decisions"]), u)
 u = gates.build_gauntlet_prompt(base_state(spec_text=f"- `{CC_DIFF}` passes", verification_commands="run the suite"))
 check("build_gauntlet: a verification_commands that is not a JSON list passes through unchanged",
       u["review_verification_commands"] == "run the suite" and not any(d.startswith("verify:") for d in u["decisions"]), u)
@@ -7739,8 +7740,8 @@ def clear_records():
     shutil.rmtree(VR.store_dir(REPO), ignore_errors=True)
 
 
-def write_record(tier, results):
-    return VR.write(REPO, tier, results, "smoke")
+def write_record(tier, results, floor=""):
+    return VR.write(REPO, tier, results, "smoke", floor=floor)
 
 
 GREEN_FINALIZE = [{"role": "test", "cmd": TIER_FULL, "exit": 0, "verdict": "green", "note": "", "tail": ""}]
@@ -7761,19 +7762,21 @@ with scenario("tiers: a parent's run_base wins over this run's base as the basel
     _c = gates.render_coder_prompt(tier_state(coder_brief={"goal": "g"}, run_base="p" * 40, run_base_sha="r" * 40))
     check(name, u.get("review_baseline_floor") == "p" * 40 and _c.get("coder_baseline_floor") == "p" * 40,
           (u.get("review_baseline_floor"), _c.get("coder_baseline_floor")))
-with scenario("tiers: a subtask round reviews at the round tier") as name:
-    _t, u = tier_of(tier_state(subtasks=CC_SUBS, subtask_index=1, subtask_changed_files=["f"]))
-    check(name, _t == "round", _t)
+with scenario("tiers: a subtask round reviews at the round tier and the same run's final review at the final "
+              "tier") as name:
+    _ts = [tier_of(tier_state(subtasks=CC_SUBS, subtask_index=1, subtask_changed_files=["f"]))[0],
+           tier_of(tier_state(subtasks=CC_SUBS, subtask_index=FINAL_SUB, final_review=True, spec_text="AC1"))[0]]
+    check(name, _ts == ["round", "final"], _ts)
 with scenario("tiers: the final whole-task review runs at the final tier") as name:
     _t, u = tier_of(tier_state(subtasks=CC_SUBS, subtask_index=FINAL_SUB, final_review=True, spec_text="AC1"))
     check(name, _t == "final", _t)
 with scenario("tiers: finalize_owner parent keeps every review at the round tier, the final review too") as name:
-    _ts = [tier_of(base_state(**over))[0] for over in
-           ({}, {"subtasks": CC_SUBS, "subtask_index": FINAL_SUB, "final_review": True, "spec_text": "AC1"})]
-    check(name, _ts == ["round", "round"], _ts)
+    _whole = {"subtasks": CC_SUBS, "subtask_index": FINAL_SUB, "final_review": True, "spec_text": "AC1"}
+    _ts = [tier_of(base_state(finalize_owner=owner, **over))[0] for owner in ("parent", "self") for over in ({}, _whole)]
+    check(name, _ts == ["round", "round", "final", "final"], _ts)
 with scenario("tiers: after a publish step every review is round tier") as name:
-    _t, u = tier_of(tier_state(publish_done=True))
-    check(name, _t == "round", _t)
+    _ts = [tier_of(tier_state(**over))[0] for over in ({"publish_done": True}, {"pr_published": True}, {})]
+    check(name, _ts == ["round", "round", "final"], _ts)
 with scenario("tiers: a finalize_owner that is neither self nor parent counts as self, ledgered once") as name:
     _t, u = tier_of(tier_state(finalize_owner="mine"))
     _again = gates.build_gauntlet_prompt(tier_state(finalize_owner="mine", decisions=u["decisions"]))
@@ -7781,9 +7784,9 @@ with scenario("tiers: a finalize_owner that is neither self nor parent counts as
     check(name, _t == "final" and _line in u["decisions"] and _again["decisions"].count(_line) == 1,
           (_t, u.get("decisions")))
 with scenario("tiers: a round-tier PASS on the same tree is not reused for a final round") as name:
-    _first = gates.build_gauntlet_prompt(base_state(spec_text="AC"))
+    _first = gates.build_gauntlet_prompt(base_state(finalize_owner="parent", spec_text="AC"))
     _passed = [dict(_first["round_heads"][-1], verdict="PASS", incomplete=[])]
-    _same = gates.build_gauntlet_prompt(base_state(spec_text="AC", round_heads=_passed))
+    _same = gates.build_gauntlet_prompt(base_state(finalize_owner="parent", spec_text="AC", round_heads=_passed))
     u = gates.build_gauntlet_prompt(tier_state(spec_text="AC", round_heads=_passed))
     check(name, _same.get("_next") == "route_gauntlet" and "_next" not in u and len(u.get("round_heads", [])) == 2
           and u["round_heads"][-1].get("tier") == "final"
@@ -7794,8 +7797,8 @@ with scenario("tiers: a probe-adoption round before publish is final") as name:
     check(name, _t == "final" and u["round_heads"][-1].get("adoption"), (_t, u.get("round_heads")))
 with scenario("tiers: CI-fix, base-sync and review_update rounds are round tier") as name:
     _ts = [tier_of(tier_state(**over))[0] for over in
-           ({"ci_fix_active": True}, {"base_sync_active": True}, {"pr_review_rounds": 1})]
-    check(name, _ts == ["round", "round", "round"], _ts)
+           ({"ci_fix_active": True}, {"base_sync_active": True}, {"pr_review_rounds": 1}, {})]
+    check(name, _ts == ["round", "round", "round", "final"], _ts)
 with scenario("round tier: the detected full suite is dropped from the review commands and the round record's "
               "commands are added, in one ledger line") as name:
     clear_records()
@@ -7803,7 +7806,7 @@ with scenario("round tier: the detected full suite is dropped from the review co
                            {"role": "impacted", "cmd": "lint-runner", "exit": 0, "verdict": "green"}])
     _cmds = json.dumps([TIER_FULL, "lint-runner"])
     try:
-        u = gates.build_gauntlet_prompt(base_state(verification_commands=_cmds))
+        u = gates.build_gauntlet_prompt(base_state(finalize_owner="parent", verification_commands=_cmds))
         _final = gates.build_gauntlet_prompt(tier_state(verification_commands=_cmds))
     finally:
         clear_records()
@@ -7813,6 +7816,30 @@ with scenario("round tier: the detected full suite is dropped from the review co
           and _lines == [f"verify: round tier: dropped the full suite `{TIER_FULL}`; added the round record "
                          "command(s): suite-runner --only t1"],
           (u.get("review_verification_commands"), _final.get("review_verification_commands"), _lines))
+with scenario("round tier: a review command is the full suite as the gates detect it or as they run it; a detected "
+              "suite no review command names is ledgered") as name:
+    clear_records()
+    # a suite gate_test_command_for_run rewrites: it adds the flag that keeps every target running
+    _as_detected, _as_run = "cargo test --workspace", "cargo test --no-fail-fast --workspace"
+    os.environ["TEST_CMD"] = _as_detected
+    try:
+        _forms = _lib.detected_test_command(REPO)
+        _bare = gates.build_gauntlet_prompt(base_state(
+            finalize_owner="parent", verification_commands=json.dumps([_as_detected, "lint-runner"])))
+        _run = gates.build_gauntlet_prompt(base_state(
+            finalize_owner="parent", verification_commands=json.dumps([_as_run])))
+        _none = gates.build_gauntlet_prompt(base_state(
+            finalize_owner="parent", verification_commands=json.dumps(["lint-runner"])))
+    finally:
+        os.environ["TEST_CMD"] = TIER_FULL
+    _missed = [d for d in _none["decisions"] if d.startswith("verify: round tier:")]
+    check(name, _forms == (_as_run, _as_detected)
+          and json.loads(_bare["review_verification_commands"]) == ["lint-runner"]
+          and json.loads(_run["review_verification_commands"]) == []
+          and _none["review_verification_commands"] == json.dumps(["lint-runner"])
+          and _missed == [f"verify: round tier: no review command is the detected full suite `{_as_run}` or "
+                          f"`{_as_detected}`; nothing dropped"],
+          (_forms, _bare.get("review_verification_commands"), _run.get("review_verification_commands"), _missed))
 with scenario("route_coder_result: CODER_COMPLETE merges the round record's commands into round_checks, first seen "
               "first") as name:
     clear_records()
@@ -7824,19 +7851,27 @@ with scenario("route_coder_result: CODER_COMPLETE merges the round record's comm
         clear_records()
     check(name, u.get("_next") == "debt_scan" and u.get("round_checks") == ["t2", "t0", "t1"], u.get("round_checks"))
 
-with scenario("pr_gate: a green finalize record for the tree -> git_ops, its tree noted") as name:
+with scenario("pr_gate: a green finalize record for the tree at the run's floor -> git_ops, its tree noted") as name:
     clear_records()
-    _rec = write_record("finalize", GREEN_FINALIZE)
+    _rec = write_record("finalize", GREEN_FINALIZE, floor=BASE)
     try:
         u = gates.pr_gate(tier_state(git_actions={"commit": True}))
     finally:
         clear_records()
     check(name, u.get("_next") == "git_ops" and u.get("finalize_tree") == gates._worktree_tree(REPO),
           (u.get("_next"), u.get("finalize_tree")))
+with scenario("pr_gate: a green finalize record written at another floor is a miss -> finalize_gate") as name:
+    clear_records()
+    write_record("finalize", GREEN_FINALIZE, floor="f" * 40)
+    try:
+        u = gates.pr_gate(tier_state(git_actions={"commit": True}))
+    finally:
+        clear_records()
+    check(name, u.get("_next") == "finalize_gate" and not u.get("finalize_tree"), (u.get("_next"), u.get("finalize_tree")))
 with scenario("pr_gate: no green finalize record -> finalize_gate, which returns to pr_gate") as name:
     clear_records()
     _red = [dict(GREEN_FINALIZE[0], exit=1, verdict="red", note="new failures: t")]
-    write_record("finalize", _red)
+    write_record("finalize", _red, floor=BASE)
     try:
         _on_red = gates.pr_gate(tier_state(git_actions={"commit": True}))
     finally:
@@ -7864,16 +7899,30 @@ with open(os.path.join(FAKE_SHARED, "finalize_gate.sh"), "w") as _fh:
               'printf \'%s\\n\' "$FAKE_FINALIZE_OUT"\nexit "${FAKE_FINALIZE_RC:-0}"\n')
 
 
+FINALIZE_BASH_ARGV = []
+
+
 def fake_finalize(state, out, rc=0):
-    """finalize_gate against a stand-in finalize_gate.sh printing `out` and exiting `rc`; (updates, its argv)."""
+    """finalize_gate against a stand-in finalize_gate.sh printing `out` and exiting `rc`; (updates, its argv). The
+    command line bash itself was started with lands in FINALIZE_BASH_ARGV."""
     args = os.path.join(TMP, "fake-finalize-args")
     saved = gates.SHARED_DIR
+    real_run = subprocess.run
+    bash = gates._shared("base_suite").bash_program()
+    FINALIZE_BASH_ARGV.clear()
+
+    def spy(argv, *a, **k):
+        if argv and argv[0] == bash:
+            FINALIZE_BASH_ARGV.append(list(argv))
+        return real_run(argv, *a, **k)
     os.environ.update(FAKE_FINALIZE_OUT=out if isinstance(out, str) else json.dumps(out),
                       FAKE_FINALIZE_RC=str(rc), FAKE_FINALIZE_ARGS=args)
     gates.SHARED_DIR = FAKE_SHARED
+    gates.subprocess.run = spy
     try:
         u = gates.finalize_gate(state)
     finally:
+        gates.subprocess.run = real_run
         gates.SHARED_DIR = saved
         for k in ("FAKE_FINALIZE_OUT", "FAKE_FINALIZE_RC", "FAKE_FINALIZE_ARGS"):
             os.environ.pop(k, None)
@@ -7885,11 +7934,18 @@ _RED_ITEMS = [{"role": "fmt", "cmd": "fmt-runner --check", "exit": 0, "verdict":
               {"role": "test", "cmd": TIER_FULL, "exit": 101, "verdict": "red", "note": "new failures: t_one",
                "tail": "x" * 5000 + "\ntest t_one ... FAILED"}]
 with scenario("finalize_gate: green -> back to pr_gate with the run counted and the tree noted; the gate gets the "
-              "project, the writer and the run base floor") as name:
+              "project, the writer and the run base floor through the environment, never on bash's command "
+              "line") as name:
     u, _argv = fake_finalize(tier_state(finalize_return="pr_gate", finalize_runs=1, run_base_sha="r" * 40),
                              {"status": "green", "tree": "t" * 40, "items": GREEN_FINALIZE})
+    _bash = [a for c in FINALIZE_BASH_ARGV for a in c]
     check(name, u.get("_next") == "pr_gate" and u.get("finalize_runs") == 2 and u.get("finalize_tree") == "t" * 40
-          and _argv == [REPO, "sisyphus-next", "r" * 40], (u, _argv))
+          and _argv == [REPO, "sisyphus-next", "r" * 40] and len(FINALIZE_BASH_ARGV) == 1
+          and not any(REPO in a or "r" * 40 in a for a in _bash), (u, _argv, FINALIZE_BASH_ARGV))
+with scenario("finalize_gate: a green run that names no tree -> finalize_unavailable, never green") as name:
+    u, _ = fake_finalize(tier_state(finalize_return="pr_gate"), {"status": "green", "tree": "", "items": GREEN_FINALIZE})
+    check(name, _lib.as_dict(u.get("escalation")).get("kind") == "finalize_unavailable" and "finalize_tree" not in u
+          and u.get("finalize_return") == "pr_gate", (u.get("_next"), u.get("finalize_tree")))
 with scenario("finalize_gate: green after a retry raised from the gauntlet -> build_gauntlet_prompt") as name:
     u, _ = fake_finalize(tier_state(finalize_return="build_gauntlet_prompt"),
                          {"status": "green", "tree": "t" * 40, "items": GREEN_FINALIZE})
@@ -7904,15 +7960,16 @@ with scenario("finalize_gate: red -> compose_fix with fix_source finalize_gate, 
           and f"test `{TIER_FULL}`: red (exit 101); new failures: t_one" in _text and "t_one ... FAILED" in _text
           and "fmt-runner" not in _text and len(u["fix_note"]) < 2000 and _fix.get("_next") == "render_coder_prompt",
           (u.get("_next"), u.get("fix_source"), _text[:300]))
-with scenario("finalize_gate: unavailable -> the finalize_unavailable question, continue recommended, at the typed "
-              "prompt") as name:
+with scenario("finalize_gate: unavailable -> the finalize_unavailable question, a hard trigger with no option "
+              "recommended, at the typed prompt") as name:
     u, _ = fake_finalize(tier_state(finalize_return="pr_gate"),
                          {"status": "unavailable", "tree": "t" * 40,
                           "items": [dict(GREEN_FINALIZE[0], exit=1, verdict="red", note="not classified: no base")]})
     _esc = u.get("escalation") or {}
     _rec = [o["text"] for o in _esc.get("options", []) if o.get("recommended")]
     check(name, u.get("_next") == "escalate_gate" and _esc.get("kind") == "finalize_unavailable"
-          and _rec == [gates.FINALIZE_CONTINUE] and not _lib.as_dict(_esc.get("data")).get("multiple_choice")
+          and _esc.get("hard_trigger") is True and _rec == []
+          and not _lib.as_dict(_esc.get("data")).get("multiple_choice")
           and "not classified: no base" in _esc.get("evidence", "") and u.get("finalize_return") == "pr_gate",
           (u.get("_next"), _esc))
 with scenario("finalize_gate: a crash or a reply with no status -> finalize_unavailable, never green") as name:
@@ -7946,13 +8003,32 @@ with scenario("finalize_unavailable: continue with a reason waives the tree; the
 with scenario("finalize_unavailable: a waived tree reviews at the round tier") as name:
     _t, _ = tier_of(tier_state(finalize_waived={"tree": gates._worktree_tree(REPO), "reason": "r"}))
     check(name, _t == "round", _t)
-with scenario("finalize_unavailable: no human -> the recommended continue, with the gate's report as the reason") as name:
+with scenario("finalize_unavailable: continue on a tree git could not name waives any tree, once asked; the review "
+              "is round tier, pr_gate goes on, and the report and the PR body say the full suite was not run") as name:
+    _unav = unavailable_esc()
+    _unknown = {**_unav, "data": {**_unav["data"], "tree": ""}}
+    u = gates.apply_answer(tier_state(escalation=_unknown, last_answer=f"{gates.FINALIZE_CONTINUE}: git timed out"))
+    _waived = tier_state(finalize_waived=u.get("finalize_waived"), git_actions={"commit": True})
+    _t, _ = tier_of(_waived)
+    _pr = gates.pr_gate(_waived)
+    _rep = gates._assemble_report(_waived, {})
+    _line = "Full suite NOT RUN at finalize: git timed out"
+    check(name, u.get("finalize_waived") == {"tree": "", "any_tree": True, "reason": "git timed out"}
+          and _t == "round" and _pr.get("_next") == "git_ops" and _line in _pr.get("report", "") and _line in _rep
+          and "Verification: tier waived; waived: git timed out" in _rep and "tier final" not in _rep,
+          (u.get("finalize_waived"), _t, _pr.get("_next")))
+with scenario("finalize_unavailable: a hard trigger, so no human stops and reports and an autonomous run asks the "
+              "owner; the full suite is never waived on its own") as name:
     _unav = unavailable_esc()
     _p = gates.parse_answer(tier_state(escalation=_unav, last_answer_text=_lib.HEADLESS_GUIDANCE))
-    u = gates.apply_answer(tier_state(escalation=_unav, last_answer=_p.get("last_answer")))
-    check(name, _p.get("last_answer") == gates.FINALIZE_CONTINUE and u.get("_next") == "pr_gate"
+    _auto = gates.escalate_gate(tier_state(escalation=_unav, escalation_policy="autonomous"))
+    check(name, _p.get("_next") == "end_blocked" and "finalize_waived" not in _p and "last_answer" not in _p
+          and _auto.get("_next") == "ask_dispatch", (_p, _auto.get("_next")))
+with scenario("finalize_unavailable: continue with no reason stated keeps the gate's report as the reason") as name:
+    u = gates.apply_answer(tier_state(escalation=unavailable_esc(), last_answer=gates.FINALIZE_CONTINUE))
+    check(name, u.get("_next") == "pr_gate"
           and _lib.as_dict(u.get("finalize_waived")).get("reason", "").startswith(gates.NO_STATED_REASON),
-          (_p.get("last_answer"), u.get("finalize_waived")))
+          u.get("finalize_waived"))
 with scenario("finalize_unavailable: retry -> finalize_gate; stop -> end_blocked; raised from the gauntlet, continue "
               "goes back to build_gauntlet_prompt") as name:
     _unav = unavailable_esc()

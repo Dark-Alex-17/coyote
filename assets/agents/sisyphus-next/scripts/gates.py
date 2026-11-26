@@ -2762,8 +2762,10 @@ def apply_answer(state):
             reason = _stated_reason(answer, options)
             if reason == NO_STATED_REASON:
                 reason = f"{NO_STATED_REASON}; the gate reported: {tail(esc.get('evidence') or 'no detail', 300)}"
-            u["finalize_waived"] = {"tree": data.get("tree") or "", "reason": reason}
-            ledger(state, u, f"finalize: waived for tree {data.get('tree') or '(unknown)'}: {tail(reason, 300)}")
+            tree = data.get("tree") or ""
+            u["finalize_waived"] = {"tree": tree, "any_tree": not tree, "reason": reason}
+            ledger(state, u, f"finalize: waived for {f'tree {tree}' if tree else 'any tree (git named none)'}: "
+                             f"{tail(reason, 300)}")
             u["_next"] = back
         else:
             _unmatched(state, u, esc, answer)
@@ -4381,9 +4383,12 @@ def _published(state):
 
 
 def _waived(state, root, tree):
-    """True when the finalize run was waived for a tree whose code equals `tree`."""
-    waived = as_dict(state.get("finalize_waived")).get("tree") or ""
-    return bool(waived) and _code_changed(state, root, waived, tree) == "unchanged"
+    """True when the finalize run was waived for a tree whose code equals `tree`, or for any tree when git could not
+    name the tree the waiver was given on."""
+    waived = as_dict(state.get("finalize_waived"))
+    if truthy(waived.get("any_tree")):
+        return True
+    return bool(waived.get("tree")) and _code_changed(state, root, waived["tree"], tree) == "unchanged"
 
 
 def _final_tier(state, root):
@@ -4391,7 +4396,7 @@ def _final_tier(state, root):
     nothing is published yet and the tree is not waived."""
     if _finalize_owner(state) != "self" or _subtask_phase(state) or _published(state):
         return False
-    return not as_dict(state.get("finalize_waived")).get("tree") or not _waived(state, root, _worktree_tree(root))
+    return not _waived(state, root, _worktree_tree(root))
 
 
 def _record_lookup(state, root, tier):
@@ -4423,14 +4428,20 @@ def _round_tier_commands(state, u, root, cmds):
         return cmds
     if not isinstance(arr, list):
         return cmds
-    full = detected_test_command(state.get("project_dir") or root)
-    kept = [c for c in arr if not (full and isinstance(c, str) and c.strip() == full)]
+    # the declared suite may be written as detected or as the gates run it, with the flags they add
+    forms = list(dict.fromkeys(f for f in detected_test_command(state.get("project_dir") or root) if f))
+    kept = [c for c in arr if not (isinstance(c, str) and c.strip() in forms)]
+    dropped = [c.strip() for c in arr if isinstance(c, str) and c.strip() in forms]
     _, record = _record_lookup(state, root, "round")
-    added = [c for c in dict.fromkeys(_record_commands(record)) if c != full and c not in kept]
-    if len(kept) == len(arr) and not added:
+    added = [c for c in dict.fromkeys(_record_commands(record)) if c not in forms and c not in kept]
+    if forms and arr and not dropped:
+        named = " or ".join(f"`{f}`" for f in forms)
+        ledger(state, u, f"verify: round tier: no review command is the detected full suite {named}; nothing dropped")
+    if not dropped and not added:
         return cmds
-    dropped = f"dropped the full suite `{full}`" if len(kept) < len(arr) else "dropped nothing"
-    ledger(state, u, f"verify: round tier: {dropped}; added the round record command(s): {'; '.join(added) or 'none'}")
+    shown = ", ".join(f"`{c}`" for c in dict.fromkeys(dropped))
+    what = f"dropped the full suite {shown}" if dropped else "dropped nothing"
+    ledger(state, u, f"verify: round tier: {what}; added the round record command(s): {'; '.join(added) or 'none'}")
     return json.dumps(kept + added)
 
 
@@ -5425,7 +5436,12 @@ def _finalize_due(state, u):
     if green and _code_changed(state, root, green, tree) == "unchanged":
         return False
     _, record = _record_lookup(state, root, "finalize")
-    if record is not None and _shared("verify_record").is_green(record, "finalize"):
+    # a record counts only at this run's floor, which decides what fmt's rewrites and the base failures belong to;
+    # the gate records the floor resolved to a commit, or none when it does not resolve
+    floor = _baseline_floor(state)
+    floor = git_out(root, "rev-parse", "--verify", "-q", f"{floor}^{{commit}}") if floor else ""
+    if (record is not None and _shared("verify_record").is_green(record, "finalize")
+            and (record.get("floor") or "") == floor):
         u["finalize_tree"] = record["tree"]
         return False
     ledger(state, u, "finalize: no green finalize record covers the tree about to be published -> finalize_gate")
@@ -5461,11 +5477,13 @@ def _finalize_unavailable(state, u, back, detail):
         "The finalize gate (full suite, formatter, lint) could not show the tree about to be published green, and "
         "an undecided run is never read as green. Continue with the full suite not run for this tree, retry the "
         "run, or stop?",
-        [option(FINALIZE_CONTINUE, True, "the report and the PR body say the full suite was not run, with the "
-                                         "stated reason; the run goes on"),
+        # no option is recommended: a hard trigger is the user's call, and a recommended one would be taken headless
+        [option(FINALIZE_CONTINUE, False, "the report and the PR body say the full suite was not run, with the "
+                                          "stated reason; the run goes on"),
          option(FINALIZE_RETRY, False, "runs the finalize gate again on the same tree"),
          option(FINALIZE_STOP)],
-        evidence=tail(detail, 2500), data={"decision": f"finalize_unavailable:{tree}", "tree": tree, "return": back}))
+        evidence=tail(detail, 2500), hard_trigger=True,
+        data={"decision": f"finalize_unavailable:{tree}", "tree": tree, "return": back}))
 
 
 def finalize_gate(state):
@@ -5479,9 +5497,12 @@ def finalize_gate(state):
     if lock:
         env["LLM_AGENT_VAR_BUILD_LOCK"] = lock
     script = os.path.join(SHARED_DIR, "finalize_gate.sh")
+    # the gate's arguments ride the environment: Git Bash on Windows re-parses its command line
+    env.update(SX_FINALIZE_SCRIPT=script, SX_FINALIZE_DIR=state.get("project_dir") or root,
+               SX_FINALIZE_FLOOR=_baseline_floor(state))
     try:
-        p = subprocess.run([_shared("base_suite").bash_program(), script, state.get("project_dir") or root,
-                            "sisyphus-next", _baseline_floor(state)],
+        p = subprocess.run([_shared("base_suite").bash_program(), "-c",
+                            'exec "$BASH" "$SX_FINALIZE_SCRIPT" "$SX_FINALIZE_DIR" sisyphus-next "$SX_FINALIZE_FLOOR"'],
                            capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
                            timeout=FINALIZE_GATE_SECS, env=env)
     except (OSError, subprocess.SubprocessError) as e:
@@ -5496,6 +5517,10 @@ def finalize_gate(state):
     if status == "unavailable" or any(i.get("verdict") == "timed_out" for i in items):
         shown = [_finalize_item(i) for i in items if i.get("verdict") not in ("green", "pre-existing")]
         return _finalize_unavailable(state, u, back, "\n\n".join(shown) or tail(p.stderr, 600) or "no detail")
+    if status == "green" and not tree:
+        # a green run on a tree git could not name covers no known tree, and pr_gate would only send it back here
+        return _finalize_unavailable(state, u, back, "the finalize gate reported green but named no tree: git could "
+                                                     "not compute the worktree tree")
     if status == "green":
         u["finalize_tree"] = tree
         ledger(state, u, f"finalize: run {runs} green on tree {tree or '(unknown)'}")
@@ -5515,7 +5540,7 @@ def _accept_red_suite(state, u):
     if not red:
         return
     tree = _worktree_tree(state.get("git_root") or state.get("project_dir") or ".")
-    u["finalize_waived"] = {"tree": tree, "red": True,
+    u["finalize_waived"] = {"tree": tree, "any_tree": not tree, "red": True,
                             "reason": f"accepted unresolved at the user's say-so: {tail(red[0], 300)}"}
     ledger(state, u, f"finalize: the red full suite on tree {tree or '(unknown)'} was accepted unresolved")
 
@@ -5543,7 +5568,7 @@ def _verification_lines(state, g):
     mode = re.findall(r"^Baseline mode:[ \t]*(.*?)[ \t]*$", str(g("coder_result") or ""), re.M)
     if _finalize_owner(state) == "parent":
         tier, finalize = "round", "parent-owned"
-    elif waived.get("tree"):
+    elif waived.get("tree") or truthy(waived.get("any_tree")):
         tier, finalize = "waived", f"waived: {waived.get('reason') or 'no reason recorded'}"
     else:
         runs = as_int(g("finalize_runs", 0))
