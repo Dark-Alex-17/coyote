@@ -57,6 +57,28 @@ variables:
       (matching is per location; a value that is not a JSON array counts as
       none). Never inferred from the prompt.
     default: '[]'
+  - name: verification_tier
+    description: |
+      Where this review sits in the run's verification; forwarded to the
+      adversary lane. Empty (the default) and `round` run nothing beyond the
+      lanes, so nothing here runs the full suite. `final` makes this review
+      the final gate: after signals records the worktree tree, the
+      finalize_check node reuses the finalize record for that tree or runs
+      .shared/finalize_gate.sh there to write one, and the verdict gate
+      blocks with a `FULL-SUITE RECORD MISSING|RED|UNAVAILABLE: <detail>`
+      line unless that record is green, even when every lane is green. Any
+      other value blocks as a PIPELINE-FAULT.
+    default: ''
+  - name: baseline_floor
+    description: |
+      Final tier only: the commit the run started from (the run base). A
+      red full suite is then judged only against the base suite at that
+      commit, run there on demand when no record exists, so failures an
+      earlier commit of the run introduced are never accepted as
+      pre-existing. Empty judges it against the nearest base record on
+      HEAD's first-parent chain that no merge and no older commit separates
+      from HEAD.
+    default: ''
 
 settings:
   max_loop_iterations: 10
@@ -67,7 +89,8 @@ settings:
   # 3 passes × 2 attempts × 11400 (max lane timeout) = 68400, + 1200 margin
   # for the script stages (signals/debris lint/select/build/retry gate/verdict gate)
   # = 69600; the parse and select_lanes llm nodes carry no `timeout:` and
-  # are bounded by max_iterations.
+  # are bounded by max_iterations. finalize_check (final tier only) runs
+  # after signals starts the retry clock, so its time is inside the budget.
   timeout: 69600
 
 initial_state:
@@ -98,6 +121,8 @@ initial_state:
   # the worktree tree before the lanes, from signals.py; verdict_gate.py diffs it to name the files the probe lane wrote
   review_tree_before: ''
   review_tree_error: ''
+  # finalize_check's record of the full suite on that tree, read by verdict_gate.py at the final tier
+  full_suite_record: {}
   touches_auth: false
   touches_deps: false
   touches_exec: false
@@ -226,8 +251,18 @@ nodes:
     id: signals
     type: script
     description: Deterministic diff signals -- file list, attack-surface and consumer-surface indicators, plus the worktree tree before the lanes run. Pure git; no LLM judgment. The diff signals keep their 120s envelope (90s per git call) and the before-tree shares one 40s deadline across its git calls, so the node timeout is 160s.
+    # routes to finalize_check through `_next` when verification_tier is final
     script: scripts/signals.py
     timeout: 160
+    next: debris_lint
+
+  finalize_check:
+    id: finalize_check
+    type: script
+    description: Final tier only (signals routes here). Looks up the finalize record for the worktree tree signals recorded and, on a miss, runs .shared/finalize_gate.sh there (fmt, check, lint, then the full suite, each killed after 3300s, a red suite judged against the base at baseline_floor when one is set) to write one; records full_suite_record {status, tree, detail} for the verdict gate. If the node is killed, full_suite_record stays unset and the verdict gate blocks on a missing record.
+    script: scripts/finalize_check.sh
+    timeout: 3600
+    fallback: debris_lint
     next: debris_lint
 
   debris_lint:
@@ -442,6 +477,8 @@ nodes:
       build_lock: '{{build_lock}}'
       debris_exclude: '{{debris_exclude}}'
       carried_failures: '{{carried_failures}}'
+      verification_tier: '{{verification_tier}}'
+      review_tree: '{{review_tree_before}}'
     prompt: |
       Adversarial plan-conformance review in {{project_dir}}.
 

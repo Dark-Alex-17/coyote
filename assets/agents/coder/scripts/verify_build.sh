@@ -16,6 +16,13 @@ fi
 
 project_dir=$(gate_workdir "$state")
 
+# The round tier picks this lap's tests before verify_tests runs them.
+GATE_TESTS_NEXT=verify_tests
+if [[ $(gate_verify_tier) == "round" ]]; then
+  GATE_TESTS_NEXT=impact_facts
+fi
+export GATE_TESTS_NEXT
+
 if [[ -n "${BUILD_CMD:-}" ]]; then
   cmd="$BUILD_CMD"
 else
@@ -28,7 +35,7 @@ if [[ -z "$cmd" || "$cmd" == "null" ]]; then
     "build_ok": true,
     "build_output": "(GATE NOT RUN: no build/check command configured or detected. This is NOT evidence that the build passed — set BUILD_CMD, and never report the build as verified.)",
     "build_verdict": "NOT RUN: no build/check command configured or detected",
-    "_next": "verify_tests"
+    "_next": env.GATE_TESTS_NEXT
   }'
   exit 0
 fi
@@ -72,7 +79,7 @@ elif (( exit_code == 0 )); then
       "build_ok": true,
       "build_output": ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR + "\n\n" + .),
       "build_verdict": "passed",
-      "_next": "verify_tests"
+      "_next": env.GATE_TESTS_NEXT
     }'
 else
   trim_output "$output" | jq -Rsc \

@@ -191,7 +191,8 @@ fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Va
         .env_remove("LLM_AGENT_VAR_TEST_COMMAND")
         .env_remove("LLM_AGENT_VAR_BUILD_TIMEOUT")
         .env_remove("LLM_AGENT_VAR_TEST_TIMEOUT")
-        .env_remove("LLM_AGENT_VAR_BASELINE_FLOOR");
+        .env_remove("LLM_AGENT_VAR_BASELINE_FLOOR")
+        .env_remove("LLM_AGENT_VAR_VERIFY_TIER");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -481,6 +482,69 @@ fn verify_tests_runs_the_test_command_variable_first() {
     );
 }
 
+/// The command a deadline pin runs: a grandchild that records its pid and
+/// would write `late.txt` a minute later, then a step that writes
+/// `after.txt` once the grandchild is done.
+const OUTLIVES_DEADLINE: &str =
+    "sh -c 'echo $$ > grandchild.pid; sleep 60; echo late > late.txt'; echo after > after.txt";
+
+/// Asserts that a gate running [`OUTLIVES_DEADLINE`] was cut short by its
+/// deadline: it returned well before the grandchild's sleep ended, the
+/// grandchild is dead, and neither it nor the step after it wrote a file.
+/// The 30 s bound is half the sleep, so a loaded host cannot trip it while
+/// an ignored deadline still does.
+/// Where the grandchild's death cannot be probed (no recorded pid, or no
+/// `kill -0`), the check waits past its write point before looking for files.
+fn assert_cut_short(label: &str, dir: &Path, started: Instant) {
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "{label}: the deadline did not cut the gate short ({elapsed:?})"
+    );
+    let pid_file = dir.join("grandchild.pid");
+    let probed = match fs::read_to_string(&pid_file) {
+        Ok(pid) => {
+            fs::remove_file(&pid_file).unwrap();
+            grandchild_died(label, pid.trim())
+        }
+        Err(_) => false,
+    };
+    if !probed {
+        let past_write = Duration::from_secs(65);
+        if let Some(rest) = past_write.checked_sub(started.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
+    for file in ["after.txt", "late.txt"] {
+        assert!(
+            !dir.join(file).exists(),
+            "{label}: {file} was written after the deadline"
+        );
+    }
+}
+
+#[cfg(unix)] // the gate kills its whole process group, so the grandchild must die with it
+fn grandchild_died(label: &str, pid: &str) -> bool {
+    let gone = Instant::now();
+    while Command::new("kill")
+        .args(["-0", pid])
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        assert!(
+            gone.elapsed() < Duration::from_secs(20),
+            "{label}: grandchild {pid} outlived the kill"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+#[cfg(not(unix))] // no process groups or kill -0 to probe the grandchild with
+fn grandchild_died(_label: &str, _pid: &str) -> bool {
+    false
+}
+
 /// A gate that outlives its deadline is killed with its whole process group
 /// and ends the run with a TIMED OUT gate_error: not a red run, so no fix
 /// attempt is spent and no `Exit code:` verdict is reported. The grandchild
@@ -493,22 +557,15 @@ fn verify_gates_report_a_deadline_kill_apart_from_a_red_run() {
     let dir = temp_dir("deadline");
     committed_project(&dir.0, "here");
     let state = serde_json::json!({ "project_dir": dir.0.to_string_lossy() });
-    let late = dir.0.join("late.txt");
-    let cmd = "sh -c 'sleep 4; echo late > late.txt'; echo after > late.txt";
     for gate in &GATES {
         let started = Instant::now();
         let out = run_script(
             gate.rel,
             &dir.0,
             &state,
-            &[(gate.cmd_env, cmd), (gate.timeout_var, "1")],
+            &[(gate.cmd_env, OUTLIVES_DEADLINE), (gate.timeout_var, "1")],
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "{}: the deadline did not cut the gate short ({:?})",
-            gate.rel,
-            started.elapsed()
-        );
+        assert_cut_short(gate.rel, &dir.0, started);
         assert_eq!(out[gate.ok_key], Value::Bool(false), "{}: {out}", gate.rel);
         assert_eq!(str_field(&out, "_next"), "end_failure", "{}", gate.rel);
         let gate_error = str_field(&out, "gate_error");
@@ -536,24 +593,17 @@ fn verify_gates_report_a_deadline_kill_apart_from_a_red_run() {
         BASELINE,
         &dir.0,
         &state,
-        &[("TEST_CMD", cmd), ("LLM_AGENT_VAR_TEST_TIMEOUT", "1")],
+        &[
+            ("TEST_CMD", OUTLIVES_DEADLINE),
+            ("LLM_AGENT_VAR_TEST_TIMEOUT", "1"),
+        ],
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{BASELINE}: the deadline did not cut the gate short ({:?})",
-        started.elapsed()
-    );
+    assert_cut_short(BASELINE, &dir.0, started);
     assert_eq!(str_field(&out, "baseline_status"), "timed_out", "{out}");
     assert_eq!(str_field(&out, "_next"), "implement", "{out}");
     assert!(
         str_field(&out, "baseline_note").contains("timed out after 1 s"),
         "{out}"
-    );
-    thread::sleep(Duration::from_secs(5));
-    assert!(
-        !late.exists(),
-        "a child of a timed-out gate outlived the kill and wrote {}",
-        late.display()
     );
 }
 
@@ -958,11 +1008,15 @@ fn baseline_tests_records_green_and_timed_out_runs_without_failures() {
         BASELINE,
         &dir.0,
         &project_state(&dir.0),
-        &[("TEST_CMD", "sleep 5"), ("LLM_AGENT_VAR_TEST_TIMEOUT", "1")],
+        &[
+            ("TEST_CMD", "sleep 60"),
+            ("LLM_AGENT_VAR_TEST_TIMEOUT", "1"),
+        ],
     );
     assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "deadline ignored"
+        started.elapsed() < Duration::from_secs(30),
+        "deadline ignored ({:?})",
+        started.elapsed()
     );
     assert_baseline_shape(&out);
     assert_eq!(str_field(&out, "baseline_status"), "timed_out", "{out}");
@@ -1260,10 +1314,9 @@ fn coder_graph_runs_the_baseline_once_before_implement() {
             .contains("{{baseline_note}}")
     );
     assert!(
-        nodes["end_success"]["output"]
-            .as_str()
-            .unwrap()
-            .contains("Tests: {{tests_verdict}}{{baseline_report}}\nReview: ")
+        nodes["end_success"]["output"].as_str().unwrap().contains(
+            "Tests: {{tests_verdict}}{{baseline_report}}\nTier: {{tests_tier}}\nReview: "
+        )
     );
     for key in [
         "baseline_status",
@@ -1445,22 +1498,28 @@ fn implement_worst_case_visits_stay_below_the_loop_cap() {
     );
 }
 
-/// With no report the `Tests:` line is followed by the `Review:` line; a
+/// With no report the `Tests:` line is followed by the `Tier:` line; a
 /// report lands on its own lines between them.
 #[test]
 fn end_success_renders_the_baseline_report_after_tests_passed() {
     let template = graph()["nodes"]["end_success"]["output"]
         .as_str()
         .unwrap()
-        .replace("{{tests_verdict}}", "passed");
+        .replace("{{tests_verdict}}", "passed")
+        .replace("{{tests_tier}}", "full");
     let plain = template.replace("{{baseline_report}}", "");
-    assert!(plain.contains("\nTests: passed\nReview: "), "{plain}");
+    assert!(
+        plain.contains("\nTests: passed\nTier: full\nReview: "),
+        "{plain}"
+    );
     let reported = template.replace(
         "{{baseline_report}}",
         "\nPre-existing failures: tests/a.py::one",
     );
     assert!(
-        reported.contains("Tests: passed\nPre-existing failures: tests/a.py::one\nReview: "),
+        reported.contains(
+            "Tests: passed\nPre-existing failures: tests/a.py::one\nTier: full\nReview: "
+        ),
         "{reported}"
     );
 }
@@ -2592,7 +2651,7 @@ fn end_success_renders_the_gate_and_review_verdicts() {
     assert!(!output.contains("Tests: passed"), "{output}");
     assert!(
         output.ends_with(
-            "\nBuild: {{build_verdict}}\nTests: {{tests_verdict}}{{baseline_report}}\nReview: {{review_verdict}}\nDesign: {{design_notes}}\n"
+            "\nBuild: {{build_verdict}}\nTests: {{tests_verdict}}{{baseline_report}}\nTier: {{tests_tier}}\nReview: {{review_verdict}}\nDesign: {{design_notes}}\n"
         ),
         "{output}"
     );

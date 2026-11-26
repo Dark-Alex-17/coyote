@@ -14,6 +14,8 @@ flowchart TD
     parse -. "fallback" .-> pfault["parse_fault<br/>(script: PIPELINE-FAULT marker)"]
     pfault --> gate
     signals --> debris["debris_lint<br/>(script: implementation-debris lint<br/>over the added lines)"]
+    signals -. "_next: verification_tier final" .-> fcheck["finalize_check<br/>(script: finalize record for the tree,<br/>finalize gate on a miss)"]
+    fcheck --> debris
     debris -. "fallback" .-> dfault["debris_fault<br/>(script: debris_error marker)"]
     dfault --> select
     debris --> select["select_lanes<br/>(llm: ADDITIVE-only judgment)"]
@@ -189,6 +191,7 @@ still appear under `## Blockers` and must be fixed as usual.
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 | debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |
+| full-suite (final tier only) | none -- `finalize_check.sh`'s `full_suite_record` read from state | no green finalize record for the tree recorded before the lanes: `FULL-SUITE RECORD MISSING\|RED\|UNAVAILABLE: <detail>` (see [Verification tiers](#verification-tiers)) |
 
 Probe-written tests: `signals.py` records the worktree's tree before the lanes run
 (`review_tree_before`; untracked, non-ignored files included, written through a temporary
@@ -297,6 +300,52 @@ rules. On BLOCKED without it: fix the findings per your own findings-handling
 rules, then spawn a **fresh** gauntlet run. On PASS with *Human attention
 required*: complete the work but carry those items into your final report
 verbatim.
+
+### Verification tiers
+
+The `verification_tier` variable (default empty) says where this review sits
+in the run's verification, and is forwarded to the adversary lane through
+`inputs:`:
+
+- Empty: the gauntlet as described above.
+- `round`: a review between fix rounds. The gauntlet itself runs nothing
+  extra, so nothing here runs the full suite; the adversary lane is told the
+  full suite runs at the final gate and may defer a criterion only the whole
+  suite can prove (see the adversary's README).
+- `final`: this review is the final gate. Once `signals` has recorded the
+  worktree tree the lanes will review, it routes to `finalize_check`
+  (node timeout 3600s), which looks up the finalize record for that tree
+  (`.shared/verify_record.py`) and reuses it as it stands, green or red. On a
+  miss it runs `.shared/finalize_gate.sh` there (fmt, check, lint, then the
+  full suite under the build_lock prefix, each killed after 3300s), which writes the
+  record. A record that decides nothing (a step timed out, or the suite could
+  not be judged) is a miss, and so is one that accepted pre-existing failures
+  against another base than `baseline_floor`. The verdict gate then needs a
+  green record for the recorded tree:
+  otherwise it blocks with a `FULL-SUITE RECORD MISSING|RED|UNAVAILABLE:
+  <detail>` line and a BLOCKED `full-suite` row, even when every lane is
+  green. MISSING covers a check that never finished and a record for another
+  tree; UNAVAILABLE is a red suite with no base suite record to tell new
+  failures from old ones, or no test command. The gate's fmt step never
+  changes the tree: every file it rewrites gets its submitted bytes back, and
+  a rewritten file that belongs to the change (the diff from `baseline_floor`,
+  else from the base the suite is judged against, plus untracked files) turns
+  the fmt result RED with its path, since it was committed or submitted
+  unformatted. Should a gate still leave a tree other than the recorded one,
+  the check reports RED naming the changed paths. The recorded tree also goes
+  to the adversary lane as `review_tree`, so it looks up the same record
+  even after the probe lane writes its tests.
+
+`baseline_floor` (default empty, final tier only) is the commit the run
+started from. With it, a red full suite is judged only against the base suite
+record at that commit, and when there is none the suite runs there on demand
+(the record's `baseline_mode` says `lazy`). Without it, the nearest base
+record on HEAD's first-parent chain counts only when no merge commit lies
+between it and HEAD and every commit in between was made after the record:
+otherwise the record could belong to an earlier task whose regressions would
+pass as pre-existing.
+
+Any other value blocks as a `PIPELINE-FAULT`.
 
 ## Notes
 

@@ -380,6 +380,15 @@ gate_ran() {
   printf '%s' "${ran# }"
 }
 
+# gate_unexport_agent_vars drops the export of every LLM_AGENT_VAR_* variable
+# of the current shell, keeping its value.
+gate_unexport_agent_vars() {
+  local name
+  for name in $(compgen -e LLM_AGENT_VAR_); do
+    export -n "$name"
+  done
+}
+
 # run_gate evals a gate command string, under gate_prefix when one is set.
 # The whole command runs as ONE unit beneath the prefix (one lock for a
 # compound `a && b`, and `FOO=bar cmd` keeps its leading assignment), so the
@@ -389,16 +398,21 @@ gate_ran() {
 # `pipefail` options the gate scripts run under, so a piped or unbound-variable
 # gate command fails the same way with or without a prefix. The inner shell
 # sees only exported variables; a gate command must not depend on the gate
-# script's own locals.
+# script's own locals. The command runs in a subshell where the agent's
+# LLM_AGENT_VAR_* variables keep their values (the prefix still resolves) but
+# are not exported, so nothing the command starts sees them.
 # Usage: output=$(cd "$dir" && run_gate "$cmd" 2>&1) || rc=$?
 run_gate() {
   local cmd=$1 prefix
   prefix=$(gate_prefix)
-  if [[ -n "$prefix" ]]; then
-    GATE_CMD=$cmd eval "$prefix bash -c 'set -uo pipefail; eval \"\$GATE_CMD\"'"
-  else
-    eval "$cmd"
-  fi
+  (
+    gate_unexport_agent_vars
+    if [[ -n "$prefix" ]]; then
+      GATE_CMD=$cmd eval "$prefix bash -c 'set -uo pipefail; eval \"\$GATE_CMD\"'"
+    else
+      eval "$cmd"
+    fi
+  )
 }
 
 # trim_output bounds a command transcript before it is embedded in graph

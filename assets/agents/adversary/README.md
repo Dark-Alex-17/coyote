@@ -309,6 +309,42 @@ paths are dropped and counted in that line.
   so an injected instruction that makes the parse LLM emit an extra `verification_commands` key
   cannot reach state: the undeclared key is dropped and the declared variable stands.
 
+### Verification tier
+
+`verification_tier` (default `''`) says where this review sits in the run's verification;
+`review-gauntlet` forwards its own through `inputs:`.
+
+- `''`: everything above, unchanged.
+- `round`: the full test suite and lint run at the final gate, after this review, and the
+  criterion checks and the holistic pass are told so. A criterion only the whole suite or lint can
+  prove is at best INSPECTED, with a `no_test_reason` beginning
+  `DEFERRED: full suite runs at the final gate`. The verdict counts it as PARTIAL unless at least
+  one recorded run is green, the same rule as an `ENVIRONMENT:` reason, so beside a green targeted
+  run it still CONFORMS.
+- `final`: this review is the final gate. `run_checks` looks up the finalize record of the
+  reviewed tree (`.shared/verify_record.py`, written by `.shared/finalize_gate.sh`) and puts its
+  results first in `exec_results`, each with `source: "finalize record <tree> @ <recorded_at>"`,
+  pre-existing failures as a pre-existing baseline and other reds as blocking; the full suite is
+  never run again. The declared `verification_commands` still run after them, so a caller
+  declares only what the finalize gate does not cover (a run-wide lint, say), never the full
+  suite. A green record run proves the criteria it covers like any recorded run. No record for
+  the tree (none, or only one for another tree, or one that decides nothing because a step timed
+  out or the suite could not be judged) or a red one forces DIVERGES with a
+  `FULL-SUITE RECORD MISSING: ...` or `FULL-SUITE RECORD RED: ...` line under the header and as
+  the first run complaint, whatever
+  the criteria say; that holds for a directly spawned adversary too. A record whose only failures
+  the finalize gate matched to the base suite is green. A `DEFERRED:` reason always counts as
+  PARTIAL here. `carried_failures` are matched against the declared runs only, since the record
+  keeps only the tail of each output.
+
+The reviewed tree is `review_tree` (default `''`) when the caller names one: `review-gauntlet`
+forwards the tree `signals` recorded before its lanes, so a test file the probe lane writes
+alongside this review does not hide the record. Only that exact tree's record counts. Empty uses
+the worktree tree as `run_checks` finds it, where a tree that differs from a record's only under
+`debris_exclude` matches too.
+
+Any other value executes nothing and records a `PIPELINE-FAULT`.
+
 ### Tools
 
 - The graph's `diff_facts` script resolves the diff itself (staged → unstaged → `HEAD~1`, or an explicit ref/range named in the prompt) — there is no `get_diff` tool anymore.
