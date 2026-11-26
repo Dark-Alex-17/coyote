@@ -1,11 +1,12 @@
 use super::state::StateManager;
 use super::state_updates;
 use super::structured;
-use super::structured::{ExtractorTransport, with_native_format_fallback};
+use super::structured::ExtractorTransport;
 use super::types::LlmNode;
 use super::{is_transient_error, wall_clock};
+use crate::client::native_format::with_native_format_fallback;
 use crate::client::structured_output::{SchemaDialect, StructuredOutputSpec, sanitize_schema_name};
-use crate::client::{Model, ModelType, call_chat_completions_streaming_quiet};
+use crate::client::{Client, Model, ModelType, call_chat_completions_streaming_quiet};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
     AgentToolGate, Input, RequestContext, Role, RoleLike, SkillPolicy,
@@ -51,8 +52,24 @@ impl LlmNodeExecutor {
             &mut default_completion_runner(),
         )
         .await;
-        finish(node, state_manager, parent_ctx, result, abort).await
+        finish(
+            node,
+            state_manager,
+            parent_ctx,
+            result,
+            abort,
+            &mut quiet_transport,
+        )
+        .await
     }
+}
+
+/// A successful chat loop's text across every turn, plus the returning
+/// turn's own output and dialect when it ran under the native format.
+#[derive(Debug)]
+struct ChatLoopOutput {
+    text: String,
+    native_final: Option<(String, SchemaDialect)>,
 }
 
 /// Extraction, state_updates, and the outcome for an already-finished run.
@@ -61,39 +78,20 @@ async fn finish(
     node: &LlmNode,
     state_manager: &mut StateManager,
     parent_ctx: &mut RequestContext,
-    result: Result<String>,
-    abort: &AbortSignal,
-) -> Result<LlmExecutionOutcome> {
-    let mut transport = quiet_transport(abort.clone());
-    finish_with(
-        node,
-        state_manager,
-        parent_ctx,
-        result,
-        abort,
-        &mut transport,
-    )
-    .await
-}
-
-async fn finish_with(
-    node: &LlmNode,
-    state_manager: &mut StateManager,
-    parent_ctx: &mut RequestContext,
-    result: Result<String>,
+    result: Result<ChatLoopOutput>,
     abort: &AbortSignal,
     transport: &mut ExtractorTransport<'_>,
 ) -> Result<LlmExecutionOutcome> {
-    let final_turn = parent_ctx.native_format.final_turn.take();
     let (output, failure_reason) = match result {
-        Ok(raw) => match &node.output_schema {
-            Some(schema) => match final_turn.and_then(|turn| parse_native_final_turn(turn, schema))
+        Ok(ChatLoopOutput {
+            text: raw,
+            native_final,
+        }) => match &node.output_schema {
+            Some(schema) => match native_final
+                .and_then(|turn| parse_native_final_turn(turn, schema))
             {
                 Some(value) => (value, None),
-                None => match structured::extract_with_transport(
-                    &raw, schema, parent_ctx, abort, None, transport,
-                )
-                .await
+                None => match structured::extract(&raw, schema, parent_ctx, abort, transport).await
                 {
                     Ok(value) => (value, None),
                     Err(e) => {
@@ -130,7 +128,7 @@ fn parse_native_final_turn(
         debug!("native {dialect:?} final turn is not JSON; extracting from the accumulated output");
         return None;
     };
-    structured::strip_nulls_for(Some(dialect), &mut value, schema);
+    dialect.strip_nulls(&mut value, schema);
     Some(value)
 }
 
@@ -158,7 +156,7 @@ async fn run(
     parent_ctx: &mut RequestContext,
     abort: &AbortSignal,
     runner: &mut CompletionRunner<'_>,
-) -> Result<String> {
+) -> Result<ChatLoopOutput> {
     let mut instructions: Option<String> = match &node.instructions {
         Some(s) => Some(
             state_manager
@@ -342,43 +340,54 @@ pub(crate) fn default_completion_runner()
     completion_runner_with(quiet_transport)
 }
 
-/// The production runner over the transport `make_transport` builds for
-/// each call; tests pass a fake transport to drive the format fallback.
-fn completion_runner_with<T, F>(
-    make_transport: F,
+/// The production runner over `transport`, which every call and its
+/// format-less retry share; tests pass a fake transport to drive the format
+/// fallback.
+fn completion_runner_with<T>(
+    transport: T,
 ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 where
-    F: Fn(AbortSignal) -> T + Send,
-    T: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send + 'static,
+    T: for<'b> Fn(
+            &'b Input,
+            &'b dyn Client,
+            &'b mut RequestContext,
+            AbortSignal,
+        ) -> CompletionFuture<'b>
+        + Send
+        + Sync
+        + 'static,
 {
+    let transport = Arc::new(transport);
     move |input, ctx, abort| {
-        let transport = make_transport(abort);
+        let transport = Arc::clone(&transport);
         Box::pin(async move {
             let client = input.create_client()?;
-            let dialect = input.native_structured_output(client.as_ref());
             ctx.before_chat_completion(input)?;
-            with_native_format_fallback(dialect, input, ctx, transport).await
+            with_native_format_fallback(input, client.as_ref(), ctx, |input, client, ctx| {
+                transport(input, client, ctx, abort.clone())
+            })
+            .await
         })
     }
 }
 
-/// One quiet streaming call per invocation, each with its own client, so
-/// the native-format fallback can repeat it with a different input.
-pub(crate) fn quiet_transport(
+/// One quiet streaming call per invocation, so the native-format fallback
+/// can repeat it with a different input.
+pub(crate) fn quiet_transport<'b>(
+    input: &'b Input,
+    client: &'b dyn Client,
+    ctx: &'b mut RequestContext,
     abort: AbortSignal,
-) -> impl for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send {
-    move |input, ctx| {
-        let abort = abort.clone();
-        Box::pin(async move {
-            let client = input.create_client()?;
-            call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
-        })
-    }
+) -> CompletionFuture<'b> {
+    Box::pin(call_chat_completions_streaming_quiet(
+        input, client, ctx, abort,
+    ))
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::CompletionFuture;
+    use crate::client::Client;
     use crate::config::{Input, RequestContext};
     use crate::function::ToolResult;
     use crate::utils::AbortSignal;
@@ -404,7 +413,13 @@ pub(crate) mod test_support {
     /// The transport-side twin of `completion_runner`.
     pub(crate) fn transport_call<F>(f: F) -> F
     where
-        F: for<'b> FnMut(&'b Input, &'b mut RequestContext) -> CompletionFuture<'b> + Send,
+        F: for<'b> FnMut(
+                &'b Input,
+                &'b dyn Client,
+                &'b mut RequestContext,
+                AbortSignal,
+            ) -> CompletionFuture<'b>
+            + Send,
     {
         f
     }
@@ -418,7 +433,7 @@ async fn bounded_run(
     ctx: &mut RequestContext,
     abort: &AbortSignal,
     runner: &mut CompletionRunner<'_>,
-) -> Result<String> {
+) -> Result<ChatLoopOutput> {
     match node.timeout.and_then(wall_clock) {
         Some(d) => match timeout(
             d,
@@ -440,10 +455,10 @@ async fn run_with_retries(
     ctx: &mut RequestContext,
     abort: &AbortSignal,
     runner: &mut CompletionRunner<'_>,
-) -> Result<String> {
+) -> Result<ChatLoopOutput> {
     let mut last_err: Option<Error> = None;
     for attempt in 1..=node.max_attempts {
-        match run_chat_loop(node_id, node, prompt, ctx, abort, runner).await {
+        match run_chat_turns(node_id, node, prompt, ctx, abort, runner).await {
             Ok(out) => return Ok(out),
             Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
                 warn!("llm node '{node_id}' attempt {attempt} failed (transient): {e:#}; retrying");
@@ -460,23 +475,6 @@ pub(crate) fn is_last_turn(turn: u32, max_iterations: u32) -> bool {
     max_iterations > 0 && turn == max_iterations - 1
 }
 
-async fn run_chat_loop(
-    node_id: &str,
-    node: &LlmNode,
-    prompt: &str,
-    ctx: &mut RequestContext,
-    abort: &AbortSignal,
-    runner: &mut CompletionRunner<'_>,
-) -> Result<String> {
-    ctx.native_format.final_turn = None;
-    let result = run_chat_turns(node_id, node, prompt, ctx, abort, runner).await;
-    // Only a successful attempt's final turn may reach `finish`.
-    if result.is_err() {
-        ctx.native_format.final_turn = None;
-    }
-    result
-}
-
 async fn run_chat_turns(
     node_id: &str,
     node: &LlmNode,
@@ -484,7 +482,7 @@ async fn run_chat_turns(
     ctx: &mut RequestContext,
     abort: &AbortSignal,
     runner: &mut CompletionRunner<'_>,
-) -> Result<String> {
+) -> Result<ChatLoopOutput> {
     let abort = abort.clone();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
@@ -513,7 +511,7 @@ async fn run_chat_turns(
         }
 
         if tool_results.is_empty() {
-            ctx.native_format.final_turn = turn_dialect.map(|d| (output, d));
+            let native_final = turn_dialect.map(|d| (output, d));
             // Whitespace-only output across every turn is a provider blip, not a
             // conclusion, unless the guardrail still has a reminder to deliver.
             let said_nothing = accumulated.trim().is_empty();
@@ -532,7 +530,10 @@ async fn run_chat_turns(
                     bail!("empty completion: model returned no text and no tool calls");
                 }
                 GuardrailAction::NoAction => {
-                    return Ok(accumulated);
+                    return Ok(ChatLoopOutput {
+                        text: accumulated,
+                        native_final,
+                    });
                 }
                 GuardrailAction::ForceTerminate(ids) => {
                     warn!(
@@ -540,7 +541,10 @@ async fn run_chat_turns(
                         ids.len(),
                         ids
                     );
-                    return Ok(accumulated);
+                    return Ok(ChatLoopOutput {
+                        text: accumulated,
+                        native_final,
+                    });
                 }
                 GuardrailAction::Inject(prompt) => {
                     if is_last_turn(turn, node.max_iterations) {
@@ -1030,6 +1034,13 @@ mod tests {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
     }
 
+    fn text_only(text: &str) -> ChatLoopOutput {
+        ChatLoopOutput {
+            text: text.to_string(),
+            native_final: None,
+        }
+    }
+
     fn paced_reply(secs: u64) -> CompletionFuture<'static> {
         boxed_completion(async move {
             tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -1061,7 +1072,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1122,7 +1133,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "recovered");
+        assert_eq!(out.text, "recovered");
         assert_eq!(attempts, 2);
     }
 
@@ -1154,7 +1165,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "recovered");
+        assert_eq!(out.text, "recovered");
         assert_eq!(attempts, 2);
     }
 
@@ -1186,7 +1197,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "recovered");
+        assert_eq!(out.text, "recovered");
         assert_eq!(attempts, 2);
     }
 
@@ -1235,7 +1246,7 @@ mod tests {
         let mut turns = 0u32;
         let mut reminder = String::new();
 
-        let out = run_chat_loop(
+        let out = run_chat_turns(
             "node",
             &node,
             "user",
@@ -1254,7 +1265,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "collected");
+        assert_eq!(out.text, "collected");
         assert_eq!(turns, 2);
         assert!(
             reminder.contains("job_1 (job): call `job__collect`"),
@@ -1322,7 +1333,7 @@ mod tests {
         let mut turns = 0u32;
         let mut prompts: Vec<String> = Vec::new();
 
-        let err = run_chat_loop(
+        let err = run_chat_turns(
             "silent",
             &node,
             "user",
@@ -1370,7 +1381,7 @@ mod tests {
         let abort = create_abort_signal();
         let mut turns = 0u32;
 
-        let err = run_chat_loop(
+        let err = run_chat_turns(
             "silent",
             &node,
             "user",
@@ -1409,7 +1420,7 @@ mod tests {
         let abort = create_abort_signal();
         let mut turns = 0u32;
 
-        let out = run_chat_loop(
+        let out = run_chat_turns(
             "talker",
             &node,
             "user",
@@ -1423,7 +1434,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "the answer");
+        assert_eq!(out.text, "the answer");
         assert_eq!(turns, 1);
         assert!(
             job_abort.aborted(),
@@ -1473,7 +1484,7 @@ mod tests {
         let abort = create_abort_signal();
         let mut attempts = 0u32;
 
-        let out = run_chat_loop(
+        let out = run_chat_turns(
             "node",
             &node,
             "user",
@@ -1497,7 +1508,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "partial");
+        assert_eq!(out.text, "partial");
         assert_eq!(attempts, 2);
     }
 
@@ -1648,7 +1659,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "second attempt");
+        assert_eq!(out.text, "second attempt");
         assert_eq!(
             turns, 3,
             "tool turn + empty turn (attempt 1), then attempt 2"
@@ -1684,7 +1695,7 @@ mod tests {
         let mut ctx = plain_ctx();
         let abort = create_abort_signal();
 
-        let err = run_chat_loop(
+        let err = run_chat_turns(
             "node",
             &node,
             "user",
@@ -1829,8 +1840,9 @@ mod tests {
             &node,
             &mut state,
             &mut ctx,
-            Ok("not json".to_string()),
+            Ok(text_only("not json")),
             &create_abort_signal(),
+            &mut quiet_transport,
         )
         .await
         .expect("a declared fallback turns the failure into a route");
@@ -1872,8 +1884,9 @@ mod tests {
             &node,
             &mut state,
             &mut ctx,
-            Ok("not json".to_string()),
+            Ok(text_only("not json")),
             &abort,
+            &mut quiet_transport,
         )
         .await
         .expect("a declared fallback turns the failure into a route");
@@ -1909,8 +1922,9 @@ mod tests {
             &node,
             &mut state,
             &mut ctx,
-            Ok("not json".to_string()),
+            Ok(text_only("not json")),
             &create_abort_signal(),
+            &mut quiet_transport,
         )
         .await
         .expect_err("no fallback means the failure bails");
@@ -1959,7 +1973,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         assert!(!ctx.in_graph_llm_node, "flag must not outlive the node");
     }
 
@@ -2043,7 +2057,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         assert_eq!(ctx.session.as_ref().unwrap().messages().len(), before);
 
         // Positive control: the same round on an attached input is
@@ -2328,7 +2342,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out, r#"{"done": true}"#);
+        assert_eq!(out.text, r#"{"done": true}"#);
         let expected = (
             Some("summarise".to_string()),
             true,
@@ -2401,12 +2415,11 @@ mod tests {
             }),
         )
         .await;
-        let mut transport = transport_call(|_input, _ctx| {
+        let mut transport = transport_call(|_input, _client, _ctx, _abort| {
             extractor_calls += 1;
             boxed_completion(async { Ok((r#"{"done": false}"#.to_string(), vec![])) })
         });
-        let outcome =
-            finish_with(&node, &mut state, &mut ctx, result, &abort, &mut transport).await;
+        let outcome = finish(&node, &mut state, &mut ctx, result, &abort, &mut transport).await;
         (outcome, state, calls, extractor_calls)
     }
 
@@ -2451,19 +2464,21 @@ mod tests {
         let node = node_with_schema(None, done_schema());
         let mut state = manager_with(&[]);
         let mut ctx = extractor_ctx();
-        ctx.native_format.final_turn = Some(("not json".to_string(), SchemaDialect::OpenAiStrict));
         let abort = create_abort_signal();
         let mut extractor_calls = 0u32;
-        let mut transport = transport_call(|_input, _ctx| {
+        let mut transport = transport_call(|_input, _client, _ctx, _abort| {
             extractor_calls += 1;
             boxed_completion(async { Ok((r#"{"done": false}"#.to_string(), vec![])) })
         });
 
-        let outcome = finish_with(
+        let outcome = finish(
             &node,
             &mut state,
             &mut ctx,
-            Ok(r#"{"done": true, "note": null}"#.to_string()),
+            Ok(ChatLoopOutput {
+                text: r#"{"done": true, "note": null}"#.to_string(),
+                native_final: Some(("not json".to_string(), SchemaDialect::OpenAiStrict)),
+            }),
             &abort,
             &mut transport,
         )
@@ -2473,27 +2488,33 @@ mod tests {
         assert_eq!(extractor_calls, 0);
         assert_eq!(state.state().get("done"), Some(&json!(true)));
         assert_eq!(state.state().get("note"), Some(&Value::Null));
-        assert_eq!(ctx.native_format.final_turn, None);
     }
 
+    /// Without a schema the node's output is the accumulated text, never
+    /// the native final turn.
     #[tokio::test]
-    async fn finish_without_a_schema_clears_the_final_turn() {
-        let node = node_with(None);
+    async fn finish_without_a_schema_outputs_the_accumulated_text() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let node = node_with(Some(u));
         let mut state = manager_with(&[]);
         let mut ctx = plain_ctx();
-        ctx.native_format.final_turn = Some(("{}".to_string(), SchemaDialect::OpenAiStrict));
 
-        finish(
+        let outcome = finish(
             &node,
             &mut state,
             &mut ctx,
-            Ok("{}".to_string()),
+            Ok(ChatLoopOutput {
+                text: "prose".to_string(),
+                native_final: Some(("{}".to_string(), SchemaDialect::OpenAiStrict)),
+            }),
             &create_abort_signal(),
+            &mut quiet_transport,
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(ctx.native_format.final_turn, None);
+        assert_eq!(outcome.unwrap(), LlmExecutionOutcome::Continue);
+        assert_eq!(state.state().get("captured"), Some(&json!("prose")));
     }
 
     #[tokio::test]
@@ -2507,21 +2528,19 @@ mod tests {
         }));
         let input = Input::from_str(&ctx, "hi", Some(role)).unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut runner = completion_runner_with(|_abort| {
-            let seen = Arc::clone(&seen);
-            transport_call(move |input, _ctx| {
-                let has_spec = input.role().structured_output().is_some();
-                seen.lock().unwrap().push(has_spec);
-                boxed_completion(async move {
-                    if has_spec {
-                        Err(Error::new(crate::client::ApiStatusError {
-                            status: 400,
-                            message: "rejected".to_string(),
-                        }))
-                    } else {
-                        Ok(("ok".to_string(), vec![]))
-                    }
-                })
+        let recorded = Arc::clone(&seen);
+        let mut runner = completion_runner_with(move |input: &Input, _client, _ctx, _abort| {
+            let has_spec = input.role().structured_output().is_some();
+            recorded.lock().unwrap().push(has_spec);
+            boxed_completion(async move {
+                if has_spec {
+                    Err(Error::new(crate::client::ApiStatusError {
+                        status: 400,
+                        message: "rejected".to_string(),
+                    }))
+                } else {
+                    Ok(("ok".to_string(), vec![]))
+                }
             })
         });
 

@@ -10,6 +10,7 @@ use crate::utils::AbortSignal;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Branch {
@@ -21,6 +22,9 @@ pub const ROUTE_CONTEXT_MESSAGES: usize = 6;
 pub const ROUTE_CONTEXT_BYTES: usize = 4096;
 
 pub const ROUTE_SCHEMA: &str = r#"{"type":"object","properties":{"decision":{"type":"string","enum":["run","chat"]}},"required":["decision"]}"#;
+
+static PARSED_ROUTE_SCHEMA: LazyLock<Value> =
+    LazyLock::new(|| serde_json::from_str(ROUTE_SCHEMA).unwrap());
 
 pub const ROUTE_ROLE_NAME: &str = "__graph_route__";
 
@@ -60,9 +64,7 @@ async fn decide(
     let (raw, _) = runner(input, ctx, abort.clone())
         .await
         .context("Graph route classifier call failed")?;
-    let schema: Value = serde_json::from_str(ROUTE_SCHEMA)?;
-    let mut transport = quiet_transport(abort.clone());
-    let value = extract_decision_with(&raw, &schema, ctx, abort, &mut transport)
+    let value = extract_decision_with(&raw, &PARSED_ROUTE_SCHEMA, ctx, abort, &mut quiet_transport)
         .await
         .context("Graph route classifier could not read the decision")?;
     match value.get("decision").and_then(Value::as_str) {
@@ -81,8 +83,13 @@ async fn extract_decision_with(
     abort: &AbortSignal,
     transport: &mut ExtractorTransport<'_>,
 ) -> Result<Value> {
-    let producer_dialect = ctx.native_format.last_dialect;
-    structured::extract_with_transport(raw, schema, ctx, abort, producer_dialect, transport).await
+    if let Some(mut parsed) = structured::try_parse_json(raw) {
+        if let Some(dialect) = ctx.native_format.last_dialect {
+            dialect.strip_nulls(&mut parsed, schema);
+        }
+        return Ok(parsed);
+    }
+    structured::extract(raw, schema, ctx, abort, transport).await
 }
 
 fn build_route_role(ctx: &RequestContext, block: &SessionBlock) -> Result<Role> {
@@ -100,7 +107,7 @@ fn build_route_role(ctx: &RequestContext, block: &SessionBlock) -> Result<Role> 
     role.set_enabled_mcp_servers(Some(Vec::new()));
     role.set_structured_output(Some(StructuredOutputSpec {
         name: ROUTE_SCHEMA_NAME.to_string(),
-        schema: serde_json::from_str(ROUTE_SCHEMA)?,
+        schema: PARSED_ROUTE_SCHEMA.clone(),
     }));
     Ok(role)
 }
@@ -705,7 +712,7 @@ mod tests {
             let mut ctx = ctx_with_session();
             ctx.native_format.last_dialect = dialect;
             let mut extractor_calls = 0u32;
-            let mut transport = transport_call(|_input, _ctx| {
+            let mut transport = transport_call(|_input, _client, _ctx, _abort| {
                 extractor_calls += 1;
                 boxed_completion(async { Ok(("{}".to_string(), vec![])) })
             });

@@ -25,6 +25,7 @@ use super::{
     ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
+use crate::client::native_format::NativeFormatState;
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
@@ -40,7 +41,6 @@ use crate::function::{
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::graph::route::Branch;
-use crate::graph::structured::NativeFormatState;
 use crate::mcp::{
     CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
@@ -12677,7 +12677,6 @@ mod tests {
         NativeFormatState {
             rejected: true,
             last_dialect: Some(crate::client::structured_output::SchemaDialect::Anthropic),
-            final_turn: None,
         }
     }
 

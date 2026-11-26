@@ -1,4 +1,5 @@
 use super::is_transient_error;
+use super::llm::quiet_transport;
 use super::state::StateManager;
 use super::state_updates;
 use super::structured;
@@ -187,7 +188,7 @@ async fn attempt_and_extract(
         .clone()
         .unwrap_or_else(create_abort_signal);
     let output_value = match &node.output_schema {
-        Some(schema) => structured::extract(&raw, schema, parent_ctx, &abort, None)
+        Some(schema) => structured::extract(&raw, schema, parent_ctx, &abort, &mut quiet_transport)
             .await
             .with_context(|| {
                 format!(

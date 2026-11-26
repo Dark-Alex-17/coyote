@@ -11,8 +11,9 @@ use self::placeholder_edit::{
 };
 use self::prompt::ReplPrompt;
 
+use crate::client::native_format::with_native_format_fallback;
 use crate::client::{
-    Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
+    Client, Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
     call_chat_completions_streaming_quiet, init_client, oauth,
 };
 use crate::config::{
@@ -26,7 +27,6 @@ use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pe
 use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
-use crate::graph::structured::with_native_format_fallback;
 use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
@@ -1925,39 +1925,43 @@ fn repl_completion_runner()
 /// Sends one request for `input` on the transport `select_transport` picks.
 fn repl_transport<'a>(
     input: &'a Input,
+    client: &'a dyn Client,
     ctx: &'a mut RequestContext,
     abort: AbortSignal,
 ) -> CompletionFuture<'a> {
     Box::pin(async move {
-        let client = input.create_client()?;
         match select_transport(input) {
             Transport::Quiet => {
-                call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
+                call_chat_completions_streaming_quiet(input, client, ctx, abort).await
             }
             Transport::Streaming => {
-                call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
+                call_chat_completions_streaming(input, client, ctx, abort).await
             }
-            Transport::Plain => {
-                call_chat_completions(input, true, false, client.as_ref(), ctx, abort).await
-            }
+            Transport::Plain => call_chat_completions(input, true, false, client, ctx, abort).await,
         }
     })
 }
 
 /// The REPL runner over `transport`. A native-format rejection is retried
-/// once without the format. The before-hook runs once per runner
-/// invocation and not again before that format-less retry.
+/// once without the format, on the same client. The before-hook runs once
+/// per runner invocation and not again before that format-less retry.
 fn repl_completion_runner_with<T>(
     transport: T,
 ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 where
-    T: for<'b> FnMut(&'b Input, &'b mut RequestContext, AbortSignal) -> CompletionFuture<'b>
-        + Clone
+    T: for<'b> Fn(
+            &'b Input,
+            &'b dyn Client,
+            &'b mut RequestContext,
+            AbortSignal,
+        ) -> CompletionFuture<'b>
         + Send
+        + Sync
         + 'static,
 {
+    let transport = Arc::new(transport);
     move |input, ctx, abort| {
-        let mut transport = transport.clone();
+        let transport = Arc::clone(&transport);
         Box::pin(async move {
             let client = input
                 .create_client()
@@ -1965,10 +1969,11 @@ where
             input
                 .guard_images()
                 .map_err(|err| anyhow::Error::new(PreflightError(err)))?;
-            let dialect = input.native_structured_output(client.as_ref());
             ctx.before_chat_completion(input)?;
-            with_native_format_fallback(dialect, input, ctx, |i, c| transport(i, c, abort.clone()))
-                .await
+            with_native_format_fallback(input, client.as_ref(), ctx, |i, cl, c| {
+                transport(i, cl, c, abort.clone())
+            })
+            .await
         })
     }
 }
@@ -5239,21 +5244,22 @@ local_hello() {\n\
             let block = graph.session.clone().unwrap();
             let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let recorded = Arc::clone(&seen);
-            let mut runner = repl_completion_runner_with(move |input: &Input, _ctx, _abort| {
-                let mut seen = recorded.lock();
-                seen.push(input.role().structured_output().cloned());
-                let first = seen.len() == 1;
-                boxed_completion(async move {
-                    if first {
-                        Err(anyhow::Error::new(crate::client::ApiStatusError {
-                            status: 400,
-                            message: "response_format rejected".into(),
-                        }))
-                    } else {
-                        Ok((r#"{"decision":"run"}"#.to_string(), vec![]))
-                    }
-                })
-            });
+            let mut runner =
+                repl_completion_runner_with(move |input: &Input, _client, _ctx, _abort| {
+                    let mut seen = recorded.lock();
+                    seen.push(input.role().structured_output().cloned());
+                    let first = seen.len() == 1;
+                    boxed_completion(async move {
+                        if first {
+                            Err(anyhow::Error::new(crate::client::ApiStatusError {
+                                status: 400,
+                                message: "response_format rejected".into(),
+                            }))
+                        } else {
+                            Ok((r#"{"decision":"run"}"#.to_string(), vec![]))
+                        }
+                    })
+                });
 
             let branch = graph::route::classify(
                 &mut ctx,

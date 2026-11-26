@@ -83,6 +83,16 @@ pub enum SchemaDialect {
     Gemini,
 }
 
+impl SchemaDialect {
+    /// OpenAI strict mode forces optional properties into nullable required
+    /// ones, so a value it produced loses those injected nulls again.
+    pub fn strip_nulls(self, value: &mut Value, schema: &Value) {
+        if self == SchemaDialect::OpenAiStrict {
+            strip_injected_nulls(value, schema);
+        }
+    }
+}
+
 /// Rewrites a JSON Schema into the subset a provider accepts. Keywords the
 /// dialect cannot express are rendered into the node's `description` so the
 /// model still sees them.
@@ -1875,5 +1885,24 @@ mod tests {
             converted["definitions"]["item"],
             json!({ "type": "number", "description": "{exclusiveMinimum: 0}" })
         );
+    }
+
+    #[test]
+    fn strip_nulls_removes_injected_nulls_only_under_openai_strict() {
+        let with_null = json!({"groups": [{"domain": "a", "files": [], "rationale": null}]});
+        for (dialect, expected) in [
+            (
+                SchemaDialect::OpenAiStrict,
+                json!({"groups": [{"domain": "a", "files": []}]}),
+            ),
+            (SchemaDialect::Anthropic, with_null.clone()),
+            (SchemaDialect::Gemini, with_null.clone()),
+        ] {
+            let mut value = with_null.clone();
+
+            dialect.strip_nulls(&mut value, &code_reviewer_groups_schema());
+
+            assert_eq!(value, expected, "dialect {dialect:?}");
+        }
     }
 }
