@@ -11326,6 +11326,26 @@ fn the_pages_quote_the_late_link_send_the_node_label_and_the_hub_hold() {
     }
 }
 
+/// A session's own farewell is discarded and cleared at join, as the node does and the
+/// farewell paragraph of Mesh.md says.
+#[test]
+fn the_farewell_paragraph_says_a_session_never_reads_its_own_farewell() {
+    let node = read(repo_root().join("src/mesh/node.rs"));
+    for piece in [
+        "Mesh cleared the farewell filed for this session's own destination {}; it has joined again",
+        "for this session's own destination {dest8} ignored: this session is running",
+    ] {
+        assert!(
+            node.contains(piece),
+            "src/mesh/node.rs no longer says {piece:?}; update Mesh.md and this test"
+        );
+    }
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    let needle = "A farewell for your own running session, one a sibling session sharing its home filed for its previous run, is discarded as well, and cleared when the session joins: its own row is never `left`.";
+    assert!(page.contains(needle), "Mesh.md does not say {needle:?}");
+}
+
 /// The route part of "Moving between networks" and the commands page quote the stale
 /// route sentence and the far-peer error as the source words them, and the section says
 /// `rnpath -d` is no longer needed.
@@ -11362,6 +11382,7 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
         "drops the route (in rnsd's table as well as its own), asks the network for a new one once, and tries the link once more before it reports anything",
         "every route over that interface counts as stale before its next request",
         "the trusted sessions and the propagation nodes reached the long way round over another interface are asked for once more",
+        "has come back since the route was last heard (rnsd's row or this session's own copy, whichever is later, when rnsd is the session's only way in)",
         "A route over an interface that is up always wins over one over an interface that is down, whatever their hops.",
         "`rnpath -d` is no longer needed after a move.",
         "A route over an interface that is up, and not just asked for, gets no extra try: its failure is reported as it is.",
@@ -11396,7 +11417,7 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         "{} reconnected upstream",
         "This host's network changed",
         "{subject}; announced so other sessions can find this one again",
-        "{subject}; this session already sent its {RECONNECT_GREETINGS_PER_HOUR} greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now",
+        "{subject}; this session already sent its {cap} greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now",
         "{subject}, but announcing failed; the next heartbeat will announce this session (details in the log).",
     ] {
         assert!(
@@ -11419,6 +11440,16 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
             "src/mesh/upstream.rs no longer says {piece:?}; update the page and this test"
         );
     }
+    let announce = read(repo_root().join("src/mesh/announce.rs"));
+    for piece in [
+        "pub(crate) const RECONNECT_GREETINGS_PER_HOUR: usize = 4;",
+        "pub(crate) const MOVE_GREETINGS_PER_HOUR: usize = 8;",
+    ] {
+        assert!(
+            announce.contains(piece),
+            "src/mesh/announce.rs no longer says {piece:?}; update the pages and this test"
+        );
+    }
     let announced = "announced so other sessions can find this one again";
     let lines = [
         format!("`[mesh:relay] This host's network changed; {announced}`"),
@@ -11434,7 +11465,8 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         "every 10 seconds it reads the host's interface addresses (loopback and link-local left out)",
         "A `private` interface to this host's own rnsd (`127.0.0.1:4242`, or one of the host's own addresses) reads the same rnsd, so a session on `type: private` greets exactly as one on `type: local` does",
         "Coyote reads again every 5 seconds until 30 seconds pass with nothing new (60 seconds at most)",
-        "The reconnect greetings share one limit of four an hour, the same number a relay reconnect is held to, counted per transition and not per interface; a change of the host's addresses is not counted against it, so every move greets, at most once per 30 seconds.",
+        "The reconnect greetings share one limit of four an hour, the same number a relay reconnect is held to, counted per transition and not per interface. A change of the host's addresses is not counted against it: moves have a limit of their own, eight an hour, so relay flaps never use up the greeting a roam needs, and a relay link that comes back within 60 seconds of a move is greeted as part of the move.",
+        "Neither moves the heartbeat.",
         "the next poll that finds rnsd's upstream online announces once more when that comes after the transition settled",
         "The ask goes out at the read that first sees the upstream back, within about 15 seconds of it, with no link having to fail first, and each destination is asked once per transition",
         "A LAN that goes from reaching nobody to reaching someone (rnsd's AutoInterface, or Coyote's own `lan`) asks the same way.",
@@ -11450,8 +11482,9 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
         .map(String::as_str)
         .chain([
             "One network switch that brings several upstreams back is one transition and one line.",
-            "The reconnect line shares one limit of four greetings an hour, counted per transition, and the network line is not counted against it; past it the reconnect line ends",
+            "The reconnect line shares one limit of four greetings an hour, counted per transition, and the network line has a limit of its own, eight an hour; past them the line ends",
             "`; this session already sent its 4 greetings for this hour, so it waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`",
+            "(`its 8 greetings` for the network line)",
             "`, but announcing failed; the next heartbeat will announce this session (details in the log).`",
             "A session with `mesh.announce` off prints nothing for these",
             "(Mesh-Deployment#moving-between-networks)",
@@ -11461,5 +11494,21 @@ fn the_pages_quote_the_upstream_and_network_change_lines() {
             commands.contains(needle),
             "Mesh-Commands.md does not quote {needle:?}"
         );
+    }
+    for (page, text) in [
+        ("Mesh-Deployment.md", &moving),
+        ("Mesh-Commands.md", &commands),
+    ] {
+        for gone in [
+            "until 10 seconds pass with nothing new",
+            "These two share one limit of four greetings an hour",
+            "do not move the heartbeat",
+            "so every move greets, at most once per 30 seconds",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "{page} still says {gone:?}, which the greeting budgets replaced"
+            );
+        }
     }
 }
