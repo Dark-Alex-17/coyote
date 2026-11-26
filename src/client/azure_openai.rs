@@ -56,7 +56,8 @@ fn prepare_chat_completions(
         self_.model.real_name()
     );
 
-    let body = openai_build_chat_completions_body(data, &self_.model);
+    let mut body = openai_build_chat_completions_body(data, &self_.model);
+    ask_for_stream_usage(&mut body);
 
     let mut request_data = RequestData::new(url, body);
 

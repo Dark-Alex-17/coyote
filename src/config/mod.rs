@@ -73,8 +73,8 @@ pub use self::role::{
 pub use self::round_chains::RoundChains;
 pub(crate) use self::session::ExitedSession;
 pub use self::session::{
-    Session, SessionInstance, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names,
-    session_scope_dirs,
+    SAVED_SESSION_LINE, Session, SessionInstance, SessionScope, TURN_INTERRUPTED_TEXT,
+    labeled_session_names, session_scope_dirs,
 };
 #[allow(unused_imports)]
 pub use self::skill::Skill;

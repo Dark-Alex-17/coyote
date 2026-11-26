@@ -1,8 +1,7 @@
 use crate::config::{RequestContext, SessionInstance};
 use unicode_width::UnicodeWidthStr;
 
-/// The line a session prints when it is written to disk on the way out.
-pub(super) const SAVED_SESSION_LINE: &str = "Saved the session to";
+pub(super) use crate::config::SAVED_SESSION_LINE;
 
 /// The names of what is active, compared across returns of the context
 /// to tell what was entered and what was left.

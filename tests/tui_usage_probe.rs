@@ -249,7 +249,7 @@ mod welcome_and_footer {
             "the welcome lost its version at 24 columns:\n{narrow}"
         );
 
-        let at = repaint_until(&mut pty, 40, 100, shows_mark);
+        let at = repaint_until(&mut pty, 40, 100, shows_big_mark);
         let back = since(&pty, at);
         assert!(
             shows_big_mark(&back),
@@ -302,7 +302,7 @@ mod welcome_and_footer {
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
         // The pty starts at 100x40, so 101 columns forces a full repaint.
-        let at = repaint_until(&mut pty, 40, 101, shows_mark);
+        let at = repaint_until(&mut pty, 40, 101, shows_big_mark);
         let frame = since(&pty, at);
         assert!(shows_big_mark(&frame), "no wordmark at 101x40:\n{frame}");
         let colored: Vec<Vec<u16>> = sgr_params(&pty.raw()[at..])

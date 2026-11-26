@@ -165,11 +165,7 @@ async fn prepare_chat_completions(
         WireApi::Responses => openai_build_responses_body(data, &self_.model),
         WireApi::Chat => {
             let mut body = openai_build_chat_completions_body(data, &self_.model);
-            // OpenAI streams a chat reply's usage only when asked to, on a
-            // last chunk of its own.
-            if body["stream"] == Value::Bool(true) {
-                body["stream_options"] = json!({ "include_usage": true });
-            }
+            ask_for_stream_usage(&mut body);
             body
         }
     };
@@ -490,6 +486,16 @@ struct EmbeddingsResBody {
 #[derive(Deserialize)]
 struct EmbeddingsResBodyEmbedding {
     embedding: Vec<f32>,
+}
+
+/// Asks a streamed chat request for its usage: OpenAI and the servers
+/// that copy its chat API send a reply's usage on a stream only when
+/// asked, on a last chunk of its own, which `openai_chat_handle_chunk`
+/// reads.
+pub fn ask_for_stream_usage(body: &mut Value) {
+    if body["stream"] == Value::Bool(true) {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
 }
 
 pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Value {
@@ -998,14 +1004,15 @@ fn openai_parse_responses_usage(usage: &Value) -> Option<TokenUsage> {
     }
 
     let cached_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
-    Some(TokenUsage {
+    let usage = TokenUsage {
         input_tokens: usage["input_tokens"]
             .as_u64()
             .map(|v| v.saturating_sub(cached_tokens.unwrap_or(0))),
         output_tokens: usage["output_tokens"].as_u64(),
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: cached_tokens,
-    })
+        cache_read_input_tokens: cached_tokens.filter(|&n| n > 0),
+    };
+    (!usage.is_empty()).then_some(usage)
 }
 
 pub async fn openai_responses_streaming(
@@ -1417,6 +1424,7 @@ mod tests {
             text: text.map(|t| t.to_string()),
             thinking,
             attachments: vec![],
+            user_messages: vec![],
         }
     }
 
@@ -1742,6 +1750,15 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(20));
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.cache_read_input_tokens, Some(60));
+
+        assert!(openai_parse_responses_usage(&json!({})).is_none());
+        let uncached = openai_parse_responses_usage(&json!({
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "input_tokens_details": { "cached_tokens": 0 },
+        }))
+        .unwrap();
+        assert_eq!(uncached.cache_read_input_tokens, None);
     }
 
     #[test]

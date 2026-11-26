@@ -1917,6 +1917,8 @@ impl RequestContext {
         let mut fork = session.clone();
         fork.set_name(fork_name.clone());
         fork.clear_autoname();
+        // A fork is a session of its own, not the old one renamed.
+        fork.new_instance();
         // The fresh root below is removed without the root lock on failure:
         // its uid was minted a few lines above, no parent file names it,
         // and nothing else can learn of it before the fork is attached.
@@ -8390,6 +8392,7 @@ impl<'a> From<&'a ToolResult> for SummaryToolResult<'a> {
             text,
             thinking,
             attachments,
+            user_messages: _,
         } = result;
         let thinking = thinking
             .iter()
@@ -16234,11 +16237,13 @@ mod tests {
         write_session_file(&ctx, "base", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
+        let base = ctx.session.as_ref().unwrap().instance();
 
         ctx.fork_session(None).unwrap();
 
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.name(), "base-fork-1");
+        assert_ne!(session.instance(), base);
         assert_eq!(session.scope(), SessionScope::Workspace);
         assert!(
             ctx.session_file_for("base-fork-1", SessionScope::Workspace)

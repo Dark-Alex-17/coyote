@@ -972,6 +972,7 @@ mod tests {
             text: None,
             thinking: vec![],
             attachments: vec![],
+            user_messages: vec![],
         }
     }
 
@@ -982,6 +983,7 @@ mod tests {
             text: text.map(|t| t.to_string()),
             thinking: vec![],
             attachments: vec![],
+            user_messages: vec![],
         }
     }
 
@@ -1512,6 +1514,7 @@ mod tests {
                 },
             ],
             attachments: vec![],
+            user_messages: vec![],
         }
     }
 
@@ -1555,6 +1558,7 @@ mod tests {
                 encrypted_content: Some("enc123".into()),
             }],
             attachments: vec![],
+            user_messages: vec![],
         };
 
         for sequence in [false, true] {

@@ -54,7 +54,19 @@ pub(super) fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) 
 /// an exchange's opener, or a line sent mid-turn, which the session undoes
 /// on its own ahead of the turn it rode in on.
 fn starts_undo_step(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
-    opens_exchange(cell, prefix) || matches!(cell, Cell::User { mid_turn: true, .. })
+    undo_step_text(cell, prefix).is_some()
+}
+
+/// What the composer gets back when the transcript is taken back to the
+/// cell: the line typed, or the command; None for a cell that starts no
+/// undo step.
+fn undo_step_text(cell: &Cell, prefix: crate::config::CommandPrefix) -> Option<&str> {
+    let starts = opens_exchange(cell, prefix) || matches!(cell, Cell::User { mid_turn: true, .. });
+    match cell {
+        Cell::User { text, .. } if starts => Some(text),
+        Cell::Command { name, .. } if starts => Some(name),
+        _ => None,
+    }
 }
 
 /// Index of the cell a `.undo` at `undo` takes the transcript back to:
@@ -153,11 +165,9 @@ pub(super) fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: Rewi
     };
     app.sync_from_ctx(ctx);
     if let Some(&at) = cut.checked_sub(1).and_then(|last| steps.get(last)) {
-        let title = match &app.transcript.cells()[at] {
-            Cell::User { text, .. } => text.clone(),
-            Cell::Command { name, .. } => name.clone(),
-            _ => String::new(),
-        };
+        let title = undo_step_text(&app.transcript.cells()[at], prefix)
+            .unwrap_or_default()
+            .to_string();
         app.transcript.truncate(at);
         app.set_composer_text(&title);
         app.pasted_images.clear();

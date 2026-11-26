@@ -45,13 +45,21 @@ fn mid_turn_turn() -> (RequestContext, Harness) {
         .handle_msg(UiMsg::AssistantText("later reply u5m".to_string()));
     harness.app.end_turn(false, &TurnOutcome::default());
     let tool_calls = crate::client::MessageContentToolCalls::new(
-        vec![crate::function::ToolResult::new(
-            crate::function::ToolCall::new("read".into(), serde_json::json!({}), Some("c1".into())),
-            serde_json::json!({
-                "output": "ok",
-                "system_notifications": [{"event": "user_message", "text": "mid line u5m"}],
-            }),
-        )],
+        vec![{
+            let mut result = crate::function::ToolResult::new(
+                crate::function::ToolCall::new(
+                    "read".into(),
+                    serde_json::json!({}),
+                    Some("c1".into()),
+                ),
+                serde_json::json!({
+                    "output": "ok",
+                    "system_notifications": [{"event": "user_message", "text": "mid line u5m"}],
+                }),
+            );
+            result.user_messages = vec!["mid line u5m".to_string()];
+            result
+        }],
         "partial reply u5m".to_string(),
     );
     let session = ctx.session.as_mut().unwrap();
