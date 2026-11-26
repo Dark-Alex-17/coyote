@@ -1702,6 +1702,70 @@ mod transcript {
         quit(pty);
     }
 
+    /// A session resumed at launch draws its history as rows; each `.undo`
+    /// then takes the newest of those exchanges off the screen in the same
+    /// frame, the `.undo` line with it, and hands its prompt back to the
+    /// composer, as for an exchange made in this run.
+    #[test]
+    #[serial]
+    fn undo_after_resuming_a_session_takes_each_restored_exchange_off_the_screen() {
+        let dir = fresh_config_dir("undo-resumed");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config_with(&dir, "");
+        write_session(&dir, "kept", 2);
+        let mut pty = spawn_tui_with_args(&dir, &[], &["-s", "kept"]);
+        pty.wait_for("previous conversation", PTY_DEADLINE)
+            .expect("the resumed history never showed its divider");
+        let frame = repainted_frame_showing(&mut pty, "answer 00001", "the resumed history");
+        for shown in ["> question 00000", "answer 00000", "> question 00001"] {
+            assert!(
+                squeezed(&frame).contains(&squeezed(shown)),
+                "{shown:?} is not shown:\n{frame}"
+            );
+        }
+        let footer = "dryrun:dry-model";
+        for (undone, kept) in [(1, Some(0)), (0, None)] {
+            let question = format!("question {undone:05}");
+            let answer = format!("answer {undone:05}");
+            pty.send(b"\x15").unwrap();
+            pty.read_for(Duration::from_millis(200));
+            pty.send(b".undo\r").unwrap();
+            let deadline = std::time::Instant::now() + PTY_DEADLINE;
+            let mut frame = flipped_frame(&mut pty);
+            while squeezed(&frame).contains(&squeezed(&answer))
+                && std::time::Instant::now() < deadline
+            {
+                frame = flipped_frame(&mut pty);
+            }
+            let flat = squeezed(&frame);
+            assert!(
+                !flat.contains(&squeezed(&answer)),
+                ".undo left the restored reply {answer:?} on screen:\n{frame}"
+            );
+            assert!(
+                !flat.contains(&squeezed(&format!("> {question}"))),
+                ".undo left the restored prompt {question:?} as a transcript row:\n{frame}"
+            );
+            assert!(
+                !flat.contains(">.undo"),
+                "the .undo line stayed on screen:\n{frame}"
+            );
+            assert_eq!(
+                composer_row_with_footer(&frame, footer),
+                question,
+                "the composer does not hold the undone prompt:\n{frame}"
+            );
+            if let Some(kept) = kept {
+                assert!(
+                    flat.contains(&squeezed(&format!("> question {kept:05}")))
+                        && flat.contains(&squeezed(&format!("answer {kept:05}"))),
+                    ".undo took more than the newest exchange:\n{frame}"
+                );
+            }
+        }
+        quit_declining_save(&mut pty);
+    }
+
     /// `.session <name>` inside the TUI shows the session's history as
     /// rows, the oldest message included, rather than as the command's
     /// printed output.

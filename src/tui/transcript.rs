@@ -314,7 +314,14 @@ impl Transcript {
                 ChildEntry::Compressed => {
                     Cell::notice(NoticeKind::Compress, COMPRESSED_DIVIDER.to_string())
                 }
-                ChildEntry::User(text) => Cell::user(&text),
+                // A restored prompt opened an exchange the session holds, so
+                // `.undo` and the rewind picker count it as one made here.
+                ChildEntry::User(text) => Cell::User {
+                    text,
+                    opened: true,
+                    mid_turn: false,
+                    cache: LineCache::default(),
+                },
                 ChildEntry::Assistant(text) => Cell::assistant(text, true),
                 ChildEntry::Tool {
                     call_id,
@@ -1845,6 +1852,27 @@ mod tests {
         assert!(at("Answer 0") < at(HISTORY_DIVIDER));
         transcript.push_history(Vec::new());
         assert_eq!(transcript.len(), 6, "an empty history appends nothing");
+    }
+
+    /// Each restored prompt opened an exchange the session holds, so an
+    /// `.undo` after the history goes back to the newest of them.
+    #[test]
+    fn a_restored_prompt_is_where_an_undo_goes_back_to() {
+        let (mut transcript, _) = transcript();
+        transcript.push_history(vec![
+            ChildEntry::User("first".to_string()),
+            ChildEntry::Assistant("one".to_string()),
+            ChildEntry::User("second".to_string()),
+            ChildEntry::Assistant("two".to_string()),
+        ]);
+        transcript.push(Cell::command(".undo"));
+        let prefix = crate::config::CommandPrefix::Dot;
+        let cells = transcript.cells();
+        let opener = super::super::rewind::undo_opener(cells, cells.len() - 1, prefix);
+        assert!(
+            matches!(opener.map(|at| &cells[at]), Some(Cell::User { text, .. }) if text == "second"),
+            "{opener:?}"
+        );
     }
 
     /// The offset is clamped to the lines above the view, a push while
