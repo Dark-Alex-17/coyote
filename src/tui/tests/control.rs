@@ -1,9 +1,11 @@
 use super::*;
+use crate::config::child_sessions::{ChildMeta, ChildStatus};
 use crate::tui::control::{
     cancel_context, catch_cancel, catch_child_load, settle_control_tasks, spawn_exit,
 };
 use crate::tui::run_loop::{EXIT_TEARDOWN_WAIT, Join, join_unattended};
 use crate::utils::AbortSignal;
+use chrono::{TimeZone, Utc};
 
 /// The exit waits for control tasks only up to its bound: one that
 /// finishes in time is joined, one that never does is aborted, and
@@ -845,6 +847,69 @@ fn the_picker_opens_a_childs_thread_through_the_keys() {
         let frame = harness.draw();
         assert!(frame.contains("kid wrote k4k"), "{frame}");
         assert!(frame.contains("(read-only)"), "{frame}");
+    });
+}
+
+/// A finished child, cancelled or completed, opens from the thread
+/// pop-up like a running one: Enter asks for its transcript and the
+/// pager shows it read-only.
+#[test]
+#[serial]
+fn the_picker_opens_a_cancelled_and_a_completed_childs_thread() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-pager-picker-finished");
+        let root = ChildSessionRoot::Proc { pid: 1, start: 14 };
+        std::fs::create_dir_all(root.children_dir()).unwrap();
+        let children = [
+            ("scout-c5c", 0, ChildStatus::Cancelled, "kid wrote c5c"),
+            ("planner-p6p", 1, ChildStatus::Completed, "kid wrote p6p"),
+        ];
+        for (session_id, minute, status, reply) in children {
+            let at = Utc.with_ymd_and_hms(2026, 1, 2, 3, minute, 5).unwrap();
+            let mut meta = ChildMeta::new_running_at(
+                at,
+                session_id,
+                session_id.split('-').next().unwrap(),
+                "agent-x7x",
+                crate::utils::process::ProcessStamp::current(),
+                None,
+                None,
+                "do it",
+                None,
+            );
+            meta.finish_at(at, status, None);
+            root.save_child_meta(&meta).unwrap();
+            write_child(&root, session_id, &child_yaml(reply));
+        }
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(root));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+
+        press_ctrl(&mut harness, 't');
+        for (row, (session_id, _, _, reply)) in children.into_iter().enumerate() {
+            harness.press(KeyCode::Tab);
+            for _ in 0..=row {
+                harness.press(KeyCode::Down);
+            }
+            harness.press(KeyCode::Enter);
+            assert!(
+                matches!(
+                    harness.app.control_requests.as_slice(),
+                    [ControlRequest::LoadChild { session_id: asked, .. }] if asked == session_id
+                ),
+                "{:?}",
+                harness.app.control_requests
+            );
+            run_control_requests(&mut harness).await;
+            let frame = harness.draw();
+            let title = frame.lines().next().unwrap_or_default();
+            assert!(title.contains("(read-only)"), "{frame}");
+            assert!(title.contains(session_id), "{frame}");
+            assert!(frame.contains(reply), "{frame}");
+            harness.press(KeyCode::Esc);
+            assert!(harness.app.pager().is_some_and(Pager::shows_root));
+        }
     });
 }
 

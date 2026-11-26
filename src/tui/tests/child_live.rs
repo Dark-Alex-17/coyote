@@ -1204,6 +1204,23 @@ fn the_thread_popup_keys_fold_step_and_open_a_thread_three_levels_down() {
         );
 
         harness.press(KeyCode::Tab);
+        let frame = harness.draw();
+        assert_eq!(
+            frame.lines().next(),
+            Some(
+                "\"Thread: main > planner > coder > tester (read-only) sess_3f4a              1-2/2\""
+            ),
+            "{frame}"
+        );
+        // The children start on the real clock, so the start time and
+        // the elapsed seconds are folded to fixed texts.
+        let filters = vec![(r"\d\d:\d\d:\d\d", "HH:MM:SS"), (r"\b\d+s\b", "Ns")];
+        insta::with_settings!({ filters => filters }, {
+            insta::assert_snapshot!("threads_popup_over_nested_thread_80x24", frame);
+            harness.resize(40, 20);
+            insta::assert_snapshot!("threads_popup_over_nested_thread_40x20", harness.draw());
+        });
+        harness.resize(80, 24);
         harness.press(KeyCode::Char('h'));
         harness.press(KeyCode::Left);
         let frame = harness.draw();

@@ -1,0 +1,28 @@
+---
+source: src/tui/tests/child_live.rs
+expression: frame
+---
+"Thread: main > planner > coder > tester (read-only) sess_3f4a              1-2/2"
+"Read-only. Tool calls show live; replies show up at the child's next checkpoint."
+"Loading...                                                                      "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"          ┌Threads───────────────────────────────────────────────────┐          "
+"          │▾ main                                                    │          "
+"          │  ▾ planner  running  HH:MM:SS  Ns  sess_5d6e             │          "
+"          │    ▾ coder  running  HH:MM:SS  Ns  sess_9c0d             │          "
+"          │        tester  running  HH:MM:SS  Ns  sess_3f4a          │          "
+"          └j/k move  h/l fold  Enter open  Esc back──────────────────┘          "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"j/k scroll  g/G top/end  / find  n/N next/prev  Tab threads  q close            "

@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/child_live.rs
+expression: harness.draw()
+---
+"Thread: ... > tester (ro) se...f4a 1-3/3"
+"Read-only. Tool calls show live; replies"
+"show up at the child's next checkpoint. "
+"Loading...                              "
+"                                        "
+"                                        "
+"                                        "
+" ┌Threads─────────────────────────────┐ "
+" │▾ main                              │ "
+" │  ▾ planner  running  HH:MM:SS  Ns  │ "
+" │    ▾ coder  running  HH:MM:SS  Ns  │ "
+" │        tester  running  Ns         │ "
+" └Enter open  Esc back────────────────┘ "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"q close  Tab threads  / find  n/N  j/k  "

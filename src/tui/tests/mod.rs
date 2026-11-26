@@ -3889,6 +3889,8 @@ fn a_role_entered_then_left_gets_a_divider_each_and_only_leaving_clears() {
     assert!(!frame.contains("before-k7m"), "{frame}");
     assert!(!frame.contains("during-k7m"), "{frame}");
     assert!(frame.contains(" left role coder "), "{frame}");
+    let top = row_text(&harness, COMPOSER_RULE_ROW);
+    assert!(!top.contains(" coder "), "{top:?}");
 }
 
 /// Leaves a session the way `.exit session` does: the command prints the
@@ -3952,7 +3954,14 @@ fn context_label_frame(width: u16, height: u16, no_color: bool) -> (Harness, Str
 fn context_label_and_a_left_divider_at_80x24() {
     let (harness, frame) = context_label_frame(80, 24, false);
     let top = row_text(&harness, COMPOSER_RULE_ROW);
-    assert!(top.starts_with(" architect "), "{top:?}");
+    let rule = top
+        .strip_prefix(" architect ")
+        .and_then(|rest| rest.strip_suffix(" your turn "))
+        .unwrap_or_else(|| panic!("{top:?}"));
+    assert!(
+        !rule.is_empty() && rule.chars().all(|c| c == '\u{2500}'),
+        "{top:?}"
+    );
     let label = &harness.terminal.backend().buffer()[(1, COMPOSER_RULE_ROW)];
     assert_eq!(
         label.fg,
@@ -5062,9 +5071,6 @@ fn the_wheel_over_the_todo_panel_scrolls_it_under_a_question_too() {
     harness
         .app
         .handle_input(mouse_at(MouseEventKind::ScrollDown, 5, 3));
-    harness
-        .app
-        .handle_input(mouse_at(MouseEventKind::ScrollUp, 5, 3));
     assert!(
         harness.draw().contains("(+1 above)"),
         "the wheel over the transcript moved the panel"
