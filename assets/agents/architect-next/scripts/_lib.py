@@ -700,6 +700,38 @@ def core_tool(name, timeout=600, **argc):
     return code == 0, out
 
 
+def _gate_print(root, script, label):
+    """What `script` prints with the shared utils.sh and the coder's gate_lib.sh sourced; "" when bash fails.
+
+    `root` reaches bash through the environment: Git Bash on Windows re-parses its command line."""
+    shared = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    import base_suite
+    try:
+        p = subprocess.run(
+            [base_suite.bash_program(), "-c", f'source "$1"; source "$2"; {script}', label, base_suite.UTILS,
+             base_suite.GATE_LIB],
+            capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=30,
+            env={**os.environ, "SX_TEST_ROOT": root},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def detected_test_command(root):
+    """The full test command the coder gates detect for `root`, as they run it; "" when none is detected."""
+    return _gate_print(root, 'gate_test_command_for_run "$(gate_test_command "$SX_TEST_ROOT")"', "detected-test-command")
+
+
+def detected_check_command(root):
+    """The build check the finalize gate runs for `root` (BUILD_CMD, else the detected check or build); "" when none."""
+    return _gate_print(root, 'if [[ -n "${BUILD_CMD:-}" ]]; then printf "%s" "$BUILD_CMD"; '
+                             "else detect_project \"$SX_TEST_ROOT\" | jq -r '.check // .build // \"\"'; fi",
+                       "detected-check-command")
+
+
 # ---------------------------------------------------------------- task files
 def frontmatter(text):
     """Flat `key: value` pairs from a leading --- block; values unquoted; lists as JSON-ish."""

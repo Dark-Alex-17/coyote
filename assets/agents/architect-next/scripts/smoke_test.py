@@ -18,6 +18,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -56,6 +57,9 @@ os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMI
 os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
 # no system or user git config (signing, hooks) reaches a scratch repository
 os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+# the coder gates' full suite and build check for every scratch repo, so no gate falls back to detecting them with a
+# model
+os.environ.update({"TEST_CMD": "suite-runner --all", "BUILD_CMD": "true"})
 
 import gates  # noqa: E402
 import _lib  # noqa: E402
@@ -65,6 +69,9 @@ from _lib import (AMEND_CYCLES_MAX, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAIL
                   escalation, option, read_file)
 
 RESULTS = []
+# the publish rows keep the routes they had before the finalize gate; the verification tier rows call the real check
+REAL_FINALIZE_OK = gates._finalize_ok
+gates._finalize_ok = lambda state: True
 
 
 def check(name, cond, detail=""):
@@ -4592,31 +4599,38 @@ def render_inputs(node, state, nodes=None):
 
 
 check("graph: delegate and wave_delegate run sisyphus-next; wave_delegate keeps teammates; their inputs are exactly review_cadence / parallel / "
-      "project_dir / escalation_policy / build_lock / retrospective",
+      "project_dir / escalation_policy / build_lock / retrospective / finalize_owner",
       all(NODES.get(n, {}).get("agent") == "sisyphus-next"
-          and sorted(NODES.get(n, {}).get("inputs") or {}) == ["build_lock", "escalation_policy", "parallel", "project_dir", "retrospective", "review_cadence"]
+          and sorted(NODES.get(n, {}).get("inputs") or {}) == ["build_lock", "escalation_policy", "finalize_owner", "parallel", "project_dir",
+                                                              "retrospective", "review_cadence"]
           for n in ("delegate", "wave_delegate")) and NODES.get("wave_delegate", {}).get("teammates") is True
-      and all(SEEDS.get(k) is not None for k in ("delegate_review_cadence", "delegate_parallel", "delegate_project_dir")),
+      and all(SEEDS.get(k) is not None for k in ("delegate_review_cadence", "delegate_finalize_owner", "delegate_parallel",
+                                                 "delegate_project_dir")),
       {n: (NODES.get(n, {}).get("agent"), NODES.get(n, {}).get("inputs")) for n in ("delegate", "wave_delegate")})
 check("graph: delegate inputs - sequential standard -> review_cadence=task, parallel=0, project_dir=the code repo",
       render_inputs("delegate", {**base_state(), **U_SEQ}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE,
-                                                               "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
+                                                               "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent",
+                                                               "finalize_owner": "parent"},
       render_inputs("delegate", {**base_state(), **U_SEQ}))
 check("graph: delegate inputs - micro -> review_cadence=batch, parallel=0, project_dir=the code repo",
       render_inputs("delegate", {**base_state(), **U_MICRO}) == {"review_cadence": "batch", "parallel": "0", "project_dir": CODE,
-                                                                 "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
+                                                                 "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent",
+                                                               "finalize_owner": "parent"},
       render_inputs("delegate", {**base_state(), **U_MICRO}))
 check("graph: wave_delegate inputs - wave item -> parallel=1, project_dir=the item's worktree, review_cadence=the item's (task)",
       render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}) == {"parallel": "1", "project_dir": WAVE[0]["worktree"], "review_cadence": "task",
-                                                                             "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
+                                                                             "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent",
+                                                               "finalize_owner": "parent"},
       render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}))
 check("graph: delegate inputs - a relay resume carries the same inputs as the delegation it resumes (code repo, task cadence, parallel=0)",
       render_inputs("delegate", {**base_state(), **U_RESUME}) == {"review_cadence": "task", "parallel": "0", "project_dir": CODE,
-                                                                  "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
+                                                                  "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent",
+                                                               "finalize_owner": "parent"},
       render_inputs("delegate", {**base_state(), **U_RESUME}))
 check("graph: delegate inputs - a wave member retried sequentially keeps its worktree as project_dir",
       render_inputs("delegate", {**base_state(), **U_RETRY}) == {"review_cadence": "task", "parallel": "0", "project_dir": WAVE[0]["worktree"],
-                                                                 "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent"},
+                                                                 "escalation_policy": "interactive", "build_lock": "", "retrospective": "parent",
+                                                               "finalize_owner": "parent"},
       render_inputs("delegate", {**base_state(), **U_RETRY}))
 LOCK = "flock -w 9 /tmp/x.lock"
 policy_in = {(n, p): render_inputs(n, {**base_state(escalation_policy=p, build_lock=LOCK), **U_SEQ, "wtask": WAVE[0]})
@@ -6901,6 +6915,255 @@ u = gates.open_questions_gate(base_state(open_questions=[{"question": "Which tok
 check("open_questions_gate: a design question framed with a trigger word is the question itself -> hard trigger",
       u.get("escalation", {}).get("kind") == "design_round" and u.get("escalation", {}).get("hard_trigger") is True, u.get("escalation"))
 
+# ---------------------------------------------------------------- verification tiers and the finalize gate
+sys.path.insert(0, os.path.join(HERE, "..", "..", ".shared"))
+import verify_record as VR  # noqa: E402
+
+TIER_FULL = os.environ["TEST_CMD"]
+GREEN_FINALIZE = [{"role": "test", "cmd": TIER_FULL, "exit": 0, "verdict": "green", "note": "", "tail": ""}]
+SENTINELS = os.path.join(TMP, "sentinels")
+os.makedirs(SENTINELS, exist_ok=True)
+
+
+def sentinel(name):
+    """(a command that leaves a file behind, the file); the file is gone before the row runs."""
+    path = os.path.join(SENTINELS, name)
+    if os.path.exists(path):
+        os.unlink(path)
+    return f"touch {shlex.quote(path)}", path
+
+
+def clear_records():
+    shutil.rmtree(VR.store_dir(CODE), ignore_errors=True)
+
+
+def per_task_stacks(fn):
+    """fn() under the per-task-stack multi strategy, which this fork's PR groups replace."""
+    saved = gates.MULTI_IS_GROUPS
+    gates.MULTI_IS_GROUPS = False
+    try:
+        return fn()
+    finally:
+        gates.MULTI_IS_GROUPS = saved
+
+
+def real_finalize_ok(fn):
+    """fn() with the publish gates' real finalize check in place."""
+    gates._finalize_ok = REAL_FINALIZE_OK
+    try:
+        return fn()
+    finally:
+        gates._finalize_ok = lambda state: True
+
+
+HYG_TASKS = copy.deepcopy(TS1) + [{"id": "TASK-990", "title": "hygiene", "status": "pending", "type": "hygiene", "unit": "run"}]
+_owners = {"single": gates._delegate_finalize_owner(base_state(tasks=TS1)),
+           "groups": gates._delegate_finalize_owner(base_state(tasks=TS1, pr_strategy="multi")),
+           "stacks": per_task_stacks(lambda: gates._delegate_finalize_owner(base_state(tasks=TS1, pr_strategy="multi"))),
+           "stacks + hygiene": per_task_stacks(lambda: gates._delegate_finalize_owner(base_state(tasks=HYG_TASKS,
+                                                                                               pr_strategy="multi")))}
+check("finalize owner: single, groups and a plan with a hygiene unit -> parent; per-task stacks with none -> self",
+      _owners == {"single": "parent", "groups": "parent", "stacks": "self", "stacks + hygiene": "parent"}, _owners)
+_stacked = per_task_stacks(lambda: gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=ts_m, current_task=T1,
+                                                                       pr_strategy="multi", delegation_kind="implement")))
+_fixed_item = per_task_stacks(lambda: gates.wave_route(base_state(
+    plan_path=PROMOTED, tasks=TS_W, pr_strategy="multi", wtask={k: v for k, v in WAVE[0].items() if k != "finalize_owner"},
+    wave_fix_rounds=0,
+    wave_report=REPORT_OK, wave_gauntlet_result=gauntlet_reply("BLOCKED", [], blockers=["adversary: criterion 1 DIVERGES"]))))
+_spawned = {"delegate": render_inputs("delegate", {**base_state(), **U_SEQ}).get("finalize_owner"),
+            "delegate, stacks": render_inputs("delegate", {**base_state(), **_stacked}).get("finalize_owner"),
+            "wave item": render_inputs("wave_delegate", {**base_state(), "wtask": WAVE[0]}).get("finalize_owner"),
+            "wave fix item, stacks": gates.as_dict(_fixed_item.get("wtask")).get("finalize_owner")}
+check("finalize owner: delegate and wave_delegate both pass it, from compose_delegation and the wave item",
+      _spawned == {"delegate": "parent", "delegate, stacks": "self", "wave item": "parent", "wave fix item, stacks": "self"},
+      _spawned)
+
+_vg_cmds = json.dumps([TIER_FULL, "true"])
+_tiers = {"task": vg(verification_commands=_vg_cmds),
+          "task, self delegate": per_task_stacks(lambda: vg(pr_strategy="multi", verification_commands=_vg_cmds)),
+          "hygiene": gates.verify_gate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, verify_scope="hygiene",
+                                                  hygiene_criteria="c", verification_commands=_vg_cmds))}
+check("verify_gate: a task reviews at the round tier, a self-finalizing delegate's task and the hygiene pass at the final "
+      "tier; the detected full suite is left out of the review commands, ledgered",
+      {k: v.get("review_verification_tier") for k, v in _tiers.items()} == {"task": "round", "task, self delegate": "final",
+                                                                           "hygiene": "final"}
+      and all(json.loads(v["verification_commands_json"])[0] == "true" and TIER_FULL not in v["verification_commands_json"]
+              for v in _tiers.values())
+      and f"verify: round tier: the full suite `{TIER_FULL}` left out of the review commands; the final gate runs it"
+      in _tiers["task"]["decisions"],
+      {k: (v.get("review_verification_tier"), v.get("verification_commands_json")) for k, v in _tiers.items()})
+_wv = gates.wave_verify_build(base_state(plan_path=PROMOTED, tasks=TS_W, wtask=WAVE[0], wave_delegate_result=REPORT_OK))
+check("wave_verify_build: the member's review carries the verification tier", _wv.get("review_verification_tier") == "round",
+      _wv.get("review_verification_tier"))
+_tier_in = {n: render_inputs(n, {**base_state(run_base_sha="r" * 40), "review_verification_tier": "final"})
+            for n in ("run_gauntlet", "wave_gauntlet", "run_adversary")}
+check("graph: run_gauntlet, wave_gauntlet and run_adversary pass the verification tier; the gauntlets the run base as floor",
+      all(v.get("verification_tier") == "final" for v in _tier_in.values())
+      and _tier_in["run_gauntlet"].get("baseline_floor") == _tier_in["wave_gauntlet"].get("baseline_floor") == "r" * 40,
+      _tier_in)
+
+check("delegation: a parent-finalized task's expected outcome names no full test suite; a self-finalizing one keeps it",
+      "full test suite" not in U_SEQ["delegation_prompt"]
+      and "targeted and impacted tests green" in U_SEQ["delegation_prompt"]
+      and "the run's final gate runs the full suite and lint" in U_SEQ["delegation_prompt"]
+      and "build + full test suite green" in _stacked["delegation_prompt"], U_SEQ["delegation_prompt"][:1500])
+_brief = gates._hygiene_brief(base_state(), "abc123", "run", "", "lint-runner", " and push the run branch")
+check("hygiene brief: the pass does not run the full suite itself; the final-tier review runs it once",
+      "run the full suite" not in _brief and "the final-tier review runs the full suite, formatter and lint once" in _brief,
+      _brief[-700:])
+
+_RC_REPORT = REPORT_OK + "\n## Round checks\n- `suite-runner --only t1`\n- `lint-runner`\n- `lint-runner`\n\n## Anomalies\n- none\n"
+_rcs = {"listed": gates._parse_report(_RC_REPORT)["round_checks"], "absent": gates._parse_report(REPORT_OK)["round_checks"],
+        "none": gates._parse_report(REPORT_OK + "\n## Round checks\n- none\n")["round_checks"],
+        "empty": gates._parse_report(REPORT_OK + "\n## Round checks\n\n## Anomalies\n- x\n")["round_checks"]}
+check("_parse_report: ## Round checks yields its commands once each; an absent, none or empty section yields none",
+      _rcs == {"listed": ["suite-runner --only t1", "lint-runner"], "absent": [], "none": [], "empty": []}, _rcs)
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, delegate_result=_RC_REPORT,
+                                    delegation_kind="implement", task_round_checks={T1: ["t0", "lint-runner"]}))
+_wi = gates.wave_integrate(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_W), wave_index=0, run_branch="feat/PLAN-widgets",
+                                      wave_results=[{"task": T3, "worktree": WAVE[1]["worktree"], "branch": WAVE[1]["branch"],
+                                                     "status": "conforms", "report": _RC_REPORT}]))
+check("route_delegate and wave_integrate: the report's round checks join the task's earlier ones in task_round_checks",
+      gates.as_dict(u.get("task_round_checks")).get(T1) == ["t0", "lint-runner", "suite-runner --only t1"]
+      and gates.as_dict(_wi.get("task_round_checks")).get(T3) == ["suite-runner --only t1", "lint-runner"],
+      (u.get("task_round_checks"), _wi.get("task_round_checks")))
+
+git(CODE, "checkout", "-q", "feat/PLAN-widgets")
+_declared, _declared_file = sentinel("declared")
+_mine, _mine_file = sentinel("mine")
+_sibling, _sibling_file = sentinel("sibling")
+u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_W), integration_task=T1, run_branch="feat/PLAN-widgets",
+                                      verification_commands=json.dumps([TIER_FULL, _declared]), task_rounds={T1: {"merged": True}},
+                                      task_round_checks={T1: [_mine, TIER_FULL], T3: [_sibling]}))
+check("integration_test: the declared commands minus the full suite plus the merged tasks' round checks, ledgered; an "
+      "unmerged task's checks do not run",
+      u.get("_next") == "harvest_report" and os.path.exists(_declared_file) and os.path.exists(_mine_file)
+      and not os.path.exists(_sibling_file)
+      and f"integration: round checks of {T1}; the full suite `{TIER_FULL}` left to the final gate" in u.get("decisions", []),
+      u.get("decisions"))
+_build, _build_file = sentinel("build")
+os.environ["BUILD_CMD"] = _build
+try:
+    u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS_W), integration_task=T1,
+                                          run_branch="feat/PLAN-widgets", verification_commands=json.dumps([TIER_FULL]),
+                                          task_rounds={T1: {"merged": True}}))
+finally:
+    os.environ["BUILD_CMD"] = "true"
+check("integration_test: no declared command but the full suite and no round checks -> the build check alone",
+      u.get("_next") == "harvest_report" and os.path.exists(_build_file)
+      and any(d.endswith(f"so the build check `{_build}` alone") for d in u.get("decisions", [])), u.get("decisions"))
+
+FAKE_FINALIZE = os.path.join(TMP, "fake-finalize-gate.sh")
+write(FAKE_FINALIZE, '#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" > "$FAKE_FINALIZE_ARGS"\n'
+                     'printf \'%s\\n\' "$FAKE_FINALIZE_OUT"\nexit "${FAKE_FINALIZE_RC:-0}"\n', exe=True)
+FAKE_FINALIZE_ARGS = os.path.join(TMP, "fake-finalize-args")
+
+
+def fake_finalize(state, out, rc=0, gate=None):
+    """`gate` (integration_check) against a stand-in finalize_gate.sh printing `out` and exiting `rc`; (updates, its argv)."""
+    if os.path.exists(FAKE_FINALIZE_ARGS):
+        os.unlink(FAKE_FINALIZE_ARGS)
+    saved = gates.FINALIZE_GATE_SH
+    os.environ.update(FAKE_FINALIZE_OUT=out if isinstance(out, str) else json.dumps(out), FAKE_FINALIZE_RC=str(rc),
+                      FAKE_FINALIZE_ARGS=FAKE_FINALIZE_ARGS)
+    gates.FINALIZE_GATE_SH = FAKE_FINALIZE
+    try:
+        u = (gate or gates.integration_check)(state)
+    finally:
+        gates.FINALIZE_GATE_SH = saved
+        for k in ("FAKE_FINALIZE_OUT", "FAKE_FINALIZE_RC", "FAKE_FINALIZE_ARGS"):
+            os.environ.pop(k, None)
+    return u, (read_file(FAKE_FINALIZE_ARGS).splitlines() if os.path.exists(FAKE_FINALIZE_ARGS) else None)
+
+
+def phase_f(**over):
+    return base_state(plan_path=PROMOTED, tasks=ts_f, run_base_sha="r" * 40, **over)
+
+
+_suite, _suite_file = sentinel("suite")
+clear_records()
+VR.write(CODE, "finalize", GREEN_FINALIZE, "smoke")
+try:
+    u, _argv = fake_finalize(phase_f(verification_commands=json.dumps([_suite]), hygiene_done=["run"]),
+                             {"status": "green", "tree": "t" * 40, "items": GREEN_FINALIZE})
+finally:
+    clear_records()
+check("integration_check: a green finalize record for the run branch is reused; the suite does not run again",
+      u.get("_next") == "integrate_findings" and u.get("integration_checked") and not os.path.exists(_suite_file)
+      and _argv is None and any(d.startswith("phase_f: finalize reused:") for d in u.get("decisions", [])),
+      (u.get("_next"), u.get("decisions"), _argv))
+u, _argv = fake_finalize(phase_f(verification_commands=json.dumps([_suite, TIER_FULL])),
+                         {"status": "green", "tree": "t" * 40, "items": GREEN_FINALIZE})
+check("integration_check: no record and the hygiene pass still to come -> the integration checks only, the finalize gate "
+      "left to the hygiene review's final tier",
+      u.get("_next") == "integrate_findings" and os.path.exists(_suite_file) and _argv is None
+      and any("hygiene review's final tier" in d for d in u.get("decisions", [])), (u.get("decisions"), _argv))
+_suite, _suite_file = sentinel("suite")
+u, _argv = fake_finalize(phase_f(verification_commands=json.dumps([_suite]), hygiene_done=["run"]),
+                         {"status": "green", "tree": "t" * 40, "items": GREEN_FINALIZE})
+check("integration_check: no record and no hygiene pass to come -> finalize_gate.sh with the run branch, the writer and the "
+      "run base; green -> integrate_findings with its tree noted",
+      u.get("_next") == "integrate_findings" and u.get("finalize_tree") == "t" * 40 and u.get("finalize_runs") == 1
+      and _argv == [CODE, "architect-next", "r" * 40] and not os.path.exists(_suite_file), (u, _argv))
+_red = {"status": "red", "tree": "t" * 40, "items": [dict(GREEN_FINALIZE[0], exit=101, verdict="red", note="new failures: t_one",
+                                                         tail="test t_one ... FAILED")]}
+u, _ = fake_finalize(phase_f(hygiene_done=["run"], final_integration_strikes=0), _red)
+_u_cap, _ = fake_finalize(phase_f(hygiene_done=["run"], final_integration_strikes=STRIKE_LIMIT), _red)
+check("integration_check: a red finalize run -> a Phase F fix round back to integration_check (B14), past the cap integration_red",
+      u.get("_next") == "fix_round" and u["fix_request"]["return_to"] == "integration_check"
+      and "t_one" in u["fix_request"]["note"] and _u_cap.get("escalation", {}).get("kind") == "integration_red",
+      (u.get("_next"), u.get("fix_request"), _u_cap.get("escalation", {}).get("kind")))
+_undecided = {}
+for _label, _out, _rc in (("unavailable", {"status": "unavailable", "tree": "t" * 40, "items": []}, 0),
+                          ("timed out", {"status": "red", "tree": "t" * 40, "items": [dict(GREEN_FINALIZE[0], verdict="timed_out")]}, 0),
+                          ("no status", "boom", 2)):
+    _undecided[_label] = fake_finalize(phase_f(hygiene_done=["run"]), _out, _rc)[0].get("escalation", {})
+check("integration_check: an unavailable, timed-out or crashed finalize run is never green -> finalize_unavailable with "
+      "continue (recommended), retry and stop",
+      all(e.get("kind") == "finalize_unavailable" and e.get("hard_trigger")
+          and [o["text"] for o in e.get("options", [])] == [gates.FINALIZE_CONTINUE, gates.FINALIZE_RETRY, gates.FINALIZE_STOP]
+          and e["options"][0]["recommended"] for e in _undecided.values()), _undecided)
+
+_E_FU = _undecided["unavailable"]
+u = gates.apply_answer(phase_f(escalation={**_E_FU, "data": {**_E_FU["data"], "tree": "w" * 40, "return": "pr_body"}},
+                               last_answer=gates.FINALIZE_CONTINUE,
+                               last_answer_text=f"{gates.FINALIZE_CONTINUE}: the runner has no GPU"))
+_retry = gates.apply_answer(phase_f(escalation=_E_FU, last_answer=gates.FINALIZE_RETRY))
+_stop = gates.apply_answer(phase_f(escalation=_E_FU, last_answer=gates.FINALIZE_STOP))
+check("apply_answer: finalize_unavailable continue -> a waiver for the tree with the stated reason, back to the publish gate; "
+      "retry -> integration_check; stop -> end_blocked",
+      u.get("_next") == "pr_body" and u.get("finalize_waived") == {"tree": "w" * 40, "reason": "the runner has no GPU"}
+      and "Full suite NOT RUN at finalize: the runner has no GPU" in u.get("follow_ups", [])
+      and _retry.get("_next") == "integration_check" and _stop.get("_next") == "end_blocked",
+      (u.get("_next"), u.get("finalize_waived"), _retry.get("_next"), _stop.get("_next")))
+
+clear_records()
+_pr = {"open_pr": real_finalize_ok(lambda: gates.open_pr(phase_f(run_branch="feat/PLAN-widgets", pr_body_path="x", pr_number="7"))),
+       "flip_ready": real_finalize_ok(lambda: gates.flip_ready(phase_f(pr_number="7")))}
+check("open_pr and flip_ready: no finalize record for the run branch -> integration_check, which returns to pr_body or flip_ready",
+      [(v.get("_next"), v.get("finalize_return")) for v in _pr.values()] == [("integration_check", "pr_body"),
+                                                                             ("integration_check", "flip_ready")],
+      {k: (v.get("_next"), v.get("finalize_return")) for k, v in _pr.items()})
+u, _ = fake_finalize(phase_f(hygiene_done=["run"], finalize_return="pr_body", integration_checked=True),
+                     {"status": "green", "tree": "t" * 40, "items": GREEN_FINALIZE})
+check("integration_check: a finalize run a publish gate asked for returns to it when green", u.get("_next") == "pr_body"
+      and u.get("finalize_return") == "", u.get("_next"))
+_head_tree = VR.worktree_tree(CODE)
+_waived = {"tree": _head_tree, "reason": "the runner has no GPU"}
+_pr_ok = real_finalize_ok(lambda: gates.open_pr(phase_f(run_branch="feat/PLAN-widgets", pr_body_path="x", pr_number="7",
+                                                        finalize_waived=_waived)))
+VR.write(CODE, "finalize", GREEN_FINALIZE, "smoke")
+try:
+    _pr_rec = real_finalize_ok(lambda: gates.open_pr(phase_f(run_branch="feat/PLAN-widgets", pr_body_path="x", pr_number="7")))
+finally:
+    clear_records()
+u = gates.pr_body(phase_f(pr_summary_text="Widgets were missing; we added them.", body_fix_rounds=RERUN_ONCE,
+                          finalize_waived=_waived))
+check("open_pr: a waiver for the run branch's tree or a green finalize record passes; the waiver line is in the PR body",
+      _pr_ok.get("_next") == _pr_rec.get("_next") == "pr_round_comments"
+      and "Full suite NOT RUN at finalize: the runner has no GPU" in read_file(u["pr_body_path"]),
+      (_pr_ok.get("_next"), _pr_rec.get("_next"), read_file(u.get("pr_body_path", ""))[:800]))
+
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",
@@ -6908,7 +7171,7 @@ u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids
 micro_wave = [render_inputs("wave_delegate", {**base_state(), "wtask": w}) for w in u["wave"]]
 micro_wave_ok = (len(u["wave"]) == 2 and all(w.get("review_cadence") == "batch" for w in u["wave"])
                  and micro_wave == [{"parallel": "1", "project_dir": w["worktree"], "review_cadence": "batch", "escalation_policy": "interactive",
-                                     "build_lock": "", "retrospective": "parent"} for w in u["wave"]]
+                                     "build_lock": "", "retrospective": "parent", "finalize_owner": "parent"} for w in u["wave"]]
                  and not any(d.startswith("mode-degraded") for d in u.get("decisions", [])))
 check("wave_claim: micro -> every item carries review_cadence=batch; wave_delegate renders it with parallel=1 and the item's worktree", micro_wave_ok, micro_wave)
 

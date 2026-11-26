@@ -56,7 +56,13 @@ os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMI
 os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
 # no system or user git config (signing, hooks) reaches a scratch repository
 os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+# the coder gates' full suite and build check for every scratch repo, so no gate falls back to detecting them with a
+# model
+os.environ.update({"TEST_CMD": "suite-runner --all", "BUILD_CMD": "true"})
 from _fixture import PlanningFixture  # noqa: E402
+
+sys.path.insert(0, os.path.join(HERE, "..", "..", ".shared"))
+import verify_record  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")
 MECHANISMS = {"R", "I", "N", "V", "-"}
@@ -299,6 +305,11 @@ def walk(combo, gates, graph, world, log):
             return {"delegate_result": world.delegate_report(gates, st, st.get("current_task"))}
         if nid in ("run_gauntlet", "wave_gauntlet"):
             key = "gauntlet_result" if nid == "run_gauntlet" else "wave_gauntlet_result"
+            if st.get("review_verification_tier") == "final":
+                # review-gauntlet's finalize_check writes this record at the final tier
+                verify_record.write(st["review_project_dir"], "finalize", [
+                    {"role": "test", "cmd": "suite-runner --all", "exit": 0, "verdict": "green", "note": "", "tail": ""}],
+                    "mode-matrix")
             return {key: "GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n"
                          "| code-review | GREEN (attention) | NEEDS-HUMAN, no critical |\n| adversary | GREEN | CONFORMS |\n"
                          "| security | SKIPPED | not selected |\n| probe | GREEN | PASS |\n| debris | GREEN | 0 hits |\n\n"
@@ -484,6 +495,8 @@ def walk_combinations(tmp_home):
     os.environ["LLM_ROOT_DIR"] = root
     ghbin = os.path.join(tmp_home, "bin")
     write(os.path.join(ghbin, "gh"), "#!/usr/bin/env bash\nexit 1\n", exe=True)
+    # the TEST_CMD above, for a finalize gate that runs on a tree no final-tier review recorded
+    write(os.path.join(ghbin, "suite-runner"), "#!/usr/bin/env bash\nexit 0\n", exe=True)
     os.environ["PATH"] = ghbin + os.pathsep + os.environ["PATH"]
 
     graph = load_graph()

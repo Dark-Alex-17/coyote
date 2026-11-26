@@ -145,7 +145,7 @@
  },
  {
   "ordinal": 19,
-  "line": 280,
+  "line": 281,
   "condition": "task_granularity=micro",
   "first": "In the oracle prompt replace \"one-engineer-day sizing\" with ",
   "mechanism": "I",
@@ -153,7 +153,7 @@
  },
  {
   "ordinal": 20,
-  "line": 290,
+  "line": 292,
   "condition": "pr_strategy=multi",
   "first": "Both gate prompts must explicitly name the PLAN's `## PR gro",
   "mechanism": "I",
@@ -161,7 +161,7 @@
  },
  {
   "ordinal": 21,
-  "line": 295,
+  "line": 297,
   "condition": "autonomy=plan-gate",
   "first": "(`plan-gate` autonomy: present the SEALED+OKAY'd breakdown t",
   "mechanism": "N",
@@ -169,7 +169,7 @@
  },
  {
   "ordinal": 22,
-  "line": 307,
+  "line": 309,
   "condition": "task_granularity=micro",
   "first": "Micro mode: every task's `index.md` frontmatter carries `bat",
   "mechanism": "I",
@@ -177,7 +177,7 @@
  },
  {
   "ordinal": 23,
-  "line": 312,
+  "line": 314,
   "condition": "pr_strategy=single",
   "first": "If {{plans_dir}} is inside {{project_dir}}, commit the plann",
   "mechanism": "R",
@@ -185,7 +185,7 @@
  },
  {
   "ordinal": 24,
-  "line": 316,
+  "line": 318,
   "condition": "pr_strategy=multi",
   "first": "If {{plans_dir}} is inside {{project_dir}}, commit the plann",
   "mechanism": "R",
@@ -193,7 +193,7 @@
  },
  {
   "ordinal": 25,
-  "line": 327,
+  "line": 329,
   "condition": "pr_strategy=single",
   "first": "0. **Create the RUN BRANCH (once, before the FIRST task).** ",
   "mechanism": "R",
@@ -201,7 +201,7 @@
  },
  {
   "ordinal": 26,
-  "line": 333,
+  "line": 335,
   "condition": "pr_strategy=multi",
   "first": "0. **Create the GROUP BRANCH (once, before the group's FIRST",
   "mechanism": "R",
@@ -209,7 +209,7 @@
  },
  {
   "ordinal": 27,
-  "line": 350,
+  "line": 358,
   "condition": "task_granularity=micro",
   "first": "Micro mode: add `\"review_cadence\": \"batch\"` to the spawn's `",
   "mechanism": "I",
@@ -217,23 +217,23 @@
  },
  {
   "ordinal": 28,
-  "line": 372,
+  "line": 380,
   "condition": "pr_strategy=single",
-  "first": "Every acceptance criterion met; build + full test suite gree",
+  "first": "Every acceptance criterion met; targeted and impacted tests ",
   "mechanism": "I",
   "home": "`compose_delegation`"
  },
  {
   "ordinal": 29,
-  "line": 378,
+  "line": 387,
   "condition": "pr_strategy=multi",
-  "first": "Every acceptance criterion met; build + full test suite gree",
+  "first": "Every acceptance criterion met; targeted and impacted tests ",
   "mechanism": "I",
   "home": "`compose_delegation` (group branch)"
  },
  {
   "ordinal": 30,
-  "line": 385,
+  "line": 395,
   "condition": "pr_strategy=single",
   "first": "- Work on the CURRENT branch (feat/PLAN-<slug>). git pull be",
   "mechanism": "I",
@@ -241,7 +241,7 @@
  },
  {
   "ordinal": 31,
-  "line": 388,
+  "line": 398,
   "condition": "pr_strategy=multi",
   "first": "- Work on the CURRENT branch (feat/PLAN-<slug>-g<N>). git pu",
   "mechanism": "I",
@@ -249,7 +249,7 @@
  },
  {
   "ordinal": 32,
-  "line": 393,
+  "line": 403,
   "condition": "pr_strategy=single",
   "first": "- Commit with messages referencing the task ID (e.g. \"feat(T",
   "mechanism": "I",
@@ -257,7 +257,7 @@
  },
  {
   "ordinal": 33,
-  "line": 397,
+  "line": 407,
   "condition": "pr_strategy=multi",
   "first": "- Commit with messages referencing the task ID (e.g. \"feat(T",
   "mechanism": "I",
@@ -265,7 +265,7 @@
  },
  {
   "ordinal": 34,
-  "line": 438,
+  "line": 450,
   "condition": "task_granularity=micro",
   "first": "<paste the task's Context pack VERBATIM - it exists precisel",
   "mechanism": "I",
@@ -273,7 +273,7 @@
  },
  {
   "ordinal": 35,
-  "line": 456,
+  "line": 473,
   "condition": "task_granularity=micro",
   "first": "**Micro cadence - read this before the lane descriptions bel",
   "mechanism": "N",
@@ -281,7 +281,7 @@
  },
  {
   "ordinal": 36,
-  "line": 530,
+  "line": 547,
   "condition": "escalation_policy=autonomous",
   "first": "Under `escalation_policy: autonomous` the standard ladder ap",
   "mechanism": "R",
@@ -289,7 +289,7 @@
  },
  {
   "ordinal": 37,
-  "line": 646,
+  "line": 663,
   "condition": "!parallel_tasks",
   "first": "**Sequential mode (parallel_tasks=0).** Tasks run SEQUENTIAL",
   "mechanism": "R",
@@ -297,7 +297,7 @@
  },
  {
   "ordinal": 38,
-  "line": 653,
+  "line": 670,
   "condition": "parallel_tasks",
   "first": "### Parallel mode (parallel_tasks=1)",
   "mechanism": "N",
@@ -305,7 +305,7 @@
  },
  {
   "ordinal": 39,
-  "line": 658,
+  "line": 675,
   "condition": "pr_strategy=multi",
   "first": "In multi-PR mode every \"run branch\" reference in this sectio",
   "mechanism": "R",
@@ -313,7 +313,7 @@
  },
  {
   "ordinal": 40,
-  "line": 672,
+  "line": 689,
   "condition": "task_granularity=micro",
   "first": "5. Micro tasks are naturally file-disjoint (one seam each) s",
   "mechanism": "R",
@@ -321,7 +321,7 @@
  },
  {
   "ordinal": 41,
-  "line": 691,
+  "line": 708,
   "condition": "task_granularity=micro",
   "first": "In micro mode add `\"review_cadence\": \"batch\"` to that same o",
   "mechanism": "I",
@@ -329,7 +329,7 @@
  },
  {
   "ordinal": 42,
-  "line": 749,
+  "line": 768,
   "condition": "pr_strategy=single",
   "first": "Phase F is UNCHANGED (same single draft PR from the run bran",
   "mechanism": "R",
@@ -337,7 +337,7 @@
  },
  {
   "ordinal": 43,
-  "line": 755,
+  "line": 774,
   "condition": "pr_strategy=multi",
   "first": "Group close-out and Phase F are UNCHANGED by parallel mode (",
   "mechanism": "R",
@@ -345,7 +345,7 @@
  },
  {
   "ordinal": 44,
-  "line": 763,
+  "line": 782,
   "condition": "pr_strategy=single",
   "first": "### Phase F \u2014 Finish (single draft PR for the whole design d",
   "mechanism": "N",
@@ -353,7 +353,7 @@
  },
  {
   "ordinal": 45,
-  "line": 768,
+  "line": 787,
   "condition": "pr_strategy=multi",
   "first": "### Phase F \u2014 Close out each group; finish after the last (o",
   "mechanism": "N",
@@ -361,7 +361,7 @@
  },
  {
   "ordinal": 46,
-  "line": 897,
+  "line": 980,
   "condition": "escalation_policy=autonomous",
   "first": "- a **`## Decisions taken autonomously`** section (only when",
   "mechanism": "R",
@@ -369,7 +369,7 @@
  },
  {
   "ordinal": 47,
-  "line": 914,
+  "line": 999,
   "condition": "pr_strategy=multi",
   "first": "Pass `--tasks <this group's member task ids, comma-separated",
   "mechanism": "I",
@@ -377,7 +377,7 @@
  },
  {
   "ordinal": 48,
-  "line": 923,
+  "line": 1008,
   "condition": "task_granularity=micro",
   "first": "Micro runs produce 3-5x the tasks. The tool's `## Tasks` che",
   "mechanism": "I",
@@ -385,7 +385,7 @@
  },
  {
   "ordinal": 49,
-  "line": 954,
+  "line": 1040,
   "condition": "escalation_policy=autonomous",
   "first": "Include the `## Decisions taken autonomously` rollup when th",
   "mechanism": "R",
@@ -393,7 +393,7 @@
  },
  {
   "ordinal": 50,
-  "line": 998,
+  "line": 1085,
   "condition": "escalation_policy=autonomous",
   "first": "In `autonomous` escalation policy, work the Escalation-polic",
   "mechanism": "V",
@@ -401,7 +401,7 @@
  },
  {
   "ordinal": 51,
-  "line": 1012,
+  "line": 1099,
   "condition": "task_granularity=micro",
   "first": "- A micro task whose acceptance criteria cannot be run by a ",
   "mechanism": "R",
@@ -409,7 +409,7 @@
  },
  {
   "ordinal": 52,
-  "line": 1019,
+  "line": 1106,
   "condition": "pr_strategy=single",
   "first": "- Opening a PER-TASK PR \u2192 the design doc gets exactly ONE PR",
   "mechanism": "R",
@@ -417,7 +417,7 @@
  },
  {
   "ordinal": 53,
-  "line": 1024,
+  "line": 1111,
   "condition": "pr_strategy=multi",
   "first": "- Opening a PER-TASK PR, or one PR spanning several groups \u2192",
   "mechanism": "R",
@@ -425,7 +425,7 @@
  },
  {
   "ordinal": 54,
-  "line": 1036,
+  "line": 1123,
   "condition": "!parallel_tasks",
   "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
   "mechanism": "R",
@@ -433,7 +433,7 @@
  },
  {
   "ordinal": 55,
-  "line": 1037,
+  "line": 1124,
   "condition": "pr_strategy=single",
   "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
   "mechanism": "R",
@@ -441,7 +441,7 @@
  },
  {
   "ordinal": 56,
-  "line": 1040,
+  "line": 1127,
   "condition": "pr_strategy=multi",
   "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
   "mechanism": "R",
@@ -449,7 +449,7 @@
  },
  {
   "ordinal": 57,
-  "line": 1044,
+  "line": 1131,
   "condition": "parallel_tasks",
   "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
   "mechanism": "R",
@@ -457,7 +457,7 @@
  },
  {
   "ordinal": 58,
-  "line": 1045,
+  "line": 1132,
   "condition": "pr_strategy=single",
   "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
   "mechanism": "R",
@@ -465,7 +465,7 @@
  },
  {
   "ordinal": 59,
-  "line": 1049,
+  "line": 1136,
   "condition": "pr_strategy=multi",
   "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
   "mechanism": "R",
@@ -473,7 +473,7 @@
  },
  {
   "ordinal": 60,
-  "line": 1085,
+  "line": 1172,
   "condition": "!parallel_tasks",
   "first": "- Destructive/irreversible actions (`rm -rf`, force-push, dr",
   "mechanism": "R",
@@ -481,7 +481,7 @@
  },
  {
   "ordinal": 61,
-  "line": 1089,
+  "line": 1176,
   "condition": "parallel_tasks",
   "first": "- Destructive/irreversible actions (`rm -rf`, force-push, dr",
   "mechanism": "R",
@@ -489,7 +489,7 @@
  },
  {
   "ordinal": 62,
-  "line": 1110,
+  "line": 1197,
   "condition": "task_granularity=micro",
   "first": "- Task granularity: micro (one-seam tasks, executable criter",
   "mechanism": "I",

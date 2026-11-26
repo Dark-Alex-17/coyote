@@ -661,6 +661,93 @@ fn verify_smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// Each verification tier guard, removed from a scratch copy, turns its smoke
+/// row red: the hygiene task that makes a delegate's finalize owner the
+/// parent, the tier `verify_gate` hands the review, the merged tasks' round
+/// checks `integration_test` runs, the finalize record `integration_check`
+/// reuses, the hygiene pass that defers the finalize gate, the finalize check
+/// before `open_pr` publishes, the delegation wording for a parent-finalized
+/// task, the hygiene brief wording, and the `## Round checks` reader.
+#[test]
+fn verification_tier_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[
+            (
+                "owner-hygiene",
+                "    if is_single(state) or MULTI_IS_GROUPS or any(isinstance(t, dict) and \
+                 t.get(\"type\") == \"hygiene\" for t in tasks):\n",
+                "    if is_single(state) or MULTI_IS_GROUPS:\n",
+                "finalize owner: single, groups and a plan with a hygiene unit -> parent; per-task \
+                 stacks with none -> self",
+            ),
+            (
+                "verify-tier",
+                "tier = \"final\" if scope == \"hygiene\" or (scope == \"task\" and \
+                 _delegate_finalize_owner(state) == \"self\") else \"round\"",
+                "tier = \"round\"",
+                "verify_gate: a task reviews at the round tier, a self-finalizing delegate's task \
+                 and the hygiene pass at the final tier; the detected full suite is left out of the \
+                 review commands, ledgered",
+            ),
+            (
+                "integration-round-checks",
+                "cmds += [c for c in as_list(checks.get(tid)) if isinstance(c, str) and c != full \
+                 and c not in cmds]",
+                "cmds += []",
+                "integration_test: the declared commands minus the full suite plus the merged \
+                 tasks' round checks, ledgered; an unmerged task's checks do not run",
+            ),
+            (
+                "finalize-reuse",
+                "    if record := _finalize_record(state, code):\n",
+                "    if (record := _finalize_record(state, code)) and False:\n",
+                "integration_check: a green finalize record for the run branch is reused; the \
+                 suite does not run again",
+            ),
+            (
+                "finalize-gate-without-hygiene",
+                "    if not back and _hygiene_to_come(state):\n",
+                "    if not back:\n",
+                "integration_check: no record and no hygiene pass to come -> finalize_gate.sh with \
+                 the run branch, the writer and the run base; green -> integrate_findings with its \
+                 tree noted",
+            ),
+            (
+                "open-pr-gate",
+                "    if not _finalize_ok(state):\n        # back through pr_body",
+                "    if False:\n        # back through pr_body",
+                "open_pr and flip_ready: no finalize record for the run branch -> \
+                 integration_check, which returns to pr_body or flip_ready",
+            ),
+            (
+                "delegation-wording",
+                "    if _delegate_finalize_owner(state) == \"parent\":\n        verified =",
+                "    if False:\n        verified =",
+                "delegation: a parent-finalized task's expected outcome names no full test suite; a \
+                 self-finalizing one keeps it",
+            ),
+            (
+                "hygiene-brief-wording",
+                "Then commit{pr_line}; the final-tier review runs the full suite, formatter \"",
+                "Then run the full suite{pr_line}; \"",
+                "hygiene brief: the pass does not run the full suite itself; the final-tier review \
+                 runs it once",
+            ),
+            (
+                "parse-round-checks",
+                "    r[\"round_checks\"] = _round_checks(text)\n",
+                "    r[\"round_checks\"] = []\n",
+                "_parse_report: ## Round checks yields its commands once each; an absent, none or \
+                 empty section yields none",
+            ),
+        ],
+    );
+}
+
 /// Each design-retrospective guard, removed from a scratch copy, turns its
 /// smoke row red: the large run's way to `run_retrospective` at run close,
 /// the adopted path that creates the refactor task, the one leading
@@ -2242,10 +2329,12 @@ fn copy_tree(src: &Path, dst: &Path) {
 fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
     let agents = scratch.0.join("tree").join("agents");
     // The smoke battery reads each child agent's declared variables and runs
-    // review-gauntlet's signals script.
+    // review-gauntlet's signals script; the verification tier rows ask the
+    // coder's own gate_lib.sh for the detected full suite.
     for name in [
         ".shared",
         "architect",
+        "coder",
         "sisyphus-next",
         "review-gauntlet",
         "adversary",
@@ -3161,10 +3250,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![52, 5241, 5254],
+        vec![54, 5536, 5550],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [5241, 5254] {
+    for line in [5536, 5550] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -5395,6 +5484,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "design_rounds",
     "draft_rounds",
     "final_integration_strikes",
+    "finalize_runs",
     "gate_fault_retries",
     "group_index",
     "oracle_rejects",

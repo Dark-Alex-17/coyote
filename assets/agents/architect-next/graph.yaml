@@ -273,6 +273,7 @@ initial_state:
   delegation_prompt: ''
   delegate_result: ''
   delegate_review_cadence: 'task'
+  delegate_finalize_owner: 'self'
   delegate_parallel: '0'
   delegate_project_dir: ''
   report_parsed: {}
@@ -297,6 +298,8 @@ initial_state:
   adversary_result: ''
   gauntlet_blockers: []
   verification_commands_json: '[]'
+  review_verification_tier: 'round'
+  task_round_checks: {}
   debris_exclude: ''
   round_log: {}
   last_verdict: ''
@@ -372,6 +375,10 @@ initial_state:
   # --- phase F ---
   integration_checked: false
   final_integration_strikes: 0
+  finalize_runs: 0
+  finalize_return: ''
+  finalize_tree: ''
+  finalize_waived: {}
   integration_follow_ups: []
   integration_amendments: []
   integration_amended: false
@@ -1488,11 +1495,12 @@ nodes:
     id: delegate
     type: agent
     agent: sisyphus-next
-    description: The per-task implementer island (the graph sisyphus); its review cadence, parallel flag, project directory, escalation policy and build lock ride `inputs:`, and the `retrospective` input `parent` leaves the design retrospective to this run's close.
+    description: The per-task implementer island (the graph sisyphus); its review cadence, finalize owner, parallel flag, project directory, escalation policy and build lock ride `inputs:`, and the `retrospective` input `parent` leaves the design retrospective to this run's close.
     prompt: |
       {{delegation_prompt}}
     inputs:
       review_cadence: '{{delegate_review_cadence}}'
+      finalize_owner: '{{delegate_finalize_owner}}'
       parallel: '{{delegate_parallel}}'
       project_dir: '{{delegate_project_dir}}'
       escalation_policy: '{{escalation_policy}}'
@@ -1549,7 +1557,7 @@ nodes:
   verify_gate:
     id: verify_gate
     type: script
-    description: Conformance lane set per mode (gauntlet with forced lanes; adversary at micro task scope; batch/hygiene scopes); diff spec per strategy; records the round HEAD.
+    description: Conformance lane set per mode (gauntlet with forced lanes; adversary at micro task scope; batch/hygiene scopes); diff spec per strategy; the verification tier (final for hygiene and for a task whose delegate finalizes itself, else round) with the detected full suite left out of the declared commands; records the round HEAD.
     script: scripts/verify_gate.py
     timeout: 60
     fallback: end_failure
@@ -1558,13 +1566,15 @@ nodes:
     id: run_gauntlet
     type: agent
     agent: review-gauntlet
-    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary; the checkout under review and the build lock ride `inputs:` too).
+    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary; the checkout under review, the verification tier verify_gate chose, the run base as baseline floor and the build lock ride `inputs:` too).
     prompt: |
       {{gauntlet_prompt}}
     inputs:
       project_dir: '{{review_project_dir}}'
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
+      verification_tier: '{{review_verification_tier}}'
+      baseline_floor: '{{run_base_sha}}'
       build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
@@ -1577,13 +1587,14 @@ nodes:
     id: run_adversary
     type: agent
     agent: adversary
-    description: Micro task scope - the direct conformance verdict (criteria are executable commands); the checkout under review and the build lock ride `inputs:`.
+    description: Micro task scope - the direct conformance verdict (criteria are executable commands); the checkout under review, the verification tier and the build lock ride `inputs:`.
     prompt: |
       {{adversary_prompt}}
     inputs:
       project_dir: '{{review_project_dir}}'
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
+      verification_tier: '{{review_verification_tier}}'
       build_lock: '{{build_lock}}'
     timeout: 7200
     max_attempts: 1
@@ -1758,13 +1769,14 @@ nodes:
     type: agent
     agent: sisyphus-next
     teammates: true
-    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree, the item's review cadence, the escalation policy and the build lock ride `inputs:`.
+    description: The per-task implementer in its worktree (same agent as `delegate`); parallel=1, the worktree, the item's review cadence and finalize owner, the escalation policy and the build lock ride `inputs:`.
     prompt: |
       {{wtask.prompt}}
     inputs:
       parallel: '1'
       project_dir: '{{wtask.worktree}}'
       review_cadence: '{{wtask.review_cadence}}'
+      finalize_owner: '{{wtask.finalize_owner}}'
       escalation_policy: '{{escalation_policy}}'
       build_lock: '{{build_lock}}'
       retrospective: 'parent'
@@ -1788,13 +1800,15 @@ nodes:
     id: wave_gauntlet
     type: agent
     agent: review-gauntlet
-    description: The member's conformance panel (independent verdict; no teammates flag); the member's worktree and the build lock ride `inputs:`.
+    description: The member's conformance panel (independent verdict; no teammates flag); the member's worktree, its verification tier, the run base as baseline floor and the build lock ride `inputs:`.
     prompt: |
       {{gauntlet_prompt}}
     inputs:
       project_dir: '{{review_project_dir}}'
       verification_commands: '{{verification_commands_json}}'
       debris_exclude: '{{debris_exclude}}'
+      verification_tier: '{{review_verification_tier}}'
+      baseline_floor: '{{run_base_sha}}'
       build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
@@ -1830,7 +1844,7 @@ nodes:
   integration_test:
     id: integration_test
     type: script
-    description: merge --no-ff, full suite after EVERY merge (B14 3-strike), conflict -> rebase round (B15 2 cycles), green -> push.
+    description: merge --no-ff, then the build plus the merged tasks' round checks after every merge (B14 3-strike); the full suite runs once at the final tier; conflict -> rebase round (B15 2 cycles), green -> push.
     script: scripts/integration_test.py
     timeout: 3600
     fallback: end_failure
@@ -2392,7 +2406,7 @@ nodes:
   integration_check:
     id: integration_check
     type: script
-    description: Full suite on the run/group branch (verification commands); red -> fix round (B14).
+    description: Reuses the finalize record for the run branch head, or runs the finalize gate (.shared/finalize_gate.sh, the run's one full suite, formatter and lint); while a hygiene pass is still to come, only the integration checks; red -> fix round (B14); undecided -> finalize_unavailable. A publish gate with no finalize record comes here and is returned to.
     script: scripts/integration_check.py
     timeout: 3600
     fallback: end_failure
@@ -2636,7 +2650,7 @@ nodes:
   open_pr:
     id: open_pr
     type: script
-    description: gh pr create --draft from the run/group branch (deterministic); records the PR number; arms the CI watch.
+    description: gh pr create --draft from the run/group branch (deterministic); records the PR number; arms the CI watch. A branch with no finalize record or waiver for its code tree goes to integration_check first, and back through pr_body.
     script: scripts/open_pr.py
     timeout: 300
     fallback: end_failure
@@ -2735,7 +2749,7 @@ nodes:
   flip_ready:
     id: flip_ready
     type: script
-    description: gh pr ready ONLY on green; every still-draft PR reported with its blocker; upstream groups -> next group.
+    description: gh pr ready ONLY on green, and only once a finalize record or waiver covers the run branch's code tree (else integration_check first); every still-draft PR reported with its blocker; upstream groups -> next group.
     script: scripts/flip_ready.py
     timeout: 390
     fallback: end_failure
