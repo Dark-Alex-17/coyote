@@ -3310,6 +3310,54 @@ mod binary_threads {
         assert_eq!(exit_code(&transcript), 0, "{transcript}");
     }
 
+    /// The threads pop-up opened with Alt+S from the main screen takes a
+    /// plain `o` as Enter: on the kid's row it opens the kid's thread.
+    /// Ctrl+O there opens nothing and leaves the pop-up up.
+    #[test]
+    #[serial]
+    fn o_in_the_threads_popup_opens_the_highlighted_childs_thread() {
+        let scene = scene("thr-o-opens", kid_mark_then_held, "");
+        let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+        engage_and_spawn(&mut pty, &scene);
+
+        pty.send(b"\x1bs").unwrap();
+        let picker = repainted_frame_showing(
+            &mut pty,
+            "Enter/o open",
+            "Alt+S did not open the threads pop-up",
+        );
+        assert!(
+            row_after(thread_picker_band(&picker), "kid  ").is_some(),
+            "the pop-up does not list the kid:\n{picker}"
+        );
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+
+        pty.send(b"\x0f").unwrap();
+        pty.read_for(Duration::from_millis(600));
+        let still =
+            repainted_frame_showing(&mut pty, "Enter/o open", "Ctrl+O closed the threads pop-up");
+        assert!(
+            !still.contains("Thread: main > kid"),
+            "Ctrl+O opened the kid's thread:\n{still}"
+        );
+
+        pty.send(b"o").unwrap();
+        let thread = repainted_frame_showing(
+            &mut pty,
+            "Thread: main > kid",
+            "o did not open the kid's thread",
+        );
+        assert!(
+            thread.contains("(read-only)") && !thread.contains("Enter/o open"),
+            "o left the pop-up over the thread or did not open it read-only:\n{thread}"
+        );
+        pty.send(b"q").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        let transcript = leave(&mut pty, &scene);
+        assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    }
+
     // ---------------------------------------------------------------------------
     // The thread picker and a child's transcript.
     // ---------------------------------------------------------------------------

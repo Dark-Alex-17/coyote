@@ -1849,6 +1849,109 @@ mod session_undo_and_rename {
         }
         out
     }
+
+    /// A saved session of two exchanges on the fake model, numbered so
+    /// they can be told apart.
+    fn write_two_exchange_session(dir: &std::path::Path, name: &str) {
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let mut yaml = String::from("model: fake:fake-model\nmessages:\n");
+        for n in 0..2 {
+            yaml.push_str(&format!(
+                "- role: user\n  content: 'asked-{n}-u5r'\n\
+                 - role: assistant\n  content: 'replied-{n}-u5r'\n"
+            ));
+        }
+        fs::write(sessions.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    /// A session entered from inside the TUI with `/session <name>` (slash
+    /// prefix) draws its two restored exchanges; `/undo` takes the newest
+    /// one off the screen and hands its prompt back, and a fresh line sent
+    /// next reaches the model after the kept exchange only: session and
+    /// transcript stay in step on an undo into restored history.
+    #[test]
+    #[serial]
+    fn undo_into_a_session_resumed_in_app_keeps_the_model_in_step_with_the_screen() {
+        let dir = fresh_config_dir("probe-undo-resumed-in-app");
+        let _guard = TempDirGuard(dir.clone());
+        let fake = FakeLlm::start(vec![Reply::Text("fresh-reply-u5r".to_string())]);
+        write_fake_llm_config_with(&dir, &fake, "command_prefix: slash\n");
+        write_two_exchange_session(&dir, "kept-u5r");
+        let mut pty = spawn_tui(&dir, &[]);
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(40, 100).unwrap();
+        pty.read_for(HOTKEY_GAP);
+
+        let at = pty.raw().len();
+        pty.send(b"/session kept-u5r\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "replied-1-u5r", at, "the restored history");
+        let shown = frame_where(&mut pty, |f| f.contains("replied-1-u5r"));
+        for text in ["asked-0-u5r", "replied-0-u5r", "asked-1-u5r"] {
+            assert!(
+                squeezed(&shown).contains(text),
+                "{text:?} is not shown after the in-app resume:\n{shown}"
+            );
+        }
+
+        clear_any_draft(&mut pty);
+        pty.send(b"/undo\r").unwrap();
+        pty.read_for(Duration::from_millis(1200));
+        let undone = frame_where(&mut pty, |f| !f.contains("replied-1-u5r"));
+        let flat = squeezed(&undone);
+        assert!(
+            !flat.contains("replied-1-u5r") && !flat.contains(">asked-1-u5r"),
+            "/undo left the newest restored exchange on screen:\n{undone}"
+        );
+        assert!(
+            !flat.contains(">/undo"),
+            "the /undo line stayed on screen:\n{undone}"
+        );
+        assert!(
+            flat.contains("asked-0-u5r") && flat.contains("replied-0-u5r"),
+            "/undo took more than the newest exchange:\n{undone}"
+        );
+        assert_eq!(
+            composer_row_with_footer(&undone, "fake:fake-model"),
+            "asked-1-u5r",
+            "the composer does not hold the undone prompt:\n{undone}"
+        );
+
+        clear_any_draft(&mut pty);
+        let sent_at = pty.raw().len();
+        pty.send(b"new-line-u5r\r").unwrap();
+        wait_for_squeezed_after(&mut pty, "fresh-reply-u5r", sent_at, "the new reply");
+        pty.read_for(Duration::from_millis(600));
+        quit_declining_save(&mut pty);
+
+        let bodies = fake.bodies();
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let rows = messages(&bodies[0]);
+        let talk: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r.0 == "user" || r.0 == "assistant")
+            .map(|r| (r.0.as_str(), r.1.as_str()))
+            .collect();
+        assert!(
+            !bodies[0].contains("asked-1-u5r") && !bodies[0].contains("replied-1-u5r"),
+            "the undone restored exchange still reached the model: {talk:?}"
+        );
+        let user_texts: Vec<&str> = talk
+            .iter()
+            .filter(|(role, _)| *role == "user")
+            .map(|(_, t)| *t)
+            .collect();
+        assert!(
+            user_texts.len() == 2
+                && user_texts[0].contains("asked-0-u5r")
+                && user_texts[1].contains("new-line-u5r"),
+            "the request is not the kept exchange then the new line: {talk:?}"
+        );
+        assert!(
+            bodies[0].contains("replied-0-u5r"),
+            "the kept restored reply did not reach the model: {talk:?}"
+        );
+    }
 }
 
 mod surfaces_hints_and_anchored_wordmark {
