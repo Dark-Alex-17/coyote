@@ -5115,7 +5115,7 @@ def _after_integration(state, u):
         return u
     code = state.get("code_repo_path", "")
     base = state.get("run_base_sha")
-    if not base:
+    if not base and code:
         git(code, "fetch", "--quiet", "origin")
         base = git_out(code, "merge-base", "--end-of-options", f"origin/{state.get('base_branch_name') or 'main'}", "HEAD", default="")
     if not base:
@@ -6531,10 +6531,10 @@ TASK_GATES = ("claim_task", "compose_delegation", "route_delegate", "verify_gate
 # gate never does, so the owner can still be asked.
 STATE_KEY_READERS = {
     "run_dir": tuple(GATES),
-    "code_repo_path": ("intake", "gate1_build", "branch_setup", "claim_task", "compose_delegation", "verify_gate", "post_round",
-                       "wave_claim", "wave_verify_build", "integration_test", "wave_cleanup", "batch_close", "phase_f_gate",
-                       "integration_check", "hygiene_create", "open_pr", "pr_round_comments", "ci_poll", "ci_evidence", "ci_apply",
-                       "flip_ready", "review_poll", "review_update"),
+    "code_repo_path": ("intake", "gate1_build", "reseal_return", "branch_setup", "claim_task", "compose_delegation", "verify_gate",
+                       "post_round", "wave_claim", "wave_verify_build", "integration_test", "wave_cleanup", "batch_close",
+                       "phase_f_gate", "integration_check", "integrate_route", "hygiene_create", "open_pr", "pr_round_comments",
+                       "ci_poll", "ci_evidence", "ci_apply", "flip_ready", "review_poll", "review_update"),
     "tasks": ("intake", "resume_route", "reseal_return", "branch_setup", "select_tasks", "claim_task", "compose_delegation",
               "route_delegate", "verify_gate", "route_verdict", "post_round", "fix_done", "harvest_report", "debt_assign",
               "task_done_verify", "stack_gate", "task_done_route", "wave_claim", "wave_verify_build", "wave_integrate",
