@@ -17,10 +17,10 @@ pub(crate) struct NativeFormatState {
 }
 
 /// Sends `input` with its native format when `client` has a dialect for it
-/// and the run has not seen a rejection. A 400 or an undecodable response is
-/// taken as the provider refusing the format: the call is repeated once
-/// without it, on the same client. Every other error propagates after the
-/// first call.
+/// and the sequence has not seen a rejection. A 400 or an undecodable
+/// response is taken as the provider refusing the format: the call is
+/// repeated once without it, on the same client. Every other error propagates
+/// after the first call.
 pub(crate) async fn with_native_format_fallback<'a, T>(
     input: &'a Input,
     client: &'a dyn Client,

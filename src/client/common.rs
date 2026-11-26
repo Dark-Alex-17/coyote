@@ -2027,7 +2027,7 @@ mod tests {
         assert_eq!(snapshot.total_cost_usd, None);
     }
 
-    /// The model has no prices at all; zero usage needs none.
+    /// The model has no prices at all; a zero bucket costs 0 without consulting one.
     #[tokio::test]
     async fn a_succeeded_call_with_all_zero_usage_keeps_the_run_cost_known() {
         let (mut ctx, stats) = run_stats_ctx();

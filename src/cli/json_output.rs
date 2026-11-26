@@ -87,8 +87,8 @@ impl DirectiveOutcome {
 }
 
 /// Prints the `--json` report for a finished one-shot run. On an error the
-/// report is the only stdout output; the caller still renders the error to
-/// stderr through `render_error`.
+/// report is the only stdout output; `main` still renders the error to stderr
+/// through `render_error`.
 pub fn emit(
     result: &anyhow::Result<DirectiveOutcome>,
     fallback_model: String,

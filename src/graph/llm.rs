@@ -342,7 +342,8 @@ pub(crate) fn default_completion_runner()
 
 /// The production runner over `transport`, which every call and its
 /// format-less retry share; tests pass a fake transport to drive the format
-/// fallback.
+/// fallback. The before-hook runs once per invocation and not again before
+/// that format-less retry.
 fn completion_runner_with<T>(
     transport: T,
 ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send

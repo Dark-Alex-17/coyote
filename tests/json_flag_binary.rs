@@ -441,8 +441,6 @@ fn a_missing_prompt_fails_on_stderr_with_empty_stdout() {
     );
 }
 
-// ---- first-time RAG build reached by an agent load ----
-
 const RAG_INIT_LINE: &str = "Initializing RAG";
 
 /// Like `serve(Behaviour::Answer)`, but answers an embeddings request (a
@@ -782,8 +780,6 @@ fn stdout_printing_flags_are_rejected_alongside_json_before_anything_runs() {
     }
     assert!(!dir.0.join("COYOTE.md").exists(), "--init-instructions ran");
 }
-
-// ---- stray writers: tool calls, first-time setup, skills ----
 
 /// An agent allowed to spawn children, so `TOOL` is declared to the model.
 fn write_tool_agent(dir: &Path) {

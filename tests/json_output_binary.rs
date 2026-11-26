@@ -438,8 +438,6 @@ const KEYS: [&str; 9] = [
     "total_cost_usd",
 ];
 
-// ---- plain one-shot ----
-
 #[test]
 fn a_plain_one_shot_prints_one_object_whose_usage_is_the_reported_usage() {
     let dir = TempDir::new("plain");
@@ -573,8 +571,6 @@ fn assert_no_usage_and_zero_cost(report: &Value) {
     assert_eq!(report["total_cost_usd"], json!(0.0), "{report}");
 }
 
-// ---- rejected invocations ----
-
 #[test]
 fn json_with_execute_or_a_macro_is_rejected_by_the_parser_with_empty_stdout() {
     let dir = TempDir::new("conflicts");
@@ -620,8 +616,6 @@ fn json_without_any_prompt_fails_plainly_on_stderr() {
     );
     assert!(model.requests().is_empty());
 }
-
-// ---- graph agents ----
 
 const ANSWER_JSON: &str = r#"{"answer":"forty-two"}"#;
 const CHILD_MARKER: &str = "CHILD-MARKER";
