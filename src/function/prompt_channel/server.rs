@@ -19,6 +19,9 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::{Condvar, Mutex};
 
+#[cfg(windows)]
+pub(crate) use win::OwnerOnlyDescriptor;
+
 /// The parent's end of the reply pipe. The child reads replies from the fd
 /// named by `env_value`, which `configure` keeps open across exec.
 #[cfg(unix)]
@@ -425,7 +428,7 @@ fn serve(pipe: &OwnedHandle, shared: &Shared) -> bool {
 
 /// Owned wrappers around the Win32 named-pipe calls the server makes.
 #[cfg(windows)]
-pub(super) mod win {
+mod win {
     use std::ffi::{OsStr, c_void};
     use std::io;
     use std::os::windows::ffi::OsStrExt;
@@ -500,12 +503,14 @@ pub(super) mod win {
             Ok(Self(descriptor))
         }
 
-        pub(crate) fn attributes(&self) -> SECURITY_ATTRIBUTES {
-            SECURITY_ATTRIBUTES {
+        /// Runs `f` with non-inheritable attributes that point at this
+        /// descriptor, which stays borrowed, and so alive, for the call.
+        pub(crate) fn with_attributes<T>(&self, f: impl FnOnce(&SECURITY_ATTRIBUTES) -> T) -> T {
+            f(&SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: self.0,
                 bInheritHandle: 0,
-            }
+            })
         }
     }
 
@@ -592,10 +597,9 @@ pub(super) mod win {
         if first {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
-        let attributes = descriptor.attributes();
         // SAFETY: `name` is NUL terminated and `attributes` points at a
         // live descriptor; both outlive the call.
-        let handle = unsafe {
+        let handle = descriptor.with_attributes(|attributes| unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
                 open_mode,
@@ -604,9 +608,9 @@ pub(super) mod win {
                 OUT_BUFFER,
                 0,
                 0,
-                &attributes,
+                attributes,
             )
-        };
+        });
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }

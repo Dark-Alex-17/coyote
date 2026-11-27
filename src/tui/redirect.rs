@@ -221,6 +221,9 @@ fn drain(fd: RawFd, shared: Arc<Shared>, mut hooks: DrainHooks) {
 /// Waits for the pipe without the lock and reads it with the lock held,
 /// so `finish` may already have taken what woke it. A failed wait still
 /// reads first: the pipe may hold bytes after its last writer closed.
+/// Only a read that sees EOF sets `eof`; any other failure ends the
+/// thread with it unset, so the sweeps in `finish` and `Drop` still read
+/// whatever is queued and find EOF themselves.
 #[cfg(windows)]
 fn drain(reader: Arc<windows::Reader>, shared: Arc<Shared>, mut hooks: DrainHooks) {
     let mut chunk = vec![0u8; READ_CHUNK];
@@ -233,14 +236,19 @@ fn drain(reader: Arc<windows::Reader>, shared: Arc<Shared>, mut hooks: DrainHook
                 break;
             }
             match windows::read_some(&drained.reader, &mut chunk) {
-                Ok(Got::Empty) if ready.is_ok() => None,
-                Ok(Got::Empty | Got::Eof) => {
+                Ok(Got::Empty) => match &ready {
+                    Ok(()) => None,
+                    Err(err) => {
+                        debug!("Stopping the capture drain after a failed pipe wait: {err}");
+                        break;
+                    }
+                },
+                Ok(Got::Eof) => {
                     drained.eof = true;
                     break;
                 }
                 Err(err) => {
                     debug!("Stopping the capture drain after a failed pipe read: {err}");
-                    drained.eof = true;
                     break;
                 }
                 Ok(Got::Data(n)) if drained.detached => {
@@ -525,7 +533,8 @@ mod windows {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr;
     use windows_sys::Win32::Foundation::{
-        ERROR_BROKEN_PIPE, ERROR_IO_PENDING, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_NOT_CONNECTED, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
@@ -534,7 +543,7 @@ mod windows {
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
     };
-    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
         PIPE_WAIT, PeekNamedPipe,
@@ -567,21 +576,20 @@ mod windows {
         .chain(Some(0))
         .collect();
         let descriptor = OwnerOnlyDescriptor::new()?;
-        let attributes = descriptor.attributes();
         // SAFETY: `name` is NUL terminated, and `attributes` and the
         // descriptor it points at outlive the call.
-        let read_end = unsafe {
+        let read_end = descriptor.with_attributes(|attributes| unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
                 PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                PIPE_BUFFER,
+                0,
                 PIPE_BUFFER,
                 0,
-                &attributes,
+                attributes,
             )
-        };
+        });
         if read_end == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
@@ -657,12 +665,28 @@ mod windows {
         let queued = match pending(reader) {
             Ok(0) => return Ok(Got::Empty),
             Ok(queued) => queued,
-            Err(err) if is_broken_pipe(&err) => return Ok(Got::Eof),
-            Err(err) => return Err(err),
+            // A failed peek does not say whether bytes are still queued
+            // behind a closed writer; only a read can.
+            Err(_) => return read_now(reader, buf),
         };
         let len = queued.min(buf.len());
-        match read_overlapped(&reader.pipe, &reader.taken, &mut buf[..len]) {
+        match read_overlapped(&reader.pipe, &reader.taken, &mut buf[..len], false) {
             Ok(n) => Ok(Got::Data(n)),
+            Err(err) if is_broken_pipe(&err) => Ok(Got::Eof),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Reads up to `buf.len()` bytes without waiting for a writer: a read
+    /// the pipe cannot satisfy at once is cancelled and reports Empty, so
+    /// it never blocks a caller holding the state lock.
+    fn read_now(reader: &Reader, buf: &mut [u8]) -> io::Result<Got> {
+        match read_overlapped(&reader.pipe, &reader.taken, buf, true) {
+            Ok(0) => Ok(Got::Eof),
+            Ok(n) => Ok(Got::Data(n)),
+            Err(err) if err.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) => {
+                Ok(Got::Empty)
+            }
             Err(err) if is_broken_pipe(&err) => Ok(Got::Eof),
             Err(err) => Err(err),
         }
@@ -673,16 +697,19 @@ mod windows {
     /// writer has closed it.
     pub(super) fn wait_readable(reader: &Reader) -> io::Result<()> {
         let mut probe = [0u8; 1];
-        read_overlapped(&reader.pipe, &reader.ready, &mut probe[..0]).map(drop)
+        read_overlapped(&reader.pipe, &reader.ready, &mut probe[..0], false).map(drop)
     }
 
     /// Waits for the read to finish before returning, so `buf` and the
     /// OVERLAPPED never go away while the kernel still holds them and no
-    /// read is ever left to cancel.
+    /// read is ever left outstanding. With `cancel_pending`, a read that
+    /// does not complete at once is cancelled first, and the wait then
+    /// only sees it finish or abort.
     fn read_overlapped(
         pipe: &OwnedHandle,
         event: &OwnedHandle,
         buf: &mut [u8],
+        cancel_pending: bool,
     ) -> io::Result<usize> {
         let mut overlapped = OVERLAPPED {
             hEvent: event.as_raw_handle(),
@@ -705,6 +732,13 @@ mod windows {
             if err.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
                 return Err(err);
             }
+            if cancel_pending {
+                // SAFETY: `overlapped` is the read just started on `pipe`;
+                // the wait below still runs, so it stays alive until the
+                // kernel is done with it. A read that completed meanwhile
+                // makes this fail harmlessly with ERROR_NOT_FOUND.
+                unsafe { CancelIoEx(pipe.as_raw_handle(), &overlapped) };
+            }
         }
         let mut transferred = 0u32;
         // SAFETY: `overlapped` is the one the read started with, and the
@@ -718,7 +752,9 @@ mod windows {
     }
 
     fn is_broken_pipe(err: &io::Error) -> bool {
-        err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32)
+        [ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, ERROR_NO_DATA]
+            .iter()
+            .any(|&code| err.raw_os_error() == Some(code as i32))
     }
 
     fn manual_reset_event() -> io::Result<OwnedHandle> {
