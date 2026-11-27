@@ -26,8 +26,10 @@ const MAX_CLASS_NODES: usize = 16;
 const MAX_CLASS_EDGES: usize = 16;
 
 /// Diagram kinds drawn without a graph layout, which stay fast at the
-/// source caps whatever they hold.
-const UNLAYERED_KINDS: [&str; 5] = ["sequenceDiagram", "gantt", "timeline", "journey", "pie"];
+/// source caps whatever they hold, in lower case as the backend matches
+/// them whatever their case. Every other kind is counted.
+const UNLAYERED_KINDS: [&str; 5] = ["sequencediagram", "gantt", "timeline", "journey", "pie"];
+const CLASS_DIAGRAM: &str = "classdiagram";
 
 /// Statements that declare no node of their own, skipped by the count.
 const NON_NODE_STATEMENTS: [&str; 22] = [
@@ -106,8 +108,11 @@ fn first_line(text: &str) -> &str {
 /// subgraphs counted roughly from the text: a node is any distinct word
 /// outside labels, and a run of link characters such as `-->`, `-.-` or
 /// `<|--` is an edge from each node on its left to each on its right, as
-/// `A & B --> C & D` is four. The count errs high, so a diagram near the
-/// caps may be refused that the backend would draw in time.
+/// `A & B --> C & D` is four. A composite `state X {` counts as a
+/// subgraph. The members in a class's `{` body are skipped, and a body
+/// left open is too complex, as nothing after it would be counted. The
+/// count errs high, so a diagram near the caps may be refused that the
+/// backend would draw in time.
 fn too_complex(source: &str) -> bool {
     let mut statements = source
         .lines()
@@ -117,11 +122,16 @@ fn too_complex(source: &str) -> bool {
     let Some(header) = statements.next() else {
         return false;
     };
-    let kind = header.split_whitespace().next().unwrap_or_default();
-    if UNLAYERED_KINDS.contains(&kind) {
+    let kind = header
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    if UNLAYERED_KINDS.contains(&kind.as_str()) {
         return false;
     }
-    let (max_nodes, max_edges) = if kind == "classDiagram" {
+    let class_diagram = kind == CLASS_DIAGRAM;
+    let (max_nodes, max_edges) = if class_diagram {
         (MAX_CLASS_NODES, MAX_CLASS_EDGES)
     } else {
         (MAX_NODES, MAX_EDGES)
@@ -132,15 +142,18 @@ fn too_complex(source: &str) -> bool {
     let mut in_class_body = false;
     for line in statements {
         if in_class_body {
-            in_class_body = !line.starts_with('}');
+            in_class_body = !line.contains('}');
             continue;
         }
-        in_class_body = line.ends_with('{');
+        in_class_body = class_diagram && line.ends_with('{');
         let mut words = line.split_whitespace();
         let first = words.next().unwrap_or_default();
         if first == "subgraph" {
             subgraphs += 1;
         } else if DECLARING_STATEMENTS.contains(&first) {
+            if first == "state" && line.ends_with('{') {
+                subgraphs += 1;
+            }
             let declared = words.next().into_iter().flat_map(identifiers);
             nodes.extend(declared.map(str::to_string));
         } else if !NON_NODE_STATEMENTS.contains(&first) {
@@ -160,7 +173,7 @@ fn too_complex(source: &str) -> bool {
             nodes.extend(identifiers(&bare).map(str::to_string));
         }
     }
-    nodes.len() > max_nodes || edges > max_edges || subgraphs > MAX_SUBGRAPHS
+    in_class_body || nodes.len() > max_nodes || edges > max_edges || subgraphs > MAX_SUBGRAPHS
 }
 
 fn is_word_char(c: char) -> bool {
@@ -183,12 +196,17 @@ fn is_link(run: &str) -> bool {
         && chars.iter().copied().any(line)
 }
 
-/// `line` up to any `:` label, with each quoted string and each bracketed
-/// or piped label closed on the line left out.
+/// `line` up to any `:` label, with each quoted string, each bracketed
+/// or piped label closed on the line and each `:::name` class suffix
+/// left out. A suffix is no label: the line goes on past it.
 fn without_labels(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut closer = None;
+    let mut resume_at = 0;
     for (at, c) in line.char_indices() {
+        if at < resume_at {
+            continue;
+        }
         if let Some(close) = closer {
             if c == close {
                 closer = None;
@@ -201,6 +219,13 @@ fn without_labels(line: &str) -> String {
             '(' => ')',
             '{' => '}',
             '|' => '|',
+            ':' if line[at..].starts_with(":::") => {
+                let name = &line[at + 3..];
+                let name_len = name.find(|c: char| !is_word_char(c)).unwrap_or(name.len());
+                resume_at = at + 3 + name_len;
+                out.push(' ');
+                continue;
+            }
             ':' => break,
             _ => {
                 out.push(c);
@@ -456,8 +481,9 @@ mod tests {
 
     /// A graph over the caps is refused before the backend sees it, by
     /// its nodes, its edges (a link joins each node on its left to each
-    /// on its right), its subgraphs, also when written on one line, or for
-    /// a class diagram by the tighter caps of its own.
+    /// on its right), its subgraphs, also when written on one line or with
+    /// `:::name` class suffixes, or for a class diagram by the tighter caps
+    /// of its own.
     #[test]
     fn a_graph_too_complex_to_lay_out_is_not_handed_to_the_backend() {
         let backend = FakeMermaid::new(|_, _| Ok("drawn".to_string()));
@@ -478,6 +504,9 @@ mod tests {
             .chain((0..17).map(|n| format!("class C{n} {{\n  +String name\n}}\n")))
             .collect();
         let fan_out = "flowchart TD\nA & B & C & D & E --> F & G & H & I & J\n".to_string();
+        let styled: String = std::iter::once("flowchart TD\nclassDef c fill:#f00\n".to_string())
+            .chain((0..25).map(|n| format!("N{}:::c --> N{}:::c\n", n % 20, (n * 7) % 20)))
+            .collect();
         let one_line = format!(
             "flowchart TD; {}",
             (0..5)
@@ -487,7 +516,7 @@ mod tests {
         );
         let start = std::time::Instant::now();
         let refused = [chain("flowchart TD", 24), edges, subgraphs, classes];
-        for source in refused.into_iter().chain([fan_out, one_line]) {
+        for source in refused.into_iter().chain([fan_out, styled, one_line]) {
             assert_eq!(
                 render_mermaid(&backend, &source, 80),
                 Err(MermaidError::TooComplex),
@@ -528,6 +557,62 @@ mod tests {
             .chain((0..60).map(|n| format!("P{n}->>Q{n}: hello\n")))
             .collect();
         assert!(!too_complex(&messages));
+    }
+
+    /// The transitions inside a composite state are counted, the state
+    /// itself counts as a subgraph, and a class body left open is too
+    /// complex rather than hiding the rest of the diagram.
+    #[test]
+    fn a_state_body_is_counted_and_an_open_class_body_is_refused() {
+        let transitions: String = (0..30)
+            .map(|n| format!("  S{n} --> S{}\n", n + 1))
+            .collect();
+        let big_state = format!("stateDiagram-v2\nstate Big {{\n{transitions}}}\n");
+        assert!(too_complex(&big_state), "{big_state}");
+        let small_state = "stateDiagram-v2\nstate Big {\n  A --> B\n}\n[*] --> Big\n";
+        assert!(!too_complex(small_state));
+        let composites: String = std::iter::once("stateDiagram-v2\n".to_string())
+            .chain((0..5).map(|n| format!("state C{n} {{\n  A{n} --> B{n}\n}}\n")))
+            .collect();
+        assert!(too_complex(&composites), "{composites}");
+
+        let open_body = format!("classDiagram\nclass A {{\n  +a\n{transitions}");
+        assert!(too_complex(&open_body), "{open_body}");
+        let closed_inline = "classDiagram\nclass A {\n  +a\n  +b }\nA <|-- B\n";
+        assert!(!too_complex(closed_inline));
+    }
+
+    /// The kind is read whatever its case, as the backend reads it.
+    #[test]
+    fn the_kind_is_read_whatever_its_case() {
+        let classes = |kind: &str, count: usize| -> String {
+            std::iter::once(format!("{kind}\n"))
+                .chain((0..count).map(|n| format!("class C{n} {{\n  +a{n}\n  +b{n}\n}}\n")))
+                .collect()
+        };
+        let messages = |kind: &str| -> String {
+            std::iter::once(format!("{kind}\n"))
+                .chain((0..60).map(|n| format!("P{n}->>Q{n}: hello\n")))
+                .collect()
+        };
+        for (kind, class_kind) in [
+            ("classDiagram", true),
+            ("ClassDiagram", true),
+            ("CLASSDIAGRAM", true),
+            ("classdiagram", true),
+            ("flowchart", false),
+        ] {
+            assert_eq!(
+                too_complex(&classes(kind, MAX_CLASS_NODES)),
+                !class_kind,
+                "{kind}: members are skipped only in a class diagram"
+            );
+            assert!(too_complex(&classes(kind, MAX_CLASS_NODES + 1)), "{kind}");
+        }
+        for kind in ["sequenceDiagram", "SequenceDiagram", "SEQUENCEDIAGRAM"] {
+            assert!(!too_complex(&messages(kind)), "{kind}");
+        }
+        assert!(too_complex(&messages("flowchart")));
     }
 
     /// An ordinary flowchart of eighteen nodes and a sequence diagram of
@@ -620,7 +705,21 @@ mod tests {
         );
         let dense = random_graph("flowchart LR", MAX_NODES, MAX_EDGES, MAX_SUBGRAPHS)
             .replace("[Node", "[A rather longer label for node");
-        for source in [flowchart, classes, fan, dense] {
+        let composites: String = (0..MAX_SUBGRAPHS)
+            .map(|group| format!("state C{group} {{\n  N{group} --> M{group}\n}}\n"))
+            .collect();
+        let states = format!(
+            "stateDiagram-v2\n{composites}{}",
+            random_graph(
+                "",
+                MAX_NODES - 3 * MAX_SUBGRAPHS,
+                MAX_EDGES - MAX_SUBGRAPHS,
+                0
+            )
+            .trim_start()
+            .replace("N", "S")
+        );
+        for source in [flowchart, classes, fan, dense, states] {
             assert!(!too_complex(&source), "{source}");
             for width in [80, 200] {
                 let start = std::time::Instant::now();

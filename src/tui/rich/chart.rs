@@ -18,8 +18,12 @@ use serde::Deserialize;
 
 const MAX_SPEC_BYTES: usize = 64 * 1024;
 const MAX_POINTS: usize = 2000;
+/// A sparkline draws only its newest values that fit, so more than this
+/// is a spec too big to read rather than a chart too wide to draw.
+const MAX_SPARKLINE_VALUES: usize = 1000;
 const MAX_SERIES: usize = 8;
-const MAX_BARS: usize = 64;
+/// The most bars that fit 80 columns, a column each with a gap between.
+const MAX_BARS: usize = 40;
 const MIN_WIDTH: u16 = 20;
 const MIN_HEIGHT: u16 = 6;
 const MAX_HEIGHT: u16 = 30;
@@ -214,7 +218,9 @@ impl ChartSpec {
             },
             ChartSpec::Sparkline(spec) => match spec.data.len() {
                 0 => Err("no data".to_string()),
-                count if count > MAX_POINTS => Err(format!("more than {MAX_POINTS} values")),
+                count if count > MAX_SPARKLINE_VALUES => {
+                    Err(format!("more than {MAX_SPARKLINE_VALUES} values"))
+                }
                 _ => Ok(()),
             },
         }
@@ -229,19 +235,15 @@ impl ChartSpec {
     }
 
     /// The fewest columns the chart can be drawn in: a bar chart needs a
-    /// column for each bar and a gap between each two, and a sparkline a
-    /// column for each value, as ratatui draws only the values that fit
-    /// yet scales them against all of them.
+    /// column for each bar and a gap between each two. A sparkline wider
+    /// than the room draws its newest values that fit.
     fn min_width(&self) -> u16 {
         match self {
             ChartSpec::Bar(spec) => {
                 let bars = u16::try_from(spec.bars.len()).unwrap_or(u16::MAX);
                 MIN_WIDTH.max(bars.saturating_mul(1 + BAR_GAP).saturating_sub(BAR_GAP))
             }
-            ChartSpec::Sparkline(spec) => {
-                MIN_WIDTH.max(u16::try_from(spec.data.len()).unwrap_or(u16::MAX))
-            }
-            ChartSpec::Line(_) | ChartSpec::Scatter(_) => MIN_WIDTH,
+            ChartSpec::Line(_) | ChartSpec::Scatter(_) | ChartSpec::Sparkline(_) => MIN_WIDTH,
         }
     }
 
@@ -361,10 +363,16 @@ impl BarSpec {
 }
 
 impl SparklineSpec {
+    /// Draws the newest values that fit, one a column, scaled against
+    /// those alone: ratatui would draw the oldest that fit, scaled
+    /// against all of them.
     fn draw(&self, area: Rect, buffer: &mut Buffer, style: &RichStyle) {
+        let block = titled(&self.title, style);
+        let columns = usize::from(block.inner(area).width);
+        let newest = &self.data[self.data.len().saturating_sub(columns)..];
         Sparkline::default()
-            .block(titled(&self.title, style))
-            .data(&self.data)
+            .block(block)
+            .data(newest)
             .style(style.series(0))
             .render(area, buffer);
     }
@@ -599,10 +607,10 @@ mod tests {
 
     #[test]
     fn a_spec_the_checks_reject_names_its_problem() {
-        let too_many = format!("type: sparkline\ndata: [{}]\n", vec!["1"; 2001].join(", "));
+        let too_many = format!("type: sparkline\ndata: [{}]\n", vec!["1"; 1001].join(", "));
         let too_many_bars = format!(
             "type: bar\nbars: [{}]\n",
-            vec!["{label: a, value: 1}"; 65].join(", ")
+            vec!["{label: a, value: 1}"; 41].join(", ")
         );
         for (body, message) in [
             ("type: line\nseries: []\n", "no series"),
@@ -623,9 +631,9 @@ mod tests {
                 "y_bounds must be two finite numbers, low first",
             ),
             ("type: bar\nbars: []\n", "no bars"),
-            (too_many_bars.as_str(), "more than 64 bars"),
+            (too_many_bars.as_str(), "more than 40 bars"),
             ("type: sparkline\ndata: []\n", "no data"),
-            (too_many.as_str(), "more than 2000 values"),
+            (too_many.as_str(), "more than 1000 values"),
         ] {
             assert_eq!(invalid(body), message, "{body:?}");
         }
@@ -740,15 +748,28 @@ mod tests {
                 available: 40,
             })
         );
-        let values = format!("type: sparkline\ndata: [{}]\n", vec!["1"; 50].join(", "));
-        assert_eq!(
-            render_chart(&values, 40, 12, &style(false)),
-            Err(ChartError::TooNarrow {
-                needed: 50,
-                available: 40,
-            })
+        let most_bars = format!(
+            "type: bar\nbars: [{}]\n",
+            vec!["{label: a, value: 1}"; MAX_BARS].join(", ")
         );
-        assert!(render_chart(&values, 50, 12, &style(false)).is_ok());
+        assert!(render_chart(&most_bars, 80, 12, &style(false)).is_ok());
+    }
+
+    /// A sparkline with more values than columns draws the newest that
+    /// fit, scaled against them alone: ten high old values and forty
+    /// equal new ones draw forty full columns in 40.
+    #[test]
+    fn a_sparkline_wider_than_the_room_draws_its_newest_values() {
+        let mut data = vec!["100"; 10];
+        data.extend(vec!["1"; 40]);
+        let body = format!("type: sparkline\ndata: [{}]\n", data.join(", "));
+        let lines = render_chart(&body, 40, 6, &style(false)).unwrap();
+        let top: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(top, "█".repeat(40));
     }
 
     #[test]

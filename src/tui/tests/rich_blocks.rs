@@ -281,6 +281,57 @@ fn a_new_theme_repaints_a_chart_on_screen() {
     assert!(!coloured(&harness));
 }
 
+/// The foreground of the first cell of `needle` on screen.
+fn fg_of(harness: &Harness, needle: &str) -> Color {
+    let y = row_with(harness, needle);
+    let buffer = harness.terminal.backend().buffer();
+    let width = buffer.area.width;
+    let x = (0..width)
+        .find(|&x| {
+            (x..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .starts_with(needle)
+        })
+        .unwrap_or_else(|| panic!("no cell starts {needle:?}"));
+    buffer[(x, y)].fg
+}
+
+/// A chart's title and its first series take the theme's heading colour,
+/// the head of the series palette, and a new theme brings its own.
+#[test]
+#[serial]
+fn a_chart_takes_the_themes_heading_colour() {
+    let _guard = TestConfigDirGuard::new("tui-chart-theme-colours");
+    let themed = |ctx: &mut RequestContext, light: bool| {
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            highlight: true,
+            theme: light.then(|| "light".to_string()),
+            ..(*app.config).clone()
+        });
+        ctx.app = Arc::new(app);
+    };
+    let mut ctx = chat_ctx();
+    themed(&mut ctx, false);
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.app.set_no_color(false);
+    replied(&mut harness, &chart_reply(LINE_CHART));
+    let heading = |harness: &Harness| theme::heading_color(harness.app.renderer.markdown_render());
+    let dark = heading(&harness);
+    assert_eq!(fg_of(&harness, "Requests"), dark);
+    assert_eq!(fg_of(&harness, "api"), dark);
+
+    themed(&mut ctx, true);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.draw();
+    let light = heading(&harness);
+    assert_ne!(light, dark);
+    assert_eq!(fg_of(&harness, "Requests"), light);
+    assert_eq!(fg_of(&harness, "api"), light);
+}
+
 /// Alt+M shows a chart as its source, the transcript view shows the
 /// source, and a drag over the chart copies its fenced source.
 #[test]

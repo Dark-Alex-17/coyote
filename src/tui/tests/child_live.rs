@@ -1960,6 +1960,40 @@ fn a_find_in_a_child_thread_opens_the_folded_row_holding_the_match() {
     });
 }
 
+/// A node row a find opened was opened for the view, not by hand, so
+/// it still folds by the rule when a late call joins it.
+#[test]
+#[serial]
+fn a_node_row_a_find_opened_still_folds_by_the_rule() {
+    run_async(async {
+        let _guard = TestConfigDirGuard::new("tui-thread-find-opened-node");
+        let mut harness = thread_harness(43);
+        node_with_calls(&mut harness, 4, true, true);
+        open_saved_node(&mut harness, 4);
+        assert!(!node_state(&mut harness, 4));
+
+        harness.press(KeyCode::Char('/'));
+        harness.type_text("node-out-2");
+        harness.press(KeyCode::Enter);
+        harness.draw();
+        assert!(
+            node_state(&mut harness, 4),
+            "the find did not open the node"
+        );
+
+        child_tool_of(&mut harness, AGENT, Some("plan"), "call-late", "fs_read");
+        let thread = whole_thread(&mut harness);
+        let header = thread
+            .lines()
+            .find(|line| line.contains("node plan"))
+            .unwrap_or_else(|| panic!("no node row: {thread}"));
+        assert!(
+            header.contains(cells::COLLAPSED_ARROW.trim_end()),
+            "{thread}"
+        );
+    });
+}
+
 /// A grandchild's thread, titled with its path, with its call open.
 #[test]
 #[serial]

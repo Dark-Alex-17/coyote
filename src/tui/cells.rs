@@ -872,6 +872,38 @@ impl Cell {
         }
     }
 
+    /// Opens or closes a foldable row for the view rather than the user,
+    /// so a node opened this way still folds by the rule when it ends.
+    pub(super) fn set_expanded(&mut self, open: bool) {
+        match self {
+            Cell::Tool {
+                expanded,
+                bookkeeping: false,
+                cache,
+                ..
+            }
+            | Cell::Job {
+                row: TaskRow { expanded, .. },
+                cache,
+                ..
+            }
+            | Cell::Agent {
+                row: TaskRow { expanded, .. },
+                cache,
+                ..
+            }
+            | Cell::Node {
+                row: TaskRow { expanded, .. },
+                cache,
+                ..
+            } if *expanded != open => {
+                *expanded = open;
+                *cache = LineCache::default();
+            }
+            _ => {}
+        }
+    }
+
     /// Marks whether a confirm asked by this tool row's call is pending,
     /// returning whether that changed what the row shows.
     pub(super) fn set_awaiting(&mut self, pending: &dyn Fn(&str) -> bool) -> bool {
@@ -1754,8 +1786,26 @@ fn row_lines<S>(
     } else {
         COLLAPSED_ARROW
     };
-    let reserved = arrow.width() + kind.len() + "   ".len() + state.width();
+    let summary = render::plain_text(&summary);
+    let summary_width = if summary.is_empty() {
+        0
+    } else {
+        "  ".len() + summary.width()
+    };
+    let reserved = arrow.width() + kind.len() + "   ".len() + state.width() + summary_width;
     let subject = render::plain_text(&fit_to_row(&format!("{name} {id}"), reserved, width));
+    // The subject keeps a floor of columns, so on a narrow row the summary
+    // is cut here, with its `...`, rather than clipped mid-word by the view.
+    let summary_room = usize::from(width).saturating_sub(
+        arrow.width() + kind.len() + "   ".len() + subject.width() + state.width() + "  ".len(),
+    );
+    let summary = if summary.width() <= summary_room {
+        summary
+    } else if summary_room > "...".len() {
+        cut_to(&summary, summary_room)
+    } else {
+        String::new()
+    };
     let (name, rest) = subject.split_at(subject.find(' ').unwrap_or(subject.len()));
     let state_style = if error.is_some() {
         styles.failed
@@ -1770,10 +1820,7 @@ fn row_lines<S>(
     ];
     spans.extend(state_spans(&state, state_style, styles.throbber));
     if !summary.is_empty() {
-        spans.push(Span::styled(
-            format!("  {}", render::plain_text(&summary)),
-            styles.muted,
-        ));
+        spans.push(Span::styled(format!("  {summary}"), styles.muted));
     }
     let mut lines = vec![Line::from(spans)];
     if row.expanded {

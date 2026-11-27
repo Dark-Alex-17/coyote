@@ -466,14 +466,11 @@ pub(crate) fn unmask(
         let mut open: Option<Piece> = None;
         let mut close = |open: &mut Option<Piece>, end: usize| {
             if let Some(piece) = open.take() {
+                let source = spans.get(piece.formula).filter(|_| piece.first);
                 regions.push(CopyRegion::Inline {
                     row,
                     cols: piece.from..end,
-                    source: if piece.first {
-                        Arc::clone(&spans[piece.formula].source)
-                    } else {
-                        Arc::from("")
-                    },
+                    source: source.map_or_else(|| Arc::from(""), |span| Arc::clone(&span.source)),
                 });
             }
         };

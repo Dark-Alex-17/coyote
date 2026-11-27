@@ -1048,7 +1048,7 @@ impl Pager {
             .map_or(&mut [][..], ChildThread::rows_mut);
         match view.cell_mut(row, cells) {
             Some(cell) => {
-                cell.toggle();
+                cell.set_expanded(true);
                 true
             }
             None => false,

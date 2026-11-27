@@ -8,7 +8,7 @@ expression: harness.draw()
 "                                        "
 "> build it                              "
 "                                        "
-"▾ node plan llm  completed in 0s  4 tool"
+"▾ node pla...  completed in 0s  4 too..."
 "  execute_command  0s  ok               "
 "  node-out-0                            "
 "  execute_command  0s  ok               "

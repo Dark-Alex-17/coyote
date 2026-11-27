@@ -6,6 +6,8 @@
 
 use crate::tui::render::plain_text;
 use crate::tui::terminal::catch_quietly_at;
+use std::iter::Peekable;
+use std::str::Chars;
 use unicode_width::UnicodeWidthStr;
 
 /// The most TeX a formula may have before it is shown as source without
@@ -18,7 +20,28 @@ const MAX_TEX_BYTES: usize = 4096;
 /// superscripts take seconds), and it runs on the draw path.
 const MAX_NESTING: usize = 32;
 
-/// Constructs the backend lays out wrongly, or draws as their source.
+/// The most constructs that nest what follows them a formula may have:
+/// fractions, roots, `^`, `_`, `(` and `{`. Without braces the backend
+/// nests a run of them all the same, so depth alone does not bound its
+/// time. In a debug build the slowest formula under these caps takes
+/// about a quarter of a second.
+const MAX_CONSTRUCTS: usize = 128;
+
+/// The most fractions a formula may have. The backend's time grows by
+/// about half again with each fraction in a run: twenty `\choose` in a
+/// row take a quarter of a second in a debug build, thirty-two a minute.
+const MAX_FRACTIONS: usize = 16;
+
+/// The commands, without their backslash, that set one part over another.
+const FRACTIONS: [&str; 13] = [
+    "over", "choose", "atop", "above", "frac", "dfrac", "tfrac", "cfrac", "binom", "dbinom",
+    "tbinom", "brace", "brack",
+];
+
+/// Constructs the backend lays out wrongly, or draws as their source,
+/// written without whitespace: they are looked for in the TeX with its
+/// whitespace taken out, as TeX ignores it between a command and its
+/// argument.
 const UNSUPPORTED: [&str; 7] = [
     "\\begin{align*}",
     "\\begin{align}",
@@ -43,6 +66,7 @@ pub(crate) trait MathRenderer: Send + Sync {
 pub(crate) enum MathError {
     TooLarge,
     TooDeep,
+    TooComplex,
     Unsupported(&'static str),
     Panicked(String),
     Empty,
@@ -56,6 +80,7 @@ impl MathError {
         let why = match self {
             MathError::TooLarge => format!("formula longer than {} KiB", MAX_TEX_BYTES / 1024),
             MathError::TooDeep => "nested too deeply".to_string(),
+            MathError::TooComplex => "formula too complex to draw".to_string(),
             MathError::Unsupported(construct) => format!("{construct} is not supported"),
             MathError::Panicked(message) => format!(
                 "renderer failed: {}",
@@ -71,37 +96,89 @@ impl MathError {
     }
 }
 
+/// The rows `tex` draws as in `max_width` columns, as [`math_rows`] has
+/// them, or None when it is shown as source. A panic is logged at debug:
+/// an inline formula in the streaming tail is drawn again on every new
+/// width and every reply, and its source is shown either way.
+pub(crate) fn render_math(
+    backend: &dyn MathRenderer,
+    tex: &str,
+    max_width: u16,
+) -> Option<Vec<String>> {
+    rows_logging_at(log::Level::Debug, backend, tex, max_width).ok()
+}
+
 /// The one row `tex` draws as in `max_width` columns, or None when it
-/// cannot be drawn there or takes more than one row. A panic is logged at
-/// debug: an inline formula in the streaming tail is drawn again on every
-/// new width and every reply, and its source is shown either way.
+/// cannot be drawn there or takes more than one row.
 pub(crate) fn one_row(backend: &dyn MathRenderer, tex: &str, max_width: u16) -> Option<String> {
-    rows_logging_at(log::Level::Debug, backend, tex, max_width)
-        .ok()
+    render_math(backend, tex, max_width)
         .filter(|rows| rows.len() == 1)
         .and_then(|mut rows| rows.pop())
 }
 
-/// How deep the braces of `tex` nest; a brace after a backslash is a
-/// literal one and does not count.
-fn nesting(tex: &str) -> usize {
+/// What `tex` nests: how deep its braces go, how many constructs nest
+/// what follows them, and how many of those are fractions. A character
+/// after a backslash that is not a letter is a literal one and does not
+/// count; a bare `sqrt` counts, as the backend reads it as a root.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Nesting {
+    deepest: usize,
+    constructs: usize,
+    fractions: usize,
+}
+
+fn nesting(tex: &str) -> Nesting {
+    let mut shape = Nesting::default();
     let mut depth: usize = 0;
-    let mut deepest = 0;
-    let mut chars = tex.chars();
+    let mut chars = tex.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                chars.next();
+                let name = word(None, &mut chars);
+                if name.is_empty() {
+                    chars.next();
+                } else if FRACTIONS.contains(&name.as_str()) {
+                    shape.fractions += 1;
+                    shape.constructs += 1;
+                } else if name == "sqrt" {
+                    shape.constructs += 1;
+                }
             }
             '{' => {
                 depth += 1;
-                deepest = deepest.max(depth);
+                shape.deepest = shape.deepest.max(depth);
+                shape.constructs += 1;
             }
             '}' => depth = depth.saturating_sub(1),
+            '^' | '_' | '(' => shape.constructs += 1,
+            c if c.is_ascii_alphabetic() => {
+                shape.constructs += word(Some(c), &mut chars).matches("sqrt").count();
+            }
             _ => {}
         }
     }
-    deepest
+    shape
+}
+
+/// `first` and the letters that follow it.
+fn word(first: Option<char>, chars: &mut Peekable<Chars<'_>>) -> String {
+    let mut word: String = first.into_iter().collect();
+    while let Some(letter) = chars.next_if(char::is_ascii_alphabetic) {
+        word.push(letter);
+    }
+    word
+}
+
+/// Whether `tex` nests within the caps the backend lays out in time.
+fn check_nesting(tex: &str) -> Result<(), MathError> {
+    let shape = nesting(tex);
+    if shape.deepest > MAX_NESTING {
+        Err(MathError::TooDeep)
+    } else if shape.constructs > MAX_CONSTRUCTS || shape.fractions > MAX_FRACTIONS {
+        Err(MathError::TooComplex)
+    } else {
+        Ok(())
+    }
 }
 
 /// The rows of `tex` drawn by `backend`, without control characters,
@@ -125,12 +202,11 @@ fn rows_logging_at(
     if tex.len() > MAX_TEX_BYTES {
         return Err(MathError::TooLarge);
     }
-    if nesting(tex) > MAX_NESTING {
-        return Err(MathError::TooDeep);
-    }
+    check_nesting(tex)?;
+    let squeezed: String = tex.chars().filter(|c| !c.is_whitespace()).collect();
     if let Some(construct) = UNSUPPORTED
         .iter()
-        .find(|construct| tex.contains(*construct))
+        .find(|construct| squeezed.contains(*construct))
     {
         return Err(MathError::Unsupported(construct));
     }
@@ -240,6 +316,116 @@ mod tests {
         assert!(math_rows(&backend, "\\begin{pmatrix} a \\end{pmatrix}", 80).is_ok());
     }
 
+    /// Whitespace between a command and its argument does not hide it.
+    #[test]
+    fn an_unsupported_construct_is_found_with_whitespace_in_it() {
+        let backend = answers("drawn");
+        for (tex, construct) in [
+            ("\\begin {align*} a &= b \\end{align*}", "\\begin{align*}"),
+            ("\\begin{ gather } a \\end{gather}", "\\begin{gather}"),
+            ("\\begin\n{array}{cc} a \\end{array}", "\\begin{array}"),
+            ("\\sqrt [3]{x}", "\\sqrt["),
+            ("\\sqrt\t[3]{x}", "\\sqrt["),
+        ] {
+            assert_eq!(
+                math_rows(&backend, tex, 80),
+                Err(MathError::Unsupported(construct)),
+                "{tex:?}"
+            );
+        }
+        assert_eq!(backend.calls(), 0);
+        assert!(math_rows(&backend, "\\sqrt {x} [3]", 80).is_ok());
+    }
+
+    /// The wrapper has a drawing's rows, and None for every reason a
+    /// formula is shown as source.
+    #[test]
+    fn render_math_has_the_rows_or_none() {
+        let fraction = render_math(&TermMathsBackend, "\\frac{a}{b}", 80).unwrap();
+        assert_eq!(fraction.len(), 3, "{fraction:?}");
+        let echo = FakeMath::new(|tex| tex.to_string());
+        let rejected = [
+            "x".repeat(MAX_TEX_BYTES + 1),
+            nested(MAX_NESTING + 1),
+            "a\\over ".repeat(MAX_FRACTIONS + 1),
+            "\\begin{align} a \\end{align}".to_string(),
+            " ".to_string(),
+            "a\\b".to_string(),
+            "x".repeat(80),
+        ];
+        for tex in &rejected {
+            assert_eq!(render_math(&echo, tex, 80), None, "{tex}");
+        }
+        let panics = FakeMath::new(|_| panic!("parser overflowed"));
+        assert_eq!(render_math(&panics, "x", 80), None);
+    }
+
+    /// Long runs of brace-free constructs the backend takes seconds over
+    /// are turned away before it sees them.
+    #[test]
+    fn too_many_nesting_constructs_are_not_handed_to_the_backend() {
+        let backend = answers("x");
+        let start = std::time::Instant::now();
+        for tex in [
+            "a\\over ".repeat(580),
+            "sqrt ".repeat(800),
+            "\\sqrt ".repeat(680),
+            "\\sqrt(".repeat(580),
+            "a\\choose ".repeat(MAX_FRACTIONS + 1),
+            "x^".repeat(MAX_CONSTRUCTS + 1),
+            "(".repeat(MAX_CONSTRUCTS + 1),
+        ] {
+            assert!(tex.len() <= MAX_TEX_BYTES, "{}", tex.len());
+            assert_eq!(math_rows(&backend, &tex, 80), Err(MathError::TooComplex));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(backend.calls(), 0);
+        assert!(math_rows(&backend, &"x^".repeat(MAX_CONSTRUCTS), 80).is_ok());
+        assert!(math_rows(&backend, &"a\\choose ".repeat(MAX_FRACTIONS), 80).is_ok());
+        assert_eq!(
+            nesting("\\frac{a}{b} + \\sqrt(x)^2 \\{ sqrtx \\alpha_i"),
+            Nesting {
+                deepest: 1,
+                constructs: 8,
+                fractions: 1,
+            }
+        );
+    }
+
+    /// The slowest formulas under the caps the real crate is handed still
+    /// lay out in well under a second in a debug build.
+    #[test]
+    fn the_crate_lays_out_the_most_nested_formulas_allowed_in_time() {
+        let rest = MAX_CONSTRUCTS - MAX_FRACTIONS;
+        let worst = [
+            format!(
+                "{}{}",
+                "a\\choose b\\over ".repeat(MAX_FRACTIONS / 2),
+                "\\sqrt ".repeat(rest)
+            ),
+            format!(
+                "{}{}",
+                "a\\choose ".repeat(MAX_FRACTIONS),
+                "x^".repeat(rest)
+            ),
+            format!(
+                "{}{}",
+                "\\binom{a}".repeat(MAX_FRACTIONS),
+                "x^{".repeat(MAX_NESTING)
+            ),
+            "sqrt ".repeat(MAX_CONSTRUCTS),
+            nested(MAX_NESTING),
+        ];
+        for tex in worst {
+            assert_eq!(check_nesting(&tex), Ok(()), "{tex}");
+            let start = std::time::Instant::now();
+            let _ = math_rows(&TermMathsBackend, &tex, 400);
+            let took = start.elapsed();
+            eprintln!("{} bytes: {took:?}", tex.len());
+            assert!(took < std::time::Duration::from_secs(2), "{took:?}\n{tex}");
+        }
+    }
+
     #[test]
     fn a_panicking_backend_fails_with_its_message() {
         let backend = FakeMath::new(|_| panic!("parser overflowed"));
@@ -310,7 +496,7 @@ mod tests {
         let literal = format!("{}x", "\\{".repeat(MAX_NESTING + 1));
         assert!(math_rows(&backend, &literal, 80).is_ok());
         assert_eq!(backend.calls(), 2);
-        assert_eq!(nesting("\\\\{a}"), 1);
+        assert_eq!(nesting("\\\\{a}").deepest, 1);
     }
 
     #[test]
@@ -340,6 +526,7 @@ mod tests {
         let notes = [
             (MathError::TooLarge, "formula longer than 4 KiB"),
             (MathError::TooDeep, "nested too deeply"),
+            (MathError::TooComplex, "formula too complex to draw"),
             (
                 MathError::Unsupported("\\begin{align*}"),
                 "\\begin{align*} is not supported",
