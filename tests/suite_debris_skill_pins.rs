@@ -36,7 +36,7 @@ fn code_review_skill_pins_debris_rules() {
             "Check this section on EVERY diff regardless of where the review stopped",
             "`phase N`, `step N` and bare `round N` have too many legitimate uses to lint",
             "`T-a`, `bake-off`, `hand-off`, `\"usage probe:\"`",
-            "**Earns its keep**",
+            "**Comment hygiene**",
             "**Human register, ASCII punctuation**",
             "curly quotes",
             "section signs",
@@ -126,6 +126,51 @@ fn code_review_skill_pins_design_pass() {
 }
 
 #[test]
+fn comment_discipline_skill_pins_the_keep_rule_and_the_final_diff_pass() {
+    assert_anchors(
+        "comment-discipline",
+        &[
+            "## The rule: a comment earns its keep",
+            "A comment should earn its keep. Code should strive to be self-documenting, so if a comment is just stating what the code does when that is easily discernible from reading the code, it is redundant and should be removed. Comments should add context that can't be determined from the code, document functionality that isn't easily seeable from the current context because it is used elsewhere in the codebase, or record decision context. Follow the codebase's existing commenting standards when it has them; otherwise fall back to these guidelines.",
+            "decision context: why this approach and not the obvious one, in a sentence beside the code it",
+            "## Final-diff pass",
+            "orchestrators run before their first review of the finished work",
+            "a judgement pass, not a pattern match",
+            "`Comment hygiene: <n> added comments read, <c> cut, <r> reduced`",
+        ],
+    );
+}
+
+#[test]
+fn code_review_skill_owns_a_comment_hygiene_finding_class() {
+    assert_anchors(
+        "code-review",
+        &[
+            "**Comment hygiene** -- every comment the diff adds or rewrites",
+            "Title each finding `Comment hygiene: <file:line>`",
+            "untagged on purpose: rigor folding must not hide",
+            "the untagged rules do not, on",
+            "A one-sentence why beside the code it explains is a comment, not a",
+            "`Comment hygiene: <n> added comments checked, <m> redundant`",
+        ],
+    );
+    let text = skill("code-review");
+    let section = text
+        .split("## 7. Comments and documentation")
+        .nth(1)
+        .and_then(|rest| rest.split("## 8. Design and structure").next())
+        .expect("code-review/SKILL.md has a section 7");
+    assert!(
+        section.contains("**Comment hygiene**"),
+        "the comment hygiene class must live in section 7, which runs on every diff"
+    );
+    assert!(
+        !text.contains("Comments restating the code are ai-slop-remover's territory"),
+        "restating comments are the review's own finding class, not handed to another skill"
+    );
+}
+
+#[test]
 fn plan_authoring_skill_pins_debris_rules() {
     assert_anchors(
         "plan-authoring",
@@ -137,6 +182,48 @@ fn plan_authoring_skill_pins_debris_rules() {
             "that supersedes them, and that task's acceptance criteria include deleting the scaffolding",
             "A scaffolding task with no superseding task named",
             "Decisions recorded in CONTRIBUTING or README",
+        ],
+    );
+}
+
+/// The micro-grain addenda are named by heading in the architect's gate
+/// prompts, so a renamed heading silently drops the addendum from the gate.
+#[test]
+fn micro_grain_addenda_keep_their_headings_and_batch_rules() {
+    let heading = "## Micro-grain addendum (applies ONLY when the spawner names it)";
+    for name in ["plan-authoring", "plan-gatekeeping", "plan-review"] {
+        assert_anchors(name, &[heading]);
+    }
+    assert_anchors(
+        "plan-authoring",
+        &[
+            "Two extra columns: `Batch`",
+            "dependency order must hold INSIDE a batch and ACROSS batches",
+            "Task frontmatter mirrors\nthem: `batch: <slug>`, `protected: true`.",
+        ],
+    );
+    assert_anchors(
+        "plan-gatekeeping",
+        &[
+            "a missing pack or batch is a leak.",
+            "must have its `Protected` column set; an unmarked one is a leak",
+            "the architect's Phase D mirrors the\n   column into the task's `protected: true` frontmatter",
+            "`plan-review`'s lane in micro mode too.",
+        ],
+    );
+    assert_anchors(
+        "plan-review",
+        &[
+            "Section 5's \"~1-5 files\" is replaced by the `plan-authoring` micro sizing rule",
+            "Dependency order must hold INSIDE a\n  batch and ACROSS batches",
+            "Whether a task SHOULD be protected is the gatekeeper's leak check",
+        ],
+    );
+    assert_anchors(
+        "task-tracking",
+        &[
+            "batch: <slug>          # micro-grain plans only",
+            "protected: true        # micro-grain plans only",
         ],
     );
 }

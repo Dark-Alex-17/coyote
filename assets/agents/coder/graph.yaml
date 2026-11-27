@@ -31,17 +31,41 @@ variables:
       Absolute path to the project directory. Defaults to "." which is the
       directory you invoked `coyote` from. Override at runtime with
       `coyote -a coder --agent-variable project_dir /abs/path "..."`.
+      Left at the default, the verify gates run in the git work tree that
+      holds every absolute planned file when that tree does not contain the
+      invocation directory (a spawned coder editing another checkout).
     default: '.'
+  - name: test_command
+    description: |
+      Test command the verify_tests gate runs instead of the detected one,
+      e.g. `cargo test --test my_suite` when the full suite does not fit the
+      gate's deadline. Takes precedence over the TEST_CMD environment
+      variable. Empty (the default) uses TEST_CMD, then detection.
+    default: ''
+  - name: build_timeout
+    description: |
+      Whole seconds verify_build may run before the gate kills the build
+      and ends the run with a TIMED OUT verdict, distinct from a red build.
+      0 disables the deadline. Keep it below the node's 1800 s timeout.
+    default: '900'
+  - name: test_timeout
+    description: |
+      Whole seconds verify_tests may run before the gate kills the suite
+      and ends the run with a TIMED OUT verdict, distinct from a red run
+      (a cold worktree's first full suite can need far more than a warm
+      one). 0 disables the deadline. Keep it below the node's 3600 s timeout.
+    default: '1800'
   - name: build_lock
     description: |
       Command prefix for every gate (build and tests), e.g. `flock /path/to/lock`
       so parallel agents sharing one target directory serialise their gate
       runs (the coder's own ad-hoc cargo calls are not covered). The whole
       gate command runs under the prefix as one unit. Waiting on the lock
-      counts toward the gate node's timeout (300 s build, 600 s tests), so
-      prefer `flock -w <secs>` or raise those timeouts when runs are long.
-      A gate killed by its timeout while still waiting leaves the lock
-      request queued; `-w` below the node timeout makes it give up instead
+      counts toward the gate's deadline (build_timeout / test_timeout, capped
+      by the nodes' 1800 s build, 3600 s tests timeouts), so prefer
+      `flock -w <secs>` or raise those deadlines when runs are long.
+      A gate killed while still waiting can leave the lock request queued;
+      `-w` below the deadline makes it give up instead
       of running later unobserved.
       The prefix is a shell fragment and is re-parsed: quote paths containing
       spaces (`flock '/tmp/my lock'`); `$VAR` inside it expands when the gate runs.
@@ -49,6 +73,28 @@ variables:
       serialises its argument command works. Empty (the default) runs the
       gate command bare.
     default: ''
+  - name: baseline_floor
+    description: |
+      Commit the calling run started from, when that run may already have
+      committed on top of it (a multi-round orchestrator). With no stored
+      baseline for HEAD on a clean tree, baseline_tests reuses the nearest
+      record on HEAD's first-parent chain (at most 50 commits back) when the
+      floor is an ancestor of that record's commit and every commit since is
+      a non-merge commit made after the record. Empty (the default) never
+      looks past HEAD.
+    default: ''
+  - name: verify_tier
+    description: |
+      How much verification each fix-loop lap runs. `full` (the default)
+      takes the baseline synchronously on the untouched tree and runs the
+      whole test command every lap. `round` starts the base suite in the
+      background in a detached worktree of the base commit, has
+      select_checks pick the tests this lap's change can break, runs only
+      those, and leaves the full suite and lint to the finalize gate
+      (.shared/finalize_gate.sh); each lap writes a round verification
+      record keyed by the worktree tree. Any other value runs the full tier
+      and says so on the `Tier:` line.
+    default: full
 
 settings:
   max_loop_iterations: 20
@@ -58,6 +104,7 @@ settings:
 
 initial_state:
   project_dir: ''
+  project_dir_defaulted: false
   fix_attempts: 0
   max_fix_attempts: 5
   fix_instructions: ''
@@ -78,6 +125,26 @@ initial_state:
   review_notes: ''
   design_notes: ''
   design_trail: ''
+  baseline_status: none
+  baseline_exit_code: 0
+  baseline_failures: []
+  baseline_failure_hash: ''
+  baseline_reused_from: ''
+  baseline_note: No baseline was recorded.
+  baseline_report: ''
+  baseline_mode: ''
+  baseline_key: ''
+  baseline_base: ''
+  impact_facts: ''
+  targeted: []
+  impacted: []
+  reason: ''
+  selection_output: ''
+  build_verdict: not run
+  tests_verdict: not run
+  tests_tier: full
+  review_verdict: not run
+  approval_reask: ''
 
 start: resolve_paths
 
@@ -97,6 +164,8 @@ nodes:
     instructions: |
       You are a senior engineer's planning assistant. Read the orchestrator's
       request and emit a structured plan. You only plan. You never edit files.
+      Read the repository as needed to name the files the request touches,
+      and stop reading once you can name them.
 
       Score complexity from 1 to 10:
         1-3: trivial - single file, <=20 lines changed, obvious approach
@@ -128,8 +197,9 @@ nodes:
 
       ## New request from the orchestrator
       {{initial_prompt}}
-    tools: []
-    timeout: 300
+    tools: [ast_grep, fs_cat, fs_ls, fs_grep, fs_glob]
+    max_iterations: 60
+    timeout: 1200
     output_schema:
       type: object
       properties:
@@ -159,8 +229,16 @@ nodes:
         ]
     state_updates:
       last_node_output: '{{output}}'
-    fallback: end_failure
+    fallback: analyze_fault
     next: route_complexity
+
+  analyze_fault:
+    id: analyze_fault
+    type: script
+    description: "Reached when analyze_request dies (iteration cap, API failure). Writes an empty plan whose plan_summary quotes the error, adds a risk naming the fault, scores it 7 and routes to gate_approval (baseline_tests under CODER_AUTOAPPROVE=1), so implement plans from the request itself and the fault shows on the Plan: line. A crash of this script fails the run closed."
+    script: scripts/analyze_fault.sh
+    timeout: 5
+    fallback: end_failure
 
   route_complexity:
     id: route_complexity
@@ -190,13 +268,32 @@ nodes:
       Complexity: {{complexity_score}}/10
 
       Approve this plan?
+      {{approval_reask}}
     options:
       - 'yes'
       - 'no'
     routes:
-      'yes': implement
+      'yes': baseline_tests
       'no': end_rejected
-    on_other: end_rejected
+    on_other: parse_approval
+    state_updates:
+      approval_answer: '{{choice}}'
+
+  parse_approval:
+    id: parse_approval
+    type: script
+    description: Reads an approval answer that is not exactly yes or no. A reworded yes goes on to baseline_tests, a reworded no to end_rejected, and anything unclear asks again with approval_reask set. A crash fails the run closed (never a rejection); a static edge back to gate_approval would be a cycle the validator refuses.
+    script: scripts/parse_approval.sh
+    timeout: 5
+    fallback: end_failure
+
+  baseline_tests:
+    id: baseline_tests
+    type: script
+    description: Run the test command once on the untouched tree, killed at test_timeout, and record which tests already fail (baseline_failures, baseline_failure_hash, baseline_exit_code) so verify_tests can tell pre-existing failures from new ones. Runs once per run, never after edits; always routes to implement, and a crash means no baseline. In the round tier it returns at once instead, with the base suite started in the background in a detached worktree of the base commit (deferred until verify_tests under build_lock) and baseline_mode, baseline_key and baseline_base set.
+    script: scripts/baseline_tests.sh
+    timeout: 3600
+    fallback: implement
 
   implement:
     id: implement
@@ -259,7 +356,7 @@ nodes:
          `comment-discipline` (self-documenting / api-documented /
          comment-heavy) and write comments to match. When the signal is
          weak, write NO comment. Every comment must EARN ITS KEEP — if
-         the code already tells the reader, don't add it.
+         the code already tells the reader, don't add it (rule 7 below).
       4. If the change touches boundaries, error paths, jobs, or state
          transitions, also note the logging register per
          `logging-discipline` (logger, message style, payload vs IDs,
@@ -292,8 +389,13 @@ nodes:
          always beats a success-shaped one; a false "passed" poisons every
          downstream consumer of your report.
       7. Comments say what the code cannot: intent, an invariant, a
-         non-obvious consequence, an external constraint. Never paraphrase
-         the code or narrate the plan. Human register: plain sentences,
+         non-obvious consequence, an external constraint, a
+         behaviour that lives elsewhere in the codebase, or the reason for
+         a choice (why this approach over the obvious one, in a sentence).
+         A comment that restates easily read code is not written: code
+         strives to be self-documenting, and the repo's own commenting
+         standards come first (`comment-discipline`). Never narrate the
+         plan. Human register: plain sentences,
          ASCII punctuation only (banned: em/en dashes, ellipsis characters,
          arrows, section signs, multiplication and comparison symbols,
          curly quotes, and the rarer look-alikes: horizontal bar,
@@ -331,7 +433,9 @@ nodes:
          change or not written.
       9. Decisions have a home: records of what was decided or checked go
          in the plan file or the task log, never in CONTRIBUTING, README or
-         code comments. A CONTRIBUTING change must be contributor guidance.
+         code comments. A one-sentence why beside the code it explains is a
+         comment (rule 7), not a record. A CONTRIBUTING change must be
+         contributor guidance.
       10. Names a stranger can read: do not carry a plan's coinage or
           acronym into a module, type or function name. If the plan's name
           only makes sense with the plan open, pick a descriptive one and
@@ -368,6 +472,10 @@ nodes:
           `Design: ASK` line) on every pass: a fix-loop re-entry writes a
           fresh summary, and the self-review reads the latest one first and
           the earlier passes after it.
+      12. Tests listed under "Tests that already failed before this run"
+          were red before you started: do not "fix" them unless the request
+          asks you to, and never write a new test that encodes the
+          behaviour a known-failing test rejects.
 
       Project directory: {{project_dir}}
     prompt: |
@@ -384,6 +492,9 @@ nodes:
       ## Original request from the orchestrator
       {{initial_prompt}}
 
+      ## Tests that already failed before this run
+      {{baseline_note}}
+
       ## Fix loop status
       {{fix_instructions}}
     tools:
@@ -398,29 +509,103 @@ nodes:
     state_updates:
       last_node_output: '{{output}}'
       design_trail: "{{design_trail}}\n{{output}}"
-    fallback: end_failure
+    fallback: implement_fault
     next: verify_build
+
+  implement_fault:
+    id: implement_fault
+    type: script
+    description: "Reached when implement dies (iteration cap, API failure). Under the fix budget it spends one fix attempt and loops back to implement with fix_instructions quoting the error, pointing at the edits already on disk and keeping the fix_instructions the dead pass was working on; at the budget it sets gate_error and ends the run. Never routes to verify_build, so a pass that wrote nothing cannot end as CODER_COMPLETE. A crash of this script fails the run closed."
+    script: scripts/implement_fault.sh
+    timeout: 5
+    fallback: end_failure
 
   verify_build:
     id: verify_build
     type: script
-    description: Run the project's check/build command. Routes to verify_tests on success, fix_loop_gate on failure.
+    description: Run the project's check/build command in project_dir, killed at build_timeout. Routes to verify_tests on success (impact_facts in the round tier), fix_loop_gate on failure, end_failure on a timeout.
     script: scripts/verify_build.sh
-    timeout: 300
+    timeout: 1800
     fallback: fix_loop_gate
+
+  impact_facts:
+    id: impact_facts
+    type: script
+    description: Round tier only. Gathers the facts select_checks chooses from (changed paths and which are tests, test files mentioning a changed file's stem, test files beside each changed file, the full test command and the base suite's duration, the previous lap's selection and result) into impact_facts. A crash goes to select_fault, which runs the full test command.
+    script: scripts/impact_facts.py
+    timeout: 120
+    fallback: select_fault
+    next: select_checks
+
+  select_checks:
+    id: select_checks
+    type: llm
+    description: Round tier only. Chooses the test commands this lap runs, targeted then impacted. A failure goes to select_fault.
+    instructions: |
+      You choose which tests verify a change before it goes to review. The
+      goal is the smallest set of test commands that would fail if this
+      change broke something. The full test suite and lint run later at the
+      finalize gate, so pick for signal, not completeness.
+
+      `targeted` holds commands that exercise the changed code itself;
+      `impacted` holds commands for code that depends on it. Each entry is
+      one shell command, run from the directory the facts name under
+      `runs in`; it may be the full test command when nothing narrower
+      covers the change. Targeted commands
+      run first and a failing one stops the run. When nothing testable
+      changed, return empty lists. `reason` says in one sentence why these
+      commands and not others.
+
+      Read the repository as needed to confirm a command selects what you
+      think it does. Never edit files.
+
+      Project directory: {{project_dir}}
+    prompt: |
+      ## What the change was supposed to do
+      {{plan_summary}}
+
+      ## Facts about the change
+      {{impact_facts}}
+    tools: [fs_cat, fs_ls, fs_grep, fs_glob, ast_grep]
+    max_iterations: 30
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        targeted:
+          type: array
+          items: { type: string }
+        impacted:
+          type: array
+          items: { type: string }
+        reason:
+          type: string
+      required: [targeted, impacted, reason]
+    state_updates:
+      selection_output: '{{output}}'
+    fallback: select_fault
+    next: verify_tests
+
+  select_fault:
+    id: select_fault
+    type: script
+    description: "Reached when impact_facts or select_checks dies. Selects the full test command as the only targeted command, with a reason quoting the error, and routes to verify_tests. A crash of this script fails the run closed."
+    script: scripts/select_fault.sh
+    timeout: 30
+    fallback: end_failure
 
   verify_tests:
     id: verify_tests
     type: script
-    description: Run the project's test command. Routes to self_review on pass, fix_loop_gate on failure.
+    description: Run test_command (or the detected test command) in project_dir, killed at test_timeout. Routes to self_review on pass, fix_loop_gate on failure, end_failure on a timeout. Against a red baseline a nonzero run passes when its exit code matches the baseline's and its failing tests are a subset of baseline_failures (or, when no test could be identified in either run, its failure output hashes alike); unidentified failures against an identified baseline fail. In the round tier it runs the selected targeted then impacted commands under one deadline, stops at the first red that is not pre-existing (judged against the base suite record, awaited or re-run at the base on demand), writes a round verification record for the worktree tree, and sets tests_tier; an empty selection is NOT RUN.
     script: scripts/verify_tests.sh
-    timeout: 600
+    timeout: 3600
     fallback: fix_loop_gate
 
   fix_loop_gate:
     id: fix_loop_gate
     type: script
-    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure. Reached via a verify_* fallback edge (engine-recorded `last_script_error`, or both gates still green) — re-runs verification once per cycle (from verify_build), then end_failure.
+    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure. Reached via a verify_* fallback edge (engine-recorded `last_script_error`, or both gates still green); re-runs verification once per cycle (from verify_build), then end_failure. A verify_* gate the engine killed at its node timeout ends the run at once with a TIMED OUT gate_error.
     script: scripts/fix_loop_gate.sh
     timeout: 5
     fallback: end_failure
@@ -484,6 +669,13 @@ nodes:
       Be terse. The orchestrator wants signal, not noise. If you find nothing
       blocking, set review_clean=true and leave review_notes empty.
 
+      When the tests passed only because their failures match the pre-run
+      baseline, accepting those failures is a scope judgement nobody else
+      reviews: if any accepted failure is within what the request asked for,
+      set review_clean=false and name it in review_notes. A build or test
+      result reported as NOT RUN was not verified, so never describe it as
+      verified or skip a check on the strength of it.
+
       Project directory: {{project_dir}}
     prompt: |
       ## Files to review
@@ -492,6 +684,15 @@ nodes:
 
       ## What the implementation was supposed to do
       {{plan_summary}}
+
+      ## Build result
+      {{build_verdict}}
+
+      ## Test result
+      {{tests_verdict}}{{baseline_report}}
+
+      ## Test output
+      {{tests_output}}
 
       ## Implementer's summary
       {{last_node_output}}
@@ -504,8 +705,8 @@ nodes:
       - fs_cat
       - fs_ls
       - execute_command
-    max_iterations: 15
-    timeout: 600
+    max_iterations: 40
+    timeout: 1200
     output_schema:
       type: object
       properties:
@@ -548,8 +749,10 @@ nodes:
       Plan: {{plan_summary}}
       Files modified: {{files_to_modify}}
       Files created: {{files_to_create}}
-      Build: passed
-      Tests: passed
+      Build: {{build_verdict}}
+      Tests: {{tests_verdict}}{{baseline_report}}
+      Tier: {{tests_tier}}
+      Review: {{review_verdict}}
       Design: {{design_notes}}
 
   end_rejected:

@@ -31,12 +31,24 @@ fn fresh_config_dir(label: &str) -> PathBuf {
     tmp_dir
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 fn probe_inspection_flag(flag: &str, require_stdout: bool) {
     let label = flag.trim_start_matches("--");
     let tmp_dir = fresh_config_dir(label);
     let home_dir = fresh_config_dir(&format!("{label}-home"));
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .arg(flag)
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         // Log file lives under the cache dir unless COYOTE_LOG_PATH overrides
@@ -128,7 +140,7 @@ fn agent_info_on_empty_config_dir_bootstraps_builtins() {
     let tmp_dir = fresh_config_dir("agent-info");
     let home_dir = fresh_config_dir("agent-info-home");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(["--agent", "adversary", "--info"])
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("COYOTE_CACHE_DIR", &home_dir)
@@ -179,7 +191,7 @@ fn sandbox_list_secrets_prints_informational_message_and_writes_nothing() {
     let tmp_dir = fresh_config_dir("sandbox-list-secrets");
     let home_dir = fresh_config_dir("sandbox-list-secrets-home");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .arg("--list-secrets")
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("COYOTE_CACHE_DIR", &home_dir)
@@ -246,7 +258,7 @@ fn sandbox_mutating_vault_flag_stays_strict() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(["--delete-secret", "probe"])
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("COYOTE_CACHE_DIR", &home_dir)
@@ -307,7 +319,7 @@ fn probe_strict_mcp_flag(label: &str, args: &[&str]) {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(args)
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("COYOTE_CACHE_DIR", &home_dir)
@@ -378,7 +390,7 @@ fn mcp_list_lists_configured_server_without_vault() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .arg("--mcp-list")
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("COYOTE_CACHE_DIR", &home_dir)
@@ -429,7 +441,7 @@ fn sync_models_stays_on_bootstrap_path() {
     let tmp_dir = fresh_config_dir("sync-models");
     let home_dir = fresh_config_dir("sync-models-home");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let output = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .arg("--sync-models")
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("COYOTE_CACHE_DIR", &home_dir)
@@ -467,7 +479,7 @@ fn run_list_sessions(
     global_sessions: &Path,
     home_dir: &Path,
 ) -> process::Output {
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .arg("--list-sessions")
         .env("COYOTE_CONFIG_DIR", config_dir)
         .env("COYOTE_CACHE_DIR", home_dir)
@@ -566,5 +578,70 @@ fn usage_probe_list_sessions_merges_cwd_workspace_scope_with_global() {
         workspace_entries,
         vec!["both.yaml", "ws-only.yaml"],
         "listing is read-only for the workspace sessions dir"
+    );
+}
+
+// Spelled in two halves so this file's own source does not match them.
+const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
+const SCRUB_DEFINITION: &str = concat!("fn scrub_", "coyote_env(");
+const SCRUB_CALL: &str = concat!("scrub_", "coyote_env(&mut ");
+const COYOTE_ENV_SET: &str = concat!(".env(\"", "COYOTE_");
+
+/// Pins that every spawn of the built binary in the `*_binary.rs` harnesses
+/// and in this file drops inherited `COYOTE_*` variables before setting its
+/// own. The check is textual, per file: the scrub helper is defined exactly
+/// once and called at least once per spawn site, and the text from the
+/// start of each spawn site's line up to the start of the next one's
+/// contains a scrub call that precedes the first `.env` of a `COYOTE_*` key
+/// in that stretch. Starting at the line covers both the wrapping form
+/// (scrub call left of the spawn) and the `let mut cmd` form (scrub call on
+/// a following line).
+#[test]
+fn every_binary_spawn_scrubs_inherited_coyote_env_before_setting_its_own() {
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut scanned = Vec::new();
+    for entry in fs::read_dir(&tests_dir).expect("tests dir is readable") {
+        let path = entry.expect("tests dir entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.ends_with("_binary.rs") && name != "inspection_flags.rs" {
+            continue;
+        }
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let definitions = source.matches(SCRUB_DEFINITION).count();
+        assert_eq!(
+            definitions, 1,
+            "{name}: expected exactly one scrub helper definition, found {definitions}"
+        );
+        let spawn_sites = source.matches(SPAWN_SITE).count();
+        let scrub_calls = source.matches(SCRUB_CALL).count();
+        assert!(
+            scrub_calls >= spawn_sites,
+            "{name}: {spawn_sites} binary spawn(s) but only {scrub_calls} scrub call(s)"
+        );
+        let starts: Vec<usize> = source
+            .match_indices(SPAWN_SITE)
+            .map(|(i, _)| source[..i].rfind('\n').map_or(0, |nl| nl + 1))
+            .collect();
+        for (n, &start) in starts.iter().enumerate() {
+            let end = starts.get(n + 1).copied().unwrap_or(source.len());
+            let chain = &source[start..end];
+            let line = source[..start].lines().count() + 1;
+            let scrub = chain.find(SCRUB_CALL).unwrap_or_else(|| {
+                panic!("{name}:{line}: binary spawn without a scrub call before the next spawn")
+            });
+            if let Some(set) = chain.find(COYOTE_ENV_SET) {
+                assert!(
+                    scrub < set,
+                    "{name}:{line}: a COYOTE_* env value is set before the scrub call, so the \
+                     scrub would erase it"
+                );
+            }
+        }
+        scanned.push(name);
+    }
+    assert!(
+        scanned.len() >= 10,
+        "expected the binary harnesses and this file to be scanned, found {scanned:?}"
     );
 }

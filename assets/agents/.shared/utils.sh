@@ -380,6 +380,15 @@ gate_ran() {
   printf '%s' "${ran# }"
 }
 
+# gate_unexport_agent_vars drops the export of every LLM_AGENT_VAR_* variable
+# of the current shell, keeping its value.
+gate_unexport_agent_vars() {
+  local name
+  for name in $(compgen -e LLM_AGENT_VAR_); do
+    export -n "$name"
+  done
+}
+
 # run_gate evals a gate command string, under gate_prefix when one is set.
 # The whole command runs as ONE unit beneath the prefix (one lock for a
 # compound `a && b`, and `FOO=bar cmd` keeps its leading assignment), so the
@@ -389,16 +398,21 @@ gate_ran() {
 # `pipefail` options the gate scripts run under, so a piped or unbound-variable
 # gate command fails the same way with or without a prefix. The inner shell
 # sees only exported variables; a gate command must not depend on the gate
-# script's own locals.
+# script's own locals. The command runs in a subshell where the agent's
+# LLM_AGENT_VAR_* variables keep their values (the prefix still resolves) but
+# are not exported, so nothing the command starts sees them.
 # Usage: output=$(cd "$dir" && run_gate "$cmd" 2>&1) || rc=$?
 run_gate() {
   local cmd=$1 prefix
   prefix=$(gate_prefix)
-  if [[ -n "$prefix" ]]; then
-    GATE_CMD=$cmd eval "$prefix bash -c 'set -uo pipefail; eval \"\$GATE_CMD\"'"
-  else
-    eval "$cmd"
-  fi
+  (
+    gate_unexport_agent_vars
+    if [[ -n "$prefix" ]]; then
+      GATE_CMD=$cmd eval "$prefix bash -c 'set -uo pipefail; eval \"\$GATE_CMD\"'"
+    else
+      eval "$cmd"
+    fi
+  )
 }
 
 # trim_output bounds a command transcript before it is embedded in graph
@@ -427,6 +441,41 @@ trim_output() {
   printf '\n\n[... %d bytes trimmed: output exceeded %d bytes; showing the first %d and last %d ...]\n\n' \
     "$(( bytes - head_bytes - tail_bytes ))" "${max}" "${head_bytes}" "${tail_bytes}"
   printf '%s' "${text:bytes-tail_bytes}"
+}
+
+##########################
+## GIT DIFF UTILITIES   ##
+##########################
+
+# Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so
+# commits that landed on the base after branching never surface as changes.
+# Explicit `..` ranges pass through, and so does a checkpoint commit on top of
+# HEAD that no ref holds, whose merge-base would be HEAD. Prints the base to
+# diff from. Returns 1 when there is no merge-base (printing the base as given)
+# and 2, printing nothing, for an option-shaped base that git would read as a
+# flag.
+# Usage: resolve_diff_base <project_dir> <base>
+resolve_diff_base() {
+  local project_dir="$1" base="$2" mb head commit held
+  case "${base}" in
+    -*) echo "error: --base '${base}' starts with '-'; pass a ref, a commit SHA or an a..b range" >&2; return 2 ;;
+    *..*) printf '%s' "${base}"; return ;;
+  esac
+  if mb=$(cd "${project_dir}" && git merge-base "${base}" HEAD 2>/dev/null) && [[ -n "${mb}" ]]; then
+    head=$(cd "${project_dir}" && git rev-parse HEAD 2>/dev/null) || head=""
+    commit=$(cd "${project_dir}" && git rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null) || commit=""
+    if [[ -n "${head}" && -n "${commit}" && "${mb}" == "${head}" && "${commit}" != "${head}" ]]; then
+      # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+      if held=$(cd "${project_dir}" && git for-each-ref --count=1 --contains "${commit}" 2>/dev/null) && [[ -z "${held}" ]]; then
+        printf '%s' "${base}"
+        return
+      fi
+    fi
+    printf '%s' "${mb}"
+  else
+    printf '%s' "${base}"
+    return 1
+  fi
 }
 
 ###########################

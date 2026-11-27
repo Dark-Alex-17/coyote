@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck disable=SC1091
+source "$(dirname "$0")/gate_lib.sh"
+
 if [[ -n "${GRAPH_STATE_FILE:-}" ]]; then
   state=$(cat "$GRAPH_STATE_FILE")
 elif [[ -n "${GRAPH_STATE:-}" ]]; then
@@ -17,6 +20,22 @@ build_output=$(echo "$state" | jq -r '.build_output // ""')
 tests_output=$(echo "$state" | jq -r '.tests_output // ""')
 gate_retries=$(echo "$state" | jq -r '.gate_retries // 0')
 last_script_error=$(echo "$state" | jq -r '.last_script_error // ""')
+
+# The engine killed a verify_* gate at its node timeout. The gate never
+# finished, so nothing says the code is red, and a re-run would only wait out
+# the same ceiling: end the run with a timed-out verdict, not a crash or a
+# fix attempt.
+if [[ "$last_script_error" == "script 'verify_"* && "$last_script_error" == *" timed out after "* ]]; then
+  gate_error="TIMED OUT before the gate finished; this is not a red run. Keep build_timeout / test_timeout below the node timeout, or pass a narrower test_command. ${last_script_error}"
+  jq -nc \
+    --arg err "$gate_error" \
+    '{
+      "gate_error": $err,
+      "last_script_error": "",
+      "_next": "end_failure"
+    }'
+  exit 0
+fi
 
 # A verify_* script crashed and the engine took its `fallback` edge, which
 # carries no state_updates. The engine records every script fallback in
@@ -69,8 +88,13 @@ if [[ "$build_ok" != "true" ]]; then
   fix_instructions=$(printf '## Fix loop status (attempt %d of %d)\n\nThe previous attempt failed the build.\n\nBuild output:\n```\n%s\n```\n\nIdentify the minimal fix and apply it. Do not refactor.' \
     "$next_attempts" "$max_fix_attempts" "$build_output")
 else
-  fix_instructions=$(printf '## Fix loop status (attempt %d of %d)\n\nBuild passed but tests failed.\n\nTest output:\n```\n%s\n```\n\nIdentify the minimal fix and apply it. Do not refactor.' \
-    "$next_attempts" "$max_fix_attempts" "$tests_output")
+  baseline_failures=$(echo "$state" | jq -r "$GATE_JQ_CAP"'.baseline_failures // [] | gate_cap(", ")')
+  pre_existing=''
+  if [[ -n "$baseline_failures" ]]; then
+    pre_existing="Pre-existing failures, already failing before you started: ${baseline_failures}. They are not yours to fix unless the request asks you to, and do not write tests that encode their behaviour."$'\n\n'
+  fi
+  fix_instructions=$(printf '## Fix loop status (attempt %d of %d)\n\nBuild passed but tests failed.\n\nTest output:\n```\n%s\n```\n\n%sIdentify the minimal fix and apply it. Do not refactor.' \
+    "$next_attempts" "$max_fix_attempts" "$tests_output" "$pre_existing")
 fi
 
 # fix_instructions embeds a gate transcript; feed it to jq on stdin so it can

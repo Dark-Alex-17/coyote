@@ -70,6 +70,23 @@ run_build() {
   fi
 }
 
+# @cmd Deterministic debt-marker scan over the working-tree diff - replaces the manual ls-files/add -N/diff/grep pipeline. Prints one `<file>:<line> -- <line text>` per ADDED debt marker with real positions already resolved (bare `cfg_attr(` without allow|expect already dropped; "no hits (clean)" = no debt), or a DEBT_SCAN_FAILED report quoting the manual fallback.
+# @option --base! Diff base: the task's base commit, recorded before the first coder spawn (a HEAD base misses everything the coder committed)
+# @option --dir Project directory override (default: the agent's project_dir)
+debt_scan() {
+  local dir
+  dir="${argc_dir:-$(_project_dir)}"
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'DEBT_SCAN_FAILED: python3 is not on PATH\nManual fallback (run it yourself, <base> = %s):\n' "${argc_base}" >> "$LLM_OUTPUT"
+    cat <<'EOF' >> "$LLM_OUTPUT"
+  git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|[sS][kK][iI][pP][iI][fF]|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|importorskip\(|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented(Error|Exception)|panic\("(TODO|not implemented|unimplemented)|(//|#|-- |;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|NOLINT(NEXTLINE|BEGIN|END)?([^A-Za-z0-9_]|$)|@?[A-Za-z_]+-(disable|ignore|nocheck|expect-error)($|[-=,:[]| +($|[a-z@#/*-]))|@?[A-Za-z_]+: ?(disable|ignore|nocheck)($|[-=,[]| +[#A-Z])|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|pragma +(GCC|clang) +diagnostic +(ignored|push)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'
+grep exiting 1 with no lines is the no-debt result; -n numbers the DIFF output, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; a bare cfg_attr( without allow|expect is not debt.
+EOF
+    return 0
+  fi
+  env -u GRAPH_STATE -u GRAPH_STATE_FILE python3 -B "$LLM_ROOT_DIR/agents/.shared/debt_scan.py" --dir "${dir}" --base "${argc_base}" >> "$LLM_OUTPUT"
+}
+
 # @cmd Run tests for the project
 run_tests() {
   local project_dir

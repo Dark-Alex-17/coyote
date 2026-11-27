@@ -10,8 +10,9 @@ Two rules, both decidable without judgment:
     and on comment-shaped added lines of code files.
 
 A line carrying the token `debris-exempt` is exempt from both rules. A task id
-on the same line as a debt marker (`#[allow(`, `todo!`, `#[ignore`, ...) is
-the one sanctioned place for one and is not reported.
+on the same line as a debt marker (`#[allow(`, `//nolint`, `# noqa`,
+`t.Skip(`, `todo!`, ...; the table is debt_markers.py, shared with
+debt_scan.py) is the one sanctioned place for one and is not reported.
 
 This module is pure when imported: it never reads GRAPH_STATE. The per-agent
 wrapper scripts own the state keys and the fail-closed output shape. Run
@@ -20,10 +21,14 @@ prints the rendered hits and the summary; exit 1 on hits, 0 when clean, 2 on
 error.
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from debt_markers import MARKER_RE as DEBT_MARKER_RE  # noqa: E402
 
 # U+FFFD (the replacement character lossy decoding produces) is deliberately
 # absent: it marks a decoding problem in the diff fetch, not punctuation the
@@ -77,12 +82,6 @@ VOCAB_NEEDLES = [
     )
 ]
 TASK_ID_RE = re.compile(r"(?<![A-Za-z-])TASK-\d+", re.I)
-# Attribute-anchored so a `.expect("...")` call or an `allow(` inside prose
-# never spares a task id.
-DEBT_MARKERS = (
-    "#[allow(", "#![allow(", "#[expect(", "#![expect(", "cfg_attr(",
-    "todo!", "unimplemented!", "#[ignore",
-)
 EXEMPT_TOKEN = "debris-exempt"
 
 PROSE_EXTENSIONS = (".md", ".rst", ".txt", ".adoc", ".yaml", ".yml")
@@ -126,6 +125,7 @@ GLOB_CHARS = "*?["
 # with one; on unix it is an ordinary (if odd) directory character that the
 # literal pathspec must keep.
 BACKSLASH_IS_SEPARATOR = os.sep == "\\"
+LINE_SUFFIX_RE = re.compile(r":\d+(?:[-:]\d+)*$")
 
 # The target-header regex only knows the a/ b/ prefix form; these pin it
 # regardless of diff.noprefix / diff.mnemonicPrefix / diff.external in the
@@ -283,7 +283,7 @@ def unicode_fix(text):
 
 def vocab_hits(text):
     hits = []
-    spared_task_id = any(marker in text for marker in DEBT_MARKERS)
+    spared_task_id = bool(DEBT_MARKER_RE.search(text))
     for needle in VOCAB_NEEDLES:
         for m in needle.finditer(text):
             if spared_task_id and TASK_ID_RE.fullmatch(m.group(0)):
@@ -437,6 +437,48 @@ def check_excludes(exclude):
     return normalized
 
 
+def parse_excludes(value):
+    """The `debris_exclude` state value as checked excludes, or ValueError.
+
+    None and "" mean none, a string starting with `[` is a JSON array, any
+    other string is one directory, and a list is taken as is; the entries
+    then go through check_excludes.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return []
+        if value.startswith("["):
+            try:
+                value = json.loads(value)
+            except ValueError as e:
+                raise ValueError(f"debris_exclude {value!r} is not a JSON array: {e}") from None
+        elif not value.startswith('"'):
+            value = [value]
+    if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+        raise ValueError(
+            f"debris_exclude must be a JSON array of strings or one directory, got {value!r}"
+        )
+    return check_excludes(value)
+
+
+def under_excludes(path, excludes):
+    """Whether a repo-relative `path`, optionally `./`-prefixed or ending in a
+    `:line` reference, is one of the checked `excludes` or lies below one.
+    An empty or absolute path, or one with a `..` segment, never is."""
+    path = LINE_SUFFIX_RE.sub("", path.strip())
+    if BACKSLASH_IS_SEPARATOR:
+        path = path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    path = path.rstrip("/")
+    if not path or path.startswith("/") or os.path.isabs(path) or ".." in path.split("/"):
+        return False
+    return any(path == e or path.startswith(e + "/") for e in excludes)
+
+
 def git_diff(project_dir, *revs, timeout=GIT_TIMEOUT, exclude=()):
     """`exclude` directories become top-anchored literal `:(exclude)` pathspecs
     after `--`, with `:/` first so the diff spans the whole repository rather
@@ -507,13 +549,26 @@ def triage_binaries(project_dir, diff_text, timeout=GIT_TIMEOUT):
 def normalize_base(project_dir, spec, timeout):
     """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
     commits that landed on the base after branching never surface as changes.
-    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    Explicit `..` ranges are the caller's choice and pass through untouched, and
+    so does a checkpoint commit on top of HEAD, whose merge-base would be HEAD."""
     if ".." in spec:
         return spec
     try:
-        return git(project_dir, "merge-base", spec, "HEAD", timeout=timeout).strip()
+        base = git(project_dir, "merge-base", spec, "HEAD", timeout=timeout).strip()
     except Exception:  # noqa: BLE001 -- the plain diff below reports the real error
         return spec
+    try:
+        head, commit = git(project_dir, "rev-parse", "HEAD", f"{spec}^{{commit}}", timeout=timeout).split()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    if base != head or head == commit:
+        return base
+    try:
+        # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+        held = git(project_dir, "for-each-ref", "--count=1", "--contains", commit, timeout=timeout).strip()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    return base if held else spec
 
 
 def diff_text_for(project_dir, spec, timeout=GIT_TIMEOUT, exclude=()):
