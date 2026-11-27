@@ -940,7 +940,7 @@
     max_input_tokens: 262144
     input_price: 0.0
     output_price: 0.0
-    cache_read_price: 0.05
+    cache_read_price: 0.0425
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8445,17 +8445,17 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.8882
-    output_price: 1.5082
+    output_price: 1.5039
     cache_read_price: 0.2
     max_output_tokens: 393216
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.111
-    output_price: 4.44
-    cache_read_price: 0.097
-    max_output_tokens: 943718
+    input_price: 0.25
+    output_price: 5.0
+    cache_read_price: 0.125
+    max_output_tokens: 393216
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash
     type: chat
@@ -8469,9 +8469,9 @@
   - name: deepseek/deepseek-v4.1-flash-1017
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.3
-    output_price: 1.2
-    cache_read_price: 0.006
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.003
     max_output_tokens: 393216
     supports_vision: true
     supports_function_calling: true
@@ -8975,18 +8975,17 @@
   - name: google/gemma-3-4b-it
     type: chat
     max_input_tokens: 131072
-    input_price: 0.04
-    output_price: 0.05
-    cache_read_price: 0.02
-    max_output_tokens: 117964
+    input_price: 0.05
+    output_price: 0.1
+    max_output_tokens: 16384
     supports_vision: true
     supports_structured_output: true
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -9093,6 +9092,16 @@
     supports_vision: true
     supports_function_calling: true
     supports_structured_output: true
+  - name: inclusionai/lingsante-3.1-air-vl
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.06
+    output_price: 0.18
+    cache_read_price: 0.012
+    max_output_tokens: 32768
+    supports_vision: true
+    supports_function_calling: true
+    supports_structured_output: true
   - name: inference-net/schematron-v2-small
     type: chat
     max_input_tokens: 128000
@@ -9177,10 +9186,10 @@
   - name: meta-llama/llama-3.3-70b-instruct
     type: chat
     max_input_tokens: 131072
-    input_price: 0.71
-    output_price: 0.71
-    cache_read_price: 0.71
-    max_output_tokens: 115200
+    input_price: 0.59
+    output_price: 0.79
+    cache_read_price: 0.295
+    max_output_tokens: 32768
     supports_function_calling: true
     supports_structured_output: true
   - name: meta-llama/llama-4-maverick
@@ -9223,10 +9232,10 @@
   - name: meta/muse-glimmer-30b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.35
-    output_price: 1.5
+    input_price: 0.3
+    output_price: 1.2
     cache_read_price: 0.04
-    max_output_tokens: 117964
+    max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
     supports_structured_output: true
@@ -9346,9 +9355,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9596,13 +9605,27 @@
     output_price: 2.5
     max_output_tokens: 4096
     supports_vision: true
+  - name: moonshotai/kimi-k2
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.57
+    output_price: 2.3
+    max_output_tokens: 98304
+    supports_function_calling: true
+  - name: moonshotai/kimi-k2-0905
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.6
+    output_price: 2.5
+    max_output_tokens: 98304
+    supports_function_calling: true
+    supports_structured_output: true
   - name: moonshotai/kimi-k2.5
     type: chat
     max_input_tokens: 262144
-    input_price: 0.5
-    output_price: 2.5
-    cache_read_price: 0.15
-    max_output_tokens: 235929
+    input_price: 0.6
+    output_price: 3.0
+    max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
     supports_structured_output: true
@@ -11091,7 +11114,7 @@
     input_price: 0.07
     output_price: 0.5
     cache_read_price: 0.03
-    max_output_tokens: 131072
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
     supports_structured_output: true
@@ -11100,7 +11123,7 @@
     max_input_tokens: 1048576
     input_price: 0.0
     output_price: 0.0
-    max_output_tokens: 131072
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
     supports_structured_output: true
@@ -12080,7 +12103,7 @@
     supports_function_calling: true
   - name: z-ai/glm-4.6
     type: chat
-    max_input_tokens: 204800
+    max_input_tokens: 202752
     input_price: 0.5
     output_price: 2.0
     cache_read_price: 0.1
@@ -13069,16 +13092,6 @@
     - low
     - medium
     - high
-  - name: ByteDance/Seed-2.0-mini
-    type: chat
-    max_input_tokens: 256000
-    input_price: 0.1
-    output_price: 0.4
-    cache_read_price: 0.02
-    max_output_tokens: 131072
-    supports_vision: true
-    supports_function_calling: true
-    supports_structured_output: true
   - name: ByteDance/Seed-2.0-pro
     type: chat
     max_input_tokens: 256000
@@ -13089,21 +13102,6 @@
     supports_vision: true
     supports_function_calling: true
     supports_structured_output: true
-  - name: ByteDance/Seed-1.8
-    type: chat
-    max_input_tokens: 256000
-    input_price: 0.25
-    output_price: 2.0
-    cache_read_price: 0.05
-    max_output_tokens: 64000
-    supports_vision: true
-    supports_function_calling: true
-    supports_structured_output: true
-    reasoning_levels:
-    - none
-    - low
-    - medium
-    - high
   - name: zai-org/GLM-4.7
     type: chat
     max_input_tokens: 202752
@@ -13316,6 +13314,21 @@
     output_price: 0.32
     max_output_tokens: 16384
     supports_function_calling: true
+    supports_structured_output: true
+  - name: Sao10K/L3.1-70B-Euryale-v2.2
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.85
+    output_price: 0.85
+    max_output_tokens: 16384
+    supports_function_calling: true
+    supports_structured_output: true
+  - name: Sao10K/L3-8B-Lunaris-v1-Turbo
+    type: chat
+    max_input_tokens: 8192
+    input_price: 0.04
+    output_price: 0.05
+    max_output_tokens: 7372
     supports_structured_output: true
   - name: meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo
     type: chat
