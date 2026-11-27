@@ -388,7 +388,8 @@ pub(crate) type BlockResult = Result<Vec<Line<'static>>, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RichKey {
-    kind: BlockKind,
+    /// None for an inline formula.
+    kind: Option<BlockKind>,
     body: u64,
     width: u16,
     /// The rows a chart takes unless its spec says otherwise.
@@ -401,11 +402,25 @@ impl RichKey {
         let mut hasher = DefaultHasher::new();
         block.body.hash(&mut hasher);
         Self {
-            kind: block.kind,
+            kind: Some(block.kind),
             body: hasher.finish(),
             width,
             chart_height,
             no_color,
+        }
+    }
+
+    /// The key of inline formula `tex` drawn in `width` columns, which
+    /// takes neither the chart height nor the colours.
+    pub(crate) fn inline_math(tex: &str, width: u16) -> Self {
+        let mut hasher = DefaultHasher::new();
+        tex.hash(&mut hasher);
+        Self {
+            kind: None,
+            body: hasher.finish(),
+            width,
+            chart_height: 0,
+            no_color: false,
         }
     }
 }
@@ -413,10 +428,11 @@ impl RichKey {
 /// How many drawn blocks are kept; each is a few dozen short rows.
 const RICH_CACHE_ENTRIES: usize = 128;
 
-/// Drawn blocks, least recently used first. A closed block can sit in the
-/// streaming tail, which is rendered anew every frame, so this is what
-/// keeps a diagram from being laid out again each time. Failures are kept
-/// too.
+/// Drawn blocks and inline formulas, least recently used first. A closed
+/// block or a formula can sit in the streaming tail, which is rendered
+/// anew every frame, so this is what keeps a diagram from being laid out
+/// again each time. Failures are kept too, so a backend that panics on a
+/// formula does so once, not every frame.
 #[derive(Default)]
 pub(crate) struct RichCache {
     entries: VecDeque<(RichKey, Arc<BlockResult>)>,

@@ -1,17 +1,22 @@
 //! LaTeX formulas drawn as rows of text. The drawing is done by a backend
 //! behind [`MathRenderer`]; [`math_rows`] guards every backend alike: it
-//! caps the input, turns away what the backend is known to draw wrongly,
-//! survives a panic, scrubs the output and refuses a drawing that is too
-//! wide or still holds a command the backend did not know.
+//! caps the input and its nesting, turns away what the backend is known to
+//! draw wrongly, survives a panic, scrubs the output and refuses a drawing
+//! that still holds a command the backend did not know or is too wide.
 
 use crate::tui::render::plain_text;
-use crate::tui::terminal::catch_quietly;
+use crate::tui::terminal::catch_quietly_at;
 use unicode_width::UnicodeWidthStr;
 
 /// The most TeX a formula may have before it is shown as source without
 /// trying to draw it. The backend's parser recurses, and a stack overflow
 /// cannot be caught the way a panic can.
 const MAX_TEX_BYTES: usize = 4096;
+
+/// The deepest braces may nest before a formula is shown as source. The
+/// backend's layout time grows steeply with depth (a thousand nested
+/// superscripts take seconds), and it runs on the draw path.
+const MAX_NESTING: usize = 32;
 
 /// Constructs the backend lays out wrongly, or draws as their source.
 const UNSUPPORTED: [&str; 7] = [
@@ -37,6 +42,7 @@ pub(crate) trait MathRenderer: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MathError {
     TooLarge,
+    TooDeep,
     Unsupported(&'static str),
     Panicked(String),
     Empty,
@@ -49,6 +55,7 @@ impl MathError {
     pub(crate) fn note(&self) -> String {
         let why = match self {
             MathError::TooLarge => format!("formula longer than {} KiB", MAX_TEX_BYTES / 1024),
+            MathError::TooDeep => "nested too deeply".to_string(),
             MathError::Unsupported(construct) => format!("{construct} is not supported"),
             MathError::Panicked(message) => format!(
                 "renderer failed: {}",
@@ -64,20 +71,53 @@ impl MathError {
     }
 }
 
-/// The rows of `tex` drawn by `backend`, or None when it cannot be drawn
-/// in `max_width` columns.
-pub(crate) fn render_math(
-    backend: &dyn MathRenderer,
-    tex: &str,
-    max_width: u16,
-) -> Option<Vec<String>> {
-    math_rows(backend, tex, max_width).ok()
+/// The one row `tex` draws as in `max_width` columns, or None when it
+/// cannot be drawn there or takes more than one row. A panic is logged at
+/// debug: an inline formula in the streaming tail is drawn again on every
+/// new width and every reply, and its source is shown either way.
+pub(crate) fn one_row(backend: &dyn MathRenderer, tex: &str, max_width: u16) -> Option<String> {
+    rows_logging_at(log::Level::Debug, backend, tex, max_width)
+        .ok()
+        .filter(|rows| rows.len() == 1)
+        .and_then(|mut rows| rows.pop())
+}
+
+/// How deep the braces of `tex` nest; a brace after a backslash is a
+/// literal one and does not count.
+fn nesting(tex: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut deepest = 0;
+    let mut chars = tex.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// The rows of `tex` drawn by `backend`, without control characters,
-/// trailing blanks or trailing blank rows, each at most `max_width` less
-/// the margin wide.
+/// trailing blanks or blank rows above and below, each at most
+/// `max_width` less the margin wide. A tab in the TeX or the drawing is a
+/// space.
 pub(crate) fn math_rows(
+    backend: &dyn MathRenderer,
+    tex: &str,
+    max_width: u16,
+) -> Result<Vec<String>, MathError> {
+    rows_logging_at(log::Level::Warn, backend, tex, max_width)
+}
+
+fn rows_logging_at(
+    level: log::Level,
     backend: &dyn MathRenderer,
     tex: &str,
     max_width: u16,
@@ -85,33 +125,43 @@ pub(crate) fn math_rows(
     if tex.len() > MAX_TEX_BYTES {
         return Err(MathError::TooLarge);
     }
+    if nesting(tex) > MAX_NESTING {
+        return Err(MathError::TooDeep);
+    }
     if let Some(construct) = UNSUPPORTED
         .iter()
         .find(|construct| tex.contains(*construct))
     {
         return Err(MathError::Unsupported(construct));
     }
-    let drawn = catch_quietly(|| backend.render(tex)).map_err(MathError::Panicked)?;
+    let tex = tex.replace('\t', " ");
+    let drawn = catch_quietly_at(level, || backend.render(&tex)).map_err(MathError::Panicked)?;
     let mut rows: Vec<String> = plain_text(&drawn)
         .split('\n')
         .map(|row| {
-            let row: String = row.chars().filter(|c| !c.is_control()).collect();
+            let row: String = row
+                .chars()
+                .map(|c| if c == '\t' { ' ' } else { c })
+                .filter(|c| !c.is_control())
+                .collect();
             row.trim_end().to_string()
         })
         .collect();
     while rows.last().is_some_and(String::is_empty) {
         rows.pop();
     }
+    let blank_above = rows.iter().take_while(|row| row.is_empty()).count();
+    rows.drain(..blank_above);
     if rows.is_empty() {
         return Err(MathError::Empty);
+    }
+    if rows.iter().any(|row| row.contains('\\')) {
+        return Err(MathError::UnknownCommand);
     }
     let available = max_width.saturating_sub(MARGIN);
     let needed = rows.iter().map(|row| row.width()).max().unwrap_or(0);
     if needed > usize::from(available) {
         return Err(MathError::TooWide { needed, available });
-    }
-    if rows.iter().any(|row| row.contains('\\')) {
-        return Err(MathError::UnknownCommand);
     }
     Ok(rows)
 }
@@ -237,6 +287,40 @@ mod tests {
             math_rows(&answers("\\foox"), "\\foo{x}", 80),
             Err(MathError::UnknownCommand)
         );
+        assert_eq!(
+            math_rows(&answers("\\foo{a very long drawing}"), "\\foo{x}", 10),
+            Err(MathError::UnknownCommand),
+            "an unknown command is named before the width"
+        );
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}x{}", "x^{".repeat(depth), "}".repeat(depth))
+    }
+
+    #[test]
+    fn braces_nested_too_deep_are_not_handed_to_the_backend() {
+        let backend = answers("x");
+        assert_eq!(
+            math_rows(&backend, &nested(MAX_NESTING + 1), 80),
+            Err(MathError::TooDeep)
+        );
+        assert_eq!(backend.calls(), 0);
+        assert!(math_rows(&backend, &nested(MAX_NESTING), 80).is_ok());
+        let literal = format!("{}x", "\\{".repeat(MAX_NESTING + 1));
+        assert!(math_rows(&backend, &literal, 80).is_ok());
+        assert_eq!(backend.calls(), 2);
+        assert_eq!(nesting("\\\\{a}"), 1);
+    }
+
+    #[test]
+    fn tabs_are_spaces_and_blank_rows_above_go() {
+        let echo = FakeMath::new(|tex| format!("\n \n{tex}"));
+        assert_eq!(math_rows(&echo, "a\tb", 80), Ok(vec!["a b".to_string()]));
+        assert_eq!(
+            math_rows(&answers("a\tb\n"), "x", 80),
+            Ok(vec!["a b".to_string()])
+        );
     }
 
     #[test]
@@ -246,13 +330,16 @@ mod tests {
             math_rows(&backend, "\\frac{a}{c}", 80),
             Ok(vec![" a".to_string(), "───".to_string(), " c".to_string()])
         );
-        assert_eq!(render_math(&backend, "\\frac{a}{c}", 3), None);
+        assert_eq!(one_row(&backend, "\\frac{a}{c}", 80), None);
+        assert_eq!(one_row(&answers("x²"), "x^2", 80), Some("x²".to_string()));
+        assert_eq!(one_row(&answers("x²"), "x^2", 3), None);
     }
 
     #[test]
     fn every_note_is_one_line_naming_the_reason() {
         let notes = [
             (MathError::TooLarge, "formula longer than 4 KiB"),
+            (MathError::TooDeep, "nested too deeply"),
             (
                 MathError::Unsupported("\\begin{align*}"),
                 "\\begin{align*} is not supported",
@@ -306,5 +393,6 @@ mod tests {
             math_rows(&TermMathsBackend, "\\foo{x}", 80),
             Err(MathError::UnknownCommand)
         );
+        assert!(math_rows(&TermMathsBackend, &nested(MAX_NESTING), 400).is_ok());
     }
 }

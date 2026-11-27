@@ -1,16 +1,18 @@
 //! LaTeX math in a reply's prose, found before the markdown renderer sees
 //! it. Display math on lines of its own is a block the segmenter splits
 //! out (see [`super::segment`]); this finds the inline formulas of a
-//! markdown run and swaps each one that draws on a single row for
-//! placeholder characters of the same width, which survive the markdown
-//! renderer's wrapping and are swapped back for the drawing afterwards.
+//! markdown run and swaps each one for placeholder characters as wide as
+//! its drawing, or as its source when it does not draw on a single row.
+//! The placeholders survive the markdown renderer's wrapping and are
+//! swapped back afterwards, so markdown never reads a formula's `*` or `_`
+//! as emphasis.
 //!
 //! Code, links, autolinks and HTML tags are never read for math, and a
 //! single `$` must look like the start of a formula rather than a price or
 //! a shell variable.
 
-use super::math_render::{MathRenderer, render_math};
 use super::{CopyRegion, Delimiter, block_delimiter, indent_columns};
+use crate::tui::render::plain_text;
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use std::sync::Arc;
@@ -314,37 +316,36 @@ pub(crate) struct InlineMath {
     source: Arc<str>,
 }
 
-/// `run` with each inline formula that draws on one row within `width`
-/// swapped for a placeholder as wide as the drawing, and those formulas
-/// in order. A formula that cannot be drawn on one row stays as its
-/// source. When any is swapped, the placeholder characters the reply
-/// itself held are dropped, so that every placeholder is one of ours.
+/// `run` with each inline formula swapped for a placeholder, and those
+/// formulas in order. A formula `draw` gives a row for takes that row's
+/// width; one it does not is shown as its source, delimiters included.
+/// That source is one unbroken placeholder, so it moves to the next row
+/// whole, and a source wider than a row is cut at the row's edge as a
+/// long word is. When any is swapped, the placeholder characters the
+/// reply itself held are dropped, so that every placeholder is one of
+/// ours.
 pub(crate) fn mask_inline(
     run: &str,
-    width: u16,
-    backend: &dyn MathRenderer,
+    mut draw: impl FnMut(&str) -> Option<String>,
 ) -> (String, Vec<InlineMath>) {
     let own = |text: &str| text.replace([PLACEHOLDER_START, PLACEHOLDER_REST], "");
     let mut masked = String::with_capacity(run.len());
     let mut spans = Vec::new();
     let mut copied = 0;
     for found in find_inline(run) {
-        let Some(drawn) = render_math(backend, &run[found.tex.clone()], width)
-            .filter(|rows| rows.len() == 1)
-            .and_then(|mut rows| rows.pop())
-        else {
-            continue;
-        };
-        let columns = drawn.width();
-        if columns == 0 {
-            continue;
-        }
+        let source = &run[found.whole.clone()];
+        let drawn = draw(&run[found.tex.clone()])
+            .filter(|drawn| drawn.width() > 0)
+            .unwrap_or_else(|| plain_text(source).replace('\t', " "));
         masked.push_str(&own(&run[copied..found.whole.start]));
         masked.push(PLACEHOLDER_START);
-        masked.extend(std::iter::repeat_n(PLACEHOLDER_REST, columns - 1));
+        masked.extend(std::iter::repeat_n(
+            PLACEHOLDER_REST,
+            drawn.width().saturating_sub(1),
+        ));
         spans.push(InlineMath {
             drawn,
-            source: Arc::from(&run[found.whole.clone()]),
+            source: Arc::from(source),
         });
         copied = found.whole.end;
     }
@@ -529,7 +530,7 @@ pub(crate) fn unmask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::rich::math_render::FakeMath;
+    use crate::tui::rich::math_render::{FakeMath, one_row};
 
     fn formulas(source: &str) -> Vec<&str> {
         find_inline(source)
@@ -640,30 +641,35 @@ mod tests {
         FakeMath::new(move |_| drawn.to_string())
     }
 
+    fn mask(run: &str, backend: &FakeMath) -> (String, Vec<InlineMath>) {
+        mask_inline(run, |tex| one_row(backend, tex, 80))
+    }
+
     #[test]
     fn a_formula_is_masked_as_wide_as_its_drawing() {
-        let (masked, spans) = mask_inline("a $x^2$ b", 80, &drawn_as("x²"));
+        let (masked, spans) = mask("a $x^2$ b", &drawn_as("x²"));
         assert_eq!(masked, "a \u{E000}\u{E001} b");
         assert_eq!(spans.len(), 1);
         assert_eq!(&*spans[0].source, "$x^2$");
     }
 
     /// A formula that draws on more than one row, or that cannot be drawn,
-    /// stays as its source, and the run is left untouched.
+    /// is masked as its source, so markdown cannot read its `*` as
+    /// emphasis, and drawn back as that source with a tab as a space.
     #[test]
-    fn a_formula_that_is_not_one_row_stays_as_source() {
+    fn a_formula_that_is_not_one_row_is_masked_as_its_source() {
         for drawn in ["a\n─\nb", "\\foo", ""] {
-            let run = "a $x$ b \u{E000}";
-            assert_eq!(
-                mask_inline(run, 80, &drawn_as(drawn)),
-                (run.to_string(), Vec::new())
-            );
+            let (masked, spans) = mask("a $f^*\t*$ b \u{E000}", &drawn_as(drawn));
+            assert_eq!(masked, format!("a \u{E000}{} b ", "\u{E001}".repeat(6)));
+            assert_eq!(&*spans[0].source, "$f^*\t*$");
+            let (lines, _) = unmask(vec![Line::from(masked)], &spans);
+            assert_eq!(texts(&lines), ["a $f^* *$ b "], "{drawn:?}");
         }
     }
 
     #[test]
     fn the_replys_own_placeholder_characters_go_once_a_formula_is_masked() {
-        let (masked, _) = mask_inline("\u{E000}a $x$ \u{E001}", 80, &drawn_as("x"));
+        let (masked, _) = mask("\u{E000}a $x$ \u{E001}", &drawn_as("x"));
         assert_eq!(masked, "a \u{E000} ");
     }
 
@@ -673,7 +679,7 @@ mod tests {
 
     #[test]
     fn unmasking_swaps_the_drawing_in_and_records_its_columns() {
-        let (masked, spans) = mask_inline("one $x^2$ two $y$", 80, &drawn_as("ab"));
+        let (masked, spans) = mask("one $x^2$ two $y$", &drawn_as("ab"));
         let bold = ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::BOLD);
         let line = Line::from(vec![
             Span::raw(masked[..masked.find(" two").unwrap()].to_string()),
@@ -704,7 +710,7 @@ mod tests {
     /// and only the first piece copies as the source.
     #[test]
     fn a_placeholder_split_across_rows_is_drawn_piece_by_piece() {
-        let (masked, spans) = mask_inline("$x$", 80, &drawn_as("a\u{4e2d}b"));
+        let (masked, spans) = mask("$x$", &drawn_as("a\u{4e2d}b"));
         assert_eq!(masked.chars().count(), 4);
         let split: Vec<char> = masked.chars().collect();
         let first: String = split[..2].iter().collect();
@@ -739,7 +745,7 @@ mod tests {
 
     #[test]
     fn rows_without_a_placeholder_come_back_as_they_were() {
-        let (_, spans) = mask_inline("$x$", 80, &drawn_as("x"));
+        let (_, spans) = mask("$x$", &drawn_as("x"));
         let lines = vec![Line::from(vec![Span::raw("plain"), Span::raw("")])];
         assert_eq!(unmask(lines.clone(), &spans), (lines, Vec::new()));
     }

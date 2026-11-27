@@ -80,6 +80,9 @@ thread_local! {
     /// `catch_quietly` that catches it.
     static QUIET_MESSAGE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// The level the hook logs a quiet panic at, set by the innermost
+    /// `catch_quietly_at`.
+    static QUIET_LEVEL: std::cell::Cell<log::Level> = const { std::cell::Cell::new(log::Level::Warn) };
 }
 
 /// One terminal mode toggled on enter and back off on leave. The `bool` is
@@ -544,7 +547,11 @@ pub(crate) fn install_panic_hook() -> bool {
                     .location()
                     .map(|at| format!(" at {at}"))
                     .unwrap_or_default();
-                warn!(
+                let level = QUIET_LEVEL
+                    .try_with(std::cell::Cell::get)
+                    .unwrap_or(log::Level::Warn);
+                log!(
+                    level,
                     "Recovered from a panic{at}: {}",
                     super::render::plain_text(&message)
                 );
@@ -564,19 +571,25 @@ pub(crate) fn install_panic_hook() -> bool {
 /// count comes back down however the call it guards ends. Entering clears
 /// any message left by a quiet panic that something other than
 /// `catch_quietly` caught, so it is never taken for this call's own.
-struct QuietGuard;
+struct QuietGuard {
+    outer_level: log::Level,
+}
 
 impl QuietGuard {
-    fn enter() -> Self {
+    fn enter(level: log::Level) -> Self {
         let _ = QUIET_PANICS.try_with(|q| q.set(q.get() + 1));
         let _ = QUIET_MESSAGE.try_with(|m| m.borrow_mut().take());
-        Self
+        let outer_level = QUIET_LEVEL
+            .try_with(|l| l.replace(level))
+            .unwrap_or(log::Level::Warn);
+        Self { outer_level }
     }
 }
 
 impl Drop for QuietGuard {
     fn drop(&mut self) {
         let _ = QUIET_PANICS.try_with(|q| q.set(q.get() - 1));
+        let _ = QUIET_LEVEL.try_with(|l| l.set(self.outer_level));
     }
 }
 
@@ -586,7 +599,13 @@ impl Drop for QuietGuard {
 /// not handed back and nothing is echoed, so a recovered failure does not
 /// flash the terminal. It is logged instead.
 pub(crate) fn catch_quietly<T>(f: impl FnOnce() -> T) -> Result<T, String> {
-    let guard = QuietGuard::enter();
+    catch_quietly_at(log::Level::Warn, f)
+}
+
+/// `catch_quietly`, logging the panic at `level`; a caller that may meet
+/// the same failure on every frame logs it below warn.
+pub(crate) fn catch_quietly_at<T>(level: log::Level, f: impl FnOnce() -> T) -> Result<T, String> {
+    let guard = QuietGuard::enter(level);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     drop(guard);
     caught.map_err(|payload| {
@@ -1616,6 +1635,24 @@ mod tests {
         assert_eq!(nested, Err::<(), _>("outer".to_string()));
         assert_eq!(depth(), 0);
         assert_eq!(QUIET_MESSAGE.with(|m| m.borrow().clone()), None);
+    }
+
+    /// The level a quiet panic is logged at is the innermost call's, and
+    /// the outer call's level is back once the inner call returns.
+    #[test]
+    fn the_log_level_of_a_quiet_panic_is_the_innermost_calls() {
+        install_panic_hook();
+        let level = || QUIET_LEVEL.with(std::cell::Cell::get);
+        let _ = catch_quietly(|| {
+            assert_eq!(level(), log::Level::Warn);
+            let inner = catch_quietly_at(log::Level::Debug, || -> u8 {
+                assert_eq!(level(), log::Level::Debug);
+                panic!("inner")
+            });
+            assert_eq!(inner, Err("inner".to_string()));
+            assert_eq!(level(), log::Level::Warn);
+        });
+        assert_eq!(level(), log::Level::Warn);
     }
 
     /// The message comes back scrubbed whether the hook recorded it or the

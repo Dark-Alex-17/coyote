@@ -267,6 +267,37 @@ fn a_node_that_ends_settles_its_running_calls() {
     assert!(!thread(&harness).rows()[0].running());
 }
 
+/// A call that joins a node after it ended with three calls folds the
+/// row, as a fourth call before its end would have; a row the user
+/// opened or closed by hand is left as it is.
+#[test]
+fn a_late_call_folds_an_ended_node_unless_toggled() {
+    for toggled in [false, true] {
+        let mut harness = Harness::standalone(80, 24);
+        started(&mut harness);
+        node_with_calls(&mut harness, 3, false, true);
+        if toggled {
+            let rows = harness
+                .app
+                .child_live
+                .by_session_mut("sess_5d6e")
+                .expect("the started child has a thread")
+                .rows_mut();
+            rows[0].toggle();
+            rows[0].toggle();
+        }
+        let expanded = |harness: &Harness| match &thread(harness).rows()[0] {
+            Cell::Node { row, .. } => row.expanded,
+            _ => panic!("expected the node row"),
+        };
+        assert!(expanded(&harness), "toggled: {toggled}");
+
+        child_tool(&mut harness, Some("plan"), "call-late", "fs_read");
+        assert_eq!(node_calls(&thread(&harness).rows()[0], "plan").len(), 4);
+        assert_eq!(expanded(&harness), toggled, "toggled: {toggled}");
+    }
+}
+
 /// A call that reports its node before the node's own start opens a row
 /// for it; the start then fills that row in rather than adding another.
 #[test]

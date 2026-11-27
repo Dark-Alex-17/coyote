@@ -179,9 +179,10 @@ fn has_alias(body: &str) -> bool {
 
 impl ChartSpec {
     fn scrub(&mut self) {
+        let flat = |text: &str| plain_text(text).replace(['\n', '\t'], " ");
         let scrub = |text: &mut Option<String>| {
             if let Some(text) = text {
-                *text = plain_text(text);
+                *text = flat(text);
             }
         };
         match self {
@@ -196,7 +197,7 @@ impl ChartSpec {
             ChartSpec::Bar(spec) => {
                 scrub(&mut spec.title);
                 for bar in &mut spec.bars {
-                    bar.label = plain_text(&bar.label);
+                    bar.label = flat(&bar.label);
                 }
             }
             ChartSpec::Sparkline(spec) => scrub(&mut spec.title),
@@ -228,14 +229,19 @@ impl ChartSpec {
     }
 
     /// The fewest columns the chart can be drawn in: a bar chart needs a
-    /// column for each bar and a gap between each two.
+    /// column for each bar and a gap between each two, and a sparkline a
+    /// column for each value, as ratatui draws only the values that fit
+    /// yet scales them against all of them.
     fn min_width(&self) -> u16 {
         match self {
             ChartSpec::Bar(spec) => {
                 let bars = u16::try_from(spec.bars.len()).unwrap_or(u16::MAX);
                 MIN_WIDTH.max(bars.saturating_mul(1 + BAR_GAP).saturating_sub(BAR_GAP))
             }
-            _ => MIN_WIDTH,
+            ChartSpec::Sparkline(spec) => {
+                MIN_WIDTH.max(u16::try_from(spec.data.len()).unwrap_or(u16::MAX))
+            }
+            ChartSpec::Line(_) | ChartSpec::Scatter(_) => MIN_WIDTH,
         }
     }
 
@@ -704,11 +710,13 @@ mod tests {
         assert_eq!(chart.x_label.as_deref(), Some("t"));
         assert_eq!(chart.series[0].name.as_deref(), Some("upx"));
         let ChartSpec::Bar(bar) =
-            parse("type: bar\nbars:\n  - {label: \"a\\u202Eb\", value: 1}\n").unwrap()
+            parse("type: bar\ntitle: \"one\\ntwo\\tthree\"\nbars:\n  - {label: \"a\\u202Eb\", value: 1}\n")
+                .unwrap()
         else {
             panic!("a bar chart");
         };
         assert_eq!(bar.bars[0].label, "ab");
+        assert_eq!(bar.title.as_deref(), Some("one two three"));
     }
 
     #[test]
@@ -732,6 +740,15 @@ mod tests {
                 available: 40,
             })
         );
+        let values = format!("type: sparkline\ndata: [{}]\n", vec!["1"; 50].join(", "));
+        assert_eq!(
+            render_chart(&values, 40, 12, &style(false)),
+            Err(ChartError::TooNarrow {
+                needed: 50,
+                available: 40,
+            })
+        );
+        assert!(render_chart(&values, 50, 12, &style(false)).is_ok());
     }
 
     #[test]

@@ -263,6 +263,24 @@ fn under_no_color_a_chart_paints_no_colour() {
     }
 }
 
+/// A theme change lays out again a chart already on screen, so turning
+/// colour off takes its colours away at once.
+#[test]
+fn a_new_theme_repaints_a_chart_on_screen() {
+    let mut harness = Harness::standalone(80, 24);
+    harness.app.set_no_color(false);
+    replied(&mut harness, &chart_reply(LINE_CHART));
+    let coloured = |harness: &Harness| {
+        let buffer = harness.terminal.backend().buffer();
+        chart_rows(harness)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg != Color::Reset))
+    };
+    assert!(coloured(&harness));
+    harness.app.set_no_color(true);
+    harness.draw();
+    assert!(!coloured(&harness));
+}
+
 /// Alt+M shows a chart as its source, the transcript view shows the
 /// source, and a drag over the chart copies its fenced source.
 #[test]
@@ -399,6 +417,63 @@ fn a_formula_shown_as_source_keeps_its_stars_and_copies_as_written() {
             dropped: 0,
         })
     );
+}
+
+/// An inline formula that cannot be drawn on one row shows as written in
+/// its sentence, its `*` and `_` not read as emphasis, and a drag over
+/// the sentence copies it as written.
+#[test]
+fn an_inline_formula_shown_as_source_keeps_its_stars_and_copies_as_written() {
+    let mut harness = Harness::standalone(80, 24);
+    let reply = "so $\\frac{1}{2} *b* c_1 _d_$ holds";
+    let frame = replied(&mut harness, reply);
+    assert!(frame.contains(reply), "{frame}");
+    let row = row_with(&harness, "so $");
+    assert_eq!(
+        left_drag(&mut harness, (0, row), (79, row)),
+        Some(Command::Copy {
+            text: reply.to_string(),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
+
+    let mut harness = Harness::standalone(40, 20);
+    let long = "so $\\frac{1}{2} *b* c_1 _d_ + \\frac{3}{4} *e* f_1 _g_ + h_2$ holds";
+    let frame = replied(&mut harness, long);
+    insta::assert_snapshot!("math_inline_fallback_wrapped_40x20", frame);
+    let first = row_with(&harness, "$\\frac") - 1;
+    assert_eq!(
+        left_drag(&mut harness, (0, first), (39, first + 2)),
+        Some(Command::Copy {
+            text: long.to_string(),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
+}
+
+/// An inline formula is drawn once per width however many frames its
+/// streaming tail takes, and so is one whose drawing failed.
+#[test]
+fn an_inline_formula_in_a_streaming_reply_is_drawn_once() {
+    for (drawn, shown) in [("DRAWN", "so DRAWN still"), ("a\nb", "so $x^2$ still")] {
+        let mut harness = Harness::standalone(80, 24);
+        let fake = Arc::new(FakeMath::new(move |_| drawn.to_string()));
+        harness.app.renderer.set_math_backend(fake.clone());
+        harness.app.begin_turn("draw it", false);
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("so $x^2$ still".to_string()));
+        let frame = harness.draw();
+        assert!(frame.contains(shown), "{frame}");
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta(" going".to_string()));
+        let frame = harness.draw();
+        assert!(frame.contains("still going"), "{frame}");
+        assert_eq!(fake.calls(), 1, "{drawn:?}");
+    }
 }
 
 /// Alt+M shows display and inline math as source, the transcript view

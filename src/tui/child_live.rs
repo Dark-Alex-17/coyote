@@ -355,6 +355,8 @@ impl ChildLive {
                 if let Some(row) = thread.node_row(&node_id) {
                     row.calls
                         .push(FoldedCall::running(call_id, name, args, now));
+                    // A late call can join a node that already ended.
+                    row.fold_when_finished();
                 }
                 thread.forget_wrapped_lines();
             }

@@ -701,13 +701,15 @@ impl App {
 
     /// Swaps in a theme built with the current renderer; the cells and the
     /// composer's placeholder take their styles from here, and a drawn
-    /// block, painted in the old theme's colours, is drawn again.
+    /// block, painted in the old theme's colours, is drawn again, as is
+    /// every laid-out line.
     fn set_theme(&mut self, theme: Theme) {
         self.renderer.faded = theme.faded;
         self.renderer.accent = theme.accent;
         self.renderer.forget_rich_blocks();
         self.composer.set_placeholder_style(theme.faded);
         self.theme = theme;
+        self.relayout_all();
     }
 
     /// Drops every laid-out line, so the next frame renders it all with
@@ -817,7 +819,6 @@ impl App {
                     );
                     self.renderer = renderer;
                     self.set_theme(theme);
-                    self.relayout_all();
                 }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
             }

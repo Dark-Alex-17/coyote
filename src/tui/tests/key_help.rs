@@ -354,7 +354,7 @@ fn the_key_help_lists_the_terminal_selection_and_the_copy_and_diagram_chords() {
             "Shift+drag / Option+drag Select with the terminal instead",
         ),
         ("Alt+C", "Alt+C Copy the focused tool call"),
-        ("Alt+M", "Alt+M Show diagrams, charts and math as"),
+        ("Alt+M", "Alt+M Show diagrams, charts and"),
     ] {
         assert!(
             help.contains(&squeezed(row)),

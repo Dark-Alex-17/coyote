@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/rich_blocks.rs
+expression: frame
+---
+"> draw it                               "
+"                                        "
+"so                                      "
+"$\frac{1}{2} *b* c_1 _d_ + \frac{3}{4} *"
+"e* f_1 _g_ + h_2$ holds                 "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"? = keys  Alt+T = tasks  Alt+S = threads"
+"───────────────────────────── your turn "
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"openai:test-model . no session . agents "

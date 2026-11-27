@@ -1,16 +1,62 @@
 //! Mermaid diagrams drawn in box-drawing characters. The drawing is done
 //! by a backend behind [`MermaidRenderer`]; [`render_mermaid`] guards
-//! every backend alike: it caps the source, survives a panic, scrubs the
-//! output and refuses a drawing wider than the room it is given.
+//! every backend alike: it caps the source and the size of the graph,
+//! survives a panic, scrubs the output and refuses a drawing wider than
+//! the room it is given.
 
 use crate::tui::render::plain_text;
 use crate::tui::terminal::catch_quietly;
+use std::collections::HashSet;
 use unicode_width::UnicodeWidthStr;
 
 /// The most source a diagram may have before it is shown as source
 /// without trying to draw it.
 const MAX_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_LINES: usize = 400;
+
+/// The largest graph handed to the backend, whose layout runs on the draw
+/// path and grows far faster than the graph: in a debug build a random
+/// flowchart at these caps lays out in well under a second, where one of
+/// 30 nodes and 40 edges with subgraphs took several seconds. Class
+/// diagrams lay out slower still, so they have caps of their own.
+const MAX_NODES: usize = 24;
+const MAX_EDGES: usize = 24;
+const MAX_SUBGRAPHS: usize = 4;
+const MAX_CLASS_NODES: usize = 16;
+const MAX_CLASS_EDGES: usize = 16;
+
+/// Diagram kinds drawn without a graph layout, which stay fast at the
+/// source caps whatever they hold.
+const UNLAYERED_KINDS: [&str; 5] = ["sequenceDiagram", "gantt", "timeline", "journey", "pie"];
+
+/// Statements that declare no node of their own, skipped by the count.
+const NON_NODE_STATEMENTS: [&str; 22] = [
+    "classDef",
+    "style",
+    "linkStyle",
+    "click",
+    "direction",
+    "title",
+    "accTitle",
+    "accDescr",
+    "note",
+    "Note",
+    "loop",
+    "alt",
+    "else",
+    "opt",
+    "par",
+    "and",
+    "rect",
+    "critical",
+    "break",
+    "end",
+    "activate",
+    "deactivate",
+];
+
+/// Statements whose next word alone names a node.
+const DECLARING_STATEMENTS: [&str; 4] = ["participant", "actor", "class", "state"];
 
 /// Draws a mermaid diagram as text in at most `max_width` columns.
 pub(crate) trait MermaidRenderer: Send + Sync {
@@ -26,6 +72,7 @@ pub(crate) enum MermaidError {
     TooWide { needed: usize, available: u16 },
     Panicked(String),
     TooLarge,
+    TooComplex,
 }
 
 impl MermaidError {
@@ -45,6 +92,7 @@ impl MermaidError {
                 "diagram longer than {MAX_SOURCE_LINES} lines or {} KiB",
                 MAX_SOURCE_BYTES / 1024
             ),
+            MermaidError::TooComplex => "diagram too complex to draw".to_string(),
         };
         format!("mermaid: {why} (showing source)")
     }
@@ -54,10 +102,125 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default().trim()
 }
 
+/// Whether the graph in `source` is over the caps, its nodes, edges and
+/// subgraphs counted roughly from the text: a node is any distinct word
+/// outside labels, and a run of link characters such as `-->`, `-.-` or
+/// `<|--` is an edge from each node on its left to each on its right, as
+/// `A & B --> C & D` is four. The count errs high, so a diagram near the
+/// caps may be refused that the backend would draw in time.
+fn too_complex(source: &str) -> bool {
+    let mut statements = source
+        .lines()
+        .flat_map(|line| line.split(';'))
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("%%"));
+    let Some(header) = statements.next() else {
+        return false;
+    };
+    let kind = header.split_whitespace().next().unwrap_or_default();
+    if UNLAYERED_KINDS.contains(&kind) {
+        return false;
+    }
+    let (max_nodes, max_edges) = if kind == "classDiagram" {
+        (MAX_CLASS_NODES, MAX_CLASS_EDGES)
+    } else {
+        (MAX_NODES, MAX_EDGES)
+    };
+    let mut nodes: HashSet<String> = HashSet::new();
+    let mut edges = 0;
+    let mut subgraphs = 0;
+    let mut in_class_body = false;
+    for line in statements {
+        if in_class_body {
+            in_class_body = !line.starts_with('}');
+            continue;
+        }
+        in_class_body = line.ends_with('{');
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        if first == "subgraph" {
+            subgraphs += 1;
+        } else if DECLARING_STATEMENTS.contains(&first) {
+            let declared = words.next().into_iter().flat_map(identifiers);
+            nodes.extend(declared.map(str::to_string));
+        } else if !NON_NODE_STATEMENTS.contains(&first) {
+            let bare = without_labels(line);
+            let mut groups = vec![1usize];
+            for run in bare.split(|c: char| c.is_whitespace() || is_word_char(c)) {
+                if is_link(run) {
+                    groups.push(1);
+                } else if let Some(group) = groups.last_mut() {
+                    *group += run.matches('&').count();
+                }
+            }
+            edges += groups
+                .windows(2)
+                .map(|pair| pair[0] * pair[1])
+                .sum::<usize>();
+            nodes.extend(identifiers(&bare).map(str::to_string));
+        }
+    }
+    nodes.len() > max_nodes || edges > max_edges || subgraphs > MAX_SUBGRAPHS
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !is_word_char(c))
+        .filter(|word| !word.is_empty())
+}
+
+/// Whether a run of punctuation draws a link: two line characters in a
+/// row, or a line character and an arrow head.
+fn is_link(run: &str) -> bool {
+    let line = |c: char| matches!(c, '-' | '=' | '.' | '~');
+    let chars: Vec<char> = run.chars().collect();
+    chars
+        .windows(2)
+        .any(|pair| (line(pair[0]) || pair[0] == '<') && (line(pair[1]) || pair[1] == '>'))
+        && chars.iter().copied().any(line)
+}
+
+/// `line` up to any `:` label, with each quoted string and each bracketed
+/// or piped label closed on the line left out.
+fn without_labels(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut closer = None;
+    for (at, c) in line.char_indices() {
+        if let Some(close) = closer {
+            if c == close {
+                closer = None;
+            }
+            continue;
+        }
+        let close = match c {
+            '"' => '"',
+            '[' => ']',
+            '(' => ')',
+            '{' => '}',
+            '|' => '|',
+            ':' => break,
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        if line[at + c.len_utf8()..].contains(close) {
+            closer = Some(close);
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The rows of `source` drawn by `backend` in at most `width` columns,
-/// without control characters or trailing blank rows. A backend that
-/// panics, or returns rows wider than `width` (some diagram kinds ignore
-/// the width they are given), fails like one that refused.
+/// without control characters, trailing blanks or trailing blank rows. A
+/// backend that panics, or returns rows wider than `width` (some diagram
+/// kinds ignore the width they are given), fails like one that refused.
 pub(crate) fn render_mermaid(
     backend: &dyn MermaidRenderer,
     source: &str,
@@ -66,13 +229,24 @@ pub(crate) fn render_mermaid(
     if source.len() > MAX_SOURCE_BYTES || source.lines().count() > MAX_SOURCE_LINES {
         return Err(MermaidError::TooLarge);
     }
+    if too_complex(source) {
+        return Err(MermaidError::TooComplex);
+    }
+    let source = source.replace('\t', " ");
     let drawn =
-        catch_quietly(|| backend.render(source, width)).map_err(MermaidError::Panicked)??;
+        catch_quietly(|| backend.render(&source, width)).map_err(MermaidError::Panicked)??;
     let mut rows: Vec<String> = plain_text(&drawn)
         .split('\n')
-        .map(|row| row.chars().filter(|c| !c.is_control()).collect())
+        .map(|row| {
+            let row: String = row
+                .chars()
+                .map(|c| if c == '\t' { ' ' } else { c })
+                .filter(|c| !c.is_control())
+                .collect();
+            row.trim_end().to_string()
+        })
         .collect();
-    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+    while rows.last().is_some_and(String::is_empty) {
         rows.pop();
     }
     if rows.is_empty() {
@@ -255,6 +429,7 @@ mod tests {
                 MermaidError::TooLarge,
                 "diagram longer than 400 lines or 16 KiB",
             ),
+            (MermaidError::TooComplex, "diagram too complex to draw"),
         ];
         for (error, why) in notes {
             assert_eq!(error.note(), format!("mermaid: {why} (showing source)"));
@@ -277,5 +452,199 @@ mod tests {
             render_mermaid(&MermaidTextBackend, "zenuml\nA.b()", 80),
             Err(MermaidError::Unsupported(_))
         ));
+    }
+
+    /// A graph over the caps is refused before the backend sees it, by
+    /// its nodes, its edges (a link joins each node on its left to each
+    /// on its right), its subgraphs, also when written on one line, or for
+    /// a class diagram by the tighter caps of its own.
+    #[test]
+    fn a_graph_too_complex_to_lay_out_is_not_handed_to_the_backend() {
+        let backend = FakeMermaid::new(|_, _| Ok("drawn".to_string()));
+        let chain = |kind: &str, links: usize| {
+            let mut source = format!("{kind}\n");
+            for n in 0..links {
+                source.push_str(&format!("N{n}[Step {n}] --> N{}\n", n + 1));
+            }
+            source
+        };
+        let edges: String = std::iter::once("flowchart TD\n".to_string())
+            .chain((0..25).map(|n| format!("A -->|go {n}| B\n")))
+            .collect();
+        let subgraphs: String = std::iter::once("flowchart TD\n".to_string())
+            .chain((0..5).map(|n| format!("subgraph S{n}\nA{n}\nend\n")))
+            .collect();
+        let classes: String = std::iter::once("classDiagram\n".to_string())
+            .chain((0..17).map(|n| format!("class C{n} {{\n  +String name\n}}\n")))
+            .collect();
+        let fan_out = "flowchart TD\nA & B & C & D & E --> F & G & H & I & J\n".to_string();
+        let one_line = format!(
+            "flowchart TD; {}",
+            (0..5)
+                .map(|n| format!("subgraph S{n}; A{n}; end"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        let start = std::time::Instant::now();
+        let refused = [chain("flowchart TD", 24), edges, subgraphs, classes];
+        for source in refused.into_iter().chain([fan_out, one_line]) {
+            assert_eq!(
+                render_mermaid(&backend, &source, 80),
+                Err(MermaidError::TooComplex),
+                "{source}"
+            );
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(backend.calls(), 0);
+
+        for source in [
+            chain("flowchart TD", 23),
+            chain("graph LR", 23),
+            chain("classDiagram", 15).replace("-->", "<|--"),
+        ] {
+            assert!(render_mermaid(&backend, &source, 80).is_ok(), "{source}");
+        }
+        assert_eq!(backend.calls(), 3);
+    }
+
+    /// Labels, quoted text and member bodies are not nodes, and a diagram
+    /// drawn without a graph layout is not counted at all.
+    #[test]
+    fn only_the_graph_is_counted() {
+        let labelled: String =
+            std::iter::once("flowchart TD\n".to_string())
+                .chain((0..20).map(|n| {
+                    format!("A[\"start {n}: go\"] -->|word{n} other{n}| B{{is it {n}?}}\n")
+                }))
+                .collect();
+        assert!(!too_complex(&labelled), "{labelled}");
+        let members: String = std::iter::once("classDiagram\n".to_string())
+            .chain(
+                (0..4).map(|n| format!("class C{n} {{\n  +a{n}\n  +b{n}\n  +c{n}\n  +d{n}\n}}\n")),
+            )
+            .collect();
+        assert!(!too_complex(&members), "{members}");
+        let messages: String = std::iter::once("sequenceDiagram\n".to_string())
+            .chain((0..60).map(|n| format!("P{n}->>Q{n}: hello\n")))
+            .collect();
+        assert!(!too_complex(&messages));
+    }
+
+    /// An ordinary flowchart of eighteen nodes and a sequence diagram of
+    /// ten messages are under the caps and drawn by the real crate.
+    #[test]
+    fn ordinary_diagrams_are_drawn_by_the_crate() {
+        let flowchart = "flowchart TD\n\
+            A[Start] --> B{Logged in?}\n\
+            B -->|Yes| C[Dashboard]\n\
+            B -->|No| D[Login]\n\
+            D --> E[Check password]\n\
+            E -->|ok| C\n\
+            E -->|bad| F[Show error]\n\
+            F --> D\n\
+            C --> G[Load profile]\n\
+            G --> H[Load feed]\n\
+            H --> I[Render]\n\
+            I --> J{More?}\n\
+            J -->|Yes| K[Fetch page]\n\
+            K --> H\n\
+            J -->|No| L[Idle]\n\
+            L --> M[Timeout]\n\
+            M --> N[Logout]\n\
+            N --> O[Clear cache]\n\
+            O --> P[Goodbye]\n\
+            P --> Q[End]\n\
+            Q --> R[Exit]\n";
+        let sequence = "sequenceDiagram\n\
+            participant U as User\n\
+            participant S as Server\n\
+            participant D as Database\n\
+            U->>S: login\n\
+            S->>D: find user\n\
+            D-->>S: user\n\
+            S-->>U: token\n\
+            U->>S: list\n\
+            S->>D: query\n\
+            D-->>S: rows\n\
+            S-->>U: page\n\
+            U->>S: logout\n\
+            S-->>U: bye\n";
+        for source in [flowchart, sequence] {
+            assert!(!too_complex(source), "{source}");
+            let rows = render_mermaid(&MermaidTextBackend, source, 120);
+            assert!(rows.is_ok(), "{source}: {rows:?}");
+        }
+    }
+
+    /// A graph whose edges join nodes picked at random, the shape that
+    /// lays out slowest: `nodes` nodes, `edges` edges, each of the first
+    /// `subgraphs` subgraphs holding a few nodes.
+    fn random_graph(kind: &str, nodes: usize, edges: usize, subgraphs: usize) -> String {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % below as u64).unwrap_or(0)
+        };
+        let mut source = format!("{kind}\n");
+        for group in 0..subgraphs {
+            source.push_str(&format!("subgraph S{group}\n"));
+            for n in (group..nodes).step_by(subgraphs.max(1)).take(3) {
+                source.push_str(&format!("N{n}[Node {n}]\n"));
+            }
+            source.push_str("end\n");
+        }
+        for n in 0..nodes.min(edges) {
+            source.push_str(&format!("N{n} --> N{}\n", (n + 1) % nodes));
+        }
+        for _ in nodes.min(edges)..edges {
+            source.push_str(&format!("N{} --> N{}\n", next(nodes), next(nodes)));
+        }
+        source
+    }
+
+    /// The worst graphs under the caps the real crate is handed still lay
+    /// out in about a second in a debug build, the slowest kind there is.
+    #[test]
+    fn the_crate_lays_out_the_largest_graphs_allowed_in_time() {
+        let flowchart = random_graph("flowchart TD", MAX_NODES, MAX_EDGES, MAX_SUBGRAPHS);
+        let classes = random_graph("classDiagram", MAX_CLASS_NODES, MAX_CLASS_EDGES, 0)
+            .replace("-->", "<|--");
+        let fan = format!(
+            "flowchart TD\nN0 & N1 & N2 & N3 --> N4 & N5 & N6 & N7 & N8 & N9\n{}\n",
+            (10..MAX_NODES)
+                .map(|n| format!("N{n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let dense = random_graph("flowchart LR", MAX_NODES, MAX_EDGES, MAX_SUBGRAPHS)
+            .replace("[Node", "[A rather longer label for node");
+        for source in [flowchart, classes, fan, dense] {
+            assert!(!too_complex(&source), "{source}");
+            for width in [80, 200] {
+                let start = std::time::Instant::now();
+                let _ = render_mermaid(&MermaidTextBackend, &source, width);
+                let took = start.elapsed();
+                eprintln!("{} at width {width}: {took:?}", first_line(&source));
+                assert!(
+                    took < std::time::Duration::from_secs(2),
+                    "{took:?}\n{source}"
+                );
+            }
+        }
+    }
+
+    /// A tab in the source reaches the backend as a space, a tab in the
+    /// drawing is a space, and trailing blanks do not count to the width.
+    #[test]
+    fn tabs_become_spaces_and_trailing_blanks_do_not_count() {
+        let echo = FakeMermaid::new(|source, _| Ok(source.to_string()));
+        assert_eq!(
+            render_mermaid(&echo, "flowchart\tTD", 80),
+            Ok(vec!["flowchart TD".to_string()])
+        );
+        let padded = FakeMermaid::new(|_, _| Ok("a\tb   \n".to_string()));
+        assert_eq!(render_mermaid(&padded, "x", 3), Ok(vec!["a b".to_string()]));
     }
 }

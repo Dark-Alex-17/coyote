@@ -417,11 +417,26 @@ impl Renderer {
     }
 
     /// A markdown run with each inline formula that draws on one row drawn
-    /// in place of its source.
+    /// in place of its source, the drawing from the cache when the formula
+    /// was drawn at this width before.
     fn prose_run(&mut self, run: &str, width: u16) -> Rendered {
         let room = self.wrap_cap.map_or(width, |cap| width.min(cap)).max(1);
-        let backend = Arc::clone(&self.math);
-        let (masked, formulas) = math::mask_inline(run, room, backend.as_ref());
+        let backend = self.math.as_ref();
+        let cache = &mut self.rich_cache;
+        let (masked, formulas) = math::mask_inline(run, |tex| {
+            let key = RichKey::inline_math(tex, room);
+            let drawn = cache.get(&key).unwrap_or_else(|| {
+                let drawn = Arc::new(
+                    math_render::one_row(backend, tex, room)
+                        .map(|row| vec![Line::from(row)])
+                        .ok_or_else(String::new),
+                );
+                cache.insert(key, Arc::clone(&drawn));
+                drawn
+            });
+            let row = drawn.as_ref().as_ref().ok()?.first()?;
+            Some(row.to_string())
+        });
         let (lines, regions) = math::unmask(self.markdown_run(&masked, width), &formulas);
         Rendered { lines, regions }
     }
