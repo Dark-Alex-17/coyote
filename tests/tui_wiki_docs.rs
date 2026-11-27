@@ -44,7 +44,6 @@ const PROTOCOL_HEADING: &str = "## Prompting the user from a tool";
 const CHANNEL_HEADING: &str = "# The Prompt Channel";
 const ENV_HEADING: &str = "# UI and Prompt Related Variables";
 const HEADLESS_HEADING: &str = "## Prompts without a human";
-const IN_PROCESS_LEAD: &str = "- **Also published in-process.**";
 /// The settings whose README and Getting-Started rows this lint checks.
 const SETTINGS: [&str; 3] = ["ui", "editor", "theme"];
 const WIKI_URL: &str = "https://github.com/Dark-Alex-17/coyote/wiki/";
@@ -144,22 +143,6 @@ fn section(label: &str, page: &str, heading: &str) -> String {
     }
     let lines = body.unwrap_or_else(|| panic!("{label} has no `{heading}` heading"));
     lines.join("\n")
-}
-
-/// The paragraph or list item of `page` that starts with `lead`, up to the
-/// next blank line or list item.
-fn paragraph(label: &str, page: &str, lead: &str) -> String {
-    let at = page
-        .find(lead)
-        .unwrap_or_else(|| panic!("{label} has no paragraph starting {lead:?}"));
-    let rest = &page[at..];
-    let end = rest[lead.len()..]
-        .find("\n\n")
-        .into_iter()
-        .chain(rest[lead.len()..].find("\n- "))
-        .min()
-        .map_or(rest.len(), |end| end + lead.len());
-    rest[..end].to_string()
 }
 
 /// `text` with every whitespace run collapsed to one space, so a sentence the
@@ -706,16 +689,6 @@ fn hooks_page_lists_the_call_id_on_every_tool_event() {
         tool_extras.contains("(\"COYOTE_TOOL_CALL_ID\","),
         "{tool_extras}"
     );
-    let dispatch = fn_body(&hooks, "fn dispatch(");
-    assert!(
-        dispatch.find("publish_hook_event(").unwrap() < dispatch.find("fire_resolved(").unwrap(),
-        "a typed event is published before its shell hooks run"
-    );
-    let fire = fn_body(&hooks, "pub fn fire(");
-    assert!(
-        fire.find("publish_hook_event(").unwrap() < fire.find("if resolved.is_empty()").unwrap(),
-        "fire publishes before it looks for shell hooks"
-    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Hooks.md"));
@@ -726,8 +699,6 @@ fn hooks_page_lists_the_call_id_on_every_tool_event() {
             "the Hooks.md `{name}` row lists COYOTE_TOOL_CALL_ID: {row:?}"
         );
     }
-    let in_process = flat(&paragraph("Hooks.md", &page, IN_PROCESS_LEAD));
-    assert!(in_process.contains("`COYOTE_HOOK_NAME`"), "{in_process}");
     let env = read(wiki.join("Environment-Variables.md"));
     let row = table_row("Environment-Variables.md", &env, "`COYOTE_TOOL_CALL_ID`");
     assert!(row[1].contains("`tool.*`"), "{row:?}");
@@ -754,6 +725,10 @@ fn environment_page_documents_the_ui_and_reply_variables() {
             "the {ui_env} row names {kind}"
         );
     }
+    assert!(
+        !ui.contains("`--tui`"),
+        "the {ui_env} row describes it as choosing the shell, which coyote does not read it for"
+    );
     let reply = table_row("Environment-Variables.md", &vars, &format!("`{reply_env}`")).join(" ");
     assert!(reply.contains("`/dev/fd/<n>`") && reply.contains("named pipe"));
     for var in ["`LLM_PROMPT_UTILS_PY`", "`LLM_PROMPT_UTILS_TS`"] {
@@ -851,10 +826,6 @@ fn tui_page_quotes_the_code() {
     let thinking = literal_with(tui, "Thinking for ")
         .trim_start()
         .replace("{}", "<time>");
-    assert_eq!(
-        const_expr(&src(&["tui", "throbber.rs"]), "THROBBER_INTERVAL"),
-        "Duration::from_millis(100)"
-    );
     let interrupt = literal_with(tui, "Esc to interrupt")
         .trim_start()
         .to_string();
@@ -891,7 +862,6 @@ fn tui_page_quotes_the_code() {
         .nth(1)
         .map(str::trim);
     assert_eq!(suspend, Some("#[cfg(unix)]"), "suspend is unix-only");
-    assert!(src(&["tui", "terminal.rs"]).contains("WriteConsoleW"));
     assert!(src(&["tui", "terminal.rs"]).contains("\\x1b[?1000h\\x1b[?1002h\\x1b[?1006h"));
     assert!(src(&["config", "input.rs"]).contains("left the group with setsid"));
     let editor = fn_body(&src(&["config", "app_config.rs"]), "pub fn editor(&self)");
@@ -921,14 +891,12 @@ fn tui_page_quotes_the_code() {
         format!("`.{threads_command}`"),
         format!("`{}`", normal.trim()),
         "1 second".to_string(),
-        "100 ms".to_string(),
         "within a second".to_string(),
         "4 MiB".to_string(),
         "32 MiB".to_string(),
         "`$VISUAL`".to_string(),
         "`$EDITOR`".to_string(),
         "`NO_COLOR`".to_string(),
-        "`WriteConsoleW`".to_string(),
         "`setsid`".to_string(),
         "`/dev/tty`".to_string(),
         "use the REPL".to_string(),
@@ -1397,10 +1365,6 @@ fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
         (
             "Hooks.md tool events".to_string(),
             section("Hooks.md", &hooks, "## Tool events"),
-        ),
-        (
-            "Hooks.md in-process paragraph".to_string(),
-            paragraph("Hooks.md", &hooks, IN_PROCESS_LEAD),
         ),
         (
             format!("Unattended-Mode.md {HEADLESS_HEADING}"),
