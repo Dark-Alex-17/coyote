@@ -10,7 +10,9 @@ mod openai_oauth;
 #[macro_use]
 mod macros;
 mod model;
+pub mod native_format;
 mod stream;
+pub mod structured_output;
 
 pub use crate::function::ToolCall;
 pub use common::*;

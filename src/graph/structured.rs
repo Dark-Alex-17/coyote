@@ -1,4 +1,7 @@
-use crate::client::call_chat_completions_streaming_quiet;
+use super::llm::CompletionFuture;
+use crate::client::Client;
+use crate::client::native_format::with_native_format_fallback;
+use crate::client::structured_output::StructuredOutputSpec;
 use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, bail};
@@ -6,6 +9,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 const EXTRACTOR_ROLE_NAME: &str = "__structured_output__";
+
+const EXTRACTOR_SCHEMA_NAME: &str = "structured_output";
 
 const EXTRACTOR_ROLE_PROMPT: &str = "\
 Extract a JSON object from the user's input that strictly conforms to the provided JSON Schema.
@@ -19,45 +24,86 @@ Rules:
 - If a field cannot be determined from the input, use `null` (when allowed) or your best inferred value.
 - Do NOT invent fields not present in the schema.";
 
-pub async fn extract(
+/// One model call on the client the caller built, injectable so tests can
+/// fail the first attempt without a provider.
+pub(crate) type ExtractorTransport<'f> = dyn for<'b> FnMut(
+        &'b Input,
+        &'b dyn Client,
+        &'b mut RequestContext,
+        AbortSignal,
+    ) -> CompletionFuture<'b>
+    + Send
+    + 'f;
+
+/// A `raw` that already parses comes back unstripped: only a caller that
+/// knows the native format `raw` was written under can strip its nulls.
+pub(crate) async fn extract(
     raw: &str,
     schema: &Value,
     parent_ctx: &mut RequestContext,
     abort: &AbortSignal,
+    transport: &mut ExtractorTransport<'_>,
 ) -> Result<Value> {
     if let Some(parsed) = try_parse_json(raw) {
         return Ok(parsed);
     }
 
-    extract_via_extractor(raw, schema, parent_ctx, abort, false).await
+    extract_via_extractor(raw, schema, parent_ctx, abort, transport).await
 }
 
+/// Runs the extractor, repair pass included, on a fresh native-format state
+/// so a rejection seen by the first pass also holds for the repair pass,
+/// then hands the caller its own state back.
 async fn extract_via_extractor(
     raw: &str,
     schema: &Value,
     parent_ctx: &mut RequestContext,
     abort: &AbortSignal,
-    is_repair: bool,
+    transport: &mut ExtractorTransport<'_>,
 ) -> Result<Value> {
-    let role = build_extractor_role(parent_ctx);
+    let saved_native_format = std::mem::take(&mut parent_ctx.native_format);
+    let result = extract_with_repair(raw, schema, parent_ctx, abort, false, transport).await;
+    parent_ctx.native_format = saved_native_format;
+    result
+}
+
+async fn extract_with_repair(
+    raw: &str,
+    schema: &Value,
+    parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    is_repair: bool,
+    transport: &mut ExtractorTransport<'_>,
+) -> Result<Value> {
+    let mut role = build_extractor_role(parent_ctx);
+    role.set_structured_output(Some(StructuredOutputSpec {
+        name: EXTRACTOR_SCHEMA_NAME.to_string(),
+        schema: schema.clone(),
+    }));
     let prompt = build_extractor_prompt(raw, schema, is_repair);
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(role);
-    let result = run_one_shot(&prompt, parent_ctx, abort).await;
+    let result = run_one_shot(&prompt, parent_ctx, abort, transport).await;
     parent_ctx.role = saved_role;
+    let extractor_dialect = parent_ctx.native_format.last_dialect;
 
     let output = result.context("Structured-output extractor LLM call failed")?;
 
     match try_parse_json(&output) {
-        Some(value) => Ok(value),
+        Some(mut value) => {
+            if let Some(dialect) = extractor_dialect {
+                dialect.strip_nulls(&mut value, schema);
+            }
+            Ok(value)
+        }
         None if is_repair => bail!(
             "Structured-output extractor failed to produce valid JSON after repair retry. \
              Last response:\n{output}"
         ),
         None => {
-            Box::pin(extract_via_extractor(
-                &output, schema, parent_ctx, abort, true,
+            Box::pin(extract_with_repair(
+                &output, schema, parent_ctx, abort, true, transport,
             ))
             .await
         }
@@ -88,6 +134,7 @@ async fn run_one_shot(
     prompt: &str,
     ctx: &mut RequestContext,
     abort: &AbortSignal,
+    transport: &mut ExtractorTransport<'_>,
 ) -> Result<String> {
     if abort.aborted() {
         bail!("Aborted.");
@@ -98,13 +145,16 @@ async fn run_one_shot(
     let client = input.create_client()?;
     ctx.before_chat_completion(&input)?;
     let (output, tool_results) =
-        call_chat_completions_streaming_quiet(&input, client.as_ref(), ctx, abort.clone()).await?;
+        with_native_format_fallback(&input, client.as_ref(), ctx, |input, client, ctx| {
+            transport(input, client, ctx, abort.clone())
+        })
+        .await?;
     ctx.after_chat_completion(app_cfg.as_ref(), &input, &output, &tool_results)?;
 
     Ok(output)
 }
 
-fn try_parse_json(raw: &str) -> Option<Value> {
+pub(crate) fn try_parse_json(raw: &str) -> Option<Value> {
     let cleaned = strip_code_fences(strip_thinking_blocks(raw.trim()));
     serde_json::from_str(cleaned).ok()
 }
@@ -135,12 +185,244 @@ fn strip_code_fences(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Model;
-    use crate::config::{AppState, WorkingMode};
+    use crate::client::ApiStatusError;
+    use crate::client::native_format::NativeFormatState;
+    use crate::client::structured_output::SchemaDialect;
+    use crate::client::{ClientConfig, Model, ModelData};
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::graph::llm::quiet_transport;
+    use crate::graph::llm::test_support::{boxed_completion, transport_call};
+    use crate::utils::create_abort_signal;
     use serde_json::json;
 
     fn make_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn api_error(status: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(ApiStatusError {
+            status,
+            message: message.to_string(),
+        })
+        .context("Failed to call chat-completions api")
+    }
+
+    fn structured_ctx() -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            clients: vec![ClientConfig::OpenAIConfig(Default::default())],
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut data = ModelData::new("structured");
+        data.supports_structured_output = true;
+        let mut role = Role::new("parent", "");
+        role.set_model(Model::from_config("openai", &[data]).remove(0));
+        ctx.role = Some(role);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn extractor_retries_without_the_format_after_a_400_and_parses_the_reply() {
+        let mut ctx = structured_ctx();
+        let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let mut seen = Vec::new();
+        let mut transport = transport_call(|input, _client, _ctx, _abort| {
+            seen.push(input.role().structured_output().cloned());
+            let first = seen.len() == 1;
+            boxed_completion(async move {
+                if first {
+                    Err(api_error(400, "rejected"))
+                } else {
+                    Ok((r#"{"a": 1}"#.to_string(), vec![]))
+                }
+            })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &schema,
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"a": 1}));
+        let spec = StructuredOutputSpec {
+            name: "structured_output".to_string(),
+            schema,
+        };
+        assert_eq!(seen, vec![Some(spec), None]);
+    }
+
+    #[tokio::test]
+    async fn extractor_repair_pass_keeps_the_rejection_from_the_first_pass() {
+        let mut ctx = structured_ctx();
+        let schema = json!({"type": "object"});
+        let mut seen = Vec::new();
+        let mut transport = transport_call(|input, _client, _ctx, _abort| {
+            seen.push(input.role().structured_output().cloned());
+            let call = seen.len();
+            boxed_completion(async move {
+                match call {
+                    1 => Err(api_error(400, "rejected")),
+                    2 => Ok(("not json".to_string(), vec![])),
+                    _ => Ok((r#"{"a": 1}"#.to_string(), vec![])),
+                }
+            })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &schema,
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"a": 1}));
+        let spec = StructuredOutputSpec {
+            name: "structured_output".to_string(),
+            schema,
+        };
+        assert_eq!(seen, vec![Some(spec), None, None]);
+        assert_eq!(ctx.native_format, NativeFormatState::default());
+    }
+
+    #[tokio::test]
+    async fn extractor_restores_the_callers_native_format_state() {
+        let caller = NativeFormatState {
+            rejected: true,
+            last_dialect: None,
+        };
+        for succeeds in [true, false] {
+            let mut ctx = structured_ctx();
+            ctx.native_format = caller.clone();
+            let mut seen = Vec::new();
+            let mut transport = transport_call(|_input, _client, ctx, _abort| {
+                seen.push(ctx.native_format.clone());
+                boxed_completion(async move {
+                    if succeeds {
+                        Ok((r#"{"a": 1}"#.to_string(), vec![]))
+                    } else {
+                        Err(api_error(500, "down"))
+                    }
+                })
+            });
+
+            let result = extract_via_extractor(
+                "prose",
+                &json!({"type": "object"}),
+                &mut ctx,
+                &create_abort_signal(),
+                &mut transport,
+            )
+            .await;
+
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(seen, vec![NativeFormatState::default()]);
+            assert_eq!(ctx.native_format, caller, "succeeds {succeeds}");
+        }
+    }
+
+    fn groups_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "domain": {"type": "string"},
+                            "files": {"type": "array", "items": {"type": "string"}},
+                            "rationale": {"type": "string"}
+                        },
+                        "required": ["domain", "files"]
+                    }
+                }
+            },
+            "required": ["groups"]
+        })
+    }
+
+    const GROUPS_WITH_NULL: &str = r#"{"groups":[{"domain":"a","files":[],"rationale":null}]}"#;
+
+    #[tokio::test]
+    async fn extract_never_strips_a_raw_that_already_parses() {
+        let mut ctx = make_ctx();
+
+        let value = extract(
+            GROUPS_WITH_NULL,
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            &mut quiet_transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({"groups": [{"domain": "a", "files": [], "rationale": null}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn extractor_strips_nulls_when_its_own_call_ran_openai_strict() {
+        let mut ctx = structured_ctx();
+        let mut transport = transport_call(|_input, _client, _ctx, _abort| {
+            boxed_completion(async { Ok((GROUPS_WITH_NULL.to_string(), vec![])) })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"groups": [{"domain": "a", "files": []}]}));
+    }
+
+    #[tokio::test]
+    async fn extractor_keeps_nulls_when_its_own_call_ran_without_the_format() {
+        let mut ctx = structured_ctx();
+        ctx.native_format.last_dialect = Some(SchemaDialect::OpenAiStrict);
+        let mut calls = 0;
+        let mut transport = transport_call(|_input, _client, _ctx, _abort| {
+            calls += 1;
+            let first = calls == 1;
+            boxed_completion(async move {
+                if first {
+                    Err(api_error(400, "rejected"))
+                } else {
+                    Ok((GROUPS_WITH_NULL.to_string(), vec![]))
+                }
+            })
+        });
+
+        let value = extract_via_extractor(
+            "prose",
+            &groups_schema(),
+            &mut ctx,
+            &create_abort_signal(),
+            &mut transport,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({"groups": [{"domain": "a", "files": [], "rationale": null}]})
+        );
     }
 
     #[test]

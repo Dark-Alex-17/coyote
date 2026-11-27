@@ -150,7 +150,8 @@ pub async fn fetch_with_loaders(
                     save_file.write_all(&chunk).await?;
                 }
                 let contents = if size == 0 {
-                    println!("{}", warning_text(&format!("No content at '{path}'")));
+                    OutputSink::diagnostic()
+                        .println(warning_text(&format!("No content at '{path}'")));
                     String::new()
                 } else {
                     run_loader_command(&save_path, &extension, loader_command)?
@@ -238,12 +239,13 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
     let start_url = Url::parse(start_url)?;
     let mut paths = vec![start_url.path().to_string()];
     let normalized_start_url = normalize_start_url(&start_url);
+    let progress = OutputSink::diagnostic();
     if !options.no_log {
-        println!(
+        progress.println(format_args!(
             "Start crawling url={start_url} exclude={} extract={}",
             options.exclude.join(","),
             options.extract.as_deref().unwrap_or_default()
-        );
+        ));
     }
 
     if let Ok(true) = GITHUB_REPO_RE.is_match(start_url.as_str()) {
@@ -292,7 +294,7 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
             match res {
                 Ok((path, text, links)) => {
                     if !options.no_log {
-                        println!("Crawled {path}");
+                        progress.println(format_args!("Crawled {path}"));
                     }
                     if !text.is_empty() {
                         result_pages.push(Page { path, text });
@@ -307,7 +309,7 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
                     if BREAK_ON_ERROR {
                         return Err(err);
                     } else if !options.no_log {
-                        println!("{}", error_text(&pretty_error(&err)));
+                        progress.println(error_text(&pretty_error(&err)));
                     }
                 }
             }

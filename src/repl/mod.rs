@@ -11,8 +11,9 @@ use self::placeholder_edit::{
 };
 use self::prompt::ReplPrompt;
 
+use crate::client::native_format::with_native_format_fallback;
 use crate::client::{
-    Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
+    Client, Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
     call_chat_completions_streaming_quiet, init_client, oauth,
 };
 use crate::config::{
@@ -1918,7 +1919,48 @@ impl std::error::Error for PreflightError {
 fn repl_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
-    |input, ctx, abort| {
+    repl_completion_runner_with(repl_transport)
+}
+
+fn repl_transport<'a>(
+    input: &'a Input,
+    client: &'a dyn Client,
+    ctx: &'a mut RequestContext,
+    abort: AbortSignal,
+) -> CompletionFuture<'a> {
+    Box::pin(async move {
+        match select_transport(input) {
+            Transport::Quiet => {
+                call_chat_completions_streaming_quiet(input, client, ctx, abort).await
+            }
+            Transport::Streaming => {
+                call_chat_completions_streaming(input, client, ctx, abort).await
+            }
+            Transport::Plain => call_chat_completions(input, true, false, client, ctx, abort).await,
+        }
+    })
+}
+
+/// The REPL runner over `transport`. A native-format rejection is retried
+/// once without the format, on the same client. The before-hook runs once
+/// per runner invocation and not again before that format-less retry.
+fn repl_completion_runner_with<T>(
+    transport: T,
+) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+where
+    T: for<'b> Fn(
+            &'b Input,
+            &'b dyn Client,
+            &'b mut RequestContext,
+            AbortSignal,
+        ) -> CompletionFuture<'b>
+        + Send
+        + Sync
+        + 'static,
+{
+    let transport = Arc::new(transport);
+    move |input, ctx, abort| {
+        let transport = Arc::clone(&transport);
         Box::pin(async move {
             let client = input
                 .create_client()
@@ -1927,17 +1969,10 @@ fn repl_completion_runner()
                 .guard_images()
                 .map_err(|err| anyhow::Error::new(PreflightError(err)))?;
             ctx.before_chat_completion(input)?;
-            match select_transport(input) {
-                Transport::Quiet => {
-                    call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
-                }
-                Transport::Streaming => {
-                    call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
-                }
-                Transport::Plain => {
-                    call_chat_completions(input, true, false, client.as_ref(), ctx, abort).await
-                }
-            }
+            with_native_format_fallback(input, client.as_ref(), ctx, |i, cl, c| {
+                transport(i, cl, c, abort.clone())
+            })
+            .await
         })
     }
 }
@@ -5187,6 +5222,133 @@ local_hello() {\n\
                 assert!(matches!(select_transport(&other), Transport::Plain));
             }
         }
+    }
+
+    #[test]
+    fn classifier_retries_without_the_native_format_after_a_400() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            with_app_config(&mut ctx, |config| {
+                config.clients = vec![ClientConfig::OpenAIConfig(Default::default())];
+            });
+            let mut data = ModelData::new("structured");
+            data.supports_structured_output = true;
+            let mut session = Session::default();
+            session.set_model(Model::from_config("openai", &[data]).remove(0));
+            ctx.session = Some(session);
+            let graph: graph::Graph = serde_yaml::from_str(&format!(
+                "name: probe\n{SESSION_BLOCK}start: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ))
+            .unwrap();
+            let block = graph.session.clone().unwrap();
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let mut runner =
+                repl_completion_runner_with(move |input: &Input, _client, _ctx, _abort| {
+                    let mut seen = recorded.lock();
+                    seen.push(input.role().structured_output().cloned());
+                    let first = seen.len() == 1;
+                    boxed_completion(async move {
+                        if first {
+                            Err(anyhow::Error::new(crate::client::ApiStatusError {
+                                status: 400,
+                                message: "response_format rejected".into(),
+                            }))
+                        } else {
+                            Ok((r#"{"decision":"run"}"#.to_string(), vec![]))
+                        }
+                    })
+                });
+
+            let branch = graph::route::classify(
+                &mut ctx,
+                &graph,
+                &block,
+                "go",
+                &create_abort_signal(),
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(branch, Branch::Run);
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].as_ref().unwrap().name, "route_decision");
+            assert!(seen[1].is_none());
+        });
+    }
+
+    /// The before-hook records `last_message`, so taking it in each transport
+    /// call shows which calls the hook ran before.
+    #[test]
+    fn repl_completion_runner_runs_the_before_hook_once_across_the_format_retry() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            with_app_config(&mut ctx, |config| {
+                config.clients = vec![ClientConfig::OpenAIConfig(Default::default())];
+            });
+            let mut data = ModelData::new("structured");
+            data.supports_structured_output = true;
+            let mut role = Role::new("r", "");
+            role.set_model(Model::from_config("openai", &[data]).remove(0));
+            role.set_structured_output(Some(
+                crate::client::structured_output::StructuredOutputSpec {
+                    name: "answer".to_string(),
+                    schema: json!({"type": "object"}),
+                },
+            ));
+            let input = Input::from_str(&ctx, "hi", Some(role)).unwrap();
+            let hook_ran = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&hook_ran);
+            let mut runner =
+                repl_completion_runner_with(move |input: &Input, _client, ctx, _abort| {
+                    recorded.lock().push(ctx.last_message.take().is_some());
+                    let has_spec = input.role().structured_output().is_some();
+                    boxed_completion(async move {
+                        if has_spec {
+                            Err(anyhow::Error::new(crate::client::ApiStatusError {
+                                status: 400,
+                                message: "response_format rejected".into(),
+                            }))
+                        } else {
+                            Ok(("ok".to_string(), vec![]))
+                        }
+                    })
+                });
+
+            let (output, _) = runner(&input, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+
+            assert_eq!(output, "ok");
+            assert_eq!(*hook_ran.lock(), vec![true, false]);
+            assert!(ctx.native_format.rejected);
+        });
+    }
+
+    #[test]
+    fn repl_completion_runner_skips_the_before_hook_when_create_client_fails() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let input = Input::from_str(&ctx, "hi", None).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let mut runner =
+                repl_completion_runner_with(move |_input: &Input, _client, _ctx, _abort| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    boxed_completion(async { Ok(("unreachable".to_string(), vec![])) })
+                });
+
+            let err = runner(&input, &mut ctx, create_abort_signal())
+                .await
+                .expect_err("the test AppState has no model to build a client for");
+
+            assert!(err.downcast_ref::<PreflightError>().is_some());
+            assert!(format!("{err:#}").contains("Invalid model"), "{err:#}");
+            assert!(ctx.last_message.is_none());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
     }
 
     #[test]

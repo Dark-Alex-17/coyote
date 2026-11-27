@@ -3,6 +3,7 @@ use super::child_sessions::{self, ChildSessionRoot, RootFile};
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
+use super::run_stats::{RunCallOutcome, RunStats};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
     KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
@@ -24,6 +25,7 @@ use super::{
     ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
+use crate::client::native_format::NativeFormatState;
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
@@ -52,8 +54,8 @@ use crate::supervisor::notification::NotificationQueue;
 use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
-    AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
+    AbortSignal, OutputSink, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
+    edit_file, estimate_token_length, fuzzy_filter, get_env_name, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -579,6 +581,13 @@ pub struct RequestContext {
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
     pub in_graph_llm_node: bool,
+    /// Native structured-output state for the current call sequence. Graph llm
+    /// nodes and the route classifier reset it before their calls; the REPL
+    /// runner does not, so a rejection there lasts until one of those resets
+    /// it. The structured-output extractor, called by llm nodes, agent nodes
+    /// and the route classifier, runs on a fresh state and restores the
+    /// caller's. Never carried into forks or children.
+    pub(crate) native_format: NativeFormatState,
     /// Whether this context may write its session back to the session file.
     /// A fork never owns the session file; only the context that loaded or
     /// created the session writes it.
@@ -611,6 +620,9 @@ pub struct RequestContext {
     /// will run, consumed by `run_agent_for_graph`.
     pub peer_assignment: Option<(String, Arc<Inbox>)>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
+    /// Usage accumulator for the whole run, shared with every branch fork
+    /// and spawned child. `None` unless a caller began one on the root.
+    pub run_stats: Option<Arc<RunStats>>,
     pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
     pub auto_continue_count: usize,
@@ -678,6 +690,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            native_format: NativeFormatState::default(),
             persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
@@ -691,6 +704,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: None,
+            run_stats: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
@@ -767,6 +781,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            native_format: NativeFormatState::default(),
             persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
@@ -780,6 +795,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: None,
+            run_stats: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
@@ -891,6 +907,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             in_graph_llm_node: self.in_graph_llm_node,
+            native_format: NativeFormatState::default(),
             persists_session: false,
             graph_chat_fc_warned: self.graph_chat_fc_warned,
             last_graph_branch: self.last_graph_branch,
@@ -904,6 +921,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: self.escalation_queue.clone(),
+            run_stats: self.run_stats.clone(),
             notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
             auto_continue_count: 0,
@@ -963,6 +981,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            native_format: NativeFormatState::default(),
             persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
@@ -976,6 +995,7 @@ impl RequestContext {
             peer_registry: None,
             peer_assignment: None,
             escalation_queue: parent.escalation_queue.clone(),
+            run_stats: parent.run_stats.clone(),
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
             auto_continue_count: 0,
@@ -1050,6 +1070,19 @@ impl RequestContext {
         self.escalation_queue
             .get_or_insert_with(|| Arc::new(EscalationQueue::new()))
             .clone()
+    }
+
+    pub fn begin_run_stats(&mut self) -> Arc<RunStats> {
+        self.run_stats
+            .get_or_insert_with(|| Arc::new(RunStats::default()))
+            .clone()
+    }
+
+    /// Records one attempted model call on the run's accumulator, if any.
+    pub fn record_run_call(&self, outcome: RunCallOutcome) {
+        if let Some(stats) = &self.run_stats {
+            stats.record_outcome(outcome);
+        }
     }
 
     pub fn ensure_inbox(&mut self) -> Arc<Inbox> {
@@ -6937,7 +6970,7 @@ impl RequestContext {
             bail!("Loaded skill '{name}' but failed to refresh tool scope: {e}");
         }
 
-        println!("✓ Loaded skill '{name}'.");
+        OutputSink::diagnostic().println(format_args!("✓ Loaded skill '{name}'."));
         report_withheld_tools(&warnings, true);
         Ok(())
     }
@@ -7425,6 +7458,7 @@ impl RequestContext {
                         async move {
                             if !rag_path.exists() {
                                 if working_mode.is_cmd() {
+                                    // --json relies on this to keep first-time RAG setup off stdout.
                                     bail!("Unknown RAG '{name}'");
                                 }
                                 Rag::init(
@@ -12361,6 +12395,65 @@ mod tests {
     }
 
     #[test]
+    fn begin_run_stats_is_idempotent_on_the_root() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.run_stats.is_none());
+
+        let first = ctx.begin_run_stats();
+        let second = ctx.begin_run_stats();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn run_stats_are_shared_with_branch_forks_and_spawned_children() {
+        let mut parent = create_test_ctx();
+        let stats = parent.begin_run_stats();
+        let branch = parent.fork_for_branch();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+
+        assert!(Arc::ptr_eq(&stats, branch.run_stats.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&stats, child.run_stats.as_ref().unwrap()));
+
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            ..Default::default()
+        };
+        for ctx in [&parent, &branch, &child] {
+            ctx.record_run_call(RunCallOutcome::Succeeded {
+                usage: Some(&usage),
+                cost: Some(0.5),
+            });
+        }
+
+        let snapshot = parent.run_stats.as_ref().unwrap().snapshot();
+        assert_eq!(snapshot.model_calls, 3);
+        assert_eq!(snapshot.input_tokens, Some(3));
+        assert_eq!(snapshot.total_cost_usd, Some(1.5));
+    }
+
+    #[test]
+    fn record_run_call_without_run_stats_is_a_no_op() {
+        let ctx = create_test_ctx();
+
+        ctx.record_run_call(RunCallOutcome::Failed);
+        ctx.record_run_call(RunCallOutcome::Succeeded {
+            usage: None,
+            cost: None,
+        });
+
+        assert!(ctx.run_stats.is_none());
+        assert!(ctx.last_token_usage.is_none());
+        assert!(ctx.last_cost.is_none());
+    }
+
+    #[test]
     #[serial]
     fn use_agent_resets_the_graph_turn_state() {
         let _guard = HelperConfigDirGuard::new();
@@ -12593,6 +12686,39 @@ mod tests {
             branch.in_graph_llm_node,
             "parallel map branches inside a node must keep the node's tool gating"
         );
+    }
+
+    fn rejected_native_format() -> NativeFormatState {
+        NativeFormatState {
+            rejected: true,
+            last_dialect: Some(crate::client::structured_output::SchemaDialect::Anthropic),
+        }
+    }
+
+    #[test]
+    fn fork_for_branch_starts_with_a_fresh_native_format_state() {
+        let mut ctx = create_test_ctx();
+        ctx.native_format = rejected_native_format();
+
+        let branch = ctx.fork_for_branch();
+
+        assert_eq!(branch.native_format, NativeFormatState::default());
+    }
+
+    #[test]
+    fn new_for_child_starts_with_a_fresh_native_format_state() {
+        let mut parent = create_test_ctx();
+        parent.native_format = rejected_native_format();
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+
+        assert_eq!(child.native_format, NativeFormatState::default());
     }
 
     #[test]

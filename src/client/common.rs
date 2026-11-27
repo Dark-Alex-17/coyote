@@ -1,7 +1,8 @@
 use super::*;
 
 use super::access_token::{distrust_access_token, get_access_token};
-use crate::config::{RenderMode, paths};
+use super::structured_output::{SchemaDialect, StructuredOutputSpec};
+use crate::config::{RenderMode, RunCallOutcome, paths};
 use crate::hooks::{self, HookEvent};
 use crate::{
     config::{AppConfig, Input, RequestContext},
@@ -54,6 +55,16 @@ pub trait Client: Sync + Send {
         false
     }
 
+    fn native_structured_output_dialect(&self) -> Option<SchemaDialect> {
+        None
+    }
+
+    fn completion_data(&self, input: &Input, stream: bool) -> Result<ChatCompletionsData> {
+        let mut data = input.prepare_completion_data(self.model(), stream)?;
+        drop_unwritten_structured_output(self.native_structured_output_dialect(), &mut data);
+        Ok(data)
+    }
+
     fn build_client(&self) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
@@ -86,7 +97,7 @@ pub trait Client: Sync + Send {
             return Ok(ChatCompletionsOutput::new(&content));
         }
         let client = self.build_client()?;
-        let data = input.prepare_completion_data(self.model(), false)?;
+        let data = self.completion_data(&input, false)?;
         let err = match self.chat_completions_inner(&client, data).await {
             Ok(output) => return Ok(output),
             Err(err) => err,
@@ -96,7 +107,7 @@ pub trait Client: Sync + Send {
                 "provider '{}' rejected access token (401); refreshing and retrying once",
                 self.name()
             );
-            let data = input.prepare_completion_data(self.model(), false)?;
+            let data = self.completion_data(&input, false)?;
             match self.chat_completions_inner(&client, data).await {
                 Err(retry_err) if is_auth_error(&retry_err) => Err(err),
                 ret => ret,
@@ -126,7 +137,7 @@ pub trait Client: Sync + Send {
                     return Ok(());
                 }
                 let client = self.build_client()?;
-                let data = input.prepare_completion_data(self.model(), true)?;
+                let data = self.completion_data(&input, true)?;
                 let err = match self.chat_completions_streaming_inner(&client, handler, data).await {
                     Ok(()) => return Ok(()),
                     Err(err) => err,
@@ -138,7 +149,7 @@ pub trait Client: Sync + Send {
                     "provider '{}' rejected access token (401); refreshing and retrying once",
                     self.name()
                 );
-                let data = input.prepare_completion_data(self.model(), true)?;
+                let data = self.completion_data(&input, true)?;
                 match self.chat_completions_streaming_inner(&client, handler, data).await {
                     Err(retry_err) if is_auth_error(&retry_err) => Err(err),
                     ret => ret,
@@ -272,6 +283,17 @@ pub trait Client: Sync + Send {
     }
 }
 
+/// A client with no native dialect has no way to send the spec, so it
+/// never reaches that client's body builder.
+fn drop_unwritten_structured_output(
+    dialect: Option<SchemaDialect>,
+    data: &mut ChatCompletionsData,
+) {
+    if dialect.is_none() {
+        data.structured_output = None;
+    }
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self::OpenAIConfig(OpenAIConfig::default())
@@ -388,6 +410,10 @@ pub struct ChatCompletionsData {
     /// Cache TTL for the system prompt and tool declarations (`"1h"`), or
     /// None for the provider default. Only the Anthropic clients read it.
     pub prompt_cache_ttl: Option<String>,
+    /// Set from the role's spec when the model's capability flag allows it
+    /// and the client has a native dialect: Some means this client writes it
+    /// into the body. See `Client::completion_data`.
+    pub structured_output: Option<StructuredOutputSpec>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -425,7 +451,7 @@ impl TokenUsage {
 
     /// Prompt-side tokens the API reported for one request: fresh input plus
     /// cache writes and cache reads. The buckets are disjoint (see
-    /// [`Self::cost_usd`]), so the terms sum without adjustment.
+    /// [`Self::billed_cost_usd`]), so the terms sum without adjustment.
     pub fn total_prompt_tokens(&self) -> u64 {
         self.input_tokens.unwrap_or(0)
             + self.cache_creation_input_tokens.unwrap_or(0)
@@ -450,25 +476,32 @@ impl TokenUsage {
         );
     }
 
-    /// USD cost of this usage at the given model's prices (USD per 1M
-    /// tokens). The four buckets are disjoint on both Anthropic direct and
-    /// Bedrock Converse (`input_tokens` excludes cache tokens), so the terms
-    /// sum without adjustment. Strict on missing prices: any nonzero
-    /// component without a price yields `None` rather than a silent
-    /// undercount. All-zero usage is also `None` — nothing billed, nothing
-    /// to show.
+    /// [`Self::billed_cost_usd`] for display: a zero total is `None`,
+    /// nothing billed, nothing to show.
     pub fn cost_usd(&self, model: &Model) -> Option<f64> {
+        self.billed_cost_usd(model).filter(|total| *total > 0.0)
+    }
+
+    /// USD cost of this usage at the given model's prices (USD per 1M
+    /// tokens), used for run accounting. The four buckets are disjoint on
+    /// both Anthropic direct and Bedrock Converse (`input_tokens` excludes
+    /// cache tokens), so the terms sum without adjustment. Strict on missing
+    /// prices: any nonzero component without a price yields `None` rather
+    /// than a silent undercount. Unlike [`Self::cost_usd`], a zero total is a
+    /// known cost.
+    pub fn billed_cost_usd(&self, model: &Model) -> Option<f64> {
         fn term(tokens: Option<u64>, price: Option<f64>) -> Option<f64> {
             match tokens.unwrap_or(0) {
                 0 => Some(0.0),
                 tokens => Some(tokens as f64 * price? / 1_000_000.0),
             }
         }
-        let total = term(self.input_tokens, model.input_price())?
-            + term(self.output_tokens, model.output_price())?
-            + term(self.cache_read_input_tokens, model.cache_read_price())?
-            + term(self.cache_creation_input_tokens, model.cache_write_price())?;
-        (total > 0.0).then_some(total)
+        Some(
+            term(self.input_tokens, model.input_price())?
+                + term(self.output_tokens, model.output_price())?
+                + term(self.cache_read_input_tokens, model.cache_read_price())?
+                + term(self.cache_creation_input_tokens, model.cache_write_price())?,
+        )
     }
 }
 
@@ -634,6 +667,13 @@ fn llm_failed_extras(
     extras
 }
 
+fn succeeded_call<'a>(usage: Option<&'a TokenUsage>, model: &Model) -> RunCallOutcome<'a> {
+    RunCallOutcome::Succeeded {
+        usage,
+        cost: usage.and_then(|usage| usage.billed_cost_usd(model)),
+    }
+}
+
 pub async fn call_chat_completions(
     input: &Input,
     print: bool,
@@ -678,11 +718,12 @@ pub async fn call_chat_completions(
                 thinking,
                 usage,
             } = ret;
+            ctx.record_run_call(succeeded_call(usage.as_ref(), client.model()));
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
                 }
-                if print {
+                if print && !json_output() {
                     ctx.app.config.print_markdown(&text)?;
                 }
             }
@@ -690,6 +731,7 @@ pub async fn call_chat_completions(
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => {
+            ctx.record_run_call(RunCallOutcome::Failed);
             hooks::fire(
                 HookEvent::LlmRequestFailed,
                 ctx,
@@ -733,6 +775,12 @@ pub async fn call_chat_completions_streaming(
     // call's input tokens (reported in message_start), so abort and error
     // paths must still count toward the session totals.
     let (text, tool_calls, thinking, usage) = handler.take();
+    let succeeded = !aborted_ctrld && !aborted_ctrlc && render_ret.is_ok() && send_ret.is_ok();
+    ctx.record_run_call(if succeeded {
+        succeeded_call(usage.as_ref(), client.model())
+    } else {
+        RunCallOutcome::Failed
+    });
     ctx.record_token_usage(usage, client.model());
 
     if aborted_ctrld {
@@ -840,6 +888,7 @@ pub async fn call_chat_completions_streaming_quiet(
             ret = client.chat_completions(input.clone()) => match ret {
                 Ok(output) => output,
                 Err(err) => {
+                    ctx.record_run_call(RunCallOutcome::Failed);
                     hooks::fire(
                         HookEvent::LlmRequestFailed,
                         ctx,
@@ -850,6 +899,7 @@ pub async fn call_chat_completions_streaming_quiet(
                 }
             },
             _ = wait_abort_signal(&abort_signal) => {
+                ctx.record_run_call(RunCallOutcome::Failed);
                 hooks::fire(
                     HookEvent::LlmRequestFailed,
                     ctx,
@@ -865,8 +915,14 @@ pub async fn call_chat_completions_streaming_quiet(
             thinking,
             usage,
         } = output;
+        let aborted = abort_signal.aborted();
+        ctx.record_run_call(if aborted {
+            RunCallOutcome::Failed
+        } else {
+            succeeded_call(usage.as_ref(), client.model())
+        });
         ctx.record_token_usage(usage, client.model());
-        if abort_signal.aborted() {
+        if aborted {
             hooks::fire(
                 HookEvent::LlmRequestFailed,
                 ctx,
@@ -893,9 +949,15 @@ pub async fn call_chat_completions_streaming_quiet(
     let send_ret = client.chat_completions_streaming(input, &mut handler).await;
 
     let (text, tool_calls, thinking, usage) = handler.take();
+    let aborted = abort_signal.aborted();
+    ctx.record_run_call(if aborted || send_ret.is_err() {
+        RunCallOutcome::Failed
+    } else {
+        succeeded_call(usage.as_ref(), client.model())
+    });
     ctx.record_token_usage(usage, client.model());
 
-    if abort_signal.aborted() {
+    if aborted {
         hooks::fire(
             HookEvent::LlmRequestFailed,
             ctx,
@@ -1181,9 +1243,10 @@ mod tests {
 
     use super::super::access_token::{is_rejected, set_access_token};
     use crate::config::{AppState, WorkingMode};
+    use crate::config::{RunStats, RunStatsSnapshot};
     use anyhow::Error;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::Instant;
 
     fn catch_error_message(data: &Value, status: u16) -> String {
@@ -1461,15 +1524,19 @@ mod tests {
     /// Fake provider whose streaming path emits `PACED_DELTAS` text chunks
     /// 60s apart, then one thinking block and one tool call, and whose
     /// non-streaming path returns that same reply in one piece when
-    /// `nonstream_replies` is set (and bails otherwise). Exercises the real
-    /// trait defaults (build_client, prepare_completion_data, abort
-    /// `select!`) with no network.
+    /// `nonstream_replies` is set (and bails otherwise). While `reject_once`
+    /// is set, the next request on either path fails with a 401 instead.
+    /// Exercises the real trait defaults (build_client, completion_data,
+    /// abort `select!`) with no network. It has no dialect, so every request
+    /// asserts the spec was dropped.
     struct PacedStreamClient {
         config: AppConfig,
         model: Model,
         stall_forever: bool,
         nonstream_replies: bool,
+        reject_once: AtomicBool,
         streaming_calls: AtomicUsize,
+        usage: Option<TokenUsage>,
     }
 
     const PACED_DELTAS: usize = 10;
@@ -1492,6 +1559,13 @@ mod tests {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         }
+    }
+
+    fn paced_auth_error() -> Error {
+        Error::new(ApiStatusError {
+            status: 401,
+            message: "error (status: 401)".to_string(),
+        })
     }
 
     #[async_trait::async_trait]
@@ -1522,6 +1596,13 @@ mod tests {
             data: ChatCompletionsData,
         ) -> Result<ChatCompletionsOutput> {
             assert!(!data.stream, "non-streaming path must not request a stream");
+            assert!(
+                data.structured_output.is_none(),
+                "spec reached a dialect-less client"
+            );
+            if self.reject_once.swap(false, Ordering::SeqCst) {
+                return Err(paced_auth_error());
+            }
             if !self.nonstream_replies {
                 bail!("the quiet transport must not take the non-streaming path");
             }
@@ -1532,7 +1613,7 @@ mod tests {
                 text: paced_text(),
                 tool_calls: vec![paced_tool_call()],
                 thinking: vec![paced_thinking()],
-                usage: None,
+                usage: self.usage.clone(),
             })
         }
 
@@ -1544,12 +1625,22 @@ mod tests {
         ) -> Result<()> {
             self.streaming_calls.fetch_add(1, Ordering::SeqCst);
             assert!(data.stream, "trait default must request a stream");
+            assert!(
+                data.structured_output.is_none(),
+                "spec reached a dialect-less client"
+            );
+            if self.reject_once.swap(false, Ordering::SeqCst) {
+                return Err(paced_auth_error());
+            }
             for i in 0..PACED_DELTAS {
                 tokio::time::sleep(PACED_GAP).await;
                 handler.text(&format!("chunk{i} "))?;
             }
             if self.stall_forever {
                 std::future::pending::<()>().await;
+            }
+            if let Some(usage) = &self.usage {
+                handler.usage(usage.clone());
             }
             handler.thinking_block(paced_thinking());
             handler.tool_call(paced_tool_call())
@@ -1562,7 +1653,9 @@ mod tests {
             model: Model::default(),
             stall_forever,
             nonstream_replies: false,
+            reject_once: AtomicBool::new(false),
             streaming_calls: AtomicUsize::new(0),
+            usage: None,
         }
     }
 
@@ -1801,6 +1894,338 @@ mod tests {
         ) -> Result<()> {
             Err(self.error())
         }
+    }
+
+    fn run_stats_ctx() -> (RequestContext, Arc<RunStats>) {
+        let mut ctx = quiet_ctx();
+        ctx.render_mode = RenderMode::Silent;
+        let stats = ctx.begin_run_stats();
+        (ctx, stats)
+    }
+
+    /// A paced client reporting `{in: 10, out: 5}` on a model priced at
+    /// $1/$2 per 1M tokens, so one succeeded call costs 0.00002.
+    fn reporting_client() -> PacedStreamClient {
+        let mut client = paced_client(false);
+        client.model = priced_model(Some(1.0), Some(2.0), None, None);
+        client.nonstream_replies = true;
+        client.usage = Some(TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            ..Default::default()
+        });
+        client
+    }
+
+    fn assert_one_succeeded_call(snapshot: &RunStatsSnapshot) {
+        assert_eq!(snapshot.model_calls, 1, "{snapshot:?}");
+        assert_eq!(snapshot.input_tokens, Some(10), "{snapshot:?}");
+        assert_eq!(snapshot.output_tokens, Some(5), "{snapshot:?}");
+        let cost = snapshot.total_cost_usd.expect("the call was priced");
+        assert!((cost - 0.00002).abs() < 1e-12, "{snapshot:?}");
+    }
+
+    fn assert_one_failed_call(snapshot: &RunStatsSnapshot) {
+        assert_eq!(
+            snapshot,
+            &RunStatsSnapshot {
+                model_calls: 1,
+                total_cost_usd: Some(0.0),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = reporting_client();
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = reporting_client();
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = reporting_client();
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn quiet_no_stream_transport_records_one_succeeded_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        let mut data = ModelData::new("test");
+        data.no_stream = true;
+        data.input_price = Some(1.0);
+        data.output_price = Some(2.0);
+        client.model = Model::from_config("provider", &[data]).remove(0);
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 0);
+        assert_one_succeeded_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn a_succeeded_call_without_usage_makes_the_run_cost_unknown() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        client.usage = None;
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.model_calls, 1);
+        assert_eq!(snapshot.input_tokens, None);
+        assert_eq!(snapshot.total_cost_usd, None);
+    }
+
+    /// The model has no prices at all; a zero bucket costs 0 without consulting one.
+    #[tokio::test]
+    async fn a_succeeded_call_with_all_zero_usage_keeps_the_run_cost_known() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        client.model = Model::default();
+        client.usage = Some(TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.model_calls, 1);
+        assert_eq!(snapshot.input_tokens, Some(0));
+        assert_eq!(snapshot.total_cost_usd, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_succeeded_call_with_unpriced_nonzero_usage_makes_the_run_cost_unknown() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = reporting_client();
+        client.model = priced_model(Some(1.0), None, None, None);
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.model_calls, 1);
+        assert_eq!(snapshot.input_tokens, Some(10));
+        assert_eq!(snapshot.total_cost_usd, None);
+    }
+
+    #[test]
+    fn billed_cost_usd_is_zero_for_all_zero_or_empty_usage_whatever_the_price() {
+        let unpriced = priced_model(None, None, None, None);
+        let zero = TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        };
+        assert_eq!(zero.billed_cost_usd(&unpriced), Some(0.0));
+        assert_eq!(TokenUsage::default().billed_cost_usd(&unpriced), Some(0.0));
+    }
+
+    #[test]
+    fn billed_cost_usd_is_zero_for_a_free_model() {
+        let free = priced_model(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(usage.billed_cost_usd(&free), Some(0.0));
+    }
+
+    #[test]
+    fn billed_cost_usd_is_unknown_when_a_nonzero_bucket_lacks_a_price() {
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            cache_read_input_tokens: Some(50),
+            ..Default::default()
+        };
+        let model = priced_model(Some(3.0), Some(15.0), None, Some(3.75));
+        assert_eq!(usage.billed_cost_usd(&model), None);
+    }
+
+    #[test]
+    fn billed_cost_usd_matches_cost_usd_for_a_priced_nonzero_call() {
+        let usage = TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            cache_creation_input_tokens: Some(200_000),
+            cache_read_input_tokens: Some(2_000_000),
+        };
+        let model = priced_model(Some(3.0), Some(15.0), Some(0.3), Some(3.75));
+        assert_eq!(usage.billed_cost_usd(&model), usage.cost_usd(&model));
+    }
+
+    #[tokio::test]
+    async fn plain_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(400);
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(400);
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn quiet_streaming_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(400);
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test]
+    async fn quiet_no_stream_transport_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = FailingStatusClient::new(400);
+        client.model = no_stream_model();
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_abort_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
+            .await
+            .unwrap_err();
+
+        assert_one_failed_call(&stats.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_abort_records_one_failed_run_call() {
+        let (mut ctx, stats) = run_stats_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+
+        let err = call_chat_completions_streaming(&input, &client, &mut ctx, abort)
+            .await
+            .expect_err("an aborted stream must not succeed");
+
+        assert_eq!(err.to_string(), "Aborted.");
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
+        assert_one_failed_call(&stats.snapshot());
     }
 
     fn llm_hooks_map(marker: &str) -> hooks::HooksMap {
@@ -2320,5 +2745,437 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer sk-test")
         );
+    }
+
+    const NATIVE_FORMAT_POINTERS: [&str; 5] = [
+        "/response_format",
+        "/text/format",
+        "/output_config/format",
+        "/generationConfig/responseJsonSchema",
+        "/outputConfig/textFormat",
+    ];
+
+    fn structured_model(client_name: &str, name: &str) -> Model {
+        let mut data = ModelData::new(name);
+        data.supports_structured_output = true;
+        Model::from_config(client_name, &[data]).remove(0)
+    }
+
+    fn structured_input() -> Input {
+        let mut role = crate::config::Role::default();
+        role.set_structured_output(structured_output_data().structured_output);
+        Input::from_str(&quiet_ctx(), "hello", Some(role)).unwrap()
+    }
+
+    /// Each path's first request is rejected with a 401, so the paced
+    /// client's no-spec assertion checks both the first attempt and the
+    /// auth retry of the non-streaming and the streaming path.
+    #[tokio::test(start_paused = true)]
+    async fn a_dialect_less_client_gets_no_spec_on_the_first_attempt_or_the_auth_retry() {
+        let mut ctx = quiet_ctx();
+        let input = structured_input();
+        let mut client = paced_client(false);
+        client.model = structured_model("paced-stream", "structured-test");
+        client.nonstream_replies = true;
+        assert!(
+            input
+                .prepare_completion_data(client.model(), false)
+                .unwrap()
+                .structured_output
+                .is_some()
+        );
+
+        cache_token("paced-stream", "paced-at");
+        client.reject_once.store(true, Ordering::SeqCst);
+        let output = client.chat_completions(input.clone()).await.unwrap();
+        assert_eq!(output.text, paced_text());
+        assert!(!client.reject_once.load(Ordering::SeqCst));
+
+        cache_token("paced-stream", "paced-at-2");
+        client.reject_once.store(true, Ordering::SeqCst);
+        let (text, _) =
+            call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+        assert_eq!(text, paced_text());
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn completion_data_keeps_the_spec_only_for_a_client_with_a_dialect() {
+        use super::super::{cohere, openai, vertexai};
+
+        let input = structured_input();
+        let http = ReqwestClient::new();
+        let prepared_has_spec = |client: &dyn Client| {
+            input
+                .prepare_completion_data(client.model(), false)
+                .unwrap()
+                .structured_output
+                .is_some()
+        };
+        // Label, spec present before the client step, spec present after it,
+        // and the request body built from the client's data.
+        let mut rows: Vec<(&str, bool, bool, Value)> = vec![];
+
+        let config = openai::OpenAIConfig {
+            name: Some("spec-openai".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let client = OpenAIClient {
+            app_config: Arc::new(AppConfig {
+                clients: vec![ClientConfig::OpenAIConfig(config.clone())],
+                ..AppConfig::default()
+            }),
+            config,
+            model: structured_model("spec-openai", "gpt-test"),
+        };
+        let data = client.completion_data(&input, false).unwrap();
+        let kept = data.structured_output.is_some();
+        let (request_data, _) = openai::prepare_chat_completions(&client, &http, data)
+            .await
+            .unwrap();
+        rows.push((
+            "openai",
+            prepared_has_spec(&client),
+            kept,
+            request_data.body,
+        ));
+
+        let client = CohereClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: cohere::CohereConfig {
+                name: Some("spec-cohere".into()),
+                api_key: Some("co-key".into()),
+                ..Default::default()
+            },
+            model: structured_model("spec-cohere", "command-test"),
+        };
+        let data = client.completion_data(&input, false).unwrap();
+        let kept = data.structured_output.is_some();
+        let request_data = cohere::prepare_chat_completions(&client, data).unwrap();
+        rows.push((
+            "cohere",
+            prepared_has_spec(&client),
+            kept,
+            request_data.body,
+        ));
+
+        set_access_token(
+            "spec-vertex",
+            "vertex-at".into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        let client = VertexAIClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: vertexai::VertexAIConfig {
+                name: Some("spec-vertex".into()),
+                project_id: Some("project".into()),
+                location: Some("us-central1".into()),
+                ..Default::default()
+            },
+            model: structured_model("spec-vertex", "mistral-large"),
+        };
+        let data = client.completion_data(&input, false).unwrap();
+        let kept = data.structured_output.is_some();
+        let request_data =
+            vertexai::prepare_chat_completions(&client, data, &vertexai::ModelCategory::Mistral)
+                .unwrap();
+        rows.push((
+            "vertex mistral",
+            prepared_has_spec(&client),
+            kept,
+            request_data.body,
+        ));
+
+        let expected = [
+            ("openai", true, true, true),
+            ("cohere", true, false, false),
+            ("vertex mistral", true, false, false),
+        ];
+        let actual: Vec<_> = rows
+            .iter()
+            .map(|(label, prepared, kept, body)| {
+                let has_format = NATIVE_FORMAT_POINTERS
+                    .into_iter()
+                    .any(|pointer| body.pointer(pointer).is_some());
+                (*label, *prepared, *kept, has_format)
+            })
+            .collect();
+        assert_eq!(actual, expected, "bodies: {rows:?}");
+    }
+
+    /// Label, expected dialect, expected format pointer, the client's
+    /// reported dialect, and the request body it built.
+    type NativeFormatRow = (
+        &'static str,
+        Option<SchemaDialect>,
+        Option<&'static str>,
+        Option<SchemaDialect>,
+        Value,
+    );
+
+    #[test]
+    fn native_structured_output_is_sent_only_when_the_client_has_a_dialect() {
+        use super::super::{
+            azure_openai, bedrock, claude, cohere, gemini, openai, openai_compatible, vertexai,
+        };
+        use std::str::FromStr;
+
+        fn written_data(client: &dyn Client) -> ChatCompletionsData {
+            client.completion_data(&structured_input(), false).unwrap()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let http = ReqwestClient::new();
+        let app_config = |clients| {
+            Arc::new(AppConfig {
+                clients,
+                ..AppConfig::default()
+            })
+        };
+        let mut rows: Vec<NativeFormatRow> = vec![];
+
+        for (label, wire_api, pointer) in [
+            ("openai chat", WireApi::Chat, "/response_format"),
+            ("openai responses", WireApi::Responses, "/text/format"),
+        ] {
+            let config = openai::OpenAIConfig {
+                name: Some("so-openai".into()),
+                api_key: Some("sk-test".into()),
+                wire_api: Some(wire_api),
+                ..Default::default()
+            };
+            let client = OpenAIClient {
+                app_config: app_config(vec![ClientConfig::OpenAIConfig(config.clone())]),
+                config,
+                model: structured_model("so-openai", "gpt-test"),
+            };
+            let (request_data, _) = runtime
+                .block_on(openai::prepare_chat_completions(
+                    &client,
+                    &http,
+                    written_data(&client),
+                ))
+                .unwrap();
+            rows.push((
+                label,
+                Some(SchemaDialect::OpenAiStrict),
+                Some(pointer),
+                client.native_structured_output_dialect(),
+                request_data.body,
+            ));
+        }
+
+        let client = AzureOpenAIClient {
+            app_config: app_config(vec![]),
+            config: azure_openai::AzureOpenAIConfig {
+                name: Some("so-azure".into()),
+                api_base: Some("https://resource.openai.azure.com".into()),
+                api_key: Some("azure-key".into()),
+                ..Default::default()
+            },
+            model: structured_model("so-azure", "gpt-test"),
+        };
+        let request_data =
+            azure_openai::prepare_chat_completions(&client, written_data(&client)).unwrap();
+        rows.push((
+            "azure",
+            Some(SchemaDialect::OpenAiStrict),
+            Some("/response_format"),
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        for (label, wire_api, pointer) in [
+            ("openai-compatible", None, "/response_format"),
+            (
+                "openai-compatible responses",
+                Some(WireApi::Responses),
+                "/text/format",
+            ),
+        ] {
+            let client = OpenAICompatibleClient {
+                app_config: app_config(vec![]),
+                config: openai_compatible::OpenAICompatibleConfig {
+                    name: Some("so-compat".into()),
+                    api_base: Some("https://compat.example/v1".into()),
+                    api_key: Some("sk-test".into()),
+                    wire_api,
+                    ..Default::default()
+                },
+                model: structured_model("so-compat", "gpt-test"),
+            };
+            let (request_data, _) = runtime
+                .block_on(openai_compatible::prepare_chat_completions(
+                    &client,
+                    &http,
+                    written_data(&client),
+                ))
+                .unwrap();
+            rows.push((
+                label,
+                Some(SchemaDialect::OpenAiStrict),
+                Some(pointer),
+                client.native_structured_output_dialect(),
+                request_data.body,
+            ));
+        }
+
+        let config = claude::ClaudeConfig {
+            name: Some("so-claude".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let client = ClaudeClient {
+            app_config: app_config(vec![ClientConfig::ClaudeConfig(config.clone())]),
+            config,
+            model: structured_model("so-claude", "claude-test"),
+        };
+        let request_data = runtime
+            .block_on(claude::prepare_chat_completions(
+                &client,
+                &http,
+                written_data(&client),
+            ))
+            .unwrap();
+        rows.push((
+            "claude",
+            Some(SchemaDialect::Anthropic),
+            Some("/output_config/format"),
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        let config = gemini::GeminiConfig {
+            name: Some("so-gemini".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        let client = GeminiClient {
+            app_config: app_config(vec![ClientConfig::GeminiConfig(config.clone())]),
+            config,
+            model: structured_model("so-gemini", "gemini-test"),
+        };
+        let request_data = runtime
+            .block_on(gemini::prepare_chat_completions(
+                &client,
+                &http,
+                written_data(&client),
+            ))
+            .unwrap();
+        rows.push((
+            "gemini",
+            Some(SchemaDialect::Gemini),
+            Some("/generationConfig/responseJsonSchema"),
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        set_access_token(
+            "so-vertex",
+            "vertex-at".into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        for (label, real_name, expected_dialect, expected_pointer) in [
+            (
+                "vertex gemini",
+                "gemini-2.5-pro",
+                Some(SchemaDialect::Gemini),
+                Some("/generationConfig/responseJsonSchema"),
+            ),
+            (
+                "vertex claude",
+                "claude-sonnet-4",
+                Some(SchemaDialect::Anthropic),
+                Some("/output_config/format"),
+            ),
+            ("vertex mistral", "mistral-large", None, None),
+        ] {
+            let client = VertexAIClient {
+                app_config: app_config(vec![]),
+                config: vertexai::VertexAIConfig {
+                    name: Some("so-vertex".into()),
+                    project_id: Some("project".into()),
+                    location: Some("us-central1".into()),
+                    ..Default::default()
+                },
+                model: structured_model("so-vertex", real_name),
+            };
+            let category = vertexai::ModelCategory::from_str(real_name).unwrap();
+            let request_data =
+                vertexai::prepare_chat_completions(&client, written_data(&client), &category)
+                    .unwrap();
+            rows.push((
+                label,
+                expected_dialect,
+                expected_pointer,
+                client.native_structured_output_dialect(),
+                request_data.body,
+            ));
+        }
+
+        let client = BedrockClient {
+            app_config: app_config(vec![]),
+            config: bedrock::BedrockConfig {
+                name: Some("so-bedrock".into()),
+                access_key_id: Some("AKIDEXAMPLE".into()),
+                secret_access_key: Some("secret".into()),
+                region: Some("us-east-1".into()),
+                ..Default::default()
+            },
+            model: structured_model("so-bedrock", "anthropic.claude-sonnet-4"),
+        };
+        let request = client
+            .chat_completions_builder(&http, written_data(&client))
+            .unwrap()
+            .build()
+            .unwrap();
+        let body = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        rows.push((
+            "bedrock",
+            Some(SchemaDialect::Anthropic),
+            Some("/outputConfig/textFormat"),
+            client.native_structured_output_dialect(),
+            body,
+        ));
+
+        let client = CohereClient {
+            app_config: app_config(vec![]),
+            config: cohere::CohereConfig {
+                name: Some("so-cohere".into()),
+                api_key: Some("co-key".into()),
+                ..Default::default()
+            },
+            model: structured_model("so-cohere", "command-test"),
+        };
+        let request_data =
+            cohere::prepare_chat_completions(&client, written_data(&client)).unwrap();
+        rows.push((
+            "cohere",
+            None,
+            None,
+            client.native_structured_output_dialect(),
+            request_data.body,
+        ));
+
+        for (label, expected_dialect, expected_pointer, dialect, body) in rows {
+            assert_eq!(dialect, expected_dialect, "{label}: dialect");
+            let present: Vec<&str> = NATIVE_FORMAT_POINTERS
+                .into_iter()
+                .filter(|pointer| body.pointer(pointer).is_some())
+                .collect();
+            assert_eq!(
+                present,
+                Vec::from_iter(expected_pointer),
+                "{label}: format pointers, body {body}"
+            );
+        }
     }
 }
