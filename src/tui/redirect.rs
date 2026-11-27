@@ -234,7 +234,12 @@ fn drain(reader: Arc<windows::Reader>, shared: Arc<Shared>, mut hooks: DrainHook
             }
             match windows::read_some(&drained.reader, &mut chunk) {
                 Ok(Got::Empty) if ready.is_ok() => None,
-                Ok(Got::Empty | Got::Eof) | Err(_) => {
+                Ok(Got::Empty | Got::Eof) => {
+                    drained.eof = true;
+                    break;
+                }
+                Err(err) => {
+                    debug!("Stopping the capture drain after a failed pipe read: {err}");
                     drained.eof = true;
                     break;
                 }
@@ -537,6 +542,7 @@ mod windows {
     use windows_sys::Win32::System::Threading::CreateEventW;
 
     use super::Got;
+    use crate::function::prompt_channel::OwnerOnlyDescriptor;
 
     pub(super) type PipeEnd = OwnedHandle;
 
@@ -546,9 +552,11 @@ mod windows {
     /// `finish` reads it; the write end is synchronous because children and
     /// Rust's stdio write to it that way. Neither end is inheritable: a
     /// child reaches the pipe only through the std handles, which `Command`
-    /// duplicates for it at spawn. The name is random and claimed with
-    /// FILE_FLAG_FIRST_PIPE_INSTANCE, so another process cannot take it
-    /// first and receive the capture.
+    /// duplicates for it at spawn. FILE_FLAG_FIRST_PIPE_INSTANCE stops
+    /// another process creating the server first, but not opening the
+    /// single instance as a client before our `CreateFileW` does; the
+    /// owner-only descriptor is what keeps other accounts and
+    /// low-integrity processes from connecting at all.
     pub(super) fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
         let name: Vec<u16> = format!(
             r"\\.\pipe\coyote-capture-{}-{}",
@@ -558,8 +566,10 @@ mod windows {
         .encode_utf16()
         .chain(Some(0))
         .collect();
-        // SAFETY: `name` is NUL terminated and outlives the call; null
-        // attributes ask for the default, non-inheritable handle.
+        let descriptor = OwnerOnlyDescriptor::new()?;
+        let attributes = descriptor.attributes();
+        // SAFETY: `name` is NUL terminated, and `attributes` and the
+        // descriptor it points at outlive the call.
         let read_end = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -569,7 +579,7 @@ mod windows {
                 PIPE_BUFFER,
                 PIPE_BUFFER,
                 0,
-                ptr::null(),
+                &attributes,
             )
         };
         if read_end == INVALID_HANDLE_VALUE {
@@ -662,7 +672,8 @@ mod windows {
     /// takes none of them. It fails once the pipe is empty and every
     /// writer has closed it.
     pub(super) fn wait_readable(reader: &Reader) -> io::Result<()> {
-        read_overlapped(&reader.pipe, &reader.ready, &mut []).map(drop)
+        let mut probe = [0u8; 1];
+        read_overlapped(&reader.pipe, &reader.ready, &mut probe[..0]).map(drop)
     }
 
     /// Waits for the read to finish before returning, so `buf` and the

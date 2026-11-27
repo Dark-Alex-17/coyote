@@ -425,7 +425,7 @@ fn serve(pipe: &OwnedHandle, shared: &Shared) -> bool {
 
 /// Owned wrappers around the Win32 named-pipe calls the server makes.
 #[cfg(windows)]
-mod win {
+pub(super) mod win {
     use std::ffi::{OsStr, c_void};
     use std::io;
     use std::os::windows::ffi::OsStrExt;
@@ -469,7 +469,7 @@ mod win {
     /// mandatory label keeps a low-integrity process of the same user
     /// (a sandboxed browser, say) from reading them, and from writing to
     /// the pipe or creating an instance under its name to forge one.
-    pub(super) struct OwnerOnlyDescriptor(*mut c_void);
+    pub(crate) struct OwnerOnlyDescriptor(*mut c_void);
 
     // SAFETY: the descriptor is an opaque heap buffer that is only read
     // after construction; nothing ties it to the thread that built it.
@@ -479,7 +479,7 @@ mod win {
     unsafe impl Sync for OwnerOnlyDescriptor {}
 
     impl OwnerOnlyDescriptor {
-        pub(super) fn new() -> io::Result<Self> {
+        pub(crate) fn new() -> io::Result<Self> {
             let sid = current_user_sid()?;
             let sddl = wide(&format!("D:P(A;;GA;;;{sid})S:(ML;;NRNW;;;ME)"));
             let mut descriptor = ptr::null_mut();
@@ -500,7 +500,7 @@ mod win {
             Ok(Self(descriptor))
         }
 
-        pub(super) fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        pub(crate) fn attributes(&self) -> SECURITY_ATTRIBUTES {
             SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: self.0,

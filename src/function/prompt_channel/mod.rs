@@ -12,6 +12,8 @@ mod tests;
 
 pub(crate) use router::{Attachment, Classified, LineAssembler, Routed, Router};
 pub(crate) use server::Server;
+#[cfg(windows)]
+pub(crate) use server::win::OwnerOnlyDescriptor;
 
 use crate::config::escape_display_text;
 use crate::events::{self, Origin};
