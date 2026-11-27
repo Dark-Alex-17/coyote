@@ -40,7 +40,7 @@ impl_client_trait!(
     (prepare_rerank, generic_rerank),
 );
 
-fn prepare_chat_completions(
+pub(super) fn prepare_chat_completions(
     self_: &CohereClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
@@ -248,4 +248,45 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     }
     let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use std::sync::Arc;
+
+    #[test]
+    fn native_structured_output_dialect_is_none() {
+        let client = CohereClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: CohereConfig::default(),
+            model: Model::new("cohere-test", "command-test"),
+        };
+
+        assert_eq!(client.native_structured_output_dialect(), None);
+    }
+
+    #[test]
+    fn chat_bodies_omit_stream_options() {
+        let client = CohereClient {
+            app_config: Arc::new(AppConfig::default()),
+            config: CohereConfig {
+                name: Some("cohere-test".into()),
+                api_key: Some("co-key".into()),
+                ..Default::default()
+            },
+            model: Model::new("cohere-test", "command-test"),
+        };
+
+        for stream in [true, false] {
+            let request_data = prepare_chat_completions(&client, plain_data(stream)).unwrap();
+
+            assert!(
+                request_data.body.get("stream_options").is_none(),
+                "body: {}",
+                request_data.body
+            );
+        }
+    }
 }

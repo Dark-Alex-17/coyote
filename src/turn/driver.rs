@@ -9,7 +9,7 @@ use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
 use crate::repl::{DEFAULT_CONTINUATION_PROMPT, EXIT_CANCEL_WAIT, latch_prompt_interrupt};
 use crate::supervisor::TaskKind;
-use crate::utils::{AbortSignal, TaskCancelGuard, wait_user_interrupt};
+use crate::utils::{AbortSignal, TaskCancelGuard, json_output, wait_user_interrupt};
 use anyhow::{Error, Result};
 use std::future::Future;
 use std::pin::Pin;
@@ -365,12 +365,16 @@ impl TurnDriver<'_> {
             ctx.before_chat_completion(&input)?;
             let graph::dispatch::ChildGraphRun { result, last_run } =
                 graph::run_active_agent_graph(ctx, &input, abort_signal.clone()).await?;
-            emit_assistant_text(
-                ui.as_ref(),
-                app.as_ref(),
-                &result.output,
-                Origin::from(&*ctx),
-            )?;
+            // Under `--json` the reply reaches stdout only inside the
+            // report.
+            if !json_output() {
+                emit_assistant_text(
+                    ui.as_ref(),
+                    app.as_ref(),
+                    &result.output,
+                    Origin::from(&*ctx),
+                )?;
+            }
             ctx.record_graph_run(app.as_ref(), &input, &result.output, last_run)?;
             return Ok(TurnOutcome::Completed);
         }

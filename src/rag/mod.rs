@@ -176,7 +176,7 @@ impl Rag {
         if doc_paths.is_empty() {
             bail!("Cannot build RAG knowledge base '{name}' with no documents");
         }
-        println!("⚙ Initializing RAG...");
+        rag_progress().println("⚙ Initializing RAG...");
         let mut data = Self::resolve_init_data(app, name, config, prompter)?;
         data.driver = config.driver.clone().unwrap_or_else(|| "yaml".to_string());
         let mut rag = Self::create(app, name, save_path, data).await?;
@@ -196,7 +196,9 @@ impl Rag {
         }
 
         match rag.save() {
-            Ok(true) => println!("✓ Saved RAG to '{}'.", save_path.display()),
+            Ok(true) => {
+                rag_progress().println(format_args!("✓ Saved RAG to '{}'.", save_path.display()))
+            }
             Ok(false) => {}
             Err(err) => {
                 sync_hooks.fire_failed(&rag.name, &rag.path, &err);
@@ -219,7 +221,7 @@ impl Rag {
             .or_else(|| app.rag_embedding_model.clone());
         let embedding_model_id = match embedding_model_id {
             Some(value) => {
-                println!("Embedding model: {value}");
+                rag_progress().println(format_args!("Embedding model: {value}"));
                 value
             }
             None => {
@@ -240,7 +242,7 @@ impl Rag {
 
         let chunk_size = match config.chunk_size.or(app.rag_chunk_size) {
             Some(value) => {
-                println!("Chunk size: {value}");
+                rag_progress().println(format_args!("Chunk size: {value}"));
                 value
             }
             None => {
@@ -254,7 +256,7 @@ impl Rag {
         };
         let chunk_overlap = match config.chunk_overlap.or(app.rag_chunk_overlap) {
             Some(value) => {
-                println!("Chunk overlap: {value}");
+                rag_progress().println(format_args!("Chunk overlap: {value}"));
                 value
             }
             None => {
@@ -311,7 +313,7 @@ impl Rag {
             prompter,
         } = run;
         Self::require_human_for_init(prompter, name)?;
-        println!("⚙ Initializing RAG...");
+        rag_progress().println("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app, prompter)?;
         let driver = if prompt_for_driver {
             select_rag_driver(prompter)?
@@ -365,7 +367,9 @@ impl Rag {
         }
 
         match rag.save() {
-            Ok(true) => println!("✓ Saved RAG to '{}'.", save_path.display()),
+            Ok(true) => {
+                rag_progress().println(format_args!("✓ Saved RAG to '{}'.", save_path.display()))
+            }
             Ok(false) => {}
             Err(err) => {
                 sync_hooks.fire_failed(&rag.name, &rag.path, &err);
@@ -603,7 +607,7 @@ impl Rag {
                     data.vectors = duck.read_all_vectors()?;
                 }
                 if data.vectors.is_empty() && !data.files.is_empty() {
-                    println!(
+                    rag_progress().println(format_args!(
                         "{} RAG '{name}' lists {} indexed file(s), but its vector store \
                          '{}' holds no vectors, so every search will return nothing. A \
                          duckdb RAG is two files: bring the .duckdb sidecar along with \
@@ -611,7 +615,7 @@ impl Rag {
                         warning_text("WARNING:"),
                         data.files.len(),
                         db_path.display()
-                    );
+                    ));
                 }
                 // data.files is always populated for duckdb, so build_bm25() is the only
                 // path; there is no from-DuckDB fallback.
@@ -714,7 +718,7 @@ impl Rag {
         let chunk_overlap = app.rag_chunk_overlap;
         let embedding_model_id = match embedding_model_id {
             Some(value) => {
-                println!("Select embedding model: {value}");
+                rag_progress().println(format_args!("Select embedding model: {value}"));
                 value
             }
             None => {
@@ -730,14 +734,14 @@ impl Rag {
 
         let chunk_size = match chunk_size {
             Some(value) => {
-                println!("Set chunk size: {value}");
+                rag_progress().println(format_args!("Set chunk size: {value}"));
                 value
             }
             None => set_chunk_size(&embedding_model, prompter)?,
         };
         let chunk_overlap = match chunk_overlap {
             Some(value) => {
-                println!("Set chunk overlay: {value}");
+                rag_progress().println(format_args!("Set chunk overlay: {value}"));
                 value
             }
             None => {
@@ -1056,12 +1060,12 @@ impl Rag {
         let mut index = 0;
         let total = recursive_urls.len() + urls.len() + protocol_paths.len() + local_paths.len();
         let handle_error = |error: anyhow::Error, has_error: &mut bool| {
-            println!("{}", warning_text(&format!("⚠️ {error}")));
+            rag_progress().println(warning_text(&format!("⚠️ {error}")));
             *has_error = true;
         };
         for start_url in recursive_urls {
             index += 1;
-            println!("Load {start_url}** [{index}/{total}]");
+            rag_progress().println(format_args!("Load {start_url}** [{index}/{total}]"));
             match load_recursive_url(&loaders, &start_url).await {
                 Ok(v) => loaded_documents.extend(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -1069,7 +1073,7 @@ impl Rag {
         }
         for url in urls {
             index += 1;
-            println!("Load {url} [{index}/{total}]");
+            rag_progress().println(format_args!("Load {url} [{index}/{total}]"));
             match load_url(&loaders, &url).await {
                 Ok(v) => loaded_documents.push(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -1077,7 +1081,7 @@ impl Rag {
         }
         for protocol_path in protocol_paths {
             index += 1;
-            println!("Load {protocol_path} [{index}/{total}]");
+            rag_progress().println(format_args!("Load {protocol_path} [{index}/{total}]"));
             match load_protocol_path(&loaders, &protocol_path).await {
                 Ok(v) => loaded_documents.extend(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -1085,7 +1089,7 @@ impl Rag {
         }
         for local_path in local_paths {
             index += 1;
-            println!("Load {local_path} [{index}/{total}]");
+            rag_progress().println(format_args!("Load {local_path} [{index}/{total}]"));
             match load_file(&loaders, &local_path).await {
                 Ok(v) => loaded_documents.push(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -2513,6 +2517,10 @@ where
     }
 
     Ok(resolved)
+}
+
+fn rag_progress() -> OutputSink {
+    OutputSink::diagnostic()
 }
 
 #[cfg(test)]

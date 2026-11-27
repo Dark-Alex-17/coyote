@@ -76,6 +76,7 @@ pub async fn macro_execute(
     macro_ctx.ui = ctx.ui.clone();
     macro_ctx.prompter = ctx.prompter.clone();
     macro_ctx.prompt_memory = ctx.prompt_memory.clone();
+    macro_ctx.run_stats = ctx.run_stats.clone();
     macro_ctx.current_depth = ctx.current_depth;
     macro_ctx.auto_continue_count = ctx.auto_continue_count;
     macro_ctx.todo_list = ctx.todo_list.clone();

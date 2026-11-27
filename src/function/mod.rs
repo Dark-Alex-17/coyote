@@ -762,7 +762,8 @@ impl Functions {
             .context("failed to write merged mcp.json")?;
 
         if !added.is_empty() {
-            println!("  + new MCP servers: {}", added.join(", "));
+            OutputSink::diagnostic()
+                .println(format_args!("  + new MCP servers: {}", added.join(", ")));
         }
 
         Ok(())

@@ -26,6 +26,7 @@ mod vault;
 extern crate log;
 
 use crate::cli::Cli;
+use crate::cli::json_output::DirectiveOutcome;
 use crate::client::{
     Client, ModelType, call_chat_completions, call_chat_completions_streaming, catalog,
     list_models, oauth,
@@ -65,6 +66,7 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use std::{env, fs, process, sync::Arc};
 
 const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
@@ -165,6 +167,14 @@ async fn async_main() -> Result<()> {
         if cli.acp_server {
             ACP_SERVER.store(true, Ordering::SeqCst);
         }
+    }
+
+    if cli.json {
+        if text.is_none() && cli.file.is_empty() {
+            bail!("--json requires a prompt (argument, -f, or stdin)");
+        }
+
+        JSON_OUTPUT.store(true, Ordering::SeqCst);
     }
 
     let info_flag = cli.info
@@ -506,6 +516,9 @@ async fn run(
         let name = &skills[0];
         paths::validate_skill_name(name)?;
         if !paths::has_skill(name) {
+            if json_output() {
+                bail!("Skill '{name}' is not installed");
+            }
             let app = Arc::clone(&ctx.app.config);
             print!("{}", ctx.upsert_skill(app.as_ref(), name)?);
             return Ok(());
@@ -736,15 +749,27 @@ async fn run(
     ctx.top_level_agent_started();
     match is_repl {
         false => {
+            let json_report = json_output();
+            if json_report {
+                ctx.render_mode = RenderMode::Silent;
+            }
+            let run_stats = json_report.then(|| ctx.begin_run_stats());
+            let started_at = Instant::now();
+            let model = ctx.current_model().id();
+            let session_id = ctx.session.as_ref().map(|s| s.name().to_string());
             let result = async {
                 let mut input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
                 input.use_embeddings(abort_signal.clone()).await?;
                 start_directive(&mut ctx, input, cli.code, abort_signal.clone()).await
             }
             .await;
+            let elapsed = started_at.elapsed();
             ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
             hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
-            result
+            if let Some(stats) = run_stats {
+                cli::json_output::emit(&result, model, session_id, &stats, elapsed);
+            }
+            result.map(|_| ())
         }
         true => {
             let full_screen = ctx.ui_kind() == config::UiKind::Tui;
@@ -773,7 +798,7 @@ async fn start_directive(
     input: Input,
     code_mode: bool,
     abort_signal: AbortSignal,
-) -> Result<()> {
+) -> Result<DirectiveOutcome> {
     let bracket = TurnBracket::enter(ctx);
     let result = start_directive_inner(ctx, input, code_mode, abort_signal.clone()).await;
     bracket.finish(ctx, &abort_signal, result)
@@ -784,7 +809,7 @@ async fn start_directive_inner(
     input: Input,
     code_mode: bool,
     abort_signal: AbortSignal,
-) -> Result<()> {
+) -> Result<DirectiveOutcome> {
     ctx.session_abort = Some(abort_signal.clone());
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     let mut runner = headless_completion_runner(extract_code);
@@ -795,8 +820,15 @@ async fn start_directive_inner(
     driver
         .run_turn(ctx, abort_signal, input, false, None)
         .await?;
+    // The turn's final reply, chat or graph, is the last message it recorded.
+    let output = ctx
+        .last_message
+        .as_ref()
+        .map(|message| message.output.clone())
+        .unwrap_or_default();
+    let outcome = DirectiveOutcome::new(ctx, output);
     ctx.exit_session()?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// One model call as a headless directive makes it: build the client, run

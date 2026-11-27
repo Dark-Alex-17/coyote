@@ -1,4 +1,4 @@
-use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signal};
+use super::{AbortSignal, IS_STDOUT_TERMINAL, OutputSink, poll_abort_signal, wait_abort_signal};
 
 use anyhow::{Result, anyhow};
 use crossterm::{cursor, queue, style, terminal};
@@ -6,7 +6,7 @@ use crossterm::{cursor, queue, style, terminal};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     future::Future,
-    io::{Write, stdout},
+    io::Write,
     sync::{Arc, Mutex, mpsc as std_mpsc},
     time::Duration,
 };
@@ -43,7 +43,7 @@ impl SpinnerInner {
         if !*IS_STDOUT_TERMINAL || self.message.is_empty() {
             return Ok(());
         }
-        let mut writer = stdout();
+        let mut writer = OutputSink::chatter().writer();
         let frame = SPINNER_FRAMES[self.index % SPINNER_FRAMES.len()];
         let dots = ".".repeat((self.index / 5) % 4);
         let line = format!("{frame}{}{:<3}", self.message, dots);
@@ -76,7 +76,7 @@ impl SpinnerInner {
         if !*IS_STDOUT_TERMINAL {
             return Ok(());
         }
-        let mut writer = stdout();
+        let mut writer = OutputSink::chatter().writer();
         queue!(
             writer,
             cursor::MoveToColumn(0),

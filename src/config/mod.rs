@@ -21,6 +21,7 @@ mod rag_cache;
 mod request_context;
 mod role;
 mod round_chains;
+mod run_stats;
 mod session;
 mod skill;
 mod skill_policy;
@@ -71,6 +72,7 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
 pub use self::round_chains::RoundChains;
+pub use self::run_stats::{RunCallOutcome, RunStats, RunStatsSnapshot};
 pub(crate) use self::session::ExitedSession;
 pub use self::session::{
     SAVED_SESSION_LINE, Session, SessionInstance, SessionScope, TURN_INTERRUPTED_TEXT,
@@ -1599,6 +1601,21 @@ clients:
         let cfg = Config::load_from_str("tui_chart_height: 20\n").unwrap();
         let app = AppConfig::from_config_lenient(cfg).unwrap();
         assert_eq!(app.tui_chart_height, 20);
+    }
+
+    #[test]
+    fn config_template_documents_supports_structured_output() {
+        let fragment = "#       supports_structured_output: true";
+        let example = include_str!("../../config.example.yaml");
+        assert!(CONFIG_TEMPLATE.contains(&format!("\n{fragment}")));
+        assert!(example.contains(&format!("\n  {fragment}")));
+        let documented = |text: &str| {
+            let line = text.lines().find(|line| line.contains(fragment)).unwrap();
+            assert!(line.is_ascii(), "{line}");
+            assert!(!line.contains("TASK-"), "{line}"); // debris-exempt
+            line.trim().trim_start_matches('#').trim().to_string()
+        };
+        assert_eq!(documented(CONFIG_TEMPLATE), documented(example));
     }
 
     #[test]

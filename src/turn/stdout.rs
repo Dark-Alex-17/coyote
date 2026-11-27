@@ -4,7 +4,8 @@ use crate::config::AppConfig;
 use crate::events::{NoticeKind, OutputStream};
 use crate::function::format_call_log;
 use crate::utils::{
-    AbortSignal, IS_STDOUT_TERMINAL, Spinner, dimmed_text, muted_warning_text, spawn_spinner,
+    AbortSignal, IS_STDOUT_TERMINAL, OutputSink, Spinner, dimmed_text, muted_warning_text,
+    spawn_spinner,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -14,7 +15,9 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// The terminal REPL's sink: prints straight to the process's stdout and stderr.
+/// The terminal REPL's sink: prints to the process's stdout and stderr.
+/// Under `--json` stdout carries only the final report, so what would
+/// print there goes to stderr or is dropped, as `OutputSink` decides.
 #[derive(Default)]
 pub struct StdoutSink {
     spinner: Mutex<Option<Spinner>>,
@@ -67,7 +70,7 @@ impl UiSink for StdoutSink {
 
     fn notice(&self, kind: NoticeKind, text: &str) {
         match kind {
-            NoticeKind::Routing => println!("{text}"),
+            NoticeKind::Routing => OutputSink::diagnostic().println(text),
             NoticeKind::ToolWarning => eprintln!("{}", muted_warning_text(text)),
             NoticeKind::Checkpoint
             | NoticeKind::AutoContinue
@@ -85,7 +88,7 @@ impl UiSink for StdoutSink {
         cmd_args: &[String],
         json_data: &Value,
     ) {
-        println!("{}", format_call_log(cmd_name, cmd_args, json_data));
+        OutputSink::chatter().println(format_call_log(cmd_name, cmd_args, json_data));
     }
 
     // Subagent (depth > 0) tools run while the parent session owns the
@@ -101,7 +104,7 @@ impl UiSink for StdoutSink {
             return;
         }
         match stream {
-            OutputStream::Stdout => echo_chunk(&mut io::stdout(), chunk),
+            OutputStream::Stdout => echo_chunk(&mut OutputSink::diagnostic().writer(), chunk),
             OutputStream::Stderr => echo_chunk(&mut io::stderr(), chunk),
         }
     }
@@ -133,8 +136,9 @@ impl UiSink for StdoutSink {
         let width = crossterm::terminal::size()
             .map(|(columns, _)| columns as usize)
             .unwrap_or(33);
-        println!("{}", dimmed_text(&"─".repeat(width))); // debris-exempt
-        println!();
+        let divider = OutputSink::chatter();
+        divider.println(dimmed_text(&"─".repeat(width))); // debris-exempt
+        divider.println("");
     }
 }
 
