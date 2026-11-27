@@ -177,10 +177,19 @@ macro_rules! impl_client_trait {
         ($prepare_chat_completions:path, $chat_completions:path, $chat_completions_streaming:path),
         ($prepare_embeddings:path, $embeddings:path),
         ($prepare_rerank:path, $rerank:path),
+        $(dialect: $dialect:expr,)?
     ) => {
         #[async_trait::async_trait]
         impl $crate::client::Client for $crate::client::$client {
             client_common_fns!();
+
+            $(
+                fn native_structured_output_dialect(
+                    &self,
+                ) -> Option<$crate::client::structured_output::SchemaDialect> {
+                    $dialect
+                }
+            )?
 
             async fn chat_completions_inner(
                 &self,
