@@ -61,9 +61,9 @@ AGPL-3.0-only; the same holds for the fork. The license texts those
 dependencies rely on are in this repository: the GNU General Public License
 version 2 in [LICENSE-GPL-2.0](./LICENSE-GPL-2.0) for the mesh crates, and the
 BSD 3-Clause License with the copyright notices of the dalek crates and
-`subtle` in [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). One obligation
-remains open for Coyote, settling the license expression for the combined
-work, which is tracked separately. [NOTICE](./NOTICE) records it.
+`subtle` in [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). Coyote itself stays
+licensed `AGPL-3.0-only`; [NOTICE](./NOTICE) records the third-party licenses
+that ship with it.
 
 `coyote-rns-transport` brings a few third parties in transitively. Its
 default `storage` feature pulls in `rusqlite` with a bundled SQLite

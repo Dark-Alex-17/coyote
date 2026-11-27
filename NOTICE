@@ -48,14 +48,11 @@ is what the "version 2 or any later version" offer names. The BSD 3-Clause
 text the dalek crates and `subtle` below are under is in the
 LICENSE-BSD-3-Clause file together with their copyright notices.
 
-One obligation of Coyote's own remains outstanding from these dependencies.
-The rest are discharged where they are recorded below, or folded into it. It
-is not an assertion of wrongdoing upstream.
-
-  - Coyote's package metadata still declares `license = "AGPL-3.0-only"`,
-    which no longer describes the combined work once these dependencies
-    ship. Settling the aggregate expression is the license owner's call and
-    is tracked separately, not as a release gate.
+Coyote's package metadata declares `license = "AGPL-3.0-only"` by the
+license owner's choice: that expression names the license of Coyote's own
+code and of the work as a whole. The third-party components that ship with it
+keep their own licenses, which this file records together with the texts they
+require; their obligations are discharged where they are recorded below.
 
 Transitive dependencies. `coyote-rns-transport` enables its default
 `storage` feature, which pulls in `rusqlite` with the `bundled` setting the
