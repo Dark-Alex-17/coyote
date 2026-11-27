@@ -43,7 +43,9 @@ BOUNDED = {
     "design_ask_gate": "B12 asks list-bounded",
     "wave_route": "B13 wave_fix_rounds<=1",
     "integration_test": "B14 integration_strikes<=3 / B15 conflict_cycles<=2",
-    "integration_check": "B14 final_integration_strikes<=3",
+    "integration_check": ("B14 final_integration_strikes<=3 / the finalize gate once per code tree: green writes the "
+                          "record the publish gates' lookup then finds; undecided goes to the finalize_unavailable "
+                          "escalation"),
     "batch_fix_route": "B16 batch strikes<=3",
     "pr_body": "B17 body_fix_rounds<=1",
     "ci_apply": "B18 fix strikes<=3 per check per PR / B19 flake reruns<=2 per check per PR",

@@ -11,6 +11,7 @@ degradation instead.
 
 import datetime
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -36,7 +37,8 @@ from _lib import (  # noqa: E402
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
-    append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, criterion_commands, emit,
+    append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, criterion_commands,
+    detected_check_command, detected_test_command, emit, round_check_commands,
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines, heal_state,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section, review_fault,
@@ -1595,12 +1597,16 @@ def _delegation_text(state, task, kind, fix_items=(), fix_note="", project_dir=N
          "- Conventions: " + CONVENTIONS_LINE.format(plans_root=state.get("plans_root"), code=code),
          "",
          "## EXPECTED OUTCOME"]
+    if _delegate_finalize_owner(state) == "parent":
+        verified = f"targeted and impacted tests green in {code}; the run's final gate runs the full suite and lint"
+    else:
+        verified = f"build + full test suite green in {code}"
     if single:
-        L += [f"Every acceptance criterion met; build + full test suite green in {code}; the work committed and pushed to the "
+        L += [f"Every acceptance criterion met; {verified}; the work committed and pushed to the "
               f"EXISTING branch {task_branch or run_branch} (already checked out - NOT commit-to-main, and NOT a new branch). Do NOT open a PR - "
               "one draft PR for the whole plan is opened at the end of the run by the orchestrator."]
     else:
-        L += [f"Every acceptance criterion met; build + full test suite green in {code}; a DRAFT PR opened (feature branch "
+        L += [f"Every acceptance criterion met; {verified}; a DRAFT PR opened (feature branch "
               f"{task_branch}, NOT commit-to-main) with base `{task.get('pr_base') or state.get('base_branch_name')}`, flipped to ready once its CI checks are green and the work is reviewable."]
     L += ["", "## MUST DO", f"- {IDIOM_LINE}", "- Derive tests from the task's Acceptance criteria."]
     if single:
@@ -1664,6 +1670,15 @@ def _delegation_text(state, task, kind, fix_items=(), fix_note="", project_dir=N
     return "\n".join(x for x in L if x is not None)
 
 
+def _delegate_finalize_owner(state):
+    """Who runs the final full-suite gate for a delegated task: 'parent' when this run publishes the integrated work
+    (single or grouped PRs) or a run-closing hygiene review covers it, else 'self' (each task PR finalizes itself)."""
+    tasks = as_list(state.get("tasks"))
+    if is_single(state) or MULTI_IS_GROUPS or any(isinstance(t, dict) and t.get("type") == "hygiene" for t in tasks):
+        return "parent"
+    return "self"
+
+
 def compose_delegation(state):
     u = {}
     tasks = as_list(state.get("tasks"))
@@ -1681,6 +1696,7 @@ def compose_delegation(state):
         text = _delegation_text(state, task, kind, as_list(state.get("fix_items")), state.get("fix_note") or "", project_dir=pd)
     u["delegation_prompt"] = text
     u["delegate_review_cadence"] = "batch" if is_micro(state) else "task"
+    u["delegate_finalize_owner"] = _delegate_finalize_owner(state)
     u["delegate_parallel"] = "0"
     u["delegate_project_dir"] = pd
     ledger(state, u, f"delegate: {task['id']} kind={kind}" + (f" items={len(as_list(state.get('fix_items')))}" if kind == "fix" else ""))
@@ -1770,7 +1786,43 @@ def _parse_report(text):
     r["shas"] = [s for s in dict.fromkeys(SHA_RE.findall(text)) if s not in ("deadbeef", "cafebabe")][:20]
     if m := SISYPHUS_RUN_RE.search(text):
         r["sisyphus_run_id"] = m.group(1)
+    r["round_checks"] = _round_checks(text)
     return r
+
+
+ROUND_CHECKS_RE = re.compile(r"(?m)^##[ \t]+Round checks[ \t]*\n((?:[ \t]*-[^\n]*(?:\n|\Z))*)")
+ROUND_CHECK_LINE_RE = re.compile(r"^[ \t]*-[ \t]+`([^`\n]+)`[ \t]*$")
+
+
+def _round_checks(text):
+    """The commands a sisyphus-next report lists under `## Round checks` (one "- `cmd`" line each), first seen first;
+    [] when the section is absent or says none."""
+    m = ROUND_CHECKS_RE.search(text or "")
+    lines = m.group(1).splitlines() if m else []
+    return list(dict.fromkeys(c.group(1).strip() for line in lines if (c := ROUND_CHECK_LINE_RE.match(line))))
+
+
+def _note_round_checks(state, u, task_id, checks):
+    """Add the reported round checks that may run to the task's task_round_checks, after the ones its earlier reports
+    listed."""
+    if not checks or not task_id:
+        return
+    known = dict(as_dict(u.get("task_round_checks", state.get("task_round_checks"))))
+    reported = list(as_list(known.get(task_id))) + list(checks)
+    known[task_id] = _runnable_round_checks(state, u, state.get("code_repo_path", ""), reported, f"round checks of {task_id}")
+    u["task_round_checks"] = known
+
+
+def _runnable_round_checks(state, u, code, checks, what):
+    """The round checks in `checks` that may run in `code`, ledgering each one left out. A child's report is free
+    text, so its checks meet the rules of an acceptance criterion's commands, with the programs of the declared
+    verification commands and of the full suite and build check the gates detect."""
+    declared = [c for c in json.loads(_verification_commands(state)) if isinstance(c, str)]
+    declared += [*detected_test_command(code), detected_check_command(code)]
+    kept, rejected = round_check_commands(checks, code, declared)
+    for c, why in rejected:
+        ledger(state, u, f"{what}: `{c}` left out: {why}")
+    return kept
 
 
 def route_delegate(state):
@@ -1797,6 +1849,7 @@ def route_delegate(state):
         task["head_sha"] = parsed["head_sha"]
     if parsed["sisyphus_run_id"]:
         task["sisyphus_run_id"] = parsed["sisyphus_run_id"]
+    _note_round_checks(state, u, task["id"], parsed["round_checks"])
     save_tasks(state, u, tasks)
     if text and not text.startswith("Agent node failed") and DISCUSSION_SENTINEL_RE.search(text):
         d = _child_discussion(text)
@@ -1968,6 +2021,9 @@ def verify_gate(state):
                 cmds = json.dumps(arr + extra)
                 over = f" ({dropped} more dropped by the cap)" if dropped else ""
                 ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
+    tier = "final" if scope == "hygiene" or (scope == "task" and _delegate_finalize_owner(state) == "self") else "round"
+    u["review_verification_tier"] = tier
+    cmds = _without_full_suite(state, u, rdir, cmds, tier)
     u["verification_commands_json"] = cmds
     u["debris_exclude"] = _debris_exclude(state, code)
     rl.append({"round": n, "head": head, "scope": scope, "started": now_iso()})
@@ -1979,6 +2035,43 @@ def verify_gate(state):
     snapshot(state, u, f"task {unit} verify r{n}")
     u["_next"] = "run_adversary" if use_adversary else "run_gauntlet"
     return u
+
+
+def _without_full_suite(state, u, rdir, cmds, tier):
+    """The review commands with the detected full suite left out: a round-tier review never runs it, and at the
+    final tier the reviewer's finalize check runs it once, so declaring it too would run it twice."""
+    try:
+        arr = json.loads(cmds)
+    except (TypeError, json.JSONDecodeError):
+        return cmds
+    forms = _full_suite_forms(rdir) if isinstance(arr, list) and arr else []
+    if not forms:
+        return cmds
+    kept, dropped = _strip_full_suite(arr, forms)
+    if not dropped:
+        ledger(state, u, f"verify: {tier} tier: no review command is the detected full suite {_named(forms, ' or ')}; "
+                         "nothing dropped")
+        return cmds
+    why = "the final gate runs it" if tier == "round" else "the finalize check runs it"
+    ledger(state, u, f"verify: {tier} tier: the full suite {_named(dropped, ', ')} left out of the review commands; {why}")
+    return json.dumps(kept)
+
+
+def _full_suite_forms(root):
+    """The full suite the coder gates detect for `root` as they run it and as detected; the declared suite may be
+    written either way, with or without the flags the gates add."""
+    return list(dict.fromkeys(f for f in detected_test_command(root) if f))
+
+
+def _strip_full_suite(cmds, forms):
+    """(kept, dropped): `cmds` less each one that is the full suite in one of its `forms`; dropped once each."""
+    hit = [isinstance(c, str) and c.strip() in forms for c in cmds]
+    return ([c for c, h in zip(cmds, hit) if not h],
+            list(dict.fromkeys(c.strip() for c, h in zip(cmds, hit) if h)))
+
+
+def _named(cmds, sep):
+    return sep.join(f"`{c}`" for c in cmds)
 
 
 # A planning store inside the code repo carries uncommitted task status edits
@@ -2772,7 +2865,8 @@ def wave_claim(state):
         roster = "\n".join(l for l in roster_lines if not l.startswith(f"- {t['id']}")) or "(no siblings)"
         prompt = _delegation_text(state, t, "implement", project_dir=wt, roster=roster)
         wave.append({"task": t["id"], "prompt": prompt, "worktree": wt, "branch": t["branch"], "base_sha": t["base_sha"],
-                     "review_cadence": "batch" if is_micro(state) else "task"})
+                     "review_cadence": "batch" if is_micro(state) else "task",
+                     "finalize_owner": _delegate_finalize_owner(state)})
     u["wave"] = wave
     u["wave_fix_rounds"] = 0
     save_tasks(state, u, tasks)
@@ -2791,7 +2885,7 @@ def wave_verify_build(state):
                 "round_log": {}, "tasks": tasks})
     inner = verify_gate(sub)
     u.update({k: inner[k] for k in ("gauntlet_prompt", "adversary_prompt", "verification_commands_json", "debris_exclude",
-                                    "review_project_dir") if k in inner})
+                                    "review_project_dir", "review_verification_tier") if k in inner})
     u["wave_report"] = state.get("wave_delegate_result") or ""
     return u
 
@@ -2826,6 +2920,7 @@ def wave_route(state):
     if real and not plan_root and as_int(state.get("wave_fix_rounds")) < RERUN_ONCE:
         fixed = dict(w)
         fixed.setdefault("review_cadence", "batch" if is_micro(state) else "task")  # a wave item from an older snapshot
+        fixed.setdefault("finalize_owner", _delegate_finalize_owner(state))
         fixed["prompt"] = (w.get("prompt", "") + "\n\n## FIX ROUND 1\nFix these plan-conformance / review failures (verbatim):\n"
                            + "\n".join(f"- {b}" for b in real) + "\n\n### Your prior report (verbatim)\n" + tail(report, 8000))
         return {"wtask": fixed, "wave_fix_rounds": as_int(state.get("wave_fix_rounds")) + 1, "_next": "wave_delegate"}
@@ -2867,6 +2962,7 @@ def wave_integrate(state):
     task.update({"worktree": r.get("worktree", task.get("worktree")), "branch": r.get("branch", task.get("branch"))})
     parsed = _parse_report(r.get("report") or "")
     u["report_parsed"] = parsed
+    _note_round_checks(state, u, r.get("task"), parsed["round_checks"])
     if parsed["pr_number"]:
         task["pr_number"], task["pr_url"] = parsed["pr_number"], parsed["pr_url"]
     save_tasks(state, u, tasks)
@@ -2893,10 +2989,11 @@ def wave_integrate(state):
     return u
 
 
-def _run_verification(state, cwd):
+def _run_verification(state, cwd, cmds=None):
     """(ok, output, failed): `failed` names the command that failed, or the one the set ran out of time before, with its
-    exit (None when it never ran); {} when nothing failed."""
-    cmds = json.loads(_verification_commands(state))
+    exit (None when it never ran); {} when nothing failed. `cmds` defaults to the declared verification commands."""
+    if cmds is None:
+        cmds = json.loads(_verification_commands(state))
     if not cmds:
         return True, "(no verification commands declared)", {}
     out_all, start = [], time.time()
@@ -2919,6 +3016,32 @@ def _drop_unpushed_merge(state, u, code, run_branch, tr):
         return
     if git(code, "reset", "--quiet", "--keep", "--end-of-options", parent)[0] == 0:
         ledger(state, u, f"integration: unpushed merge {sha[:12]} undone before merging the fixed branch")
+
+
+def _integration_commands(state, u, merged, code):
+    """What an integration run on the run branch checks: the declared verification commands plus every round check
+    the merged tasks reported that may run, except the detected full suite (it runs once, at the final gate); with
+    none left, the build check alone."""
+    declared = json.loads(_verification_commands(state))
+    forms = _full_suite_forms(code)
+    checks = as_dict(state.get("task_round_checks"))
+    sources = [tid for tid in merged if as_list(checks.get(tid))]
+    reported = [c for tid in sources for c in as_list(checks.get(tid)) if c not in declared]
+    kept, dropped = _strip_full_suite(declared + reported, forms)
+    cmds = [c for c in kept if c in declared]
+    # task_round_checks from an older snapshot never went through the rules when it was stored
+    allowed = _runnable_round_checks(state, u, code, [c for c in kept if c not in declared], "integration")
+    cmds += [c for c in allowed if c not in cmds]
+    line = f"integration: round checks of {', '.join(sources) or 'none'}"
+    if dropped:
+        line += f"; the full suite {_named(dropped, ', ')} left to the final gate"
+    elif forms and declared + reported:
+        line += f"; no command is the detected full suite {_named(forms, ' or ')}; nothing dropped"
+    if not cmds and (build := detected_check_command(code)):
+        cmds = [build]
+        line += f"; nothing else to run, so the build check `{build}` alone"
+    ledger(state, u, line)
+    return cmds
 
 
 def integration_test(state):
@@ -2963,11 +3086,13 @@ def integration_test(state):
             u["_next"] = "fix_round"
             return u
         tr.update({"merged": True, "merge_head": head, "merge_sha": git_out(code, "rev-parse", "HEAD"), "merge_parent": parent})
-    ok, out, failed = _run_verification(state, code)
+    merged = [t.get("id") for t in tasks if isinstance(t, dict) and t.get("id")
+              and (t.get("id") == tid or as_dict(rounds.get(t.get("id"))).get("integrated_sha"))]
+    ok, out, failed = _run_verification(state, code, _integration_commands(state, u, merged, code))
     if not ok:
         strikes = as_int(tr.get("integration_strikes")) + 1
         tr["integration_strikes"] = strikes
-        ledger(state, u, f"integration: suite RED after merging {tid} (strike {strikes}/{STRIKE_LIMIT})")
+        ledger(state, u, f"integration: round checks RED after merging {tid} (strike {strikes}/{STRIKE_LIMIT})")
         if esc := _verification_question(state, u, "task", tid, out, failed):
             return raise_escalation(state, u, esc)
         return _red_next(state, u, "task", tid, out, failed)
@@ -2980,7 +3105,7 @@ def integration_test(state):
     git(code, "push", "--quiet", "--end-of-options", "origin", run_branch)
     task["head_sha"] = git_out(code, "rev-parse", "HEAD", default="")
     save_tasks(state, u, tasks)
-    ledger(state, u, f"integration: {tid} merged into {run_branch} @ {task['head_sha']}; suite green; pushed")
+    ledger(state, u, f"integration: {tid} merged into {run_branch} @ {task['head_sha']}; round checks green; pushed")
     u["_next"] = "harvest_report"
     return u
 
@@ -4860,6 +4985,10 @@ def apply_answer(state):
             u["_next"] = "end_blocked"
         elif a == "skip":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + ["Run-closing hygiene pass skipped for one unit: merge-base unresolvable"]
+            if is_single(state) or MULTI_IS_GROUPS:
+                # the close-out's only unit, so hygiene_create skips nothing else; with no hygiene review to run the full
+                # suite, integration_check runs the finalize gate
+                u["hygiene_skipped"] = True
             u["_next"] = "hygiene_create"
         else:
             _unmatched(state, u, esc, answer)
@@ -4970,6 +5099,30 @@ def apply_answer(state):
             u["_next"] = "finish_plan"
     elif kind == "pr_body_notes":
         u["_next"] = "open_pr"
+    elif kind == "finalize_unavailable":
+        data = as_dict(esc.get("data"))
+        back = data.get("return") if data.get("return") in PUBLISH_GATES else ""
+        a = "stop" if stop else _picked_key(answer, options, {"continue": ["continue"], "retry": ["retry"], "stop": ["stop"]})
+        if a == "stop":
+            u["failure_reason"] = (f"stopped at the user's request: the finalize gate could not show the run branch green "
+                                   f"({tail(esc.get('evidence') or 'no detail', 300)})")
+            u["_next"] = "end_blocked"
+        elif a == "retry":
+            u["finalize_return"] = back
+            ledger(state, u, "finalize: retry asked -> integration_check")
+            u["_next"] = "integration_check"
+        elif a == "continue":
+            reason = _owner_reason(state, answer, options) or (
+                f"no reason stated; the gate reported: {tail(esc.get('evidence') or 'no detail', 300)}")
+            line = FINALIZE_WAIVED_LINE.format(reason=trim_items(reason, 300))
+            tree = data.get("tree") or ""
+            u["finalize_waived"] = {"tree": tree, "any_tree": not tree, "reason": reason}
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [line]
+            ledger(state, u, f"finalize: waived for {f'tree {tree}' if tree else 'any tree (git named none)'} "
+                             f"(by {_decided_by(state)}): {trim_items(reason, 300)}")
+            _phase_f_green(state, u, back, "")
+        else:
+            _unmatched(state, u, esc, answer)
     else:
         ledger(state, u, f"apply_answer: unknown escalation kind {kind!r}; stopping safely")
         u["failure_reason"] = f"unknown escalation kind {kind!r}"
@@ -5031,18 +5184,212 @@ def phase_f_gate(state):
 def integration_check(state):
     u = {}
     code = state.get("code_repo_path", "")
-    ok, out, failed = _run_verification(state, code)
-    if ok:
-        u.update({"integration_checked": True, "verification_proposal": {}})
-        ledger(state, u, "phase_f: full suite green on the run branch")
+    back = state.get("finalize_return") if state.get("finalize_return") in PUBLISH_GATES else ""
+    if record := _finalize_record(state, code):
+        ledger(state, u, f"phase_f: finalize reused: the green finalize record for tree {record['tree']} covers the run "
+                         "branch; the full suite does not run again")
+        return _phase_f_green(state, u, back, record["tree"])
+    if not back and _hygiene_to_come(state):
+        done = [t["id"] for t in as_list(state.get("tasks"))
+                if isinstance(t, dict) and t.get("id") and t.get("status") == "complete" and t.get("type") != "hygiene"]
+        ok, out, failed = _run_verification(state, code, _integration_commands(state, u, done, code))
+        if ok:
+            ledger(state, u, "phase_f: integration checks green on the run branch; the full suite runs once, at the "
+                             "hygiene review's final tier")
+            return _phase_f_green(state, u, "", "")
+        return _phase_f_red(state, u, out, failed, "round checks")
+    return _run_finalize_gate(state, u, code, back)
+
+
+def _phase_f_green(state, u, back, tree):
+    """Phase F is green: on to the run close, or back to the publish gate that asked for the finalize run."""
+    u.update({"integration_checked": True, "verification_proposal": {}, "finalize_return": ""})
+    if tree:
+        u["finalize_tree"] = tree
+    # each return spelled out, so audit_graph.py sees the edge
+    if back == "pr_body":
+        u["_next"] = "pr_body"
+    elif back == "flip_ready":
+        u["_next"] = "flip_ready"
+    else:
         u["_next"] = "integrate_findings"
-        return u
+    return u
+
+
+def _phase_f_red(state, u, out, failed, ran):
     strikes = as_int(state.get("final_integration_strikes")) + 1
     u["final_integration_strikes"] = strikes
-    ledger(state, u, f"phase_f: full suite RED on the run branch (strike {strikes}/{STRIKE_LIMIT})")
+    ledger(state, u, f"phase_f: {ran} RED on the run branch (strike {strikes}/{STRIKE_LIMIT})")
     if esc := _verification_question(state, u, "run", _final_red_owner(state), out, failed):
         return raise_escalation(state, u, esc)
     return _red_next(state, u, "run", "", out, failed)
+
+
+# the gates that publish the run branch; each one sends a tree with no finalize record to integration_check first
+PUBLISH_GATES = ("pr_body", "flip_ready")
+FINALIZE_GATE_SH = os.path.join(SHARED_DIR, "finalize_gate.sh")
+FINALIZE_GATE_SECS = 3500    # under the integration_check node's 3600
+FINALIZE_TEST_SECS = 1800    # each finalize step's TEST_TIMEOUT unless the environment sets one
+FINALIZE_ITEM_CHARS = 1500   # output tail kept per failing finalize step
+FINALIZE_CONTINUE = "Continue with the full suite NOT RUN (state a reason)"
+FINALIZE_RETRY = "Retry the finalize run"
+FINALIZE_STOP = "Stop"
+FINALIZE_WAIVED_LINE = "Full suite NOT RUN at finalize: {reason}"
+
+
+def _shared(name):
+    """The `.shared` module `name`."""
+    if SHARED_DIR not in sys.path:
+        sys.path.insert(0, SHARED_DIR)
+    return importlib.import_module(name)
+
+
+def _plans_dirs(state, code):
+    return json.loads(_planning_exclude(state, code) or "[]")
+
+
+def _finalize_record(state, code):
+    """The green finalize record for the run branch's worktree as it stands, the planning store aside; None if none."""
+    vr = _shared("verify_record")
+    try:
+        _, record = vr.lookup(code, "finalize", exclude=_plans_dirs(state, code)) if code else (None, None)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+    return record if record is not None and vr.is_green(record, "finalize") else None
+
+
+def _same_code_tree(state, code, a, b):
+    """True when trees `a` and `b` differ at most under the planning store."""
+    if a == b:
+        return True
+    spec = [".", *(f":(exclude,literal){d}" for d in _plans_dirs(state, code))]
+    top = state.get("git_root") or git_out(code, "rev-parse", "--show-toplevel", default="") or code
+    return git(top, "diff-tree", "--quiet", a, b, "--", *spec)[0] == 0
+
+
+def _finalize_ok(state):
+    """True when the run branch's code tree has a green finalize record, a green finalize run whose record was not
+    written, or a waiver the owner gave for it or for any tree when git could not name the tree."""
+    waived = as_dict(state.get("finalize_waived"))
+    if truthy(waived.get("any_tree")):
+        return True
+    code = state.get("code_repo_path", "")
+    tree = _shared("verify_record").worktree_tree(code) if code else ""
+    if not tree:
+        return False
+    covered = (waived.get("tree"), state.get("finalize_tree"))
+    if any(t and _same_code_tree(state, code, t, tree) for t in covered):
+        return True
+    return _finalize_record(state, code) is not None
+
+
+def _waiver_line(state):
+    """The not-run line for a finalize waiver that covers the run branch's code tree or any tree; "" when none does."""
+    waived = as_dict(state.get("finalize_waived"))
+    line = FINALIZE_WAIVED_LINE.format(reason=trim_items(waived.get("reason") or "no reason recorded", 300))
+    if truthy(waived.get("any_tree")):
+        return line
+    code = state.get("code_repo_path", "")
+    tree = _shared("verify_record").worktree_tree(code) if code and waived.get("tree") else ""
+    if not tree or not _same_code_tree(state, code, waived["tree"], tree):
+        return ""
+    return line
+
+
+def _to_finalize(state, u, gate):
+    """Send a publish gate whose tree has no finalize record to integration_check, which returns to `gate`."""
+    ledger(state, u, f"finalize: no green finalize record covers the run branch -> integration_check, then {gate}")
+    u.update({"finalize_return": gate, "_next": "integration_check"})
+    return u
+
+
+def _hygiene_to_come(state):
+    """True while the closing unit's hygiene pass is still ahead: its final-tier review runs the full suite."""
+    if truthy(state.get("hygiene_skipped")):
+        return False
+    unit = state.get("closeout_unit") or "run"
+    tasks = [t for t in as_list(state.get("tasks")) if isinstance(t, dict)]
+    if any(t.get("type") == "hygiene" and t.get("unit") == unit and t.get("status") != "complete" for t in tasks):
+        return True
+    return unit not in as_list(state.get("hygiene_done"))
+
+
+def _finalize_item(item):
+    """One finalize step that did not pass: its header line, then its output tail trimmed to FINALIZE_ITEM_CHARS."""
+    head = f"{item.get('role')} `{item.get('cmd') or '(none)'}`: {item.get('verdict')} (exit {item.get('exit')})"
+    if str(item.get("note") or "").strip():
+        head += f"; {str(item['note']).strip()}"
+    out = str(item.get("tail") or "").strip()
+    return head + (f"\n{tail(out, FINALIZE_ITEM_CHARS)}" if out else "")
+
+
+def _last_json(text):
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    try:
+        found = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError:
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _run_finalize_gate(state, u, code, back):
+    """The run's one full suite, formatter and lint on the run branch, through .shared/finalize_gate.sh, which writes
+    the finalize record. Red takes the Phase F fix-round path; a run that decides nothing is never read as green."""
+    runs = as_int(state.get("finalize_runs")) + 1
+    u["finalize_runs"] = runs
+    # the gate's arguments ride the environment: Git Bash on Windows re-parses its command line
+    env = {**os.environ, "TEST_TIMEOUT": os.environ.get("TEST_TIMEOUT") or str(FINALIZE_TEST_SECS),
+           "AX_FINALIZE_SCRIPT": FINALIZE_GATE_SH, "AX_FINALIZE_DIR": code,
+           "AX_FINALIZE_FLOOR": state.get("run_base_sha") or ""}
+    if lock := str(var(state, "build_lock") or ""):
+        env["LLM_AGENT_VAR_BUILD_LOCK"] = lock
+    try:
+        p = subprocess.run([_shared("base_suite").bash_program(), "-c",
+                            'exec "$BASH" "$AX_FINALIZE_SCRIPT" "$AX_FINALIZE_DIR" architect-next "$AX_FINALIZE_FLOOR"'],
+                           capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                           timeout=FINALIZE_GATE_SECS, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _finalize_unavailable(state, u, back, f"the finalize gate did not finish: {e}")
+    summary = _last_json(p.stdout)
+    status = summary.get("status")
+    if p.returncode != 0 or status not in ("green", "red", "unavailable"):
+        return _finalize_unavailable(state, u, back, f"the finalize gate exited {p.returncode} with no status: "
+                                                     f"{tail(p.stderr or p.stdout or 'no output', 600)}")
+    items = [i for i in as_list(summary.get("items")) if isinstance(i, dict)]
+    tree = summary.get("tree") or ""
+    if status == "unavailable" or any(i.get("verdict") == "timed_out" for i in items):
+        shown = [_finalize_item(i) for i in items if i.get("verdict") not in ("green", "pre-existing")]
+        return _finalize_unavailable(state, u, back, "\n\n".join(shown) or tail(p.stderr, 600) or "no detail")
+    if status == "green" and not tree:
+        # a green run on a tree git could not name covers no known tree, and the publish gates would only send it back
+        return _finalize_unavailable(state, u, back, "the finalize gate reported green but named no tree: git could "
+                                                     "not compute the worktree tree")
+    if status == "green":
+        ledger(state, u, f"finalize: run {runs} green on tree {tree}")
+        return _phase_f_green(state, u, back, tree)
+    failing = [i for i in items if i.get("verdict") not in _shared("verify_record").PASSING]
+    ledger(state, u, f"finalize: run {runs} red on tree {tree or '(unknown)'} "
+                     f"({', '.join(str(i.get('role')) for i in failing) or 'no failing step named'})")
+    first = failing[0] if failing else {}
+    out = "\n\n".join(_finalize_item(i) for i in failing) or tail(p.stdout, 1500)
+    return _phase_f_red(state, u, out, {"command": first.get("cmd") or "", "exit": first.get("exit")}, "full suite")
+
+
+def _finalize_unavailable(state, u, back, detail):
+    """Ask how to go on when the finalize run could not decide the run branch; an undecided run is never green."""
+    code = state.get("code_repo_path", "")
+    tree = _shared("verify_record").worktree_tree(code) if code else ""
+    ledger(state, u, f"finalize: undecided on tree {tree or '(unknown)'} ({tail(detail, 300)}); never read as green")
+    return raise_escalation(state, u, escalation(
+        "finalize_unavailable",
+        "The finalize gate (full suite, formatter, lint) could not show the run branch green, and an undecided run is "
+        "never read as green. Continue with the full suite not run for this tree, retry the run, or stop?",
+        [option(FINALIZE_CONTINUE, True, "the report and the PR body say the full suite was not run, with the "
+                                         "stated reason; the run goes on"),
+         option(FINALIZE_RETRY, False, "runs the finalize gate again on the same tree"),
+         option(FINALIZE_STOP)],
+        evidence=tail(detail, 2500), hard_trigger=True,
+        data={"decision": f"finalize_unavailable:{tree}", "tree": tree, "return": back}))
 
 
 def integrate_route(state):
@@ -5249,7 +5596,8 @@ def _hygiene_brief(state, base, scope_word, ledger_lines, lint_cmd, pr_line):
         "For each hit: REMOVE it, or JUSTIFY it -- a justification must cite a repo convention at file:line or a recorded `## Quality bar` "
         "drop -- and report every kept item under a `HYGIENE:` heading (file:line, what, justification). A lint hit may be kept ONLY for "
         "the reasons the code-review skill sanctions (the glyph is the point, or the line must name the needles); such a line is marked "
-        f"with the lint's `debris-exempt` token. Then run the full suite{pr_line}.\n"
+        f"with the lint's `debris-exempt` token. Then commit{pr_line}; the final-tier review runs the full suite, formatter "
+        "and lint once.\n"
         "Carve-outs: you MAY touch any task's files; you MAY delete opt-in-only or CI-duplicate tests and lapsed scaffolding, NEVER a "
         "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
         f"Starting ledger (exemptions earlier tasks justified; verbatim):\n{ledger_lines or '(none)'}\n"
@@ -5384,6 +5732,8 @@ def pr_body(state):
         ledger(state, u, "pr: summary node unavailable; Problem/Approach pasted verbatim (declared)")
     if changes := _verification_change_lines(state):
         summary = summary.rstrip("\n") + "\n\n## Verification command changes\n" + "\n".join(changes)
+    if waived := _waiver_line(state):
+        summary = summary.rstrip("\n") + "\n\n## Verification\n" + waived
     write_artifact(run_dir, "pr-summary.md", summary)
     hyg = as_list(state.get("hygiene_items"))
     if hyg:
@@ -5422,6 +5772,9 @@ def open_pr(state):
     u = {}
     harvest_anomaly_lines(state, u, state.get("pr_body_fix_report") or "", "pr_body_fix")
     note_script_error(state, u, "pr_body_fix")
+    if not _finalize_ok(state):
+        # back through pr_body, so a waiver given on the way lands in the PR body
+        return _to_finalize(state, u, "pr_body")
     code = state.get("code_repo_path", "")
     branch = state.get("run_branch") or _run_branch(state)
     base = state.get("unit_base_branch") or state.get("base_branch_name") or "main"
@@ -5789,6 +6142,8 @@ def ci_apply(state):
 def flip_ready(state):
     u = {}
     started = _lib._now()
+    if (is_single(state) or MULTI_IS_GROUPS) and state.get("pr_number") and not _finalize_ok(state):
+        return _to_finalize(state, u, "flip_ready")
     code = state.get("code_repo_path", "")
     tasks = as_list(state.get("tasks"))
     if is_single(state) or MULTI_IS_GROUPS:
@@ -6476,7 +6831,8 @@ def whetstone_gate(state):
 def group_closeout(state):
     u = {}
     u["closeout_scope"] = state.get("closeout_scope") or "group"
-    u.update({"integration_checked": False, "hygiene_units": []})
+    # a hygiene pass skipped for an earlier group does not skip this group's
+    u.update({"integration_checked": False, "hygiene_units": [], "hygiene_skipped": False})
     ledger(state, u, f"group: close-out of {state.get('closeout_unit')} (scope {u['closeout_scope']})")
     if _group_members(state) == "":
         return _skip_empty_group(state, u)

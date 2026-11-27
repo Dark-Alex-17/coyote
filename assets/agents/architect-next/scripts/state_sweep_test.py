@@ -41,6 +41,9 @@ for _k in list(os.environ):
         os.environ.pop(_k)
 os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
                    "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+# the coder gates' full suite and build check for every scratch repo, so no gate falls back to detecting them with a
+# model
+os.environ.update({"TEST_CMD": "suite-runner --all", "BUILD_CMD": "true"})
 
 BIN = os.path.join(TMP, "bin")
 os.makedirs(BIN)

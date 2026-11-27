@@ -95,7 +95,7 @@ GO_AHEAD_FILLER = frozenset((
 
 # The graph variables; a run restored from a discussion park keeps the live values of these.
 RUN_VARIABLES = ("project_dir", "observability_agent", "parallel", "auto_confirm", "escalation_policy", "build_lock",
-                 "review_cadence", "retrospective", "pr_tracking")
+                 "review_cadence", "finalize_owner", "run_base", "retrospective", "pr_tracking")
 
 
 def bare_go_ahead(text):
@@ -699,6 +699,31 @@ def added_lines_since(root, base):
     return "\n".join(l for l in out.splitlines() if l.startswith("+") and not l.startswith("+++"))
 
 
+def detected_test_command(root):
+    """(as run, as detected): the full test command the coder gates detect for `root`, after and before
+    gate_test_command_for_run rewrites it; ("", "") when none is detected or bash fails.
+
+    `root` reaches bash through the environment: Git Bash on Windows re-parses its command line."""
+    shared = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    import base_suite
+    script = ('source "$1"; source "$2"; bare=$(gate_test_command "$SX_TEST_ROOT"); '
+              'printf "%s\\0%s" "$(gate_test_command_for_run "$bare")" "$bare"')
+    try:
+        p = subprocess.run(
+            [base_suite.bash_program(), "-c", script, "detected-test-command", base_suite.UTILS, base_suite.GATE_LIB],
+            capture_output=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=30,
+            env={**os.environ, "SX_TEST_ROOT": root},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    if p.returncode != 0:
+        return "", ""
+    run, _, bare = p.stdout.partition("\0")
+    return run.strip(), bare.strip()
+
+
 # ---------------------------------------------------------------- criterion commands
 GIT_READ_ONLY = ("diff", "status", "log", "show", "rev-parse", "ls-files", "merge-base", "cat-file")
 GIT_UNSAFE_ARGS = ("-O", "--open-files-in-pager", "--ext-diff", "--textconv", "--output")
@@ -725,37 +750,55 @@ def _in_tree_executable(prog, cwd):
     return os.path.commonpath([root, path]) == root and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+def _declared_programs(declared):
+    return {a[0] for a in map(_command_args, declared or []) if a}
+
+
+def _command_refusal(span, cwd, programs):
+    """Why `span` may not run through a shell as a verification command; "" when it may.
+
+    A span may run when it has no shell metacharacters, quotes, ~ or !, no leading NAME=value assignment, and a
+    program that is either one of `programs`, a path holding a slash that resolves to an executable file inside cwd,
+    or git with a read-only subcommand (diff, status, log, show, rev-parse, ls-files, merge-base, cat-file) and no
+    -O, --open-files-in-pager, --ext-diff, --textconv or --output argument. Any git span must meet the git rule, even
+    when git is one of `programs`. Assignments are refused because the span runs through a shell, where
+    GIT_EXTERNAL_DIFF, GIT_CONFIG_*, PATH or LD_PRELOAD would turn an allowed program into an arbitrary one."""
+    if SHELL_META_RE.search(span):
+        return "shell metacharacters, quotes, ~ or !"
+    if ENV_ASSIGN_RE.match(span):
+        return "a leading NAME=value assignment"
+    args = _command_args(span)
+    if not args:
+        return "no program"
+    prog = args[0]
+    if prog == "git":
+        if len(args) < 2 or args[1] not in GIT_READ_ONLY or any(a.startswith(GIT_UNSAFE_ARGS) for a in args):
+            return "git without a read-only subcommand"
+    elif prog not in programs and not ("/" in prog and _in_tree_executable(prog, cwd)):
+        return f"`{prog}` is neither a declared program nor an executable inside the repo"
+    return ""
+
+
 def criterion_commands(criteria_text, cwd, declared, cap=8):
     """(kept, dropped): the backticked spans of acceptance criteria whose exit status is the criterion's verdict.
 
-    A span counts when it has a program and at least one argument, no leading NAME=value assignment, no shell
-    metacharacters, quotes, ~ or !, and a program that is either the program of a declared verification command,
-    a path holding a slash that resolves to an executable file inside cwd, or git with a read-only subcommand
-    (diff, status, log, show, rev-parse, ls-files, merge-base, cat-file) and no -O, --open-files-in-pager,
-    --ext-diff, --textconv or --output argument. Any git span must meet the git rule, even when git is declared.
-    The span must also carry --exit-code or --quiet, or sit on a criterion line that states a passing exit and no
-    failing one, because a span whose exit does not decide the criterion would report a false green or red.
-    Assignments are refused because the span runs through a shell, where GIT_EXTERNAL_DIFF, GIT_CONFIG_*, PATH or
-    LD_PRELOAD would turn an allowed program into an arbitrary one.
+    A span counts when _command_refusal allows it with the programs of the declared verification commands, and it
+    has at least one argument. The span must also carry --exit-code or --quiet, or sit on a criterion line that
+    states a passing exit and no failing one, because a span whose exit does not decide the criterion would report
+    a false green or red.
     kept is deduplicated and at most cap long; dropped counts the eligible spans the cap left out.
     """
-    programs = {a[0] for a in map(_command_args, declared or []) if a}
+    programs = _declared_programs(declared)
     out, seen, dropped = [], set(), 0
     for line in (criteria_text or "").splitlines():
         prose = re.sub(r"`[^`]*`", " ", line)
         line_passes = bool(CRITERION_PASS_RE.search(prose)) and not CRITERION_FAIL_RE.search(prose)
         for span in re.findall(r"`([^`]+)`", line):
             span = span.strip()
-            if span in seen or SHELL_META_RE.search(span):
+            if span in seen or _command_refusal(span, cwd, programs):
                 continue
             args = _command_args(span)
-            if ENV_ASSIGN_RE.match(span) or len(args) < 2 or not (line_passes or any(a in EXIT_CODE_FLAGS for a in args)):
-                continue
-            prog = args[0]
-            if prog == "git":
-                if args[1] not in GIT_READ_ONLY or any(a.startswith(GIT_UNSAFE_ARGS) for a in args):
-                    continue
-            elif prog not in programs and not ("/" in prog and _in_tree_executable(prog, cwd)):
+            if len(args) < 2 or not (line_passes or any(a in EXIT_CODE_FLAGS for a in args)):
                 continue
             seen.add(span)
             if len(out) >= cap:

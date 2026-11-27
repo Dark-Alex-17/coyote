@@ -1508,6 +1508,11 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("adversary").join("scripts"),
         &agents.join("adversary").join("scripts"),
     );
+    // the round-tier rows ask the coder's own gate_lib.sh for the detected full suite
+    copy_tree(
+        &agents_dir().join("coder").join("scripts"),
+        &agents.join("coder").join("scripts"),
+    );
     // the red-gate rows render the coder's own end_failure template, and the
     // seating rows read every child agent's declared variables
     for entry in fs::read_dir(agents_dir()).unwrap() {
@@ -1888,6 +1893,267 @@ fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
                  state.get(\"git_report\") or \"\"))) if linked",
                 "flip: a publish report naming only Closes #12 never runs gh pr ready on 12; the \
                  ref comes from gh pr view",
+            ),
+        ],
+    );
+}
+
+/// Each verification tier guard, removed from a scratch copy, turns its smoke
+/// row red: every guard behind the final tier and the tier in the reuse key,
+/// the round tier's full-suite drop in either form and its record commands,
+/// the finalize check before publishing and its floor, the finalize gate's
+/// red route, crash guard, empty-tree guard and environment-borne arguments,
+/// the hard-trigger `finalize_unavailable` question, the waiver of an unknown
+/// tree and its report lines, the triage override for a red full suite, the
+/// report's Verification line and `## Round checks`, the published-tree note
+/// and `publish_done`.
+#[test]
+#[ignore = "thirty-three smoke battery runs take about an hour; run with -- --ignored"] // TASK-942
+fn verification_tier_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let tier_guard =
+        "if _finalize_owner(state) != \"self\" or _subtask_phase(state) or _published(state):";
+    let due_guard = "if _finalize_owner(state) != \"self\" or _published(state):";
+    run_smoke_sabotages(
+        &python,
+        &[
+            (
+                "final-tier-owner",
+                tier_guard,
+                "if _subtask_phase(state) or _published(state):",
+                "tiers: finalize_owner parent keeps every review at the round tier, the final \
+                 review too",
+            ),
+            (
+                "final-tier-subtask",
+                tier_guard,
+                "if _finalize_owner(state) != \"self\" or _published(state):",
+                "tiers: a subtask round reviews at the round tier and the same run's final review \
+                 at the final tier",
+            ),
+            (
+                "final-tier-published",
+                tier_guard,
+                "if _finalize_owner(state) != \"self\" or _subtask_phase(state):",
+                "tiers: after a publish step every review is round tier",
+            ),
+            (
+                "final-tier-waiver",
+                "    return not _waived(state, root, _worktree_tree(root))\n",
+                "    return True\n",
+                "finalize_unavailable: a waived tree reviews at the round tier",
+            ),
+            (
+                "tier-always-final",
+                "tier = \"final\" if _final_tier(state, root) else \"round\"",
+                "tier = \"final\"",
+                "tiers: a subtask round reviews at the round tier and the same run's final review \
+                 at the final tier",
+            ),
+            (
+                "tier-always-round",
+                "tier = \"final\" if _final_tier(state, root) else \"round\"",
+                "tier = \"round\"",
+                "tiers: a run with no subtasks reviews at the final tier, its round entry and key \
+                 carry the tier, and the run base is the baseline floor",
+            ),
+            (
+                "reuse-key-tier",
+                "u[\"review_carried_failures\"], tier)",
+                "u[\"review_carried_failures\"])",
+                "tiers: a round-tier PASS on the same tree is not reused for a final round",
+            ),
+            (
+                "final-tier-false",
+                tier_guard,
+                "if True:",
+                "tiers: a probe-adoption round before publish is final",
+            ),
+            (
+                "published-post-publish",
+                "truthy(state.get(\"pr_published\")) or truthy(state.get(\"ci_fix_active\"))\n            \
+                 or as_int(state.get(\"pr_review_rounds\")) > 0 or \
+                 truthy(state.get(\"base_sync_active\")))",
+                "truthy(state.get(\"pr_published\")))",
+                "tiers: CI-fix, base-sync and review_update rounds are round tier",
+            ),
+            (
+                "round-keeps-full",
+                "    kept = [c for c in arr if not (isinstance(c, str) and c.strip() in forms)]\n",
+                "    kept = list(arr)\n",
+                "round tier: the detected full suite is dropped from the review commands and the \
+                 round record's commands are added, in one ledger line",
+            ),
+            (
+                "round-adds-nothing",
+                "    added = [c for c in dict.fromkeys(_record_commands(record)) if c not in forms \
+                 and c not in kept]\n",
+                "    added = []\n",
+                "round tier: the detected full suite is dropped from the review commands and the \
+                 round record's commands are added, in one ledger line",
+            ),
+            (
+                "round-run-form-only",
+                "    forms = list(dict.fromkeys(f for f in \
+                 detected_test_command(state.get(\"project_dir\") or root) if f))\n",
+                "    forms = [detected_test_command(state.get(\"project_dir\") or root)[0]]\n",
+                "round tier: a review command is the full suite as the gates detect it or as they \
+                 run it; a detected suite no review command names is ledgered",
+            ),
+            (
+                "round-no-match-ledger",
+                "    if forms and arr and not dropped:\n",
+                "    if False:\n",
+                "round tier: a review command is the full suite as the gates detect it or as they \
+                 run it; a detected suite no review command names is ledgered",
+            ),
+            (
+                "finalize-due-never",
+                due_guard,
+                "if True:",
+                "pr_gate: no green finalize record -> finalize_gate, which returns to pr_gate",
+            ),
+            (
+                "finalize-due-published",
+                due_guard,
+                "if _finalize_owner(state) != \"self\":",
+                "pr_gate: post-publish paths and a parent-owned run never go to finalize_gate",
+            ),
+            (
+                "finalize-after-no-publish",
+                "    if _finalize_due(state, u):\n        u[\"finalize_return\"] = \"pr_gate\"\n        \
+                 u[\"_next\"] = \"finalize_gate\"\n        return u\n    \
+                 actions = as_dict(state.get(\"git_actions\"))\n    \
+                 wanted = any(truthy(actions.get(k)) for k in (\"commit\", \"push\", \"open_pr\"))\n    \
+                 if not wanted:\n        u[\"_next\"] = \"final_report\"\n        return u\n",
+                "    actions = as_dict(state.get(\"git_actions\"))\n    \
+                 wanted = any(truthy(actions.get(k)) for k in (\"commit\", \"push\", \"open_pr\"))\n    \
+                 if not wanted:\n        u[\"_next\"] = \"final_report\"\n        return u\n    \
+                 if _finalize_due(state, u):\n        u[\"finalize_return\"] = \"pr_gate\"\n        \
+                 u[\"_next\"] = \"finalize_gate\"\n        return u\n",
+                "pr_gate: no publish asked and no record -> finalize_gate before final_report",
+            ),
+            (
+                "finalize-floor",
+                "\n            and (record.get(\"floor\") or \"\") == floor):",
+                "):",
+                "pr_gate: a green finalize record written at another floor is a miss -> \
+                 finalize_gate",
+            ),
+            (
+                "finalize-env",
+                "'exec \"$BASH\" \"$SX_FINALIZE_SCRIPT\" \"$SX_FINALIZE_DIR\" sisyphus-next \
+                 \"$SX_FINALIZE_FLOOR\"'],",
+                "'exec \"$BASH\" \"$SX_FINALIZE_SCRIPT\" \"$@\"', \"finalize\", \
+                 env[\"SX_FINALIZE_DIR\"], \"sisyphus-next\", env[\"SX_FINALIZE_FLOOR\"]],",
+                "finalize_gate: green -> back to pr_gate with the run counted and the tree noted; \
+                 the gate gets the project, the writer and the run base floor through the \
+                 environment, never on bash's command line",
+            ),
+            (
+                "finalize-red-source",
+                "u.update(fix_source=\"finalize_gate\", ",
+                "u.update(fix_source=\"review\", ",
+                "finalize_gate: red -> compose_fix with fix_source finalize_gate, each failing \
+                 step's header kept and its output trimmed",
+            ),
+            (
+                "finalize-red-route",
+                "    u[\"_next\"] = \"compose_fix\"\n    return u\n\n\ndef _accept_red_suite",
+                "    u[\"_next\"] = \"pr_gate\"\n    return u\n\n\ndef _accept_red_suite",
+                "finalize_gate: red -> compose_fix with fix_source finalize_gate, each failing \
+                 step's header kept and its output trimmed",
+            ),
+            (
+                "finalize-crash-guard",
+                "if p.returncode != 0 or status not in (\"green\", \"red\", \"unavailable\"):",
+                "if p.returncode != 0:",
+                "finalize_gate: a crash or a reply with no status -> finalize_unavailable, never \
+                 green",
+            ),
+            (
+                "finalize-green-no-tree",
+                "    if status == \"green\" and not tree:\n",
+                "    if False:\n",
+                "finalize_gate: a green run that names no tree -> finalize_unavailable, never green",
+            ),
+            (
+                "finalize-hard-trigger",
+                "evidence=tail(detail, 2500), hard_trigger=True,",
+                "evidence=tail(detail, 2500),",
+                "finalize_unavailable: a hard trigger, so no human stops and reports and an \
+                 autonomous run asks the owner; the full suite is never waived on its own",
+            ),
+            (
+                "finalize-continue-recommended",
+                "[option(FINALIZE_CONTINUE, False,",
+                "[option(FINALIZE_CONTINUE, True,",
+                "finalize_unavailable: a hard trigger, so no human stops and reports and an \
+                 autonomous run asks the owner; the full suite is never waived on its own",
+            ),
+            (
+                "waiver-line",
+                "lines.append(f\"Full suite {what} at finalize: ",
+                "lines.append(f\"Full suite at finalize: ",
+                "finalize_unavailable: continue with a reason waives the tree; the report and the \
+                 PR body say the full suite was not run",
+            ),
+            (
+                "waiver-any-tree",
+                "    if truthy(waived.get(\"any_tree\")):\n        return True\n",
+                "",
+                "finalize_unavailable: continue on a tree git could not name waives any tree, once \
+                 asked; the review is round tier, pr_gate goes on, and the report and the PR body \
+                 say the full suite was not run",
+            ),
+            (
+                "waiver-any-tree-report",
+                "elif waived.get(\"tree\") or truthy(waived.get(\"any_tree\")):",
+                "elif waived.get(\"tree\"):",
+                "finalize_unavailable: continue on a tree git could not name waives any tree, once \
+                 asked; the review is round tier, pr_gate goes on, and the report and the PR body \
+                 say the full suite was not run",
+            ),
+            (
+                "triage-red-override",
+                "        if finding.startswith(FULL_SUITE_RED) and action != \"fix\":\n",
+                "        if False:\n",
+                "triage: a FULL-SUITE RECORD RED blocker rejected with a citation is fixed anyway, \
+                 ledgered",
+            ),
+            (
+                "triage-red-add-back",
+                "        if str(b).startswith(FULL_SUITE_RED) and str(b) not in judged:\n",
+                "        if False:\n",
+                "triage: a FULL-SUITE RECORD RED blocker the triage left out stands as a fix",
+            ),
+            (
+                "verification-line",
+                "    lines = [f\"Verification: tier {tier}; {finalize}; baseline mode {mode[-1] if \
+                 mode else 'not reported'}\"]",
+                "    lines = [f\"Verification: {finalize}\"]",
+                "report: the Verification line names the tier, the finalize runs and the coder's \
+                 baseline mode; ## Round checks lists each command",
+            ),
+            (
+                "round-checks-section",
+                "    lines += [\"## Round checks\"] + ",
+                "    lines += [] and ",
+                "report: the Verification line names the tier, the finalize runs and the coder's \
+                 baseline mode; ## Round checks lists each command",
+            ),
+            (
+                "published-tree-note",
+                "differs from the finalize record's. Advisory: the run goes on.\"\"\"\n",
+                "differs from the finalize record's. Advisory: the run goes on.\"\"\"\n    return\n",
+                "ci_gate: a published tree that differs from the finalize record's tree -> an \
+                 advisory attention line, never a block",
+            ),
+            (
+                "publish-done",
+                "        u[\"publish_done\"] = True\n",
+                "        pass\n",
+                "ci_gate: a commit-only publish sets publish_done",
             ),
         ],
     );
@@ -3517,6 +3783,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("explore_slice_team", "max_attempts", 2),
     ("explore_slice_team", "timeout", 1800),
     ("final_report", "timeout", 60),
+    ("finalize_gate", "timeout", 3600),
     ("git_ops", "max_iterations", 20),
     ("git_ops", "timeout", 1800),
     ("headless_judge", "timeout", 120),
@@ -3582,6 +3849,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "debt_rounds",
     "design_ask_rounds",
     "draft_rounds",
+    "finalize_runs",
     "fix_round",
     "fix_strikes",
     "navigator_reasks",
@@ -6500,9 +6768,94 @@ fn run_coder_passes_the_baseline_floor_to_the_coder() {
         "{node:?}"
     );
     assert_eq!(
+        node["inputs"]["verify_tier"].as_str(),
+        Some("round"),
+        "{node:?}"
+    );
+    assert_eq!(
         shipped["initial_state"]["coder_baseline_floor"].as_str(),
         Some("")
     );
+}
+
+/// Every review round hands the gauntlet the tier `build_gauntlet_prompt`
+/// decided and the run base as its baseline floor; the seeds are the round
+/// tier and no floor.
+#[test]
+fn run_gauntlet_passes_the_review_tier_and_baseline_floor() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &shipped["nodes"]["run_gauntlet"];
+    assert_eq!(
+        node["inputs"]["verification_tier"].as_str(),
+        Some("{{review_verification_tier}}"),
+        "{node:?}"
+    );
+    assert_eq!(
+        node["inputs"]["baseline_floor"].as_str(),
+        Some("{{review_baseline_floor}}"),
+        "{node:?}"
+    );
+    let seeds = &shipped["initial_state"];
+    assert_eq!(seeds["review_verification_tier"].as_str(), Some("round"));
+    assert_eq!(seeds["review_baseline_floor"].as_str(), Some(""));
+    let gate = &shipped["nodes"]["finalize_gate"];
+    assert_eq!(gate["type"].as_str(), Some("script"), "{gate:?}");
+    assert_eq!(
+        gate["script"].as_str(),
+        Some("scripts/finalize_gate.py"),
+        "{gate:?}"
+    );
+    assert_eq!(gate["fallback"].as_str(), Some("end_failure"), "{gate:?}");
+    assert!(gate.get("inputs").is_none(), "{gate:?}");
+}
+
+/// `finalize_owner` is declared where the prose twin declares it (right
+/// after `review_cadence`, right before `run_base`) with default `self`,
+/// and the candidate's description names what `parent` changes and how any
+/// other value reads.
+#[test]
+fn finalize_owner_is_declared_at_the_prose_twins_position() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let prose = variable_list(&agents_dir().join("sisyphus/config.yaml"));
+    for (label, vars) in [("sisyphus-next", &candidate), ("sisyphus", &prose)] {
+        let names = names_of(vars);
+        let at = names
+            .iter()
+            .position(|n| *n == "finalize_owner")
+            .unwrap_or_else(|| panic!("{label} declares no finalize_owner: {names:?}"));
+        assert_eq!(
+            at.checked_sub(1).and_then(|i| names.get(i)),
+            Some(&"review_cadence"),
+            "{label}: {names:?}"
+        );
+        assert_eq!(names.get(at + 1), Some(&"run_base"), "{label}: {names:?}");
+        assert_eq!(
+            vars[at]["default"].as_str(),
+            Some("self"),
+            "{label} default"
+        );
+        assert_eq!(
+            vars[at + 1]["default"].as_str(),
+            Some(""),
+            "{label} run_base default"
+        );
+    }
+    let description = candidate
+        .iter()
+        .find(|v| v["name"].as_str() == Some("finalize_owner"))
+        .and_then(|v| v["description"].as_str())
+        .unwrap();
+    for phrase in [
+        "'parent'",
+        "every review here stays at round tier and the run does not finalize",
+        "Any other value counts as self, with a ledger note",
+    ] {
+        assert!(
+            description.contains(phrase),
+            "missing {phrase:?} in: {description}"
+        );
+    }
 }
 
 /// One run of the lifted research fan-out on the real binary (which
