@@ -77,7 +77,7 @@ use crate::mesh::request::{
     NoAnswer, OriginName, PathHash, RefusalCode, RemoteRefusal, RequestError, RequestOptions,
     STATUS_PATH, redact_hashes, request as link_request, short,
 };
-use crate::mesh::routes::{Affected, LinkTry, RouteBook, Routes};
+use crate::mesh::routes::{Affected, LinkTry, RNSD_LAN, RouteBook, Routes};
 use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -495,11 +495,6 @@ pub(crate) fn loopback_endpoint(endpoint: &str) -> bool {
             .rsplit_once(':')
             .is_some_and(|(host, _)| loopback_host(host))
 }
-
-/// The local rnsd's AutoInterfaces, together, as `LanPresence` names them. It matches no
-/// path-table interface name (those read `AutoInterfacePeer[...]`), so return home over a
-/// LAN that came back asks for every wanted destination routed the long way round.
-const RNSD_LAN: &str = "rnsd AutoInterfaces";
 
 /// Whether `host`, as a `private` interface names it, is this machine: its loopback, or
 /// one of `local_addresses`, the addresses of this host's own interfaces. A name other
@@ -1961,6 +1956,45 @@ impl MeshRuntime {
                 routes
                     .return_home_rnsd(returned, &wanted, &runtime.return_home_asked)
                     .await;
+            }
+        });
+    }
+
+    /// After rnsd's interfaces `down` went down: what each offered is remembered, so return
+    /// home asks over it only for what it reaches shorter once it is back.
+    fn after_upstream_down(self: &Arc<Self>, down: Vec<String>) {
+        self.spawn_route_work(move |runtime| async move {
+            let Some(transport) = runtime.transport_handle().await else {
+                return;
+            };
+            runtime.routes(&transport).remember_rnsd_offers(&down).await;
+        });
+    }
+
+    /// `after_upstream_down` for this node's own in-process interface `iface`.
+    fn after_interface_down(self: &Arc<Self>, iface: AddressHash) {
+        self.spawn_route_work(move |runtime| async move {
+            let Some(transport) = runtime.transport_handle().await else {
+                return;
+            };
+            runtime.routes(&transport).remember_own_offers(iface).await;
+        });
+    }
+
+    /// `after_upstream_down` for LAN interfaces that went from reaching someone to reaching
+    /// nobody (`lost`, as `lan_presence` names them).
+    fn after_lan_lost(self: &Arc<Self>, lost: Vec<String>) {
+        self.spawn_route_work(move |runtime| async move {
+            let Some(transport) = runtime.transport_handle().await else {
+                return;
+            };
+            let routes = runtime.routes(&transport);
+            for lan in &lost {
+                if lan == RNSD_LAN {
+                    routes.remember_rnsd_offers(std::slice::from_ref(lan)).await;
+                } else if let Ok(host) = AddressHash::new_from_hex_string(lan) {
+                    routes.remember_own_offers(host).await;
+                }
             }
         });
     }
@@ -4823,11 +4857,19 @@ async fn watch_interfaces(
                 if !change.network_changed.is_empty() {
                     last_move_at = Some(tokio::time::Instant::now());
                 }
+                let down = upstream.take_went_down();
+                if !down.is_empty() {
+                    runtime.after_upstream_down(down);
+                }
                 let step = settle.observe(&change, tokio::time::Instant::now());
                 if !change.is_empty() {
                     runtime.after_upstream_change(&change, step.opens);
                 }
                 let gained = lan_presence.observe(&runtime.lan_presence().await);
+                let lost = lan_presence.take_lost();
+                if !lost.is_empty() {
+                    runtime.after_lan_lost(lost);
+                }
                 if !gained.is_empty() {
                     runtime.after_lan_gained(gained, !settle.is_open());
                 }
@@ -4859,6 +4901,11 @@ async fn watch_interfaces(
                         )
                     {
                         runtime.after_interface_back(event.iface());
+                    }
+                    if let Some(runtime) = runtime.upgrade()
+                        && matches!(event.kind(), InterfaceEventKind::Disconnected { .. })
+                    {
+                        runtime.after_interface_down(event.iface());
                     }
                     transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
                 }

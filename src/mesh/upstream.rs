@@ -184,22 +184,31 @@ pub(crate) struct SettleStep {
 #[derive(Debug, Default)]
 pub(crate) struct LanPresence {
     seen: BTreeMap<String, u64>,
+    lost: Vec<String>,
 }
 
 impl LanPresence {
     /// Folds one reading of `counts` (interface, hosts it reaches; `None` unread) in and
     /// returns the interfaces that reach someone now and reached nobody at the last
-    /// reading. An interface's first reading is no transition, and an unread one keeps
-    /// the last count.
+    /// reading; one that went the other way is kept for `take_lost`. An interface's first
+    /// reading is no transition, and an unread one keeps the last count.
     pub(crate) fn observe(&mut self, counts: &[(String, Option<u64>)]) -> Vec<String> {
         let mut gained = Vec::new();
         for (name, count) in counts {
             let Some(count) = count else { continue };
-            if self.seen.insert(name.clone(), *count) == Some(0) && *count > 0 {
-                gained.push(name.clone());
+            match self.seen.insert(name.clone(), *count) {
+                Some(0) if *count > 0 => gained.push(name.clone()),
+                Some(before) if before > 0 && *count == 0 => self.lost.push(name.clone()),
+                _ => {}
             }
         }
         gained
+    }
+
+    /// The interfaces that went from reaching someone to reaching nobody since this was
+    /// last taken.
+    pub(crate) fn take_lost(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.lost)
     }
 }
 
@@ -213,6 +222,8 @@ pub(crate) struct UpstreamWatch {
     /// been down then, or have dropped and come back inside one poll, so the next
     /// reading that finds it online counts as a reconnect once more.
     after_move: bool,
+    /// The interfaces seen going down since `take_went_down` last ran.
+    went_down: Vec<String>,
 }
 
 impl UpstreamWatch {
@@ -223,6 +234,7 @@ impl UpstreamWatch {
             rnsd: None,
             addresses,
             after_move: false,
+            went_down: Vec::new(),
         }
     }
 
@@ -264,7 +276,10 @@ impl UpstreamWatch {
                     transitions.record(name, TransitionKind::Up, now);
                     back.push(name.clone());
                 }
-                (Some(true), false) => transitions.record(name, TransitionKind::Down, now),
+                (Some(true), false) => {
+                    transitions.record(name, TransitionKind::Down, now);
+                    self.went_down.push(name.clone());
+                }
                 _ => {}
             }
         }
@@ -280,6 +295,12 @@ impl UpstreamWatch {
             back.extend(online);
         }
         back
+    }
+
+    /// The interfaces that went down, online at one reading and offline at the next, since
+    /// this was last taken. One that was never seen online never went down.
+    pub(crate) fn take_went_down(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.went_down)
     }
 
     /// Folds one reading of the host's addresses in and returns the interfaces whose
@@ -350,6 +371,11 @@ impl UpstreamPoll {
             self.settle_at = None;
             self.tick().await;
         }
+    }
+
+    /// The rnsd interfaces the readings saw go down since this was last taken.
+    pub(crate) fn take_went_down(&mut self) -> Vec<String> {
+        self.watch.take_went_down()
     }
 
     /// One poll: one read of rnsd when there is one (serialised with every other read
@@ -1056,6 +1082,28 @@ mod tests {
         assert_eq!(started.elapsed(), SETTLE_READ, "the first wait's deadline");
     }
 
+    /// An upstream goes down only from online: one offline at the join read that comes
+    /// up later is a first connect, which leaves nothing for return home to remember, and
+    /// one that drops after it was up is taken once.
+    #[test]
+    fn only_an_upstream_seen_online_goes_down() {
+        let transitions = InterfaceTransitions::default();
+        let now = SystemTime::now();
+        let mut watch = UpstreamWatch::default();
+        watch.seed_rnsd(&[tcp(RELAY, false)]);
+        assert_eq!(
+            watch.observe_rnsd(&[tcp(RELAY, true)], &transitions, now),
+            [RELAY]
+        );
+        assert!(
+            watch.take_went_down().is_empty(),
+            "the session-start connect"
+        );
+        watch.observe_rnsd(&[tcp(RELAY, false)], &transitions, now);
+        assert_eq!(watch.take_went_down(), [RELAY]);
+        assert!(watch.take_went_down().is_empty());
+    }
+
     /// A LAN interface that goes from nobody to somebody has come back; its first reading,
     /// an unread count, and a LAN that keeps its hosts or loses them are no such change.
     #[test]
@@ -1072,7 +1120,10 @@ mod tests {
             presence.observe(&read(Some(3))).is_empty(),
             "still reaching hosts"
         );
+        assert!(presence.take_lost().is_empty(), "nothing lost yet");
         assert!(presence.observe(&read(Some(0))).is_empty(), "lost them");
+        assert_eq!(presence.take_lost(), ["AutoInterface"], "the loss is kept");
+        assert!(presence.take_lost().is_empty(), "and taken once");
         assert_eq!(
             presence.observe(&read(Some(1))),
             ["AutoInterface"],

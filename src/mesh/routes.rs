@@ -212,22 +212,45 @@ pub(crate) fn paths_over(rows: &[(String, String)], affected: &Affected) -> Vec<
         .collect()
 }
 
+/// The local rnsd's AutoInterfaces, together, as `LanPresence` names them and return home
+/// remembers what they offered. No path-table interface reads this; `interface_key` folds
+/// theirs (`AutoInterfacePeer[...]`) into it.
+pub(crate) const RNSD_LAN: &str = "rnsd AutoInterfaces";
+
+/// The name a path over rnsd's `interface` is remembered and compared under: every one of
+/// rnsd's AutoInterfaces is the one LAN, `RNSD_LAN`.
+fn interface_key(interface: &str) -> &str {
+    if interface.starts_with("AutoInterface") {
+        RNSD_LAN
+    } else {
+        interface
+    }
+}
+
 /// The destinations among `wanted` (trusted sessions and filed propagation nodes) whose
-/// path in `rows` (destination hex, interface, hops) runs the long way round, over another
-/// interface than `returned` and more than one hop, so a path request may find the shorter
-/// one the returned interface reaches. Each destination at most once.
+/// path in `rows` (destination hex, interface, hops, whether that interface is up) is worse
+/// than what `returned` offered before it went down: `offers` holds the hops each
+/// destination had over it then. A path over an interface that is down loses to the
+/// returned one, which is up; a path over an interface that is up loses only to fewer
+/// hops. A destination `returned` offered nothing for is left alone, since nothing says it
+/// reaches it shorter, as is one already over `returned`. Each destination at most once.
 pub(crate) fn return_home_candidates(
-    rows: &[(String, String, u8)],
+    rows: &[(String, String, u8, bool)],
     returned: &str,
+    offers: &HashMap<String, u8>,
     wanted: &HashSet<String>,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     rows.iter()
-        .filter(|(destination, interface, hops)| {
-            interface != returned && *hops > 1 && wanted.contains(destination)
+        .filter(|(destination, interface, hops, online)| {
+            interface_key(interface) != returned
+                && wanted.contains(destination)
+                && offers
+                    .get(destination)
+                    .is_some_and(|offer| !online || offer < hops)
         })
-        .filter(|(destination, _, _)| seen.insert(destination.clone()))
-        .map(|(destination, _, _)| destination.clone())
+        .filter(|(destination, ..)| seen.insert(destination.clone()))
+        .map(|(destination, ..)| destination.clone())
         .collect()
 }
 
@@ -258,6 +281,9 @@ pub(crate) struct RouteBook {
     down: Mutex<HashSet<AddressHash>>,
     /// When each in-process interface last came back after a disconnect.
     back_at: Mutex<HashMap<AddressHash, SystemTime>>,
+    /// What each interface offered when it last went down: the hops of every path over it
+    /// then, by destination, under its `interface_key` (an in-process one by its hash).
+    offers: Mutex<HashMap<String, HashMap<String, u8>>>,
     /// Destinations whose path a transition made suspect; the next request to each asks
     /// the network first.
     marked: Mutex<HashSet<String>>,
@@ -324,6 +350,28 @@ impl RouteBook {
 
     fn in_process_back_since(&self, iface: &AddressHash, since: SystemTime) -> bool {
         self.back_at.lock().get(iface).is_some_and(|at| *at > since)
+    }
+
+    /// Remembers `paths` (destination, hops) as what `interface` offered as it went down,
+    /// in place of anything it offered before.
+    pub(crate) fn remember_offers(
+        &self,
+        interface: &str,
+        paths: impl IntoIterator<Item = (String, u8)>,
+    ) {
+        self.offers
+            .lock()
+            .insert(interface.to_string(), paths.into_iter().collect());
+    }
+
+    /// What `interface` offered when it last went down; empty when it has not gone down
+    /// this run.
+    pub(crate) fn offers_of(&self, interface: &str) -> HashMap<String, u8> {
+        self.offers
+            .lock()
+            .get(interface)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Marks `destinations` suspect until each is next requested.
@@ -656,27 +704,81 @@ impl Routes<'_> {
             .unwrap_or_default()
     }
 
-    /// After the rnsd interface `returned` came back: each of `wanted` routed the long way
-    /// round over another interface has rnsd's row dropped and asked for once, so the
-    /// shorter route over `returned` can answer; rnsd would answer the request from the
-    /// long row otherwise. This node's own copy stays, so a link opened meanwhile still
-    /// has a path. How many were asked for.
+    /// After rnsd's interfaces `down` went down: the paths over each are remembered as what
+    /// it offers, so return home can tell, when it comes back, whether it is the shorter
+    /// way. Unreadable rows remember nothing.
+    pub(crate) async fn remember_rnsd_offers(&self, down: &[String]) {
+        let Some(rows) = self.rnsd_rows().await else {
+            return;
+        };
+        for interface in down {
+            let paths: Vec<(String, u8)> = rows
+                .iter()
+                .filter(|row| interface_key(&row.interface) == interface)
+                .map(|row| (row.hash.to_hex_string(), row.hops))
+                .collect();
+            debug!(
+                "Mesh remembered {} path(s) over {interface}, which went down",
+                paths.len()
+            );
+            self.book.remember_offers(interface, paths);
+        }
+    }
+
+    /// `remember_rnsd_offers` for this node's own in-process interface `iface`.
+    pub(crate) async fn remember_own_offers(&self, iface: AddressHash) {
+        let iface = iface.to_hex_string();
+        let paths: Vec<(String, u8)> = self
+            .own_rows()
+            .await
+            .into_iter()
+            .filter(|(_, interface, _)| *interface == iface)
+            .map(|(destination, _, hops)| (destination, hops))
+            .collect();
+        self.book.remember_offers(&iface, paths);
+    }
+
+    /// After the rnsd interface `returned` came back: each of `wanted` whose path is worse
+    /// than what `returned` offered before it went down (`return_home_candidates`) has
+    /// rnsd's row dropped and asked for once, so the shorter route over `returned` can
+    /// answer; rnsd would answer the request from the long row otherwise. This node's own
+    /// copy stays, so a link opened meanwhile still has a path. How many were asked for.
     pub(crate) async fn return_home_rnsd(
         &self,
         returned: &str,
         wanted: &HashSet<String>,
         asked_before: &Mutex<HashSet<String>>,
     ) -> usize {
+        let offers = self.book.offers_of(returned);
+        if offers.is_empty() {
+            return 0;
+        }
         let Some(rows) = self.rnsd_rows().await else {
             return 0;
         };
-        let rows: Vec<(String, String, u8)> = rows
+        // An interface whose state cannot be read counts as up: a working path is never
+        // dropped on a guess.
+        let down: HashSet<String> = match self.rnsd {
+            Some(reader) => reader
+                .interface_states()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|state| !state.online)
+                .map(|state| state.name)
+                .collect(),
+            None => HashSet::new(),
+        };
+        let rows: Vec<(String, String, u8, bool)> = rows
             .into_iter()
-            .map(|row| (row.hash.to_hex_string(), row.interface, row.hops))
+            .map(|row| {
+                let online = !down.contains(&row.interface);
+                (row.hash.to_hex_string(), row.interface, row.hops, online)
+            })
             .collect();
         let mut asked = 0;
         for (destination, hash) in claim_unasked(
-            return_home_candidates(&rows, returned, wanted),
+            return_home_candidates(&rows, returned, &offers, wanted),
             asked_before,
         ) {
             debug!(
@@ -698,10 +800,24 @@ impl Routes<'_> {
         wanted: &HashSet<String>,
         asked_before: &Mutex<HashSet<String>>,
     ) -> usize {
-        let rows = self.own_rows().await;
+        let returned = iface.to_hex_string();
+        let offers = self.book.offers_of(&returned);
+        if offers.is_empty() {
+            return 0;
+        }
+        let rows: Vec<(String, String, u8, bool)> = self
+            .own_rows()
+            .await
+            .into_iter()
+            .map(|(destination, interface, hops)| {
+                let online = AddressHash::new_from_hex_string(&interface)
+                    .map_or(true, |hash| self.book.in_process_online(&hash));
+                (destination, interface, hops, online)
+            })
+            .collect();
         let mut asked = 0;
         for (destination, hash) in claim_unasked(
-            return_home_candidates(&rows, &iface.to_hex_string(), wanted),
+            return_home_candidates(&rows, &returned, &offers, wanted),
             asked_before,
         ) {
             debug!(
@@ -1502,6 +1618,10 @@ mod rnsd_tests {
                 ("expires", Value::F64(learned + 604_800.0)),
                 ("interface", Value::from(PUBLIC_HUB)),
             ])]),
+            ("get", "interface_stats") => map(vec![(
+                "interfaces",
+                Value::Array(vec![stat(TEAM_RELAY, true), stat(PUBLIC_HUB, true)]),
+            )]),
             ("drop", "path") => Value::from(true),
             ("get", "next_hop_if_name") => Value::from("None"),
             other => panic!("unexpected request {other:?}"),
@@ -1511,6 +1631,12 @@ mod rnsd_tests {
         let transport = transport();
         let transitions = InterfaceTransitions::default();
         let book = RouteBook::default();
+        // Before each went down, Team Relay and the propagation node reached the
+        // destination in fewer hops than the hub's 3, and the hub in 3.
+        let dest = destination().to_hex_string();
+        book.remember_offers(TEAM_RELAY, [(dest.clone(), 1)]);
+        book.remember_offers("TCPInterface[Propagation Node]", [(dest.clone(), 2)]);
+        book.remember_offers(PUBLIC_HUB, [(dest, 3)]);
         let routes = Routes {
             transport: &transport,
             rnsd: Some(&reader),
@@ -1560,6 +1686,219 @@ mod rnsd_tests {
             "a new transition asks again"
         );
         assert_eq!(drops(), 2);
+    }
+
+    /// rnsd holding one path to `destination()` over `interface`, `hops` away, with each of
+    /// `states` (interface, online) as its interface stats; a drop answers true.
+    async fn rnsd_routing(
+        interface: &'static str,
+        hops: u8,
+        states: Vec<(&'static str, bool)>,
+    ) -> FakeRnsd {
+        let learned = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        FakeRnsd::start(move |(verb, what)| match (verb.as_str(), what.as_str()) {
+            ("get", "path_table") => Value::Array(vec![map(vec![
+                ("hash", Value::Binary(destination().as_slice().to_vec())),
+                ("timestamp", Value::F64(learned)),
+                ("via", Value::Binary(vec![0x11; 16])),
+                ("hops", Value::from(hops)),
+                ("expires", Value::F64(learned + 604_800.0)),
+                ("interface", Value::from(interface)),
+            ])]),
+            ("get", "interface_stats") => map(vec![(
+                "interfaces",
+                Value::Array(
+                    states
+                        .iter()
+                        .map(|(name, online)| stat(name, *online))
+                        .collect(),
+                ),
+            )]),
+            ("drop", "path") => Value::from(true),
+            ("get", "next_hop_if_name") => Value::from("None"),
+            other => panic!("unexpected request {other:?}"),
+        })
+        .await
+    }
+
+    fn drops_of(rnsd: &FakeRnsd) -> usize {
+        rnsd.asked()
+            .iter()
+            .filter(|verb| *verb == &("drop".to_string(), "path".to_string()))
+            .count()
+    }
+
+    /// The live hub flap: the path to a session is 2 hops over Team Relay, the short way,
+    /// and the Public Hub comes back. Whatever the hub offered before it went down (the
+    /// same 2 hops, its own 3, or nothing for this destination), the working path is not
+    /// dropped and nothing says it runs the long way round.
+    #[tokio::test]
+    async fn a_hub_flap_leaves_a_shorter_lan_path_alone() {
+        crate::testing::install_log_collector();
+        let tmp = TempDir::new("routes-return-home-hub-flap");
+        let rnsd = rnsd_routing(TEAM_RELAY, 2, vec![(TEAM_RELAY, true), (PUBLIC_HUB, true)]).await;
+        let reader = rnsd.reader(&tmp);
+        let transport = transport();
+        let transitions = InterfaceTransitions::default();
+        let book = RouteBook::default();
+        let routes = Routes {
+            transport: &transport,
+            rnsd: Some(&reader),
+            transitions: &transitions,
+            book: &book,
+            own_via_rnsd: true,
+        };
+        let dest = destination().to_hex_string();
+        let wanted: HashSet<String> = [dest.clone()].into();
+        let before = crate::testing::debug_snapshot().len();
+        for offered in [Some(3), Some(2), None] {
+            book.remember_offers(PUBLIC_HUB, offered.map(|hops| (dest.clone(), hops)));
+            let asked = Mutex::new(HashSet::new());
+            assert_eq!(
+                routes.return_home_rnsd(PUBLIC_HUB, &wanted, &asked).await,
+                0,
+                "the hub offered {offered:?}"
+            );
+        }
+        assert_eq!(drops_of(&rnsd), 0, "the LAN path stays");
+        let long_way = crate::testing::debug_snapshot()[before..]
+            .iter()
+            .filter(|line| {
+                line.contains("runs the long way round")
+                    && line.contains(&format!("now that {PUBLIC_HUB} is back"))
+            })
+            .count();
+        assert_eq!(long_way, 0);
+    }
+
+    /// The #110 case: away, the path is 3 hops over the Public Hub; Team Relay reached the
+    /// destination in 2 when it went down, read from rnsd's rows then. When it comes back
+    /// the hub row is dropped and asked for again.
+    #[tokio::test]
+    async fn a_lan_relay_that_returns_shorter_than_the_hub_path_asks_again() {
+        let tmp = TempDir::new("routes-return-home-relay-back");
+        let before_down =
+            rnsd_routing(TEAM_RELAY, 2, vec![(TEAM_RELAY, true), (PUBLIC_HUB, true)]).await;
+        let reader = before_down.reader(&tmp);
+        let transport = transport();
+        let transitions = InterfaceTransitions::default();
+        let book = RouteBook::default();
+        let routes = Routes {
+            transport: &transport,
+            rnsd: Some(&reader),
+            transitions: &transitions,
+            book: &book,
+            own_via_rnsd: true,
+        };
+        routes.remember_rnsd_offers(&[TEAM_RELAY.to_string()]).await;
+        let dest = destination().to_hex_string();
+        assert_eq!(book.offers_of(TEAM_RELAY), [(dest.clone(), 2)].into());
+
+        let away = TempDir::new("routes-return-home-relay-back-away");
+        let rnsd = rnsd_routing(PUBLIC_HUB, 3, vec![(TEAM_RELAY, true), (PUBLIC_HUB, true)]).await;
+        let reader = rnsd.reader(&away);
+        let routes = Routes {
+            rnsd: Some(&reader),
+            ..routes
+        };
+        let wanted: HashSet<String> = [dest].into();
+        let asked = Mutex::new(HashSet::new());
+        assert_eq!(
+            routes.return_home_rnsd(TEAM_RELAY, &wanted, &asked).await,
+            1
+        );
+        assert_eq!(drops_of(&rnsd), 1, "the hub row is dropped and asked for");
+    }
+
+    /// A path over an interface that is down loses to the one that came back, which is
+    /// up, even at the same hops (ANN-021); over an up interface the same hops stay.
+    #[tokio::test]
+    async fn a_path_over_a_down_interface_loses_to_the_returned_one_at_equal_hops() {
+        let dest = destination().to_hex_string();
+        let wanted: HashSet<String> = [dest.clone()].into();
+        for (hub_up, expected) in [(false, 1), (true, 0)] {
+            let tmp = TempDir::new("routes-return-home-up-beats-down");
+            let rnsd = rnsd_routing(
+                PUBLIC_HUB,
+                2,
+                vec![(TEAM_RELAY, true), (PUBLIC_HUB, hub_up)],
+            )
+            .await;
+            let reader = rnsd.reader(&tmp);
+            let transport = transport();
+            let transitions = InterfaceTransitions::default();
+            let book = RouteBook::default();
+            book.remember_offers(TEAM_RELAY, [(dest.clone(), 2)]);
+            let routes = Routes {
+                transport: &transport,
+                rnsd: Some(&reader),
+                transitions: &transitions,
+                book: &book,
+                own_via_rnsd: true,
+            };
+            let asked = Mutex::new(HashSet::new());
+            assert_eq!(
+                routes.return_home_rnsd(TEAM_RELAY, &wanted, &asked).await,
+                expected,
+                "hub up: {hub_up}"
+            );
+            assert_eq!(drops_of(&rnsd), expected);
+        }
+    }
+
+    /// At session start nothing has gone down this run, so nothing is known of what any
+    /// interface offers: an interface read back at the first readings asks for nothing,
+    /// even for a path 3 hops the other way, and rnsd is not even read.
+    #[tokio::test]
+    async fn session_start_runs_no_return_home_pass() {
+        let tmp = TempDir::new("routes-return-home-start");
+        let rnsd = rnsd_routing(PUBLIC_HUB, 3, vec![(TEAM_RELAY, true), (PUBLIC_HUB, true)]).await;
+        let reader = rnsd.reader(&tmp);
+        let transport = transport();
+        let transitions = InterfaceTransitions::default();
+        let book = RouteBook::default();
+        let routes = Routes {
+            transport: &transport,
+            rnsd: Some(&reader),
+            transitions: &transitions,
+            book: &book,
+            own_via_rnsd: true,
+        };
+        let wanted: HashSet<String> = [destination().to_hex_string()].into();
+        let asked = Mutex::new(HashSet::new());
+        for returned in [TEAM_RELAY, PUBLIC_HUB, RNSD_LAN] {
+            assert_eq!(routes.return_home_rnsd(returned, &wanted, &asked).await, 0);
+        }
+        assert!(rnsd.asked().is_empty(), "{:?}", rnsd.asked());
+        let own = AddressHash::new_from_hex_string(&"cd".repeat(16)).unwrap();
+        assert_eq!(routes.return_home_in_process(own, &wanted, &asked).await, 0);
+    }
+
+    /// rnsd's AutoInterface rows, whatever follows the prefix, are remembered as the one
+    /// LAN, `RNSD_LAN`.
+    #[tokio::test]
+    async fn the_rnsd_lan_remembers_its_autointerface_paths() {
+        let tmp = TempDir::new("routes-return-home-lan-offers");
+        let rnsd = rnsd_routing("AutoInterface[Default Interface]", 1, Vec::new()).await;
+        let reader = rnsd.reader(&tmp);
+        let transport = transport();
+        let transitions = InterfaceTransitions::default();
+        let book = RouteBook::default();
+        let routes = Routes {
+            transport: &transport,
+            rnsd: Some(&reader),
+            transitions: &transitions,
+            book: &book,
+            own_via_rnsd: true,
+        };
+        routes.remember_rnsd_offers(&[RNSD_LAN.to_string()]).await;
+        assert_eq!(
+            book.offers_of(RNSD_LAN),
+            [(destination().to_hex_string(), 1)].into()
+        );
     }
 
     /// A link that never came up over a sound path learned long ago is reported at once.
@@ -1880,45 +2219,51 @@ mod tests {
         assert_eq!(paths_over(&rows, &Affected::Everything), ["aa", "bb", "cc"]);
     }
 
-    /// Back home, only the trusted sessions and filed nodes routed the long way round over
-    /// another interface are asked for again, each once.
+    /// Back home, only the trusted sessions and filed nodes whose path is worse than what
+    /// the returned interface offered are asked for again, each once: more hops over an up
+    /// interface, or any path over a down one. Equal hops, fewer hops, a destination it
+    /// offered nothing for, one already over it and a stranger are left alone.
     #[test]
     fn return_home_asks_only_for_wanted_destinations_routed_the_long_way() {
+        let hub = "TCPInterface[Public Hub]";
+        let relay = "TCPInterface[Team Relay]";
+        let row = |destination: &str, interface: &str, hops: u8, online: bool| {
+            (destination.to_string(), interface.to_string(), hops, online)
+        };
         let rows = vec![
-            (
-                "alice".to_string(),
-                "TCPInterface[Public Hub]".to_string(),
-                3,
-            ),
-            (
-                "alice".to_string(),
-                "TCPInterface[Public Hub]".to_string(),
-                3,
-            ),
-            ("pn".to_string(), "TCPInterface[Public Hub]".to_string(), 2),
-            (
-                "near".to_string(),
-                "TCPInterface[Public Hub]".to_string(),
-                1,
-            ),
-            (
-                "home".to_string(),
-                "TCPInterface[Team Relay]".to_string(),
-                2,
-            ),
-            (
-                "stranger".to_string(),
-                "TCPInterface[Public Hub]".to_string(),
-                3,
-            ),
+            row("alice", hub, 3, true),
+            row("alice", hub, 3, true),
+            row("pn", hub, 3, true),
+            row("equal", hub, 2, true),
+            row("near", hub, 1, true),
+            row("down", hub, 2, false),
+            row("unoffered", hub, 5, true),
+            row("home", relay, 2, true),
+            row("stranger", hub, 3, true),
         ];
-        let wanted: HashSet<String> = ["alice", "pn", "near", "home"]
+        let offers: HashMap<String, u8> = [
+            ("alice", 2),
+            ("pn", 1),
+            ("equal", 2),
+            ("near", 2),
+            ("down", 2),
+            ("home", 1),
+            ("stranger", 1),
+        ]
+        .into_iter()
+        .map(|(destination, hops)| (destination.to_string(), hops))
+        .collect();
+        let wanted: HashSet<String> = ["alice", "pn", "equal", "near", "down", "unoffered", "home"]
             .into_iter()
             .map(String::from)
             .collect();
         assert_eq!(
-            return_home_candidates(&rows, "TCPInterface[Team Relay]", &wanted),
-            ["alice", "pn"]
+            return_home_candidates(&rows, relay, &offers, &wanted),
+            ["alice", "pn", "down"]
+        );
+        assert!(
+            return_home_candidates(&rows, relay, &HashMap::new(), &wanted).is_empty(),
+            "nothing offered, nothing asked"
         );
     }
 

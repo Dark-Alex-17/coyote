@@ -11381,7 +11381,8 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
         stale,
         "drops the route (in rnsd's table as well as its own), asks the network for a new one once, and tries the link once more before it reports anything",
         "every route over that interface counts as stale before its next request",
-        "the trusted sessions and the propagation nodes reached the long way round over another interface are asked for once more",
+        "the trusted sessions and the propagation nodes it reached in fewer hops when it went down, and that are now reached the long way round over another interface, are asked for once more",
+        "A route over an interface that is up with no more hops than that is left alone, and so is every route when nothing is known of what the upstream reached, as at session start: a hub that flaps never takes away a shorter route over the LAN.",
         "has come back since the route was last heard (rnsd's row or this session's own copy, whichever is later, when rnsd is the session's only way in)",
         "A route over an interface that is up always wins over one over an interface that is down, whatever their hops.",
         "`rnpath -d` is no longer needed after a move.",
@@ -11392,6 +11393,11 @@ fn the_pages_quote_the_stale_route_sentence_and_the_far_peer_error() {
             "Mesh-Deployment.md's Moving between networks section does not say {needle:?}"
         );
     }
+    let gone = "the propagation nodes reached the long way round over another interface";
+    assert!(
+        !moving.contains(gone),
+        "Mesh-Deployment.md still says {gone:?}, which asked for a shorter route over the LAN as well"
+    );
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
     for needle in [
         stale,
