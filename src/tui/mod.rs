@@ -700,10 +700,12 @@ impl App {
     }
 
     /// Swaps in a theme built with the current renderer; the cells and the
-    /// composer's placeholder take their styles from here.
+    /// composer's placeholder take their styles from here, and a drawn
+    /// block, painted in the old theme's colours, is drawn again.
     fn set_theme(&mut self, theme: Theme) {
         self.renderer.faded = theme.faded;
         self.renderer.accent = theme.accent;
+        self.renderer.forget_rich_blocks();
         self.composer.set_placeholder_style(theme.faded);
         self.theme = theme;
     }

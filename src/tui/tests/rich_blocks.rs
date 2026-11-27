@@ -70,6 +70,28 @@ fn an_unsupported_diagram_shows_its_source_and_a_note() {
         "{frame}"
     );
     insta::assert_snapshot!("mermaid_fallback_note", frame);
+    let mut narrow = Harness::standalone(40, 20);
+    let frame = replied(&mut narrow, &reply_with("zenuml\n    Alice.hello()"));
+    insta::assert_snapshot!("mermaid_fallback_note_40x20", frame);
+}
+
+/// A drag over the source rows of a diagram that could not be drawn
+/// copies its fenced source, the note left out.
+#[test]
+fn a_drag_over_a_fallback_diagram_copies_its_source() {
+    let mut harness = Harness::standalone(80, 24);
+    let body = "zenuml\n    Alice.hello()";
+    replied(&mut harness, &reply_with(body));
+    let row = row_with(&harness, "Alice.hello()");
+    let note = row_with(&harness, "showing source");
+    assert_eq!(
+        left_drag(&mut harness, (6, row), (9, note)),
+        Some(Command::Copy {
+            text: fenced(body),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
 }
 
 /// Alt+M shows every diagram as its source and a second press draws it
@@ -270,6 +292,30 @@ fn a_chart_shows_and_copies_as_its_source() {
     assert!(frame.contains("type: bar"), "{frame}");
 }
 
+/// A config reload that changes only `tui_chart_height` redraws a chart
+/// already on screen at the new height.
+#[test]
+#[serial]
+fn a_reloaded_chart_height_redraws_the_chart() {
+    let _guard = TestConfigDirGuard::new("tui-chart-height-reload");
+    let mut ctx = chat_ctx();
+    let mut harness = Harness::for_ctx(&ctx);
+    harness.resize(80, 48);
+    harness.app.sync_from_ctx(&mut ctx);
+    replied(&mut harness, &chart_reply(SPARKLINE));
+    assert_eq!(chart_rows(&harness).len(), 12);
+
+    let mut app = (*ctx.app).clone();
+    app.config = Arc::new(AppConfig {
+        tui_chart_height: 20,
+        ..(*app.config).clone()
+    });
+    ctx.app = Arc::new(app);
+    harness.app.sync_from_ctx(&mut ctx);
+    harness.draw();
+    assert_eq!(chart_rows(&harness).len(), 20);
+}
+
 const FRACTION: &str = "$$\\frac{a+b}{c}$$";
 const SUM: &str = "$$\\sum_{i=1}^{n} i^2$$";
 const MATRIX: &str = "$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$";
@@ -333,6 +379,26 @@ fn display_math_that_cannot_be_drawn_shows_its_source_and_a_note() {
         "{frame}"
     );
     insta::assert_snapshot!("math_fallback_80x24", frame);
+}
+
+/// A `*` in a formula that cannot be drawn is shown as written, not read
+/// as emphasis, and a drag over the source copies the formula.
+#[test]
+fn a_formula_shown_as_source_keeps_its_stars_and_copies_as_written() {
+    let mut harness = Harness::standalone(80, 24);
+    let formula = "$$\\begin{align*} a *b* &= c_1 * d_2 \\end{align*}$$";
+    let frame = replied(&mut harness, &math_reply(formula));
+    assert!(frame.contains("a *b* &= c_1 * d_2"), "{frame}");
+    insta::assert_snapshot!("math_fallback_with_star_80x24", frame);
+    let row = row_with(&harness, "align*} a");
+    assert_eq!(
+        left_drag(&mut harness, (3, row), (8, row)),
+        Some(Command::Copy {
+            text: formula.to_string(),
+            from: "the selection".to_string(),
+            dropped: 0,
+        })
+    );
 }
 
 /// Alt+M shows display and inline math as source, the transcript view

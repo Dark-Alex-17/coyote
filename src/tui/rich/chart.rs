@@ -4,6 +4,7 @@
 //! in the widget.
 
 use super::{RichStyle, buffer_lines};
+use crate::tui::render::plain_text;
 use crate::tui::terminal::catch_quietly;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
@@ -26,7 +27,8 @@ pub(crate) const DEFAULT_HEIGHT: u16 = 12;
 const BAR_GAP: u16 = 1;
 
 /// The markers series take in turn under `NO_COLOR`, where they cannot
-/// differ by colour.
+/// differ by colour. There are fewer of them than `MAX_SERIES`, so a
+/// fifth series takes the first one's marker again.
 const PLAIN_MARKERS: [Marker; 4] = [Marker::Braille, Marker::Dot, Marker::Block, Marker::Bar];
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -140,18 +142,67 @@ fn first_line(text: &str) -> String {
 
 /// The spec in `body`, read as YAML (so JSON too) and checked: every
 /// number finite, no series or bar list empty or over its cap, and any
-/// bounds given low end first.
+/// bounds given low end first. Its text is scrubbed of escapes and format
+/// characters, so a title cannot reorder or hide what is drawn.
 pub(crate) fn parse(body: &str) -> Result<ChartSpec, ChartError> {
     if body.len() > MAX_SPEC_BYTES {
         return Err(ChartError::TooLarge);
     }
-    let spec: ChartSpec = serde_yaml::from_str(body)
+    if has_alias(body) {
+        return Err(ChartError::Invalid(
+            "YAML aliases (*name) are not supported".to_string(),
+        ));
+    }
+    let mut spec: ChartSpec = serde_yaml::from_str(body)
         .map_err(|err| ChartError::Invalid(first_line(&err.to_string())))?;
     spec.check().map_err(ChartError::Invalid)?;
+    spec.scrub();
     Ok(spec)
 }
 
+/// Whether `body` may hold a YAML alias: a `*` where a token can start,
+/// followed by a name. serde_yaml replays an alias's whole anchored node
+/// at each use and caps only how many uses there are, so a 10 KiB spec of
+/// nested aliases takes seconds and gigabytes to read. The scan does not
+/// follow quoting or comments, so a quoted ` *word` is refused as well;
+/// it never misses an alias.
+fn has_alias(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    (0..chars.len()).any(|i| {
+        let starts_token = i == 0 || chars[i - 1].is_whitespace() || "[{,:".contains(chars[i - 1]);
+        let named = chars
+            .get(i + 1)
+            .is_some_and(|next| !next.is_whitespace() && !",[]{}".contains(*next));
+        chars[i] == '*' && starts_token && named
+    })
+}
+
 impl ChartSpec {
+    fn scrub(&mut self) {
+        let scrub = |text: &mut Option<String>| {
+            if let Some(text) = text {
+                *text = plain_text(text);
+            }
+        };
+        match self {
+            ChartSpec::Line(chart) | ChartSpec::Scatter(chart) => {
+                for text in [&mut chart.title, &mut chart.x_label, &mut chart.y_label] {
+                    scrub(text);
+                }
+                for series in &mut chart.series {
+                    scrub(&mut series.name);
+                }
+            }
+            ChartSpec::Bar(spec) => {
+                scrub(&mut spec.title);
+                for bar in &mut spec.bars {
+                    bar.label = plain_text(&bar.label);
+                }
+            }
+            ChartSpec::Sparkline(spec) => scrub(&mut spec.title),
+        }
+    }
+
     fn check(&self) -> Result<(), String> {
         match self {
             ChartSpec::Line(chart) | ChartSpec::Scatter(chart) => chart.check(),
@@ -329,7 +380,8 @@ fn titled<'a>(title: &Option<String>, style: &RichStyle) -> Block<'a> {
 }
 
 /// One marker per series: the one chosen for all of them, or under
-/// `no_color` a different one for each, starting with the one chosen.
+/// `no_color` the plain markers in turn, starting with the one chosen and
+/// starting over after the fourth series.
 fn markers(chosen: Marker, count: usize, no_color: bool) -> Vec<Marker> {
     if !no_color {
         return vec![chosen; count];
@@ -371,7 +423,7 @@ pub(crate) fn render_chart(
     height: u16,
     style: &RichStyle,
 ) -> Result<Vec<Line<'static>>, ChartError> {
-    let spec = parse(body)?;
+    let spec = guarded(|| parse(body))?;
     let needed = spec.min_width();
     if width < needed {
         return Err(ChartError::TooNarrow {
@@ -384,13 +436,19 @@ pub(crate) fn render_chart(
         .unwrap_or(height)
         .clamp(MIN_HEIGHT, MAX_HEIGHT);
     let area = Rect::new(0, 0, width, height);
-    let buffer = catch_quietly(|| {
+    let buffer = guarded(|| {
         let mut buffer = Buffer::empty(area);
         spec.draw(area, &mut buffer, style);
-        buffer
-    })
-    .map_err(|message| ChartError::Panicked(first_line(&message)))?;
+        Ok(buffer)
+    })?;
     Ok(buffer_lines(&buffer, style.no_color))
+}
+
+/// `step` run so that a panic in it is an error: serde_yaml panics on an
+/// alias it cannot resolve, and a widget may panic on a size it did not
+/// expect.
+fn guarded<T>(step: impl FnOnce() -> Result<T, ChartError>) -> Result<T, ChartError> {
+    catch_quietly(step).map_err(|message| ChartError::Panicked(first_line(&message)))?
 }
 
 /// Every chart `type` and every field name a spec can hold. A unit test
@@ -576,6 +634,83 @@ mod tests {
         assert_eq!(parse(&body), Err(ChartError::TooLarge));
     }
 
+    /// Nested aliases over a large anchored list: serde_yaml would replay
+    /// the list at every use (each level here takes about nine times the
+    /// last, seconds by the third), so any alias is refused before it is
+    /// read.
+    #[test]
+    fn an_alias_bomb_is_refused_at_once() {
+        let mut body = String::from("type: line\nseries:\n  - data: [&a0 [");
+        body.push_str(&vec!["1"; 5000].join(","));
+        body.push(']');
+        for level in 1..=9 {
+            let uses = vec![format!("*a{}", level - 1); 9].join(",");
+            body.push_str(&format!(", &a{level} [{uses}]"));
+        }
+        body.push_str("]\n");
+        assert!(body.len() < MAX_SPEC_BYTES);
+        let start = std::time::Instant::now();
+        let refused = parse(&body);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            refused,
+            Err(ChartError::Invalid(
+                "YAML aliases (*name) are not supported".to_string()
+            ))
+        );
+    }
+
+    /// Every place an alias can start is caught; a `*` inside a word or
+    /// before a space, and an anchor with no alias, are not aliases.
+    #[test]
+    fn only_an_alias_is_refused() {
+        for alias in [
+            "*a",
+            "title: *a",
+            "data: [*a]",
+            "data: [1,*a]",
+            "{\"title\":*a}",
+            "series:\n\t- *a",
+        ] {
+            assert!(has_alias(alias), "{alias:?}");
+        }
+        for plain in ["title: a * b", "title: 2*3", "title: x*", "title: *"] {
+            assert!(!has_alias(plain), "{plain:?}");
+        }
+        assert!(parse("type: sparkline\ntitle: &t Load\ndata: [1]\n").is_ok());
+    }
+
+    #[test]
+    fn a_panic_while_reading_is_an_error() {
+        let read = guarded(|| -> Result<ChartSpec, ChartError> { panic!("unresolved alias: 3") });
+        assert_eq!(
+            read,
+            Err(ChartError::Panicked("unresolved alias: 3".to_string()))
+        );
+    }
+
+    /// A title, a bar label and a series name lose the format characters
+    /// that could reorder or hide what the chart shows.
+    #[test]
+    fn the_specs_text_is_scrubbed() {
+        let ChartSpec::Line(chart) = parse(
+            "type: line\ntitle: \"rm \\u202Etxt\"\nx_label: \"t\\u200B\"\n\
+             series:\n  - {name: \"up\\u2066x\", data: [1]}\n",
+        )
+        .unwrap() else {
+            panic!("a line chart");
+        };
+        assert_eq!(chart.title.as_deref(), Some("rm txt"));
+        assert_eq!(chart.x_label.as_deref(), Some("t"));
+        assert_eq!(chart.series[0].name.as_deref(), Some("upx"));
+        let ChartSpec::Bar(bar) =
+            parse("type: bar\nbars:\n  - {label: \"a\\u202Eb\", value: 1}\n").unwrap()
+        else {
+            panic!("a bar chart");
+        };
+        assert_eq!(bar.bars[0].label, "ab");
+    }
+
     #[test]
     fn a_chart_too_narrow_for_the_room_is_not_drawn() {
         let body = "type: sparkline\ndata: [1, 2]\n";
@@ -618,13 +753,27 @@ mod tests {
         assert_eq!(rows("type: sparkline\nheight: 7\ndata: [1]\n", 12), 7);
     }
 
-    /// Under `NO_COLOR` each series has its own marker, starting with the
-    /// one asked for, and with colour all share it.
+    /// Under `NO_COLOR` the series take the plain markers in turn, starting
+    /// with the one asked for and starting over at the fifth; with colour
+    /// all share it.
     #[test]
     fn under_no_color_each_series_has_its_own_marker() {
         assert_eq!(
             markers(Marker::Dot, 3, true),
             [Marker::Dot, Marker::Braille, Marker::Block]
+        );
+        assert_eq!(
+            markers(Marker::Dot, MAX_SERIES, true),
+            [
+                Marker::Dot,
+                Marker::Braille,
+                Marker::Block,
+                Marker::Bar,
+                Marker::Dot,
+                Marker::Braille,
+                Marker::Block,
+                Marker::Bar,
+            ]
         );
         assert_eq!(markers(Marker::Dot, 2, false), [Marker::Dot, Marker::Dot]);
     }

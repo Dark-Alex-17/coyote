@@ -539,13 +539,15 @@ pub(crate) fn install_panic_hook() -> bool {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if QUIET_PANICS.try_with(|q| q.get() > 0).unwrap_or(false) {
-                let message =
-                    super::render::plain_text(info.payload_as_str().unwrap_or("panicked"));
+                let message = info.payload_as_str().unwrap_or("panicked").to_string();
                 let at = info
                     .location()
                     .map(|at| format!(" at {at}"))
                     .unwrap_or_default();
-                warn!("Recovered from a panic{at}: {message}");
+                warn!(
+                    "Recovered from a panic{at}: {}",
+                    super::render::plain_text(&message)
+                );
                 let _ = QUIET_MESSAGE.try_with(|m| *m.borrow_mut() = Some(message));
                 return;
             }
@@ -559,36 +561,43 @@ pub(crate) fn install_panic_hook() -> bool {
 }
 
 /// Counts this thread into `QUIET_PANICS` for as long as it lives, so the
-/// count comes back down however the call it guards ends.
+/// count comes back down however the call it guards ends. Entering clears
+/// any message left by a quiet panic that something other than
+/// `catch_quietly` caught, so it is never taken for this call's own.
 struct QuietGuard;
 
 impl QuietGuard {
     fn enter() -> Self {
-        QUIET_PANICS.with(|q| q.set(q.get() + 1));
+        let _ = QUIET_PANICS.try_with(|q| q.set(q.get() + 1));
+        let _ = QUIET_MESSAGE.try_with(|m| m.borrow_mut().take());
         Self
     }
 }
 
 impl Drop for QuietGuard {
     fn drop(&mut self) {
-        QUIET_PANICS.with(|q| q.set(q.get() - 1));
+        let _ = QUIET_PANICS.try_with(|q| q.set(q.get() - 1));
     }
 }
 
 /// Runs `f`, turning a panic in it into an error carrying the panic's
-/// message. The panic hook leaves such a panic to the caller: the screen
-/// is not handed back and nothing is echoed, so a recovered failure does
-/// not flash the terminal. It is logged instead.
+/// message, scrubbed of escapes and format characters as it is shown in a
+/// cell. The panic hook leaves such a panic to the caller: the screen is
+/// not handed back and nothing is echoed, so a recovered failure does not
+/// flash the terminal. It is logged instead.
 pub(crate) fn catch_quietly<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     let guard = QuietGuard::enter();
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     drop(guard);
     caught.map_err(|payload| {
-        QUIET_MESSAGE
-            .with(|m| m.borrow_mut().take())
+        let message = QUIET_MESSAGE
+            .try_with(|m| m.borrow_mut().take())
+            .ok()
+            .flatten()
             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
             .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "panicked".to_string())
+            .unwrap_or_else(|| "panicked".to_string());
+        super::render::plain_text(&message)
     })
 }
 
@@ -1607,6 +1616,24 @@ mod tests {
         assert_eq!(nested, Err::<(), _>("outer".to_string()));
         assert_eq!(depth(), 0);
         assert_eq!(QUIET_MESSAGE.with(|m| m.borrow().clone()), None);
+    }
+
+    /// The message comes back scrubbed whether the hook recorded it or the
+    /// payload is read directly, as it is where the hook is not installed
+    /// (`resume_unwind` skips the hook); a message left from before the
+    /// call is never returned for it.
+    #[test]
+    fn a_caught_panic_message_is_scrubbed_on_both_paths() {
+        install_panic_hook();
+        let dirty = "bad \x1b]0;title\x07\u{202E}text";
+        assert_eq!(
+            catch_quietly(|| -> u8 { panic!("{dirty}") }),
+            Err("bad text".to_string())
+        );
+        QUIET_MESSAGE.with(|m| *m.borrow_mut() = Some("stale".to_string()));
+        let unhooked =
+            catch_quietly(|| -> u8 { std::panic::resume_unwind(Box::new(dirty.to_string())) });
+        assert_eq!(unhooked, Err("bad text".to_string()));
     }
 
     fn units_of(text: &str) -> Vec<u16> {

@@ -1105,6 +1105,7 @@ impl Cell {
         let no_color = renderer.no_color;
         let faded = renderer.faded;
         let tick = Some(renderer.tick);
+        let rich = renderer.rich;
         Cow::Borrowed(match self {
             Cell::User {
                 text,
@@ -1127,7 +1128,7 @@ impl Cell {
                 cache,
             } => {
                 &cache
-                    .finished(without_think_spans(source, true), width, renderer)
+                    .finished(without_think_spans(source, true), width, rich, renderer)
                     .lines
             }
             Cell::Assistant {
@@ -1137,7 +1138,13 @@ impl Cell {
             } => {
                 return Cow::Owned(
                     cache
-                        .rendered(without_think_spans(source, *done), *done, width, renderer)
+                        .rendered(
+                            without_think_spans(source, *done),
+                            *done,
+                            width,
+                            rich,
+                            renderer,
+                        )
                         .lines,
                 );
             }
@@ -1288,13 +1295,14 @@ impl Cell {
     /// The rows of the cell's lines at `width` that a copy maps back to
     /// source; only a reply's drawn blocks have any.
     pub(super) fn copy_regions(&mut self, width: u16, renderer: &mut Renderer) -> Vec<CopyRegion> {
+        let rich = renderer.rich;
         match self {
             Cell::Assistant {
                 source,
                 done: true,
                 cache,
             } => cache
-                .finished(without_think_spans(source, true), width, renderer)
+                .finished(without_think_spans(source, true), width, rich, renderer)
                 .regions
                 .clone(),
             Cell::Assistant {
@@ -1303,7 +1311,13 @@ impl Cell {
                 cache,
             } => {
                 cache
-                    .rendered(without_think_spans(source, *done), *done, width, renderer)
+                    .rendered(
+                        without_think_spans(source, *done),
+                        *done,
+                        width,
+                        rich,
+                        renderer,
+                    )
                     .regions
             }
             _ => Vec::new(),
@@ -1316,8 +1330,14 @@ impl Cell {
     /// reply with its rich blocks shown as source. Every other cell reads
     /// as it does in the transcript.
     pub(super) fn full_lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
-        if let Cell::Assistant { source, done, .. } = self {
-            return renderer.markdown_source(without_think_spans(source, *done), width);
+        if let Cell::Assistant {
+            source,
+            done,
+            cache,
+        } = self
+        {
+            let source = without_think_spans(source, *done);
+            return cache.rendered(source, *done, width, false, renderer).lines;
         }
         if let Cell::Text { tail, .. } = self {
             return tail.full.lines(width).to_vec();
@@ -3003,6 +3023,29 @@ mod tests {
             .collect();
         assert!(paged.contains("memory__search"), "{paged}");
         assert!(paged.contains("remembered fact"), "{paged}");
+    }
+
+    /// The pager lays a streaming reply out through the cell's own cache
+    /// with its blocks as source, the rows the transcript shows with rich
+    /// blocks off, and leaves the drawn render in the cache.
+    #[test]
+    fn the_pager_reads_a_streaming_reply_through_the_cells_cache() {
+        use crate::tui::rich::mermaid::FakeMermaid;
+        let mut renderer = renderer();
+        let fake = std::sync::Arc::new(FakeMermaid::new(|_, _| Ok("drawn".to_string())));
+        renderer.set_mermaid_backend(fake.clone());
+        let source = "intro\n\n```mermaid\nA-->B\n```\n\nstill".to_string();
+        let mut cell = Cell::assistant(source, false);
+        let texts = |lines: &[Line<'_>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let drawn = texts(&cell.lines(80, &mut renderer));
+        let paged = texts(&cell.full_lines(80, &mut renderer));
+        assert!(drawn.contains(&"drawn".to_string()), "{drawn:?}");
+        assert!(paged.contains(&"A-->B".to_string()), "{paged:?}");
+        assert!(!paged.contains(&"drawn".to_string()), "{paged:?}");
+        assert_eq!(texts(&cell.lines(80, &mut renderer)), drawn);
+        assert_eq!(fake.calls(), 1);
+        renderer.rich = false;
+        assert_eq!(texts(&cell.lines(80, &mut renderer)), paged);
     }
 
     #[test]

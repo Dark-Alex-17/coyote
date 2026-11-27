@@ -10,7 +10,7 @@
 //! a shell variable.
 
 use super::math_render::{MathRenderer, render_math};
-use super::{CopyRegion, Delimiter, block_delimiter};
+use super::{CopyRegion, Delimiter, block_delimiter, indent_columns};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use std::sync::Arc;
@@ -100,36 +100,51 @@ fn paragraph_end(source: &str, from: usize) -> usize {
 }
 
 /// The byte ranges of `source` never read for math, in order: fenced code
-/// (an open fence runs to the end), code spans, links and images, and
-/// autolinks and HTML tags.
+/// (an open fence runs to the end), indented code, code spans, links and
+/// images, and autolinks and HTML tags. A line indented four columns is
+/// taken as code after a blank line, a fence or another such line, since
+/// it cannot carry on a paragraph; inside a list item that guess keeps a
+/// formula as source.
 fn protected(source: &str) -> Vec<Range<usize>> {
-    let mut fences = Vec::new();
+    let mut blocks = Vec::new();
     let mut open = None;
     let mut offset = 0;
+    let mut code_may_start = true;
     for line in source.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
         if matches!(block_delimiter(line), Some(Delimiter::Fence { .. })) {
             match open.take() {
                 None => open = Some(start),
-                Some(at) => fences.push(at..offset),
+                Some(at) => blocks.push(at..offset),
             }
+            code_may_start = true;
+            continue;
         }
+        if open.is_some() {
+            continue;
+        }
+        let blank = line.trim().is_empty();
+        let indented = !blank && indent_columns(line) > 3 && code_may_start;
+        if indented {
+            blocks.push(start..offset);
+        }
+        code_may_start = blank || indented;
     }
     if let Some(at) = open {
-        fences.push(at..source.len());
+        blocks.push(at..source.len());
     }
     let bytes = source.as_bytes();
     let mut ranges = Vec::new();
-    let mut fences = fences.into_iter().peekable();
+    let mut blocks = blocks.into_iter().peekable();
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(fence) = fences.next_if(|fence| fence.start <= i) {
-            i = i.max(fence.end);
-            ranges.push(fence);
+        if let Some(block) = blocks.next_if(|block| block.start <= i) {
+            i = i.max(block.end);
+            ranges.push(block);
             continue;
         }
-        let limit = fences.peek().map_or(bytes.len(), |fence| fence.start);
+        let limit = blocks.peek().map_or(bytes.len(), |block| block.start);
         let span = match bytes[i] {
             b'`' => code_span(bytes, i, limit),
             b'[' | b'!' if !escaped(bytes, i) => link(bytes, i, limit),
@@ -584,10 +599,15 @@ mod tests {
             "<https://e.com/$x$>",
             "<a href=\"$x$\">",
             "<!-- $x$ -->",
+            "    let cost = $x$;\n",
+            "intro\n\n    $x$ in code\n\n\tand $y$ too\n",
+            "```\nfence\n```\n    $x$ after a fence\n",
         ] {
             assert!(formulas(prose).is_empty(), "{prose:?}");
         }
         assert_eq!(formulas("`code` then $x$"), ["$x$"]);
+        assert_eq!(formulas("a paragraph\n    carried on $x$"), ["$x$"]);
+        assert_eq!(formulas("    code\nback to $x$"), ["$x$"]);
         assert_eq!(formulas("a ` lone tick $x$"), ["$x$"]);
         assert_eq!(formulas("if $a<b$ and c>d"), ["$a<b$"]);
         assert_eq!(formulas("[not a link] $x$"), ["$x$"]);

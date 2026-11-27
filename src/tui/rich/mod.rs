@@ -39,6 +39,14 @@ pub(crate) struct Block<'a> {
     pub(crate) body: &'a str,
 }
 
+impl Block<'_> {
+    /// What a copy over the block's rows takes: its fenced source with the
+    /// reply's CRLF line ends as LF, as the rest of a copy has them.
+    pub(crate) fn copy_source(&self) -> Arc<str> {
+        Arc::from(self.fenced.replace("\r\n", "\n"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Segment<'a> {
     Markdown(&'a str),
@@ -149,10 +157,7 @@ impl Delimiter<'_> {
 /// most three columns of indent opens display math.
 pub(crate) fn block_delimiter(line: &str) -> Option<Delimiter<'_>> {
     let text = line.trim_start();
-    let indent = line[..line.len() - text.len()]
-        .chars()
-        .map(|c| if c == '\t' { 4 } else { 1 })
-        .sum();
+    let indent = indent_columns(line);
     if text.starts_with("```") {
         let info = text.trim_start_matches('`').trim_end_matches(['\n', '\r']);
         return Some(Delimiter::Fence { indent, info });
@@ -167,6 +172,15 @@ pub(crate) fn block_delimiter(line: &str) -> Option<Delimiter<'_>> {
             closer,
             body: line.len() - text.len() + opener.len(),
         })
+}
+
+/// The columns of whitespace `line` starts with, a tab counted as four.
+pub(crate) fn indent_columns(line: &str) -> usize {
+    let text = line.trim_start();
+    line[..line.len() - text.len()]
+        .chars()
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
 }
 
 /// What is open at a line of a reply read from the top: a code fence or
@@ -276,9 +290,10 @@ pub(crate) fn segment(source: &str) -> Vec<Segment<'_>> {
             segments.push(Segment::Markdown(&source[run_start..closed.at]));
         }
         let fenced = &source[closed.at..offset];
+        let fenced = fenced.strip_suffix('\n').unwrap_or(fenced);
         segments.push(Segment::Block(Block {
             kind: closed.kind,
-            fenced: fenced.strip_suffix('\n').unwrap_or(fenced),
+            fenced: fenced.strip_suffix('\r').unwrap_or(fenced),
             body: &source[closed.body],
         }));
         run_start = offset;
@@ -290,15 +305,19 @@ pub(crate) fn segment(source: &str) -> Vec<Segment<'_>> {
 }
 
 /// The faded line under a block shown as source, saying why it was not
-/// drawn.
+/// drawn, on one row: a newline or tab in the note is a space.
 pub(crate) fn note_line(note: &str, faded: Style) -> Line<'static> {
-    Line::from(Span::styled(plain_text(note), faded))
+    Line::from(Span::styled(
+        plain_text(note).replace(['\n', '\t'], " "),
+        faded,
+    ))
 }
 
 /// The theme a drawn block paints with.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RichStyle {
-    /// The colours of a chart's series in turn; never empty.
+    /// The colours of a chart's series in turn; with none, a series takes
+    /// the default colour.
     pub(crate) palette: Vec<Color>,
     pub(crate) title: Style,
     /// A chart's axes, their labels and its legend.
@@ -309,7 +328,12 @@ pub(crate) struct RichStyle {
 impl RichStyle {
     /// The colour of the `index`th series.
     pub(crate) fn series(&self, index: usize) -> Style {
-        Style::new().fg(self.palette[index % self.palette.len()])
+        Style {
+            fg: index
+                .checked_rem(self.palette.len())
+                .map(|index| self.palette[index]),
+            ..Style::new()
+        }
     }
 }
 
@@ -367,17 +391,20 @@ pub(crate) struct RichKey {
     kind: BlockKind,
     body: u64,
     width: u16,
+    /// The rows a chart takes unless its spec says otherwise.
+    chart_height: u16,
     no_color: bool,
 }
 
 impl RichKey {
-    pub(crate) fn new(block: &Block, width: u16, no_color: bool) -> Self {
+    pub(crate) fn new(block: &Block, width: u16, chart_height: u16, no_color: bool) -> Self {
         let mut hasher = DefaultHasher::new();
         block.body.hash(&mut hasher);
         Self {
             kind: block.kind,
             body: hasher.finish(),
             width,
+            chart_height,
             no_color,
         }
     }
@@ -606,7 +633,7 @@ mod tests {
                 fenced: body,
                 body,
             };
-            RichKey::new(&block, width, false)
+            RichKey::new(&block, width, 12, false)
         }
         let mut cache = RichCache::default();
         cache.insert(key("first", 80), Arc::new(Ok(Vec::new())));
@@ -619,6 +646,39 @@ mod tests {
         assert!(cache.get(&key("first", 80)).is_some());
         assert!(cache.get(&key("body 1", 80)).is_none());
         assert!(cache.get(&key("first", 40)).is_none());
+    }
+
+    #[test]
+    fn a_note_is_one_row() {
+        let line = note_line("chart: bad\n\tspec\x1b[2J", Style::new());
+        assert_eq!(line.to_string(), "chart: bad  spec");
+    }
+
+    #[test]
+    fn an_empty_palette_paints_series_in_the_default_colour() {
+        let style = RichStyle {
+            palette: Vec::new(),
+            title: Style::new(),
+            axis: Style::new(),
+            no_color: false,
+        };
+        assert_eq!(style.series(3), Style::new());
+        let style = RichStyle {
+            palette: vec![Color::Red, Color::Blue],
+            ..style
+        };
+        assert_eq!(style.series(3), Style::new().fg(Color::Blue));
+    }
+
+    /// A reply with CRLF line ends gives a block with no CR after its
+    /// closer, and its copy has LF line ends.
+    #[test]
+    fn a_crlf_block_copies_with_lf_line_ends() {
+        let source = "before\r\n```mermaid\r\nA-->B\r\n```\r\nafter";
+        let found = blocks(&segment(source));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].fenced, "```mermaid\r\nA-->B\r\n```");
+        assert_eq!(&*found[0].copy_source(), "```mermaid\nA-->B\n```");
     }
 
     fn buffer(width: u16, draw: impl FnOnce(&mut Buffer)) -> Buffer {

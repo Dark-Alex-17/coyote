@@ -379,6 +379,12 @@ impl Renderer {
         &self.markdown
     }
 
+    /// Drops every drawn block, so the next frame draws them in the
+    /// colours set since.
+    pub(super) fn forget_rich_blocks(&mut self) {
+        self.rich_cache = RichCache::default();
+    }
+
     /// Swaps the mermaid backend, dropping the blocks the old one drew.
     #[cfg(test)]
     pub(super) fn set_mermaid_backend(&mut self, backend: Arc<dyn MermaidRenderer>) {
@@ -428,11 +434,14 @@ impl Renderer {
     }
 
     /// A block drawn at `width`, from the cache when it was drawn before.
-    /// One that cannot be drawn is its fenced source, highlighted as in a
-    /// markdown run, with a faded note under it that a copy leaves out.
+    /// One that cannot be drawn is its source, with a faded note under it
+    /// that a copy leaves out: a fence highlighted as in a markdown run,
+    /// and display math as its literal text, since markdown would read a
+    /// `*` or `_` in the TeX as emphasis. Either way its rows copy as the
+    /// source.
     fn rich_block(&mut self, block: &Block, width: u16) -> Rendered {
         let width = self.wrap_cap.map_or(width, |cap| width.min(cap)).max(1);
-        let key = RichKey::new(block, width, self.no_color);
+        let key = RichKey::new(block, width, self.chart_height, self.no_color);
         let drawn = match self.rich_cache.get(&key) {
             Some(drawn) => drawn,
             None => {
@@ -446,19 +455,28 @@ impl Renderer {
                 lines: lines.clone(),
                 regions: vec![CopyRegion::Block {
                     rows: 0..lines.len(),
-                    source: Arc::from(block.fenced),
+                    source: block.copy_source(),
                 }],
             },
             Err(note) => {
-                let mut lines = self.markdown_run(block.fenced, width);
+                let mut lines = match block.kind {
+                    BlockKind::DisplayMath => plain_lines(block.fenced, width, Style::new()),
+                    BlockKind::Mermaid | BlockKind::Chart => self.markdown_run(block.fenced, width),
+                };
                 let row = lines.len();
                 lines.push(rich::note_line(note, self.faded));
                 Rendered {
                     lines,
-                    regions: vec![CopyRegion::Block {
-                        rows: row..row + 1,
-                        source: Arc::from(""),
-                    }],
+                    regions: vec![
+                        CopyRegion::Block {
+                            rows: 0..row,
+                            source: block.copy_source(),
+                        },
+                        CopyRegion::Block {
+                            rows: row..row + 1,
+                            source: Arc::from(""),
+                        },
+                    ],
                 }
             }
         }
@@ -604,13 +622,15 @@ pub(crate) fn split_stable_tail(source: &str) -> usize {
 
 struct StableRender {
     width: u16,
+    rich: bool,
     stable_len: usize,
     rendered: Rendered,
 }
 
-/// One reply rendered with the renderer's `rich` setting, cached per width
-/// for the stable part. The two most recently used widths stay cached so a
-/// resize and back costs nothing.
+/// One reply rendered with its rich blocks drawn or shown as source, the
+/// stable part cached per width and mode. The two most recently used
+/// widths of each mode stay cached so a resize and back costs nothing,
+/// and the pager's source view never evicts the transcript's drawn one.
 #[derive(Default)]
 pub(crate) struct RenderCache {
     entries: Vec<StableRender>,
@@ -624,6 +644,7 @@ impl RenderCache {
         source: &str,
         done: bool,
         width: u16,
+        rich: bool,
         renderer: &mut Renderer,
     ) -> Rendered {
         let split = if done {
@@ -631,9 +652,8 @@ impl RenderCache {
         } else {
             split_stable_tail(source)
         };
-        let mut rendered = self.stable(source, split, width, renderer).clone();
+        let mut rendered = self.stable(source, split, width, rich, renderer).clone();
         if split < source.len() {
-            let rich = renderer.rich;
             rendered.append(renderer.render_reply(&source[split..], width, rich));
         }
         rendered
@@ -645,9 +665,10 @@ impl RenderCache {
         &mut self,
         source: &str,
         width: u16,
+        rich: bool,
         renderer: &mut Renderer,
     ) -> &Rendered {
-        self.stable(source, source.len(), width, renderer)
+        self.stable(source, source.len(), width, rich, renderer)
     }
 
     fn stable(
@@ -655,16 +676,25 @@ impl RenderCache {
         source: &str,
         split: usize,
         width: u16,
+        rich: bool,
         renderer: &mut Renderer,
     ) -> &Rendered {
-        let entry = match self.entries.iter().position(|e| e.width == width) {
+        let found = self
+            .entries
+            .iter()
+            .position(|e| e.width == width && e.rich == rich);
+        let entry = match found {
             Some(index) => self.entries.remove(index),
             None => {
-                if self.entries.len() >= 2 {
-                    self.entries.remove(0);
+                if self.entries.iter().filter(|e| e.rich == rich).count() >= 2 {
+                    let oldest = self.entries.iter().position(|e| e.rich == rich);
+                    if let Some(oldest) = oldest {
+                        self.entries.remove(oldest);
+                    }
                 }
                 StableRender {
                     width,
+                    rich,
                     stable_len: usize::MAX,
                     rendered: Rendered::default(),
                 }
@@ -674,7 +704,6 @@ impl RenderCache {
         let index = self.entries.len() - 1;
         let entry = &mut self.entries[index];
         if entry.stable_len != split {
-            let rich = renderer.rich;
             entry.rendered = renderer.render_reply(&source[..split], width, rich);
             entry.stable_len = split;
         }
@@ -1124,25 +1153,27 @@ mod tests {
         let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
         let mut cache = RenderCache::default();
         let source = "first paragraph\n\nsecond paragraph still streaming";
-        let wide = cache.rendered(source, false, 80, &mut renderer).lines;
-        let narrow = cache.rendered(source, false, 10, &mut renderer).lines;
+        let wide = cache.rendered(source, false, 80, true, &mut renderer).lines;
+        let narrow = cache.rendered(source, false, 10, true, &mut renderer).lines;
         assert_eq!(cache.entries.len(), 2);
         assert!(narrow.len() > wide.len());
         let longer = format!("{source} and more");
-        let again = cache.rendered(&longer, false, 80, &mut renderer).lines;
+        let again = cache
+            .rendered(&longer, false, 80, true, &mut renderer)
+            .lines;
         assert_eq!(cache.entries.len(), 2);
         assert_eq!(again[0], wide[0]);
-        cache.rendered(&longer, false, 40, &mut renderer);
+        cache.rendered(&longer, false, 40, true, &mut renderer);
         assert_eq!(cache.entries.len(), 2);
         assert!(cache.entries.iter().all(|e| e.width != 10));
-        let done = cache.rendered(&longer, true, 80, &mut renderer).lines;
+        let done = cache.rendered(&longer, true, 80, true, &mut renderer).lines;
         assert!(
             done.iter()
                 .any(|line| line.to_string().contains("and more")),
             "{done:?}"
         );
         assert_eq!(cache.entries.last().unwrap().stable_len, longer.len());
-        assert_eq!(cache.finished(&longer, 80, &mut renderer).lines, done);
+        assert_eq!(cache.finished(&longer, 80, true, &mut renderer).lines, done);
         assert_eq!(cache.entries.len(), 2);
     }
 
@@ -1223,8 +1254,8 @@ mod tests {
     }
 
     /// Every way the backend can fail shows the fenced source as it is
-    /// highlighted in a markdown run, with one faded note under it that
-    /// copies as nothing.
+    /// highlighted in a markdown run, copying as that source, with one
+    /// faded note under it that copies as nothing.
     #[test]
     fn each_failure_shows_the_source_and_a_note() {
         type Respond = fn(&str, u16) -> Result<String, MermaidError>;
@@ -1265,13 +1296,53 @@ mod tests {
             let row = expected.len() - 1;
             assert_eq!(
                 rendered.regions,
-                [CopyRegion::Block {
-                    rows: row..row + 1,
-                    source: Arc::from(""),
-                }],
+                [
+                    CopyRegion::Block {
+                        rows: 0..row,
+                        source: Arc::from(source.as_str()),
+                    },
+                    CopyRegion::Block {
+                        rows: row..row + 1,
+                        source: Arc::from(""),
+                    },
+                ],
                 "{why}"
             );
         }
+    }
+
+    /// A reply cached in one mode is never served in the other, and the
+    /// source view at a width leaves the drawn view at it cached.
+    #[test]
+    fn the_cache_keeps_drawn_and_source_renders_apart() {
+        let (mut renderer, fake) = faked(|_, _| Ok("drawn".to_string()));
+        let mut cache = RenderCache::default();
+        let source = format!("intro\n\n{DIAGRAM}\n\nstill");
+        let drawn = texts(
+            &cache
+                .rendered(&source, false, 40, true, &mut renderer)
+                .lines,
+        );
+        let plain = cache.rendered(&source, false, 40, false, &mut renderer);
+        assert!(drawn.contains(&"drawn".to_string()), "{drawn:?}");
+        assert!(plain.regions.is_empty());
+        let plain = texts(&plain.lines);
+        assert!(plain.contains(&"flowchart TD".to_string()), "{plain:?}");
+        assert!(!plain.contains(&"drawn".to_string()), "{plain:?}");
+        cache.rendered(&source, false, 30, false, &mut renderer);
+        cache.rendered(&source, false, 20, false, &mut renderer);
+        assert_eq!(cache.entries.len(), 3);
+        let again = texts(
+            &cache
+                .rendered(&source, false, 40, true, &mut renderer)
+                .lines,
+        );
+        assert_eq!(again, drawn);
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(
+            cache.finished(&source, 40, false, &mut renderer).lines,
+            renderer.markdown_source(&source, 40)
+        );
     }
 
     /// A closed block in the streaming tail is drawn once and taken from
@@ -1281,17 +1352,29 @@ mod tests {
         let (mut renderer, fake) = faked(|_, _| Ok("drawn".to_string()));
         let mut cache = RenderCache::default();
         let source = format!("intro\n\n{DIAGRAM}\nstill");
-        let first = cache.rendered(&source, false, 40, &mut renderer);
-        let second = cache.rendered(&format!("{source} going"), false, 40, &mut renderer);
+        let first = cache.rendered(&source, false, 40, true, &mut renderer);
+        let second = cache.rendered(&format!("{source} going"), false, 40, true, &mut renderer);
         assert_eq!(fake.calls(), 1);
         assert_eq!(first.regions, second.regions);
         assert!(texts(&second.lines).contains(&"drawn".to_string()));
-        cache.rendered(&source, false, 30, &mut renderer);
+        cache.rendered(&source, false, 30, true, &mut renderer);
         assert_eq!(fake.calls(), 2);
         let (mut failing, fake) = faked(|_, _| Err(MermaidError::Empty));
         failing.render_reply(DIAGRAM, 40, true);
         failing.render_reply(DIAGRAM, 40, true);
         assert_eq!(fake.calls(), 1, "a failure is cached too");
+    }
+
+    /// A chart drawn at one default height is not served from the cache
+    /// once the default changes.
+    #[test]
+    fn a_new_chart_height_draws_the_chart_again() {
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let source = "```chart\ntype: sparkline\ndata: [1, 2]\n```";
+        let rows = |renderer: &mut Renderer| renderer.render_reply(source, 40, true).lines.len();
+        assert_eq!(rows(&mut renderer), usize::from(chart::DEFAULT_HEIGHT));
+        renderer.chart_height = 20;
+        assert_eq!(rows(&mut renderer), 20);
     }
 
     /// A fence still streaming shows as source until it closes.
@@ -1337,15 +1420,29 @@ mod tests {
         );
     }
 
+    /// Display math that cannot be drawn is its literal text, a `*` in it
+    /// kept rather than read as emphasis, and its rows copy as the source.
     #[test]
     fn display_math_that_cannot_be_drawn_shows_its_source_and_why() {
         let (mut renderer, fake) = math_faked(|_| "drawn".to_string());
-        let formula = "$$\\begin{align*} a &= b \\end{align*}$$";
+        let formula = "$$\\begin{align*} a *b* &= c \\end{align*}$$";
         let rendered = renderer.render_reply(formula, 40, true);
-        let mut expected = renderer.markdown_source(formula, 40);
+        let mut expected = plain_lines(formula, 40, Style::new());
         let note = "math: \\begin{align*} is not supported (showing source)";
         expected.push(Line::from(Span::styled(note, renderer.faded)));
         assert_eq!(rendered.lines, expected);
+        assert!(
+            texts(&rendered.lines).concat().contains("a *b* &= c"),
+            "{rendered:?}"
+        );
+        let row = expected.len() - 1;
+        assert_eq!(
+            rendered.regions[0],
+            CopyRegion::Block {
+                rows: 0..row,
+                source: Arc::from(formula),
+            }
+        );
         assert_eq!(fake.calls(), 0);
     }
 
