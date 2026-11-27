@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+case "$1" in
+  cols) echo 100 ;;
+  lines) echo 40 ;;
+  *) exit 1 ;;
+esac

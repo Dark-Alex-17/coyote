@@ -1,0 +1,28 @@
+---
+source: src/tui/tests/rich_blocks.rs
+expression: frame
+---
+"> draw it                                                                       "
+"                                                                                "
+"the value x² + y² here                                                          "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo                         "
+"───────────────────────────────────────────────────────────────────── your turn "
+" Type a prompt or a .command; Enter sends                                       "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"openai:test-model . no session . agents 0 . jobs 0                              "

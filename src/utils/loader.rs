@@ -34,7 +34,7 @@ pub async fn load_recursive_url(
     let extension = RECURSIVE_URL_LOADER;
     let pages: Vec<Page> = match loaders.get(extension) {
         Some(loader_command) => {
-            let contents = run_loader_command(path, extension, loader_command)?;
+            let contents = run_loader_command(path, extension, loader_command).await?;
             serde_json::from_str(&contents).context(r#"The crawler response is invalid. It should follow the JSON format: `[{"path":"...", "text":"..."}]`."#)?
         }
         None => {
@@ -57,7 +57,7 @@ pub async fn load_recursive_url(
 pub async fn load_file(loaders: &HashMap<String, String>, path: &str) -> Result<LoadedDocument> {
     let extension = get_patch_extension(path).unwrap_or_else(|| DEFAULT_EXTENSION.into());
     match loaders.get(&extension) {
-        Some(loader_command) => load_with_command(path, &extension, loader_command),
+        Some(loader_command) => load_with_command(path, &extension, loader_command).await,
         None => load_plain(path, &extension).await,
     }
 }
@@ -76,8 +76,12 @@ async fn load_plain(path: &str, extension: &str) -> Result<LoadedDocument> {
     Ok(LoadedDocument::new(path.into(), contents, metadata))
 }
 
-fn load_with_command(path: &str, extension: &str, loader_command: &str) -> Result<LoadedDocument> {
-    let contents = run_loader_command(path, extension, loader_command)?;
+async fn load_with_command(
+    path: &str,
+    extension: &str,
+    loader_command: &str,
+) -> Result<LoadedDocument> {
+    let contents = run_loader_command(path, extension, loader_command).await?;
     let mut metadata: DocumentMetadata = Default::default();
     metadata.insert(EXTENSION_METADATA.into(), DEFAULT_EXTENSION.to_string());
     Ok(LoadedDocument::new(path.into(), contents, metadata))
@@ -90,7 +94,7 @@ pub fn is_loader_protocol(loaders: &HashMap<String, String>, path: &str) -> bool
     }
 }
 
-pub fn load_protocol_path(
+pub async fn load_protocol_path(
     loaders: &HashMap<String, String>,
     path: &str,
 ) -> Result<Vec<LoadedDocument>> {
@@ -101,7 +105,7 @@ pub fn load_protocol_path(
             Some((protocol, loader_command, path))
         })
         .ok_or_else(|| anyhow!("No document loader for '{}'", path))?;
-    let contents = run_loader_command(new_path, protocol, loader_command)?;
+    let contents = run_loader_command(new_path, protocol, loader_command).await?;
     let output = if let Ok(list) = serde_json::from_str::<Vec<LoadedDocument>>(&contents) {
         list.into_iter()
             .map(|mut v| {

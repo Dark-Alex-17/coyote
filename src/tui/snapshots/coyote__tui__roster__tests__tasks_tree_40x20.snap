@@ -1,0 +1,24 @@
+---
+source: src/tui/roster.rs
+expression: text(&terminal)
+---
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+" ┌Tasks───────────────────────────────┐ "
+" │▾ lead  ⠋ running  02:59:05  5m 0s  │ "
+" │  ▾ review  ⠋ running  3m 20s       │ "
+" │      execute_command  ⠋ running    │ "
+" │      file-review  finished         │ "
+" │  planner  finished  02:49:05       │ "
+" │  build  completed  02:55:45        │ "
+" │  fetch  failed  02:57:25  ...7a8b9c│ "
+" │  ask review  Ship the fix to main? │ "
+" └Esc = close  j/k = move  h/l = fold ┘ "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "

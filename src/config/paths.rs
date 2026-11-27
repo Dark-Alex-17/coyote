@@ -407,12 +407,14 @@ pub fn repl_history_dir() -> PathBuf {
 }
 
 pub fn repl_history_file(session: &Option<Session>) -> PathBuf {
-    let history_key = if let Some(session) = &session {
-        format!("session_{}", session.name().replace('/', "_"))
-    } else {
-        "default".to_string()
-    };
+    repl_history_file_for(session.as_ref().map(Session::name))
+}
 
+pub fn repl_history_file_for(session_name: Option<&str>) -> PathBuf {
+    let history_key = match session_name {
+        Some(name) => format!("session_{}", name.replace('/', "_")),
+        None => "default".to_string(),
+    };
     repl_history_dir().join(history_key)
 }
 
@@ -792,10 +794,7 @@ mod tests {
         use serial_test::serial;
 
         fn with_workspace_dir<F: FnOnce(&Path, &Path)>(f: F) {
-            let unique = time::SystemTime::now()
-                .duration_since(time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let unique = crate::testing::unique_dir_suffix();
             let root = env::temp_dir().join(format!("coyote-workspace-mcp-test-{unique}"));
             let ws_dir = root.join(WORKSPACE_COYOTE_DIR_NAME);
             fs::create_dir_all(&ws_dir).unwrap();
@@ -1035,10 +1034,7 @@ mod tests {
     }
 
     fn sidecar_temp_dir(label: &str) -> PathBuf {
-        let unique = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-{label}-test-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root

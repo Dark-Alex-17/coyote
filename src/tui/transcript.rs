@@ -1,0 +1,2474 @@
+//! The transcript: its cells in order, where the view sits in them and
+//! which row holds the focus. Following the bottom is the rest state; a
+//! scroll away from it holds the view still while new cells arrive
+//! below, and a chip offers the way back (and counts them) until the
+//! view follows again.
+
+use super::cells::{
+    self, AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTail, TaskRow, ToolStatus,
+    append_output,
+};
+use super::pager::{COMPRESSED_DIVIDER, ChildEntry, entry_summary};
+use super::render::{RenderCache, Renderer};
+use super::selection::{self, Pos};
+use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
+use crate::events::NoticeKind;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
+use serde_json::Value;
+use std::borrow::Cow;
+use std::time::Instant;
+
+const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
+/// Lines one wheel notch moves the view.
+pub(super) const WHEEL_LINES: i32 = 1;
+/// The rows a cell above the view counts as until the view first reaches
+/// it and lays it out.
+const UNLAID_ROWS: usize = 1;
+/// The line under a resumed session's history: the TUI's form of the
+/// divider the REPL prints there.
+pub(super) const HISTORY_DIVIDER: &str = "--- previous conversation ---";
+
+/// The screen rows one cell took in the last frame, counted from the
+/// view's top row, from row `from` of the cell on.
+struct RowSpan {
+    cell: usize,
+    from: usize,
+    first_row: u16,
+    rows: u16,
+}
+
+/// The line at the top of the last frame, by the cell it belongs to and
+/// the row inside that cell. The blank line between two cells is held by
+/// the cell below it with `gap` set, so the cell above growing does not
+/// carry it down.
+#[derive(Clone, Copy)]
+struct Anchor {
+    cell: usize,
+    row: usize,
+    gap: bool,
+}
+
+/// How many rows a cell took when it was last laid out, and for what: the
+/// cell's revision, the width and the room a greeting was given.
+#[derive(Clone, Copy)]
+struct LaidOut {
+    revision: u64,
+    width: u16,
+    room: Option<u16>,
+    rows: usize,
+}
+
+/// Where a frame's view sits: each cell's first line, the line count,
+/// the offset from the bottom and the lines it shows.
+struct Placement {
+    headers: Vec<usize>,
+    total: usize,
+    offset: usize,
+    start: usize,
+    end: usize,
+}
+
+impl Placement {
+    /// The cell holding the view's top line, or the one above the gap a
+    /// view starting on a gap shows.
+    fn first_cell(&self) -> usize {
+        self.headers
+            .partition_point(|header| *header <= self.start)
+            .saturating_sub(1)
+    }
+}
+
+pub(super) struct Transcript {
+    cells: Vec<Cell>,
+    /// Lines between the bottom of the view and the bottom of the
+    /// transcript; zero while the view follows new output.
+    offset_from_bottom: usize,
+    /// The offset the last frame was drawn at; what a scroll since has
+    /// moved it by is applied to `anchor`.
+    last_offset: usize,
+    /// The line the last frame started on. A scrolled view is put back on
+    /// it, so a cell above the view or on it growing or shrinking leaves
+    /// the lines on screen where they were.
+    anchor: Option<Anchor>,
+    /// The line count the last frame laid out. A scrolled view with no
+    /// anchor to go back to takes what the count grew by as output
+    /// arrived below it.
+    last_total: usize,
+    /// Cells appended while the view was scrolled away from the bottom.
+    unseen: usize,
+    /// The row Ctrl+Up/Down or a click put the cursor on; only a cell
+    /// that opens and closes can hold it.
+    focus: Option<usize>,
+    /// The Assistant cell the reply streams into. A cell pushed
+    /// mid-stream (a background job's output, a notice) lands after it
+    /// and the next delta still finds it.
+    stream: Option<usize>,
+    /// The cells of the streaming reply that a command's cell cut off,
+    /// oldest first. Until the next delta opens another, the reply has
+    /// no open cell.
+    stream_parts: Vec<usize>,
+    /// The fence or think tag a cut reply's next part reopens.
+    stream_carry: String,
+    /// The unfinished last line a cut took off the reply; the next part
+    /// shows it, after `stream_carry`.
+    stream_held: String,
+    /// Set when the focus moved; the next frame scrolls so the focused
+    /// row's header is in view.
+    reveal_focus: bool,
+    last_layout: Vec<RowSpan>,
+    last_area: Rect,
+    /// Goes up at every change to the cells, so a layout of all of them
+    /// (the pager's) is looked at again only then.
+    generation: u64,
+    /// The generation each cell last changed at, by index. No two changes
+    /// share one, so a cell laid out at some revision is known to read
+    /// the same while it keeps it, wherever it has moved to.
+    revisions: Vec<u64>,
+    /// What each cell took when last laid out, by index; an entry whose
+    /// revision is not its cell's is stale. Cells above the view are laid
+    /// out only once the view reaches them.
+    laid_out: Vec<Option<LaidOut>>,
+    /// The bytes every call's whole output in the cells keeps.
+    full_output_bytes: usize,
+    /// The divider each clear of the main view started it at, oldest
+    /// first; the newest is the first cell the view draws, scrolls,
+    /// focuses and selects. The pager, the exit dump and undo still read
+    /// every cell.
+    floors: Vec<usize>,
+}
+
+impl Transcript {
+    pub(super) fn new() -> Self {
+        Self {
+            cells: vec![Cell::welcome()],
+            offset_from_bottom: 0,
+            last_offset: 0,
+            anchor: None,
+            last_total: 0,
+            unseen: 0,
+            focus: None,
+            stream: None,
+            stream_parts: Vec::new(),
+            stream_carry: String::new(),
+            stream_held: String::new(),
+            reveal_focus: false,
+            last_layout: Vec::new(),
+            last_area: Rect::ZERO,
+            generation: 1,
+            revisions: vec![1],
+            laid_out: Vec::new(),
+            full_output_bytes: 0,
+            floors: Vec::new(),
+        }
+    }
+
+    pub(super) fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// The first cell the main view draws.
+    pub(super) fn view_floor(&self) -> usize {
+        self.floors.last().copied().unwrap_or(0)
+    }
+
+    /// Starts the main view afresh at cell `index`, following the bottom.
+    pub(super) fn clear_view_from(&mut self, index: usize) {
+        self.floors.push(index);
+        self.scroll_to_bottom();
+        self.anchor = None;
+        if self.focus.is_some_and(|focus| focus < index) {
+            self.focus = None;
+        }
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn next_revision(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// Cell `index` to change, counted as changed.
+    fn touch(&mut self, index: usize) -> Option<&mut Cell> {
+        if index >= self.cells.len() {
+            return None;
+        }
+        self.revisions[index] = self.next_revision();
+        let cell = &mut self.cells[index];
+        cell.forget_wrapped_lines();
+        Some(cell)
+    }
+
+    /// Opens the tool rows whose call has a confirm pending and folds the
+    /// rest back to what their toggle says.
+    pub(super) fn set_awaiting(&mut self, pending: &dyn Fn(&str) -> bool) {
+        for index in 0..self.cells.len() {
+            if self.cells[index].set_awaiting(pending) {
+                self.touch(index);
+            }
+        }
+    }
+
+    /// Counts every running row as changed, so the next frame draws its
+    /// throbber and elapsed time anew; whether there was one.
+    pub(super) fn touch_running(&mut self) -> bool {
+        let mut any = false;
+        for index in 0..self.cells.len() {
+            if self.cells[index].running() {
+                self.touch(index);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// The cells for laying out, with the revision of each: what they
+    /// show is left as it is and only the line caches inside them fill,
+    /// so nothing counts as changed.
+    pub(super) fn cells_for_layout(&mut self) -> (&mut [Cell], &[u64]) {
+        (&mut self.cells, &self.revisions)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub(super) fn cell_mut(&mut self, index: usize) -> Option<&mut Cell> {
+        self.touch(index)
+    }
+
+    pub(super) fn last_mut(&mut self) -> Option<&mut Cell> {
+        self.touch(self.cells.len().checked_sub(1)?)
+    }
+
+    /// Counts `delta` more bytes kept by the whole output of a call in
+    /// some cell, then gives up the oldest calls' whole output until the
+    /// total fits `budget`. Only a cell that gave something up changes.
+    pub(super) fn account_full_output(&mut self, delta: isize, budget: usize) {
+        self.full_output_bytes = self.full_output_bytes.saturating_add_signed(delta);
+        if self.full_output_bytes <= budget {
+            return;
+        }
+        for index in 0..self.cells.len() {
+            let excess = self.full_output_bytes.saturating_sub(budget);
+            if excess == 0 {
+                break;
+            }
+            if self.cells[index].full_output_bytes() == 0 {
+                continue;
+            }
+            let freed = self
+                .touch(index)
+                .map_or(0, |cell| cell.evict_full_outputs(excess));
+            self.full_output_bytes = self.full_output_bytes.saturating_sub(freed);
+        }
+    }
+
+    /// Drops every cell's cached lines and counts each cell as changed,
+    /// so the transcript and the pager both style the text anew; for when
+    /// the renderer itself changed.
+    pub(super) fn forget_layout(&mut self) {
+        for index in 0..self.cells.len() {
+            if let Some(cell) = self.touch(index) {
+                cell.forget_layout();
+            }
+        }
+    }
+
+    /// Appends a cell. The greeting gives way to the first real entry,
+    /// whatever brings it: a submitted line or a notice.
+    pub(super) fn push(&mut self, cell: Cell) {
+        self.clear_welcome();
+        if self.offset_from_bottom > 0 {
+            self.unseen += 1;
+        }
+        self.full_output_bytes += cell.full_output_bytes();
+        let revision = self.next_revision();
+        self.revisions.push(revision);
+        self.cells.push(cell);
+    }
+
+    /// Appends a resumed session's history, as the REPL prints it on
+    /// resuming: every line, reply and saved call, as rows like the live
+    /// ones, then a divider. Nothing is appended for an empty history.
+    /// The saved calls' whole output counts against the same budget as
+    /// live output, and a view scrolled away counts the block as one new
+    /// entry below.
+    pub(super) fn push_history(&mut self, entries: Vec<ChildEntry>) {
+        self.push_history_within(entries, FULL_OUTPUT_BUDGET);
+    }
+
+    fn push_history_within(&mut self, entries: Vec<ChildEntry>, budget: usize) {
+        if entries.is_empty() {
+            return;
+        }
+        let unseen = self.unseen;
+        for entry in entries {
+            let cell = match entry {
+                ChildEntry::Compressed => {
+                    Cell::notice(NoticeKind::Compress, COMPRESSED_DIVIDER.to_string())
+                }
+                // A restored prompt opened an exchange the session holds, so
+                // `.undo` and the rewind picker count it as one made here.
+                ChildEntry::User(text) => Cell::User {
+                    text,
+                    opened: true,
+                    mid_turn: false,
+                    cache: LineCache::default(),
+                },
+                ChildEntry::Assistant(text) => Cell::assistant(text, true),
+                ChildEntry::Tool {
+                    call_id,
+                    name,
+                    args,
+                    output,
+                } => {
+                    let summary = entry_summary(&name, &args);
+                    Cell::recorded_tool(call_id, &name, &args, summary, &output)
+                }
+            };
+            self.push(cell);
+        }
+        self.push(Cell::notice(
+            NoticeKind::Checkpoint,
+            HISTORY_DIVIDER.to_string(),
+        ));
+        if self.offset_from_bottom > 0 {
+            self.unseen = unseen + 1;
+        }
+        self.account_full_output(0, budget);
+    }
+
+    /// Appends the cell a reply streams into and remembers where it is.
+    pub(super) fn open_stream(&mut self, cell: Cell) {
+        self.push(cell);
+        self.stream = Some(self.cells.len() - 1);
+    }
+
+    pub(super) fn stream_cell_mut(&mut self) -> Option<&mut Cell> {
+        let stream = self.stream?;
+        self.touch(stream)
+    }
+
+    /// Adds a delta to the streaming reply, opening a cell for it when
+    /// none is open.
+    pub(super) fn stream_delta(&mut self, delta: &str) {
+        match self.stream_cell_mut() {
+            Some(Cell::Assistant { source, .. }) => source.push_str(delta),
+            _ => {
+                self.open_carried_stream(delta);
+            }
+        }
+    }
+
+    /// Opens the next part of a cut reply with what the cut carried and
+    /// held back, followed by `delta`.
+    fn open_carried_stream(&mut self, delta: &str) {
+        let source =
+            std::mem::take(&mut self.stream_carry) + &std::mem::take(&mut self.stream_held) + delta;
+        self.open_stream(Cell::assistant(source, false));
+    }
+
+    /// Ends the streaming reply's open cell where it is, so the next cell
+    /// pushed sits below the text so far and the next delta opens a cell
+    /// below that one. The unfinished last line moves to the next cell:
+    /// a fence or think tag on it may not be whole yet, so the state the
+    /// next cell carries over is read from complete lines only. A cell
+    /// left with nothing goes.
+    pub(super) fn cut_stream(&mut self) {
+        let Some(index) = self.stream.take() else {
+            return;
+        };
+        let (carry, held, emptied) = match self.touch(index) {
+            Some(Cell::Assistant { source, done, .. }) => {
+                *done = true;
+                let held = source.rfind('\n').map_or(0, |at| at + 1);
+                let unfinished = source.split_off(held);
+                (
+                    cells::reply_continuation(source),
+                    unfinished,
+                    source.is_empty(),
+                )
+            }
+            _ => (String::new(), String::new(), false),
+        };
+        self.stream_carry = carry;
+        self.stream_held = held;
+        if emptied {
+            self.remove(index);
+        } else {
+            self.stream_parts.push(index);
+        }
+    }
+
+    /// Forgets the streaming cell and hands it over to be finalised; the
+    /// cells a command cut off the reply are already final. A line a cut
+    /// held back with no delta since gets a cell of its own, so the
+    /// reply ending there does not lose it.
+    pub(super) fn close_stream(&mut self) -> Option<&mut Cell> {
+        self.stream_parts.clear();
+        if self.stream.is_none() && !self.stream_held.is_empty() {
+            self.open_carried_stream("");
+        }
+        self.stream_carry.clear();
+        let stream = self.stream.take()?;
+        self.touch(stream)
+    }
+
+    /// Puts a round's final text in place of what streamed of it: the
+    /// cells a command cut off go, and the text takes the open cell, or a
+    /// cell of its own at the end when none is open.
+    pub(super) fn finish_stream(&mut self, text: String) {
+        for index in std::mem::take(&mut self.stream_parts).into_iter().rev() {
+            self.remove(index);
+        }
+        match self.close_stream() {
+            Some(Cell::Assistant {
+                source,
+                done,
+                cache,
+            }) => {
+                *source = text;
+                *done = true;
+                *cache = RenderCache::default();
+            }
+            _ => self.push(Cell::assistant(text, true)),
+        }
+    }
+
+    /// Puts `cell` where another was; the row keeps its place and its
+    /// focus. Whole output the caller moves from the old cell into the
+    /// new one afterwards is counted again with `account_full_output`.
+    pub(super) fn replace(&mut self, index: usize, cell: Cell) -> Cell {
+        self.full_output_bytes += cell.full_output_bytes();
+        self.revisions[index] = self.next_revision();
+        let old = std::mem::replace(&mut self.cells[index], cell);
+        self.full_output_bytes = self
+            .full_output_bytes
+            .saturating_sub(old.full_output_bytes());
+        old
+    }
+
+    pub(super) fn remove(&mut self, index: usize) -> Cell {
+        let unseen_from = self.cells.len().saturating_sub(self.unseen);
+        self.next_revision();
+        self.revisions.remove(index);
+        if index < self.laid_out.len() {
+            self.laid_out.remove(index);
+        }
+        let removed = self.cells.remove(index);
+        self.full_output_bytes = self
+            .full_output_bytes
+            .saturating_sub(removed.full_output_bytes());
+        if index >= unseen_from {
+            self.unseen -= 1;
+        }
+        let shift = |held: Option<usize>| match held {
+            Some(held) if held == index => None,
+            Some(held) if held > index => Some(held - 1),
+            other => other,
+        };
+        self.focus = shift(self.focus);
+        self.stream = shift(self.stream);
+        self.stream_parts = self
+            .stream_parts
+            .iter()
+            .filter_map(|&part| shift(Some(part)))
+            .collect();
+        self.floors = self
+            .floors
+            .iter()
+            .filter_map(|&floor| shift(Some(floor)))
+            .collect();
+        self.anchor = match self.anchor {
+            Some(anchor) if anchor.cell == index && index < self.cells.len() => Some(Anchor {
+                cell: index,
+                row: 0,
+                ..anchor
+            }),
+            Some(anchor) if anchor.cell == index => index.checked_sub(1).map(|cell| Anchor {
+                cell,
+                row: usize::MAX,
+                gap: false,
+            }),
+            Some(anchor) if anchor.cell > index => Some(Anchor {
+                cell: anchor.cell - 1,
+                ..anchor
+            }),
+            other => other,
+        };
+        removed
+    }
+
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.unseen = self
+            .unseen
+            .saturating_sub(self.cells.len().saturating_sub(len));
+        let cut: usize = self
+            .cells
+            .iter()
+            .skip(len)
+            .map(Cell::full_output_bytes)
+            .sum();
+        self.full_output_bytes = self.full_output_bytes.saturating_sub(cut);
+        self.next_revision();
+        self.cells.truncate(len);
+        self.revisions.truncate(len);
+        self.laid_out.truncate(len);
+        if self.focus.is_some_and(|focus| focus >= len) {
+            self.focus = None;
+        }
+        if self.stream.is_some_and(|stream| stream >= len) {
+            self.stream = None;
+        }
+        self.stream_parts.retain(|&part| part < len);
+        self.floors.retain(|&floor| floor < len);
+        self.anchor = match self.anchor {
+            Some(anchor) if anchor.gap && anchor.cell == len => {
+                len.checked_sub(1).map(|cell| Anchor {
+                    cell,
+                    row: usize::MAX,
+                    gap: false,
+                })
+            }
+            Some(anchor) if anchor.cell >= len => None,
+            other => other,
+        };
+        if self.cells.is_empty() {
+            self.cells.push(Cell::welcome());
+            let revision = self.next_revision();
+            self.revisions.push(revision);
+        }
+    }
+
+    /// Drops the greeting. Called ahead of reading `len` as a cell index
+    /// so the index survives the next push.
+    pub(super) fn clear_welcome(&mut self) {
+        if matches!(self.cells.first(), Some(Cell::Welcome { .. })) {
+            self.remove(0);
+        }
+    }
+
+    pub(super) fn welcome_only(&self) -> bool {
+        matches!(self.cells.as_slice(), [Cell::Welcome { .. }])
+    }
+
+    /// Puts the greeting's wordmark at `step` of its startup sweep, or
+    /// settles it; the greeting is drawn anew only when that changes.
+    pub(super) fn set_welcome_sweep(&mut self, step: Option<usize>) {
+        if matches!(self.cells.first(), Some(Cell::Welcome { sweep, .. }) if *sweep != step)
+            && let Some(Cell::Welcome { sweep, .. }) = self.touch(0)
+        {
+            *sweep = step;
+        }
+    }
+
+    pub(super) fn scrolled(&self) -> bool {
+        self.offset_from_bottom > 0
+    }
+
+    pub(super) fn focused(&self) -> bool {
+        self.focus.is_some()
+    }
+
+    pub(super) fn focus(&self) -> Option<usize> {
+        self.focus
+    }
+
+    /// Moves the view `delta` lines: down towards the bottom when
+    /// positive, up when negative. Reaching the bottom resumes following.
+    pub(super) fn scroll_lines(&mut self, delta: i32) {
+        let offset = i64::try_from(self.offset_from_bottom).unwrap_or(i64::MAX) - i64::from(delta);
+        self.offset_from_bottom = usize::try_from(offset).unwrap_or(0);
+        if self.offset_from_bottom == 0 {
+            self.unseen = 0;
+        }
+    }
+
+    pub(super) fn scroll_page(&mut self, direction: i32) {
+        let page = i32::from(self.last_area.height.max(1));
+        self.scroll_lines(direction.saturating_mul(page));
+    }
+
+    pub(super) fn scroll_to_bottom(&mut self) {
+        self.offset_from_bottom = 0;
+        self.unseen = 0;
+    }
+
+    fn collapsible_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.cells
+            .iter()
+            .enumerate()
+            .skip(self.view_floor())
+            .filter(|(_, cell)| cell.collapsible())
+            .map(|(index, _)| index)
+    }
+
+    /// Focus the previous row that opens and closes; from no focus, the
+    /// last one.
+    pub(super) fn focus_prev(&mut self) {
+        let target = match self.focus {
+            None => self.collapsible_indices().next_back(),
+            Some(focus) => self
+                .collapsible_indices()
+                .rev()
+                .find(|index| *index < focus)
+                .or(Some(focus)),
+        };
+        self.set_focus(target);
+    }
+
+    /// Focus the next row that opens and closes; from no focus, the first
+    /// one from the top of the view down, or the last above it when none
+    /// is, so a long history above is not laid out to reach its oldest.
+    pub(super) fn focus_next(&mut self) {
+        let target = match self.focus {
+            None => {
+                let top = self.anchor.map_or(0, |anchor| anchor.cell);
+                self.collapsible_indices()
+                    .find(|index| *index >= top)
+                    .or_else(|| self.collapsible_indices().next_back())
+            }
+            Some(focus) => self
+                .collapsible_indices()
+                .find(|index| *index > focus)
+                .or(Some(focus)),
+        };
+        self.set_focus(target);
+    }
+
+    fn set_focus(&mut self, target: Option<usize>) {
+        if target.is_some() {
+            self.focus = target;
+            self.reveal_focus = true;
+        }
+    }
+
+    pub(super) fn toggle_focused(&mut self) {
+        if let Some(focus) = self.focus
+            && let Some(cell) = self.touch(focus)
+        {
+            cell.toggle();
+        }
+    }
+
+    pub(super) fn clear_focus(&mut self) {
+        self.focus = None;
+    }
+
+    /// A left click on a row that opens and closes focuses it and flips
+    /// it; a click anywhere else does nothing.
+    pub(super) fn click(&mut self, column: u16, row: u16) {
+        if !self.last_area.contains(Position::new(column, row)) {
+            return;
+        }
+        let row = row - self.last_area.y;
+        let Some(index) = self
+            .last_layout
+            .iter()
+            .find(|span| span.first_row <= row && row < span.first_row + span.rows)
+            .map(|span| span.cell)
+        else {
+            return;
+        };
+        if self.cells.get(index).is_some_and(Cell::collapsible)
+            && let Some(cell) = self.touch(index)
+        {
+            cell.toggle();
+            self.focus = Some(index);
+        }
+    }
+
+    /// The area the last frame drew the transcript in.
+    pub(super) fn area(&self) -> Rect {
+        self.last_area
+    }
+
+    /// The row and column of the last frame at screen cell `column`,
+    /// `row`. The blank line under a cell counts as the row past its
+    /// last, and so does the space below the last cell. The greeting
+    /// alone is drawn centred, apart from this layout, so it has none.
+    pub(super) fn pos_at(&self, column: u16, row: u16) -> Option<Pos> {
+        if self.welcome_only() || !self.last_area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let row = row - self.last_area.y;
+        let column = usize::from(column - self.last_area.x);
+        let span = self
+            .last_layout
+            .iter()
+            .rev()
+            .find(|span| span.first_row <= row)
+            .or(self.last_layout.first())?;
+        let inside = usize::from(row.saturating_sub(span.first_row));
+        Some(if inside < usize::from(span.rows) {
+            Pos::new(span.cell, span.from + inside, column)
+        } else if row < span.first_row {
+            Pos::new(span.cell, span.from, 0)
+        } else {
+            Pos::new(span.cell, span.from + usize::from(span.rows), 0)
+        })
+    }
+
+    /// The rows of cells `first..=last` as the selection copies them, at
+    /// the width of the last frame; the rows of a reply's drawn block copy
+    /// as the block's source.
+    pub(super) fn selection_rows(
+        &mut self,
+        first: usize,
+        last: usize,
+        renderer: &mut Renderer,
+    ) -> Vec<selection::Row> {
+        let width = self.last_area.width;
+        let last = last.min(self.cells.len().saturating_sub(1));
+        let mut rows = Vec::new();
+        for (index, cell) in self.cells.iter_mut().enumerate().take(last + 1).skip(first) {
+            let regions = cell.copy_regions(width, renderer);
+            let cell_lines = cell.cached_lines(width, None, renderer);
+            let mut cell_rows = selection::rows(
+                cell_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(row, line)| (Pos::new(index, row, 0), line)),
+            );
+            selection::mark_regions(&mut cell_rows, &regions);
+            rows.extend(cell_rows);
+        }
+        rows
+    }
+
+    /// Paints the rows of the last frame that fall inside `range`.
+    pub(super) fn paint_selection(&self, buf: &mut Buffer, range: (Pos, Pos), style: Style) {
+        let area = self.last_area.intersection(*buf.area());
+        for span in &self.last_layout {
+            for inside in 0..span.rows {
+                let y = self.last_area.y + span.first_row + inside;
+                if y < area.bottom() {
+                    let key = (span.cell, span.from + usize::from(inside));
+                    selection::paint_row(buf, area, y, key, range, style);
+                }
+            }
+        }
+    }
+
+    /// Lays the cells out for `area` and hands back the rows to draw.
+    /// The scroll offset is clamped to what the transcript can show, and
+    /// the rows each cell received are kept so a click can find its cell.
+    pub(super) fn view(&mut self, area: Rect, renderer: &mut Renderer) -> TranscriptView {
+        // An empty area lays nothing out, so the frame after it is
+        // compared with the last one that did and keeps its anchor.
+        if area.is_empty() {
+            self.last_layout.clear();
+            return TranscriptView {
+                lines: Vec::new(),
+                centre: false,
+                centre_rows: None,
+                chip: None,
+            };
+        }
+        let previous = std::mem::replace(&mut self.last_area, area);
+        let resized = area.width != previous.width;
+        let centre = self.welcome_only();
+        let room = centre.then_some(area.height);
+        let count = self.cells.len();
+        let floor = self.view_floor();
+        self.laid_out.resize(count, None);
+        // Only the cells from the view's top line down are laid out. One
+        // further up counts the rows it took when last laid out at this
+        // width, or `UNLAID_ROWS` until the view first reaches it, so a
+        // long history costs what is on screen rather than all of it. The
+        // view is placed again with every cell it reaches laid out, until
+        // it reaches no cell that is not.
+        let mut exact_from = count;
+        let mut frame_lines: Vec<(usize, Vec<Line<'static>>)> = Vec::new();
+        let placement = loop {
+            let mut rows = Vec::with_capacity(count);
+            for index in 0..count {
+                if index < floor {
+                    rows.push(0);
+                    continue;
+                }
+                rows.push(match self.rows_laid_out(index, area.width, room) {
+                    Some(rows) => rows,
+                    None if index >= exact_from => {
+                        self.lay_out(index, area.width, room, renderer, &mut frame_lines)
+                    }
+                    None => UNLAID_ROWS,
+                });
+            }
+            let placement = self.place(&rows, area, previous, resized, centre);
+            let first = placement.first_cell();
+            if first >= exact_from
+                || (first..exact_from)
+                    .all(|index| self.rows_laid_out(index, area.width, room).is_some())
+            {
+                break placement;
+            }
+            exact_from = first;
+        };
+        let Placement {
+            headers,
+            total,
+            offset,
+            start,
+            end,
+        } = placement;
+        self.last_total = total;
+        self.offset_from_bottom = offset;
+        self.reveal_focus = false;
+        if self.offset_from_bottom == 0 {
+            self.unseen = 0;
+        }
+        self.last_offset = self.offset_from_bottom;
+        self.anchor = headers
+            .partition_point(|header| *header <= start)
+            .checked_sub(1)
+            .map(|cell| match headers.get(cell + 1) {
+                Some(next) if start + 1 == *next => Anchor {
+                    cell: cell + 1,
+                    row: 0,
+                    gap: true,
+                },
+                _ => Anchor {
+                    cell,
+                    row: start - headers[cell],
+                    gap: false,
+                },
+            });
+
+        let mut lines = Vec::with_capacity(end - start);
+        self.last_layout.clear();
+        let first = self.anchor.map_or(floor, |anchor| anchor.cell);
+        for (index, &header) in headers.iter().enumerate().skip(first) {
+            if header > end {
+                break;
+            }
+            if index > 0 && header > start {
+                lines.push(Line::default());
+            }
+            let cell_rows = match frame_lines.iter().position(|(at, _)| *at == index) {
+                Some(at) => Cow::Owned(frame_lines.swap_remove(at).1),
+                None => self.cells[index].cached_lines(area.width, room, renderer),
+            };
+            let from = start.saturating_sub(header);
+            let to = cell_rows.len().min(end - header);
+            if from >= to {
+                continue;
+            }
+            self.last_layout.push(RowSpan {
+                cell: index,
+                from,
+                first_row: u16::try_from(header + from - start).unwrap_or(u16::MAX),
+                rows: u16::try_from(to - from).unwrap_or(u16::MAX),
+            });
+            lines.extend(cell_rows[from..to].iter().enumerate().map(|(row, line)| {
+                if from + row == 0 && self.focus == Some(index) {
+                    line.clone().patch_style(REVERSED)
+                } else {
+                    line.clone()
+                }
+            }));
+        }
+
+        let chip = (self.offset_from_bottom > 0).then(|| {
+            if self.unseen > 0 {
+                format!("{} new below  End = follow", self.unseen)
+            } else {
+                "End = follow".to_string()
+            }
+        });
+        TranscriptView {
+            lines,
+            centre,
+            centre_rows: None,
+            chip,
+        }
+    }
+
+    /// The rows cell `index` took when laid out for `width` and `room`,
+    /// if it has been since it last changed.
+    fn rows_laid_out(&self, index: usize, width: u16, room: Option<u16>) -> Option<usize> {
+        let laid_out = self.laid_out.get(index).copied().flatten()?;
+        (laid_out.revision == self.revisions[index]
+            && laid_out.width == width
+            && laid_out.room == room)
+            .then_some(laid_out.rows)
+    }
+
+    /// Lays cell `index` out and returns its rows. A cell whose lines are
+    /// drawn anew each frame (a streaming reply) is not remembered as laid
+    /// out; its lines for this frame are kept in `frame_lines` instead.
+    fn lay_out(
+        &mut self,
+        index: usize,
+        width: u16,
+        room: Option<u16>,
+        renderer: &mut Renderer,
+        frame_lines: &mut Vec<(usize, Vec<Line<'static>>)>,
+    ) -> usize {
+        if let Some((_, lines)) = frame_lines.iter().find(|(at, _)| *at == index) {
+            return lines.len();
+        }
+        match self.cells[index].cached_lines(width, room, renderer) {
+            Cow::Borrowed(lines) => {
+                let rows = lines.len();
+                self.laid_out[index] = Some(LaidOut {
+                    revision: self.revisions[index],
+                    width,
+                    room,
+                    rows,
+                });
+                rows
+            }
+            Cow::Owned(lines) => {
+                let rows = lines.len();
+                frame_lines.push((index, lines));
+                rows
+            }
+        }
+    }
+
+    /// Places the view over cells of `rows` each. A blank line separates
+    /// each cell after the view floor from the one before; the cells
+    /// under the floor take no lines. A scrolled view is held on the line
+    /// the last frame started on; a new width re-wraps every cell, so a
+    /// row inside one no longer names the same text, and the offset is
+    /// kept as it was instead.
+    fn place(
+        &self,
+        rows: &[usize],
+        area: Rect,
+        previous: Rect,
+        resized: bool,
+        centre: bool,
+    ) -> Placement {
+        let mut headers = Vec::with_capacity(rows.len());
+        let mut total = 0;
+        let floor = self.view_floor();
+        for (index, &cell_rows) in rows.iter().enumerate() {
+            if index > floor {
+                total += 1;
+            }
+            headers.push(total);
+            total += cell_rows;
+        }
+        let height = usize::from(area.height);
+        let mut offset = self.offset_from_bottom;
+        if offset > 0 && !resized {
+            match self
+                .anchor
+                .filter(|anchor| anchor.cell >= floor)
+                .and_then(|anchor| anchor.line(&headers, total))
+            {
+                Some(top) => {
+                    offset = anchored_offset(
+                        self.last_offset,
+                        offset,
+                        top + usize::from(previous.height),
+                        total,
+                    );
+                }
+                None => offset += total.saturating_sub(self.last_total),
+            }
+        }
+        offset = offset.min(total.saturating_sub(height));
+        if self.reveal_focus
+            && let Some(header) = self.focus.map(|focus| headers[focus])
+        {
+            offset = revealed(offset, header, total, height);
+        }
+        let end = total - offset;
+        // A greeting taller than the area keeps its top, where the
+        // wordmark is; the render clips its bottom.
+        let start = if centre {
+            0
+        } else {
+            end.saturating_sub(height)
+        };
+        Placement {
+            headers,
+            total,
+            offset,
+            start,
+            end,
+        }
+    }
+
+    /// The tool row a hook's call id names: the row with that id, or,
+    /// for a model that gave no id, the newest running row without one.
+    fn tool_row(&self, first_cell: usize, call_id: &str) -> Option<usize> {
+        let cells = self.cells();
+        (first_cell..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id: id,
+                    status,
+                    ..
+                } if call_id.is_empty() => {
+                    id.is_empty() && matches!(status, ToolStatus::Running { .. })
+                }
+                Cell::Tool { call_id: id, .. } => id == call_id,
+                _ => false,
+            })
+    }
+
+    /// The job or agent row a `job__*` or `agent__*` call addresses by
+    /// the id in its arguments.
+    fn addressed_row(&self, name: &str, args: Option<&Value>) -> Option<usize> {
+        let id = args?.get("id")?.as_str()?;
+        let job = matches!(name, "job__check" | "job__collect" | "job__cancel");
+        let agent = matches!(
+            name,
+            "agent__check" | "agent__collect" | "agent__send_message" | "agent__cancel"
+        );
+        self.cells().iter().rposition(|cell| match cell {
+            Cell::Job { job_id, .. } => job && job_id == id,
+            Cell::Agent { agent_id, .. } => agent && agent_id == id,
+            _ => false,
+        })
+    }
+
+    /// Names the row the narration opened. A call that checks on a job
+    /// or agent folds into that job's or agent's row instead, so the
+    /// transcript shows one row per background task rather than one per
+    /// look at it.
+    pub(super) fn tool_started(
+        &mut self,
+        first_cell: usize,
+        call_id: String,
+        name: String,
+        args: Option<Value>,
+    ) {
+        let Some(mut row) = self.addressed_row(&name, args.as_ref()) else {
+            if let Some(index) = self.tool_row(first_cell, &call_id)
+                && let Some(Cell::Tool {
+                    name: current,
+                    args: short,
+                    bookkeeping,
+                    ..
+                }) = self.cell_mut(index)
+            {
+                *bookkeeping = cells::is_bookkeeping(&name);
+                *current = name;
+                if let Some(args) = &args {
+                    *short = cells::short_args(&args.to_string());
+                }
+            }
+            return;
+        };
+        if let Some(index) = self.tool_row(first_cell, &call_id) {
+            self.remove(index);
+            if index < row {
+                row -= 1;
+            }
+        }
+        if let Some(
+            Cell::Job {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            },
+        ) = self.cell_mut(row)
+        {
+            calls.push(FoldedCall::new(call_id, name));
+        }
+    }
+
+    pub(super) fn tool_finished(
+        &mut self,
+        first_cell: usize,
+        now: Instant,
+        call_id: &str,
+        ok: bool,
+        error: Option<String>,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(index) = self.tool_row(first_cell, call_id) else {
+            return;
+        };
+        let Some(Cell::Tool { status, tail, .. }) = self.cell_mut(index) else {
+            return;
+        };
+        let grew = tail.full.settle();
+        status.finish(now, ok, error, duration_ms);
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+    }
+
+    /// A job or agent row takes the place of the running `starter` call
+    /// that made it, keeping that call folded so its output still routes
+    /// to the row; without one the row is appended.
+    pub(super) fn start_row(&mut self, first_cell: usize, row: Cell, starter: &str) {
+        let cells = self.cells();
+        let running = (first_cell..cells.len()).rev().find(|&index| {
+            matches!(
+                &cells[index],
+                Cell::Tool {
+                    status: ToolStatus::Running { .. },
+                    ..
+                }
+            )
+        });
+        match running {
+            Some(index) if matches!(&cells[index], Cell::Tool { name, .. } if name == starter) => {
+                let Cell::Tool {
+                    call_id,
+                    name,
+                    tail,
+                    ..
+                } = self.replace(index, row)
+                else {
+                    unreachable!("the index was found holding a tool row");
+                };
+                let moved = tail.full.text().len();
+                if let Some(
+                    Cell::Job {
+                        row: TaskRow { calls, .. },
+                        ..
+                    }
+                    | Cell::Agent {
+                        row: TaskRow { calls, .. },
+                        ..
+                    },
+                ) = self.cell_mut(index)
+                {
+                    calls.push(FoldedCall {
+                        call_id,
+                        name,
+                        args: None,
+                        tail,
+                        status: None,
+                    });
+                    self.account_full_output(
+                        isize::try_from(moved).unwrap_or(isize::MAX),
+                        FULL_OUTPUT_BUDGET,
+                    );
+                }
+            }
+            _ => self.push(row),
+        }
+    }
+
+    pub(super) fn set_job_status(&mut self, job_id: &str, status: JobStatus) {
+        let row = self
+            .cells()
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::Job { job_id: id, .. } if id == job_id));
+        if let Some(Cell::Job { row: task, .. }) = row.and_then(|row| self.cell_mut(row)) {
+            task.status = status;
+        }
+    }
+
+    pub(super) fn set_agent_status(&mut self, agent_id: &str, status: AgentStatus) {
+        let row = self
+            .cells()
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::Agent { agent_id: id, .. } if id == agent_id));
+        if let Some(Cell::Agent { row: task, .. }) = row.and_then(|row| self.cell_mut(row)) {
+            task.status = status;
+        }
+    }
+
+    /// Settles every running job and agent row whose task `tracked` no
+    /// longer names: a dropped supervisor aborts its tasks without
+    /// reporting how they ended, so nothing else would stop those rows
+    /// counting up. A job reads cancelled and an agent interrupted.
+    pub(super) fn settle_vanished(&mut self, tracked: &dyn Fn(&str) -> bool) {
+        for index in 0..self.cells.len() {
+            let vanished = match &self.cells[index] {
+                Cell::Job {
+                    job_id: id, row, ..
+                } => matches!(row.status, JobStatus::Running { .. }) && !tracked(id),
+                Cell::Agent {
+                    agent_id: id, row, ..
+                } => matches!(row.status, AgentStatus::Running { .. }) && !tracked(id),
+                _ => false,
+            };
+            if !vanished {
+                continue;
+            }
+            match self.touch(index) {
+                Some(Cell::Job { row, .. }) => row.status = JobStatus::Cancelled,
+                Some(Cell::Agent { row, .. }) => row.status = AgentStatus::Interrupted,
+                _ => {}
+            }
+        }
+    }
+
+    /// Late command output arrives one pipe read at a time; consecutive
+    /// chunks join the trailing Routing cell instead of each taking a
+    /// cell of their own, but only when that cell sits at or after index
+    /// `merge_from`, and the cell keeps only its newest text.
+    pub(super) fn push_notice(&mut self, merge_from: usize, kind: NoticeKind, mut text: String) {
+        if kind != NoticeKind::Routing {
+            self.push(Cell::notice(kind, text));
+            return;
+        }
+        text.truncate(text.trim_end_matches('\n').len());
+        if self.len() > merge_from
+            && let Some(Cell::Notice {
+                kind: NoticeKind::Routing,
+                text: tail,
+                ..
+            }) = self.last_mut()
+        {
+            if !tail.is_empty() && !text.is_empty() {
+                tail.push('\n');
+            }
+            tail.push_str(&text);
+            if tail.len() > LATE_OUTPUT_LIMIT {
+                let cut = tail.len() - LATE_OUTPUT_LIMIT;
+                let cut = (cut..=tail.len())
+                    .find(|at| tail.is_char_boundary(*at))
+                    .unwrap_or(tail.len());
+                tail.drain(..cut);
+            }
+            return;
+        }
+        self.push(Cell::notice(kind, text));
+    }
+
+    pub(super) fn append_tool_output(
+        &mut self,
+        first_cell: usize,
+        in_turn: bool,
+        call_id: Option<String>,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Output of a call the transcript has a row for (or has folded
+        // into a job's or agent's row) belongs to that row. The pump of a
+        // call the model gave no id reports `None`; its row is the one
+        // the narration opened with an empty id.
+        let target = match call_id.as_deref() {
+            Some(id) => self.tool_output_target(first_cell, id),
+            None if in_turn => self.anonymous_tool_output_target(first_cell),
+            None => None,
+        };
+        if let Some(tail) = target {
+            let text = append_output(tail, bytes);
+            let grew = tail.full.push(&text);
+            self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+            return;
+        }
+        // Inside a turn the output never merges into a cell from before
+        // the turn; outside one (a background job still writing) every
+        // chunk of the same call shares the trailing cell, so a chatty
+        // job cannot grow the transcript by a cell per read.
+        let cells = self.cells();
+        let last = cells.len().checked_sub(1);
+        let continues_last = last.is_some_and(|index| {
+            index >= first_cell
+                && matches!(&cells[index], Cell::Text { call_id: id, .. } if *id == call_id)
+        });
+        if !continues_last {
+            self.push(Cell::Text {
+                call_id,
+                tail: OutputTail::default(),
+                cache: LineCache::default(),
+            });
+        }
+        let Some(Cell::Text { tail, .. }) = self.last_mut() else {
+            return;
+        };
+        let text = append_output(tail, bytes);
+        let grew = tail.full.push(&text);
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+    }
+
+    /// The output tail of the call `call_id`: a tool row's own, within
+    /// this turn, or that of a call folded into a job's or agent's row,
+    /// which a later turn's check reaches back to.
+    fn tool_output_target(&mut self, first_cell: usize, call_id: &str) -> Option<&mut OutputTail> {
+        let index = self
+            .cells()
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, cell)| {
+                *index >= first_cell || matches!(cell, Cell::Job { .. } | Cell::Agent { .. })
+            })
+            .find(|(_, cell)| cell.takes_output_of(call_id))?
+            .0;
+        self.cell_mut(index)?.output_for(call_id)
+    }
+
+    /// The output tail of a call without an id, within this turn: the
+    /// newest running tool row without one (a finished one has had all
+    /// its output), or the newest such call folded into a running job's
+    /// or agent's row; a finished job or agent takes nothing more.
+    fn anonymous_tool_output_target(&mut self, first_cell: usize) -> Option<&mut OutputTail> {
+        let cells = self.cells();
+        let index = (first_cell..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id, status, ..
+                } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
+                Cell::Job { row, .. } => {
+                    matches!(row.status, JobStatus::Running { .. })
+                        && row.calls.iter().any(|call| call.call_id.is_empty())
+                }
+                Cell::Agent { row, .. } => {
+                    matches!(row.status, AgentStatus::Running { .. })
+                        && row.calls.iter().any(|call| call.call_id.is_empty())
+                }
+                _ => false,
+            })?;
+        self.cell_mut(index)?.output_for("")
+    }
+}
+
+/// The offset that moves the view the least it has to for line `header`
+/// to be on it.
+fn revealed(offset: usize, header: usize, total: usize, height: usize) -> usize {
+    let end = total - offset;
+    let start = end.saturating_sub(height);
+    if header < start {
+        total - (header + height).min(total)
+    } else if header >= end {
+        total - (header + 1)
+    } else {
+        offset
+    }
+}
+
+/// The offset that ends the view at line `end`, where the last frame
+/// drawn at `last_offset` ended, moved by the scroll that has taken the
+/// offset to `offset` since. Ending where it ended keeps the bottom row
+/// still when the view changes height, as it stays following. It is at
+/// least 1: cells below the view shrinking can bring the bottom up past
+/// that line, and the view stays scrolled until the user returns.
+fn anchored_offset(last_offset: usize, offset: usize, end: usize, total: usize) -> usize {
+    let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let end = wide(end) + wide(last_offset) - wide(offset);
+    usize::try_from(wide(total) - end).unwrap_or(0).max(1)
+}
+
+impl Anchor {
+    /// Where the anchored row is now, given each cell's first line; a
+    /// cell that shrank past the row gives the line after its last.
+    fn line(self, headers: &[usize], total: usize) -> Option<usize> {
+        let header = *headers.get(self.cell)?;
+        if self.gap {
+            return Some(header.saturating_sub(1));
+        }
+        let end = headers.get(self.cell + 1).map_or(total, |next| next - 1);
+        Some(header + self.row.min(end - header))
+    }
+}
+
+/// The rows of the transcript the view shows, with the follow chip while
+/// the view is scrolled away from the bottom. The greeting alone sits in
+/// the middle of the area rather than at its bottom, and loses its bottom
+/// rows rather than its top when it is taller.
+pub(super) struct TranscriptView {
+    lines: Vec<Line<'static>>,
+    centre: bool,
+    /// The height the greeting is centred in, when that is not the
+    /// area's own: a band opening over the composer then covers the
+    /// greeting's bottom rows instead of moving it.
+    centre_rows: Option<u16>,
+    chip: Option<String>,
+}
+
+impl TranscriptView {
+    /// Centres the greeting in `rows` from the area's top, whatever height
+    /// the area is drawn at.
+    pub(super) fn centred_in(mut self, rows: u16) -> Self {
+        self.centre_rows = Some(rows);
+        self
+    }
+}
+
+impl Widget for TranscriptView {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let area = area.intersection(*buf.area());
+        if area.is_empty() {
+            return;
+        }
+        let mut content = area;
+        if self.centre {
+            let rows = self.centre_rows.unwrap_or(area.height);
+            let spare = usize::from(rows).saturating_sub(self.lines.len());
+            let top = u16::try_from(spare / 2)
+                .unwrap_or(0)
+                .min(area.height.saturating_sub(1));
+            content.y += top;
+            content.height -= top;
+        }
+        let skip = if self.centre {
+            0
+        } else {
+            self.lines.len().saturating_sub(usize::from(content.height))
+        };
+        let visible: Vec<Line<'static>> = self.lines.into_iter().skip(skip).collect();
+        Paragraph::new(visible).render(content, buf);
+        if let Some(chip) = self.chip {
+            let last_row = Rect {
+                y: area.bottom() - 1,
+                height: 1,
+                ..area
+            };
+            Paragraph::new(Line::from(Span::styled(chip, REVERSED)))
+                .right_aligned()
+                .render(last_row, buf);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::tui::cells::{ToolStatus, append_output};
+    use std::time::{Duration, Instant};
+
+    fn transcript() -> (Transcript, Renderer) {
+        let config = AppConfig {
+            highlight: false,
+            ..Default::default()
+        };
+        let renderer = Renderer::new(config.render_options().unwrap()).unwrap();
+        let mut transcript = Transcript::new();
+        transcript.clear_welcome();
+        (transcript, renderer)
+    }
+
+    fn tool(call_id: &str) -> Cell {
+        Cell::tool(
+            call_id.to_string(),
+            "fs_read",
+            call_id,
+            format!("Call fs_read {call_id}"),
+            Instant::now(),
+        )
+    }
+
+    /// A tool row opened, so its narration and output take lines.
+    fn open_tool(call_id: &str) -> Cell {
+        let mut cell = tool(call_id);
+        cell.toggle();
+        cell
+    }
+
+    fn area(height: u16) -> Rect {
+        Rect::new(0, 0, 40, height)
+    }
+
+    fn grow_tool(transcript: &mut Transcript, index: usize, call_id: &str, lines: usize) {
+        let tail = transcript
+            .cell_mut(index)
+            .unwrap()
+            .output_for(call_id)
+            .unwrap();
+        let text: String = (0..lines).map(|n| format!("{call_id} out {n}\n")).collect();
+        append_output(tail, text.as_bytes());
+    }
+
+    fn finish_tool(transcript: &mut Transcript, index: usize) {
+        if let Some(Cell::Tool { status, .. }) = transcript.cell_mut(index) {
+            *status = ToolStatus::Ok {
+                elapsed: Duration::from_secs(1),
+            };
+        }
+    }
+
+    fn finish_and_close(transcript: &mut Transcript, index: usize) {
+        finish_tool(transcript, index);
+        transcript.cell_mut(index).unwrap().toggle();
+    }
+
+    fn rows(view: &TranscriptView) -> Vec<String> {
+        view.lines.iter().map(ToString::to_string).collect()
+    }
+
+    /// A tool row whose whole output holds `text`, counted as pushed.
+    fn tool_with_output(transcript: &mut Transcript, call_id: &str, text: &str) {
+        transcript.push(tool(call_id));
+        let index = transcript.len() - 1;
+        let tail = transcript
+            .cell_mut(index)
+            .unwrap()
+            .output_for(call_id)
+            .unwrap();
+        let grew = tail.full.push(text);
+        transcript.account_full_output(grew, usize::MAX);
+    }
+
+    /// Output under the budget changes no cell; over it, the oldest calls
+    /// give up their whole output and only their cells count as changed.
+    #[test]
+    fn the_budget_gives_up_the_oldest_output_and_changes_nothing_else() {
+        let (mut transcript, mut renderer) = transcript();
+        for n in 1..=3 {
+            tool_with_output(
+                &mut transcript,
+                &format!("c{n}"),
+                &format!("call {n} out\n"),
+            );
+        }
+        let each = "call 1 out\n".len();
+        let generation = transcript.generation();
+        transcript.account_full_output(0, 3 * each);
+        assert_eq!(
+            transcript.generation(),
+            generation,
+            "a budget pass that gave nothing up counted as a change"
+        );
+        let revisions = transcript.revisions.clone();
+        transcript.account_full_output(0, 2 * each - 1);
+        assert_eq!(transcript.full_output_bytes, each);
+        let kept: Vec<usize> = transcript
+            .cells()
+            .iter()
+            .map(Cell::full_output_bytes)
+            .collect();
+        assert_eq!(kept, [0, 0, each]);
+        assert_ne!(transcript.revisions[0], revisions[0]);
+        assert_ne!(transcript.revisions[1], revisions[1]);
+        assert_eq!(transcript.revisions[2], revisions[2]);
+        let note = transcript.cells_for_layout().0[0].full_lines(80, &mut renderer);
+        assert!(
+            note.iter()
+                .any(|line| line.to_string() == format!("[... {each} earlier bytes not kept]")),
+            "{note:?}"
+        );
+        transcript.remove(2);
+        assert_eq!(transcript.full_output_bytes, 0);
+    }
+
+    /// The running count of whole-output bytes stays the sum over the
+    /// cells through a replace, a remove and a truncate.
+    #[test]
+    fn the_full_output_count_matches_the_cells_after_replace_remove_and_truncate() {
+        fn recounted(transcript: &Transcript) -> usize {
+            transcript.cells().iter().map(Cell::full_output_bytes).sum()
+        }
+        let (mut transcript, _) = transcript();
+        tool_with_output(&mut transcript, "c1", "one\n");
+        tool_with_output(&mut transcript, "c2", "second call\n");
+        tool_with_output(&mut transcript, "c3", "the third call's output\n");
+        tool_with_output(&mut transcript, "c4", "four 4\n");
+        assert_eq!(transcript.full_output_bytes, 47);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+
+        let mut swapped = tool("c9");
+        let tail = swapped.output_for("c9").unwrap();
+        tail.full.push("a much longer replacement output\n");
+        transcript.replace(1, swapped);
+        assert_eq!(transcript.full_output_bytes, 68);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+
+        transcript.remove(0);
+        assert_eq!(transcript.full_output_bytes, 64);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+
+        transcript.truncate(1);
+        assert_eq!(transcript.full_output_bytes, 33);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+    }
+
+    /// Ctrl+Up from nothing takes the last row that opens; Ctrl+Down the
+    /// first; a bookkeeping call and a user line are skipped over.
+    #[test]
+    fn focus_walks_the_rows_that_open_and_skips_the_rest() {
+        let (mut transcript, _) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.push(tool("c1"));
+        transcript.push(Cell::tool(
+            "c2".to_string(),
+            "memory__read",
+            "{}",
+            "Call memory__read {}".to_string(),
+            Instant::now(),
+        ));
+        transcript.push(tool("c3"));
+        transcript.focus_prev();
+        assert_eq!(transcript.focus, Some(3));
+        transcript.focus_prev();
+        assert_eq!(transcript.focus, Some(1));
+        transcript.focus_prev();
+        assert_eq!(transcript.focus, Some(1), "focus ran off the first row");
+        transcript.clear_focus();
+        transcript.focus_next();
+        assert_eq!(transcript.focus, Some(1));
+        transcript.focus_next();
+        assert_eq!(transcript.focus, Some(3));
+        transcript.toggle_focused();
+        assert!(matches!(
+            transcript.cells()[3],
+            Cell::Tool { expanded: true, .. }
+        ));
+        transcript.truncate(2);
+        assert_eq!(transcript.focus, None);
+    }
+
+    /// Removing a cell ahead of the focused one keeps the focus on the
+    /// same row; removing the focused one clears it.
+    #[test]
+    fn removing_cells_keeps_the_focus_on_its_row() {
+        let (mut transcript, _) = transcript();
+        transcript.push(tool("c1"));
+        transcript.push(tool("c2"));
+        transcript.focus_prev();
+        assert_eq!(transcript.focus, Some(1));
+        transcript.remove(0);
+        assert_eq!(transcript.focus, Some(0));
+        transcript.remove(0);
+        assert_eq!(transcript.focus, None);
+    }
+
+    /// Removing a cell that arrived below a scrolled view takes it out
+    /// of the chip's count; removing one above the view leaves it.
+    #[test]
+    fn removing_an_unseen_cell_drops_it_from_the_count() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-100);
+        transcript.push(Cell::user("late 1"));
+        transcript.push(Cell::user("late 2"));
+        assert_eq!(transcript.unseen, 2);
+        transcript.remove(0);
+        assert_eq!(transcript.unseen, 2);
+        transcript.remove(9);
+        assert_eq!(transcript.unseen, 1);
+        transcript.remove(9);
+        assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Truncating below a scrolled view takes the cut cells out of the
+    /// chip's count and no more than that.
+    #[test]
+    fn truncating_unseen_cells_drops_them_from_the_count() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-100);
+        transcript.push(Cell::user("late 1"));
+        transcript.push(Cell::user("late 2"));
+        transcript.push(Cell::user("late 3"));
+        assert_eq!(transcript.unseen, 3);
+        transcript.truncate(12);
+        assert_eq!(transcript.unseen, 2);
+        transcript.truncate(5);
+        assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Thousands of resumed messages of the shape a long session holds.
+    fn long_history(exchanges: usize) -> Vec<ChildEntry> {
+        (0..exchanges)
+            .flat_map(|n| {
+                [
+                    ChildEntry::User(format!("question {n}")),
+                    ChildEntry::Tool {
+                        call_id: format!("call-{n}"),
+                        name: "fs_read".to_string(),
+                        args: format!("{{\"path\":\"notes-{n}.md\"}}"),
+                        output: format!("line one of {n}\nline two of {n}\n"),
+                    },
+                    ChildEntry::Assistant(format!(
+                        "**Answer {n}**: a reply long enough to wrap onto a second row at forty \
+                         columns, with `code` in it.\n\n- a list item\n- another"
+                    )),
+                ]
+            })
+            .collect()
+    }
+
+    /// A long resumed history lays out only the cells the view reaches:
+    /// the first frame costs a screenful, not the whole history, and is
+    /// drawn in bounded time.
+    #[test]
+    fn a_long_history_lays_out_only_what_the_view_reaches() {
+        let (mut transcript, mut renderer) = transcript();
+        let started = Instant::now();
+        transcript.push_history(long_history(5_000));
+        let view = transcript.view(area(10), &mut renderer);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "15,000 messages took {elapsed:?} to first frame"
+        );
+        let laid_out = (0..transcript.len())
+            .filter(|&index| transcript.rows_laid_out(index, 40, None).is_some())
+            .count();
+        assert!(
+            laid_out < 20,
+            "{laid_out} cells were laid out for one screen"
+        );
+        let Cell::User { cache, .. } = &transcript.cells[0] else {
+            panic!("the history does not start with its first line");
+        };
+        assert!(
+            cache.peek(40).is_none(),
+            "the first message was wrapped for a frame that never shows it"
+        );
+        let shown = rows(&view);
+        assert!(
+            shown.iter().any(|row| row.contains(HISTORY_DIVIDER)),
+            "{shown:#?}"
+        );
+        assert!(
+            shown.iter().any(|row| row.contains("another")),
+            "{shown:#?}"
+        );
+    }
+
+    /// Ctrl+Down with nothing focused picks a row in view, not the oldest
+    /// saved call far above, so the next frame lays out only what it shows.
+    #[test]
+    fn focusing_from_no_focus_in_a_long_history_stays_in_view() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push_history(long_history(2_000));
+        transcript.view(area(10), &mut renderer);
+        transcript.focus_next();
+        let focus = transcript.focus.expect("a row took the focus");
+        assert!(
+            focus > transcript.len() - 20,
+            "the focus jumped to row {focus}"
+        );
+        transcript.view(area(10), &mut renderer);
+        let laid_out = (0..transcript.len())
+            .filter(|&index| transcript.rows_laid_out(index, 40, None).is_some())
+            .count();
+        assert!(
+            laid_out < 30,
+            "{laid_out} cells were laid out to show the focus"
+        );
+    }
+
+    /// Paging up through a long resumed history reaches its very first
+    /// message, the view moving up every page, and stops there.
+    #[test]
+    fn paging_up_a_long_history_reaches_its_first_message() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push_history(long_history(1_000));
+        transcript.view(area(10), &mut renderer);
+        let mut pages = 0;
+        let mut last_offset = 0;
+        let top = loop {
+            transcript.scroll_page(-1);
+            let view = transcript.view(area(10), &mut renderer);
+            pages += 1;
+            if transcript.offset_from_bottom == last_offset {
+                break rows(&view);
+            }
+            last_offset = transcript.offset_from_bottom;
+            assert!(pages < 10_000, "paging never reached the top");
+        };
+        assert_eq!(
+            top.first().map(String::as_str),
+            Some("> question 0"),
+            "{top:#?}"
+        );
+        assert!(pages > 100, "a history this long cannot fit {pages} pages");
+        let laid_out = (0..transcript.len())
+            .filter(|&index| transcript.rows_laid_out(index, 40, None).is_some())
+            .count();
+        assert_eq!(
+            laid_out,
+            transcript.len(),
+            "the top reached, every cell is laid out"
+        );
+    }
+
+    /// A resumed history's saved outputs count against the whole-output
+    /// budget at once, the oldest given up first; a view scrolled away
+    /// counts the whole history as one entry below.
+    #[test]
+    fn a_resumed_history_keeps_to_the_output_budget_and_counts_once_below() {
+        let (mut transcript, mut renderer) = transcript();
+        for n in 0..30 {
+            transcript.push(Cell::user(&format!("line {n}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-3);
+        transcript.view(area(5), &mut renderer);
+        let output = "x".repeat(1_000);
+        let entries: Vec<ChildEntry> = (0..10)
+            .map(|n| ChildEntry::Tool {
+                call_id: format!("call-{n}"),
+                name: "fs_read".to_string(),
+                args: "{}".to_string(),
+                output: output.clone(),
+            })
+            .collect();
+        transcript.push_history_within(entries, 4_000);
+        assert!(
+            transcript.full_output_bytes <= 4_000,
+            "{} bytes kept over a 4000-byte budget",
+            transcript.full_output_bytes
+        );
+        let kept: Vec<usize> = transcript
+            .cells
+            .iter()
+            .map(Cell::full_output_bytes)
+            .collect();
+        assert_eq!(
+            kept.iter().filter(|bytes| **bytes > 0).count(),
+            4,
+            "{kept:?}"
+        );
+        assert!(
+            kept[30..34].iter().all(|bytes| *bytes == 0),
+            "the oldest kept theirs: {kept:?}"
+        );
+        assert_eq!(transcript.unseen, 1, "the history counted entry by entry");
+    }
+
+    /// A resumed history reads as the live rows do: the user line, the
+    /// saved call as a finished row, the reply, then the divider under
+    /// the last; compressed rounds come first under their own divider.
+    #[test]
+    fn a_resumed_history_shows_as_rows_under_a_divider() {
+        let (mut transcript, mut renderer) = transcript();
+        let mut entries = vec![ChildEntry::Compressed, ChildEntry::User("old".to_string())];
+        entries.extend(long_history(1));
+        transcript.push_history(entries);
+        let shown = rows(&transcript.view(area(30), &mut renderer));
+        let at = |needle: &str| {
+            shown
+                .iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not shown: {shown:#?}"))
+        };
+        assert!(at(COMPRESSED_DIVIDER) < at("> old"));
+        assert!(at("> old") < at("> question 0"));
+        assert!(at("> question 0") < at("fs_read"));
+        assert!(at("fs_read") < at("Answer 0"));
+        assert!(at("Answer 0") < at(HISTORY_DIVIDER));
+        transcript.push_history(Vec::new());
+        assert_eq!(transcript.len(), 6, "an empty history appends nothing");
+    }
+
+    /// Each restored prompt opened an exchange the session holds, so an
+    /// `.undo` after the history goes back to the newest of them.
+    #[test]
+    fn a_restored_prompt_is_where_an_undo_goes_back_to() {
+        let (mut transcript, _) = transcript();
+        transcript.push_history(vec![
+            ChildEntry::User("first".to_string()),
+            ChildEntry::Assistant("one".to_string()),
+            ChildEntry::User("second".to_string()),
+            ChildEntry::Assistant("two".to_string()),
+        ]);
+        transcript.push(Cell::command(".undo"));
+        let prefix = crate::config::CommandPrefix::Dot;
+        let cells = transcript.cells();
+        let opener = super::super::rewind::undo_opener(cells, cells.len() - 1, prefix);
+        assert!(
+            matches!(opener.map(|at| &cells[at]), Some(Cell::User { text, .. }) if text == "second"),
+            "{opener:?}"
+        );
+    }
+
+    /// The offset is clamped to the lines above the view, a push while
+    /// scrolled counts as unseen and grows the offset by what it added,
+    /// and reaching the bottom forgets the count.
+    #[test]
+    fn scrolling_clamps_and_counts_what_arrives_below() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        // 10 cells and 9 blank separators: 19 lines, 5 on screen.
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-100);
+        transcript.view(area(5), &mut renderer);
+        assert_eq!(transcript.offset_from_bottom, 14);
+        transcript.push(Cell::user("late"));
+        assert_eq!(transcript.unseen, 1);
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+        assert_eq!(transcript.offset_from_bottom, 16, "the view slid");
+        transcript.scroll_page(1);
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(transcript.offset_from_bottom, 11);
+        assert_eq!(transcript.unseen, 1, "a partial scroll forgot the count");
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+        transcript.scroll_to_bottom();
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(transcript.offset_from_bottom, 0);
+        assert_eq!(view.chip, None);
+        assert_eq!(transcript.unseen, 0);
+    }
+
+    /// Cells landing below a scrolled view leave the lines on screen
+    /// where they were; only the chip's count tells they arrived.
+    #[test]
+    fn a_scrolled_view_keeps_its_lines_while_cells_arrive_below() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-6);
+        let before = transcript.view(area(5), &mut renderer);
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let after = transcript.view(area(5), &mut renderer);
+        assert_eq!(
+            after.lines[0].to_string(),
+            before.lines[0].to_string(),
+            "the first visible line moved"
+        );
+        assert_eq!(after.chip.as_deref(), Some("3 new below  End = follow"));
+        transcript.scroll_to_bottom();
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip, None);
+        assert_eq!(view.lines.last().unwrap().to_string(), "> late 2");
+    }
+
+    /// A narrower view re-wraps every cell onto more lines; that is not
+    /// output arriving below and must not push the offset up. Cells
+    /// pushed after the resize still do.
+    #[test]
+    fn a_resize_does_not_inflate_a_scrolled_offset() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i} {}", "x".repeat(30))));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-6);
+        transcript.view(area(5), &mut renderer);
+        assert_eq!(transcript.offset_from_bottom, 6);
+        let narrow = Rect::new(0, 0, 20, 5);
+        transcript.view(narrow, &mut renderer);
+        assert_eq!(
+            transcript.offset_from_bottom, 6,
+            "the re-wrap counted as new output"
+        );
+        transcript.push(Cell::user("late"));
+        transcript.view(narrow, &mut renderer);
+        assert_eq!(
+            transcript.offset_from_bottom, 8,
+            "the cell and its separator"
+        );
+    }
+
+    /// Open tool rows above the view at 0, on it at 11 and below it at
+    /// 15, with user lines between; all three are running.
+    fn tools_around_users() -> (Transcript, Renderer) {
+        let (mut transcript, renderer) = transcript();
+        transcript.push(open_tool("a"));
+        grow_tool(&mut transcript, 0, "a", 3);
+        for i in 1..=10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(open_tool("b"));
+        grow_tool(&mut transcript, 11, "b", 3);
+        for i in 12..=14 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(open_tool("c"));
+        (transcript, renderer)
+    }
+
+    /// While scrolled, a row on the view closing as its call ends, a row
+    /// above it growing and one below it growing all leave the lines
+    /// above the change where they were; a cell pushed below is counted.
+    #[test]
+    fn a_scrolled_view_holds_its_lines_while_other_cells_change_size() {
+        let (mut transcript, mut renderer) = tools_around_users();
+        transcript.view(area(8), &mut renderer);
+        transcript.scroll_lines(-10);
+        let before = rows(&transcript.view(area(8), &mut renderer));
+        assert_eq!(before[0], "> line 9", "{before:?}");
+        assert!(before[4].starts_with("\u{25BE} fs_read("), "{before:?}");
+
+        finish_and_close(&mut transcript, 11);
+        let closed = rows(&transcript.view(area(8), &mut renderer));
+        assert_eq!(closed[..4], before[..4], "the view moved as a row closed");
+        assert!(closed[4].contains("ok"), "{closed:?}");
+        assert_eq!(closed[6], "> line 12", "{closed:?}");
+
+        grow_tool(&mut transcript, 0, "a", 5);
+        let view = rows(&transcript.view(area(8), &mut renderer));
+        assert_eq!(view, closed, "the view moved as a row above it grew");
+
+        grow_tool(&mut transcript, 15, "c", 5);
+        transcript.push(Cell::user("late"));
+        let view = transcript.view(area(8), &mut renderer);
+        assert_eq!(rows(&view), closed, "the view moved as cells below grew");
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+
+        transcript.scroll_lines(1);
+        let view = rows(&transcript.view(area(8), &mut renderer));
+        assert_eq!(
+            view[..7],
+            closed[1..],
+            "a line down moved by other than a line"
+        );
+    }
+
+    /// A tool row's wrapped lines are kept between frames, so each way
+    /// it changes has to show on the next one: the row opening, output
+    /// arriving, the call ending, the row closing and the view changing
+    /// width.
+    #[test]
+    fn a_tool_row_redraws_after_each_change() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(tool("a"));
+        let has = |view: &TranscriptView, text: &str| rows(view).iter().any(|row| row == text);
+        grow_tool(&mut transcript, 0, "a", 2);
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(!has(&view, "  a out 1"), "collapsed: {:?}", rows(&view));
+
+        transcript.focus_prev();
+        transcript.toggle_focused();
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(has(&view, "  a out 1"), "opened: {:?}", rows(&view));
+
+        grow_tool(&mut transcript, 0, "a", 3);
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(has(&view, "  a out 2"), "output: {:?}", rows(&view));
+
+        finish_tool(&mut transcript, 0);
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(rows(&view).iter().any(|row| row.ends_with("ok")));
+
+        let wide = transcript.view(area(20), &mut renderer).lines.len();
+        let narrow = transcript
+            .view(Rect::new(0, 0, 4, 20), &mut renderer)
+            .lines
+            .len();
+        assert!(narrow > wide, "width: {wide} then {narrow}");
+
+        transcript.toggle_focused();
+        let view = transcript.view(area(20), &mut renderer);
+        assert!(!has(&view, "  a out 1"), "closed: {:?}", rows(&view));
+    }
+
+    /// A row the view starts inside closing past that row leaves the view
+    /// starting on the line after it, not on text further up or down.
+    #[test]
+    fn a_row_closing_under_the_top_of_a_scrolled_view_keeps_what_follows_it() {
+        let (mut transcript, mut renderer) = tools_around_users();
+        transcript.view(area(8), &mut renderer);
+        transcript.scroll_lines(-3);
+        let before = rows(&transcript.view(area(8), &mut renderer));
+        assert_eq!(before[0], "  b out 1", "{before:?}");
+        finish_and_close(&mut transcript, 11);
+        let after = rows(&transcript.view(area(8), &mut renderer));
+        assert_eq!(after[..2], ["", "> line 12"], "{after:?}");
+    }
+
+    /// Scrolled away with nothing new below, the chip still offers the
+    /// way back; it is the only sign the view is not following.
+    #[test]
+    fn a_scrolled_view_with_nothing_new_still_offers_the_way_back() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-3);
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip.as_deref(), Some("End = follow"));
+        transcript.scroll_lines(3);
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(view.chip, None);
+    }
+
+    /// Truncating everything away brings the greeting back; the next
+    /// turn clears it as on boot.
+    #[test]
+    fn truncating_to_nothing_reseeds_the_greeting() {
+        let (mut transcript, _) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.push(Cell::assistant("hello".to_string(), true));
+        transcript.truncate(0);
+        assert!(matches!(transcript.cells(), [Cell::Welcome { .. }]));
+        assert!(transcript.welcome_only());
+        transcript.clear_welcome();
+        assert!(transcript.cells().is_empty());
+        transcript.push(Cell::user("again"));
+        transcript.truncate(1);
+        assert_eq!(
+            transcript.len(),
+            1,
+            "a truncation that leaves cells adds nothing"
+        );
+    }
+
+    #[test]
+    fn a_cleared_view_draws_and_focuses_only_from_its_floor() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("before"));
+        transcript.push(tool("old"));
+        transcript.push(Cell::divider("left agent a".to_string()));
+        transcript.clear_view_from(2);
+        transcript.push(Cell::user("after"));
+        let shown = rows(&transcript.view(area(10), &mut renderer));
+        assert!(shown[0].contains("left agent a"), "{shown:?}");
+        assert!(shown.iter().all(|row| !row.contains("before")), "{shown:?}");
+        transcript.focus_prev();
+        assert_eq!(
+            transcript.focus(),
+            None,
+            "the old tool row is below the floor"
+        );
+        assert_eq!(transcript.cells().len(), 4);
+
+        transcript.truncate(2);
+        assert_eq!(transcript.view_floor(), 0);
+        let shown = rows(&transcript.view(area(10), &mut renderer));
+        assert!(shown.iter().any(|row| row.contains("before")), "{shown:?}");
+    }
+
+    #[test]
+    fn a_truncation_keeps_the_floors_it_does_not_reach() {
+        let (mut transcript, _) = transcript();
+        transcript.push(Cell::user("one"));
+        transcript.push(Cell::divider("left role a".to_string()));
+        transcript.clear_view_from(1);
+        transcript.push(Cell::user("two"));
+        transcript.push(Cell::divider("left role b".to_string()));
+        transcript.clear_view_from(3);
+        transcript.push(Cell::user("three"));
+        transcript.truncate(3);
+        assert_eq!(transcript.view_floor(), 1);
+        transcript.remove(0);
+        assert_eq!(transcript.view_floor(), 0);
+    }
+
+    /// A zero-sized area (the todo panel has the whole width) lays
+    /// nothing out and leaves no rows for a click to land on.
+    #[test]
+    fn an_empty_area_lays_nothing_out() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.push(tool("c1"));
+        transcript.view(area(10), &mut renderer);
+        assert_eq!(transcript.last_layout.len(), 2);
+        let view = transcript.view(Rect::ZERO, &mut renderer);
+        assert!(view.lines.is_empty());
+        assert_eq!(view.chip, None);
+        assert!(transcript.last_layout.is_empty());
+        transcript.click(0, 0);
+        assert_eq!(transcript.focus, None);
+    }
+
+    /// Ten user lines, scrolled 6 lines up a 5-line view, which then
+    /// starts on `> line 4`.
+    fn scrolled_users() -> (Transcript, Renderer, Vec<String>) {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-6);
+        let before = rows(&transcript.view(area(5), &mut renderer));
+        assert_eq!(before[0], "> line 4", "{before:?}");
+        (transcript, renderer, before)
+    }
+
+    /// Removing the cell the view starts on puts the view on the cell
+    /// after it, and output arriving below then leaves it there.
+    #[test]
+    fn removing_the_top_cell_of_a_scrolled_view_holds_it_on_the_next() {
+        let (mut transcript, mut renderer, before) = scrolled_users();
+        transcript.remove(4);
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view)[0], before[2], "{:?}", rows(&view));
+        assert_eq!(view.chip.as_deref(), Some("3 new below  End = follow"));
+    }
+
+    /// Five user lines, a running tool row and ten more user lines, in a
+    /// 5-line view scrolled to start on the blank line after the tool row.
+    fn scrolled_to_the_gap_after_a_tool() -> (Transcript, Renderer, Vec<String>) {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..5 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(open_tool("a"));
+        grow_tool(&mut transcript, 5, "a", 2);
+        for i in 6..16 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        let all = rows(&transcript.view(area(100), &mut renderer));
+        let top = all.iter().position(|row| row == "> line 6").unwrap() - 1;
+        let offset = i32::try_from(all.len() - top - 5).unwrap();
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-offset);
+        let before = rows(&transcript.view(area(5), &mut renderer));
+        assert_eq!(before[..2], ["", "> line 6"], "{before:?}");
+        (transcript, renderer, before)
+    }
+
+    /// A view starting on the blank line after an open tool row stays
+    /// on it as the row grows, rather than starting on the new output.
+    #[test]
+    fn a_view_starting_between_cells_holds_as_the_cell_above_grows() {
+        let (mut transcript, mut renderer, before) = scrolled_to_the_gap_after_a_tool();
+        let offset = transcript.offset_from_bottom;
+        grow_tool(&mut transcript, 5, "a", 3);
+        let after = rows(&transcript.view(area(5), &mut renderer));
+        assert_eq!(after, before);
+        assert_eq!(transcript.offset_from_bottom, offset);
+    }
+
+    /// Removing the cell after the blank line the view starts on leaves
+    /// the view on that blank line, now before the cell that followed.
+    #[test]
+    fn removing_the_cell_after_a_view_starting_between_cells_keeps_the_gap() {
+        let (mut transcript, mut renderer, _) = scrolled_to_the_gap_after_a_tool();
+        transcript.remove(6);
+        transcript.push(Cell::user("late"));
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view)[..2], ["", "> line 7"], "{:?}", rows(&view));
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+    }
+
+    /// Output arriving while the view had no room (the todo panel took
+    /// it) leaves the lines it showed where they were once it is back.
+    #[test]
+    fn output_arriving_while_the_view_is_hidden_does_not_move_it() {
+        let (mut transcript, mut renderer, before) = scrolled_users();
+        transcript.view(Rect::ZERO, &mut renderer);
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view), before);
+        assert_eq!(view.chip.as_deref(), Some("3 new below  End = follow"));
+    }
+
+    /// With no anchor to go back to, as after a rewind cut the cell the
+    /// view started on, what the line count grew by still counts as
+    /// output below.
+    #[test]
+    fn a_scrolled_view_without_an_anchor_still_makes_room_for_output_below() {
+        let (mut transcript, mut renderer, before) = scrolled_users();
+        transcript.anchor = None;
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view), before);
+    }
+
+    /// An open row below the view closing brings the bottom up past
+    /// the view's last line; the view stays scrolled, with its count,
+    /// rather than going back to following.
+    #[test]
+    fn a_row_closing_below_a_scrolled_view_keeps_it_scrolled() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(open_tool("b"));
+        grow_tool(&mut transcript, 10, "b", 5);
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-2);
+        transcript.view(area(5), &mut renderer);
+        transcript.push(Cell::user("late"));
+        transcript.view(area(5), &mut renderer);
+        finish_and_close(&mut transcript, 10);
+        let view = transcript.view(area(5), &mut renderer);
+        assert!(transcript.scrolled());
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+        transcript.push(Cell::user("later"));
+        let view = transcript.view(area(5), &mut renderer);
+        assert!(transcript.scrolled(), "output below scrolled the view");
+        assert_eq!(view.chip.as_deref(), Some("2 new below  End = follow"));
+    }
+
+    /// A transcript shorter than the view has nowhere to scroll to, so
+    /// a scroll up leaves it following.
+    #[test]
+    fn a_transcript_shorter_than_the_view_stays_following() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-1);
+        let view = transcript.view(area(5), &mut renderer);
+        assert!(!transcript.scrolled());
+        assert_eq!(view.chip, None);
+    }
+
+    /// Focusing a row that is scrolled out of view brings its header
+    /// onto the screen, by the least movement that does.
+    #[test]
+    fn focus_reveals_its_row() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(open_tool("c1"));
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(open_tool("c2"));
+        transcript.view(area(4), &mut renderer);
+        transcript.focus_prev();
+        transcript.view(area(4), &mut renderer);
+        assert_eq!(
+            transcript.offset_from_bottom, 0,
+            "the last row was in view already"
+        );
+        transcript.focus_prev();
+        transcript.view(area(4), &mut renderer);
+        // 12 cells, 11 separators and a second line on each open tool
+        // row: 25 lines; the first row's header is line 0 and the view
+        // must start there.
+        assert_eq!(transcript.offset_from_bottom, 21);
+        assert_eq!(transcript.last_layout[0].cell, 0);
+        assert_eq!(transcript.last_layout[0].first_row, 0);
+        transcript.focus_next();
+        transcript.view(area(4), &mut renderer);
+        // The last row's header is line 23; the view stops once that is
+        // its bottom line, leaving the row's own second line below.
+        assert_eq!(transcript.offset_from_bottom, 1);
+    }
+
+    /// A click lands on the cell that took that screen row in the last
+    /// frame; a row that does not open ignores it.
+    #[test]
+    fn a_click_maps_through_the_last_layout() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.push(tool("c1"));
+        transcript.view(Rect::new(0, 2, 40, 10), &mut renderer);
+        // Three lines drawn from the top of the area: the user line on
+        // its first row, a blank, then the tool row.
+        transcript.click(5, 2);
+        assert_eq!(transcript.focus, None);
+        let generation = transcript.generation();
+        transcript.click(5, 2);
+        assert_eq!(
+            transcript.generation(),
+            generation,
+            "a click that changed nothing counted as a change"
+        );
+        transcript.click(5, 2 + 2);
+        assert_eq!(transcript.focus, Some(1));
+        assert_ne!(transcript.generation(), generation);
+        assert!(matches!(
+            transcript.cells()[1],
+            Cell::Tool { expanded: true, .. }
+        ));
+        transcript.click(5, 2 + 2);
+        assert!(matches!(
+            transcript.cells()[1],
+            Cell::Tool {
+                expanded: false,
+                ..
+            }
+        ));
+        transcript.click(5, 20);
+        assert_eq!(
+            transcript.focus,
+            Some(1),
+            "a click outside the area did something"
+        );
+    }
+
+    /// Streams `before`, cuts the reply, streams `after`, and returns the
+    /// cut cell's source and the next cell's.
+    fn cut_between(before: &str, after: &str) -> (String, String) {
+        let (mut transcript, _) = transcript();
+        transcript.stream_delta(before);
+        transcript.cut_stream();
+        transcript.stream_delta(after);
+        let sources: Vec<String> = transcript
+            .cells()
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Assistant { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+        let [cut, next] = <[String; 2]>::try_from(sources).expect("two reply cells");
+        (cut, next)
+    }
+
+    #[test]
+    fn a_cut_inside_a_fence_carries_its_opening_line() {
+        let (cut, next) = cut_between("```rust\nlet a = 1;\n", "let b = 2;\n```\n");
+        assert_eq!(cut, "```rust\nlet a = 1;\n");
+        assert_eq!(next, "```rust\nlet b = 2;\n```\n");
+    }
+
+    #[test]
+    fn a_closing_fence_with_no_newline_yet_moves_on_and_carries_nothing() {
+        let (cut, next) = cut_between("```rust\nlet a = 1;\n```", "\nafter\n");
+        assert_eq!(cut, "```rust\nlet a = 1;\n");
+        assert_eq!(next, "```rust\n```\nafter\n");
+    }
+
+    #[test]
+    fn an_opening_fence_with_no_newline_yet_moves_on_whole() {
+        let (cut, next) = cut_between("intro\n```rust", "\nlet a = 1;\n");
+        assert_eq!(cut, "intro\n");
+        assert_eq!(next, "```rust\nlet a = 1;\n");
+    }
+
+    #[test]
+    fn a_partial_think_close_moves_on_after_the_open_tag() {
+        let (cut, next) = cut_between("<think>\nweighing\n</thi", "nk>answer");
+        assert_eq!(cut, "<think>\nweighing\n");
+        assert_eq!(next, "<think></think>answer");
+        assert_eq!(cells::without_think_spans(&next, true), "answer");
+    }
+
+    /// A reply cut before its first line ends leaves no empty cell
+    /// behind; all of it goes on in the next one.
+    #[test]
+    fn a_cut_inside_the_first_line_moves_the_whole_reply_on() {
+        let (mut transcript, _) = transcript();
+        transcript.stream_delta("<think>weigh");
+        transcript.cut_stream();
+        assert!(transcript.cells().is_empty());
+        transcript.stream_delta("ing</think>answer");
+        assert!(matches!(
+            transcript.cells(),
+            [Cell::Assistant { source, .. }] if source == "<think>weighing</think>answer"
+        ));
+    }
+
+    /// A reply that ends right after a cut, with no delta since, keeps
+    /// the line the cut held back in a closed cell of its own.
+    #[test]
+    fn closing_after_a_cut_keeps_the_held_line() {
+        let (mut transcript, _) = transcript();
+        transcript.stream_delta("```sh\nls\n```\nDone.");
+        transcript.cut_stream();
+        transcript.push(Cell::user("an at-once command"));
+        if let Some(Cell::Assistant { done, .. }) = transcript.close_stream() {
+            *done = true;
+        }
+        let sources: Vec<(&str, bool)> = transcript
+            .cells()
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Assistant { source, done, .. } => Some((source.as_str(), *done)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, [("```sh\nls\n```\n", true), ("Done.", true)]);
+        assert!(matches!(
+            transcript.cells().last(),
+            Some(Cell::Assistant { .. })
+        ));
+        assert!(transcript.close_stream().is_none(), "the held line stayed");
+    }
+}

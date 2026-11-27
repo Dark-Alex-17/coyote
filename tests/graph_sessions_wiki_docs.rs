@@ -40,10 +40,14 @@
 //! message in `src/graph/validator.rs` and the runtime prefix in
 //! `src/function/agents.rs`.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use common::source_scan::{const_str, fn_body, read, repo_root, src, string_literals};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test graph_sessions_wiki_docs`";
@@ -111,10 +115,6 @@ const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
 /// The Graph-Agents.md subsection that documents an agent node's `inputs:`.
 const INPUTS_HEADING: &str = "### Passing state into a child agent (inputs)";
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
 /// The `agent.*` events a spawned child fires, scraped from the
 /// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
 /// reaches the wiki checks without a hand-kept copy. The four lifecycle
@@ -174,23 +174,6 @@ fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
         .collect();
     texts.extend(edited_rows(wiki));
     texts
-}
-
-fn read(path: impl AsRef<Path>) -> String {
-    let path = path.as_ref();
-    // Line endings are normalised so the `\n`-anchored block and heading
-    // searches below hold on a CRLF checkout.
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
-}
-
-fn src(parts: &[&str]) -> String {
-    let mut path = repo_root().join("src");
-    for part in parts {
-        path = path.join(part);
-    }
-    read(path)
 }
 
 /// The one sentence of resume policy the bundled prompts and the Agents
@@ -254,41 +237,6 @@ fn wiki_dir() -> Option<PathBuf> {
         dir.display()
     );
     Some(dir)
-}
-
-/// Every `"..."` literal in `source`, in order, with `\"`, `\\` and `\n`
-/// unescaped and a `\` line continuation (the backslash, the newline and the
-/// next line's indentation) dropped the way rustc drops it.
-fn string_literals(source: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let mut chars = source.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut literal = String::new();
-        loop {
-            match chars.next() {
-                Some('"') => break,
-                Some('\\') => match chars.next() {
-                    Some(escaped @ ('"' | '\\')) => literal.push(escaped),
-                    Some('n') => literal.push('\n'),
-                    Some('\n') => {
-                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                            chars.next();
-                        }
-                    }
-                    other => panic!(
-                        "unexpected escape {other:?} in {literal:?}; extend string_literals in tests/graph_sessions_wiki_docs.rs"
-                    ),
-                },
-                Some(c) => literal.push(c),
-                None => panic!("unterminated string literal: {literal:?}"),
-            }
-        }
-        literals.push(literal);
-    }
-    literals
 }
 
 /// The cells of a markdown table row, split on unescaped pipes and trimmed.
@@ -587,28 +535,6 @@ fn const_str_array(source: &str, name: &str) -> Vec<String> {
     literals
 }
 
-/// The source of the function whose signature starts with `head` in
-/// `source`, up to its closing brace: the first `}` standing alone on a line
-/// at the function's own indentation.
-fn fn_body(source: &str, head: &str) -> String {
-    let start = source
-        .find(head)
-        .unwrap_or_else(|| panic!("the source defines {head}"));
-    let indent: String = source[..start]
-        .rsplit('\n')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .collect();
-    let body = &source[start..];
-    let close = format!("\n{indent}}}");
-    let end = body
-        .find(&close)
-        .unwrap_or_else(|| panic!("{head} closes with `}}` on its own line"));
-    body[..end].to_string()
-}
-
 /// The text of a source file before its `mod tests` block, so a pin on
 /// production code never matches a copy of the same text that a unit test
 /// holds in a string literal. A file whose test module is not found that
@@ -618,22 +544,6 @@ fn before_test_module(source: &str) -> &str {
         .split_once("\n#[cfg(test)]\nmod tests {")
         .map(|(before, _)| before)
         .expect("the source has a `#[cfg(test)] mod tests {` block")
-}
-
-/// The value of `const {name}: &str = "...";` in `source`, whatever its
-/// visibility.
-fn const_str(source: &str, name: &str) -> String {
-    let head = format!("const {name}: &str = ");
-    let start = source
-        .find(&head)
-        .unwrap_or_else(|| panic!("the source declares {name}"));
-    let rest = &source[start + head.len()..];
-    let end = rest
-        .find(';')
-        .unwrap_or_else(|| panic!("{name} ends with `;`"));
-    let mut literals = string_literals(&rest[..=end]);
-    assert_eq!(literals.len(), 1, "{name} is one string literal");
-    literals.remove(0)
 }
 
 /// The directory a workspace session for an agent lives in, as the wiki
@@ -2174,17 +2084,26 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         "const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(",
         ')',
     );
-    // Every bounded drain in the REPL but the sessionless Ctrl-C helper is a
-    // session command the subsection lists.
+    // Every bounded drain in the REPL is a session command the subsection
+    // lists; the turn driver's one is the sessionless Ctrl-C helper.
     let repl_production = before_test_module(&repl);
     let drains = repl_production
         .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
         .count();
-    let sessionless = fn_body(repl_production, "async fn cancel_sessionless_turn_tasks(")
+    let driver = src(&["turn", "driver.rs"]);
+    let driver_production = before_test_module(&driver);
+    assert_eq!(
+        driver_production
+            .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
+            .count(),
+        1,
+        "the turn driver drains only in the sessionless Ctrl-C helper"
+    );
+    let sessionless = fn_body(driver_production, "async fn cancel_sessionless_turn_tasks(")
         .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
         .count();
     assert_eq!(sessionless, 1, "the sessionless Ctrl-C helper drains once");
-    let command_drains = match drains - sessionless {
+    let command_drains = match drains {
         5 => "Five",
         n => panic!(
             "the REPL drains at {n} session-command sites; update the Session commands list and this pin"
@@ -2384,18 +2303,18 @@ fn sessions_configuration_table_names_the_child_sessions_knob() {
     }
 }
 
-/// The spawn seam's extra variable is read from `spawned_agent_hook_extras`
+/// The child's session variable is read from `agent_extras` in `src/hooks.rs`
 /// and must appear on every `agent.*` row of Hooks.md and in the
 /// Environment-Variables.md table; the base `COYOTE_SESSION_ID` row says
 /// what it holds inside a child.
 #[test]
 fn hook_pages_carry_the_child_session_variable() {
-    let agents = src(&["function", "agents.rs"]);
-    let extras = fn_body(&agents, "fn spawned_agent_hook_extras(");
+    let hooks_rs = src(&["hooks.rs"]);
+    let extras = fn_body(&hooks_rs, "fn agent_extras(");
     let var = string_literals(&extras)
         .into_iter()
         .find(|literal| literal.ends_with("_SESSION_ID"))
-        .expect("spawned_agent_hook_extras pushes a session id variable");
+        .expect("agent_extras pushes a session id variable");
     assert_eq!(var, "COYOTE_AGENT_SESSION_ID");
 
     let events = agent_events();
@@ -2885,9 +2804,10 @@ fn ctrl_c_wording_names_the_session_split() {
         ),
         "the .help footer lost its session qualifier"
     );
-    let mut literals = string_literals(&fn_body(&repl, "fn sessionless_cancelling_notice("));
+    let driver = src(&["turn", "driver.rs"]);
+    let mut literals = string_literals(&fn_body(&driver, "fn sessionless_cancelling_notice("));
     literals.extend(string_literals(&fn_body(
-        &repl,
+        &driver,
         "fn sessionless_still_running_notice(",
     )));
     for notice in [
@@ -2904,27 +2824,27 @@ fn ctrl_c_wording_names_the_session_split() {
     // abort, in a session or not. Only that error branch checkpoints the
     // failed turn; the graph turn prints the notice and returns its error
     // before it, so it checkpoints nothing.
-    let repl_production = before_test_module(&repl);
+    let driver_production = before_test_module(&driver);
     assert!(
-        repl_production.contains(
-            "                    if abort_signal.aborted_ctrlc() {\n                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                    }\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n"
+        driver_production.contains(
+            "                        if abort_signal.aborted_ctrlc() {\n                            emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                        }\n                        ctx.on_chat_completion_error(app.as_ref(), &input);\n"
         ),
         "the error branch of the ask loop no longer prints the interrupt notice in every turn"
     );
     assert!(
-        !repl_production.contains("aborted_ctrlc() && ctx.session.is_none()"),
+        !driver_production.contains("aborted_ctrlc() && ctx.session.is_none()"),
         "an interrupt notice is limited to sessionless turns again"
     );
     assert_eq!(
-        repl_production
+        driver_production
             .matches("ctx.on_chat_completion_error(app.as_ref(), &input);")
             .count(),
         1,
         "the ask loop checkpoints a failed request at one site"
     );
     assert!(
-        repl_production.contains(
-            "                Err(err) => {\n                    if abort_signal.aborted_ctrlc() {\n                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                    }\n                    return Err(err);\n                }\n            };\n            match turn {\n"
+        driver_production.contains(
+            "                    Err(err) => {\n                        if abort_signal.aborted_ctrlc() {\n                            emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                        }\n                        return Err(err);\n                    }\n                };\n                match turn {\n"
         ),
         "the graph turn no longer returns its error before the checkpointing branch"
     );
@@ -2994,6 +2914,36 @@ fn ctrl_c_wording_names_the_session_split() {
     }
 }
 
+/// Both collect tools stop on a line the user sends under the TUI, and
+/// their rows say so.
+#[test]
+fn wiki_documents_the_collect_tools_user_message_status() {
+    let status = "{\"status\":\"user_message\"}";
+    for (file, page, heading, tool) in [
+        ("agents.rs", "Agents.md", None, "`agent__collect`"),
+        (
+            "jobs.rs",
+            "Background-Jobs.md",
+            Some("## The Six Tools"),
+            "`job__collect`",
+        ),
+    ] {
+        let collect = fn_body(&src(&["function", file]), "async fn handle_collect(");
+        assert!(
+            collect.contains("\"status\": \"user_message\""),
+            "{file} handle_collect no longer returns status \"user_message\""
+        );
+        let Some(wiki) = wiki_dir() else { continue };
+        let text = read(wiki.join(page));
+        let scope = heading.map_or(text.clone(), |heading| section(page, &text, heading));
+        let row = table_row(page, &scope, tool);
+        assert!(
+            row[1].contains(status),
+            "the {page} {tool} row does not name {status}: {row:?}"
+        );
+    }
+}
+
 #[test]
 fn wiki_documents_the_wait_tools() {
     let Some(wiki) = wiki_dir() else { return };
@@ -3017,7 +2967,7 @@ fn wiki_documents_the_wait_tools() {
     let lead = "`job__wait` answers with a `status`";
     let statuses = flat(&paragraph("Background-Jobs.md", &tools, lead));
     for needle in [
-        "`ready`, `timeout`, `interrupted`, `pending` or `none`",
+        "`ready`, `timeout`, `interrupted`, `pending`, `user_message` or `none`",
         "an `outcome` of `success` or `failed`",
     ] {
         assert!(
@@ -3025,7 +2975,14 @@ fn wiki_documents_the_wait_tools() {
             "the Background-Jobs.md job__wait result sentence does not list {needle}"
         );
     }
-    for status in ["ready", "timeout", "interrupted", "pending", "none"] {
+    for status in [
+        "ready",
+        "timeout",
+        "interrupted",
+        "pending",
+        "user_message",
+        "none",
+    ] {
         assert!(
             handle_wait.contains(&format!("\"status\": \"{status}\"")),
             "handle_wait no longer returns status {status:?}"
@@ -3189,7 +3146,7 @@ fn wiki_documents_the_wait_tools() {
     let agent_lead = "`agent__wait` answers with a `status`";
     let agent_statuses = flat(&paragraph("Agents.md", &agents, agent_lead));
     for needle in [
-        "`ready`, `timeout`, `interrupted`, `pending` or `none`",
+        "`ready`, `timeout`, `interrupted`, `pending`, `user_message` or `none`",
         "an `outcome` of `success`, `failed`, or `finished`",
         "(Background-Jobs#the-six-tools)",
     ] {
@@ -3198,7 +3155,14 @@ fn wiki_documents_the_wait_tools() {
             "the Agents.md agent__wait result sentence does not say {needle}"
         );
     }
-    for status in ["ready", "timeout", "interrupted", "pending", "none"] {
+    for status in [
+        "ready",
+        "timeout",
+        "interrupted",
+        "pending",
+        "user_message",
+        "none",
+    ] {
         assert!(
             agent_wait.contains(&format!("\"status\": \"{status}\"")),
             "agents.rs handle_wait no longer returns status {status:?}"

@@ -3,32 +3,71 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fmt;
 
-/// One background-task completion event, delivered to the context that
-/// started the task by merging a `system_notifications` entry onto the last
-/// tool result of a batch.
+pub(crate) const USER_MESSAGE_EVENT: &str = "user_message";
+/// What a tool result's notifications tell the model when background tasks
+/// have finished.
+pub(crate) const TASK_NOTIFICATION_INSTRUCTION: &str =
+    "Background tasks have finished; collect each result with its next_action command.";
+
+/// One entry of the `system_notifications` channel, delivered to the context
+/// that owns the queue by merging onto the last tool result of a batch.
 #[derive(Clone)]
-pub struct SystemNotification {
-    pub event: &'static str,
-    pub id: String,
-    pub tool_or_agent: String,
-    pub status: &'static str,
-    pub next_action: String,
+pub enum SystemNotification {
+    /// A background task reached a terminal state.
+    Task {
+        event: &'static str,
+        id: String,
+        tool_or_agent: String,
+        status: &'static str,
+        next_action: String,
+    },
+    /// Text the user typed while a turn was running, handed to the model at
+    /// the next tool-round boundary.
+    UserMessage { text: String },
 }
 
 impl SystemNotification {
     pub fn to_value(&self) -> Value {
-        json!({
-            "event": self.event,
-            "id": self.id,
-            "tool_or_agent": self.tool_or_agent,
-            "status": self.status,
-            "next_action": self.next_action,
-        })
+        match self {
+            Self::Task {
+                event,
+                id,
+                tool_or_agent,
+                status,
+                next_action,
+            } => json!({
+                "event": event,
+                "id": id,
+                "tool_or_agent": tool_or_agent,
+                "status": status,
+                "next_action": next_action,
+            }),
+            Self::UserMessage { text } => json!({
+                "event": USER_MESSAGE_EVENT,
+                "text": text,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn event(&self) -> &'static str {
+        match self {
+            Self::Task { event, .. } => event,
+            Self::UserMessage { .. } => USER_MESSAGE_EVENT,
+        }
+    }
+
+    /// The task id a notification points the model at; a user message has none.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Task { id, .. } => Some(id),
+            Self::UserMessage { .. } => None,
+        }
     }
 }
 
 pub fn job_notification(id: &str, tool: &str, success: bool) -> SystemNotification {
-    SystemNotification {
+    SystemNotification::Task {
         event: if success {
             "job_completed"
         } else {
@@ -42,7 +81,7 @@ pub fn job_notification(id: &str, tool: &str, success: bool) -> SystemNotificati
 }
 
 pub fn agent_notification(id: &str, agent_name: &str, success: bool) -> SystemNotification {
-    SystemNotification {
+    SystemNotification::Task {
         event: if success {
             "agent_completed"
         } else {
@@ -78,11 +117,49 @@ impl NotificationQueue {
         std::mem::take(&mut *self.pending.lock())
     }
 
+    /// Whether a message the user sent mid-turn is waiting for the model.
+    pub fn has_user_message(&self) -> bool {
+        self.pending
+            .lock()
+            .iter()
+            .any(|notification| matches!(notification, SystemNotification::UserMessage { .. }))
+    }
+
+    /// Removes and returns, in order, the entries `take` accepts; the rest
+    /// stay in place. One lock, so a concurrent drain sees either the whole
+    /// queue or the kept remainder, never a half-moved one.
+    pub fn take_where(
+        &self,
+        mut take: impl FnMut(&SystemNotification) -> bool,
+    ) -> Vec<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let mut taken = Vec::new();
+        let mut index = 0;
+        while index < pending.len() {
+            if take(&pending[index]) {
+                taken.push(pending.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        taken
+    }
+
+    /// Removes and returns the newest entry `matches` accepts, if any.
+    pub fn take_last_where(
+        &self,
+        matches: impl FnMut(&SystemNotification) -> bool,
+    ) -> Option<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let index = pending.iter().rposition(matches)?;
+        Some(pending.remove(index))
+    }
+
     pub fn take_ids(&self, ids: &HashSet<&str>) -> Vec<SystemNotification> {
         let mut pending = self.pending.lock();
         let (taken, kept) = std::mem::take(&mut *pending)
             .into_iter()
-            .partition(|n| ids.contains(n.id.as_str()));
+            .partition(|n| n.id().is_some_and(|id| ids.contains(id)));
         *pending = kept;
         taken
     }
@@ -125,9 +202,12 @@ mod tests {
     #[test]
     fn job_notification_failure_shape() {
         let event = job_notification("job_a1b2", "execute_command", false);
-        assert_eq!(event.event, "job_failed");
-        assert_eq!(event.status, "failed");
-        assert_eq!(event.next_action, "job__collect --id job_a1b2 for output");
+        assert_eq!(event.event(), "job_failed");
+        assert_eq!(event.to_value()["status"], "failed");
+        assert_eq!(
+            event.to_value()["next_action"],
+            "job__collect --id job_a1b2 for output"
+        );
     }
 
     #[test]
@@ -148,11 +228,24 @@ mod tests {
     #[test]
     fn agent_notification_failure_shape() {
         let event = agent_notification("agent_explore_a1b2", "explore", false);
-        assert_eq!(event.event, "agent_failed");
-        assert_eq!(event.status, "failed");
+        assert_eq!(event.event(), "agent_failed");
+        assert_eq!(event.to_value()["status"], "failed");
         assert_eq!(
-            event.next_action,
+            event.to_value()["next_action"],
             "agent__collect --id agent_explore_a1b2 for output"
+        );
+    }
+
+    #[test]
+    fn user_message_shape() {
+        let event = SystemNotification::UserMessage {
+            text: "keep going".to_string(),
+        };
+        assert_eq!(event.event(), "user_message");
+        assert_eq!(event.id(), None);
+        assert_eq!(
+            serde_json::to_string(&event.to_value()).unwrap(),
+            r#"{"event":"user_message","text":"keep going"}"#
         );
     }
 
@@ -165,8 +258,8 @@ mod tests {
         let drained = queue.drain();
 
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].id, "job_1");
-        assert_eq!(drained[1].id, "job_2");
+        assert_eq!(drained[0].id(), Some("job_1"));
+        assert_eq!(drained[1].id(), Some("job_2"));
         assert!(queue.drain().is_empty());
     }
 
@@ -174,6 +267,44 @@ mod tests {
     fn drain_on_empty_queue_is_a_noop() {
         let queue = NotificationQueue::default();
         assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn take_where_removes_the_accepted_entries_and_keeps_the_rest_in_order() {
+        let queue = NotificationQueue::new();
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(SystemNotification::UserMessage { text: "b".into() });
+        queue.push(job_notification("job_2", "execute_command", false));
+
+        let taken = queue.take_where(|n| matches!(n, SystemNotification::UserMessage { .. }));
+
+        let texts: Vec<Value> = taken.iter().map(|n| n.to_value()["text"].clone()).collect();
+        assert_eq!(texts, [json!("a"), json!("b")]);
+        let left = queue.drain();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].id(), Some("job_1"));
+        assert_eq!(left[1].id(), Some("job_2"));
+    }
+
+    #[test]
+    fn take_last_where_removes_only_the_newest_match() {
+        let queue = NotificationQueue::new();
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(SystemNotification::UserMessage { text: "a".into() });
+
+        let taken = queue.take_last_where(|n| matches!(n, SystemNotification::UserMessage { .. }));
+
+        assert_eq!(
+            taken.map(|n| n.to_value()["text"].clone()),
+            Some(json!("a"))
+        );
+        let left = queue.drain();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].id(), None);
+        assert_eq!(left[1].id(), Some("job_1"));
+        assert!(queue.take_last_where(|_| true).is_none());
     }
 
     #[test]
@@ -186,10 +317,10 @@ mod tests {
         let taken = queue.take_ids(&HashSet::from(["job_1", "agent_a", "job_9"]));
 
         assert_eq!(taken.len(), 2);
-        assert_eq!(taken[0].id, "job_1");
-        assert_eq!(taken[1].id, "agent_a");
+        assert_eq!(taken[0].id(), Some("job_1"));
+        assert_eq!(taken[1].id(), Some("agent_a"));
         let rest = queue.drain();
         assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].id, "job_2");
+        assert_eq!(rest[0].id(), Some("job_2"));
     }
 }

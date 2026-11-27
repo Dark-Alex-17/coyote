@@ -20,8 +20,32 @@
 # See https://github.com/timo-reymann/bash-tui-toolkit/blob/main/test.sh
 # for examples on how to use these commands
 #
-# - guard_operation   Prompt for permission to run an operation
-# - guard_path        Prompt for permission to perform path operations
+# When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set), confirm,
+# list, checkbox, input and password are answered through it; range and
+# editor have no channel path and use the terminal when one is permitted
+# (see below). File descriptor 9 is reserved for the
+# channel's request stream while the helper is sourced. The channel answers
+# one prompt at a time: never run two helpers concurrently (background
+# subshells) in the same tool, or they will swallow each other's replies.
+# Under Git Bash or Cygwin the reply pipe is opened through its /proc path.
+# Through the channel, list prints the index of the chosen option and exits
+# 0; typing an option's exact text counts as choosing it. When the user
+# typed an answer of their own, list prints that text as is and exits 2, so
+# a typed "1" is never mistaken for index 1. An empty or whitespace-only
+# answer is a cancel: exit 1, nothing printed.
+#
+# COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
+# nobody can; tools may branch on it before asking. Under "tui" only the
+# channel-backed helpers are usable: range, editor and any terminal prompt
+# would draw straight over the full-screen UI, so under "tui" every helper
+# without a channel (COYOTE_PROMPT_REPLY unset) fails closed instead, exit 1
+# with one line on stderr; guard_operation and guard_path then abort the
+# operation they guard.
+#
+# - guard_operation   Prompt for permission to run an operation:
+#                     guard_operation [question] [operation]
+# - guard_path        Prompt for permission to perform path operations:
+#                     guard_path <path> <question>
 # - patch_file        Patch a file
 # - error             Log an error
 # - warn              Log a warning
@@ -35,21 +59,33 @@
 # - magenta           Output given text in magenta
 # - cyan              Output given text in cyan
 # - white             Output given text in white
+#
+# "Yes for this session" is remembered against the exact question, so a
+# guard names what it guards: guard_operation sends the question, a newline
+# and the operation when one is given, and guard_path appends a newline and
+# the resolved path unless the question already contains that resolved path.
+
+# Without a usable TERM (unset in CI, `dumb` under the full-screen UI) tput
+# fails or complains on stderr; the colours stay empty instead.
+_coyote_tput() {
+  [ -n "${TERM:-}" ] || return 0
+  tput "$@" 2>/dev/null || true
+}
 
 # shellcheck disable=SC2034
-red=$(tput setaf 1)
-green=$(tput setaf 2)
-gold=$(tput setaf 3)
-blue=$(tput setaf 4)
-magenta=$(tput setaf 5)
-cyan=$(tput setaf 6)
-white=$(tput setaf 7)
+red=$(_coyote_tput setaf 1)
+green=$(_coyote_tput setaf 2)
+gold=$(_coyote_tput setaf 3)
+blue=$(_coyote_tput setaf 4)
+magenta=$(_coyote_tput setaf 5)
+cyan=$(_coyote_tput setaf 6)
+white=$(_coyote_tput setaf 7)
 
-default=$(tput sgr0)
-gray=$(tput setaf 243)
+default=$(_coyote_tput sgr0)
+gray=$(_coyote_tput setaf 243)
 
-bold=$(tput bold)
-underlined=$(tput smul)
+bold=$(_coyote_tput bold)
+underlined=$(_coyote_tput smul)
 
 error() {
   echo -e "${red}${bold}ERROR:${default}${red} $1${default}"
@@ -103,7 +139,163 @@ white() {
   echo -e "${white}$1${default}"
 }
 
+# When Coyote offers a reply channel, prompts go to its prompter instead of
+# the terminal: the helper writes one request line to the tool's real stdout
+# and reads the answer line back from COYOTE_PROMPT_REPLY. Callers wrap the
+# helpers in $(...), which points fd 1 at the capture, so the real stdout is
+# saved on fd 9 once at source time. A channel handed over on fd 9 itself
+# would be clobbered by that save, so it is treated as absent.
+if [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -z "${_COYOTE_PROMPT_OUT:-}" ]]; then
+  exec 9>&1 && export _COYOTE_PROMPT_OUT=9
+fi
+
+# The reply path is opened as given. On Windows Coyote names a pipe
+# \\.\pipe\<name>, which Git Bash and Cygwin open by that spelling; their
+# /proc/sys/Device/NamedPipe view of the pipe namespace cannot be opened.
+_COYOTE_PROMPT_REPLY_PATH="${COYOTE_PROMPT_REPLY:-}"
+
+# Reads one reply line into the caller's `reply`. Under Git Bash or Cygwin
+# an open of a Windows pipe can be refused as busy for a moment while
+# Coyote puts its next instance up, so it is retried briefly and quietly;
+# the last attempt reports its error as any other open does.
+_coyote_read_reply() {
+  case "${OSTYPE:-}" in
+    msys* | cygwin*)
+      if [[ "$_COYOTE_PROMPT_REPLY_PATH" == '\\.\pipe\'* ]]; then
+        declare attempt
+        for attempt in 1 2 3 4 5 6 7 8 9; do
+          if { IFS= read -r reply; } 2>/dev/null <"$_COYOTE_PROMPT_REPLY_PATH"; then
+            return 0
+          fi
+          sleep 0.05
+        done
+      fi
+      ;;
+  esac
+  IFS= read -r reply <"$_COYOTE_PROMPT_REPLY_PATH"
+}
+
+_coyote_prompt_enabled() {
+  [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -n "${_COYOTE_PROMPT_OUT:-}" ]]
+}
+
+# _coyote_prompt_send <id> <action> <question> <options-json>
+_coyote_prompt_send() {
+  declare id="$1"
+  declare action="$2"
+  declare question="$3"
+  declare options="$4"
+  declare line
+  line="$(jq -cn --arg id "$id" --arg action "$action" --arg question "$question" \
+    --argjson options "$options" \
+    '{coyote_prompt:{id:$id,action:$action,question:$question,options:$options}}')" || return 1
+  printf '%s\n' "$line" >&"$_COYOTE_PROMPT_OUT"
+}
+
+# _coyote_prompt_map <action> <reply-line> <options-json>
+# Prints the answer in the same shape the terminal helpers print: confirm 1/0,
+# select the option index (or, when the user typed an answer of their own,
+# that text as is), checkbox the checked indices, input/password the text.
+# Fails when the answer does not fit the action.
+_coyote_prompt_map() {
+  declare action="$1"
+  declare reply="$2"
+  declare options="$3"
+  case "$action" in
+    confirm)
+      printf '%s' "$reply" | jq -er \
+        'if .answer == true then 1 elif .answer == false then 0 else empty end'
+      ;;
+    select)
+      printf '%s' "$reply" | jq -er --argjson options "$options" \
+        'if (.answer | type) == "string" then (.answer as $a | ($options | index($a)) // $a) else empty end'
+      ;;
+    checkbox)
+      printf '%s' "$reply" | jq -er --argjson options "$options" \
+        'if (.answer | type) == "array" and ((.answer - $options) | length) == 0 then (.answer as $a | [$options | to_entries[] | select(.value as $v | $a | index($v) != null) | .key] | map(tostring) | join(" ")) else empty end'
+      ;;
+    input | password)
+      printf '%s' "$reply" | jq -er \
+        'if (.answer | type) == "string" then .answer else empty end'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# _coyote_prompt <action> <question> [options...]
+# Returns 1 and prints nothing when the prompt was cancelled, the channel
+# closed, or the reply is not usable, so callers fail closed. A select
+# answered with text of the user's own returns 2, or 1 when that text is
+# blank.
+_coyote_prompt() {
+  declare action="$1"
+  declare question="$2"
+  # shift, not "${@:3}": bash 3.2 joins a "${@:N}" slice into one word when
+  # IFS holds no space.
+  shift 2
+  declare options='[]'
+  if [[ $# -gt 0 ]]; then
+    options="$(printf '%s\0' "$@" | jq -cRs 'split("\u0000") | .[:-1]')" || return 1
+  fi
+
+  # $RANDOM is not reseeded in $(...) subshells on bash < 5.1, so sibling
+  # prompts could mint the same id; the kernel's entropy is used instead.
+  declare id
+  id="p$$-$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ "$id" == "p$$-" ]]; then
+    id="p$$-$RANDOM-$SECONDS"
+  fi
+
+  _coyote_prompt_send "$id" "$action" "$question" "$options" || {
+    show_error "prompt request channel unavailable"
+    return 1
+  }
+
+  declare reply
+  while :; do
+    if ! _coyote_read_reply; then
+      show_error "prompt reply channel closed"
+      return 1
+    fi
+    if printf '%s' "$reply" | jq -e --arg id "$id" '.id == $id' >/dev/null 2>&1; then
+      break
+    fi
+  done
+
+  if printf '%s' "$reply" | jq -e '.answer == null' >/dev/null; then
+    return 1
+  fi
+
+  declare answer
+  if ! answer="$(_coyote_prompt_map "$action" "$reply" "$options")"; then
+    show_error "prompt reply unusable"
+    return 1
+  fi
+  if [[ "$action" == select ]] && ! printf '%s' "$reply" | jq -e --argjson options "$options" \
+    '.answer as $a | $options | index($a) != null' >/dev/null; then
+    [[ -n "${answer//[[:space:]]/}" ]] || return 1
+    printf '%s' "$answer"
+    return 2
+  fi
+  printf '%s' "$answer"
+}
+
+_COYOTE_TUI_NO_CHANNEL="prompts are not available in the TUI without the reply channel"
+
+# Under the full-screen UI the terminal belongs to the UI's own reader: a
+# fallback prompt would be invisible and a typed answer (a password included)
+# would land in its composer. Without the channel the helper fails closed.
+_coyote_refuse_terminal_under_tui() {
+  if [[ "${COYOTE_UI:-}" == "tui" ]]; then
+    echo "$_COYOTE_TUI_NO_CHANNEL" >&2
+    exit 1
+  fi
+}
+
 _read_stdin() {
+  _coyote_refuse_terminal_under_tui
   read -r "$@" </dev/tty
 }
 
@@ -152,8 +344,22 @@ _new_line_foreach_item() {
   done
 }
 
+# The question is printed as data, never read for backslash escapes, and with
+# control characters other than a newline and the bidi overrides and isolates
+# dropped, as the Python and TypeScript helpers do, so a guarded command
+# cannot cut its own prompt short, repaint it or reorder it. The strip repeats
+# until nothing changes: removing one sequence can join the bytes around it
+# into another.
 _prompt_text() {
-  echo -en "\033[32m?\033[0m\033[1m ${1}\033[0m " >&2
+  declare text prev=""
+  text="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\011\013-\037\177' |
+    LC_ALL=C sed -e $'s/\xc2[\x80-\x9f]//g' -e $'s/\xe2\x80[\xaa-\xae]//g' -e $'s/\xe2\x81[\xa6-\xa9]//g')"
+  while [[ "$text" != "$prev" ]]; do
+    prev="$text"
+    text="$(printf '%s' "$text" |
+      LC_ALL=C sed -e $'s/\xc2[\x80-\x9f]//g' -e $'s/\xe2\x80[\xaa-\xae]//g' -e $'s/\xe2\x81[\xa6-\xa9]//g')"
+  done
+  printf '\033[32m?\033[0m\033[1m %s\033[0m ' "$text" >&2
 }
 
 _decrement_selected() {
@@ -179,6 +385,11 @@ _increment_selected() {
 
 # shellcheck disable=SC2154
 input() {
+  if _coyote_prompt_enabled; then
+    _coyote_prompt input "$1"
+    return $?
+  fi
+  _coyote_refuse_terminal_under_tui
   _prompt_text "$1"
   echo -en "\033[36m\c" >&2
   _read_stdin -r text
@@ -186,6 +397,11 @@ input() {
 }
 
 confirm() {
+  if _coyote_prompt_enabled; then
+    _coyote_prompt confirm "$1"
+    return $?
+  fi
+  _coyote_refuse_terminal_under_tui
   # stty targets stdin, which is /dev/null when the host spawns tool scripts;
   # point it at the real terminal and stay quiet when there isn't one.
   trap "stty echo </dev/tty 2>/dev/null; exit" EXIT
@@ -220,9 +436,16 @@ confirm() {
 }
 
 list() {
-  _prompt_text "$1 "
-  declare opts=("${@:2}")
-  declare opts_count=$(($# - 1))
+  declare question="$1"
+  shift
+  if _coyote_prompt_enabled; then
+    _coyote_prompt select "$question" "$@"
+    return $?
+  fi
+  _coyote_refuse_terminal_under_tui
+  _prompt_text "$question "
+  declare opts=("$@")
+  declare opts_count=$#
 
   _new_line_foreach_item "${#opts[@]}"
 
@@ -264,11 +487,18 @@ list() {
 }
 
 checkbox() {
-  _prompt_text "$1"
+  declare question="$1"
+  shift
+  if _coyote_prompt_enabled; then
+    _coyote_prompt checkbox "$question" "$@"
+    return $?
+  fi
+  _coyote_refuse_terminal_under_tui
+  _prompt_text "$question"
   declare opts
-  opts=("${@:2}")
+  opts=("$@")
   declare opts_count
-  opts_count=$(($# - 1))
+  opts_count=$#
 
   _new_line_foreach_item "${#opts[@]}"
 
@@ -333,6 +563,11 @@ checkbox() {
 }
 
 password() {
+  if _coyote_prompt_enabled; then
+    _coyote_prompt password "$1"
+    return $?
+  fi
+  _coyote_refuse_terminal_under_tui
   _prompt_text "$1"
   echo -en "\033[36m" >&2
   declare password=''
@@ -360,6 +595,7 @@ password() {
 }
 
 editor() {
+  _coyote_refuse_terminal_under_tui
   tmpfile=$(mktemp)
   _prompt_text "$1"
   echo "" >&2
@@ -373,7 +609,10 @@ editor() {
 with_validate() {
   while true; do
     declare val
-    val="$(eval "$1")"
+    # A prompt that fails (refused under the UI, cancelled on the channel)
+    # ends the loop with its status; the subshell's exit would otherwise
+    # leave an empty value for the validator to reject forever.
+    val="$(eval "$1")" || return 1
 
     if ($2 "$val" >/dev/null); then
       echo "$val"
@@ -385,6 +624,10 @@ with_validate() {
 }
 
 range() {
+  # Refused here, not only inside the cursor and key subshells below: an
+  # exit from a subshell ends the subshell alone and the loop would spin
+  # on the refusal forever.
+  _coyote_refuse_terminal_under_tui
   declare min="$2"
   declare current="$3"
   declare max="$4"
@@ -508,13 +751,25 @@ open_link() {
 }
 
 guard_operation() {
-	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
-		# can't leak into tool_call_error JSON when the wrapped command fails.
-		ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)"
+	if [[ -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
+		declare question="${1:-Are you sure you want to continue?}"
+		if [[ "$#" -ge 2 ]]; then
+			question="$question"$'\n'"$2"
+		fi
+		# `|| ans=""`: a cancelled prompt returns 1, which errexit would turn into a silent exit here.
+		if _coyote_prompt_enabled; then
+			ans="$(confirm "$question")" || ans=""
+		else
+			# Refused before the redirection below: under the full-screen UI
+			# /dev/tty is the UI's own screen.
+			_coyote_refuse_terminal_under_tui
+			# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
+			# can't leak into tool_call_error JSON when the wrapped command fails.
+			ans="$(confirm "$question" 2>/dev/tty)" || ans=""
+		fi
 
-		if [[ "$ans" == 0 ]]; then
-			error "Operation aborted!" 2>&1
+		if [[ "$ans" != 1 ]]; then
+			error "Operation aborted!" >&2
 			exit 1
 		fi
 	fi
@@ -768,12 +1023,22 @@ guard_path() {
 
 	path="$(_to_real_path "$1")"
 	confirmation_prompt="$2"
+	if [[ "$confirmation_prompt" != *"$path"* ]]; then
+		confirmation_prompt="$confirmation_prompt"$'\n'"$path"
+	fi
 
-	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		# 2>/dev/tty: see guard_operation — prevents prompt text leaking via captured stderr.
-		ans="$(confirm "$confirmation_prompt" 2>/dev/tty)"
+	declare cwd
+	cwd="$(pwd)"
+	if [[ "$path" != "$cwd" && "$path" != "${cwd%/}"/* && -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
+		if _coyote_prompt_enabled; then
+			ans="$(confirm "$confirmation_prompt")" || ans=""
+		else
+			_coyote_refuse_terminal_under_tui
+			# 2>/dev/tty: see guard_operation; prevents prompt text leaking via captured stderr.
+			ans="$(confirm "$confirmation_prompt" 2>/dev/tty)" || ans=""
+		fi
 
-		if [[ "$ans" == 0 ]]; then
+		if [[ "$ans" != 1 ]]; then
 			error "Operation aborted!" >&2
 			exit 1
 		fi
@@ -787,8 +1052,12 @@ _to_real_path() {
     path="$(cygpath -u "$path")"
   fi
 
-  awk -v path="$path" -v pwd="$PWD" '
+  # ENVIRON, not -v: awk reads backslash escapes in a -v value, which would
+  # turn two different paths into one.
+  _TO_REAL_PATH="$path" awk '
     BEGIN {
+      path = ENVIRON["_TO_REAL_PATH"]
+      pwd = ENVIRON["PWD"]
       if (path !~ /^\//) {
         path = pwd "/" path
       }
@@ -819,7 +1088,7 @@ _to_real_path() {
 
       for (i = 1; i <= newPartsLength; i++) {
         newPart = newParts[i]
-        printf newPart
+        printf "%s", newPart
         if (i < newPartsLength) {
           printf "/"
         }

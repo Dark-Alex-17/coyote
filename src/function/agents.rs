@@ -11,10 +11,11 @@ use crate::config::{
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
     load_agent_variables, paths, roster_line,
 };
+use crate::events::{AgentOutcome, Event, Origin};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
-use crate::supervisor::notification::agent_notification;
+use crate::supervisor::notification::{SystemNotification, agent_notification};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
 use crate::utils::fs::{refuse_symlinked_dir, write_private_atomic};
 use crate::utils::process::ProcessStamp;
@@ -47,6 +48,10 @@ pub const AGENT_FUNCTION_PREFIX: &str = "agent__";
 pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
 pub const PARENT_ALIAS: &str = "parent";
+
+/// How long `agent__cancel` waits for a cancelled agent's task to join
+/// before it reports the cleanup as still under way.
+pub(crate) const CANCEL_CLEANUP_WAIT: Duration = Duration::from_secs(5);
 
 /// Rows per page of `agent__list_sessions` when the caller names none.
 const LIST_SESSIONS_PAGE_SIZE: usize = 20;
@@ -1169,6 +1174,7 @@ pub async fn run_agent_for_graph(
         info_flag,
         agent_name,
         child_abort.clone(),
+        Arc::clone(&parent_ctx.prompter),
     )
     .await?;
 
@@ -1355,23 +1361,6 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
     Ok(())
 }
 
-/// The `agent.*` extras every event about a spawned child carries. Only a
-/// seated child has a session to name, so the key is absent otherwise.
-fn spawned_agent_hook_extras(
-    agent_id: &str,
-    agent_name: &str,
-    session_id: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut extras = vec![
-        ("COYOTE_AGENT_ID", agent_id.to_string()),
-        ("COYOTE_AGENT_NAME", agent_name.to_string()),
-    ];
-    if let Some(session_id) = session_id {
-        extras.push(("COYOTE_AGENT_SESSION_ID", session_id.to_string()));
-    }
-    extras
-}
-
 /// Records a seated child's terminal status on its sidecar. The sidecar is
 /// bookkeeping about the child, not part of its result, so a sidecar that
 /// cannot be read or written is logged and the caller carries on with the
@@ -1475,6 +1464,7 @@ struct SpawnResultHooks {
     session_id: Option<String>,
     agent_id: String,
     agent_name: String,
+    origin: Origin,
 }
 
 impl SpawnResultHooks {
@@ -1495,6 +1485,7 @@ impl SpawnResultHooks {
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.to_string(),
             agent_name: agent_name.to_string(),
+            origin: Origin::from(child_ctx),
         }
     }
 
@@ -1502,22 +1493,22 @@ impl SpawnResultHooks {
     /// sidecar, so the hooks and the sidecar never disagree about a
     /// ctrl-c'd child, whatever its run returned.
     fn fire(self, error: Option<&str>, interrupted: bool) {
-        let mut extras =
-            spawned_agent_hook_extras(&self.agent_id, &self.agent_name, self.session_id.as_deref());
-        let (event, resolved) = match (interrupted, error) {
-            (true, _) => (HookEvent::AgentInterrupted, self.interrupted),
-            (false, None) => (HookEvent::AgentCompleted, self.completed),
-            (false, Some(error)) => {
-                extras.push(("COYOTE_AGENT_ERROR", error.to_string()));
-                (HookEvent::AgentFailed, self.failed)
-            }
+        let (outcome, resolved) = match (interrupted, error) {
+            (true, _) => (AgentOutcome::Interrupted, self.interrupted),
+            (false, None) => (AgentOutcome::Completed, self.completed),
+            (false, Some(error)) => (AgentOutcome::Failed(error.to_string()), self.failed),
         };
-        hooks::fire_resolved(
-            event,
+        hooks::emit_resolved(
+            Event::AgentFinished {
+                origin: self.origin,
+                agent_id: self.agent_id,
+                name: Some(self.agent_name.clone()),
+                session_id: self.session_id,
+                outcome,
+            },
             resolved,
-            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name)),
-            &extras,
-            None,
+            self.session_name.as_deref(),
+            Some(&self.agent_name),
         );
     }
 }
@@ -1851,7 +1842,13 @@ fn resume_variables(
         &explicit_keys,
         inherited,
     );
-    let seated = Agent::init_agent_variables(declared, Some(&resolved), no_interaction, false)?;
+    let seated = Agent::init_agent_variables(
+        declared,
+        Some(&resolved),
+        no_interaction,
+        false,
+        &crate::prompt::HeadlessPrompter,
+    )?;
     for key in declared_keys(declared, explicit) {
         if !explicit_keys.contains(key) {
             explicit_keys.push(key.clone());
@@ -2459,6 +2456,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         info_flag,
         &agent_name,
         child_abort.clone(),
+        Arc::clone(&ctx.prompter),
     )
     .await?;
 
@@ -2599,26 +2597,26 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         return Err(error);
     }
 
+    // Names the spawner's own child session; stays empty for any other
+    // session a spawner may hold (the REPL root's, however it is named, or
+    // a temp one).
+    let spawner_session_id = ctx
+        .session
+        .as_ref()
+        .filter(|_| ctx.self_agent_id.is_some())
+        .map(Session::name)
+        .filter(|name| child_sessions::parse_session_id(name).is_some())
+        .map(str::to_string);
     let session_id = match (resumed_session_id, root) {
         (Some(id), _) => Some(id),
         (None, Some(root)) if seat_session => {
             let session_id = child_sessions::new_session_id(&agent_name);
-            // Names the spawner's own child session; stays empty for any
-            // other session a spawner may hold (the REPL root's, however it
-            // is named, or a temp one).
-            let spawner_session_id = ctx
-                .session
-                .as_ref()
-                .filter(|_| ctx.self_agent_id.is_some())
-                .map(Session::name)
-                .filter(|name| child_sessions::parse_session_id(name).is_some())
-                .map(str::to_string);
             let meta = ChildMeta::new_running(
                 &session_id,
                 &agent_name,
                 &agent_id,
                 ProcessStamp::current(),
-                spawner_session_id,
+                spawner_session_id.clone(),
                 ctx.self_agent_id.clone(),
                 &prompt,
                 task_id,
@@ -2650,11 +2648,16 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
 
     debug!("Spawning child agent '{agent_name}' as '{agent_id}'");
 
-    hooks::fire(
-        HookEvent::AgentStarted,
+    hooks::emit(
         &child_ctx,
-        &spawned_agent_hook_extras(&agent_id, &agent_name, session_id.as_deref()),
-        None,
+        Event::AgentStarted {
+            origin: Origin::from(&child_ctx),
+            agent_id: agent_id.clone(),
+            name: Some(agent_name.clone()),
+            session_id: session_id.clone(),
+            parent_agent_id: ctx.self_agent_id.clone(),
+            parent_session_id: spawner_session_id,
+        },
     );
 
     Ok(SpawnBuild::Ready(Box::new(ChildSpawn {
@@ -2810,6 +2813,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         session_id: session_id.clone(),
         child_session_root: root.clone(),
         succeeded,
+        started_at: std::time::Instant::now(),
     };
 
     let registered = match ctx.supervisor.as_ref() {
@@ -2960,6 +2964,14 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             "message": format!("agent__collect was interrupted by the user; agent '{id}' is still running in the background. Collect it again later, cancel it with agent__cancel, or continue with other work."),
         })
     };
+    let message_arrived = || {
+        json!({
+            "status": "user_message",
+            "id": id,
+            "session_id": session_id,
+            "message": format!("agent__collect stopped waiting because the user sent a message (in system_notifications); agent '{id}' is still running in the background. Answer the user, then collect it again later."),
+        })
+    };
 
     let user_interrupts_here = ctx.user_interrupts_here();
     loop {
@@ -2974,6 +2986,17 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 
         if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             return Ok(interrupted());
+        }
+
+        super::wait_race_point();
+        if ctx.user_message_waiting() {
+            // An agent that finished since the check above is collected:
+            // its result is not given up for the message, which reaches
+            // the model with it.
+            if supervisor.read().is_finished(id).unwrap_or(false) {
+                break;
+            }
+            return Ok(message_arrived());
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -3158,7 +3181,10 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
                 .notification_queue
                 .take_ids(&ids)
                 .into_iter()
-                .map(|n| (n.id, n.status))
+                .filter_map(|n| match n {
+                    SystemNotification::Task { id, status, .. } => Some((id, status)),
+                    SystemNotification::UserMessage { .. } => None,
+                })
                 .collect();
             let ready: Vec<Value> = finished
                 .iter()
@@ -3212,6 +3238,28 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
         if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             break interrupted();
+        }
+
+        super::wait_race_point();
+        if ctx.user_message_waiting() {
+            // An agent that finished since the pass above is reported
+            // ready on the next pass rather than given up for the message.
+            let finished_since = {
+                let sup = supervisor.read();
+                running
+                    .iter()
+                    .any(|id| sup.is_finished(id).unwrap_or(false))
+            };
+            if finished_since {
+                continue;
+            }
+            break json!({
+                "status": "user_message",
+                "ready": [],
+                "running": running,
+                "unknown": unknown,
+                "message": "The wait stopped because the user sent a message (in system_notifications); the watched agents are still running in the background. Answer the user, then wait again later.",
+            });
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -3529,6 +3577,11 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             }
             let was_running = !join_handle.is_finished();
             abort_signal.set_ctrlc();
+            // Descendants' questions go when their own waits see the abort;
+            // this one goes now so the roster drops it before the cleanup wait.
+            if let Some(queue) = ctx.root_escalation_queue() {
+                queue.remove_for_agents(&[id]);
+            }
             // Written here as well as by the child's own exit, so the
             // sidecar reads cancelled even when the child outlives the
             // cleanup wait below. A child that had already finished keeps
@@ -3545,7 +3598,7 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 );
             }
 
-            let cleanup = tokio::time::timeout(Duration::from_secs(5), join_handle).await;
+            let cleanup = tokio::time::timeout(CANCEL_CLEANUP_WAIT, join_handle).await;
             let cleaned_up = cleanup.is_ok();
 
             // A task that panicked, whether before this cancel or while
@@ -3568,7 +3621,8 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 format!("Cancelled agent '{agent_name}' and waited for cleanup.")
             } else {
                 format!(
-                    "Cancelled agent '{agent_name}'; cleanup did not complete within 5s. Its descendants have been signalled and will tear down asynchronously."
+                    "Cancelled agent '{agent_name}'; cleanup did not complete within {}s. Its descendants have been signalled and will tear down asynchronously.",
+                    CANCEL_CLEANUP_WAIT.as_secs()
                 )
             };
 
@@ -3727,7 +3781,17 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         .get("reply")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'reply' is required"))?;
+    reply_escalation(ctx, escalation_id, reply)
+}
 
+/// Answers a pending escalation from the parent's side; the reply reaches
+/// the waiting child and `escalation.answered` fires from the replying
+/// context, carrying the request's agent and question in its envs.
+pub(crate) fn reply_escalation(
+    ctx: &mut RequestContext,
+    escalation_id: &str,
+    reply: &str,
+) -> Result<Value> {
     let queue = ctx
         .escalation_queue
         .clone()
@@ -3737,7 +3801,12 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         Some(request) => {
             let from_agent = request.from_agent_name.clone();
             let question = request.question.clone();
-            let _ = request.reply_tx.send(reply.to_string());
+            if request.reply_tx.send(reply.to_string()).is_err() {
+                return Ok(json!({
+                    "status": "error",
+                    "message": format!("The reply was not delivered: agent '{from_agent}' stopped waiting on escalation '{escalation_id}'"),
+                }));
+            }
             hooks::fire(
                 HookEvent::EscalationAnswered,
                 ctx,
@@ -3758,7 +3827,7 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         }
         None => Ok(json!({
             "status": "error",
-            "message": format!("No pending escalation found with id '{escalation_id}'. It may have already been replied to."),
+            "message": format!("The reply was not delivered: no pending escalation has id '{escalation_id}'. It was already answered, or its asker stopped waiting."),
         })),
     }
 }
@@ -4139,6 +4208,7 @@ mod tests {
             false,
             &agent_name,
             create_abort_signal(),
+            Arc::clone(&ctx.prompter),
         ))
         .unwrap();
         ctx.agent = Some(agent);
@@ -4298,7 +4368,8 @@ mod tests {
 
     /// Both session keys name the child's own session: `COYOTE_SESSION_ID`
     /// because the child is seated on a session named after the id, and
-    /// `COYOTE_AGENT_SESSION_ID` because the spawn seam adds it.
+    /// `COYOTE_AGENT_SESSION_ID` because the agent events carry the id and
+    /// `hooks::agent_extras` turns it into that variable.
     fn assert_session_envs(capture: &hooks::test_sink::Capture, session_id: &str) {
         assert_eq!(
             capture
@@ -4439,12 +4510,11 @@ mod tests {
             .notification_queue
             .drain()
             .iter()
-            .map(|notification| {
-                (
-                    notification.event,
-                    notification.id.clone(),
-                    notification.status,
-                )
+            .map(|notification| match notification {
+                SystemNotification::Task {
+                    event, id, status, ..
+                } => (*event, id.clone(), *status),
+                SystemNotification::UserMessage { .. } => panic!("{:?}", notification.to_value()),
             })
             .collect();
         assert_eq!(notified, [("agent_failed", id, "failed")]);
@@ -4610,8 +4680,10 @@ mod tests {
     }
 
     /// With the app knob off no child is seated, so neither session key
-    /// reaches the hooks: not the spawn seam's `COYOTE_AGENT_SESSION_ID`,
-    /// and not the base `COYOTE_SESSION_ID`, since the child has no session.
+    /// reaches the hooks: not `COYOTE_AGENT_SESSION_ID`, which
+    /// `hooks::agent_extras` sets only when the agent events carry a session
+    /// id, and not the base `COYOTE_SESSION_ID`, since the child has no
+    /// session.
     #[test]
     #[serial]
     fn unseated_spawn_hooks_carry_no_session_keys() {
@@ -4639,6 +4711,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_bus_twin_without_resolved_hooks() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let agent_id = "agent-bus-probe-x7x";
+        ctx.self_agent_id = Some(agent_id.to_string());
+        ctx.current_depth = 1;
+        let _sink = hooks::test_sink::install();
+        let bus = crate::events::RecordingSink::install();
+
+        SpawnResultHooks::resolve(&ctx, agent_id, "explore", None).fire(None, false);
+
+        let published = bus.drain_hooks_with_env("COYOTE_AGENT_ID", agent_id);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let crate::events::Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::AgentCompleted);
+        assert_eq!(*origin, Origin::from(&ctx));
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_AGENT_NAME".to_string(), "explore".to_string())));
+        assert!(envs.contains(&("COYOTE_EVENT".to_string(), "agent.completed".to_string())));
+        assert!(!envs.iter().any(|(key, _)| key == "COYOTE_AGENT_SESSION_ID"));
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_AGENT_ID").map(String::as_str) != Some(agent_id)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
     }
 
     #[test]
@@ -7139,8 +7248,8 @@ mod tests {
 
     /// Recording a graph run is the caller's job: the dispatcher hands the
     /// record back and never touches the session itself, and exactly three
-    /// callers store it: the REPL `.run` arm and the one-shot graph arm in
-    /// main.rs, on the engaged session, and the child runner, on the
+    /// callers store it: the REPL turn and the one-shot graph turn, both in
+    /// the turn driver, on the engaged session, and the child runner, on the
     /// child's own session.
     #[test]
     fn only_the_repl_turn_the_one_shot_arm_and_the_child_runner_record_a_graph_run() {
@@ -7163,11 +7272,15 @@ mod tests {
 
         let repl = include_str!("../repl/mod.rs").replace("\r\n", "\n");
         let repl = &repl[..repl.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        assert_eq!(repl.matches("record_graph_run(").count(), 1);
+        assert_eq!(repl.matches("record_graph_run(").count(), 0);
 
         let main = include_str!("../main.rs").replace("\r\n", "\n");
         let main = &main[..main.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        assert_eq!(main.matches("record_graph_run(").count(), 1);
+        assert_eq!(main.matches("record_graph_run(").count(), 0);
+
+        let driver = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let driver = &driver[..driver.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(driver.matches("record_graph_run(").count(), 2);
     }
 
     #[test]
@@ -12400,6 +12513,7 @@ mod tests {
             session_id: Some(sid.to_string()),
             child_session_root: Some(root),
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()
@@ -14659,6 +14773,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()
@@ -14710,6 +14825,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Default::default(),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()
@@ -15221,6 +15337,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -15250,6 +15367,34 @@ mod tests {
         let mut ctx = ctx_with_supervisor(4, 3);
         let result = run_async(handle_cancel(&mut ctx, &json!({"id": "missing"}))).unwrap();
         assert_eq!(result["status"], "error");
+    }
+
+    /// The cancelled agent's open question leaves the queue with it, even
+    /// while its wait still holds the receiver; other agents' stay.
+    #[test]
+    fn handle_cancel_withdraws_the_agents_pending_questions() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        let queue = ctx.ensure_root_escalation_queue();
+        let mut receivers = Vec::new();
+        for (id, from) in [("esc_c1", "a1"), ("esc_o1", "a2")] {
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            queue.submit(EscalationRequest {
+                id: id.into(),
+                from_agent_id: from.into(),
+                from_agent_name: "explore".into(),
+                question: "Which way?".into(),
+                options: None,
+                reply_tx: tx,
+            });
+            receivers.push(rx);
+        }
+
+        let result = run_async(handle_cancel(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "ok");
+        let ids: Vec<String> = queue.pending().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["esc_o1"]);
     }
 
     #[test]
@@ -15843,7 +15988,7 @@ mod tests {
         assert_eq!(result["status"], "error");
         assert_eq!(
             result["message"],
-            "No pending escalation found with id 'missing'. It may have already been replied to."
+            "The reply was not delivered: no pending escalation has id 'missing'. It was already answered, or its asker stopped waiting."
         );
     }
 
@@ -15855,14 +16000,43 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// `escalation.answered` belongs to the successful take -> reply arm
-    /// alone: exactly once per escalation, and never from the failure arms
-    /// (unknown id, already-taken id).
+    /// A reply that reaches no one is an error, and `escalation.answered`
+    /// does not fire for it.
     #[test]
     #[serial]
-    fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
+    fn replying_after_the_asker_stopped_waiting_is_an_error() {
         let _sink = hooks::test_sink::install();
-        let marker = "t049_answered_once";
+        let marker = "answered_after_asker_left_k4p";
+        let mut ctx = ctx_with_answered_hook(marker);
+        let queue = Arc::new(EscalationQueue::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        queue.submit(EscalationRequest {
+            id: "esc_gone".into(),
+            from_agent_id: "a1".into(),
+            from_agent_name: "explore".into(),
+            question: "What do?".into(),
+            options: None,
+            reply_tx: tx,
+        });
+        ctx.escalation_queue = Some(queue.clone());
+        drop(rx);
+
+        let result = reply_escalation(&mut ctx, "esc_gone", "do X").unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "status": "error",
+                "message": "The reply was not delivered: agent 'explore' stopped waiting on escalation 'esc_gone'",
+            })
+        );
+        assert!(queue.take("esc_gone").is_none());
+        assert!(
+            hook_captures_named(marker).is_empty(),
+            "an undelivered reply must not fire escalation.answered"
+        );
+    }
+
+    fn ctx_with_answered_hook(marker: &str) -> RequestContext {
         let mut hooks_map = hooks::HooksMap::default();
         hooks_map.insert(
             "escalation.answered".to_string(),
@@ -15876,7 +16050,34 @@ mod tests {
             hooks: hooks_map,
             ..Default::default()
         });
-        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    #[tokio::test]
+    async fn reply_escalation_matches_the_tool_wrapper_for_an_unknown_id() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.escalation_queue = Some(Arc::new(EscalationQueue::new()));
+        let via_tool = handle_agent_tool(
+            &mut ctx,
+            "agent__reply_escalation",
+            &json!({ "escalation_id": "esc_missing_7h", "reply": "ok" }),
+        )
+        .await
+        .unwrap();
+        let lifted = reply_escalation(&mut ctx, "esc_missing_7h", "ok").unwrap();
+        assert_eq!(via_tool["status"], "error");
+        assert_eq!(via_tool, lifted);
+    }
+
+    /// `escalation.answered` belongs to the successful take -> reply arm
+    /// alone: exactly once per escalation, and never from the failure arms
+    /// (unknown id, already-taken id).
+    #[test]
+    #[serial]
+    fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
+        let _sink = hooks::test_sink::install();
+        let marker = "t049_answered_once";
+        let mut ctx = ctx_with_answered_hook(marker);
         let queue = Arc::new(EscalationQueue::new());
         let (tx, rx) = tokio::sync::oneshot::channel();
         queue.submit(EscalationRequest {
@@ -16231,6 +16432,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16290,6 +16492,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16353,6 +16556,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16428,6 +16632,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16478,6 +16683,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -16545,6 +16751,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -17287,6 +17494,7 @@ mod tests {
                 session_id: None,
                 child_session_root: None,
                 succeeded: Default::default(),
+                started_at: std::time::Instant::now(),
             };
             ctx.supervisor
                 .as_ref()
@@ -17821,7 +18029,7 @@ mod tests {
                 .notification_queue
                 .drain()
                 .into_iter()
-                .map(|n| n.id)
+                .map(|n| n.id().unwrap().to_string())
                 .collect();
             assert_eq!(left, vec!["other"]);
         });
@@ -17975,6 +18183,242 @@ mod tests {
         });
     }
 
+    /// A message the user sends mid-wait ends agent__wait and
+    /// agent__collect promptly with a `user_message` status; the agent
+    /// waited on is neither cancelled nor collected, keeps running, and is
+    /// collected later once the model has read the message.
+    #[test]
+    fn a_user_message_mid_wait_ends_wait_and_collect_and_the_agent_keeps_running() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let abort =
+                register_agent_running_for(&mut ctx, "slow", "test", Duration::from_secs(2));
+            ctx.session_abort = Some(create_abort_signal());
+            let queue = Arc::clone(&ctx.notification_queue);
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(50)).await;
+                queue.push(SystemNotification::UserMessage {
+                    text: "stop and look u7m".to_string(),
+                });
+            });
+            let result = time::timeout(Duration::from_secs(2), handle_wait(&mut ctx, &json!({})))
+                .await
+                .expect("a user message mid-wait must end the wait promptly")
+                .unwrap();
+            assert_eq!(result["status"], "user_message");
+            assert_eq!(result["running"], json!(["slow"]));
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&mut ctx, &json!({"id": "slow"})),
+            )
+            .await
+            .expect("a waiting user message must end the collect promptly")
+            .unwrap();
+            assert_eq!(result["status"], "user_message");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("still running")
+            );
+
+            {
+                let sup = ctx.supervisor.as_ref().unwrap().read();
+                assert!(sup.has_agent("slow"), "the agent was taken");
+                assert_eq!(sup.is_finished("slow"), Some(false), "the agent stopped");
+            }
+            assert!(!abort.aborted(), "the agent was cancelled");
+            assert!(
+                ctx.notification_queue.has_user_message(),
+                "the message was consumed"
+            );
+
+            ctx.notification_queue.take_where(|notification| {
+                matches!(notification, SystemNotification::UserMessage { .. })
+            });
+            let result = time::timeout(
+                Duration::from_secs(10),
+                handle_collect(&mut ctx, &json!({"id": "slow"})),
+            )
+            .await
+            .expect("the agent kept running and finishes")
+            .unwrap();
+            assert_eq!(result["status"], "completed", "{result}");
+        });
+    }
+
+    /// An agent that finishes at the moment the user's message arrives is
+    /// collected, not given up for the message: agent__collect returns its
+    /// real result and agent__wait reports it ready, whether the two land
+    /// together mid-wait or are both there before the call. The message
+    /// stays queued, to reach the model with the result.
+    #[test]
+    fn an_agent_finishing_as_the_message_arrives_returns_its_result() {
+        run_async(async {
+            for already in [false, true] {
+                let mut ctx = ctx_with_supervisor(4, 3);
+                ctx.session_abort = Some(create_abort_signal());
+                let run_for = if already {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(50)
+                };
+                register_agent_running_for(&mut ctx, "quick", "test", run_for);
+                let queue = Arc::clone(&ctx.notification_queue);
+                let message = async move {
+                    time::sleep(run_for).await;
+                    queue.push(SystemNotification::UserMessage {
+                        text: "sent with the finish".to_string(),
+                    });
+                };
+                if already {
+                    message.await;
+                    time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    tokio::spawn(message);
+                }
+                let waited =
+                    time::timeout(Duration::from_secs(2), handle_wait(&mut ctx, &json!({})))
+                        .await
+                        .expect("the wait must end")
+                        .unwrap();
+                assert_eq!(waited["status"], "ready", "already={already}: {waited}");
+
+                let collected = time::timeout(
+                    Duration::from_secs(2),
+                    handle_collect(&mut ctx, &json!({"id": "quick"})),
+                )
+                .await
+                .expect("the collect must end")
+                .unwrap();
+                assert_eq!(
+                    collected["status"], "completed",
+                    "already={already}: {collected}"
+                );
+                assert!(
+                    ctx.notification_queue.has_user_message(),
+                    "already={already}: the message was lost"
+                );
+            }
+        });
+    }
+
+    /// The worst moment for the race: the loop has just found the agent
+    /// running, and before it looks for a message the user's message lands
+    /// and the agent finishes. agent__collect still returns the agent's
+    /// own output and agent__wait reports it ready; the message stays
+    /// queued for the model. The tool runs on this thread and the agent on
+    /// a worker, so the hook can wait for the agent to finish in between.
+    #[test]
+    fn an_agent_finishing_between_the_loop_checks_returns_its_result() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        for collect in [true, false] {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.session_abort = Some(create_abort_signal());
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            let join_handle = tokio::spawn(async move {
+                let _ = released.await;
+                Ok(AgentResult {
+                    id: "racer".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: "the racer's own output".to_string(),
+                    exit_status: AgentExitStatus::Completed,
+                    session_id: None,
+                })
+            });
+            let supervisor = Arc::clone(ctx.supervisor.as_ref().unwrap());
+            supervisor
+                .write()
+                .register(AgentHandle {
+                    id: "racer".to_string(),
+                    agent_name: "explore".to_string(),
+                    depth: 1,
+                    inbox: Arc::new(Inbox::new()),
+                    abort_signal: create_abort_signal(),
+                    join_handle,
+                    child_supervisor: None,
+                    session_id: None,
+                    child_session_root: None,
+                    succeeded: Default::default(),
+                    started_at: std::time::Instant::now(),
+                })
+                .unwrap();
+            let queue = Arc::clone(&ctx.notification_queue);
+            super::super::at_wait_race_point(move || {
+                queue.push(SystemNotification::UserMessage {
+                    text: "sent as it finished".to_string(),
+                });
+                let _ = release.send(());
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while !supervisor.read().is_finished("racer").unwrap_or(false) {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "the agent never finished"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let result = if collect {
+                runtime.block_on(time::timeout(
+                    Duration::from_secs(5),
+                    handle_collect(&mut ctx, &json!({"id": "racer"})),
+                ))
+            } else {
+                runtime.block_on(time::timeout(
+                    Duration::from_secs(5),
+                    handle_wait(&mut ctx, &json!({})),
+                ))
+            }
+            .expect("the call must end")
+            .unwrap();
+            if collect {
+                assert_eq!(result["status"], "completed", "{result}");
+                assert!(
+                    result["output"]
+                        .to_string()
+                        .contains("the racer's own output"),
+                    "{result}"
+                );
+            } else {
+                assert_eq!(result["status"], "ready", "{result}");
+            }
+            assert!(
+                ctx.notification_queue.has_user_message(),
+                "collect={collect}: the message was lost"
+            );
+        }
+    }
+
+    /// A spawned child's wait answers no user, so a message on its queue
+    /// does not end it.
+    #[test]
+    fn a_spawned_childs_wait_ignores_a_user_message() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            ctx.notification_queue
+                .push(SystemNotification::UserMessage {
+                    text: "not for the child".to_string(),
+                });
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_wait(&mut ctx, &json!({"timeout_secs": 0.3})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result["status"], "timeout");
+        });
+    }
+
     /// The bare-SIGINT arm a spawned child latches cannot be driven
     /// hermetically, so this pins that the child's wait ends on its timeout.
     #[test]
@@ -18092,6 +18536,7 @@ mod tests {
             session_id: None,
             child_session_root: None,
             succeeded: Arc::new(OnceLock::from(false)),
+            started_at: std::time::Instant::now(),
         };
         ctx.supervisor
             .as_ref()

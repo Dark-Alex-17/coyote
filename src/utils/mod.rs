@@ -19,7 +19,9 @@ mod task_cancel_guard;
 mod variables;
 
 pub use self::abort_signal::*;
-pub use self::clipboard::{ClipboardContent, read_for_paste, set_text};
+pub use self::clipboard::{
+    ClipboardContent, osc52_payload_cap, osc52_sequence, read_for_paste, set_text, set_text_native,
+};
 pub use self::command::*;
 pub use self::crypto::*;
 pub use self::cursor_sync::*;
@@ -204,11 +206,21 @@ pub fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "stands down when crate::tui::active()"
+)]
 pub fn drain_stale_tty_input() {
     use crossterm::event::{poll, read};
     use std::time::{Duration, Instant};
 
-    if !io::stdin().is_terminal() {
+    // Under the full-screen UI the event stream owns stdin; reading here
+    // would steal its keystrokes and toggle the raw mode it set. The
+    // inquire prompter drains before every widget; under the UI the modal
+    // answers in its place, so this branch guards the next caller.
+    // A piped stdin does not stop the drain: crossterm then reads keys from
+    // /dev/tty, which is where the inquire widget reads its answer too.
+    if crate::tui::active() || !*IS_STDOUT_TERMINAL {
         return;
     }
 
@@ -329,17 +341,15 @@ pub fn dimmed_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    let color = TOOL_DIM_COLOR.get().copied().unwrap_or(Color::Fixed(243));
-    color.paint(input).to_string()
+    tool_dim_color().paint(input).to_string()
 }
 
 pub fn cyan_bold_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
     nu_ansi_term::Style::new()
-        .fg(color)
+        .fg(tool_fn_color())
         .bold()
         .paint(input)
         .to_string()
@@ -361,8 +371,22 @@ pub fn magenta_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    let color = TOOL_KEY_COLOR.get().copied().unwrap_or(Color::Fixed(133));
-    color.paint(input).to_string()
+    tool_key_color().paint(input).to_string()
+}
+
+/// The muted colour of a tool call line's punctuation, as the theme set it.
+pub(crate) fn tool_dim_color() -> Color {
+    TOOL_DIM_COLOR.get().copied().unwrap_or(Color::Fixed(243))
+}
+
+/// The colour of a tool call line's function name.
+pub(crate) fn tool_fn_color() -> Color {
+    TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73))
+}
+
+/// The colour of a tool call line's argument names.
+pub(crate) fn tool_key_color() -> Color {
+    TOOL_KEY_COLOR.get().copied().unwrap_or(Color::Fixed(133))
 }
 
 pub fn multiline_text(input: &str) -> String {

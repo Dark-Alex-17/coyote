@@ -177,7 +177,6 @@ mod tests {
     use crate::config::WORKSPACE_COYOTE_DIR_NAME;
     use crate::testing::{CacheDirGuard, TestConfigDirGuard};
     use serial_test::serial;
-    use std::time;
 
     const VALID_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
 schemaVersion: "3"
@@ -208,11 +207,8 @@ capabilities:
 "#;
 
     fn unique_root(prefix: &str) -> PathBuf {
-        let nanos = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("coyote-{prefix}-{nanos}"));
+        let unique = crate::testing::unique_dir_suffix();
+        let root = env::temp_dir().join(format!("coyote-{prefix}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root
     }

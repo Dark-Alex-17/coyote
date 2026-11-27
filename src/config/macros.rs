@@ -73,6 +73,9 @@ pub async fn macro_execute(
     macro_ctx.inbox = ctx.inbox.clone();
     macro_ctx.parent_inbox = ctx.parent_inbox.clone();
     macro_ctx.escalation_queue = ctx.escalation_queue.clone();
+    macro_ctx.ui = ctx.ui.clone();
+    macro_ctx.prompter = ctx.prompter.clone();
+    macro_ctx.prompt_memory = ctx.prompt_memory.clone();
     macro_ctx.run_stats = ctx.run_stats.clone();
     macro_ctx.current_depth = ctx.current_depth;
     macro_ctx.auto_continue_count = ctx.auto_continue_count;
@@ -362,12 +365,12 @@ mod tests {
     use super::*;
     use crate::client::{ClientConfig, Model};
     use crate::config::{AppConfig, AppState, CommandPrefix, Session, WorkingMode};
+    use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, ScriptedPrompter};
     use crate::testing::TestConfigDirGuard;
     use crate::utils::{create_abort_signal, get_env_name};
     use serial_test::serial;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::future::Future;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, str};
 
     fn test_ctx() -> RequestContext {
@@ -384,10 +387,7 @@ mod tests {
     /// containing a `shared` macro whose `description` names its source, and
     /// points the workspace/global dir env overrides at them for `f`.
     fn with_macro_load_envs<F: FnOnce()>(f: F) {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-macro-load-tests-{unique}"));
         let workspace_root = root.join("workspace");
         let workspace_macros = workspace_root.join("macros");
@@ -1213,6 +1213,67 @@ variables:
             "isolated execution must not swap the live app config"
         );
         assert!(!ctx.macro_flag);
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_macro_prompts_through_the_live_ctx_prompter() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file("iso-delete-macro", "steps:\n  - \".delete role\"\n");
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("macro-doomed-4n.md");
+        write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            "macro-doomed-4n".to_string(),
+        ])]));
+        ctx.prompter = prompter.clone();
+
+        run_async(macro_execute(
+            &mut ctx,
+            "iso-delete-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(
+            !role_path.exists(),
+            "the macro context must prompt through the live context's prompter"
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].question, "Select role to delete:");
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_macro_session_exit_keeps_the_live_ctx_prompt_memory() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "iso-session-macro",
+            "steps:\n  - \".session macro-s1\"\n  - \".exit session\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::refusing());
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mac-mem-7r", Vec::new(), None)
+        };
+        ctx.prompt_memory.remember(&req);
+
+        run_async(macro_execute(
+            &mut ctx,
+            "iso-session-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(ctx.session.is_none());
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
     }
 
     #[test]

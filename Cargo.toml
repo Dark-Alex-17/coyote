@@ -36,7 +36,20 @@ tokio = { version = "1.34.0", features = [
   "rt-multi-thread",
   "full",
 ] }
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+# `crossterm_0_29` pins ratatui's backend to the crossterm above; the
+# textarea's `crossterm` feature resolves to the same backend through it.
+ratatui = { version = "0.30", default-features = false, features = [
+  "crossterm_0_29",
+  "layout-cache",
+  "underline-color",
+] }
+ansi-to-tui = "8"
+ratatui-textarea = { version = "0.9", default-features = false, features = [
+  "crossterm",
+] }
+mermaid-text = "=0.58.0"
+term-maths = "=1.0.0"
 chrono = "0.4.23"
 bincode = { version = "2.0.0", features = [
   "serde",
@@ -61,6 +74,7 @@ log4rs = { version = "1.4.0", features = [
 shell-words = "1.1.0"
 sha2 = "0.10.8"
 unicode-width = "0.2.0"
+unicode-segmentation = "1.13.3"
 http = "1.1.0"
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.12.1"
@@ -144,8 +158,24 @@ arboard = { version = "3.6", default-features = false, features = ["image-data"]
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# The prompt reply pipe (src/function/prompt_channel/server.rs), the console
+# writer and escape processing (src/tui/terminal.rs) and the std-handle
+# redirect (src/tui/redirect.rs).
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Pipes",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_IO",
+  "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 ctor = "1.0.13"
+insta = { version = "1", features = ["filters"] }
 pretty_assertions = "1.4.0"
 rmcp = { version = "3.1.2", features = ["server"] }
 serial_test = "3"

@@ -5,7 +5,7 @@ use crate::{
     client::Model,
     config::memory,
     function::{
-        FunctionDeclaration, Functions, ToolAgent,
+        FunctionDeclaration, Functions, ToolAgent, ToolIo,
         jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
         run_llm_function,
     },
@@ -26,11 +26,14 @@ use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
-use crate::rag::RagInitConfig;
+use crate::prompt::{
+    NeedsHuman, Prompter, Reach, can_ask, confirm, require_human, required_sensitive_input,
+};
+use crate::rag::{RagInitConfig, RagInitRun};
+use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
-use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -77,13 +80,14 @@ pub(crate) fn install_and_reconcile_agent_hooks(
     shipped: &[(String, String)],
     mode: InstallMode,
     sticky: &mut StickyMode,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
     let dir = paths::agents_data_dir().join(agent).join("hooks");
     let mut written = BTreeSet::new();
     for (name, content) in shipped {
         let path = dir.join(name);
         if path.exists()
-            && !conflict::should_replace_existing(&path, content, "agents", mode, sticky)?
+            && !conflict::should_replace_existing(&path, content, "agents", mode, sticky, prompter)?
         {
             debug!(
                 "Agent hook file already exists, skipping: {}",
@@ -185,7 +189,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn install_builtin_agents(mode: InstallMode) -> Result<()> {
+    pub fn install_builtin_agents(mode: InstallMode, prompter: &dyn Prompter) -> Result<()> {
         info!(
             "Installing built-in agents in {}",
             paths::agents_data_dir().display()
@@ -209,6 +213,7 @@ impl Agent {
                     "agents",
                     mode,
                     &mut sticky,
+                    prompter,
                 )?
             {
                 debug!(
@@ -287,7 +292,11 @@ impl Agent {
         Ok(())
     }
 
-    pub fn install_builtin_agent_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
+    pub fn install_builtin_agent_hooks(
+        mode: InstallMode,
+        sticky: &mut StickyMode,
+        prompter: &dyn Prompter,
+    ) -> Result<()> {
         let mut shipped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for file in AgentAssets::iter() {
             let Some((agent, rest)) = file.as_ref().split_once('/') else {
@@ -305,12 +314,15 @@ impl Agent {
         }
 
         for (agent, files) in &shipped {
-            install_and_reconcile_agent_hooks(agent, files, mode, sticky)?;
+            install_and_reconcile_agent_hooks(agent, files, mode, sticky, prompter)?;
         }
 
         Ok(())
     }
 
+    /// The prompter arrives as an `Arc` because the RAG build runs inside
+    /// the owning `rag_cache.load_with` future, which captures by move and
+    /// cannot borrow from this frame; a clone of the handle goes in.
     pub async fn init(
         app: &AppConfig,
         app_state: &AppState,
@@ -318,6 +330,7 @@ impl Agent {
         info_flag: bool,
         name: &str,
         abort_signal: AbortSignal,
+        prompter: Arc<dyn Prompter>,
     ) -> Result<Self> {
         let agent_data_dir = paths::agent_data_dir(name);
         let loaders = app.document_loaders.clone();
@@ -394,10 +407,28 @@ impl Agent {
             Some(rag)
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
-            if *IS_STDOUT_TERMINAL {
-                ans = Confirm::new("The agent has documents attached, init RAG?")
-                    .with_default(true)
-                    .prompt()?;
+            if can_ask(prompter.as_ref()) {
+                // The knowledge base is optional, so a run with no human
+                // to ask declines it instead of failing. Closing the
+                // question still cancels the agent init.
+                ans = match confirm(
+                    prompter.as_ref(),
+                    "The agent has documents attached, init RAG?",
+                    true,
+                ) {
+                    Ok(answer) => answer,
+                    Err(e) if NeedsHuman::caused(&e) => {
+                        debug!(
+                            "Agent '{name}' has documents but no human to ask about RAG; starting without it"
+                        );
+                        false
+                    }
+                    Err(e) => return Err(e),
+                };
+            } else {
+                debug!(
+                    "Agent '{name}' has documents but no terminal to ask about RAG; starting without it"
+                );
             }
             if ans {
                 let document_paths =
@@ -407,6 +438,7 @@ impl Agent {
                 let rag_path_clone = rag_path.clone();
                 let abort = abort_signal.clone();
                 let sync_hooks = rag_sync_hooks.clone();
+                let prompter = Arc::clone(&prompter);
                 let rag = app_state
                     .rag_cache
                     .load_with(key, || async move {
@@ -415,9 +447,12 @@ impl Agent {
                             "rag",
                             &rag_path_clone,
                             &document_paths,
-                            abort,
                             true,
-                            sync_hooks,
+                            RagInitRun {
+                                abort_signal: abort,
+                                sync_hooks,
+                                prompter: prompter.as_ref(),
+                            },
                         )
                         .await
                     })
@@ -442,6 +477,7 @@ impl Agent {
                     info_flag,
                     abort_signal.clone(),
                     &rag_sync_hooks,
+                    &prompter,
                 )
                 .await?
             }
@@ -516,6 +552,7 @@ impl Agent {
         pre_set_variables: Option<&AgentVariables>,
         no_interaction: bool,
         interactive: bool,
+        prompter: &dyn Prompter,
     ) -> Result<AgentVariables> {
         let mut output = IndexMap::new();
         if agent_variables.is_empty() {
@@ -536,23 +573,16 @@ impl Agent {
             if no_interaction {
                 continue;
             }
-            if interactive && *IS_STDOUT_TERMINAL {
+            if may_ask_human(interactive, prompter) {
                 if !printed {
                     println!("⚙ Init agent variables...");
                     printed = true;
                 }
-                let value = Text::new(&format!(
-                    "{} ({}):",
-                    agent_variable.name, agent_variable.description
-                ))
-                .with_validator(|input: &str| {
-                    if input.trim().is_empty() {
-                        Ok(Validation::Invalid("This field is required".into()))
-                    } else {
-                        Ok(Validation::Valid)
-                    }
-                })
-                .prompt()?;
+                let value = ask_required_variable(
+                    prompter,
+                    &agent_variable.name,
+                    &agent_variable.description,
+                )?;
                 output.insert(key, value);
             } else {
                 unset_variables.push(agent_variable)
@@ -909,22 +939,33 @@ impl Agent {
     }
 
     fn run_instructions_fn(&self, tool_timeout: Option<u64>) -> Result<String> {
-        let run = run_llm_function(
-            self.name().to_string(),
-            vec!["_instructions".into(), "{}".into()],
-            self.variable_envs(),
-            Some(ToolAgent {
-                name: self.name().to_string(),
-                script: true,
-            }),
-            tool_timeout,
-            false,
-            None,
-        )?;
-        match run.output {
-            Some(v) => Ok(v),
-            _ => bail!("No return value from '_instructions' function"),
-        }
+        let run = || {
+            run_llm_function(
+                self.name().to_string(),
+                vec!["_instructions".into(), "{}".into()],
+                self.variable_envs(),
+                Some(ToolAgent {
+                    name: self.name().to_string(),
+                    script: true,
+                }),
+                tool_timeout,
+                ToolIo::new(Arc::new(SilentSink), None, 0),
+                None,
+            )
+        };
+        // The tool blocks its thread until it exits; on a multi-thread
+        // worker that would strand the runtime's drivers. block_in_place
+        // panics on a current-thread runtime, so it is used only on the
+        // multi-thread flavour.
+        let on_multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        let value = if on_multi_thread {
+            tokio::task::block_in_place(run)
+        } else {
+            run()
+        }?;
+        instructions_from_tool_output(value.output)
     }
 
     #[cfg(test)]
@@ -1438,6 +1479,7 @@ async fn init_graph_rags(
     info_flag: bool,
     abort_signal: AbortSignal,
     sync_hooks: &RagSyncHooks,
+    prompter: &Arc<dyn Prompter>,
 ) -> Result<HashMap<String, Arc<Rag>>> {
     let mut rags = HashMap::new();
     if info_flag {
@@ -1481,20 +1523,22 @@ async fn init_graph_rags(
                 && config.chunk_size.is_some()
                 && config.chunk_overlap.is_some();
             if !fully_specified {
-                if !*IS_STDOUT_TERMINAL {
-                    bail!(
-                        "Agent '{agent_name}' requires RAG for rag node '{node_id}', but its \
-                         knowledge base is not built and the node does not fully specify how \
-                         to build it. Set `embedding_model`, `chunk_size`, and `chunk_overlap` \
-                         on the node, or run the agent once interactively."
-                    );
-                }
+                require_human(
+                    prompter.as_ref(),
+                    format_args!(
+                        "build the knowledge base for rag node '{node_id}' of agent '{agent_name}'"
+                    ),
+                    ", or set `embedding_model`, `chunk_size`, and `chunk_overlap` on the node.",
+                )?;
 
-                let ans = Confirm::new(&format!(
-                    "Initialize RAG knowledge base for rag node '{node_id}'?"
-                ))
-                .with_default(true)
-                .prompt()?;
+                let ans = confirm(
+                    prompter.as_ref(),
+                    format!("Initialize RAG knowledge base for rag node '{node_id}'?"),
+                    true,
+                )
+                .with_context(|| {
+                    format!("rag node '{node_id}' of agent '{agent_name}' needs its knowledge base built")
+                })?;
 
                 if !ans {
                     bail!(
@@ -1504,7 +1548,7 @@ async fn init_graph_rags(
                 }
 
                 if config.driver.is_none() {
-                    config.driver = Some(rag::select_rag_driver()?);
+                    config.driver = Some(rag::select_rag_driver(prompter.as_ref())?);
                 }
             }
 
@@ -1515,6 +1559,7 @@ async fn init_graph_rags(
             let name_clone = node_id.clone();
             let abort = abort_signal.clone();
             let sync_hooks = sync_hooks.clone();
+            let prompter = Arc::clone(prompter);
             app_state
                 .rag_cache
                 .load_with(key, || async move {
@@ -1524,8 +1569,11 @@ async fn init_graph_rags(
                         &path_clone,
                         &document_paths,
                         &config,
-                        abort,
-                        sync_hooks,
+                        RagInitRun {
+                            abort_signal: abort,
+                            sync_hooks,
+                            prompter: prompter.as_ref(),
+                        },
                     )
                     .await
                 })
@@ -1618,7 +1666,9 @@ pub fn try_load_agent_variables(name: &str) -> Result<Vec<AgentVariable>> {
     Ok(stub.variables)
 }
 
-pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
+pub fn complete_agent_variables(
+    agent_name: &str,
+) -> Vec<(String, Option<String>, Option<&'static str>)> {
     load_agent_variables(agent_name)
         .iter()
         .map(|v| {
@@ -1626,15 +1676,235 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
                 Some(default) => format!("{} [default: {default}]", v.description),
                 None => v.description.clone(),
             };
-            (format!("{}=", v.name), Some(description))
+            (format!("{}=", v.name), Some(description), Some("variable"))
         })
         .collect()
+}
+
+/// Turns the `_instructions` function's output into the agent's instructions.
+/// A tool failure comes back as a `{"tool_call_error": ..}` payload rather
+/// than an error, and must not become the prompt the agent runs on; the
+/// tool's stderr, stdout and partial output ride along so the failure can be read.
+fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
+    let Some(value) = value else {
+        bail!("No return value from '_instructions' function");
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&value) else {
+        return Ok(value);
+    };
+    let Some(error) = payload.get("tool_call_error") else {
+        return Ok(value);
+    };
+    let error = error
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let mut message = format!("'_instructions' function failed: {error}");
+    for key in ["stderr", "stdout", "output"] {
+        if let Some(detail) = payload.get(key).and_then(serde_json::Value::as_str)
+            && !detail.trim().is_empty()
+        {
+            message.push_str(&format!("\n{key}:\n{}", detail.trim_end()));
+        }
+    }
+    bail!("{message}")
+}
+
+fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str) -> Result<String> {
+    required_sensitive_input(prompter, &format!("{name} ({description}):"))
+}
+
+/// Whether a required agent variable may be asked for rather than
+/// reported as missing. The prompter would refuse the question on its
+/// own without a human, but failing on the first refusal would name one
+/// variable; gating here lets the loop collect every unset variable and
+/// report them all in one bail.
+fn may_ask_human(interactive: bool, prompter: &dyn Prompter) -> bool {
+    interactive && prompter.reach() == Reach::Human
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing;
+    use crate::config::conflict::prompt_script::Scripted;
+    use crate::events::{Event, RecordingSink};
+    use crate::prompt::{
+        HeadlessPrompter, PromptAction, PromptAnswer, ScriptedPrompter, prompt_events,
+    };
+    use crate::testing::{self, AtomicFlagGuard};
+    use crate::utils::{ACP_SERVER, HEADLESS};
+    use serial_test::serial;
+
+    /// A blank answer is asked again with the reason in front of the
+    /// label, so the modal says why it is back; the first non-blank one
+    /// lands.
+    #[test]
+    #[serial]
+    fn a_blank_required_variable_is_asked_again_with_the_reason() {
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text("  ".to_string()),
+            PromptAnswer::Text("value-7p".to_string()),
+        ]);
+
+        let value = ask_required_variable(&prompter, "region", "Deployment region").unwrap();
+
+        assert_eq!(value, "value-7p");
+        let questions: Vec<String> = prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect();
+        assert_eq!(
+            questions,
+            vec![
+                "region (Deployment region):",
+                "This field is required. region (Deployment region):",
+                "This field is required. region (Deployment region):",
+            ]
+        );
+        assert!(
+            prompter
+                .requests()
+                .iter()
+                .all(|req| req.action == PromptAction::Input)
+        );
+    }
+
+    /// A variable can hold a key or token, so the value typed for it
+    /// stays off the event bus.
+    #[test]
+    #[serial]
+    fn a_required_variable_value_is_never_published() {
+        let sink = RecordingSink::install();
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text("key-2h9d".to_string()),
+        ]);
+
+        let value = ask_required_variable(&prompter, "api_key", "Service key av-2h9d").unwrap();
+
+        assert_eq!(value, "key-2h9d");
+        let asked = prompter.requests();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|req| req.sensitive), "{asked:?}");
+        let events = sink.drain();
+        for req in &asked {
+            let (requested, answered) = prompt_events(events.clone(), &req.question);
+            assert_eq!(requested.len(), 1, "{requested:?}");
+            assert!(
+                matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
+                "{answered:?}"
+            );
+        }
+        let published = format!("{events:?}");
+        assert!(!published.contains("key-2h9d"), "{published}");
+    }
+
+    #[test]
+    fn init_agent_variables_does_not_prompt_for_a_preset_variable() {
+        let variables = vec![AgentVariable {
+            name: "region".to_string(),
+            description: "Deployment region".to_string(),
+            default: None,
+            value: String::new(),
+        }];
+        let preset = IndexMap::from([("region".to_string(), "preset-3k".to_string())]);
+
+        let seeded = Agent::init_agent_variables(
+            &variables,
+            Some(&preset),
+            false,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
+
+        assert_eq!(seeded.get("region").map(String::as_str), Some("preset-3k"));
+    }
+
+    /// A headless run has nobody to ask, so a required variable fails closed
+    /// instead of storing whatever the prompter hands back.
+    #[test]
+    #[serial]
+    fn init_agent_variables_fails_closed_without_a_human() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let variables = vec![AgentVariable {
+            name: "region".to_string(),
+            description: "Deployment region".to_string(),
+            default: None,
+            value: String::new(),
+        }];
+
+        let err = Agent::init_agent_variables(
+            &variables,
+            None,
+            false,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("The following agent variables are required"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("region: Deployment region"),
+            "{err}"
+        );
+    }
+
+    /// With a human but no terminal there is nowhere to draw the
+    /// question, so the variable is reported missing and nothing is asked.
+    #[test]
+    #[serial]
+    fn without_a_tty_a_missing_required_variable_is_reported_not_asked() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+        let variables = vec![AgentVariable {
+            name: "region".to_string(),
+            description: "Deployment region".to_string(),
+            default: None,
+            value: String::new(),
+        }];
+
+        let err =
+            Agent::init_agent_variables(&variables, None, false, true, &prompter).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "The following agent variables are required:\n  - region: Deployment region"
+            ),
+            "{err}"
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn may_ask_human_needs_an_interactive_run_and_a_human_at_a_terminal() {
+        let _acp = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let prompter = ScriptedPrompter::refusing();
+        let tty = crate::config::conflict::prompt_script::install(&[]);
+        let headless = AtomicFlagGuard::set(&HEADLESS, true);
+        assert!(!may_ask_human(true, &prompter));
+        drop(headless);
+
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        assert!(may_ask_human(true, &prompter));
+        assert!(!may_ask_human(false, &prompter));
+        assert!(!may_ask_human(true, &HeadlessPrompter));
+        drop(tty);
+
+        let _no_tty = crate::config::conflict::prompt_script::install_non_interactive();
+        assert!(!may_ask_human(true, &prompter));
+    }
 
     #[test]
     fn parse_direct_hook_path_accepts_only_direct_hook_children() {
@@ -1644,6 +1914,52 @@ mod tests {
         assert_eq!(parse_direct_hook_path("x/hooks/"), None);
         assert_eq!(parse_direct_hook_path("x/config.yaml"), None);
         assert_eq!(parse_direct_hook_path("config.yaml"), None);
+    }
+
+    #[test]
+    fn instructions_from_tool_output_rejects_a_tool_failure_payload() {
+        let failure = serde_json::json!({
+            "tool_call_error": "Tool call 'probe' exited with code 3",
+            "stderr": "boom",
+            "stdout": "chatter\n",
+            "output": "partial\n",
+        })
+        .to_string();
+        let err = instructions_from_tool_output(Some(failure)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'_instructions' function failed: Tool call 'probe' exited with code 3\n\
+             stderr:\n\
+             boom\n\
+             stdout:\n\
+             chatter\n\
+             output:\n\
+             partial"
+        );
+
+        let bare = serde_json::json!({"tool_call_error": "Tool call 'probe' aborted"}).to_string();
+        assert_eq!(
+            instructions_from_tool_output(Some(bare))
+                .unwrap_err()
+                .to_string(),
+            "'_instructions' function failed: Tool call 'probe' aborted"
+        );
+
+        let err = instructions_from_tool_output(None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No return value from '_instructions' function"
+        );
+
+        let text = "You are a probe agent.\n{\"not\": \"an error\"}".to_string();
+        assert_eq!(
+            instructions_from_tool_output(Some(text.clone())).unwrap(),
+            text
+        );
+        assert_eq!(
+            instructions_from_tool_output(Some("{\"output\": \"fine\"}".to_string())).unwrap(),
+            "{\"output\": \"fine\"}"
+        );
     }
 
     #[test]
@@ -2476,6 +2792,7 @@ nodes: {}
             false,
             name,
             create_abort_signal(),
+            Arc::new(ScriptedPrompter::refusing()),
         )
         .await
         .unwrap()
@@ -2640,6 +2957,472 @@ nodes: {}
         );
     }
 
+    /// Under the full-screen UI the RAG question is a confirm through
+    /// the prompter; declining it starts the agent without its
+    /// knowledge base.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn declining_the_rag_confirm_under_the_tui_starts_without_rag() {
+        let _guard = TestConfigDirGuard::new("agent-rag-confirm");
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let name = unique("rag_confirm");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_none());
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "The agent has documents attached, init RAG?");
+        assert_eq!(req.default, Some(json!(true)));
+    }
+
+    /// Closing the optional RAG question cancels the agent init; only a
+    /// "no" starts the agent without its knowledge base.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_the_rag_confirm_cancels_the_agent_init() {
+        let _guard = TestConfigDirGuard::new("agent-rag-cancel");
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let name = unique("rag_cancel");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::prompt::PromptCancelled::caused(&err));
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "The agent has documents attached, init RAG?");
+    }
+
+    /// Accepting the RAG question under the full-screen UI goes on to
+    /// build the knowledge base through the same prompter: its first
+    /// question is the embedding model, a closed select. Building the
+    /// base itself needs an embedding model to call, so the pin answers
+    /// that select with an option it does not offer and stops there.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn accepting_the_rag_confirm_under_the_tui_goes_on_to_build_the_knowledge_base() {
+        let _guard = TestConfigDirGuard::new("agent-rag-accept");
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let name = unique("rag_accept");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Selected("not-an-offered-model".to_string()),
+        ]));
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("is not one of the offered options"),
+            "{err}"
+        );
+        let [confirm, select] = prompter.requests().try_into().unwrap();
+        assert_eq!(confirm.action, PromptAction::Confirm);
+        assert_eq!(
+            confirm.question,
+            "The agent has documents attached, init RAG?"
+        );
+        assert_eq!(select.action, PromptAction::Select);
+        assert_eq!(select.question, "Select embedding model:");
+        assert!(select.closed);
+        assert!(!select.options.is_empty());
+    }
+
+    /// Without a terminal the RAG question is skipped rather than
+    /// refused: the agent starts without its knowledge base and nothing
+    /// is asked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn without_a_terminal_the_rag_question_is_skipped_and_the_agent_starts() {
+        let _guard = TestConfigDirGuard::new("agent-rag-no-tty");
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let name = unique("rag_no_tty");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_none());
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// Off the UI, a terminal on stdout is enough to ask the RAG question:
+    /// with stdin piped, accepting it still builds the knowledge base and
+    /// the agent's `rag.sync.*` hooks fire.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn with_piped_stdin_the_rag_question_is_asked_and_the_sync_hooks_fire() {
+        let _guard = TestConfigDirGuard::new("agent-rag-piped-stdin");
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _stdout_tty = crate::config::conflict::prompt_script::install(&[]);
+        let _stdin = testing::pipe_stdin();
+        let _sink = crate::hooks::test_sink::install();
+        crate::hooks::test_sink::drain();
+        let marker = "agent-rag-piped-h3k";
+        let name = unique("rag_piped");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("notes.md"), "").unwrap();
+        let hooks: String = ["started", "completed", "failed"]
+            .iter()
+            .map(|event| {
+                format!(
+                    "  rag.sync.{event}:\n    - name: {marker}-{event}\n      command: \"true\"\n"
+                )
+            })
+            .collect();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\nhooks:\n{hooks}"),
+        )
+        .unwrap();
+
+        let mut client = crate::client::ClientConfig::default();
+        if let crate::client::ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("test-seeded".to_string());
+            let mut embedder = crate::client::ModelData::new("test-embedder");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            clients: vec![client],
+            rag_embedding_model: Some("test-seeded:test-embedder".to_string()),
+            rag_chunk_size: Some(1000),
+            rag_chunk_overlap: Some(100),
+            ..Default::default()
+        });
+        let mut answers = vec![PromptAnswer::Confirmed(true)];
+        if cfg!(not(target_env = "musl")) {
+            let yaml_row = "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)"; // debris-exempt: inquire label kept verbatim
+            answers.push(PromptAnswer::Selected(yaml_row.to_string()));
+        }
+        let prompter = Arc::new(ScriptedPrompter::new(answers));
+
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_some());
+        assert_eq!(
+            prompter.requests()[0].question,
+            "The agent has documents attached, init RAG?"
+        );
+        let fired: Vec<String> = crate::hooks::test_sink::drain()
+            .into_iter()
+            .map(|capture| capture.hook_name)
+            .filter(|hook| hook.starts_with(marker))
+            .collect();
+        assert_eq!(
+            fired,
+            [format!("{marker}-started"), format!("{marker}-completed")]
+        );
+    }
+
+    /// With no human attached the optional RAG question cannot be
+    /// answered; the agent starts without its knowledge base instead of
+    /// failing on the refusal.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_headless_run_with_documents_starts_without_rag_instead_of_failing() {
+        let _guard = TestConfigDirGuard::new("agent-rag-headless");
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let name = unique("rag_headless");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::new(HeadlessPrompter),
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_none());
+    }
+
+    /// A graph's rag node whose knowledge base is not built asks the same
+    /// way; declining is fatal because the graph cannot run without it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn declining_a_rag_node_confirm_under_the_tui_fails_the_init() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-confirm");
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let name = unique("rag_node_confirm");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("rag node 'lookup' but its RAG was not initialized"),
+            "{err:#}"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(
+            req.question,
+            "Initialize RAG knowledge base for rag node 'lookup'?"
+        );
+        assert_eq!(req.default, Some(json!(true)));
+    }
+
+    /// Closing the rag node question is not a decline either way: the
+    /// init fails on the cancellation, named with the node it was for.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_a_rag_node_confirm_under_the_tui_fails_the_init() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-cancel");
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let name = unique("rag_node_cancel");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("rag node 'lookup' of agent '{name}' needs its knowledge base built")
+        );
+        assert_eq!(
+            err.root_cause().to_string(),
+            "Operation was canceled by the user"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(
+            req.question,
+            "Initialize RAG knowledge base for rag node 'lookup'?"
+        );
+    }
+
+    /// Without a terminal an unbuilt rag node is refused in the shared
+    /// shape, naming the node fields that would make the question moot,
+    /// and nothing is asked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn without_a_terminal_an_unbuilt_rag_node_is_refused_without_asking() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-no-tty");
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let name = unique("rag_node_no_tty");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "Refusing to build the knowledge base for rag node 'lookup' of agent '"
+            ),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(
+                "non-interactively. Re-run in a terminal, or set `embedding_model`, \
+                 `chunk_size`, and `chunk_overlap` on the node."
+            ),
+            "got: {message}"
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// With a terminal but no human the rag node confirm is refused; the
+    /// refusal names the node and agent so a log reader knows what to
+    /// build.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_headless_run_with_an_unbuilt_rag_node_names_the_node_in_the_refusal() {
+        let _guard = TestConfigDirGuard::new("agent-rag-node-headless");
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let name = unique("rag_node_headless");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nstart: lookup\nnodes:\n  lookup:\n    type: rag\n    documents: [notes.md]\n    next: done\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::new(HeadlessPrompter),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "rag node 'lookup' of agent '{name}' needs its knowledge base built"
+            )),
+            "{err:#}"
+        );
+    }
+
     fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {
         entries
             .iter()
@@ -2662,8 +3445,14 @@ nodes: {}
         // First conflict answered per-file, second by the sticky replace-all.
         let script = prompt_script::install(&["replace-all"]);
         let mut sticky = StickyMode::None;
-        install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
-            .unwrap();
+        install_and_reconcile_agent_hooks(
+            "probe",
+            &shipped,
+            InstallMode::Prompt,
+            &mut sticky,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
         assert_eq!(read_to_string(dir.join("b.sh")).unwrap(), "new content\n");
@@ -2680,8 +3469,14 @@ nodes: {}
         fs::write(dir.join("a.sh"), "local again").unwrap();
         let script = prompt_script::install(&[]);
         let mut sticky = StickyMode::KeepAll;
-        install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
-            .unwrap();
+        install_and_reconcile_agent_hooks(
+            "probe",
+            &shipped,
+            InstallMode::Prompt,
+            &mut sticky,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "local again");
         drop(script);
@@ -2698,6 +3493,7 @@ nodes: {}
             &fixture(&[("keep.sh", "v1\n"), ("drop.sh", "#!/bin/sh\n")]),
             InstallMode::Skip,
             &mut StickyMode::None,
+            &Scripted,
         )
         .unwrap();
         fs::write(dir.join("user.sh"), "user-owned").unwrap();
@@ -2707,6 +3503,7 @@ nodes: {}
             &fixture(&[("keep.sh", "v2\n"), ("added.sh", "#!/bin/sh\n")]),
             InstallMode::Force,
             &mut StickyMode::None,
+            &Scripted,
         )
         .unwrap();
 
@@ -2759,11 +3556,13 @@ nodes: {}
             &fixture(&[("stale.sh", "#!/bin/sh\n")]),
             InstallMode::Skip,
             &mut StickyMode::None,
+            &Scripted,
         )
         .unwrap();
         fs::write(dir.join("user.sh"), "user-owned").unwrap();
 
-        Agent::install_builtin_agent_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        Agent::install_builtin_agent_hooks(InstallMode::Skip, &mut StickyMode::None, &Scripted)
+            .unwrap();
 
         assert!(
             !dir.join("stale.sh").exists(),
@@ -2796,6 +3595,65 @@ nodes: {}
             "the sweep must never follow a symlinked agent dir"
         );
         assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
+    }
+
+    /// An agent whose `_instructions` tool writes `text` as its output.
+    #[cfg(unix)]
+    fn agent_with_instructions_tool(name: &str, text: &str) -> Agent {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = paths::agent_bin_dir(name);
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join(name);
+        std::fs::write(
+            &tool,
+            format!("#!/usr/bin/env bash\nprintf '%s' '{text}' > \"$LLM_OUTPUT\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Agent::test_new(AgentConfig {
+            name: name.to_string(),
+            ..AgentConfig::default()
+        })
+    }
+
+    /// On a multi-thread runtime's worker the tool runs through
+    /// `block_in_place`, and its output comes back as the instructions.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_instructions_fn_returns_the_tool_output_on_a_multi_thread_worker() {
+        let _guard = testing::TestConfigDirGuard::new("agent-instructions-mt");
+        let agent = agent_with_instructions_tool("probe-mt", "You are the mt probe x7x.");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let instructions = runtime
+            .block_on(
+                async move { tokio::spawn(async move { agent.run_instructions_fn(None) }).await },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(instructions, "You are the mt probe x7x.");
+    }
+
+    /// On a current-thread runtime `block_in_place` would panic, so the
+    /// tool runs on the calling thread and still gives its output back.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_instructions_fn_returns_the_tool_output_on_a_current_thread_runtime() {
+        let _guard = testing::TestConfigDirGuard::new("agent-instructions-ct");
+        let agent = agent_with_instructions_tool("probe-ct", "You are the ct probe x7x.");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instructions = runtime
+            .block_on(async { agent.run_instructions_fn(None) })
+            .unwrap();
+        assert_eq!(instructions, "You are the ct probe x7x.");
     }
 
     #[test]

@@ -21,6 +21,11 @@ pub fn render(app: &AppConfig, compressed: &[Message], active: &[Message]) -> Re
     if compressed.is_empty() && active.is_empty() {
         return Ok(());
     }
+    // Under the full-screen UI the history goes to the transcript as rows;
+    // printed, it would land in a captured command's output.
+    if crate::tui::show_history(compressed, active) {
+        return Ok(());
+    }
 
     render_messages(app, compressed)?;
     if !compressed.is_empty() && !active.is_empty() {

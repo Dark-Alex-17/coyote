@@ -1,0 +1,24 @@
+---
+source: src/tui/tests/mod.rs
+expression: frame
+---
+"                                        "
+" ┌Keys─────────────────────────1-7/290┐ "
+" │                                    │ "
+" │Anywhere                            │ "
+" │  Ctrl+Z                            │ "
+" │    Suspend to the shell            │ "
+" │  Ctrl+L                            │ "
+" │    Redraw the screen               │ "
+" │  Shift+drag / Option+drag          │ "
+" │    Select with the terminal instead│ "
+" └j/k scroll  PgUp/Dn page  Esc close─┘ "
+"                                        "
+"────────────────────────────────────────"
+"                                        "
+"───────────────────────────── your turn "
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"────────────────────────────────────────"
+"openai:test-model . no session . agents "

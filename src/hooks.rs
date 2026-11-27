@@ -2,7 +2,9 @@ use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::config::{
     RequestContext, builtin_manifest, ensure_parent_exists, paths, set_executable_bit_if_script,
 };
+use crate::events::{AgentOutcome, Event, Origin};
 use crate::function::write_file_atomic;
+use crate::prompt::Prompter;
 
 use anyhow::{Error, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
@@ -23,7 +25,11 @@ use tokio::sync::Notify;
 #[folder = "assets/hooks/"]
 struct HookAssets;
 
-pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
+pub fn install_builtin_hooks(
+    mode: InstallMode,
+    sticky: &mut StickyMode,
+    prompter: &dyn Prompter,
+) -> Result<()> {
     info!(
         "Installing built-in example hooks in {}",
         paths::hooks_dir().display()
@@ -41,7 +47,9 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
         let file_path = paths::hooks_dir().join(file.as_ref());
 
         if file_path.exists()
-            && !conflict::should_replace_existing(&file_path, content, "hooks", mode, sticky)?
+            && !conflict::should_replace_existing(
+                &file_path, content, "hooks", mode, sticky, prompter,
+            )?
         {
             debug!(
                 "Hook file already exists, skipping: {}",
@@ -226,13 +234,14 @@ pub struct ResolvedHook {
     pub cwd: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RagSyncHooks {
     started: Vec<ResolvedHook>,
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_name: Option<String>,
+    origin: Origin,
 }
 
 impl RagSyncHooks {
@@ -246,9 +255,12 @@ impl RagSyncHooks {
                 .as_ref()
                 .map(|session| session.name().to_string()),
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+            origin: Origin::from(ctx),
         }
     }
 
+    /// Resolved while an agent loads, before any context holds it, so its
+    /// events carry no origin.
     pub fn resolve_for_agent(
         global_hooks: &HooksMap,
         gate: &[String],
@@ -270,6 +282,7 @@ impl RagSyncHooks {
             failed: resolve(HookEvent::RagSyncFailed),
             session_name: None,
             agent_name: Some(agent_name.to_string()),
+            origin: Origin::detached(),
         }
     }
 
@@ -311,9 +324,6 @@ impl RagSyncHooks {
         rag_path: &str,
         extras: &[(&str, String)],
     ) {
-        if resolved.is_empty() {
-            return;
-        }
         let base_envs = base_envs_parts(
             event,
             self.session_name.as_deref(),
@@ -324,16 +334,21 @@ impl RagSyncHooks {
             ("COYOTE_RAG_PATH", rag_path.to_string()),
         ];
         envs.extend(extras.iter().map(|(key, value)| (*key, value.clone())));
+        publish_hook_event(event, &base_envs, &envs, None, self.origin.clone());
+        if resolved.is_empty() {
+            return;
+        }
         fire_resolved(event, resolved.to_vec(), base_envs, &envs, None);
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct McpServerHooks {
     connected: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_name: Option<String>,
+    origin: Origin,
 }
 
 impl McpServerHooks {
@@ -346,6 +361,7 @@ impl McpServerHooks {
                 .as_ref()
                 .map(|session| session.name().to_string()),
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+            origin: Origin::from(ctx),
         }
     }
 
@@ -373,14 +389,15 @@ impl McpServerHooks {
     }
 
     fn fire(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        if resolved.is_empty() {
-            return;
-        }
         let base_envs = base_envs_parts(
             event,
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
+        publish_hook_event(event, &base_envs, extras, None, self.origin.clone());
+        if resolved.is_empty() {
+            return;
+        }
         fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
     }
 }
@@ -528,6 +545,10 @@ fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<Resol
     }
 }
 
+/// Fires `event` for every hook resolved from `ctx` and publishes its
+/// in-process twin on the event bus. The bus event goes out even when no
+/// shell hook is configured, so observers see the full hook stream without
+/// user configuration.
 pub fn fire(
     event: HookEvent,
     ctx: &RequestContext,
@@ -535,11 +556,271 @@ pub fn fire(
     payload: Option<String>,
 ) {
     let resolved = ctx.resolved_hooks(event);
+    let base = base_envs(event, ctx);
+    publish_hook_event(event, &base, extras, payload.clone(), Origin::from(ctx));
     if resolved.is_empty() {
         return;
     }
 
-    fire_resolved(event, resolved, base_envs(event, ctx), extras, payload);
+    fire_resolved(event, resolved, base, extras, payload);
+}
+
+/// The shell side of a typed hook event: the hook it fires, the env it adds
+/// after `COYOTE_HOOK_NAME` in order, its payload, and the origin its
+/// [`Event::Hook`] twin carries.
+struct HookSpec {
+    event: HookEvent,
+    extras: Vec<(&'static str, String)>,
+    payload: Option<String>,
+    origin: Origin,
+}
+
+/// Maps a typed event to the hook dispatch it stands for; `None` for an
+/// event no hook fires on.
+fn hook_spec(event: &Event) -> Option<HookSpec> {
+    let (hook, extras, payload, origin) = match event {
+        Event::ToolStarted {
+            origin,
+            name,
+            call_id,
+            args,
+        } => (
+            HookEvent::ToolStarted,
+            tool_extras(name, call_id),
+            Some(args.clone()),
+            origin,
+        ),
+        Event::ToolFinished {
+            origin,
+            name,
+            call_id,
+            args,
+            duration_ms,
+            error,
+        } => {
+            let mut extras = tool_extras(name, call_id);
+            if let Some(error) = error {
+                extras.push(("COYOTE_TOOL_ERROR", error.clone()));
+            }
+            if let Some(duration_ms) = duration_ms {
+                extras.push(("COYOTE_TOOL_DURATION_MS", duration_ms.to_string()));
+            }
+            let hook = if error.is_some() {
+                HookEvent::ToolFailed
+            } else {
+                HookEvent::ToolCompleted
+            };
+            (hook, extras, args.clone(), origin)
+        }
+        Event::JobStarted {
+            origin,
+            job_id,
+            tool,
+        } => (
+            HookEvent::JobStarted,
+            job_extras(job_id, tool),
+            None,
+            origin,
+        ),
+        Event::JobFinished {
+            origin,
+            job_id,
+            tool,
+            ok,
+            error,
+        } => {
+            let mut extras = job_extras(job_id, tool);
+            if let Some(error) = error {
+                extras.push(("COYOTE_JOB_ERROR", error.clone()));
+            }
+            let hook = if *ok {
+                HookEvent::JobCompleted
+            } else {
+                HookEvent::JobFailed
+            };
+            (hook, extras, None, origin)
+        }
+        Event::AgentStarted {
+            origin,
+            agent_id,
+            name,
+            session_id,
+            ..
+        } => (
+            HookEvent::AgentStarted,
+            agent_extras(agent_id, name.as_deref(), session_id.as_deref()),
+            None,
+            origin,
+        ),
+        Event::AgentFinished {
+            origin,
+            agent_id,
+            name,
+            session_id,
+            outcome,
+        } => {
+            let mut extras = agent_extras(agent_id, name.as_deref(), session_id.as_deref());
+            let hook = match outcome {
+                AgentOutcome::Completed => HookEvent::AgentCompleted,
+                AgentOutcome::Interrupted => HookEvent::AgentInterrupted,
+                AgentOutcome::Failed(error) => {
+                    extras.push(("COYOTE_AGENT_ERROR", error.clone()));
+                    HookEvent::AgentFailed
+                }
+            };
+            (hook, extras, None, origin)
+        }
+        Event::NodeStarted {
+            origin,
+            node_id,
+            node_type,
+        } => (
+            HookEvent::GraphNodeStarted,
+            node_extras(node_id, node_type),
+            None,
+            origin,
+        ),
+        Event::NodeFinished {
+            origin,
+            node_id,
+            node_type,
+            duration_ms,
+            route,
+            error,
+        } => {
+            let mut extras = node_extras(node_id, node_type);
+            extras.push(("COYOTE_NODE_DURATION_MS", duration_ms.to_string()));
+            if let Some(route) = route {
+                extras.push(("COYOTE_NODE_ROUTE", route.clone()));
+            }
+            if let Some(error) = error {
+                extras.push(("COYOTE_NODE_ERROR", error.clone()));
+            }
+            let hook = if error.is_some() {
+                HookEvent::GraphNodeFailed
+            } else {
+                HookEvent::GraphNodeCompleted
+            };
+            (hook, extras, None, origin)
+        }
+        _ => return None,
+    };
+    Some(HookSpec {
+        event: hook,
+        extras,
+        payload,
+        origin: origin.clone(),
+    })
+}
+
+fn tool_extras(name: &str, call_id: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_TOOL_NAME", name.to_string()),
+        ("COYOTE_TOOL_CALL_ID", call_id.to_string()),
+    ]
+}
+
+fn job_extras(job_id: &str, tool: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_JOB_ID", job_id.to_string()),
+        ("COYOTE_TOOL_NAME", tool.to_string()),
+    ]
+}
+
+fn agent_extras(
+    agent_id: &str,
+    name: Option<&str>,
+    session_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut extras = vec![("COYOTE_AGENT_ID", agent_id.to_string())];
+    if let Some(name) = name {
+        extras.push(("COYOTE_AGENT_NAME", name.to_string()));
+    }
+    if let Some(session_id) = session_id {
+        extras.push(("COYOTE_AGENT_SESSION_ID", session_id.to_string()));
+    }
+    extras
+}
+
+fn node_extras(node_id: &str, node_type: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_NODE_ID", node_id.to_string()),
+        ("COYOTE_NODE_TYPE", node_type.to_string()),
+    ]
+}
+
+/// Publishes a typed hook event and fires the hooks `ctx` resolves for it.
+/// Its [`Event::Hook`] twin goes out first with the same origin, so an
+/// observer of either form sees every event. An event no hook fires on is
+/// only published.
+pub fn emit(ctx: &RequestContext, event: Event) {
+    let Some(spec) = hook_spec(&event) else {
+        crate::events::bus().publish(event);
+        return;
+    };
+    let resolved = ctx.resolved_hooks(spec.event);
+    let base = base_envs(spec.event, ctx);
+    dispatch(spec, event, resolved, base);
+}
+
+/// [`emit`] for call sites that outlive the context borrow their hooks were
+/// resolved from. `resolved` must hold the hooks for the event that `event`
+/// maps to; the base env is built here so its timestamp is the moment of
+/// the event, not of the resolution.
+pub(crate) fn emit_resolved(
+    event: Event,
+    resolved: Vec<ResolvedHook>,
+    session_name: Option<&str>,
+    agent_name: Option<&str>,
+) {
+    let Some(spec) = hook_spec(&event) else {
+        crate::events::bus().publish(event);
+        return;
+    };
+    let base = base_envs_parts(spec.event, session_name, agent_name);
+    dispatch(spec, event, resolved, base);
+}
+
+fn dispatch(
+    spec: HookSpec,
+    event: Event,
+    resolved: Vec<ResolvedHook>,
+    base_envs: Vec<(String, String)>,
+) {
+    publish_hook_event(
+        spec.event,
+        &base_envs,
+        &spec.extras,
+        spec.payload.clone(),
+        spec.origin,
+    );
+    crate::events::bus().publish(event);
+    fire_resolved(spec.event, resolved, base_envs, &spec.extras, spec.payload);
+}
+
+/// Publishes the [`Event::Hook`] twin of a dispatch. Call sites that hand
+/// pre-resolved hooks to [`fire_resolved`] must call this themselves, before
+/// any empty-hooks early return, so the bus sees every event. The envs match
+/// what a hook would receive minus the per-hook `COYOTE_HOOK_NAME`.
+pub(crate) fn publish_hook_event(
+    event: HookEvent,
+    base_envs: &[(String, String)],
+    extras: &[(&str, String)],
+    payload: Option<String>,
+    origin: Origin,
+) {
+    let mut envs = base_envs.to_vec();
+    envs.extend(
+        extras
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone())),
+    );
+    crate::events::bus().publish(Event::Hook {
+        event,
+        envs: sanitize_envs(envs),
+        payload,
+        origin,
+    });
 }
 
 /// Dispatches already-resolved hooks, for call sites that outlive the context
@@ -569,21 +850,7 @@ pub fn fire_resolved(
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.clone())),
         );
-        let envs: Vec<(String, String)> = envs
-            .into_iter()
-            .map(|(key, mut value)| {
-                // Values like escalation questions carry agent-authored text;
-                // an interior NUL makes `Command::spawn` fail on Unix, which
-                // would let a child suppress its own hooks. Strip them.
-                if value.contains('\0') {
-                    value.retain(|c| c != '\0');
-                }
-                // `end` is a char boundary by construction, so `truncate` cannot panic.
-                let end = truncate_env_value(&value).len();
-                value.truncate(end);
-                (key, value)
-            })
-            .collect();
+        let envs = sanitize_envs(envs);
 
         #[cfg(test)]
         if test_sink::record(event, &hook, &envs, payload.as_deref()) {
@@ -607,6 +874,25 @@ pub fn fire_resolved(
             SpawnAckGuard::register(),
         )));
     }
+}
+
+/// Makes env values safe to hand to `Command::spawn`: strips NUL bytes and
+/// bounds each value to the hook env size limit.
+pub(crate) fn sanitize_envs(envs: Vec<(String, String)>) -> Vec<(String, String)> {
+    envs.into_iter()
+        .map(|(key, mut value)| {
+            // Values like escalation questions carry agent-authored text;
+            // an interior NUL makes `Command::spawn` fail on Unix, which
+            // would let a child suppress its own hooks. Strip them.
+            if value.contains('\0') {
+                value.retain(|c| c != '\0');
+            }
+            // `end` is a char boundary by construction, so `truncate` cannot panic.
+            let end = truncate_env_value(&value).len();
+            value.truncate(end);
+            (key, value)
+        })
+        .collect()
 }
 
 static PENDING_SPAWNS: AtomicUsize = AtomicUsize::new(0);
@@ -1062,6 +1348,7 @@ mod tests {
     use crate::config::{AppConfig, AppState, Role, WorkingMode};
     use crate::{testing, utils};
     use serial_test::serial;
+    use std::collections::BTreeMap;
     use std::env;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
@@ -1099,10 +1386,7 @@ mod tests {
 
     impl HooksDirGuard {
         fn new(label: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let unique = testing::unique_dir_suffix();
             let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
             Self {
                 _env: testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &root),
@@ -1157,10 +1441,7 @@ mod tests {
     }
 
     fn fresh_payload_dir(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = testing::unique_dir_suffix();
         let dir = env::temp_dir().join(format!("coyote-{label}-{unique}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1258,7 +1539,11 @@ mod tests {
         // below still has to run before any assertion can bail out.
         let notify = root.join("notify.sh");
         let log_events = root.join("log-events.sh");
-        let fresh = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+        let fresh = install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        );
         let installed = (notify.is_file(), log_events.is_file());
         #[cfg(unix)]
         let modes: Vec<std::io::Result<u32>> = {
@@ -1269,9 +1554,17 @@ mod tests {
                 .collect()
         };
         let modified = std::fs::write(&notify, "modified");
-        let no_force = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+        let no_force = install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        );
         let after_no_force = std::fs::read_to_string(&notify);
-        let force = install_builtin_hooks(InstallMode::Force, &mut StickyMode::None);
+        let force = install_builtin_hooks(
+            InstallMode::Force,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        );
         let after_force = std::fs::read_to_string(&notify);
 
         drop(env_guard);
@@ -1300,14 +1593,24 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_skip_mode_never_prompts_even_on_a_terminal() {
         let guard = HooksDirGuard::new("hooks-skip-no-prompt");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         std::fs::write(&notify, "modified").unwrap();
 
         // A forced terminal with no scripted answers: any prompt would panic
         // and the counter would move.
         let _script = prompt_script::install(&[]);
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
@@ -1317,19 +1620,34 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_prompt_mode_asks_only_for_differing_files() {
         let guard = HooksDirGuard::new("hooks-prompt-conflict");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         std::fs::write(&notify, "modified").unwrap();
 
         // log-events.sh is identical to the embed, so only notify.sh asks.
         let script = prompt_script::install(&["keep"]);
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
         drop(script);
 
         let script = prompt_script::install(&["replace"]);
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert!(
             std::fs::read_to_string(&notify)
@@ -1345,7 +1663,12 @@ mod tests {
         let guard = HooksDirGuard::new("hooks-prompt-missing");
         let _script = prompt_script::install(&[]);
 
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert!(guard.root.join("notify.sh").is_file());
@@ -1356,12 +1679,22 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_prompt_mode_keeps_local_files_without_a_terminal() {
         let guard = HooksDirGuard::new("hooks-prompt-non-tty");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         std::fs::write(&notify, "modified").unwrap();
 
         let _script = prompt_script::install_non_interactive();
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
@@ -1371,14 +1704,24 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_keep_all_covers_every_remaining_conflict() {
         let guard = HooksDirGuard::new("hooks-prompt-keep-all");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         let log_events = guard.root.join("log-events.sh");
         std::fs::write(&notify, "modified notify").unwrap();
         std::fs::write(&log_events, "modified log-events").unwrap();
 
         let _script = prompt_script::install(&["keep-all"]);
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified notify");
@@ -1394,7 +1737,12 @@ mod tests {
         use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
 
         let guard = HooksDirGuard::new("hooks-manifest-stale");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         // Simulate an upgrade from a release that also shipped old-hook.sh:
         // the manifest records it, so reinstall removes it — while a user
@@ -1407,7 +1755,12 @@ mod tests {
         std::fs::write(guard.root.join("old-hook.sh"), "stale").unwrap();
         std::fs::write(guard.root.join("user-hook.sh"), "user-owned").unwrap();
 
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert!(!guard.root.join("old-hook.sh").exists());
         assert_eq!(
@@ -1426,11 +1779,21 @@ mod tests {
         use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
 
         let guard = HooksDirGuard::new("hooks-manifest-malformed");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         std::fs::write(guard.root.join(BUILTIN_MANIFEST_FILE), [0xff, 0xfe, 0x00]).unwrap();
         std::fs::write(guard.root.join("old-hook.sh"), "keep").unwrap();
 
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert!(
             guard.root.join("old-hook.sh").exists(),
@@ -1451,7 +1814,12 @@ mod tests {
         // must stay quiet even though the strings differ.
         let alias = guard.path.join("hooks").join("..").join("hooks");
         let env_guard = testing::EnvVarGuard::set(&env_name, &alias);
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         drop(env_guard);
 
         let default_notify = guard.path.join("hooks").join("notify.sh");
@@ -1469,7 +1837,12 @@ mod tests {
             std::os::unix::fs::symlink(guard.path.join("hooks"), &link).unwrap();
             std::fs::remove_file(&default_notify).unwrap();
             let _env_guard = testing::EnvVarGuard::set(&env_name, &link);
-            install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+            install_builtin_hooks(
+                InstallMode::Skip,
+                &mut StickyMode::None,
+                &prompt_script::Scripted,
+            )
+            .unwrap();
             assert!(
                 default_notify.is_file(),
                 "the removed script must be reinstalled, so wrote_any was true"
@@ -1496,7 +1869,12 @@ mod tests {
         let override_dir = guard.path.join("elsewhere-hooks");
         let _env_guard = testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &override_dir);
 
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         // Fresh install: nothing ever created the default dir, so its
         // canonicalization fails and the compare falls back to the original
@@ -2247,6 +2625,474 @@ mod tests {
         assert!(
             !marker.exists(),
             "no process may spawn while the sink is installed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_one_bus_twin_per_hook_event() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        for event in HookEvent::ALL {
+            let mut ctx =
+                ctx_with_global_hooks(hooks_map(event.as_str(), &[("parity-probe", "true")]));
+            ctx.self_agent_id = Some("parity-child".to_string());
+            ctx.current_depth = 2;
+            test_sink::drain();
+            sink.drain();
+
+            fire(
+                event,
+                &ctx,
+                &[("HOOK_EXTRA", "parity-probe-x7x".to_string())],
+                Some(format!("{{\"event\":\"{}\"}}", event.as_str())),
+            );
+
+            let captures: Vec<_> = test_sink::drain()
+                .into_iter()
+                .filter(|capture| capture.hook_name == "parity-probe")
+                .collect();
+            assert_eq!(captures.len(), 1, "{event:?}: {captures:?}");
+            let capture = &captures[0];
+            let published: Vec<_> = sink
+                .drain()
+                .into_iter()
+                .filter(|published| {
+                    matches!(
+                        published,
+                        Event::Hook { envs, .. }
+                            if envs.contains(&("HOOK_EXTRA".to_string(), "parity-probe-x7x".to_string()))
+                    )
+                })
+                .collect();
+            assert_eq!(published.len(), 1, "{event:?}: {published:?}");
+            let Event::Hook {
+                event: got,
+                envs,
+                payload,
+                origin,
+            } = &published[0]
+            else {
+                panic!("{event:?}: expected Event::Hook, got {:?}", published[0]);
+            };
+            assert_eq!(*got, event);
+            assert_eq!(*payload, capture.payload, "{event:?}");
+            assert_eq!(
+                *origin,
+                Origin {
+                    agent_id: Some("parity-child".to_string()),
+                    depth: 2,
+                    node: None,
+                },
+                "{event:?}"
+            );
+            let bus_envs: BTreeMap<String, String> = envs.iter().cloned().collect();
+            assert_eq!(
+                bus_envs.len(),
+                envs.len(),
+                "{event:?}: duplicate key in {envs:?}"
+            );
+            let hook_envs: BTreeMap<String, String> = capture
+                .envs
+                .iter()
+                .filter(|(key, _)| key.as_str() != "COYOTE_HOOK_NAME")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            assert_eq!(bus_envs, hook_envs, "{event:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_bus_twin_when_no_hook_is_configured() {
+        let _guard = test_sink::install();
+        test_sink::drain();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let probe = ("HOOK_EXTRA".to_string(), "no-hook-probe-k4v".to_string());
+
+        fire(
+            HookEvent::TurnStarted,
+            &ctx,
+            &[("HOOK_EXTRA", "no-hook-probe-k4v".to_string())],
+            None,
+        );
+
+        let published: Vec<_> = sink
+            .drain()
+            .into_iter()
+            .filter(
+                |published| matches!(published, Event::Hook { envs, .. } if envs.contains(&probe)),
+            )
+            .collect();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert!(matches!(
+            &published[0],
+            Event::Hook {
+                event: HookEvent::TurnStarted,
+                payload: None,
+                ..
+            }
+        ));
+        assert!(
+            test_sink::drain()
+                .iter()
+                .all(|capture| capture.envs.get("HOOK_EXTRA") != Some(&probe.1)),
+            "no shell hook is configured, so nothing may reach test_sink"
+        );
+    }
+
+    fn extras_of(event: &Event) -> (HookEvent, Vec<(&'static str, String)>, Option<String>) {
+        let spec = hook_spec(event).expect("a typed hook event");
+        (spec.event, spec.extras, spec.payload)
+    }
+
+    fn owned(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (*key, value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn typed_events_map_to_hook_extras_in_order() {
+        let origin = Origin::detached();
+        let tool_finished = |duration_ms, error: Option<&str>, args: Option<&str>| {
+            extras_of(&Event::ToolFinished {
+                origin: origin.clone(),
+                name: "fs_read".to_string(),
+                call_id: "c1".to_string(),
+                args: args.map(str::to_string),
+                duration_ms,
+                error: error.map(str::to_string),
+            })
+        };
+        let tool_ids = [
+            ("COYOTE_TOOL_NAME", "fs_read"),
+            ("COYOTE_TOOL_CALL_ID", "c1"),
+        ];
+        assert_eq!(
+            extras_of(&Event::ToolStarted {
+                origin: origin.clone(),
+                name: "fs_read".to_string(),
+                call_id: "c1".to_string(),
+                args: "{}".to_string(),
+            }),
+            (HookEvent::ToolStarted, owned(&tool_ids), Some("{}".into()))
+        );
+        assert_eq!(
+            tool_finished(Some(12), None, Some("{}")),
+            (
+                HookEvent::ToolCompleted,
+                owned(&[tool_ids[0], tool_ids[1], ("COYOTE_TOOL_DURATION_MS", "12")]),
+                Some("{}".into())
+            )
+        );
+        assert_eq!(
+            tool_finished(None, Some("boom"), None),
+            (
+                HookEvent::ToolFailed,
+                owned(&[tool_ids[0], tool_ids[1], ("COYOTE_TOOL_ERROR", "boom")]),
+                None
+            )
+        );
+
+        let job_ids = [("COYOTE_JOB_ID", "job_1"), ("COYOTE_TOOL_NAME", "echo")];
+        assert_eq!(
+            extras_of(&Event::JobStarted {
+                origin: origin.clone(),
+                job_id: "job_1".to_string(),
+                tool: "echo".to_string(),
+            }),
+            (HookEvent::JobStarted, owned(&job_ids), None)
+        );
+        let job_finished = |ok, error: Option<&str>| {
+            extras_of(&Event::JobFinished {
+                origin: origin.clone(),
+                job_id: "job_1".to_string(),
+                tool: "echo".to_string(),
+                ok,
+                error: error.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            job_finished(true, None),
+            (HookEvent::JobCompleted, owned(&job_ids), None)
+        );
+        assert_eq!(
+            job_finished(false, Some("exit 1")),
+            (
+                HookEvent::JobFailed,
+                owned(&[job_ids[0], job_ids[1], ("COYOTE_JOB_ERROR", "exit 1")]),
+                None
+            )
+        );
+
+        assert_eq!(
+            extras_of(&Event::AgentStarted {
+                origin: origin.clone(),
+                agent_id: "agent_1".to_string(),
+                name: Some("coder".to_string()),
+                session_id: Some("sess_1".to_string()),
+                parent_agent_id: Some("agent_0".to_string()),
+                parent_session_id: Some("sess_0".to_string()),
+            }),
+            (
+                HookEvent::AgentStarted,
+                owned(&[
+                    ("COYOTE_AGENT_ID", "agent_1"),
+                    ("COYOTE_AGENT_NAME", "coder"),
+                    ("COYOTE_AGENT_SESSION_ID", "sess_1"),
+                ]),
+                None
+            )
+        );
+        let agent_finished = |name: Option<&str>, outcome| {
+            extras_of(&Event::AgentFinished {
+                origin: origin.clone(),
+                agent_id: "agent_1".to_string(),
+                name: name.map(str::to_string),
+                session_id: None,
+                outcome,
+            })
+        };
+        assert_eq!(
+            agent_finished(None, AgentOutcome::Completed),
+            (
+                HookEvent::AgentCompleted,
+                owned(&[("COYOTE_AGENT_ID", "agent_1")]),
+                None
+            )
+        );
+        assert_eq!(
+            agent_finished(Some("coder"), AgentOutcome::Interrupted),
+            (
+                HookEvent::AgentInterrupted,
+                owned(&[
+                    ("COYOTE_AGENT_ID", "agent_1"),
+                    ("COYOTE_AGENT_NAME", "coder"),
+                ]),
+                None
+            )
+        );
+        assert_eq!(
+            agent_finished(Some("coder"), AgentOutcome::Failed("boom".into())),
+            (
+                HookEvent::AgentFailed,
+                owned(&[
+                    ("COYOTE_AGENT_ID", "agent_1"),
+                    ("COYOTE_AGENT_NAME", "coder"),
+                    ("COYOTE_AGENT_ERROR", "boom"),
+                ]),
+                None
+            )
+        );
+
+        let node_ids = [("COYOTE_NODE_ID", "plan"), ("COYOTE_NODE_TYPE", "llm")];
+        assert_eq!(
+            extras_of(&Event::NodeStarted {
+                origin: origin.clone(),
+                node_id: "plan".to_string(),
+                node_type: "llm".to_string(),
+            }),
+            (HookEvent::GraphNodeStarted, owned(&node_ids), None)
+        );
+        let node_finished = |route: Option<&str>, error: Option<&str>| {
+            extras_of(&Event::NodeFinished {
+                origin: origin.clone(),
+                node_id: "plan".to_string(),
+                node_type: "llm".to_string(),
+                duration_ms: 7,
+                route: route.map(str::to_string),
+                error: error.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            node_finished(Some("build"), None),
+            (
+                HookEvent::GraphNodeCompleted,
+                owned(&[
+                    node_ids[0],
+                    node_ids[1],
+                    ("COYOTE_NODE_DURATION_MS", "7"),
+                    ("COYOTE_NODE_ROUTE", "build"),
+                ]),
+                None
+            )
+        );
+        assert_eq!(
+            node_finished(None, Some("boom")),
+            (
+                HookEvent::GraphNodeFailed,
+                owned(&[
+                    node_ids[0],
+                    node_ids[1],
+                    ("COYOTE_NODE_DURATION_MS", "7"),
+                    ("COYOTE_NODE_ERROR", "boom"),
+                ]),
+                None
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn emit_publishes_the_typed_event_after_its_twin_with_the_same_origin() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_global_hooks(hooks_map("tool.started", &[("emit-probe", "true")]));
+        ctx.self_agent_id = Some("emit-child".to_string());
+        ctx.current_depth = 1;
+        test_sink::drain();
+        sink.drain();
+        let origin = Origin::from(&ctx);
+        let typed = Event::ToolStarted {
+            origin: origin.clone(),
+            name: "fs_read".to_string(),
+            call_id: "emit-probe-q2w".to_string(),
+            args: r#"{"path":"a"}"#.to_string(),
+        };
+
+        emit(&ctx, typed.clone());
+
+        let published: Vec<_> = sink
+            .drain()
+            .into_iter()
+            .filter(|published| match published {
+                Event::Hook { envs, .. } => envs.iter().any(|(_, value)| value == "emit-probe-q2w"),
+                Event::ToolStarted { call_id, .. } => call_id == "emit-probe-q2w",
+                _ => false,
+            })
+            .collect();
+        assert_eq!(published.len(), 2, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin: twin_origin,
+        } = &published[0]
+        else {
+            panic!("the twin must come first: {published:?}");
+        };
+        assert_eq!(*event, HookEvent::ToolStarted);
+        assert_eq!(payload.as_deref(), Some(r#"{"path":"a"}"#));
+        assert_eq!(*twin_origin, origin);
+        let tail: Vec<_> = envs[envs.len() - 2..]
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                ("COYOTE_TOOL_NAME", "fs_read"),
+                ("COYOTE_TOOL_CALL_ID", "emit-probe-q2w")
+            ]
+        );
+        assert_eq!(published[1], typed);
+
+        let captures: Vec<_> = test_sink::drain()
+            .into_iter()
+            .filter(|capture| capture.hook_name == "emit-probe")
+            .collect();
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("emit-probe-q2w")
+        );
+        assert_eq!(captures[0].payload.as_deref(), Some(r#"{"path":"a"}"#));
+    }
+
+    #[test]
+    #[serial]
+    fn rag_sync_fire_completed_publishes_bus_twin_without_resolved_hooks() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_global_hooks(IndexMap::new());
+        ctx.self_agent_id = Some("rag-origin-x7x".into());
+        ctx.current_depth = 1;
+        let rag_name = "rag-bus-probe-x7x";
+
+        RagSyncHooks::resolve(&ctx).fire_completed(rag_name, "/tmp/rag", 3);
+
+        let published = sink.drain_hooks_with_env("COYOTE_RAG_NAME", rag_name);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::RagSyncCompleted);
+        assert_eq!(*origin, Origin::from(&ctx));
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_RAG_PATH".to_string(), "/tmp/rag".to_string())));
+        assert!(envs.contains(&("COYOTE_RAG_DOC_COUNT".to_string(), "3".to_string())));
+        assert!(
+            test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_RAG_NAME").map(String::as_str) != Some(rag_name)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mcp_server_fire_connected_publishes_bus_twin_without_resolved_hooks() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_global_hooks(IndexMap::new());
+        ctx.self_agent_id = Some("mcp-origin-x7x".into());
+        ctx.current_depth = 1;
+        let server = "mcp-bus-probe-x7x";
+
+        McpServerHooks::resolve(&ctx).fire_connected(server, "stdio", true);
+
+        let published = sink.drain_hooks_with_env("COYOTE_MCP_SERVER", server);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::McpServerConnected);
+        assert_eq!(*origin, Origin::from(&ctx));
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_MCP_TRANSPORT".to_string(), "stdio".to_string())));
+        assert!(envs.contains(&("COYOTE_MCP_RECONNECT".to_string(), "true".to_string())));
+        assert!(
+            test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_MCP_SERVER").map(String::as_str) != Some(server)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    fn sanitize_envs_strips_nul_and_bounds_length() {
+        let oversized = "x".repeat(3000);
+        let sanitized = sanitize_envs(vec![
+            ("NUL".to_string(), "before\u{0000}after".to_string()),
+            ("BIG".to_string(), oversized),
+            ("SHORT".to_string(), "fine".to_string()),
+        ]);
+
+        assert_eq!(
+            sanitized,
+            vec![
+                ("NUL".to_string(), "beforeafter".to_string()),
+                ("BIG".to_string(), "x".repeat(2048)),
+                ("SHORT".to_string(), "fine".to_string()),
+            ]
         );
     }
 
@@ -3270,7 +4116,11 @@ mod tests {
             ));
             let _env = testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &hooks_dir);
 
-            let result = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+            let result = install_builtin_hooks(
+                InstallMode::Skip,
+                &mut StickyMode::None,
+                &prompt_script::Scripted,
+            );
 
             // Capture outcomes first and assert only after the temp dir is
             // removed, so a failed assertion cannot leak it.
@@ -3342,7 +4192,12 @@ mod tests {
         fn install_completes_without_the_unix_exec_bit() {
             let guard = HooksDirGuard::new("win-hooks-exec-noop");
 
-            install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+            install_builtin_hooks(
+                InstallMode::Skip,
+                &mut StickyMode::None,
+                &prompt_script::Scripted,
+            )
+            .unwrap();
 
             let notify = guard.root.join("notify.sh");
             assert!(notify.is_file());

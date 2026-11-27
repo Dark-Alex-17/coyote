@@ -17,7 +17,7 @@ main() {
     argc_code="$(jq -r '.code' <<< "$LLM_TOOL_RAW_JSON")"
 
     if ! grep -qi '^select' <<<"$argc_code"; then
-        guard_operation ""
+        guard_operation "Execute SQL?" "$argc_code"
     fi
     usql -c "$argc_code" "$USQL_DSN" >> "$LLM_OUTPUT"
 }

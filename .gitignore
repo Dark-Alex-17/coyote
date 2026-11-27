@@ -10,3 +10,7 @@
 .coyote-project.json
 .coyote/memory/
 __pycache__/
+
+# insta snapshot review leftovers
+*.snap.new
+*.pending-snap

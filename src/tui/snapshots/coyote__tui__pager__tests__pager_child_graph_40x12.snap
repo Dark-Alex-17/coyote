@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: planner (ro) planner-b2  4-13/13"
+"> plan the release                      "
+"                                        "
+"▾ node pla...  completed in 2s, route bu"
+"  fs_read  0s  ok                       "
+"  read Cargo.toml                       "
+"  fs_grep  0s  ok                       "
+"  3 matches                             "
+"                                        "
+"▾ node build tool  failed: exit 3       "
+"  error: exit 3                         "
+"q close  Tab threads  / find  n/N  j/k  "

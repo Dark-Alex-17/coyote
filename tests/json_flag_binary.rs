@@ -965,9 +965,11 @@ fn the_loop_warning_goes_to_stderr_under_json() {
     }
     let plain = script_tool_run("loop-plain", 4, false);
     assert!(plain.status.success(), "{}", combined(&plain));
+    // A tool warning is a notice the REPL's sink always writes to stderr,
+    // so the loop warning is already off stdout without --json.
     assert!(
-        String::from_utf8_lossy(&plain.stdout).contains(LOOP_WARNING),
-        "without --json the loop warning is on stdout:\n{}",
+        String::from_utf8_lossy(&plain.stderr).contains(LOOP_WARNING),
+        "without --json the loop warning is on stderr:\n{}",
         combined(&plain)
     );
 

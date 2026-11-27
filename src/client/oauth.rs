@@ -5,13 +5,17 @@ use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
+use crate::events::Origin;
+use crate::prompt::{
+    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, Reach, ask,
+    require_human,
+};
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use indexmap::IndexMap;
-use inquire::Text;
 use reqwest::{Client as ReqwestClient, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -236,9 +240,14 @@ pub struct OAuthTokens {
 
 const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
+pub async fn run_oauth_flow(
+    provider: &dyn OAuthProvider,
+    client_name: &str,
+    prompter: &dyn Prompter,
+    origin: &Origin,
+) -> Result<()> {
     match provider.flow() {
-        OAuthFlow::Pkce => run_pkce_flow(provider, client_name).await,
+        OAuthFlow::Pkce => run_pkce_flow(provider, client_name, prompter, origin).await,
         OAuthFlow::ClientCredentials => {
             run_client_credentials_flow(provider, client_name).await?;
             println!(
@@ -287,7 +296,12 @@ fn build_authorize_url(
     authorize_url
 }
 
-async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
+async fn run_pkce_flow(
+    provider: &dyn OAuthProvider,
+    client_name: &str,
+    prompter: &dyn Prompter,
+    origin: &Origin,
+) -> Result<()> {
     let random_bytes: [u8; 32] = rand::random::<[u8; 32]>();
     let code_verifier = URL_SAFE_NO_PAD.encode(random_bytes);
 
@@ -309,6 +323,13 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
         (provider.redirect_uri().to_string(), false)
     };
 
+    // The paste flows need someone at a terminal; checked before the URL is
+    // printed or a browser opened for a sign-in nobody could finish.
+    let capture = code_capture(use_callback_listener);
+    if capture != CodeCapture::Listener {
+        ensure_paste_can_be_asked(prompter, client_name)?;
+    }
+
     let authorize_url = build_authorize_url(provider, &redirect_uri, &code_challenge, &state);
 
     println!(
@@ -320,21 +341,16 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
 
     let _ = open::that(&authorize_url);
 
-    let (code, returned_state) = match code_capture(use_callback_listener) {
+    let (code, returned_state) = match capture {
         CodeCapture::Listener => {
             let (code, state) = listen_for_oauth_callback(&redirect_uri)?;
             (code, Some(state))
         }
         CodeCapture::SandboxPaste => {
             println!("{}\n", sandbox_paste_hint(&redirect_uri));
-            let input =
-                Text::new("Paste the callback URL from your browser's address bar:").prompt()?;
-            parse_paste_input(input.trim())?
+            ask_paste_input(prompter, client_name, SANDBOX_PASTE_QUESTION, origin)?
         }
-        CodeCapture::Paste => {
-            let input = Text::new("Paste the authorization code or callback URL:").prompt()?;
-            parse_paste_input(input.trim())?
-        }
+        CodeCapture::Paste => ask_paste_input(prompter, client_name, PASTE_QUESTION, origin)?,
     };
 
     if let Some(returned) = returned_state.as_deref() {
@@ -969,14 +985,48 @@ fn build_token_request(
     request
 }
 
+const PASTE_QUESTION: &str = "Paste the authorization code or callback URL:";
+const SANDBOX_PASTE_QUESTION: &str = "Paste the callback URL from your browser's address bar:";
+
+fn ask_paste_input(
+    prompter: &dyn Prompter,
+    client_name: &str,
+    question: &str,
+    origin: &Origin,
+) -> Result<(String, Option<String>)> {
+    ensure_paste_can_be_asked(prompter, client_name)?;
+    let req = PromptRequest {
+        sensitive: true,
+        ..PromptRequest::new(PromptAction::Input, question, origin.clone())
+    };
+    let input = ask(prompter, req).and_then(PromptAnswer::into_text)?;
+    parse_paste_input(input.trim())
+}
+
+fn ensure_paste_can_be_asked(prompter: &dyn Prompter, client_name: &str) -> Result<()> {
+    // Refused before any widget exists, with the flow's own message rather
+    // than the prompter's typed refusal, so a headless run reads the same
+    // error whichever step it stops at; `ask_paste_input_bails_without_a_human_before_asking`
+    // pins that no request reaches the prompter. A run with a human but no
+    // terminal to paste into gets the shared non-interactive refusal.
+    if prompter.reach() == Reach::Headless {
+        bail!("{NO_HUMAN_FOR_OAUTH}");
+    }
+    require_human(
+        prompter,
+        format_args!("sign in to '{client_name}' with OAuth"),
+        ".",
+    )?;
+    Ok(())
+}
+
 fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
     if input.is_empty() {
         bail!("Empty input; paste the code, code#state, or callback URL from your browser.");
     }
 
     if input.starts_with("http://") || input.starts_with("https://") {
-        let parsed =
-            Url::parse(input).with_context(|| format!("Failed to parse pasted URL: {input}"))?;
+        let parsed = Url::parse(input).context("Failed to parse the pasted callback URL")?;
         let code = parsed
             .query_pairs()
             .find(|(k, _)| k == "code")
@@ -1269,7 +1319,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::str;
-    use std::time::UNIX_EPOCH;
 
     use super::*;
     use crate::client::access_token::{distrust_access_token, get_access_token};
@@ -1278,9 +1327,13 @@ mod tests {
     use crate::client::openai::OpenAIConfig;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
-    use crate::utils::get_env_name;
+    use crate::config::conflict::prompt_script;
+    use crate::events::{Event, RecordingSink};
+    use crate::prompt::{ScriptedPrompter, prompt_events};
+    use crate::testing::AtomicFlagGuard;
+    use crate::utils::{HEADLESS, get_env_name};
     use serial_test::serial;
-    use std::{env, time::SystemTime};
+    use std::env;
 
     fn with_temp_cache<F: FnOnce()>(f: F) {
         struct Restore {
@@ -1300,10 +1353,7 @@ mod tests {
             }
         }
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-client-oauth-test-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let env_key = get_env_name("cache_dir");
@@ -2025,10 +2075,213 @@ echo_pkce_in_token_exchange: true
     }
 
     #[test]
+    fn a_malformed_pasted_url_is_not_echoed_in_the_error() {
+        let err = parse_paste_input("https://[bad?code=code-3q8z").unwrap_err();
+        assert!(!format!("{err:#}").contains("code-3q8z"), "{err:#}");
+    }
+
+    #[test]
     fn parse_paste_input_url_missing_code_fails() {
         let err =
             parse_paste_input("https://provider.example/oauth/callback?state=xyz").unwrap_err();
         assert!(err.to_string().contains("code"), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_round_trips_a_url_and_a_code_state_paste() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tty = prompt_script::install(&[]);
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(
+                " https://provider.example/oauth/callback?code=abc123&state=xyz ".to_string(),
+            ),
+            PromptAnswer::Text("def456#uvw".to_string()),
+        ]);
+        let origin = Origin {
+            agent_id: Some("paste-origin-x7x".to_string()),
+            depth: 1,
+            node: None,
+        };
+
+        let (code, state) =
+            ask_paste_input(&prompter, "client-x", PASTE_QUESTION, &origin).unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz"));
+        let (code, state) =
+            ask_paste_input(&prompter, "client-x", PASTE_QUESTION, &origin).unwrap();
+        assert_eq!(code, "def456");
+        assert_eq!(state.as_deref(), Some("uvw"));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        for req in &requests {
+            assert_eq!(req.action, PromptAction::Input);
+            assert_eq!(req.origin, origin);
+            assert_eq!(
+                req.question,
+                "Paste the authorization code or callback URL:"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_reports_a_cancel() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tty = prompt_script::install(&[]);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let err = ask_paste_input(&prompter, "client-x", PASTE_QUESTION, &Origin::detached())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Operation was canceled by the user"),
+            "{err}"
+        );
+    }
+
+    /// The pasted code is a credential, so neither paste question lets it
+    /// onto the event bus.
+    #[test]
+    #[serial]
+    fn ask_paste_input_never_publishes_the_paste() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tty = prompt_script::install(&[]);
+        let sink = RecordingSink::install();
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text("code-5r7x#state-5r7x".to_string()),
+            PromptAnswer::Text(
+                "http://localhost/callback?code=code-8m2w&state=state-8m2w".to_string(),
+            ),
+        ]);
+
+        let (code, _) =
+            ask_paste_input(&prompter, "client-x", PASTE_QUESTION, &Origin::detached()).unwrap();
+        assert_eq!(code, "code-5r7x");
+        let (code, _) = ask_paste_input(
+            &prompter,
+            "client-x",
+            SANDBOX_PASTE_QUESTION,
+            &Origin::detached(),
+        )
+        .unwrap();
+        assert_eq!(code, "code-8m2w");
+
+        let events = sink.drain();
+        for question in [PASTE_QUESTION, SANDBOX_PASTE_QUESTION] {
+            let (requested, answered) = prompt_events(events.clone(), question);
+            assert_eq!(requested.len(), 1, "{requested:?}");
+            assert!(
+                matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
+                "{answered:?}"
+            );
+        }
+        let published = format!("{events:?}");
+        assert!(!published.contains("code-5r7x"), "{published}");
+        assert!(!published.contains("code-8m2w"), "{published}");
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_bails_without_a_human_before_asking() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = ask_paste_input(&prompter, "client-x", PASTE_QUESTION, &Origin::detached())
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_refuses_without_a_terminal_before_asking() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _no_tty = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = ask_paste_input(&prompter, "client-x", PASTE_QUESTION, &Origin::detached())
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'client-x' with OAuth non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_paste_can_be_asked_refuses_without_a_terminal() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _no_tty = prompt_script::install_non_interactive();
+
+        let err = ensure_paste_can_be_asked(&ScriptedPrompter::refusing(), "client-x").unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'client-x' with OAuth non-interactively. Re-run in a terminal."
+        );
+    }
+
+    /// A paste-flow provider (no fixed or localhost redirect) that fails the
+    /// test if anything reads its authorize URL, which the flow needs both
+    /// to print the URL and to open the browser.
+    struct UnreachableAuthorizeProvider;
+
+    impl OAuthProvider for UnreachableAuthorizeProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn client_id(&self) -> &str {
+            "stub-client"
+        }
+
+        fn authorize_url(&self) -> &str {
+            panic!("the authorize URL was built before the paste flow was refused")
+        }
+
+        fn token_url(&self) -> &str {
+            "https://as.example/token"
+        }
+
+        fn redirect_uri(&self) -> &str {
+            "urn:ietf:wg:oauth:2.0:oob"
+        }
+
+        fn scopes(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn paste_flow_without_a_terminal_refuses_before_building_the_authorize_url() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let _no_tty = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = run_pkce_flow(
+            &UnreachableAuthorizeProvider,
+            "client-x",
+            &prompter,
+            &Origin::detached(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'client-x' with OAuth non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]

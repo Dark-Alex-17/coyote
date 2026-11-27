@@ -73,14 +73,10 @@ pub fn build_instructions_section(instructions: &WorkspaceInstructions) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, time};
-    use time::SystemTime;
+    use std::env;
 
     fn temp_root(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-instructions-{label}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root

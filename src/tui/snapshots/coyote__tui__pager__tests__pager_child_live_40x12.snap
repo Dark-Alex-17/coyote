@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: reviewer (ro) rev...r-a1 5-14/14"
+"                                        "
+"Reading the file first.                 "
+"                                        "
+"▸ fs_grep({"pattern":"unsafe"})  done   "
+"                                        "
+"▸ fs_read({"path":"src/lib.rs"})  1s  ok"
+"                                        "
+"It looks fine.                          "
+"                                        "
+"▸ execute_command({"co...)  ⠋ running 0s"
+"q close  Tab threads  / find  n/N  j/k  "

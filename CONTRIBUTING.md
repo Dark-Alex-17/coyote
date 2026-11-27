@@ -56,6 +56,44 @@ cz commit
    will run lint and test.
 7. Create a PR
 
+### Running tests
+CI runs the suite with [cargo-nextest](https://nexte.st) as `cargo nextest run --all --profile ci`: the suites that
+drive the binary on a pseudo-terminal run in a `pty` test group capped at two at a time, and a failing test from that
+group gets one retry (see `.config/nextest.toml`). `cargo test` still works locally.
+
+### Windows cross-check
+The `cfg(windows)` code can be type-checked and linted from a Linux host through the gnu target.
+Add the target (`rustup target add x86_64-pc-windows-gnu`), install `mingw-w64` and `nasm`
+(`ring` assembles with `nasm`), and pass the big-object flag that `duckdb`'s bundled C++ needs to
+get past `file too big`:
+
+```shell
+CXXFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' CFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' \
+  cargo clippy --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+This compiles the Windows-only code and tests under clippy but does not run them, and it is the
+gnu ABI rather than the msvc one the release builds use, so it is a type check and nothing more.
+The msvc target cannot be built from Linux: its dependency build scripts need a C compiler that
+targets Windows. The `windows-latest` CI leg is where the msvc build and the Windows tests run.
+
+On macOS, with `mingw-w64` from Homebrew, bindgen also needs the mingw sysroot; export it before running the
+command above:
+
+```shell
+export BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="--sysroot=$(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32 -I$(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32/include"
+```
+
+The gnu build takes several gigabytes; a separate `CARGO_TARGET_DIR` (for example `target/gnu-check`) keeps it from
+invalidating the host build.
+
+### Snapshot tests
+The TUI's frame tests are [insta](https://insta.rs) snapshots under `src/tui/snapshots/` and `src/tui/tests/snapshots/`. A changed frame fails the
+test and writes a `*.snap.new` (or, with `cargo insta` installed, a `*.pending-snap`) beside the old file; git ignores
+both. Compare the two, and when the change is intended re-run that test with `INSTA_UPDATE=always` (or install the
+reviewer once with `cargo install cargo-insta` and use `cargo insta review`) and commit the updated `.snap`. Never
+commit a `.snap.new` or a `.pending-snap`.
+
 ### CI/CD Testing with Act
 If you also are planning on testing out your changes before pushing them with [Act](https://github.com/nektos/act), you will need to set up `act`,
 `docker`, and configure your local system to run different architectures:

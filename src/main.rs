@@ -2,6 +2,7 @@ mod acp;
 mod cli;
 mod client;
 mod config;
+mod events;
 mod function;
 mod graph;
 mod hooks;
@@ -12,10 +13,13 @@ mod repl;
 mod utils;
 mod mcp;
 mod parsers;
+mod prompt;
 mod sandbox;
 mod supervisor;
 #[cfg(test)]
 mod testing;
+mod tui;
+mod turn;
 mod vault;
 
 #[macro_use]
@@ -35,18 +39,21 @@ use crate::config::{
     sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
-use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::events::Origin;
+use crate::graph::llm::CompletionFuture;
 use crate::mcp::McpServersConfig;
+use crate::prompt::{InquirePrompter, Prompter};
 use crate::render::{prompt_theme, render_error};
 use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket, sweep_stale_pasted_images};
+use crate::turn::{SilentSink, TurnDriver, TurnMode};
 use crate::utils::*;
 use crate::vault::{Vault, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
-use inquire::{Select, Text, set_global_render_config};
-use log::{LevelFilter, warn};
+use inquire::{Text, set_global_render_config};
+use log::LevelFilter;
 use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::rolling_file::RollingFileAppender;
 use log4rs::append::rolling_file::policy::compound::CompoundPolicy;
@@ -56,13 +63,16 @@ use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use std::{env, fs, process, sync::Arc};
 
 const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
+/// The name of the thread `main` hands the runtime to; the UI's panic
+/// echo recognises the main thread by it.
+pub(crate) const MAIN_THREAD_NAME: &str = "main";
 
 /// Bootstraps the async entry point on a dedicated thread with an explicit
 /// large stack instead of `#[tokio::main]`, which would poll the root
@@ -77,7 +87,7 @@ const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
 /// exit code identical to the direct arrangement.
 fn main() -> Result<()> {
     std::thread::Builder::new()
-        .name("main".into())
+        .name(MAIN_THREAD_NAME.into())
         .stack_size(MAIN_STACK_SIZE)
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -138,6 +148,10 @@ async fn async_main() -> Result<()> {
     } else {
         WorkingMode::Cmd
     };
+    if (cli.tui || cli.repl) && !working_mode.is_repl() {
+        let flag = if cli.tui { "--tui" } else { "--repl" };
+        bail!("{flag} requires the interactive mode; drop the prompt");
+    }
 
     if cli.headless || cli.acp_server {
         if cli.headless && !cli.acp_server && text.is_none() && cli.file.is_empty() {
@@ -181,38 +195,6 @@ async fn async_main() -> Result<()> {
         || cli.list_skills
         || cli.list_sessions)
         && !cli.sync_models;
-    let vault_flags = cli.add_secret.is_some()
-        || cli.get_secret.is_some()
-        || cli.update_secret.is_some()
-        || cli.delete_secret.is_some()
-        || cli.list_secrets;
-
-    let log_path = setup_logger(cli.acp_server)?;
-
-    if let Some(path) = &cli.generate_models {
-        return catalog::generate_models_file(path).await;
-    }
-
-    if let Some(version) = &cli.update {
-        let version = version.clone();
-        let force = cli.force;
-        return tokio::task::spawn_blocking(move || config::run_self_update(version, force))
-            .await?;
-    }
-
-    if cli.list_bundles {
-        return config::list_installed_bundles();
-    }
-
-    if let Some(scope) = cli.memory_migrate {
-        let round_chains = memory_migrate::configured_round_chains().context(
-            "memory_round_chains could not be read; fix the config and rerun --memory-migrate",
-        )?;
-        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
-        print!("{report}");
-        return report.into_result();
-    }
-
     let mcp_inspect =
         cli.mcp_list && cli.mcp_get.is_none() && cli.mcp_remove.is_none() && cli.mcp_add.is_none();
     let vault_inspect = cli.list_secrets
@@ -222,39 +204,164 @@ async fn async_main() -> Result<()> {
         && cli.delete_secret.is_none();
     let inspection_only =
         (readout_flag || vault_inspect || mcp_inspect) && cli.agent.is_none() && cli.role.is_none();
+
+    let log_path = setup_logger(cli.acp_server)?;
+
+    if run_cli_flag(&cli, inspection_only, mcp_inspect, vault_inspect).await? {
+        return Ok(());
+    }
+
+    let abort_signal = create_abort_signal();
+    let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
+    let cfg = Config::load_with_interpolation(info_flag, readout_flag).await?;
+    let mut app_config = if readout_flag {
+        AppConfig::from_config_lenient(cfg)?
+    } else {
+        AppConfig::from_config(cfg)?
+    };
+    if cli.no_workspace_mcp {
+        app_config.no_workspace_mcp = true;
+    }
+    if cli.no_workspace_macros {
+        app_config.no_workspace_macros = true;
+    }
+    app_config.ui = Some(config::run_ui(
+        cli.macro_name.is_some(),
+        io::stdin().is_terminal(),
+        *IS_STDOUT_TERMINAL,
+        cli.tui,
+        cli.repl,
+        app_config.ui,
+    ));
+    let app_config: Arc<AppConfig> = Arc::new(app_config);
+    let app_state: Arc<AppState> = Arc::new(
+        AppState::init(
+            app_config,
+            log_path,
+            start_mcp_servers,
+            info_flag,
+            inspection_only,
+            abort_signal.clone(),
+        )
+        .await?,
+    );
+    let mut ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
+    let app_config = Arc::clone(&ctx.app.config);
     if !inspection_only {
-        install_builtins()?;
+        ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
+            .await?;
+    }
+
+    {
+        let app = &*ctx.app.config;
+        if app.highlight {
+            let render_opts = app.render_options()?;
+            if let Some(ref theme) = render_opts.theme {
+                utils::init_tool_colors(theme);
+            }
+            set_global_render_config(prompt_theme(render_opts)?)
+        }
+    }
+
+    if let Err(err) = run(ctx, cli, text, abort_signal).await {
+        render_error(err);
+        process::exit(1);
+    }
+    Ok(())
+}
+
+/// The CLI-only flag paths, in the order the flags take precedence; each
+/// finishes the run before any UI starts. `Ok(false)` means no such flag
+/// was given and the caller goes on to the REPL or TUI.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the CLI flag paths of main (--install, --update, --vault, ...) and install_builtins (Skip mode, never prompts); each returns before any UI starts"
+)]
+async fn run_cli_flag(
+    cli: &Cli,
+    inspection_only: bool,
+    mcp_inspect: bool,
+    vault_inspect: bool,
+) -> Result<bool> {
+    if let Some(path) = &cli.generate_models {
+        catalog::generate_models_file(path).await?;
+        return Ok(true);
+    }
+
+    if let Some(version) = &cli.update {
+        let version = version.clone();
+        let force = cli.force;
+        let prompter = InquirePrompter::new(Arc::default());
+        tokio::task::spawn_blocking(move || {
+            config::run_self_update(version, force, &prompter, " or pass --force.")
+        })
+        .await??;
+        return Ok(true);
+    }
+
+    if cli.list_bundles {
+        config::list_installed_bundles()?;
+        return Ok(true);
+    }
+
+    if let Some(scope) = cli.memory_migrate {
+        let round_chains = memory_migrate::configured_round_chains().context(
+            "memory_round_chains could not be read; fix the config and rerun --memory-migrate",
+        )?;
+        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
+        print!("{report}");
+        report.into_result()?;
+        return Ok(true);
+    }
+
+    if !inspection_only {
+        install_builtins(&InquirePrompter::new(Arc::default()))?;
     }
 
     if let Some(category) = cli.install_builtins {
-        return config::install_assets(category);
+        config::install_assets(
+            category,
+            &InquirePrompter::new(Arc::default()),
+            cli.yes,
+            " or pass --yes.",
+        )?;
+        return Ok(true);
     }
 
     if let Some(value) = cli.install.as_deref() {
-        return config::install_or_update(
+        config::install_or_update(
             value,
             cli.git_host.as_deref(),
             cli.filter,
             cli.install_force,
-            config::CommandPrefix::default(),
-        );
+            config::InstallIo {
+                prefix: config::CommandPrefix::default(),
+                prompter: &InquirePrompter::new(Arc::default()),
+                remedy: config::CLI_CONFLICT_REMEDY,
+                force_flag: "--install-force",
+            },
+        )?;
+        return Ok(true);
     }
 
     if let Some(spec) = cli.update_bundle.as_deref() {
-        return config::update_bundle(spec, cli.yes);
+        config::update_bundle(spec, cli.yes, &InquirePrompter::new(Arc::default()))?;
+        return Ok(true);
     }
 
     if let Some(name) = cli.uninstall.as_deref() {
-        return config::uninstall_bundle(name, cli.yes);
+        config::uninstall_bundle(name, cli.yes, &InquirePrompter::new(Arc::default()))?;
+        return Ok(true);
     }
 
     if let Some(client_arg) = &cli.authenticate {
         let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
+        let prompter = InquirePrompter::new(Arc::default());
         let (client_name, provider) =
-            resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
-        oauth::run_oauth_flow(&*provider, &client_name).await?;
-        return Ok(());
+            resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
+        oauth::run_oauth_flow(&*provider, &client_name, &prompter, &Origin::detached()).await?;
+        return Ok(true);
     }
 
     if let Some(server_name) = &cli.auth_mcp {
@@ -294,17 +401,20 @@ async fn async_main() -> Result<()> {
         }
 
         let url = spec.url.as_deref().expect("validated: remote spec has url");
+        let prompter = InquirePrompter::new(Arc::default());
         mcp::oauth::run_mcp_oauth_flow(
             server_name,
             url,
             spec.oauth.as_ref().and_then(|o| o.client_id.as_deref()),
             spec.oauth.as_ref().and_then(|o| o.callback_port),
             spec.oauth.as_ref().and_then(|o| o.redirect_host.as_deref()),
+            &prompter,
+            &Origin::detached(),
         )
         .await?;
         println!("Authentication saved. '{server_name}' is now available for use.");
 
-        return Ok(());
+        return Ok(true);
     }
 
     let mcp_action =
@@ -322,11 +432,16 @@ async fn async_main() -> Result<()> {
             Vault::init(&app_config)?
         };
 
-        mcp::manage::handle(&cli, &vault)?;
+        mcp::manage::handle(cli, &vault)?;
 
-        return Ok(());
+        return Ok(true);
     }
 
+    let vault_flags = cli.add_secret.is_some()
+        || cli.get_secret.is_some()
+        || cli.update_secret.is_some()
+        || cli.delete_secret.is_some()
+        || cli.list_secrets;
     if vault_flags {
         let cfg = Config::load_with_interpolation(true, vault_inspect).await?;
         let app_config = if vault_inspect {
@@ -335,58 +450,11 @@ async fn async_main() -> Result<()> {
             AppConfig::from_config(cfg)?
         };
         let vault = Vault::init(&app_config)?;
-        return Vault::handle_vault_flags(cli, &vault);
+        Vault::handle_vault_flags(cli, &vault, &InquirePrompter::new(Arc::default()))?;
+        return Ok(true);
     }
 
-    let abort_signal = create_abort_signal();
-    let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
-    let cfg = Config::load_with_interpolation(info_flag, readout_flag).await?;
-    let mut app_config = if readout_flag {
-        AppConfig::from_config_lenient(cfg)?
-    } else {
-        AppConfig::from_config(cfg)?
-    };
-    if cli.no_workspace_mcp {
-        app_config.no_workspace_mcp = true;
-    }
-    if cli.no_workspace_macros {
-        app_config.no_workspace_macros = true;
-    }
-    let app_config: Arc<AppConfig> = Arc::new(app_config);
-    let app_state: Arc<AppState> = Arc::new(
-        AppState::init(
-            app_config,
-            log_path,
-            start_mcp_servers,
-            info_flag,
-            inspection_only,
-            abort_signal.clone(),
-        )
-        .await?,
-    );
-    let mut ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
-    let app_config = Arc::clone(&ctx.app.config);
-    if !inspection_only {
-        ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
-            .await?;
-    }
-
-    {
-        let app = &*ctx.app.config;
-        if app.highlight {
-            let render_opts = app.render_options()?;
-            if let Some(ref theme) = render_opts.theme {
-                utils::init_tool_colors(theme);
-            }
-            set_global_render_config(prompt_theme(render_opts)?)
-        }
-    }
-
-    if let Err(err) = run(ctx, cli, text, abort_signal).await {
-        render_error(err);
-        process::exit(1);
-    }
-    Ok(())
+    Ok(false)
 }
 
 fn update_app_config(ctx: &mut RequestContext, update: impl FnOnce(&mut AppConfig)) {
@@ -452,7 +520,7 @@ async fn run(
                 bail!("Skill '{name}' is not installed");
             }
             let app = Arc::clone(&ctx.app.config);
-            ctx.upsert_skill(app.as_ref(), name)?;
+            print!("{}", ctx.upsert_skill(app.as_ref(), name)?);
             return Ok(());
         }
     } else if skills.len() > 1 {
@@ -478,6 +546,7 @@ async fn run(
                 ctx.info_flag,
                 agent,
                 abort_signal.clone(),
+                Arc::clone(&ctx.prompter),
             )
             .await?;
             return Ok(());
@@ -668,6 +737,7 @@ async fn run(
 
     if cli.acp_server {
         ctx.render_mode = RenderMode::Silent;
+        ctx.ui = Arc::new(SilentSink);
         return acp::run_acp_server(ctx, abort_signal).await;
     }
 
@@ -702,12 +772,22 @@ async fn run(
             result.map(|_| ())
         }
         true => {
-            if !*IS_STDOUT_TERMINAL {
+            let full_screen = ctx.ui_kind() == config::UiKind::Tui;
+            if full_screen {
+                // Refused here, before the models refresh and the REPL
+                // setup are started on the UI's behalf; `tui::run` checks
+                // again so it holds on its own, whoever calls it.
+                tui::ensure_tty()?;
+            } else if !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for REPL")
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
+            // Both shells save pasted images to the same cache.
             sweep_stale_pasted_images();
+            if full_screen {
+                return tui::run(ctx).await;
+            }
             start_interactive(ctx).await
         }
     }
@@ -730,71 +810,45 @@ async fn start_directive_inner(
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<DirectiveOutcome> {
-    let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
     ctx.session_abort = Some(abort_signal.clone());
-
-    if graph::active_agent_graph_name(ctx).is_some() {
-        ctx.before_chat_completion(&input)?;
-        let graph::dispatch::ChildGraphRun { result, last_run } =
-            graph::run_active_agent_graph(ctx, &input, abort_signal.clone()).await?;
-        if !json_output() {
-            app.print_markdown(&result.output)?;
-        }
-        ctx.record_graph_run(app.as_ref(), &input, &result.output, last_run)?;
-        let outcome = DirectiveOutcome::new(ctx, result.output);
-        ctx.exit_session()?;
-        return Ok(outcome);
-    }
-
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
-    let mut input = input;
-    let output = loop {
-        let client = input.create_client()?;
-        ctx.before_chat_completion(&input)?;
-        let (output, tool_results) = if !input.stream() || extract_code {
-            call_chat_completions(
-                &input,
-                true,
-                extract_code,
-                client.as_ref(),
-                ctx,
-                abort_signal.clone(),
-            )
-            .await?
-        } else {
-            call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone())
-                .await?
-        };
-        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
-
-        if !tool_results.is_empty() {
-            input = input.merge_tool_results(output, tool_results);
-            let (next, _) = ctx.maybe_checkpoint_tool_loop(input)?;
-            input = next;
-            continue;
-        }
-
-        match check_pending_tasks_guardrail(ctx) {
-            GuardrailAction::Inject(prompt) => {
-                input = Input::from_str(ctx, &prompt, None)?;
-                continue;
-            }
-            GuardrailAction::ForceTerminate(ids) => {
-                warn!(
-                    "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
-                    ids.len(),
-                    ids
-                );
-            }
-            GuardrailAction::NoAction => {}
-        }
-
-        break output;
+    let mut runner = headless_completion_runner(extract_code);
+    let mut driver = TurnDriver {
+        runner: &mut runner,
+        mode: TurnMode::Headless,
     };
-
+    driver
+        .run_turn(ctx, abort_signal, input, false, None)
+        .await?;
+    // The turn's final reply, chat or graph, is the last message it recorded.
+    let output = ctx
+        .last_message
+        .as_ref()
+        .map(|message| message.output.clone())
+        .unwrap_or_default();
     let outcome = DirectiveOutcome::new(ctx, output);
     ctx.exit_session()?;
     Ok(outcome)
+}
+
+/// One model call as a headless directive makes it: build the client, run
+/// the before-hook, then stream unless the input or code extraction (which
+/// needs the whole reply) says otherwise.
+fn headless_completion_runner(
+    extract_code: bool,
+) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+{
+    move |input, ctx, abort| {
+        Box::pin(async move {
+            let client = input.create_client()?;
+            ctx.before_chat_completion(input)?;
+            if !input.stream() || extract_code {
+                call_chat_completions(input, true, extract_code, client.as_ref(), ctx, abort).await
+            } else {
+                call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
+            }
+        })
+    }
 }
 
 async fn start_interactive(ctx: RequestContext) -> Result<()> {
@@ -802,6 +856,10 @@ async fn start_interactive(ctx: RequestContext) -> Result<()> {
     repl.run().await
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the -e flow; the process never reaches a UI"
+)]
 async fn shell_execute(
     ctx: &mut RequestContext,
     shell: &Shell,
@@ -1036,9 +1094,16 @@ fn init_console_logger(
         .unwrap()
 }
 
+/// The OAuth client to sign in to: the one named by `explicit`, the only
+/// OAuth-capable one, or a pick between several. The pick, and the
+/// no-terminal refusal naming `--authenticate <CLIENT_NAME>` as its
+/// remedy, is reached from the CLI alone: the REPL's `.authenticate`
+/// always names the current model's client, so under it `explicit` is
+/// never `None`.
 fn resolve_oauth_client(
     explicit: Option<&str>,
     clients: &[ClientConfig],
+    prompter: &dyn Prompter,
 ) -> Result<(String, Box<dyn OAuthProvider>)> {
     let find_by_name = |name: &str| -> Option<&ClientConfig> {
         clients.iter().find(|cc| {
@@ -1056,8 +1121,19 @@ fn resolve_oauth_client(
             0 => bail!("No OAuth-capable clients configured."),
             1 => find_by_name(&candidates[0]).unwrap(),
             _ => {
-                let choice =
-                    Select::new("Select a client to authenticate:", candidates.clone()).prompt()?;
+                crate::prompt::require_human(
+                    prompter,
+                    format_args!(
+                        "pick between the OAuth-capable clients ({})",
+                        candidates.join(", ")
+                    ),
+                    " or pass --authenticate <CLIENT_NAME>.",
+                )?;
+                let choice = crate::prompt::select_closed(
+                    prompter,
+                    "Select a client to authenticate:",
+                    candidates,
+                )?;
                 find_by_name(&choice)
                     .ok_or_else(|| anyhow!("Selected client '{choice}' not found"))?
             }
@@ -1079,6 +1155,83 @@ fn resolve_oauth_client(
 mod tests {
     use super::*;
     use crate::client::{Model, ModelData};
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
+    use serial_test::serial;
+
+    fn oauth_client(name: &str) -> ClientConfig {
+        serde_yaml::from_str(&format!("type: claude\nname: {name}\nauth: oauth\n")).unwrap()
+    }
+
+    /// With more than one OAuth-capable client and none named, the pick is
+    /// a closed Select through the prompter.
+    #[test]
+    #[serial]
+    fn resolve_oauth_client_asks_which_client_through_the_prompter() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let clients = [oauth_client("work"), oauth_client("home")];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("home".into())]);
+
+        let (name, _) = resolve_oauth_client(None, &clients, &prompter).unwrap();
+
+        assert_eq!(name, "home");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Select a client to authenticate:");
+        assert!(requests[0].closed);
+        assert_eq!(requests[0].options, ["work", "home"]);
+    }
+
+    /// Without a terminal the pick is refused up front in the shared
+    /// refusal shape, naming the flag that skips the menu.
+    #[test]
+    #[serial]
+    fn resolve_oauth_client_without_a_tty_is_refused_before_any_prompt() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::tui::OwnerGuard::shell_for_test();
+        let clients = [oauth_client("work"), oauth_client("home")];
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = resolve_oauth_client(None, &clients, &prompter)
+            .map(|(name, _)| name)
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Refusing to pick between the OAuth-capable clients (work, home)"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("Re-run in a terminal or pass --authenticate <CLIENT_NAME>."),
+            "{message}"
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_oauth_client_with_no_human_is_refused() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let clients = [oauth_client("work"), oauth_client("home")];
+
+        let err = resolve_oauth_client(None, &clients, &HeadlessPrompter)
+            .map(|(name, _)| name)
+            .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:?}");
+    }
+
+    #[test]
+    fn resolve_oauth_client_with_one_candidate_never_prompts() {
+        let clients = [oauth_client("work")];
+
+        let (name, _) =
+            resolve_oauth_client(None, &clients, &ScriptedPrompter::refusing()).unwrap();
+
+        assert_eq!(name, "work");
+    }
 
     #[test]
     fn reject_unsplit_sandbox_refuses_a_parsed_sandbox_flag() {

@@ -6,8 +6,9 @@ use super::structured;
 use super::types::AgentNode;
 use super::wall_clock;
 use crate::config::RequestContext;
+use crate::events::{AgentOutcome, Event, Origin};
 use crate::function::agents::run_agent_for_graph;
-use crate::hooks::{self, HookEvent};
+use crate::hooks;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow};
@@ -51,32 +52,25 @@ impl AgentNodeExecutor {
         )
         .await;
         if let Err(e) = &result {
-            if parent_ctx
+            let outcome = if parent_ctx
                 .session_abort
                 .as_ref()
                 .is_some_and(|signal| signal.aborted_ctrlc())
             {
-                hooks::fire(
-                    HookEvent::AgentInterrupted,
-                    parent_ctx,
-                    &[
-                        ("COYOTE_AGENT_ID", agent_hook_id),
-                        ("COYOTE_AGENT_NAME", node.agent.clone()),
-                    ],
-                    None,
-                );
+                AgentOutcome::Interrupted
             } else {
-                hooks::fire(
-                    HookEvent::AgentFailed,
-                    parent_ctx,
-                    &[
-                        ("COYOTE_AGENT_ID", agent_hook_id),
-                        ("COYOTE_AGENT_NAME", node.agent.clone()),
-                        ("COYOTE_AGENT_ERROR", format!("{e:#}")),
-                    ],
-                    None,
-                );
-            }
+                AgentOutcome::Failed(format!("{e:#}"))
+            };
+            hooks::emit(
+                parent_ctx,
+                Event::AgentFinished {
+                    origin: Origin::from(&*parent_ctx),
+                    agent_id: agent_hook_id,
+                    name: Some(node.agent.clone()),
+                    session_id: None,
+                    outcome,
+                },
+            );
         }
         outcome_from(node_id, node, state_manager, result)
     }

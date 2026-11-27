@@ -350,108 +350,126 @@ pub async fn openai_chat_completions_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut call_id = String::new();
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
+    let mut state = OpenAiChatStreamState::default();
     let handle = |message: SseMessage| -> Result<bool> {
-        if message.data == "[DONE]" {
-            if !function_name.is_empty() {
-                if function_arguments.is_empty() {
-                    function_arguments = String::from("{}");
-                }
-                let arguments: Value = function_arguments.parse().with_context(|| {
-                    format!(
-                        "Tool call '{function_name}' has non-JSON arguments '{function_arguments}'"
-                    )
-                })?;
-                handler.tool_call(ToolCall::new(
-                    function_name.clone(),
-                    arguments,
-                    normalize_function_id(&function_id),
-                ))?;
-            }
-            return Ok(true);
-        }
-        let data: Value = serde_json::from_str(&message.data)?;
-        debug!("stream-data: {data}");
-        // Usage may arrive on any chunk (OpenAI/Azure send a trailing
-        // `choices: []` chunk; some compatible providers attach it to the
-        // finish chunk), so any usage object is consumed and `null` is skipped.
-        if let Some(usage) = openai_parse_chat_usage(&data["usage"]) {
-            debug!("token-usage: {usage:?}");
-            handler.usage(usage);
-        }
-        if let Some(text) = data["choices"][0]["delta"]["content"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            handler.text(text)?;
-        } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
-            .as_str()
-            .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 0 {
-                handler.text("<think>\n")?;
-                reasoning_state = 1;
-            }
-            handler.text(text)?;
-        }
-        if let (Some(function), index, id) = (
-            data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
-            data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
-            data["choices"][0]["delta"]["tool_calls"][0]["id"]
-                .as_str()
-                .filter(|v| !v.is_empty()),
-        ) {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
-            if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {
-                if !function_name.is_empty() {
-                    if function_arguments.is_empty() {
-                        function_arguments = String::from("{}");
-                    }
-                    let arguments: Value = function_arguments.parse().with_context(|| {
-                        format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                    })?;
-                    handler.tool_call(ToolCall::new(
-                        function_name.clone(),
-                        arguments,
-                        normalize_function_id(&function_id),
-                    ))?;
-                }
-                function_name.clear();
-                function_arguments.clear();
-                function_id.clear();
-                call_id = maybe_call_id;
-            }
-            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                if name.starts_with(&function_name) {
-                    function_name = name.to_string();
-                } else {
-                    function_name.push_str(name);
-                }
-            }
-            if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
-                function_arguments.push_str(arguments);
-            }
-            if let Some(id) = id {
-                function_id = id.to_string();
-            }
-        }
-        Ok(false)
+        openai_chat_handle_chunk(&message.data, &mut state, handler)
     };
 
     sse_stream(builder, handle).await
+}
+
+/// What a chat-completions stream carries between chunks: the tool call
+/// being assembled from its deltas and whether a `<think>` span is open.
+#[derive(Default)]
+struct OpenAiChatStreamState {
+    call_id: String,
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_open: bool,
+}
+
+impl OpenAiChatStreamState {
+    fn flush_tool_call(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if self.function_name.is_empty() {
+            return Ok(());
+        }
+        if self.function_arguments.is_empty() {
+            self.function_arguments = String::from("{}");
+        }
+        let arguments: Value = self.function_arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' has non-JSON arguments '{}'",
+                self.function_name, self.function_arguments
+            )
+        })?;
+        handler.tool_call(ToolCall::new(
+            self.function_name.clone(),
+            arguments,
+            normalize_function_id(&self.function_id),
+        ))
+    }
+
+    fn close_reasoning(&mut self, handler: &mut SseHandler) -> Result<()> {
+        if self.reasoning_open {
+            handler.text("\n</think>\n\n")?;
+            self.reasoning_open = false;
+            handler.thinking_stopped();
+        }
+        Ok(())
+    }
+}
+
+/// Handles one SSE data payload, `[DONE]` included; returns whether the
+/// stream is finished.
+fn openai_chat_handle_chunk(
+    payload: &str,
+    state: &mut OpenAiChatStreamState,
+    handler: &mut SseHandler,
+) -> Result<bool> {
+    if payload == "[DONE]" {
+        state.close_reasoning(handler)?;
+        state.flush_tool_call(handler)?;
+        return Ok(true);
+    }
+    let data: Value = serde_json::from_str(payload)?;
+    debug!("stream-data: {data}");
+    // Usage may arrive on any chunk (OpenAI/Azure send a trailing
+    // `choices: []` chunk; some compatible providers attach it to the
+    // finish chunk), so any usage object is consumed and `null` is skipped.
+    if let Some(usage) = openai_parse_chat_usage(&data["usage"]) {
+        debug!("token-usage: {usage:?}");
+        handler.usage(usage);
+    }
+    if let Some(text) = data["choices"][0]["delta"]["content"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+    {
+        state.close_reasoning(handler)?;
+        handler.text(text)?;
+    } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
+        .as_str()
+        .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        if !state.reasoning_open {
+            handler.thinking_started();
+            handler.text("<think>\n")?;
+            state.reasoning_open = true;
+        }
+        handler.text(text)?;
+    }
+    if let (Some(function), index, id) = (
+        data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
+        data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
+        data["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .filter(|v| !v.is_empty()),
+    ) {
+        state.close_reasoning(handler)?;
+        let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
+        if maybe_call_id != state.call_id && maybe_call_id.len() >= state.call_id.len() {
+            state.flush_tool_call(handler)?;
+            state.function_name.clear();
+            state.function_arguments.clear();
+            state.function_id.clear();
+            state.call_id = maybe_call_id;
+        }
+        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+            if name.starts_with(&state.function_name) {
+                state.function_name = name.to_string();
+            } else {
+                state.function_name.push_str(name);
+            }
+        }
+        if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+            state.function_arguments.push_str(arguments);
+        }
+        if let Some(id) = id {
+            state.function_id = id.to_string();
+        }
+    }
+    Ok(false)
 }
 
 pub async fn openai_embeddings(
@@ -746,32 +764,35 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     Ok(output)
 }
 
+/// A chat-completions `usage` object: a server sends it on a non-streamed
+/// reply and, when it reports usage on a stream at all, on a late chunk.
+/// `prompt_tokens` covers the whole prompt, including cached reads and cache
+/// writes, so both are subtracted to keep the buckets disjoint. An empty
+/// object is no usage.
+fn openai_parse_chat_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let cache_write_tokens = usage["prompt_tokens_details"]["cache_write_tokens"].as_u64();
+    let usage = TokenUsage {
+        input_tokens: usage["prompt_tokens"].as_u64().map(|v| {
+            v.saturating_sub(cached_tokens.unwrap_or(0))
+                .saturating_sub(cache_write_tokens.unwrap_or(0))
+        }),
+        output_tokens: usage["completion_tokens"].as_u64(),
+        cache_creation_input_tokens: cache_write_tokens.filter(|&n| n > 0),
+        cache_read_input_tokens: cached_tokens.filter(|&n| n > 0),
+    };
+    (!usage.is_empty()).then_some(usage)
+}
+
 fn normalize_function_id(value: &str) -> Option<String> {
     if value.is_empty() {
         None
     } else {
         Some(value.to_string())
     }
-}
-
-/// `prompt_tokens` covers the whole prompt, including cached reads and cache
-/// writes, so both are subtracted to keep the buckets disjoint.
-fn openai_parse_chat_usage(usage: &Value) -> Option<TokenUsage> {
-    if !usage.is_object() {
-        return None;
-    }
-
-    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
-    let cache_write_tokens = usage["prompt_tokens_details"]["cache_write_tokens"].as_u64();
-    Some(TokenUsage {
-        input_tokens: usage["prompt_tokens"].as_u64().map(|v| {
-            v.saturating_sub(cached_tokens.unwrap_or(0))
-                .saturating_sub(cache_write_tokens.unwrap_or(0))
-        }),
-        output_tokens: usage["completion_tokens"].as_u64(),
-        cache_creation_input_tokens: cache_write_tokens,
-        cache_read_input_tokens: cached_tokens,
-    })
 }
 
 pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> Value {
@@ -1014,14 +1035,15 @@ fn openai_parse_responses_usage(usage: &Value) -> Option<TokenUsage> {
     }
 
     let cached_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
-    Some(TokenUsage {
+    let usage = TokenUsage {
         input_tokens: usage["input_tokens"]
             .as_u64()
             .map(|v| v.saturating_sub(cached_tokens.unwrap_or(0))),
         output_tokens: usage["output_tokens"].as_u64(),
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: cached_tokens,
-    })
+        cache_read_input_tokens: cached_tokens.filter(|&n| n > 0),
+    };
+    (!usage.is_empty()).then_some(usage)
 }
 
 pub async fn openai_responses_streaming(
@@ -1042,7 +1064,17 @@ pub async fn openai_responses_streaming(
 
 fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Result<bool> {
     match data["type"].as_str() {
+        // The phase opened here closes when the reasoning item is done,
+        // and again at the first text delta or finished function call,
+        // so a reasoning item the server never finished still closes
+        // before whatever follows it.
+        Some("response.output_item.added") => {
+            if data["item"]["type"].as_str() == Some("reasoning") {
+                handler.thinking_started();
+            }
+        }
         Some("response.output_text.delta") => {
+            handler.thinking_stopped();
             if let Some(delta) = data["delta"].as_str().filter(|v| !v.is_empty()) {
                 handler.text(delta)?;
             }
@@ -1051,6 +1083,7 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
             let item = &data["item"];
             match item["type"].as_str() {
                 Some("function_call") => {
+                    handler.thinking_stopped();
                     if let (Some(name), Some(arguments_str), Some(call_id)) = (
                         item["name"].as_str(),
                         item["arguments"].as_str(),
@@ -1070,6 +1103,7 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
                     if let Some(block) = reasoning_thinking_block(item) {
                         handler.thinking_block(block);
                     }
+                    handler.thinking_stopped();
                 }
                 _ => {}
             }
@@ -1423,6 +1457,7 @@ mod tests {
             text: text.map(|t| t.to_string()),
             thinking,
             attachments: vec![],
+            user_messages: vec![],
         }
     }
 
@@ -1715,6 +1750,22 @@ mod tests {
     }
 
     #[test]
+    fn extract_chat_completions_parses_usage() {
+        let chat = json!({
+            "choices": [{ "message": { "content": "answer" } }],
+            "usage": { "prompt_tokens": 50, "completion_tokens": 7 },
+        });
+        let usage = openai_extract_chat_completions(&chat).unwrap().usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_read_input_tokens, None);
+        let bare = json!({ "choices": [{ "message": { "content": "answer" } }] });
+        assert!(openai_extract_chat_completions(&bare).unwrap().usage.is_none());
+        let empty = json!({ "choices": [{ "message": { "content": "answer" } }], "usage": {} });
+        assert!(openai_extract_chat_completions(&empty).unwrap().usage.is_none());
+    }
+
+    #[test]
     fn extract_responses_parses_usage() {
         let data = json!({
             "output": [
@@ -1734,6 +1785,15 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(20));
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.cache_read_input_tokens, Some(60));
+
+        assert!(openai_parse_responses_usage(&json!({})).is_none());
+        let uncached = openai_parse_responses_usage(&json!({
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "input_tokens_details": { "cached_tokens": 0 },
+        }))
+        .unwrap();
+        assert_eq!(uncached.cache_read_input_tokens, None);
     }
 
     #[test]
@@ -2531,6 +2591,30 @@ mod tests {
         );
     }
 
+    /// A streamed chat request asks OpenAI for its usage chunk; a request
+    /// that does not stream gets usage on the reply anyway and sends no
+    /// stream options.
+    #[test]
+    fn a_streamed_chat_request_asks_for_its_usage() {
+        let config = api_key_config("openai-wire-chat-usage-test", Some(WireApi::Chat));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config.clone())]);
+
+        let (streamed, _) = prepare_with_stream(&client, true).unwrap();
+        assert_eq!(
+            streamed.body["stream_options"],
+            json!({ "include_usage": true })
+        );
+        let (whole, _) = prepare_with_stream(&client, false).unwrap();
+        assert!(whole.body.get("stream_options").is_none(), "{}", whole.body);
+
+        // A custom endpoint may be a gateway that rejects the key.
+        let mut gateway = config;
+        gateway.api_base = Some("https://gateway.example/v1".to_string());
+        let client = make_client(gateway.clone(), vec![ClientConfig::OpenAIConfig(gateway)]);
+        let (streamed, _) = prepare_with_stream(&client, true).unwrap();
+        assert!(streamed.body.get("stream_options").is_none(), "{}", streamed.body);
+    }
+
     #[test]
     fn explicit_responses_wire_forks_the_streaming_path_too() {
         let config = api_key_config("openai-wire-responses-stream-test", Some(WireApi::Responses));
@@ -2587,6 +2671,298 @@ mod tests {
         client.patch_request_data(&mut request_data);
 
         assert_eq!(request_data.body, body_before, "a chat-shaped model patch must not merge into a responses body");
+    }
+
+    mod thinking_events {
+        use super::*;
+        use crate::client::stream::test_support::{
+            ThisThreadRecording, detached_pair, new_handler,
+        };
+        use crate::events::{Event, Origin};
+
+        fn started() -> Event {
+            Event::ThinkingStarted {
+                origin: Origin::detached(),
+            }
+        }
+
+        fn feed_chat(payloads: &[String]) -> (Vec<Event>, SseHandler) {
+            let recording = ThisThreadRecording::install();
+            let (mut handler, _rx) = new_handler();
+            let mut state = OpenAiChatStreamState::default();
+            for payload in payloads {
+                openai_chat_handle_chunk(payload, &mut state, &mut handler).unwrap();
+            }
+            (recording.events(), handler)
+        }
+
+        fn chat_delta(delta: Value) -> String {
+            json!({ "choices": [{ "index": 0, "delta": delta }] }).to_string()
+        }
+
+        /// A late chunk's `usage` lands on the handler, cached reads split
+        /// out of the prompt count; a stream that reports none leaves it
+        /// empty.
+        #[test]
+        #[serial_test::serial]
+        fn a_streamed_usage_chunk_reaches_the_handler() {
+            let usage = json!({ "choices": [], "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": 100 },
+            }})
+            .to_string();
+            let (_, handler) = feed_chat(&[chat_delta(json!({ "content": "hi" })), usage]);
+            let (_, _, _, usage) = handler.take();
+            let usage = usage.expect("the stream's usage");
+            assert_eq!(usage.input_tokens, Some(20));
+            assert_eq!(usage.output_tokens, Some(30));
+            assert_eq!(usage.cache_read_input_tokens, Some(100));
+            assert_eq!(usage.cache_creation_input_tokens, None);
+
+            let (_, handler) = feed_chat(&[chat_delta(json!({ "content": "hi" }))]);
+            assert!(handler.take().3.is_none());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_first_reasoning_chunk_opens_the_phase_once() {
+            let (events, _) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "let me" })),
+                chat_delta(json!({ "reasoning_content": " think" })),
+            ]);
+            assert_eq!(events, vec![started()]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_first_content_chunk_after_reasoning_closes_the_phase() {
+            let (events, handler) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "hmm" })),
+                chat_delta(json!({ "content": "answer" })),
+                chat_delta(json!({ "content": "!" })),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "<think>\nhmm\n</think>\n\nanswer!");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_tool_call_after_reasoning_closes_the_phase() {
+            let (events, handler) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "hmm" })),
+                chat_delta(json!({ "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "fs_read", "arguments": "{\"path\":\"x\"}" }
+                }] })),
+                "[DONE]".to_string(),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, calls, _, _) = handler.take();
+            assert_eq!(text, "<think>\nhmm\n</think>\n\n");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "fs_read");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_stream_that_ends_inside_reasoning_still_closes_the_phase() {
+            let (events, handler) = feed_chat(&[
+                chat_delta(json!({ "reasoning_content": "hmm" })),
+                "[DONE]".to_string(),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, _, _) = handler.take();
+            assert!(text.trim_end().ends_with("</think>"), "{text:?}");
+        }
+
+        fn feed_responses(events: &[Value]) -> (Vec<Event>, SseHandler) {
+            let recording = ThisThreadRecording::install();
+            let (mut handler, _rx) = new_handler();
+            for event in events {
+                openai_responses_handle_event(event, &mut handler).unwrap();
+            }
+            (recording.events(), handler)
+        }
+
+        fn reasoning_item() -> Value {
+            json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{ "type": "summary_text", "text": "thinking" }],
+                "encrypted_content": "enc123",
+            })
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_reasoning_item_opens_the_phase_when_added() {
+            let (events, _) = feed_responses(&[json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+            })]);
+            assert_eq!(events, vec![started()]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_reasoning_item_added_then_done_then_text_publishes_one_pair() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": "thinking"
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning_item()
+                }),
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": { "type": "message", "id": "msg_1", "role": "assistant", "content": [] }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 1,
+                    "delta": "answer"
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (text, _, thinking, _) = handler.take();
+            assert_eq!(text, "answer");
+            assert_eq!(thinking.len(), 1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_reasoning_item_done_without_an_id_still_closes_the_phase() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "summary": [] }
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (_, _, thinking, _) = handler.take();
+            assert!(thinking.is_empty());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn two_reasoning_items_publish_a_pair_each() {
+            let (events, _) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning_item()
+                }),
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": { "type": "reasoning", "id": "rs_2", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": { "type": "reasoning", "id": "rs_2", "summary": [] }
+                }),
+            ]);
+            assert_eq!(
+                events,
+                [detached_pair(), detached_pair()].concat()
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn text_arriving_while_reasoning_is_open_closes_it_first() {
+            let (events, _) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 1,
+                    "delta": "answer"
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_function_call_finishing_while_reasoning_is_open_closes_it_first() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "reasoning", "id": "rs_1", "summary": [] }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "fs_read",
+                        "arguments": "{\"path\":\"x\"}"
+                    }
+                }),
+            ]);
+            assert_eq!(events, detached_pair());
+            let (_, calls, _, _) = handler.take();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "fs_read");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_stream_without_reasoning_publishes_nothing() {
+            let (events, handler) = feed_responses(&[
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": { "type": "message", "id": "msg_1", "role": "assistant", "content": [] }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "plain"
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": { "type": "message", "id": "msg_1", "role": "assistant", "content": [] }
+                }),
+            ]);
+            assert!(events.is_empty());
+            let (text, _, _, _) = handler.take();
+            assert_eq!(text, "plain");
+        }
     }
 
     #[test]

@@ -1,0 +1,28 @@
+---
+source: src/tui/tests/mouse_and_copy.rs
+expression: frame
+---
+"> look                                                                          "
+"                                                                                "
+"▾ fs_read({})  1s  ok                                                           "
+"  Call fs_read {}                                                               "
+"  alpha one                                                                     "
+"  beta two                                                                      "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"? = keys  Alt+T = tasks  Alt+S = threads  Ctrl+X = todo                         "
+"───────────────────────────────────────────────────────────────────── your turn "
+" Type a prompt or a .command; Enter sends                                       "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"openai:test-model . no session . agents 0 . jobs 0                              "

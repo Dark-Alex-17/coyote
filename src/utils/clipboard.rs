@@ -42,9 +42,8 @@ pub fn classify_clipboard(
 
 #[cfg(not(any(target_os = "android", target_os = "emscripten")))]
 mod internal {
-    use super::{ClipboardContent, classify_clipboard};
+    use super::{ClipboardContent, classify_clipboard, write_osc52};
     use arboard::Clipboard;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::sync::{LazyLock, Mutex};
@@ -53,16 +52,23 @@ mod internal {
         LazyLock::new(|| Mutex::new(Clipboard::new().ok()));
 
     pub fn set_text(text: &str) -> anyhow::Result<()> {
-        let mut clipboard = CLIPBOARD.lock().unwrap();
-        match clipboard.as_mut() {
-            Some(clipboard) => {
-                clipboard.set_text(text)?;
-                #[cfg(target_os = "linux")]
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                Ok(())
-            }
-            None => set_text_osc52(text),
+        if set_text_native(text)? {
+            Ok(())
+        } else {
+            set_text_osc52(text)
         }
+    }
+
+    /// Ok(false) when there is no system clipboard to write to.
+    pub fn set_text_native(text: &str) -> anyhow::Result<bool> {
+        let mut clipboard = CLIPBOARD.lock().unwrap();
+        let Some(clipboard) = clipboard.as_mut() else {
+            return Ok(false);
+        };
+        clipboard.set_text(text)?;
+        #[cfg(target_os = "linux")]
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(true)
     }
 
     /// A read that fails or comes back empty counts as absent, so the next
@@ -101,18 +107,8 @@ mod internal {
         Some(cursor.into_inner())
     }
 
-    /// Attempts to set text to clipboard with OSC52 escape sequence
-    /// Works in many modern terminals, including over SSH.
     fn set_text_osc52(text: &str) -> anyhow::Result<()> {
-        let encoded = STANDARD.encode(text);
-        let seq = format!("\x1b]52;c;{encoded}\x07");
-        if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), seq.as_bytes()) {
-            return Err(anyhow::anyhow!("Failed to send OSC52 sequence").context(e));
-        }
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
-            return Err(anyhow::anyhow!("Failed to flush OSC52 sequence").context(e));
-        }
-        Ok(())
+        write_osc52(&mut std::io::stdout(), text)
     }
 }
 
@@ -124,6 +120,10 @@ mod internal {
         Err(anyhow::anyhow!("No clipboard available"))
     }
 
+    pub fn set_text_native(_text: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     pub fn read_for_paste() -> anyhow::Result<ClipboardContent> {
         Err(anyhow::anyhow!("No clipboard available"))
     }
@@ -131,6 +131,65 @@ mod internal {
 
 pub fn set_text(text: &str) -> anyhow::Result<()> {
     internal::set_text(text).context("Failed to copy")
+}
+
+/// Puts `text` on the system clipboard, returning whether there was one.
+/// Writes nothing to the terminal, so the caller decides where an OSC 52
+/// fallback goes.
+pub fn set_text_native(text: &str) -> bool {
+    match internal::set_text_native(text) {
+        Ok(copied) => copied,
+        Err(err) => {
+            warn!("Failed to copy to the system clipboard: {err}");
+            false
+        }
+    }
+}
+
+/// The most base64 an OSC 52 request carries: many terminals drop a
+/// larger payload, and the write blocks until the terminal has read it
+/// all.
+const OSC52_PAYLOAD_LIMIT: usize = 100_000;
+/// The most text whose base64 fits `OSC52_PAYLOAD_LIMIT`.
+const OSC52_TEXT_LIMIT: usize = OSC52_PAYLOAD_LIMIT / 4 * 3;
+
+/// The tail of `text` that fits an OSC 52 request. A cut inside a line
+/// moves on to the start of the next one, so every line kept is whole;
+/// a tail with no line break left is cut on a char boundary instead.
+pub fn osc52_payload_cap(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(OSC52_TEXT_LIMIT);
+    if start == 0 || text.as_bytes()[start - 1] == b'\n' {
+        return &text[start..];
+    }
+    if let Some(newline) = text.as_bytes()[start..].iter().position(|&b| b == b'\n')
+        && start + newline + 1 < text.len()
+    {
+        return &text[start + newline + 1..];
+    }
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// The OSC 52 escape that asks the terminal to put `text` on the clipboard;
+/// works in many modern terminals, including over SSH.
+pub fn osc52_sequence(text: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
+}
+
+/// Asks the terminal behind `writer` to put as much of `text` on the
+/// clipboard as one OSC 52 request carries.
+fn write_osc52(writer: &mut impl std::io::Write, text: &str) -> anyhow::Result<()> {
+    let seq = osc52_sequence(osc52_payload_cap(text));
+    if let Err(e) = writer.write_all(seq.as_bytes()) {
+        return Err(anyhow::anyhow!("Failed to send OSC52 sequence").context(e));
+    }
+    if let Err(e) = writer.flush() {
+        return Err(anyhow::anyhow!("Failed to flush OSC52 sequence").context(e));
+    }
+    Ok(())
 }
 
 pub fn read_for_paste() -> anyhow::Result<ClipboardContent> {
@@ -200,6 +259,73 @@ mod tests {
                 || panic!("text must not be read"),
             ),
             ClipboardContent::ImagePng(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn the_osc52_sequence_carries_the_text_in_base64() {
+        assert_eq!(osc52_sequence("hi\n"), "\x1b]52;c;aGkK\x07");
+        assert_eq!(osc52_sequence(""), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn the_osc52_payload_keeps_the_newest_text_whole_chars_only() {
+        assert_eq!(osc52_payload_cap("short"), "short");
+
+        let text = format!("old\n{}", "x".repeat(OSC52_TEXT_LIMIT));
+        assert_eq!(osc52_payload_cap(&text), &text[4..]);
+
+        let text = format!(
+            "{}{}",
+            "\u{e9}".repeat(10),
+            "y".repeat(OSC52_TEXT_LIMIT - 1)
+        );
+        let kept = osc52_payload_cap(&text);
+        assert_eq!(kept.len(), OSC52_TEXT_LIMIT - 1);
+        assert!(kept.chars().all(|c| c == 'y'));
+    }
+
+    #[test]
+    fn the_osc52_cap_bounds_the_encoded_request() {
+        let text = "z".repeat(3 * OSC52_PAYLOAD_LIMIT);
+        let frame = osc52_sequence("").len();
+        assert_eq!(
+            osc52_sequence(osc52_payload_cap(&text)).len(),
+            OSC52_PAYLOAD_LIMIT + frame
+        );
+    }
+
+    #[test]
+    fn the_osc52_cap_drops_a_partial_first_line() {
+        let line = format!("{}\n", "w".repeat(97));
+        let text = line.repeat(2 * OSC52_TEXT_LIMIT / line.len());
+        assert_ne!(
+            (text.len() - OSC52_TEXT_LIMIT) % line.len(),
+            0,
+            "the byte cut has to fall inside a line"
+        );
+        let kept = osc52_payload_cap(&text);
+        assert!(kept.len() <= OSC52_TEXT_LIMIT);
+        assert!(kept.lines().all(|kept| kept.len() == 97), "a line was cut");
+        assert_eq!(kept.lines().count(), OSC52_TEXT_LIMIT / line.len());
+
+        let one_line = format!("{}\n", "v".repeat(OSC52_TEXT_LIMIT * 2));
+        assert_eq!(osc52_payload_cap(&one_line).len(), OSC52_TEXT_LIMIT);
+    }
+
+    /// The REPL's fallback sends the same capped request Alt+C does.
+    #[test]
+    fn the_osc52_fallback_writes_the_capped_request() {
+        let text = "u".repeat(3 * OSC52_PAYLOAD_LIMIT);
+        let mut written = Vec::new();
+        write_osc52(&mut written, &text).unwrap();
+        assert_eq!(
+            written,
+            osc52_sequence(osc52_payload_cap(&text)).into_bytes()
+        );
+        assert_eq!(
+            written.len(),
+            OSC52_PAYLOAD_LIMIT + osc52_sequence("").len()
         );
     }
 }

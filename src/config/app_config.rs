@@ -3,7 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::{CommandPrefix, RoundChains, paths};
+use super::{CommandPrefix, RoundChains, UiMode, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub save: bool,
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
+    pub ui: Option<UiMode>,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -108,6 +109,7 @@ pub struct AppConfig {
     pub highlight: bool,
     pub raw_markdown: bool,
     pub theme: Option<String>,
+    pub tui_chart_height: u16,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
 
@@ -135,6 +137,7 @@ impl Default for AppConfig {
             save: false,
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
+            ui: None,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -206,6 +209,7 @@ impl Default for AppConfig {
             highlight: true,
             raw_markdown: false,
             theme: None,
+            tui_chart_height: 12,
             left_prompt: None,
             right_prompt: None,
 
@@ -247,6 +251,7 @@ impl AppConfig {
             save: config.save,
             keybindings: config.keybindings,
             command_prefix: config.command_prefix,
+            ui: config.ui,
             editor: config.editor,
             wrap: config.wrap,
             wrap_code: config.wrap_code,
@@ -318,6 +323,7 @@ impl AppConfig {
             highlight: config.highlight,
             raw_markdown: config.raw_markdown,
             theme: config.theme,
+            tui_chart_height: config.tui_chart_height,
             left_prompt: config.left_prompt,
             right_prompt: config.right_prompt,
 
@@ -726,6 +732,9 @@ impl AppConfig {
                 drain_stale_tty_input();
             }
         }
+        if let Some(Some(v)) = super::read_env_value::<u16>(&get_env_name("tui_chart_height")) {
+            self.tui_chart_height = v;
+        }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("left_prompt")) {
             self.left_prompt = v;
         }
@@ -801,7 +810,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, UiKind};
 
     fn cached_editor() -> Option<String> {
         super::super::EDITOR.get().cloned().flatten()
@@ -1153,6 +1162,40 @@ mod tests {
                 Some(v) => env::set_var(&env_name, v),
                 None => env::remove_var(&env_name),
             }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_config_copies_ui() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            ui: Some(UiMode::Tui),
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.ui, Some(UiMode::Tui));
+    }
+
+    /// `COYOTE_UI` is what coyote exports to its tools, not a setting:
+    /// whatever it holds, loading the environment leaves the file's `ui`
+    /// alone and does not fail.
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_ignores_coyote_ui() {
+        for value in ["foo", "tui"] {
+            let _env = crate::testing::EnvVarGuard::set(UiKind::ENV, value);
+            let mut app = AppConfig {
+                ui: Some(UiMode::Repl),
+                ..AppConfig::default()
+            };
+
+            app.load_envs();
+
+            assert_eq!(app.ui, Some(UiMode::Repl), "COYOTE_UI={value}");
         }
     }
 

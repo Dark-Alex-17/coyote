@@ -13,7 +13,7 @@ main() {
     # shellcheck disable=SC2154
     argc_command="$(jq -r '.command' <<< "$LLM_TOOL_RAW_JSON")"
 
-    guard_operation
+    guard_operation "Run this command?" "$argc_command"
     local script
     script="$(mktemp)"
     # shellcheck disable=SC2064

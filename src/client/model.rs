@@ -414,6 +414,7 @@ pub fn tool_result_tokens(result: &ToolResult) -> usize {
         text: result.text.clone(),
         thinking: result.thinking.clone(),
         attachments: vec![],
+        user_messages: vec![],
     };
     let text_tokens = serde_json::to_string(&without_attachments)
         .map(|v| estimate_token_length(&v))

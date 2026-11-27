@@ -1,0 +1,2367 @@
+//! Terminal lifecycle for the full-screen UI. Every escape sequence goes
+//! through a descriptor dup'd from stdout once at start, so a command turn
+//! that redirects fd 1 into its capture pipe never swallows a draw or the
+//! restore, and the panic hook writes the leave sequence through that same
+//! descriptor before the default hook prints.
+//!
+//! On Windows the descriptor is a duplicated stdout handle, written through
+//! `WriteConsoleW` when it is a console, and the console modes crossterm
+//! cannot reach through a writer (escape processing, the input flags) are
+//! kept by hand here.
+
+use anyhow::Result;
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
+};
+use crossterm::{Command, execute};
+use ratatui::Terminal;
+use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
+use ratatui::layout::{Position, Size};
+use std::collections::BTreeSet;
+use std::fmt;
+use std::io::{self, Write};
+use std::sync::Once;
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, AtomicU64};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    ENABLE_EXTENDED_FLAGS, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+};
+
+#[cfg(unix)]
+pub(crate) type TtyWriter = std::fs::File;
+#[cfg(windows)]
+pub(crate) type TtyWriter = io::BufWriter<console::ConsoleWriter>;
+
+/// Raw fd of the dup'd stdout the panic hook restores through; -1 until
+/// `Screen::enter` has run, and again once the `Screen` is gone.
+#[cfg(unix)]
+static PANIC_FD: AtomicI32 = AtomicI32::new(-1);
+/// Raw handle of the duplicated stdout the panic hook restores through and
+/// the escape-processing check reads; 0 (the null handle, which no open
+/// handle has, while INVALID_HANDLE_VALUE is -1) until `Screen::enter` has
+/// run, and again once the `Screen` is gone.
+#[cfg(windows)]
+static CONSOLE_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// The console input mode before raw mode first came on, taken once per
+/// `Screen::enter`; the whole u32 range is a mode, so the "never taken"
+/// sentinel lives above it at `u64::MAX`.
+#[cfg(windows)]
+static SAVED_INPUT_MODE: AtomicU64 = AtomicU64::new(NO_SAVED_INPUT_MODE);
+#[cfg(windows)]
+const NO_SAVED_INPUT_MODE: u64 = u64::MAX;
+/// Whether the keyboard enhancement flags are currently pushed, so the
+/// leave path pops them exactly when the enter path pushed them.
+static ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+/// Whether `enter` has run without a matching `leave`. Keyed here rather
+/// than on crossterm's raw-mode flag because a command handler may toggle
+/// raw mode itself mid-session, which must not make `leave` skip the
+/// restore.
+static SCREEN_ENTERED: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK: Once = Once::new();
+
+thread_local! {
+    /// How many `catch_quietly` calls this thread is inside; the panic hook
+    /// leaves the terminal alone while it is above zero.
+    static QUIET_PANICS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The message of the last panic the hook let pass quietly, for the
+    /// `catch_quietly` that catches it.
+    static QUIET_MESSAGE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// The level the hook logs a quiet panic at, set by the innermost
+    /// `catch_quietly_at`.
+    static QUIET_LEVEL: std::cell::Cell<log::Level> = const { std::cell::Cell::new(log::Level::Warn) };
+}
+
+/// One terminal mode toggled on enter and back off on leave. The `bool` is
+/// the state the step moves the terminal to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalStep {
+    RawMode(bool),
+    AlternateScreen(bool),
+    /// Ratatui hides the cursor on every frame and only shows it again
+    /// from `Terminal`'s Drop, which a hard exit, a suspend and the panic
+    /// hook never reach; the leave sequence shows it itself.
+    CursorHidden(bool),
+    BracketedPaste(bool),
+    MouseCapture(bool),
+    KeyboardEnhancement(bool),
+}
+
+impl TerminalStep {
+    /// The step that undoes this one.
+    pub(crate) fn inverse(self) -> Self {
+        match self {
+            Self::RawMode(on) => Self::RawMode(!on),
+            Self::AlternateScreen(on) => Self::AlternateScreen(!on),
+            Self::CursorHidden(on) => Self::CursorHidden(!on),
+            Self::BracketedPaste(on) => Self::BracketedPaste(!on),
+            Self::MouseCapture(on) => Self::MouseCapture(!on),
+            Self::KeyboardEnhancement(on) => Self::KeyboardEnhancement(!on),
+        }
+    }
+
+    fn apply(self, writer: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::RawMode(true) => enable_raw_mode(),
+            Self::RawMode(false) => disable_raw_mode(),
+            Self::AlternateScreen(true) => execute!(writer, EnterAlternateScreen),
+            Self::AlternateScreen(false) => execute!(writer, LeaveAlternateScreen),
+            Self::CursorHidden(true) => execute!(writer, Hide),
+            Self::CursorHidden(false) => execute!(writer, Show),
+            Self::BracketedPaste(true) => execute!(writer, EnableBracketedPaste),
+            Self::BracketedPaste(false) => execute!(writer, DisableBracketedPaste),
+            Self::MouseCapture(true) => execute!(writer, EnableClickAndWheelReports),
+            Self::MouseCapture(false) => execute!(writer, DisableMouseCapture),
+            Self::KeyboardEnhancement(true) => execute!(
+                writer,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            ),
+            Self::KeyboardEnhancement(false) => execute!(writer, PopKeyboardEnhancementFlags),
+        }
+    }
+}
+
+/// Mouse reports for presses, releases and the wheel (?1000) and for
+/// motion while a button is held (?1002), in SGR encoding (?1006).
+/// crossterm's `EnableMouseCapture` also turns on any-motion tracking, so
+/// every pointer move would become an event the UI reads and drops.
+/// `DisableMouseCapture` still undoes it: it resets the modes asked for
+/// here and the ones a crossterm enable would have left.
+struct EnableClickAndWheelReports;
+
+impl Command for EnableClickAndWheelReports {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        crossterm::event::EnableMouseCapture.is_ansi_code_supported()
+    }
+}
+
+/// The modes switched on when the UI takes the terminal, in order. The
+/// enhancement flags are pushed last, after the alternate screen is up, and
+/// only when the terminal answered the probe.
+pub(crate) fn enter_sequence(enhancement: bool) -> Vec<TerminalStep> {
+    let mut steps = vec![
+        TerminalStep::RawMode(true),
+        TerminalStep::AlternateScreen(true),
+        TerminalStep::CursorHidden(true),
+        TerminalStep::BracketedPaste(true),
+        TerminalStep::MouseCapture(true),
+    ];
+    if enhancement {
+        steps.push(TerminalStep::KeyboardEnhancement(true));
+    }
+    steps
+}
+
+/// The strict mirror of [`enter_sequence`]: the same modes switched off in
+/// reverse order.
+pub(crate) fn leave_sequence(enhancement: bool) -> Vec<TerminalStep> {
+    enter_sequence(enhancement)
+        .into_iter()
+        .rev()
+        .map(TerminalStep::inverse)
+        .collect()
+}
+
+/// Asks the terminal whether it speaks the kitty keyboard protocol. Reads
+/// the tty, so it must run before the event stream owns stdin.
+pub(crate) fn probe_keyboard_enhancement() -> bool {
+    supports_keyboard_enhancement().unwrap_or(false)
+}
+
+/// A second handle on stdout, independent of what a later `dup2` puts on
+/// fd 1.
+#[cfg(unix)]
+pub(crate) fn open_tty_writer() -> io::Result<TtyWriter> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created by fcntl and nothing else owns it.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// A second handle on stdout, independent of what a later `SetStdHandle`
+/// makes the process's stdout.
+#[cfg(windows)]
+pub(crate) fn open_tty_writer() -> io::Result<TtyWriter> {
+    use std::os::windows::io::AsHandle;
+    let handle = io::stdout().as_handle().try_clone_to_owned()?;
+    Ok(io::BufWriter::new(console::ConsoleWriter::new(handle)))
+}
+
+#[cfg(windows)]
+mod console {
+    use std::io::{self, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
+    };
+    use windows_sys::Win32::System::Console::{GetConsoleMode, SetConsoleMode, WriteConsoleW};
+
+    /// Writes to a console through `WriteConsoleW`, so text outside the
+    /// console's code page still arrives intact, and to anything else (a
+    /// pipe, a file) through `WriteFile`. Console writes go through
+    /// [`super::utf8_chunk`], which holds back a trailing partial UTF-8
+    /// sequence between calls and caps each call's units.
+    pub(crate) struct ConsoleWriter {
+        handle: OwnedHandle,
+        pending: [u8; 4],
+        pending_len: usize,
+    }
+
+    impl ConsoleWriter {
+        pub(super) fn new(handle: OwnedHandle) -> Self {
+            Self {
+                handle,
+                pending: [0; 4],
+                pending_len: 0,
+            }
+        }
+
+        pub(super) fn raw_handle(&self) -> HANDLE {
+            self.handle.as_raw_handle()
+        }
+    }
+
+    impl Write for ConsoleWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let handle = self.raw_handle();
+            if mode(handle).is_err() {
+                return write_file(handle, buf);
+            }
+            let (units, consumed) =
+                super::utf8_chunk(&mut self.pending, &mut self.pending_len, buf)?;
+            write_console(handle, &units)?;
+            Ok(consumed)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writes every unit of `units`, which `utf8_chunk` capped at
+    /// `MAX_UNITS_PER_WRITE`; `WriteConsoleW` may stop short, so the rest
+    /// goes in the next call.
+    fn write_console(handle: HANDLE, mut rest: &[u16]) -> io::Result<()> {
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            let len = rest.len() as u32;
+            // SAFETY: `rest` is valid for `len` units; the count out pointer
+            // is a valid local; the reserved pointer has to be null.
+            let ok =
+                unsafe { WriteConsoleW(handle, rest.as_ptr(), len, &mut written, ptr::null()) };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            rest = &rest[written as usize..];
+        }
+        Ok(())
+    }
+
+    fn write_file(handle: HANDLE, buf: &[u8]) -> io::Result<usize> {
+        let mut written = 0u32;
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        // SAFETY: `buf` is valid for `len` bytes; the count out pointer is
+        // a valid local; a null OVERLAPPED selects the blocking form.
+        let ok = unsafe { WriteFile(handle, buf.as_ptr(), len, &mut written, ptr::null_mut()) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(written as usize)
+    }
+
+    /// The console mode of `handle`; an error means it is not a console.
+    pub(super) fn mode(handle: HANDLE) -> io::Result<u32> {
+        let mut mode = 0u32;
+        // SAFETY: the out pointer is a valid local; the result is checked.
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(mode)
+    }
+
+    pub(super) fn set_mode(handle: HANDLE, mode: u32) -> io::Result<()> {
+        // SAFETY: SetConsoleMode takes no pointers; the result is checked.
+        if unsafe { SetConsoleMode(handle, mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The console's input buffer, whatever the process's stdin handle
+    /// points at right now.
+    pub(super) fn open_input() -> io::Result<OwnedHandle> {
+        open_console("CONIN$")
+    }
+
+    /// The console's active screen buffer, whatever the process's stdout
+    /// handle points at right now.
+    #[cfg(test)]
+    pub(super) fn open_output() -> io::Result<OwnedHandle> {
+        open_console("CONOUT$")
+    }
+
+    fn open_console(name: &str) -> io::Result<OwnedHandle> {
+        let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `name` is NUL terminated; the null attributes and
+        // template are the documented defaults.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle was just returned by CreateFileW and nothing
+        // else owns it.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+/// Most UTF-16 units handed to one `WriteConsoleW`; the console host
+/// fails larger buffers outright on some Windows versions.
+#[cfg(any(windows, test))]
+const MAX_UNITS_PER_WRITE: usize = 8192;
+
+/// Splits one write of `buf` into the UTF-16 units the console gets now
+/// and how many bytes of `buf` they account for. A write that ends inside
+/// a UTF-8 sequence has those bytes held in `pending` and reported as
+/// consumed, the same way std's stdout treats them, since the buffer in
+/// front of the writer splits at byte counts, not character boundaries.
+/// The units stop at `MAX_UNITS_PER_WRITE` on a character boundary, so
+/// a surrogate pair never straddles two console writes.
+#[cfg(any(windows, test))]
+fn utf8_chunk(
+    pending: &mut [u8; 4],
+    pending_len: &mut usize,
+    buf: &[u8],
+) -> io::Result<(Vec<u16>, usize)> {
+    if *pending_len > 0 {
+        return complete_pending(pending, pending_len, buf);
+    }
+    let text = match std::str::from_utf8(buf) {
+        Ok(text) => text,
+        Err(err) if err.valid_up_to() == 0 && err.error_len().is_none() => {
+            // An unfinished sequence is under four bytes, so this is the
+            // whole of `buf`.
+            pending[..buf.len()].copy_from_slice(buf);
+            *pending_len = buf.len();
+            return Ok((Vec::new(), buf.len()));
+        }
+        Err(err) if err.valid_up_to() == 0 => return Err(invalid_utf8()),
+        Err(err) => std::str::from_utf8(&buf[..err.valid_up_to()])
+            .expect("from_utf8 vouched for this prefix"),
+    };
+    let mut units = Vec::with_capacity(text.len().min(MAX_UNITS_PER_WRITE));
+    let mut consumed = 0;
+    for c in text.chars() {
+        if units.len() + c.len_utf16() > MAX_UNITS_PER_WRITE {
+            break;
+        }
+        units.extend_from_slice(c.encode_utf16(&mut [0u16; 2]));
+        consumed += c.len_utf8();
+    }
+    Ok((units, consumed))
+}
+
+/// Finishes the sequence held back by an earlier write. The lead byte's
+/// run of leading one bits is the sequence length, and it is in 2..=4
+/// because `from_utf8` classified the held bytes as an incomplete
+/// sequence rather than invalid ones.
+#[cfg(any(windows, test))]
+fn complete_pending(
+    pending: &mut [u8; 4],
+    pending_len: &mut usize,
+    buf: &[u8],
+) -> io::Result<(Vec<u16>, usize)> {
+    let width = pending[0].leading_ones() as usize;
+    let take = buf.len().min(width - *pending_len);
+    pending[*pending_len..*pending_len + take].copy_from_slice(&buf[..take]);
+    *pending_len += take;
+    if *pending_len < width {
+        return Ok((Vec::new(), take));
+    }
+    *pending_len = 0;
+    match std::str::from_utf8(&pending[..width]) {
+        Ok(text) => Ok((text.encode_utf16().collect(), take)),
+        Err(_) => Err(invalid_utf8()),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn invalid_utf8() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Windows console writes must be valid UTF-8",
+    )
+}
+
+/// Switches escape processing on for the recorded console if a child the
+/// UI ran left it off. A no-op before `Screen::enter`, after the `Screen`
+/// is gone, and when the handle is not a console. The output mode is left
+/// on at exit on purpose: escape processing is the console default on
+/// current Windows, and crossterm leaves it on as well.
+#[cfg(windows)]
+fn ensure_vt_processing() {
+    let handle = CONSOLE_HANDLE.load(Ordering::SeqCst);
+    if handle == 0 {
+        return;
+    }
+    let handle = handle as HANDLE;
+    let Ok(current) = console::mode(handle) else {
+        return;
+    };
+    if let Some(wanted) = vt_output_mode(current) {
+        let _ = console::set_mode(handle, wanted);
+    }
+}
+
+/// `current` with escape processing fully on, or None when it already is.
+/// Only the two bits escape output needs are touched; newline handling
+/// and input flags stay whatever they are.
+#[cfg(windows)]
+fn vt_output_mode(current: u32) -> Option<u32> {
+    const WANTED: u32 = ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
+    (current & WANTED != WANTED).then_some(current | WANTED)
+}
+
+/// The mode to hand `SetConsoleMode` so that `saved` is applied whole:
+/// without ENABLE_EXTENDED_FLAGS the call leaves quick-edit and insert
+/// mode as they are instead of restoring them.
+#[cfg(windows)]
+fn restored_input_mode(saved: u32) -> u32 {
+    saved | ENABLE_EXTENDED_FLAGS
+}
+
+/// Reads the console input mode and records it for every later restore,
+/// or None (recording nothing) when there is no console to ask, in which
+/// case the mode cannot be put back on exit either.
+#[cfg(windows)]
+fn snapshot_input_mode() -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mode = console::open_input()
+        .and_then(|input| console::mode(input.as_raw_handle()))
+        .map_err(|err| {
+            warn!("Could not read the console input mode; it will not be restored on exit: {err}");
+        })
+        .ok()?;
+    SAVED_INPUT_MODE.store(u64::from(mode), Ordering::SeqCst);
+    Some(mode)
+}
+
+#[cfg(windows)]
+fn restore_input_mode(saved: u32) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let input = console::open_input()?;
+    console::set_mode(input.as_raw_handle(), restored_input_mode(saved))
+}
+
+/// The restore `leave` does from the recorded mode. crossterm restores
+/// nothing of the Windows input mode, so this is the only thing that
+/// brings quick-edit, insert mode and VT input back. A no-op while the
+/// sentinel is in place, which is what the failed `u32` conversion means.
+#[cfg(windows)]
+fn restore_input_mode_from_static() -> io::Result<()> {
+    match u32::try_from(SAVED_INPUT_MODE.load(Ordering::SeqCst)) {
+        Ok(saved) => restore_input_mode(saved),
+        Err(_) => Ok(()),
+    }
+}
+
+/// The tty's current line-discipline settings.
+#[cfg(unix)]
+fn tty_modes(fd: i32) -> io::Result<libc::termios> {
+    let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr fills one termios through a valid pointer; the
+    // result is checked before the value is read.
+    if unsafe { libc::tcgetattr(fd, modes.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a zero return means tcgetattr initialised `modes`.
+    Ok(unsafe { modes.assume_init() })
+}
+
+#[cfg(unix)]
+fn set_tty_modes(fd: i32, modes: &libc::termios) -> io::Result<()> {
+    // SAFETY: tcsetattr reads one termios through a valid pointer; the
+    // result is checked.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, modes) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Installs the restoring panic hook in front of whatever hook is current.
+/// Returns whether this call installed it; later calls are no-ops.
+pub(crate) fn install_panic_hook() -> bool {
+    let mut installed = false;
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if QUIET_PANICS.try_with(|q| q.get() > 0).unwrap_or(false) {
+                let message = info.payload_as_str().unwrap_or("panicked").to_string();
+                let at = info
+                    .location()
+                    .map(|at| format!(" at {at}"))
+                    .unwrap_or_default();
+                let level = QUIET_LEVEL
+                    .try_with(std::cell::Cell::get)
+                    .unwrap_or(log::Level::Warn);
+                log!(
+                    level,
+                    "Recovered from a panic{at}: {}",
+                    super::render::plain_text(&message)
+                );
+                let _ = QUIET_MESSAGE.try_with(|m| *m.borrow_mut() = Some(message));
+                return;
+            }
+            restore_from_static();
+            echo_panic_past_capture(info);
+            previous(info);
+        }));
+        installed = true;
+    });
+    installed
+}
+
+/// Counts this thread into `QUIET_PANICS` for as long as it lives, so the
+/// count comes back down however the call it guards ends. Entering clears
+/// any message left by a quiet panic that something other than
+/// `catch_quietly` caught, so it is never taken for this call's own.
+struct QuietGuard {
+    outer_level: log::Level,
+}
+
+impl QuietGuard {
+    fn enter(level: log::Level) -> Self {
+        let _ = QUIET_PANICS.try_with(|q| q.set(q.get() + 1));
+        let _ = QUIET_MESSAGE.try_with(|m| m.borrow_mut().take());
+        let outer_level = QUIET_LEVEL
+            .try_with(|l| l.replace(level))
+            .unwrap_or(log::Level::Warn);
+        Self { outer_level }
+    }
+}
+
+impl Drop for QuietGuard {
+    fn drop(&mut self) {
+        let _ = QUIET_PANICS.try_with(|q| q.set(q.get() - 1));
+        let _ = QUIET_LEVEL.try_with(|l| l.set(self.outer_level));
+    }
+}
+
+/// Runs `f`, turning a panic in it into an error carrying the panic's
+/// message, scrubbed of escapes and format characters as it is shown in a
+/// cell. The panic hook leaves such a panic to the caller: the screen is
+/// not handed back and nothing is echoed, so a recovered failure does not
+/// flash the terminal. It is logged instead.
+pub(crate) fn catch_quietly<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_quietly_at(log::Level::Warn, f)
+}
+
+/// `catch_quietly`, logging the panic at `level`; a caller that may meet
+/// the same failure on every frame logs it below warn.
+pub(crate) fn catch_quietly_at<T>(level: log::Level, f: impl FnOnce() -> T) -> Result<T, String> {
+    let guard = QuietGuard::enter(level);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    drop(guard);
+    caught.map_err(|payload| {
+        let message = QUIET_MESSAGE
+            .try_with(|m| m.borrow_mut().take())
+            .ok()
+            .flatten()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panicked".to_string());
+        super::render::plain_text(&message)
+    })
+}
+
+/// The terminal behind the descriptor `enter` recorded, or None before
+/// `Screen::enter` and after the `Screen` is gone.
+#[cfg(unix)]
+fn static_tty() -> Option<std::mem::ManuallyDrop<std::fs::File>> {
+    use std::os::fd::FromRawFd;
+    // Read, not taken: the fd stays armed for the next panic, since a
+    // background task's panic is caught as a join error and the UI
+    // re-enters the screen afterwards. `leave` itself is single-taker
+    // through SCREEN_ENTERED, so two hooks cannot both write.
+    let fd = PANIC_FD.load(Ordering::SeqCst);
+    (fd >= 0).then(|| {
+        // SAFETY: the fd was dup'd by `open_tty_writer`; `Screen` clears
+        // PANIC_FD before the writer that owns the fd drops, so this write
+        // normally lands on an open descriptor. A hook racing `Screen::drop`
+        // on another thread can still find it closed and get EBADF, which
+        // is ignored like every other error here. ManuallyDrop keeps this
+        // handle from closing the fd.
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
+    })
+}
+
+/// The console behind the handle `enter` recorded, or None before
+/// `Screen::enter` and after the `Screen` is gone.
+#[cfg(windows)]
+fn static_tty() -> Option<std::mem::ManuallyDrop<console::ConsoleWriter>> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    // Read, not taken, for the same reason as the unix fd: the handle
+    // stays armed for the next panic after a caught one.
+    let handle = CONSOLE_HANDLE.load(Ordering::SeqCst);
+    (handle != 0).then(|| {
+        // SAFETY: the handle was duplicated by `open_tty_writer`; `Screen`
+        // clears CONSOLE_HANDLE before the writer that owns it drops, so
+        // this write normally lands on an open handle. A hook racing
+        // `Screen::drop` on another thread can still find it closed and
+        // get ERROR_INVALID_HANDLE, which is ignored like every other
+        // error here. ManuallyDrop keeps this writer from closing it.
+        std::mem::ManuallyDrop::new(console::ConsoleWriter::new(unsafe {
+            OwnedHandle::from_raw_handle(handle as _)
+        }))
+    })
+}
+
+/// Writes the leave sequence through the descriptor `enter` recorded. Runs
+/// on the panic path, so every error is ignored: there is nothing left to
+/// report it to.
+fn restore_from_static() {
+    if let Some(mut writer) = static_tty() {
+        let _ = leave(&mut *writer);
+    }
+}
+
+/// The hook after this one prints to fd 2, which during a command turn is
+/// the capture pipe. A panic on a work thread is caught as a join error
+/// and its text comes back through the late-output path; the driver's own
+/// panic ends the process with the text still in the pipe, so it is
+/// written to the terminal here as well, after `leave` has cooked it.
+fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
+    if super::redirect::output_captured()
+        && std::thread::current().name() == Some(crate::MAIN_THREAD_NAME)
+        && let Some(mut tty) = static_tty()
+    {
+        // The payload is whatever the panicking code formatted; it goes
+        // to the restored terminal stripped of anything it could do there.
+        let message = super::render::plain_text(&info.to_string());
+        let _ = writeln!(tty, "thread '{}' {message}", crate::MAIN_THREAD_NAME);
+    }
+}
+
+/// Switches the terminal into the UI's modes.
+pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()> {
+    install_panic_hook();
+    #[cfg(windows)]
+    ensure_vt_processing();
+    enter_steps(writer, enter_sequence(enhancement))
+}
+
+/// Applies `steps` in order. A failing step hands the terminal back through
+/// `leave`, which undoes the full sequence (switching off a mode that never
+/// came on is harmless) and clears the entered flag.
+fn enter_steps(writer: &mut impl Write, steps: Vec<TerminalStep>) -> io::Result<()> {
+    SCREEN_ENTERED.store(true, Ordering::SeqCst);
+    for step in steps {
+        if let Err(err) = step.apply(writer) {
+            let _ = leave(writer);
+            return Err(err);
+        }
+        if step == TerminalStep::KeyboardEnhancement(true) {
+            ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
+        }
+    }
+    Ok(())
+}
+
+/// Restores the terminal; a no-op unless `enter` ran since the last call,
+/// so the panic hook and the normal exit path can both call it. Keeps
+/// going past a failed step so the later modes still get restored. On
+/// Windows the console input mode goes back last, by hand: crossterm
+/// restores none of it (its `disable_raw_mode` only ORs the raw-mode bits
+/// back on and its mouse-capture disable replays its own first snapshot),
+/// so this is what brings quick-edit, insert mode and VT input back.
+pub(crate) fn leave(writer: &mut impl Write) -> io::Result<()> {
+    if !SCREEN_ENTERED.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    ensure_vt_processing();
+    let enhancement = ENHANCEMENT_PUSHED.swap(false, Ordering::SeqCst);
+    let mut first_error = None;
+    for step in leave_sequence(enhancement) {
+        if let Err(err) = step.apply(writer) {
+            first_error.get_or_insert(err);
+        }
+    }
+    #[cfg(windows)]
+    if let Err(err) = restore_input_mode_from_static() {
+        first_error.get_or_insert(err);
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The backend the screen draws through: crossterm, with the rows each
+/// frame touched on record.
+type ScreenBackend<W> = RowTrackingBackend<CrosstermBackend<W>>;
+
+/// A backend that passes everything through to `backend` and keeps the
+/// rows the `draw` calls since `forget_rows` wrote to, so a frame can
+/// tell which rows ratatui's cell diff reached.
+struct RowTrackingBackend<B> {
+    backend: B,
+    rows: BTreeSet<u16>,
+}
+
+impl<B> RowTrackingBackend<B> {
+    fn new(backend: B) -> Self {
+        Self {
+            backend,
+            rows: BTreeSet::new(),
+        }
+    }
+
+    fn forget_rows(&mut self) {
+        self.rows.clear();
+    }
+
+    fn drew_row(&self, y: u16) -> bool {
+        self.rows.contains(&y)
+    }
+}
+
+impl<B: Backend> Backend for RowTrackingBackend<B> {
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let rows = &mut self.rows;
+        self.backend.draw(content.inspect(|(_, y, _)| {
+            rows.insert(*y);
+        }))
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.backend.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.backend.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        self.backend.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+        self.backend.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.backend.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: BackendClearType) -> Result<(), Self::Error> {
+        self.backend.clear_region(clear_type)
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+        self.backend.append_lines(n)
+    }
+
+    fn size(&self) -> Result<Size, Self::Error> {
+        self.backend.size()
+    }
+
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+        self.backend.window_size()
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.backend.flush()
+    }
+}
+
+/// The escape sequences around a frame and the lines printed after
+/// `leave` go to the backend's writer, as they do on a bare crossterm
+/// backend.
+impl<B: Write> Write for RowTrackingBackend<B> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.backend.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.backend.flush()
+    }
+}
+
+/// One frame bracketed by a synchronized update so the terminal paints it
+/// atomically. Rows holding emoji or VS16/ZWJ graphemes that the frame
+/// changed are re-emitted whole after ratatui's cell diff, since
+/// terminals disagree on how many columns those take and a partial
+/// repaint leaves ghost cells behind.
+fn draw_frame<W: Write>(
+    terminal: &mut Terminal<ScreenBackend<W>>,
+    render: impl FnOnce(&mut ratatui::Frame),
+) -> io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let drawn = draw_and_repaint_uncertain(terminal, render);
+    let ended = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    drawn.and(ended)
+}
+
+/// Draws the frame, then writes every cell of each row `uncertain_rows`
+/// picks and the diff wrote to straight to the backend. A row the diff
+/// left alone is on screen as the last frame painted it, so its repaint
+/// would only cost bytes. The hardware cursor is hidden for the whole UI
+/// (nothing sets a cursor position), so the extra draw cannot leave it
+/// somewhere ratatui does not expect.
+fn draw_and_repaint_uncertain<B: Backend>(
+    terminal: &mut Terminal<RowTrackingBackend<B>>,
+    render: impl FnOnce(&mut ratatui::Frame),
+) -> Result<(), B::Error> {
+    terminal.backend_mut().forget_rows();
+    let cells = uncertain_rows(terminal.draw(render)?.buffer);
+    let backend = terminal.backend_mut();
+    let cells: Vec<_> = cells
+        .into_iter()
+        .filter(|(_, y, _)| backend.drew_row(*y))
+        .collect();
+    if cells.is_empty() {
+        return Ok(());
+    }
+    backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+    backend.flush()
+}
+
+/// Every cell, in x order, of each row whose symbols include a
+/// presentation selector (U+FE0E, U+FE0F), a ZWJ sequence (U+200D), a
+/// keycap (U+20E3), a symbol from the U+2600..=U+27BF blocks, one of the
+/// Emoji_Presentation characters scattered below them (watches, media
+/// controls, squares, stars), or anything at U+1F000 and above. Cells
+/// hidden under a wide grapheme are left out the way ratatui's own diff
+/// leaves them out, so the repaint never splits a grapheme.
+fn uncertain_rows(buffer: &Buffer) -> Vec<(u16, u16, Cell)> {
+    let area = buffer.area;
+    let mut cells = Vec::new();
+    for y in area.top()..area.bottom() {
+        let row = (area.left()..area.right()).map(|x| &buffer[(x, y)]);
+        if !row
+            .clone()
+            .any(|cell| cell.symbol().chars().any(is_width_uncertain))
+        {
+            continue;
+        }
+        let mut hidden = 0u16;
+        for (x, cell) in (area.left()..area.right()).zip(row) {
+            if hidden > 0 {
+                hidden -= 1;
+                continue;
+            }
+            if matches!(cell.diff_option, CellDiffOption::Skip) {
+                continue;
+            }
+            hidden = cell.cell_width().saturating_sub(1);
+            cells.push((x, y, cell.clone()));
+        }
+    }
+    cells
+}
+
+fn is_width_uncertain(c: char) -> bool {
+    matches!(
+        c,
+        '\u{FE0E}'..='\u{FE0F}'
+            | '\u{200D}'
+            | '\u{20E3}'
+            | '\u{231A}'..='\u{231B}'
+            | '\u{23E9}'..='\u{23F3}'
+            | '\u{23F8}'..='\u{23FA}'
+            | '\u{25FD}'..='\u{25FE}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{2B1B}'..='\u{2B1C}'
+            | '\u{2B50}'
+            | '\u{2B55}'
+            | '\u{3030}'
+            | '\u{303D}'
+            | '\u{3297}'
+            | '\u{3299}'
+    ) || c >= '\u{1F000}'
+}
+
+/// Clears the terminal and forgets both of ratatui's buffers so the next
+/// `draw` repaints every cell. `Terminal::clear` is not used because it
+/// starts with a cursor-position query, which blocks until the event
+/// stream answers it, and nothing polls that stream here.
+fn repaint_from_scratch<W: Write>(terminal: &mut Terminal<ScreenBackend<W>>) -> io::Result<()> {
+    execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+    terminal.current_buffer_mut().reset();
+    terminal.swap_buffers();
+    Ok(())
+}
+
+/// Re-applies the terminal modes and schedules a full repaint when `leave`
+/// ran behind the UI's back: the panic hook restores the terminal for a
+/// panic on a background task too, and that one is caught as a join error
+/// while the loop keeps drawing. Returns whether it had to.
+fn reenter_if_left<W: Write>(
+    terminal: &mut Terminal<ScreenBackend<W>>,
+    steps: Vec<TerminalStep>,
+) -> io::Result<bool> {
+    if SCREEN_ENTERED.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    warn!("The terminal was restored behind the UI; re-entering the screen");
+    enter_steps(terminal.backend_mut(), steps)?;
+    repaint_from_scratch(terminal)?;
+    Ok(true)
+}
+
+/// The alternate screen the UI draws on, with the terminal modes it owns.
+pub(crate) struct Screen {
+    terminal: Terminal<ScreenBackend<TtyWriter>>,
+    enhancement: bool,
+    #[cfg(unix)]
+    fd: i32,
+    #[cfg(windows)]
+    handle: isize,
+    /// The line discipline as it was before raw mode first came on. Raw
+    /// mode is restored from crossterm's own snapshot, which it takes on
+    /// the first `enable_raw_mode` after a `disable_raw_mode`; a child
+    /// run with the terminal released may change the modes in between,
+    /// so the re-entry puts these back first.
+    #[cfg(unix)]
+    cooked: libc::termios,
+    /// The console input mode before raw mode first came on. crossterm
+    /// restores nothing of it, so this copy (and the static one `leave`
+    /// reads) is all that brings quick-edit, insert mode and VT input
+    /// back; None when there was no console to ask, in which case nothing
+    /// is restored.
+    #[cfg(windows)]
+    input_mode: Option<u32>,
+}
+
+impl Screen {
+    /// Probes the terminal, enters the alternate screen and builds the
+    /// ratatui terminal over the dup'd stdout. The terminal is built
+    /// first (it only asks for the size) so a failure after the modes are
+    /// applied cannot leave them on, and the input mode is recorded only
+    /// once nothing but `enter` itself can still fail, so an early error
+    /// never leaves the static armed.
+    pub(crate) fn enter() -> Result<Self> {
+        let enhancement = probe_keyboard_enhancement();
+        let writer = open_tty_writer()?;
+        #[cfg(unix)]
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
+        #[cfg(windows)]
+        let handle = writer.get_ref().raw_handle() as isize;
+        #[cfg(unix)]
+        let cooked = tty_modes(fd)?;
+        let mut terminal = Terminal::new(RowTrackingBackend::new(CrosstermBackend::new(writer)))?;
+        #[cfg(unix)]
+        PANIC_FD.store(fd, Ordering::SeqCst);
+        #[cfg(windows)]
+        let input_mode = snapshot_input_mode();
+        #[cfg(windows)]
+        CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
+        if let Err(err) = enter(terminal.backend_mut(), enhancement) {
+            // Taken back before `terminal` drops the writer: the hook must
+            // never write to a closed or reused descriptor.
+            #[cfg(unix)]
+            PANIC_FD.swap(-1, Ordering::SeqCst);
+            #[cfg(windows)]
+            {
+                CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
+                SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+            }
+            return Err(err.into());
+        }
+        Ok(Self {
+            terminal,
+            enhancement,
+            #[cfg(unix)]
+            fd,
+            #[cfg(windows)]
+            handle,
+            #[cfg(unix)]
+            cooked,
+            #[cfg(windows)]
+            input_mode,
+        })
+    }
+
+    /// Points the panic hook at this screen's descriptor again. Called
+    /// after every re-enter so the hook's view never depends on which
+    /// path last took the terminal.
+    fn arm_panic_hook(&self) {
+        #[cfg(unix)]
+        PANIC_FD.store(self.fd, Ordering::SeqCst);
+        #[cfg(windows)]
+        CONSOLE_HANDLE.store(self.handle, Ordering::SeqCst);
+    }
+
+    #[cfg(unix)]
+    fn restore_cooked_modes(&self) -> io::Result<()> {
+        set_tty_modes(self.fd, &self.cooked)
+    }
+
+    /// Drops what was typed while the terminal was released. Keys typed
+    /// at a cooked terminal wait in its line buffer, and switching raw
+    /// mode back on does not wake the event reader on Linux, so they
+    /// would otherwise surface with the next keystroke.
+    #[cfg(unix)]
+    fn discard_typeahead(&self) -> io::Result<()> {
+        // SAFETY: tcflush takes a descriptor and a queue selector only.
+        if unsafe { libc::tcflush(self.fd, libc::TCIFLUSH) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn restore_cooked_modes(&self) -> io::Result<()> {
+        match self.input_mode {
+            Some(mode) => restore_input_mode(mode),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
+        // Ahead of the re-entry check as well as the frame: a child that
+        // reset the console mode leaves it off for both.
+        #[cfg(windows)]
+        ensure_vt_processing();
+        if reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))? {
+            self.arm_panic_hook();
+        }
+        draw_frame(&mut self.terminal, render)
+    }
+
+    pub(crate) fn clear(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        ensure_vt_processing();
+        repaint_from_scratch(&mut self.terminal)
+    }
+
+    pub(crate) fn leave(&mut self) -> io::Result<()> {
+        leave(self.terminal.backend_mut())
+    }
+
+    /// Prints a line through the dup'd descriptor, for a message that has
+    /// to reach the terminal while fds 1 and 2 are still captured by a
+    /// turn that never finished. Meant for after `leave`.
+    pub(crate) fn print_line(&mut self, text: &str) -> io::Result<()> {
+        let writer = self.terminal.backend_mut();
+        writeln!(writer, "{text}")?;
+        Write::flush(writer)
+    }
+
+    /// The dup'd descriptor, for an escape sequence meant for the terminal
+    /// itself, such as an OSC 52 clipboard request: fd 1 may be a turn's
+    /// capture pipe.
+    pub(crate) fn writer(&mut self) -> &mut impl Write {
+        self.terminal.backend_mut()
+    }
+
+    /// Hands the terminal to `f` in its normal modes (a suspended shell, an
+    /// editor), then takes it back: puts the line discipline back to its
+    /// pre-UI state so a child that changed it (an editor leaving echo
+    /// off) leaves no trace in what the final `leave` restores, re-enters,
+    /// and clears so the next frame repaints everything.
+    pub(crate) fn with_terminal_released<T>(&mut self, f: impl FnOnce() -> T) -> io::Result<T> {
+        self.leave()?;
+        let value = f();
+        #[cfg(unix)]
+        if let Err(err) = self.discard_typeahead() {
+            warn!("Failed to drop the input typed while the terminal was released: {err}");
+        }
+        if let Err(err) = self.restore_cooked_modes() {
+            warn!("Failed to restore the terminal modes after the terminal was released: {err}");
+        }
+        enter(self.terminal.backend_mut(), self.enhancement)?;
+        self.arm_panic_hook();
+        repaint_from_scratch(&mut self.terminal)?;
+        Ok(value)
+    }
+}
+
+/// An early `?` or an unwind between `enter` and the explicit `leave` in
+/// the run loop still restores the terminal; after that `leave` this is a
+/// no-op. The hook's descriptor is forgotten here, ahead of the writer
+/// closing it; a hook already past its `load` on another thread writes to
+/// the closed fd and ignores the EBADF.
+impl Drop for Screen {
+    fn drop(&mut self) {
+        let _ = self.leave();
+        #[cfg(unix)]
+        PANIC_FD.swap(-1, Ordering::SeqCst);
+        #[cfg(windows)]
+        {
+            CONSOLE_HANDLE.swap(0, Ordering::SeqCst);
+            SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+    use ratatui::layout::Rect;
+    use ratatui::layout::{Position, Size};
+    use ratatui::widgets::Paragraph;
+    use ratatui::{TerminalOptions, Viewport};
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    // crossterm decides once per process whether its commands emit escape
+    // bytes or call the console API, from `TERM` and whether enabling
+    // escape processing on stdout works; a runner without a console would
+    // fail the second check and route the alternate-screen command away
+    // from the pipe the tests below read. `TERM` set to anything but
+    // "dumb" settles it before the cache is filled.
+    //
+    // `unsafe` is ctor's required acknowledgment that this runs before
+    // main; the body is sound pre-main because no other thread exists.
+    #[cfg(windows)]
+    #[ctor::ctor(unsafe)]
+    fn force_ansi_terminal() {
+        if std::env::var_os("TERM").is_none() {
+            // SAFETY: no other thread exists before main, so nothing can be
+            // reading the environment concurrently.
+            unsafe { std::env::set_var("TERM", "xterm-256color") };
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBuf {
+        fn take(&self) -> String {
+            String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
+        }
+    }
+
+    /// A terminal writing into `buf`; the fixed viewport keeps ratatui
+    /// from asking the (absent) terminal for its size.
+    fn buffer_terminal(buf: &SharedBuf) -> Terminal<ScreenBackend<SharedBuf>> {
+        Terminal::with_options(
+            RowTrackingBackend::new(CrosstermBackend::new(buf.clone())),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A writer that fails its `n`th write and records the rest.
+    #[cfg(unix)]
+    struct FailingWriter {
+        out: Vec<u8>,
+        writes: usize,
+        fail_at: usize,
+    }
+
+    #[cfg(unix)]
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == self.fail_at {
+                return Err(io::Error::other("write refused"));
+            }
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The enter steps that only write to the terminal: raw mode is left
+    /// out because it would switch the test runner's own tty.
+    #[cfg(unix)]
+    fn writing_enter_steps() -> Vec<TerminalStep> {
+        enter_sequence(false)
+            .into_iter()
+            .filter(|step| !matches!(step, TerminalStep::RawMode(_)))
+            .collect()
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
+    #[test]
+    fn leave_sequence_is_the_strict_mirror_of_enter() {
+        for enhancement in [false, true] {
+            let enter = enter_sequence(enhancement);
+            let leave = leave_sequence(enhancement);
+            assert_eq!(enter.len(), leave.len());
+            let mirrored: Vec<TerminalStep> =
+                leave.iter().rev().map(|step| step.inverse()).collect();
+            assert_eq!(mirrored, enter);
+            assert_eq!(enter[0], TerminalStep::RawMode(true));
+            assert_eq!(enter[1], TerminalStep::AlternateScreen(true));
+            assert_eq!(enter[2], TerminalStep::CursorHidden(true));
+            assert_eq!(enter[3], TerminalStep::BracketedPaste(true));
+            assert_eq!(enter[4], TerminalStep::MouseCapture(true));
+            assert_eq!(*leave.last().unwrap(), TerminalStep::RawMode(false));
+        }
+        assert_eq!(
+            *enter_sequence(true).last().unwrap(),
+            TerminalStep::KeyboardEnhancement(true)
+        );
+        assert!(
+            !enter_sequence(false)
+                .iter()
+                .any(|step| matches!(step, TerminalStep::KeyboardEnhancement(_)))
+        );
+    }
+
+    /// The UI reads presses, releases, the wheel and drags, so any-motion
+    /// tracking stays off; leaving switches off every mode entering asked
+    /// for.
+    #[cfg(unix)]
+    #[test]
+    fn mouse_capture_asks_for_clicks_drags_and_the_wheel_only() {
+        let mut enter = Vec::new();
+        TerminalStep::MouseCapture(true).apply(&mut enter).unwrap();
+        assert_eq!(enter, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        let mut leave = Vec::new();
+        TerminalStep::MouseCapture(false).apply(&mut leave).unwrap();
+        for mode in [&b"\x1b[?1000l"[..], b"\x1b[?1002l", b"\x1b[?1006l"] {
+            assert_eq!(count(&leave, mode), 1, "{leave:?}");
+        }
+    }
+
+    /// Without an `enter` on record there is nothing to undo, so `leave`
+    /// writes no bytes and a second call is just as quiet.
+    #[test]
+    #[serial]
+    fn leave_without_a_prior_enter_is_a_no_op_twice() {
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+        let mut out = Vec::new();
+        leave(&mut out).unwrap();
+        leave(&mut out).unwrap();
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A step failing midway hands back what came on before it: the
+    /// alternate screen entered by the first write is left again, the
+    /// flag is down, and nothing is pushed.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_failing_enter_step_unwinds_the_steps_already_applied() {
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+        let mut writer = FailingWriter {
+            out: Vec::new(),
+            writes: 0,
+            fail_at: 2,
+        };
+        let err = enter_steps(&mut writer, writing_enter_steps()).unwrap_err();
+        assert_eq!(err.to_string(), "write refused");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert!(!ENHANCEMENT_PUSHED.load(Ordering::SeqCst));
+        let enter_alt = find(&writer.out, b"\x1b[?1049h").expect("the first step was applied");
+        let leave_alt = find(&writer.out, b"\x1b[?1049l").expect("the applied step was undone");
+        assert!(enter_alt < leave_alt, "{:?}", writer.out);
+        assert!(
+            !writer.out.contains(&b'u'),
+            "no enhancement flags were pushed or popped: {:?}",
+            writer.out
+        );
+    }
+
+    /// `leave` undoes an `enter` once: the full mirror on the first call
+    /// (pop, then the modes, then the cursor shown inside the alternate
+    /// screen before it is left), nothing on the second.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn leave_restores_once_and_is_silent_afterwards() {
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        leave(&mut out).unwrap();
+        assert_eq!(count(&out, b"\x1b[?1049l"), 1, "{out:?}");
+        assert_eq!(count(&out, b"\x1b[<1u"), 1, "{out:?}");
+        assert!(find(&out, b"\x1b[<1u") < find(&out, b"\x1b[?1049l"));
+        assert_eq!(count(&out, b"\x1b[?25h"), 1, "{out:?}");
+        assert!(find(&out, b"\x1b[?25h") < find(&out, b"\x1b[?1049l"));
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert!(!ENHANCEMENT_PUSHED.load(Ordering::SeqCst));
+
+        let mut again = Vec::new();
+        leave(&mut again).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// A frame drawn after something else restored the terminal first
+    /// re-enters it and repaints from scratch; once back, drawing is just
+    /// drawing.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_draw_after_a_foreign_leave_reenters_and_repaints_once() {
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        assert!(reenter_if_left(&mut terminal, writing_enter_steps()).unwrap());
+        let bytes = out.take();
+        assert!(bytes.contains("\x1b[?1049h"), "{bytes:?}");
+        assert!(bytes.contains("\x1b[2J"), "{bytes:?}");
+        assert!(SCREEN_ENTERED.load(Ordering::SeqCst));
+
+        assert!(!reenter_if_left(&mut terminal, writing_enter_steps()).unwrap());
+        assert!(out.take().is_empty());
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+    }
+
+    /// The repaint helper never asks the terminal anything: a buffer that
+    /// cannot answer a cursor-position query gets the clear and the next
+    /// frame paints every cell, including the ones unchanged since before.
+    #[test]
+    fn repaint_from_scratch_clears_and_repaints_every_cell_without_a_query() {
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        let paint = |frame: &mut ratatui::Frame| {
+            frame.render_widget(Paragraph::new("cell-x7x"), frame.area());
+        };
+        terminal.draw(paint).unwrap();
+        out.take();
+        terminal.draw(paint).unwrap();
+        assert!(
+            !out.take().contains("cell-x7x"),
+            "an unchanged frame should paint nothing"
+        );
+
+        repaint_from_scratch(&mut terminal).unwrap();
+        let bytes = out.take();
+        assert!(bytes.contains("\x1b[2J"), "{bytes:?}");
+        assert!(!bytes.contains("\x1b[6n"), "{bytes:?}");
+        terminal.draw(paint).unwrap();
+        assert!(
+            out.take().contains("cell-x7x"),
+            "the frame after a repaint must paint every cell"
+        );
+    }
+
+    #[test]
+    fn a_frame_is_bracketed_by_a_synchronized_update() {
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        draw_frame(&mut terminal, |frame| {
+            frame.render_widget(Paragraph::new("x"), frame.area());
+        })
+        .unwrap();
+        let bytes = out.take();
+        assert!(bytes.starts_with("\x1b[?2026h"), "{bytes:?}");
+        assert!(bytes.ends_with("\x1b[?2026l"), "{bytes:?}");
+    }
+
+    fn positions(cells: &[(u16, u16, Cell)]) -> Vec<(u16, u16)> {
+        cells.iter().map(|(x, y, _)| (*x, *y)).collect()
+    }
+
+    /// Every column of row `y` except the ones hidden under the wide
+    /// grapheme at `wide_x`.
+    fn whole_row(buffer: &Buffer, y: u16, wide_x: u16) -> Vec<(u16, u16)> {
+        let hidden = wide_x + 1..wide_x + buffer[(wide_x, y)].cell_width();
+        (0..buffer.area.width)
+            .filter(|x| !hidden.contains(x))
+            .map(|x| (x, y))
+            .collect()
+    }
+
+    #[test]
+    fn plain_rows_are_never_uncertain() {
+        let buffer = Buffer::with_lines(["plain text", "more text "]);
+        assert!(uncertain_rows(&buffer).is_empty());
+    }
+
+    #[test]
+    fn a_vs16_grapheme_marks_its_whole_row_in_x_order() {
+        let buffer = Buffer::with_lines(["ok \u{2714}\u{fe0f} done", "plain     "]);
+        let cells = uncertain_rows(&buffer);
+        assert_eq!(positions(&cells), whole_row(&buffer, 0, 3));
+        assert_eq!(cells[3].2.symbol(), "\u{2714}\u{fe0f}");
+    }
+
+    #[test]
+    fn a_zwj_sequence_marks_its_whole_row() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let buffer = Buffer::with_lines([format!("{family} fam"), "plain ".to_string()]);
+        let cells = uncertain_rows(&buffer);
+        assert_eq!(positions(&cells), whole_row(&buffer, 0, 0));
+        assert_eq!(cells[0].2.symbol(), family);
+    }
+
+    #[test]
+    fn every_uncertain_row_is_marked() {
+        let buffer = Buffer::with_lines([
+            "\u{1F600} hi",
+            "plain",
+            "\u{2705} ok",
+            "\u{2B50} star",
+            "1\u{FE0F}\u{20E3} key",
+            "\u{2122}\u{FE0E} text",
+        ]);
+        let cells = uncertain_rows(&buffer);
+        let mut expected = whole_row(&buffer, 0, 0);
+        expected.extend(whole_row(&buffer, 2, 0));
+        expected.extend(whole_row(&buffer, 3, 0));
+        expected.extend(whole_row(&buffer, 4, 0));
+        expected.extend(whole_row(&buffer, 5, 0));
+        assert_eq!(positions(&cells), expected);
+    }
+
+    /// A backend that keeps every `draw` it receives, so a test can tell
+    /// what ratatui's diff emitted from what the repaint added.
+    struct RecordingBackend {
+        inner: TestBackend,
+        draws: Vec<Vec<(u16, u16, Cell)>>,
+    }
+
+    impl Backend for RecordingBackend {
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            let cells: Vec<_> = content.map(|(x, y, c)| (x, y, c.clone())).collect();
+            self.inner.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))?;
+            self.draws.push(cells);
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+            self.inner.append_lines(n)
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    fn recording_terminal() -> Terminal<RowTrackingBackend<RecordingBackend>> {
+        Terminal::new(RowTrackingBackend::new(RecordingBackend {
+            inner: TestBackend::new(12, 2),
+            draws: Vec::new(),
+        }))
+        .unwrap()
+    }
+
+    fn paint(lines: [&'static str; 2]) -> impl FnOnce(&mut ratatui::Frame) {
+        move |frame: &mut ratatui::Frame| {
+            frame.render_widget(Paragraph::new(lines.join("\n")), frame.area());
+        }
+    }
+
+    /// The frame after a one-cell change in each row: ratatui's diff emits
+    /// the two changed cells, and the repaint adds the rest of the emoji
+    /// row and nothing from the plain row.
+    #[test]
+    fn a_changed_emoji_row_is_repainted_whole_and_a_plain_row_is_not() {
+        let mut terminal = recording_terminal();
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smile ok", "plain row"]))
+            .unwrap();
+        let first_frame_draws = terminal.backend().backend.draws.len();
+
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smilE ok", "plain roW"]))
+            .unwrap();
+
+        let recorder = &terminal.backend().backend;
+        let draws = &recorder.draws[first_frame_draws..];
+        let diff = positions(&draws[0]);
+        assert_eq!(diff, vec![(7, 0), (8, 1)]);
+        let repaint = positions(&draws[1]);
+        assert_eq!(repaint, whole_row(recorder.inner.buffer(), 0, 0));
+        assert_eq!(draws.len(), 2);
+        recorder
+            .inner
+            .assert_buffer_lines(["\u{1F600} smilE ok", "plain roW   "]);
+    }
+
+    /// ratatui calls `draw` once per frame whatever the diff holds; an
+    /// emoji row the frame left alone adds no repaint draw to that, and
+    /// neither does a change in a plain row beside it.
+    #[test]
+    fn an_unchanged_emoji_row_is_not_repainted() {
+        let mut terminal = recording_terminal();
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smile ok", "plain row"]))
+            .unwrap();
+        let first_frame_draws = terminal.backend().backend.draws.len();
+
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smile ok", "plain row"]))
+            .unwrap();
+        let draws = &terminal.backend().backend.draws[first_frame_draws..];
+        assert_eq!(draws.len(), 1);
+        assert!(draws[0].is_empty(), "{:?}", positions(&draws[0]));
+
+        draw_and_repaint_uncertain(&mut terminal, paint(["\u{1F600} smile ok", "plain roW"]))
+            .unwrap();
+        let draws = &terminal.backend().backend.draws[first_frame_draws + 1..];
+        assert_eq!(draws.len(), 1);
+        assert_eq!(positions(&draws[0]), vec![(8, 1)]);
+    }
+
+    #[test]
+    fn panic_hook_installs_once() {
+        install_panic_hook();
+        assert!(PANIC_HOOK.is_completed());
+        assert!(!install_panic_hook());
+    }
+
+    /// A panic inside comes back as an error with its message, through
+    /// the hook, and the count of quiet calls is back at zero after each
+    /// call, nested or not.
+    #[test]
+    fn catch_quietly_returns_the_panic_message_and_unwinds_the_count() {
+        install_panic_hook();
+        let depth = || QUIET_PANICS.with(std::cell::Cell::get);
+        assert_eq!(catch_quietly(|| 7), Ok(7));
+        assert_eq!(
+            catch_quietly(|| -> u8 { panic!("drawing failed: {}", 3) }),
+            Err("drawing failed: 3".to_string())
+        );
+        assert_eq!(depth(), 0);
+        let nested = catch_quietly(|| {
+            let inner = catch_quietly(|| -> u8 { panic!("inner") });
+            assert_eq!(depth(), 1);
+            assert_eq!(inner, Err("inner".to_string()));
+            panic!("outer")
+        });
+        assert_eq!(nested, Err::<(), _>("outer".to_string()));
+        assert_eq!(depth(), 0);
+        assert_eq!(QUIET_MESSAGE.with(|m| m.borrow().clone()), None);
+    }
+
+    /// The level a quiet panic is logged at is the innermost call's, and
+    /// the outer call's level is back once the inner call returns.
+    #[test]
+    fn the_log_level_of_a_quiet_panic_is_the_innermost_calls() {
+        install_panic_hook();
+        let level = || QUIET_LEVEL.with(std::cell::Cell::get);
+        let _ = catch_quietly(|| {
+            assert_eq!(level(), log::Level::Warn);
+            let inner = catch_quietly_at(log::Level::Debug, || -> u8 {
+                assert_eq!(level(), log::Level::Debug);
+                panic!("inner")
+            });
+            assert_eq!(inner, Err("inner".to_string()));
+            assert_eq!(level(), log::Level::Warn);
+        });
+        assert_eq!(level(), log::Level::Warn);
+    }
+
+    /// The message comes back scrubbed whether the hook recorded it or the
+    /// payload is read directly, as it is where the hook is not installed
+    /// (`resume_unwind` skips the hook); a message left from before the
+    /// call is never returned for it.
+    #[test]
+    fn a_caught_panic_message_is_scrubbed_on_both_paths() {
+        install_panic_hook();
+        let dirty = "bad \x1b]0;title\x07\u{202E}text";
+        assert_eq!(
+            catch_quietly(|| -> u8 { panic!("{dirty}") }),
+            Err("bad text".to_string())
+        );
+        QUIET_MESSAGE.with(|m| *m.borrow_mut() = Some("stale".to_string()));
+        let unhooked =
+            catch_quietly(|| -> u8 { std::panic::resume_unwind(Box::new(dirty.to_string())) });
+        assert_eq!(unhooked, Err("bad text".to_string()));
+    }
+
+    fn units_of(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    /// A multi-byte character cut at every byte boundary between two
+    /// writes: the first write holds the head back and reports it
+    /// consumed, the second completes the character, emits it whole and
+    /// consumes only the bytes that finished it.
+    #[test]
+    fn a_sequence_split_across_writes_arrives_whole() {
+        for text in ["\u{1F600}", "\u{20AC}"] {
+            let bytes = text.as_bytes();
+            for cut in 1..bytes.len() {
+                let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+                let (head, consumed) =
+                    utf8_chunk(&mut pending, &mut pending_len, &bytes[..cut]).unwrap();
+                assert!(head.is_empty(), "{text:?} cut at {cut}: {head:?}");
+                assert_eq!(consumed, cut);
+                assert_eq!(pending_len, cut);
+
+                let mut rest = bytes[cut..].to_vec();
+                rest.extend_from_slice(b"tail");
+                let (tail, consumed) = utf8_chunk(&mut pending, &mut pending_len, &rest).unwrap();
+                assert_eq!(tail, units_of(text), "{text:?} cut at {cut}");
+                assert_eq!(consumed, bytes.len() - cut, "{text:?} cut at {cut}");
+                assert_eq!(pending_len, 0);
+            }
+        }
+    }
+
+    /// A write that ends mid-sequence hands over the characters before
+    /// the cut and leaves the partial sequence for the next write.
+    #[test]
+    fn a_cut_inside_the_last_sequence_stops_before_it() {
+        let bytes = "ab\u{1F600}".as_bytes();
+        let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, &bytes[..4]).unwrap();
+        assert_eq!(units, units_of("ab"));
+        assert_eq!(consumed, 2);
+        assert_eq!(pending_len, 0);
+
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, &bytes[2..4]).unwrap();
+        assert!(units.is_empty());
+        assert_eq!(consumed, 2);
+        assert_eq!(pending_len, 2);
+
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, &bytes[4..]).unwrap();
+        assert_eq!(units, units_of("\u{1F600}"));
+        assert_eq!(consumed, 2);
+        assert_eq!(pending_len, 0);
+    }
+
+    /// Bytes that are not UTF-8 are refused as `InvalidData`, whether they
+    /// lead a write or arrive where a held-back sequence expected its
+    /// continuation; the held bytes are dropped with the error.
+    #[test]
+    fn invalid_bytes_are_refused() {
+        let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+        let err = utf8_chunk(&mut pending, &mut pending_len, b"\xffabc").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending_len, 0);
+
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, b"\xf0\x9f").unwrap();
+        assert!(units.is_empty());
+        assert_eq!(consumed, 2);
+        let err = utf8_chunk(&mut pending, &mut pending_len, b"ab").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending_len, 0);
+    }
+
+    /// A write is handed over in chunks of at most `MAX_UNITS_PER_WRITE`
+    /// units, and a chunk that would end on the high half of a surrogate
+    /// pair stops one unit short so the pair goes out together.
+    #[test]
+    fn a_chunk_never_ends_on_a_high_surrogate() {
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 1);
+        text.push('\u{1F600}');
+        text.push('b');
+        let bytes = text.as_bytes();
+        let (mut pending, mut pending_len) = ([0u8; 4], 0usize);
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, bytes).unwrap();
+        assert_eq!(units.len(), MAX_UNITS_PER_WRITE - 1);
+        assert_eq!(consumed, MAX_UNITS_PER_WRITE - 1);
+        assert!(units.iter().all(|unit| *unit == u16::from(b'a')));
+        let (units, consumed) =
+            utf8_chunk(&mut pending, &mut pending_len, &bytes[consumed..]).unwrap();
+        assert_eq!(units, units_of("\u{1F600}b"));
+        assert_eq!(consumed, 5);
+
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 2);
+        text.push('\u{1F600}');
+        text.push('b');
+        let bytes = text.as_bytes();
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, bytes).unwrap();
+        assert_eq!(units.len(), MAX_UNITS_PER_WRITE);
+        assert_eq!(&units[MAX_UNITS_PER_WRITE - 2..], units_of("\u{1F600}"));
+        assert_eq!(consumed, bytes.len() - 1);
+        let (units, consumed) =
+            utf8_chunk(&mut pending, &mut pending_len, &bytes[consumed..]).unwrap();
+        assert_eq!(units, units_of("b"));
+        assert_eq!(consumed, 1);
+    }
+
+    /// A panic restores the terminal, the UI re-enters it, and a second
+    /// panic restores it again: the hook's descriptor survives the first
+    /// restore.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn the_panic_hook_restores_again_after_a_reenter() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        // Every leave step flushes before the hook returns and the alternate
+        // screen is the last one written, so reading up to it cannot block.
+        fn read_through_leave_alt(reader: &mut io::PipeReader) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 256];
+            while !out.ends_with(b"\x1b[?1049l") {
+                let n = reader.read(&mut chunk).unwrap();
+                assert_ne!(n, 0, "the pipe closed before the leave sequence: {out:?}");
+                out.extend_from_slice(&chunk[..n]);
+            }
+            out
+        }
+
+        let (mut reader, writer) = io::pipe().unwrap();
+        PANIC_FD.store(writer.as_raw_fd(), Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let first = read_through_leave_alt(&mut reader);
+        assert_eq!(count(&first, b"\x1b[?1049l"), 1, "{first:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert_eq!(
+            PANIC_FD.load(Ordering::SeqCst),
+            writer.as_raw_fd(),
+            "the first restore disarmed the hook"
+        );
+
+        // The UI re-entering the screen, as `reenter_if_left` does.
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let second = read_through_leave_alt(&mut reader);
+        assert_eq!(count(&second, b"\x1b[?1049l"), 1, "{second:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+
+        PANIC_FD.store(-1, Ordering::SeqCst);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn escape_processing_is_added_only_when_a_bit_is_missing() {
+        use windows_sys::Win32::System::Console::ENABLE_WRAP_AT_EOL_OUTPUT;
+
+        let full = ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            | ENABLE_WRAP_AT_EOL_OUTPUT;
+        assert_eq!(vt_output_mode(full), None);
+        assert_eq!(
+            vt_output_mode(ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT),
+            Some(full)
+        );
+        assert_eq!(
+            vt_output_mode(ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_WRAP_AT_EOL_OUTPUT),
+            Some(full)
+        );
+        assert_eq!(vt_output_mode(0), Some(full & !ENABLE_WRAP_AT_EOL_OUTPUT));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_restored_input_mode_carries_the_extended_flags() {
+        use windows_sys::Win32::System::Console::{ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE};
+
+        let saved = ENABLE_LINE_INPUT | ENABLE_QUICK_EDIT_MODE;
+        assert_eq!(restored_input_mode(saved), saved | ENABLE_EXTENDED_FLAGS);
+        assert_eq!(
+            restored_input_mode(saved | ENABLE_EXTENDED_FLAGS),
+            saved | ENABLE_EXTENDED_FLAGS
+        );
+    }
+
+    /// Pins a crossterm behaviour the enter sequence relies on: 0.29
+    /// answers `supports_keyboard_enhancement` with `Ok(false)` on
+    /// Windows, so the sequence there never carries the enhancement step.
+    /// A crossterm upgrade that changes the answer would route the push
+    /// through the console API instead of the writer, and must be noticed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_never_pushes_the_keyboard_enhancement() {
+        assert!(!probe_keyboard_enhancement());
+        assert!(
+            !enter_sequence(probe_keyboard_enhancement())
+                .iter()
+                .any(|step| matches!(step, TerminalStep::KeyboardEnhancement(_)))
+        );
+    }
+
+    /// The Windows twin of the unix test above: the hook's handle survives
+    /// the first restore. The pipe is read on its own thread so a hook
+    /// that writes nothing fails the test instead of blocking it.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn the_panic_hook_restores_again_after_a_reenter() {
+        use std::io::Read;
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+        let (mut reader, writer) = io::pipe().unwrap();
+        let (sequences, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                out.extend_from_slice(&chunk[..n]);
+                while let Some(at) = find(&out, LEAVE_ALT) {
+                    let rest = out.split_off(at + LEAVE_ALT.len());
+                    let _ = sequences.send(std::mem::replace(&mut out, rest));
+                }
+            }
+        });
+        let next_leave = || {
+            received
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the leave sequence reached the pipe")
+        };
+
+        let handle = writer.as_raw_handle() as isize;
+        CONSOLE_HANDLE.store(handle, Ordering::SeqCst);
+        SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let first = next_leave();
+        assert_eq!(count(&first, LEAVE_ALT), 1, "{first:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert_eq!(
+            CONSOLE_HANDLE.load(Ordering::SeqCst),
+            handle,
+            "the first restore disarmed the hook"
+        );
+
+        // The UI re-entering the screen, as `reenter_if_left` does.
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let second = next_leave();
+        assert_eq!(count(&second, LEAVE_ALT), 1, "{second:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+
+        CONSOLE_HANDLE.store(0, Ordering::SeqCst);
+    }
+
+    /// The handle `open` produced, or None when the runner has no console
+    /// and says so through `COYOTE_TEST_NO_CONSOLE`. A runner that has
+    /// none and does not say so fails the test: the Windows CI runner has
+    /// a console, and the tests that need one must run there.
+    #[cfg(windows)]
+    fn console_handle_or_skip(
+        open: io::Result<std::os::windows::io::OwnedHandle>,
+        buffer: &str,
+    ) -> Option<std::os::windows::io::OwnedHandle> {
+        match open {
+            Ok(handle) => Some(handle),
+            Err(err) if std::env::var_os("COYOTE_TEST_NO_CONSOLE").is_some() => {
+                eprintln!("skipping: no console {buffer} ({err})");
+                None
+            }
+            Err(err) => panic!(
+                "no console {buffer} ({err}); the Windows CI runner has a console and this \
+                 test must run there, so set COYOTE_TEST_NO_CONSOLE only on a runner without one"
+            ),
+        }
+    }
+
+    /// Puts each handle back to the mode paired with it and returns the
+    /// statics `enter` and `leave` keep to their idle values, so a failed
+    /// assertion leaves neither the runner's console nor the next test
+    /// perturbed.
+    #[cfg(windows)]
+    struct ConsoleModeGuard {
+        restore: Vec<(std::os::windows::io::OwnedHandle, u32)>,
+    }
+
+    #[cfg(windows)]
+    impl Drop for ConsoleModeGuard {
+        fn drop(&mut self) {
+            use std::os::windows::io::AsRawHandle;
+            for (handle, mode) in &self.restore {
+                let _ = console::set_mode(handle.as_raw_handle(), *mode);
+            }
+            CONSOLE_HANDLE.store(0, Ordering::SeqCst);
+            SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+            SCREEN_ENTERED.store(false, Ordering::SeqCst);
+            ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// With nothing recorded the restore touches no console. Once a
+    /// snapshot is taken, a console whose quick-edit bit was flipped and
+    /// whose line input was switched off behind it comes back to the
+    /// recorded mode, extended flags included; without the perturbation
+    /// the restore could be a no-op and the test would not know. Echo
+    /// goes off with line input because the console rejects echo on its
+    /// own.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn the_input_mode_restore_is_a_no_op_until_a_snapshot_round_trips() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE,
+        };
+
+        SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        restore_input_mode_from_static().unwrap();
+        assert_eq!(
+            SAVED_INPUT_MODE.load(Ordering::SeqCst),
+            NO_SAVED_INPUT_MODE,
+            "the sentinel survives a restore"
+        );
+
+        let Some(input) = console_handle_or_skip(console::open_input(), "input buffer") else {
+            return;
+        };
+        let handle = input.as_raw_handle();
+        let before = console::mode(handle).unwrap();
+        let _guard = ConsoleModeGuard {
+            restore: vec![(input, restored_input_mode(before))],
+        };
+        let saved = snapshot_input_mode().expect("the open input buffer answers GetConsoleMode");
+        assert_eq!(saved, before);
+        assert_eq!(SAVED_INPUT_MODE.load(Ordering::SeqCst), u64::from(saved));
+
+        let perturbed = ((saved ^ ENABLE_QUICK_EDIT_MODE)
+            & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+            | ENABLE_EXTENDED_FLAGS;
+        console::set_mode(handle, perturbed).unwrap();
+        assert_ne!(
+            console::mode(handle).unwrap(),
+            saved,
+            "the console took the perturbed mode"
+        );
+
+        restore_input_mode_from_static().unwrap();
+        assert_eq!(console::mode(handle).unwrap(), restored_input_mode(saved));
+    }
+
+    /// Escape processing comes back on the recorded console before `leave`
+    /// writes its sequence, before `enter` writes its own, and from the
+    /// check every frame runs first, so a child that reset the console
+    /// mode cannot make the restore or the next frame print raw escapes.
+    /// The bit is cleared on the real screen buffer before each and read
+    /// back after. `Screen::clear` and `Screen::draw` need a tty-backed
+    /// terminal, so `enter` and `ensure_vt_processing` stand in for them.
+    /// The input mode is restored by the guard too: `enter` and `leave`
+    /// switch raw mode on the runner's console input.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn escape_processing_is_restored_before_leave_enter_and_each_frame() {
+        use std::os::windows::io::AsRawHandle;
+
+        const WANTED: u32 = ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
+
+        let Some(output) = console_handle_or_skip(console::open_output(), "screen buffer") else {
+            return;
+        };
+        let handle = output.as_raw_handle();
+        let original = console::mode(handle).unwrap();
+        let mut restore = vec![(output, original)];
+        if let Ok(input) = console::open_input() {
+            let before = console::mode(input.as_raw_handle()).unwrap();
+            restore.push((input, restored_input_mode(before)));
+        }
+        let _guard = ConsoleModeGuard { restore };
+        let clear_escape_processing = || {
+            console::set_mode(handle, original & !ENABLE_VIRTUAL_TERMINAL_PROCESSING).unwrap();
+            assert_eq!(
+                console::mode(handle).unwrap() & ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                0,
+                "the console took the cleared mode"
+            );
+        };
+        let escape_bits = || console::mode(handle).unwrap() & WANTED;
+
+        CONSOLE_HANDLE.store(handle as isize, Ordering::SeqCst);
+        SAVED_INPUT_MODE.store(NO_SAVED_INPUT_MODE, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+
+        clear_escape_processing();
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        // The mouse-capture step fails without crossterm's own enable on
+        // record; only the mode matters here.
+        let _ = leave(&mut Vec::new());
+        assert_eq!(
+            escape_bits(),
+            WANTED,
+            "leave switched escape processing back on"
+        );
+
+        clear_escape_processing();
+        let _ = enter(&mut Vec::new(), false);
+        assert_eq!(
+            escape_bits(),
+            WANTED,
+            "enter switched escape processing back on"
+        );
+
+        clear_escape_processing();
+        ensure_vt_processing();
+        assert_eq!(
+            escape_bits(),
+            WANTED,
+            "the per-frame check switched escape processing back on"
+        );
+    }
+}
+
+/// `utf8_chunk` driven the way `ConsoleWriter` drives it, a byte buffer at
+/// a time with the `pending` carry between calls. Output reaches the
+/// console through `WriteConsoleW` as UTF-16, so every scalar must arrive
+/// whole; the function's own contract adds that a trailing partial
+/// sequence is held back and reported consumed, the units stop at the cap
+/// on a character boundary, and a surrogate pair never straddles two writes.
+#[cfg(test)]
+mod utf8_chunking {
+    use super::*;
+
+    /// Feeds `buf` the way the writer does: each call consumes some prefix
+    /// and the remainder is offered again, until the buffer is spent.
+    fn drive(
+        pending: &mut [u8; 4],
+        pending_len: &mut usize,
+        mut buf: &[u8],
+    ) -> io::Result<Vec<Vec<u16>>> {
+        let mut calls = Vec::new();
+        while !buf.is_empty() {
+            let (units, consumed) = utf8_chunk(pending, pending_len, buf)?;
+            assert!(
+                consumed > 0,
+                "a non-empty buffer must make progress ({} bytes left)",
+                buf.len()
+            );
+            assert!(
+                consumed <= buf.len(),
+                "consumed {consumed} of {} bytes",
+                buf.len()
+            );
+            assert!(
+                units.len() <= MAX_UNITS_PER_WRITE,
+                "{} units exceed the per-write cap",
+                units.len()
+            );
+            if let Some(&last) = units.last() {
+                assert!(
+                    !(0xD800..0xDC00).contains(&last),
+                    "a call ended on a lone high surrogate"
+                );
+            }
+            calls.push(units);
+            buf = &buf[consumed..];
+        }
+        Ok(calls)
+    }
+
+    fn decode(calls: &[Vec<u16>]) -> String {
+        let all: Vec<u16> = calls.iter().flatten().copied().collect();
+        String::from_utf16(&all).expect("well-formed UTF-16 across calls")
+    }
+
+    const SAMPLE: &str = "a\u{e9}\u{20ac}\u{1F600}z \u{4e2d}\u{6587} \u{1F1FA}\u{1F1F8}!";
+
+    // Whatever the byte split, the units concatenate back to the
+    // text and no call ends inside a scalar.
+    #[test]
+    fn every_byte_split_of_mixed_text_reassembles() {
+        let bytes = SAMPLE.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut pending = [0u8; 4];
+            let mut pending_len = 0;
+            let mut calls = drive(&mut pending, &mut pending_len, &bytes[..cut]).unwrap();
+            calls.extend(drive(&mut pending, &mut pending_len, &bytes[cut..]).unwrap());
+            assert_eq!(decode(&calls), SAMPLE, "split at {cut}");
+            assert_eq!(
+                pending_len, 0,
+                "nothing left pending after a complete text (cut {cut})"
+            );
+        }
+    }
+
+    // One byte per write: the worst case for the carry.
+    #[test]
+    fn one_byte_writes_reassemble() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let mut calls = Vec::new();
+        for byte in SAMPLE.as_bytes() {
+            calls
+                .extend(drive(&mut pending, &mut pending_len, std::slice::from_ref(byte)).unwrap());
+        }
+        assert_eq!(decode(&calls), SAMPLE);
+        assert_eq!(pending_len, 0);
+    }
+
+    // An empty write is a no-op; a short write is one call.
+    #[test]
+    fn empty_and_short_writes() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let (units, consumed) = utf8_chunk(&mut pending, &mut pending_len, b"").unwrap();
+        assert!(units.is_empty());
+        assert_eq!(consumed, 0);
+        let calls = drive(&mut pending, &mut pending_len, "hi \u{1F600}".as_bytes()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(decode(&calls), "hi \u{1F600}");
+    }
+
+    // The cap lands exactly where a scalar straddles it.
+    #[test]
+    fn the_cap_never_splits_a_surrogate_pair() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+
+        // 8191 ASCII units + a pair: the pair would be unit 8192/8193, so
+        // the first call stops at 8191.
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 1);
+        text.push('\u{1F600}');
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "unit counts: {:?}",
+            calls.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].len(), MAX_UNITS_PER_WRITE - 1);
+        assert_eq!(calls[1].len(), 2);
+        assert_eq!(decode(&calls), text);
+
+        // 8192 ASCII + a pair: a full first write, then the pair alone.
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE);
+        text.push('\u{1F600}');
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE, 2]
+        );
+        assert_eq!(decode(&calls), text);
+
+        // 8191 ASCII + a one-unit three-byte scalar fits in one write.
+        let mut text = "a".repeat(MAX_UNITS_PER_WRITE - 1);
+        text.push('\u{20ac}');
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE]
+        );
+        assert_eq!(decode(&calls), text);
+    }
+
+    // ASCII of exactly k * cap bytes is k full writes.
+    #[test]
+    fn ascii_multiples_of_the_cap_are_full_writes() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let text = "x".repeat(3 * MAX_UNITS_PER_WRITE);
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE; 3]
+        );
+        // All pairs: 4 bytes -> 2 units, so a cap's worth of pairs is
+        // 4096 scalars per write.
+        let text = "\u{1F600}".repeat(MAX_UNITS_PER_WRITE);
+        let calls = drive(&mut pending, &mut pending_len, text.as_bytes()).unwrap();
+        assert_eq!(
+            calls.iter().map(Vec::len).collect::<Vec<_>>(),
+            [MAX_UNITS_PER_WRITE; 2]
+        );
+        assert_eq!(decode(&calls), text);
+    }
+
+    // A write ending inside a scalar has the partial bytes held
+    // back (the writer loop may take a second call to hand them over) and
+    // the next write completes the scalar.
+    #[test]
+    fn a_trailing_partial_scalar_is_held_then_completed() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        let bytes = "ab\u{1F600}cd".as_bytes();
+        let calls = drive(&mut pending, &mut pending_len, &bytes[..4]).unwrap();
+        assert_eq!(
+            decode(&calls),
+            "ab",
+            "only the complete scalars are emitted"
+        );
+        assert_eq!(pending_len, 2, "the two partial bytes wait in `pending`");
+        assert_eq!(&pending[..2], &bytes[2..4]);
+        let calls = drive(&mut pending, &mut pending_len, &bytes[4..]).unwrap();
+        assert_eq!(decode(&calls), "\u{1F600}cd");
+        assert_eq!(pending_len, 0);
+    }
+
+    // Malformed input is an error, never a panic, and the stream can
+    // continue afterwards.
+    #[test]
+    fn malformed_bytes_error_without_panicking() {
+        let mut pending = [0u8; 4];
+        let mut pending_len = 0;
+        for bad in [
+            &b"\x80"[..],
+            b"\xff",
+            b"\xc3\x28",
+            b"\xf0\x9f\x98",
+            b"\xed\xa0\x80", // a UTF-8-encoded surrogate
+            b"\xf8\x88\x80\x80\x80",
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut p = [0u8; 4];
+                let mut l = 0;
+                drive(&mut p, &mut l, bad)
+            }));
+            assert!(outcome.is_ok(), "panicked on {bad:?}");
+        }
+        // An unfinished scalar followed by something that is not its
+        // continuation: an error, and the next clean write still works.
+        let (_, consumed) = utf8_chunk(&mut pending, &mut pending_len, b"\xf0\x9f").unwrap();
+        assert_eq!(consumed, 2);
+        let err = utf8_chunk(&mut pending, &mut pending_len, b"ab").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        pending_len = 0;
+        let calls = drive(&mut pending, &mut pending_len, b"ok").unwrap();
+        assert_eq!(decode(&calls), "ok");
+    }
+
+    // Pseudo-random byte soup through the writer loop never
+    // panics or spins.
+    #[test]
+    fn random_bytes_never_panic_or_stall() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let len = (next() % 64) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            let mut pending = [0u8; 4];
+            let mut pending_len = 0;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drive(&mut pending, &mut pending_len, &bytes)
+            }));
+            assert!(outcome.is_ok(), "panicked on {bytes:?}");
+        }
+        // Valid random text of random length, fed in random slices.
+        for _ in 0..200 {
+            let chars = (next() % 40) as usize;
+            let text: String = (0..chars)
+                .map(|_| match next() % 4 {
+                    0 => 'a',
+                    1 => '\u{e9}',
+                    2 => '\u{20ac}',
+                    _ => '\u{1F600}',
+                })
+                .collect();
+            let bytes = text.as_bytes();
+            let mut pending = [0u8; 4];
+            let mut pending_len = 0;
+            let mut calls = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let take = ((next() % 5) as usize + 1).min(bytes.len() - at);
+                calls.extend(drive(&mut pending, &mut pending_len, &bytes[at..at + take]).unwrap());
+                at += take;
+            }
+            assert_eq!(decode(&calls), text);
+            assert_eq!(pending_len, 0);
+        }
+    }
+}

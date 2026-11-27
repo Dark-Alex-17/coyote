@@ -1,6 +1,8 @@
 use super::agent::{AgentExecutionOutcome, AgentNodeExecutor};
 use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
-use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed, node_type_label};
+use super::logging::{
+    GraphLogger, narrate_node_complete, narrate_node_failed, node_type_label, route_suffix,
+};
 use super::map::MapNodeExecutor;
 use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
@@ -16,6 +18,7 @@ use super::{
 use crate::config::{
     AgentVariable, AgentVariables, RenderMode, RequestContext, child_sessions_enabled,
 };
+use crate::events::{Event, Origin};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, TaskCancelGuard, wait_abort_signal, wait_user_interrupt};
@@ -90,6 +93,8 @@ impl GraphExecutor {
             &self.graph.name,
             self.graph.settings.log_state_snapshots,
             is_nested,
+            Arc::clone(&ctx.ui),
+            Origin::from(&*ctx),
         );
         let result = self.run(&mut logger, ctx, abort_signal).await;
         if let Err(e) = &result {
@@ -266,19 +271,13 @@ impl GraphExecutor {
                         anyhow!("Node '{}' not found in graph '{}'", node_id, graph.name)
                     })?
                     .clone();
-                logger.node_start(&node, in_super_step);
                 let node_hooks = NodeHookEmitter::resolve(ctx, node_id, node_type_label(&node));
-                hooks::fire(
-                    HookEvent::GraphNodeStarted,
-                    ctx,
-                    &[
-                        ("COYOTE_NODE_ID", node_id.clone()),
-                        ("COYOTE_NODE_TYPE", node_hooks.node_type.to_string()),
-                    ],
-                    None,
-                );
+                logger.node_start(&node, in_super_step, &node_hooks.origin);
+                node_hooks.started();
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
+                branch_ctx.graph_node = Some(node_id.clone());
+                let ui = Arc::clone(&branch_ctx.ui);
                 let mut peer_id: Option<String> = None;
                 if let Some(assignment) = peer_assignments.remove(node_id) {
                     peer_id = Some(assignment.0.clone());
@@ -319,11 +318,13 @@ impl GraphExecutor {
                         .expect("semaphore should not be closed");
                     if abort_clone.aborted() {
                         narrate_node_failed(
+                            ui.as_ref(),
                             silent,
                             &node,
                             Duration::default(),
                             "aborted",
                             in_super_step,
+                            &node_hooks.origin,
                         );
                         node_hooks.failed(Duration::default(), "aborted");
                         return (
@@ -355,44 +356,49 @@ impl GraphExecutor {
                                 Some(targets.join(", "))
                             };
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
-                                route.as_deref(),
-                                false,
+                                &route_suffix(route.as_deref(), false),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.completed(elapsed, route.as_deref());
                         }
                         Ok(StepResult::FellBack(target)) => {
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
-                                Some(target),
-                                true,
+                                &route_suffix(Some(target), true),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.completed(elapsed, Some(target));
                         }
                         Ok(StepResult::End(_)) => {
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
-                                Some("END"),
-                                false,
+                                &route_suffix(Some("END"), false),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.completed(elapsed, Some("END"));
                         }
                         Err(e) => {
                             narrate_node_failed(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
                                 &e.to_string(),
                                 in_super_step,
+                                &node_hooks.origin,
                             );
                             node_hooks.failed(elapsed, &e.to_string());
                         }
@@ -597,17 +603,20 @@ fn provision_frontier_peers(
 }
 
 struct NodeHookEmitter {
+    started: Vec<ResolvedHook>,
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_name: Option<String>,
     node_id: String,
     node_type: &'static str,
+    origin: Origin,
 }
 
 impl NodeHookEmitter {
     fn resolve(ctx: &RequestContext, node_id: &str, node_type: &'static str) -> Self {
         Self {
+            started: ctx.resolved_hooks(HookEvent::GraphNodeStarted),
             completed: ctx.resolved_hooks(HookEvent::GraphNodeCompleted),
             failed: ctx.resolved_hooks(HookEvent::GraphNodeFailed),
             session_name: ctx
@@ -617,43 +626,56 @@ impl NodeHookEmitter {
             agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
             node_id: node_id.to_string(),
             node_type,
+            origin: Origin {
+                node: Some(node_id.to_string()),
+                ..Origin::from(ctx)
+            },
         }
     }
 
-    fn extras(&self, elapsed: Duration) -> Vec<(&'static str, String)> {
-        vec![
-            ("COYOTE_NODE_ID", self.node_id.clone()),
-            ("COYOTE_NODE_TYPE", self.node_type.to_string()),
-            ("COYOTE_NODE_DURATION_MS", elapsed.as_millis().to_string()),
-        ]
-    }
-
-    fn dispatch(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        hooks::fire_resolved(
+    fn dispatch(&self, event: Event, resolved: &[ResolvedHook]) {
+        hooks::emit_resolved(
             event,
             resolved.to_vec(),
-            hooks::base_envs_parts(
-                event,
-                self.session_name.as_deref(),
-                self.agent_name.as_deref(),
-            ),
-            extras,
-            None,
+            self.session_name.as_deref(),
+            self.agent_name.as_deref(),
+        );
+    }
+
+    fn started(&self) {
+        self.dispatch(
+            Event::NodeStarted {
+                origin: self.origin.clone(),
+                node_id: self.node_id.clone(),
+                node_type: self.node_type.to_string(),
+            },
+            &self.started,
         );
     }
 
     fn completed(&self, elapsed: Duration, route: Option<&str>) {
-        let mut extras = self.extras(elapsed);
-        if let Some(route) = route {
-            extras.push(("COYOTE_NODE_ROUTE", route.to_string()));
-        }
-        self.dispatch(HookEvent::GraphNodeCompleted, &self.completed, &extras);
+        self.dispatch(
+            self.finished(elapsed, route.map(str::to_string), None),
+            &self.completed,
+        );
     }
 
     fn failed(&self, elapsed: Duration, error: &str) {
-        let mut extras = self.extras(elapsed);
-        extras.push(("COYOTE_NODE_ERROR", error.to_string()));
-        self.dispatch(HookEvent::GraphNodeFailed, &self.failed, &extras);
+        self.dispatch(
+            self.finished(elapsed, None, Some(error.to_string())),
+            &self.failed,
+        );
+    }
+
+    fn finished(&self, elapsed: Duration, route: Option<String>, error: Option<String>) -> Event {
+        Event::NodeFinished {
+            origin: self.origin.clone(),
+            node_id: self.node_id.clone(),
+            node_type: self.node_type.to_string(),
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            route,
+            error,
+        }
     }
 }
 
@@ -1943,7 +1965,7 @@ nodes:
         );
     }
 
-    /// Usage probe (spec AC3): the key is written only when the failing
+    /// The key is written only when the failing
     /// script node HAS a `fallback`. Without one the failure must still
     /// propagate as a hard error — recording must never turn a crash into a
     /// silent continue.
@@ -1983,7 +2005,7 @@ nodes:
         assert!(chain.contains("boom"), "{chain}");
     }
 
-    /// Usage probe (spec AC3): the 8 KiB cap must land on a char boundary.
+    /// The 8 KiB cap must land on a char boundary.
     /// stderr made of 3-byte characters guarantees most candidate cut points
     /// fall inside a character; both cuts (end of head, start of tail) must
     /// land on whole characters and the recorded value must stay within one
@@ -2056,7 +2078,7 @@ nodes:
         );
     }
 
-    /// Usage probe (AC3): "capped at 8 KiB" is a closed bound — a message of
+    /// "Capped at 8 KiB" is a closed bound: a message of
     /// exactly `SCRIPT_FALLBACK_ERROR_MAX_BYTES` is stored verbatim, one byte
     /// more keeps the head ¼ and tail ¾ verbatim around a marker naming the
     /// single dropped byte.
@@ -2095,7 +2117,7 @@ nodes:
             .unwrap_or_else(|e| panic!("cannot read shipped script {}: {e}", path.display()))
     }
 
-    /// Usage probe (spec AC3 + AC5 end to end): the SHIPPED coder
+    /// End to end: the SHIPPED coder
     /// `fix_loop_gate.sh` reached over a `verify_build` fallback edge must
     /// read the engine-recorded error, re-run `verify_build` once, and on the
     /// second crash end the run as `end_failure` with the "crashed again"
@@ -2186,7 +2208,7 @@ nodes:
         );
     }
 
-    /// Usage probe (spec AC6 end to end): the SHIPPED step-runner gate does
+    /// End to end: the SHIPPED step-runner gate does
     /// the same dance with `verify_format_lint` as its retry target.
     #[tokio::test]
     async fn usage_probe_shipped_step_runner_gate_retries_format_lint_once_after_crash() {
@@ -2274,7 +2296,7 @@ nodes:
         );
     }
 
-    /// Usage probe (self_review fallback end to end): when the review node
+    /// self_review fallback end to end: when the review node
     /// dies, the engine routes to the SHIPPED `self_review_fault.sh`, which
     /// lifts the implementer's `Design: ASK -- <question>` lines out of
     /// `design_trail` (label stripped, de-duplicated), marks `review_notes`,
@@ -2411,6 +2433,7 @@ nodes:
     /// the distinct routes prove one branch's metadata never leaks into a
     /// sibling's events.
     #[tokio::test]
+    #[serial]
     async fn parallel_super_step_branches_fire_per_node_metadata() {
         if !cmd_available("bash") {
             eprintln!("skipping: bash not available");
@@ -2685,6 +2708,235 @@ nodes:
                 .any(|message| message.contains("t037_mal_empty")
                     && message.contains("empty command")),
             "expected a debug log for the skipped hook: {debugs:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn completed_publishes_bus_twin_without_resolved_hooks() {
+        let mut ctx = ctx_with_global_hooks(Default::default());
+        ctx.self_agent_id = Some("graph-agent-x7x".to_string());
+        ctx.current_depth = 1;
+        let node_id = "node-bus-probe-x7x";
+        let _sink = hooks::test_sink::install();
+        let bus = crate::events::RecordingSink::install();
+
+        NodeHookEmitter::resolve(&ctx, node_id, "llm")
+            .completed(Duration::from_millis(5), Some("next"));
+
+        let published = bus.drain_hooks_with_env("COYOTE_NODE_ID", node_id);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let crate::events::Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::GraphNodeCompleted);
+        assert_eq!(
+            *origin,
+            Origin {
+                agent_id: Some("graph-agent-x7x".to_string()),
+                depth: 1,
+                node: Some(node_id.to_string()),
+            }
+        );
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_NODE_TYPE".to_string(), "llm".to_string())));
+        assert!(envs.contains(&("COYOTE_NODE_ROUTE".to_string(), "next".to_string())));
+        assert!(envs.contains(&("COYOTE_NODE_DURATION_MS".to_string(), "5".to_string())));
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_NODE_ID").map(String::as_str) != Some(node_id)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn failed_publishes_with_the_graph_agents_origin() {
+        let mut ctx = ctx_with_global_hooks(Default::default());
+        ctx.self_agent_id = Some("graph-agent-f3f".to_string());
+        ctx.current_depth = 2;
+        let node_id = "node-failed-probe-f3f";
+        let bus = crate::events::RecordingSink::install();
+
+        NodeHookEmitter::resolve(&ctx, node_id, "script").failed(Duration::from_millis(7), "boom");
+
+        let published = bus.drain_hooks_with_env("COYOTE_NODE_ID", node_id);
+        let [
+            crate::events::Event::Hook {
+                event,
+                envs,
+                origin,
+                ..
+            },
+        ] = published.as_slice()
+        else {
+            panic!("expected one Event::Hook, got {published:?}");
+        };
+        assert_eq!(*event, HookEvent::GraphNodeFailed);
+        assert!(envs.contains(&("COYOTE_NODE_ERROR".to_string(), "boom".to_string())));
+        assert_eq!(
+            *origin,
+            Origin {
+                agent_id: Some("graph-agent-f3f".to_string()),
+                depth: 2,
+                node: Some(node_id.to_string()),
+            }
+        );
+    }
+
+    /// Two nodes of one super-step share the graph agent's id; every
+    /// hook fired inside a node, and the node's own start, names that
+    /// node. The agent nodes name an agent that does not exist, so each
+    /// fires `agent.failed` from inside its node and falls back.
+    #[tokio::test]
+    #[serial]
+    async fn hooks_inside_super_step_nodes_name_their_node() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+        let yaml = r#"
+name: super_step_origin_test
+settings:
+  validate_before_run: false
+start: dispatcher
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {}
+    next: [left_o9n, right_o9n]
+  left_o9n:
+    type: agent
+    agent: missing-agent-o9n
+    prompt: "go"
+    fallback: done
+    next: done
+  right_o9n:
+    type: agent
+    agent: missing-agent-o9n
+    prompt: "go"
+    fallback: done
+    next: done
+  done:
+    type: end
+    output: "ok"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        ctx.self_agent_id = Some("graph-agent-o9n".to_string());
+        ctx.current_depth = 1;
+        let bus = crate::events::RecordingSink::install();
+        GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let origin = |node: &str| Origin {
+            agent_id: Some("graph-agent-o9n".to_string()),
+            depth: 1,
+            node: Some(node.to_string()),
+        };
+        let events = bus.drain();
+        let hooks_of = |wanted: HookEvent| -> Vec<(String, Origin)> {
+            let mut found: Vec<(String, Origin)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::events::Event::Hook {
+                        event,
+                        envs,
+                        origin,
+                        ..
+                    } if *event == wanted
+                        && origin.agent_id.as_deref() == Some("graph-agent-o9n") =>
+                    {
+                        let node_env = envs
+                            .iter()
+                            .find(|(key, _)| key == "COYOTE_NODE_ID" || key == "COYOTE_AGENT_ID")
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or_default();
+                        Some((node_env, origin.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            found.retain(|(id, _)| id.ends_with("_o9n"));
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            found
+        };
+        let expected = vec![
+            ("left_o9n".to_string(), origin("left_o9n")),
+            ("right_o9n".to_string(), origin("right_o9n")),
+        ];
+        assert_eq!(hooks_of(HookEvent::GraphNodeStarted), expected);
+        assert_eq!(hooks_of(HookEvent::AgentFailed), expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn node_start_notice_names_its_node_in_the_origin() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("step.sh", "#!/bin/bash\necho '{}'\n");
+        let yaml = r#"
+name: node_start_origin_test
+settings:
+  validate_before_run: false
+start: step_s4n
+nodes:
+  step_s4n:
+    type: script
+    script: step.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "ok"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        ctx.self_agent_id = Some("graph-agent-s4n".to_string());
+        let bus = crate::events::RecordingSink::install();
+        GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let starts: Vec<Origin> = bus
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::events::Event::Notice {
+                    kind: crate::events::NoticeKind::GraphNode,
+                    text,
+                    origin,
+                } if text.contains("(script) start")
+                    && origin.agent_id.as_deref() == Some("graph-agent-s4n") =>
+                {
+                    Some(origin)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![Origin {
+                agent_id: Some("graph-agent-s4n".to_string()),
+                depth: 0,
+                node: Some("step_s4n".to_string()),
+            }]
         );
     }
 
@@ -3790,8 +4042,8 @@ nodes:
         );
         let events = ctx.notification_queue.drain();
         assert_eq!(events.len(), 1, "queued notification must survive the run");
-        assert_eq!(events[0].id, "job_bg");
-        assert_eq!(events[0].event, "job_completed");
+        assert_eq!(events[0].id(), Some("job_bg"));
+        assert_eq!(events[0].event(), "job_completed");
     }
 
     use crate::testing::TestConfigDirGuard;

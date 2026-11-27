@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: reviewer (ro) rev...r-a1 1-10/10"
+"Read-only. Tool calls show live; replies"
+"show up at the child's next checkpoint. "
+"                                        "
+"> review src/lib.rs                     "
+"                                        "
+"Reading the file first.                 "
+"                                        "
+"▸ fs_read({"path":"src/lib.rs"})  done  "
+"                                        "
+"It looks fine.                          "
+"q close  Tab threads  / find  n/N  j/k  "

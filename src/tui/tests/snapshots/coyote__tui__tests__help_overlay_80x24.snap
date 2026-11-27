@@ -1,0 +1,28 @@
+---
+source: src/tui/tests/mod.rs
+expression: frame
+---
+"                                                                                "
+" ┌Keys────────────────────────────────────────────────────────────────1-11/180┐ "
+" │                                                                            │ "
+" │Anywhere                                                                    │ "
+" │  Ctrl+Z                                  Suspend to the shell              │ "
+" │  Ctrl+L                                  Redraw the screen                 │ "
+" │  Shift+drag / Option+drag                Select with the terminal instead  │ "
+" │                                          (Option in iTerm2)                │ "
+" │                                                                            │ "
+" │Transcript, also under a question                                           │ "
+" │  Ctrl+X                                  Show or hide the todo panel       │ "
+" │  PgUp / PgDn                             Scroll the transcript a page      │ "
+" │  Alt+PgUp / Alt+PgDn                     Scroll the todo panel a page,     │ "
+" │                                          while it is open                  │ "
+" └j/k scroll  PgUp/Dn page  Esc close─────────────────────────────────────────┘ "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"                                                                                "
+"───────────────────────────────────────────────────────────────────── your turn "
+" Type a prompt or a .command; Enter sends                                       "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+"openai:test-model . no session . agents 0 . jobs 0                              "

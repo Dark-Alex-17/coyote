@@ -366,6 +366,17 @@ mod tests {
         );
     }
 
+    /// A compatible server may be a gateway that rejects unknown keys, so
+    /// no request asks for a usage chunk; a model patch opts in.
+    #[test]
+    fn no_chat_request_asks_for_a_usage_chunk() {
+        let client = make_client(compat_config(None));
+        for stream in [true, false] {
+            let (request, _) = prepare(&client, stream).unwrap();
+            assert!(request.body.get("stream_options").is_none(), "{}", request.body);
+        }
+    }
+
     #[test]
     fn default_wire_is_chat() {
         let client = make_client(compat_config(None));

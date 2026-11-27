@@ -197,8 +197,6 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     const BASE_FILE_PATH: &str = "/home/agent/.config/base";
 
@@ -206,14 +204,8 @@ mod tests {
 
     impl TempRoot {
         fn new(label: &str) -> Self {
-            // The clock alone can collide between parallel tests sharing a label.
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = env::temp_dir().join(format!("coyote-preflight-{label}-{nanos}-{seq}"));
+            let unique = crate::testing::unique_dir_suffix();
+            let root = env::temp_dir().join(format!("coyote-preflight-{label}-{unique}"));
             fs::create_dir_all(&root).unwrap();
             Self(root)
         }

@@ -5,10 +5,9 @@
 //! keep-all/replace-all semantics are identical everywhere, including when
 //! one sticky scope spans several install locations in a single run.
 
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::prompt::{Prompter, can_ask, require_human, select_closed};
 
 use anyhow::{Context, Result, bail};
-use inquire::Select;
 use std::fs;
 use std::path::Path;
 
@@ -35,9 +34,15 @@ pub(crate) enum ConflictAction {
     Replace,
 }
 
+/// What a conflict comes to when no question can be shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NonInteractive {
-    Bail,
+    /// Refused in the shared shape; `remedy` follows "Re-run in a
+    /// terminal" and names the flags of the surface that started the
+    /// run (see [`require_human`]).
+    Bail {
+        remedy: &'static str,
+    },
     Keep,
 }
 
@@ -47,6 +52,7 @@ pub(crate) fn should_replace_existing(
     category: &str,
     mode: InstallMode,
     sticky: &mut StickyMode,
+    prompter: &dyn Prompter,
 ) -> Result<bool> {
     match mode {
         InstallMode::Skip => Ok(false),
@@ -55,7 +61,7 @@ pub(crate) fn should_replace_existing(
             if fs::read(dst).is_ok_and(|local| local == content.as_bytes()) {
                 return Ok(false);
             }
-            match resolve_conflict(dst, category, sticky, NonInteractive::Keep)? {
+            match resolve_conflict(dst, category, sticky, NonInteractive::Keep, prompter)? {
                 ConflictAction::Keep => Ok(false),
                 ConflictAction::Replace => Ok(true),
             }
@@ -68,6 +74,7 @@ pub(crate) fn resolve_conflict(
     category: &str,
     sticky: &mut StickyMode,
     non_interactive: NonInteractive,
+    prompter: &dyn Prompter,
 ) -> Result<ConflictAction> {
     match *sticky {
         StickyMode::KeepAll => return Ok(ConflictAction::Keep),
@@ -75,20 +82,18 @@ pub(crate) fn resolve_conflict(
         StickyMode::None => {}
     }
 
-    if !is_interactive() {
-        match non_interactive {
-            NonInteractive::Keep => return Ok(ConflictAction::Keep),
-            NonInteractive::Bail => bail!(
-                "Refusing to overwrite local file {} non-interactively. \
-                 Re-run in a terminal, with --install-force (installs), \
-                 or with --yes (updates).",
-                dst.display()
-            ),
-        }
+    match non_interactive {
+        NonInteractive::Keep if !can_ask(prompter) => return Ok(ConflictAction::Keep),
+        NonInteractive::Keep => {}
+        NonInteractive::Bail { remedy } => require_human(
+            prompter,
+            format_args!("overwrite local file {}", dst.display()),
+            remedy,
+        )?,
     }
 
     let prompt = format!("Conflict at {} (category: {category})", dst.display());
-    let choice = select_choice(&prompt)?;
+    let choice = select_choice(&prompt, prompter)?;
 
     match choice.as_str() {
         "keep" => Ok(ConflictAction::Keep),
@@ -102,41 +107,32 @@ pub(crate) fn resolve_conflict(
             Ok(ConflictAction::Replace)
         }
         "abort" => bail!("Install aborted by user at conflict resolution."),
-        _ => unreachable!("inquire::Select returned an unexpected option"),
+        _ => unreachable!("select_closed only hands back an offered option"),
     }
 }
 
-fn is_interactive() -> bool {
-    #[cfg(test)]
-    if let Some(forced) = prompt_script::forced_tty() {
-        return forced;
-    }
-    *IS_STDOUT_TERMINAL
-}
-
-fn select_choice(prompt: &str) -> Result<String> {
-    #[cfg(test)]
-    if prompt_script::active() {
-        return Ok(prompt_script::next_answer(prompt));
-    }
-    Select::new(
+fn select_choice(prompt: &str, prompter: &dyn Prompter) -> Result<String> {
+    select_closed(
+        prompter,
         prompt,
-        vec!["keep", "replace", "keep-all", "replace-all", "abort"],
+        ["keep", "replace", "keep-all", "replace-all", "abort"]
+            .map(str::to_string)
+            .to_vec(),
     )
-    .prompt()
-    .map(str::to_string)
     .with_context(|| "failed to read conflict choice")
 }
 
 #[cfg(test)]
 pub(crate) mod prompt_script {
-    //! Scripted stand-in for the interactive conflict prompt.
-    //! `inquire::Select` cannot run under the test harness, so while a guard
-    //! is installed the resolver takes its terminal answer from the guard and
-    //! serves each prompt from a queue of scripted answers, counting every
-    //! prompt asked. A forced-terminal guard with an empty queue pins the
-    //! "never prompts" invariant: any prompt panics and the counter stays 0.
+    //! Scripted stand-in for the conflict menu. While a guard is installed
+    //! the terminal check takes its answer from the guard, and the
+    //! [`Scripted`] prompter serves each select from a queue of scripted
+    //! answers, counting every prompt asked. A forced-terminal guard with
+    //! an empty queue pins the "never prompts" invariant: any prompt panics
+    //! and the counter stays 0.
 
+    use crate::prompt::{PromptAnswer, PromptRequest, Prompter};
+    use anyhow::Result;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -193,11 +189,9 @@ pub(crate) mod prompt_script {
         ASKED.load(Ordering::SeqCst)
     }
 
-    pub(super) fn active() -> bool {
-        STATE.load(Ordering::SeqCst) != INACTIVE
-    }
-
-    pub(super) fn forced_tty() -> Option<bool> {
+    /// The stdout terminal the script stands in for. Stdin is left real, so
+    /// a test pipes fd 0 itself when it needs a non-terminal stdin.
+    pub(crate) fn forced_stdout_tty() -> Option<bool> {
         match STATE.load(Ordering::SeqCst) {
             TTY => Some(true),
             NON_TTY => Some(false),
@@ -205,7 +199,7 @@ pub(crate) mod prompt_script {
         }
     }
 
-    pub(super) fn next_answer(prompt: &str) -> String {
+    fn next_answer(prompt: &str) -> String {
         ASKED.fetch_add(1, Ordering::SeqCst);
         let mut answers = ANSWERS
             .lock()
@@ -216,11 +210,29 @@ pub(crate) mod prompt_script {
         );
         answers.remove(0)
     }
+
+    /// The prompter that answers every select from the installed script.
+    #[derive(Debug)]
+    pub struct Scripted;
+
+    impl Prompter for Scripted {
+        fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
+            Ok(PromptAnswer::Selected(next_answer(&req.question)))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::prompt::{HeadlessPrompter, NeedsHuman};
+    use crate::prompt::{PromptAction, PromptAnswer, ScriptedPrompter};
+    use prompt_script::Scripted;
     use serial_test::serial;
     use std::path::PathBuf;
 
@@ -228,19 +240,101 @@ mod tests {
         PathBuf::from("/tmp/coyote-conflict-tests/example.yaml")
     }
 
+    /// The bail answer with a remedy no caller uses, so a test seeing it
+    /// in the message proves the caller's text is what gets there.
+    const BAIL: NonInteractive = NonInteractive::Bail {
+        remedy: " or pass --some-flag.",
+    };
+
+    fn resolve(
+        category: &str,
+        sticky: &mut StickyMode,
+        non_interactive: NonInteractive,
+    ) -> Result<ConflictAction> {
+        resolve_conflict(&dst(), category, sticky, non_interactive, &Scripted)
+    }
+
     #[test]
     fn sticky_modes_short_circuit_without_prompting() {
         let mut sticky = StickyMode::KeepAll;
         assert!(matches!(
-            resolve_conflict(&dst(), "macros", &mut sticky, NonInteractive::Bail).unwrap(),
+            resolve("macros", &mut sticky, BAIL).unwrap(),
             ConflictAction::Keep
         ));
 
         let mut sticky = StickyMode::ReplaceAll;
         assert!(matches!(
-            resolve_conflict(&dst(), "macros", &mut sticky, NonInteractive::Bail).unwrap(),
+            resolve("macros", &mut sticky, BAIL).unwrap(),
             ConflictAction::Replace
         ));
+    }
+
+    /// Under the full-screen UI the conflict menu is asked through the
+    /// prompter as a closed select, question and options intact.
+    #[test]
+    #[serial]
+    fn select_choice_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("replace".into())]);
+
+        let choice = select_choice("Conflict on example.yaml", &prompter).unwrap();
+
+        assert_eq!(choice, "replace");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Conflict on example.yaml");
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            ["keep", "replace", "keep-all", "replace-all", "abort"]
+        );
+    }
+
+    /// A run with no human refuses the conflict menu with the typed
+    /// select refusal and draws nothing on the terminal.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn headless_select_choice_is_a_typed_select_refusal_with_nothing_on_stdout() {
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let (saved, mut reader) = crate::testing::capture_stdout();
+
+        let err = select_choice("Conflict on example.yaml", &HeadlessPrompter).unwrap_err();
+
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Select))
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_answer_outside_the_offered_options_is_an_error() {
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("maybe".into())]);
+        let mut sticky = StickyMode::None;
+
+        let err = resolve_conflict(
+            &dst(),
+            "hooks",
+            &mut sticky,
+            NonInteractive::Keep,
+            &prompter,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("'maybe' is not one of the offered options"),
+            "got: {err:#}"
+        );
+        assert_eq!(sticky, StickyMode::None);
     }
 
     #[test]
@@ -249,14 +343,16 @@ mod tests {
         let _script = prompt_script::install_non_interactive();
         let mut sticky = StickyMode::None;
 
-        let err =
-            resolve_conflict(&dst(), "macros", &mut sticky, NonInteractive::Bail).unwrap_err();
+        let err = resolve("macros", &mut sticky, BAIL).unwrap_err();
 
-        assert!(
-            err.to_string().contains("Refusing to overwrite local file"),
-            "got: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Refusing to overwrite local file {} non-interactively. \
+                 Re-run in a terminal or pass --some-flag.",
+                dst().display()
+            )
         );
-        assert!(err.to_string().contains("example.yaml"), "got: {err}");
         assert_eq!(prompt_script::prompts_asked(), 0);
     }
 
@@ -266,11 +362,40 @@ mod tests {
         let _script = prompt_script::install_non_interactive();
         let mut sticky = StickyMode::None;
 
-        let action = resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap();
+        let action = resolve("hooks", &mut sticky, NonInteractive::Keep).unwrap();
 
         assert!(matches!(action, ConflictAction::Keep));
         assert_eq!(sticky, StickyMode::None);
         assert_eq!(prompt_script::prompts_asked(), 0);
+    }
+
+    /// The full-screen UI has a modal to show the menu in, so a forced
+    /// non-tty does not make either caller take its non-interactive
+    /// answer: both ask and take what the prompter says.
+    #[test]
+    #[serial]
+    fn under_the_tui_a_forced_non_tty_still_asks_through_the_prompter() {
+        let _script = prompt_script::install_non_interactive();
+        let _tui_on = crate::tui::OwnerGuard::tui_for_test();
+        let mut sticky = StickyMode::None;
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("replace".into())]);
+        let action = resolve_conflict(
+            &dst(),
+            "hooks",
+            &mut sticky,
+            NonInteractive::Keep,
+            &prompter,
+        )
+        .unwrap();
+        assert!(matches!(action, ConflictAction::Replace));
+        assert_eq!(prompter.requests().len(), 1);
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("keep".into())]);
+        let action = resolve_conflict(&dst(), "macros", &mut sticky, BAIL, &prompter).unwrap();
+        assert!(matches!(action, ConflictAction::Keep));
+        assert_eq!(prompter.requests().len(), 1);
+        assert_eq!(sticky, StickyMode::None);
     }
 
     #[test]
@@ -280,23 +405,23 @@ mod tests {
         let mut sticky = StickyMode::None;
 
         assert!(matches!(
-            resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap(),
+            resolve("hooks", &mut sticky, NonInteractive::Keep).unwrap(),
             ConflictAction::Keep
         ));
         assert_eq!(sticky, StickyMode::None);
         assert!(matches!(
-            resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap(),
+            resolve("hooks", &mut sticky, NonInteractive::Keep).unwrap(),
             ConflictAction::Replace
         ));
         assert_eq!(sticky, StickyMode::None);
         assert!(matches!(
-            resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap(),
+            resolve("hooks", &mut sticky, NonInteractive::Keep).unwrap(),
             ConflictAction::Replace
         ));
         assert_eq!(sticky, StickyMode::ReplaceAll);
         // The sticky answer now short-circuits: no further prompt is asked.
         assert!(matches!(
-            resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap(),
+            resolve("hooks", &mut sticky, NonInteractive::Keep).unwrap(),
             ConflictAction::Replace
         ));
         assert_eq!(prompt_script::prompts_asked(), 3);
@@ -308,7 +433,7 @@ mod tests {
         let _script = prompt_script::install(&["abort"]);
         let mut sticky = StickyMode::None;
 
-        let err = resolve_conflict(&dst(), "hooks", &mut sticky, NonInteractive::Keep).unwrap_err();
+        let err = resolve("hooks", &mut sticky, NonInteractive::Keep).unwrap_err();
 
         assert!(
             err.to_string()
@@ -333,6 +458,7 @@ mod tests {
             "hooks",
             InstallMode::Prompt,
             &mut sticky,
+            &Scripted,
         )
         .unwrap();
 
@@ -351,10 +477,22 @@ mod tests {
         fs::write(&path, "local edit").unwrap();
 
         let mut sticky = StickyMode::None;
-        let skip =
-            should_replace_existing(&path, "shipped", "hooks", InstallMode::Skip, &mut sticky);
-        let force =
-            should_replace_existing(&path, "shipped", "hooks", InstallMode::Force, &mut sticky);
+        let skip = should_replace_existing(
+            &path,
+            "shipped",
+            "hooks",
+            InstallMode::Skip,
+            &mut sticky,
+            &Scripted,
+        );
+        let force = should_replace_existing(
+            &path,
+            "shipped",
+            "hooks",
+            InstallMode::Force,
+            &mut sticky,
+            &Scripted,
+        );
 
         let _ = fs::remove_dir_all(&dir);
         assert!(!skip.unwrap());

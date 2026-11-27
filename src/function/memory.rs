@@ -1354,13 +1354,9 @@ mod tests {
     use crate::config::memory::find_git_root_under;
     use serial_test::serial;
     use std::fs;
-    use std::time;
 
     fn temp_root(label: &str) -> PathBuf {
-        let unique = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = crate::testing::unique_dir_suffix();
         let root = env::temp_dir().join(format!("coyote-function-memory-{label}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root
