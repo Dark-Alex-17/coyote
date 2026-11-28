@@ -350,18 +350,18 @@ fn keyed_defaults(page: &str, prefix: &str) -> BTreeMap<String, (usize, String)>
 }
 
 /// Pushes a hit for every key of `expected` that `documented` lacks or gives another
-/// default than the code span of the expected value, and for every key it has beyond.
+/// Default cell than the expected one, and for every key it has beyond.
 fn default_hits(
     hits: &mut Vec<String>,
     label: &str,
     documented: &BTreeMap<String, (usize, String)>,
     expected: &[(String, String)],
 ) {
-    for (key, value) in expected {
+    for (key, expected_cell) in expected {
         match documented.get(key) {
             None => hits.push(format!("{label}: no `{key}` row")),
-            Some((line, cell)) if *cell != format!("`{value}`") => hits.push(format!(
-                "{label}:{line}: `{key}` defaults to {cell}, the code to `{value}`"
+            Some((line, cell)) if cell != expected_cell => hits.push(format!(
+                "{label}:{line}: `{key}` defaults to {cell}, the code to {expected_cell}"
             )),
             Some(_) => {}
         }
@@ -432,16 +432,13 @@ fn with_thousands(n: usize) -> String {
 }
 
 /// A test launched from a git hook inherits `GIT_DIR` and friends, which would point the
-/// call at the hook's repository regardless of `-C`; system and user-global attributes
-/// files are ignored as `hygiene_pins` ignores them.
+/// call at the hook's repository regardless of `-C`.
 fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
-        .args(["-c", "core.attributesFile="])
         .arg("-C")
         .arg(root)
         .args(args)
-        .env("GIT_ATTR_NOSYSTEM", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
@@ -708,16 +705,80 @@ fn expected_command_rows() -> Vec<(String, String, &'static str, &'static str)> 
         .collect()
 }
 
-#[test]
-fn the_commands_page_tables_list_the_repl_command_table_row_for_row() {
-    let Some(wiki) = wiki_dir() else { return };
-    let label = "Mesh-Commands.md";
-    let page = wiki_page(&wiki, label);
-    let heads = headings(&page);
-    let start = heads
+/// `label:line: ...` for every way the first table headed `Tool` in `page` differs from
+/// `names`: its row count, a name with no row, a row naming no declared tool.
+fn tool_table_hits(label: &str, page: &str, names: &[String]) -> Vec<String> {
+    let tables = tables(page);
+    let Some(table) = tables
+        .iter()
+        .find(|table| table.header.first().is_some_and(|cell| cell == "Tool"))
+    else {
+        return vec![format!("{label}: no table headed `Tool`")];
+    };
+    let mut hits = Vec::new();
+    if table.rows.len() != names.len() {
+        hits.push(format!(
+            "{label}: the tool table has {} rows, mesh_function_declarations has {}",
+            table.rows.len(),
+            names.len()
+        ));
+    }
+    let documented: Vec<(usize, &str)> = table
+        .rows
+        .iter()
+        .map(|(line, cells)| {
+            let cell = cells.first().map_or("", String::as_str);
+            (*line, unbacktick(cell).unwrap_or(cell))
+        })
+        .collect();
+    for name in names {
+        if !documented.iter().any(|(_, documented)| documented == name) {
+            hits.push(format!("{label}: the tool table has no `{name}` row"));
+        }
+    }
+    for (line, documented) in &documented {
+        if !names.iter().any(|name| name == documented) {
+            hits.push(format!(
+                "{label}:{line}: `{documented}` is not a declared tool"
+            ));
+        }
+    }
+    hits
+}
+
+/// `expected_command_rows` laid out as the commands page lays them out: a `## The commands`
+/// section with one `Command | Usage | What it does | Node` table per run of a group.
+fn render_command_tables() -> String {
+    let escape = |cell: &str| cell.replace('|', "\\|");
+    let mut out = String::from("## The commands\n");
+    let mut current = None;
+    for (heading, path, usage, summary) in expected_command_rows() {
+        if current.as_deref() != Some(heading.as_str()) {
+            out.push_str(&format!(
+                "\n{heading}\n\n| Command | Usage | What it does | Node |\n|---|---|---|---|\n"
+            ));
+            current = Some(heading);
+        }
+        out.push_str(&format!(
+            "| `{path}` | `{}` | {} | on |\n",
+            escape(usage),
+            escape(summary)
+        ));
+    }
+    out
+}
+
+/// `label:line: ...` for every way the `## The commands` tables of `page` differ from
+/// `COMMANDS`: group headings, row count and order, and each row's heading, path, usage
+/// and summary.
+fn command_table_hits(label: &str, page: &str) -> Vec<String> {
+    let heads = headings(page);
+    let Some(start) = heads
         .iter()
         .position(|(_, heading)| *heading == "## The commands")
-        .unwrap_or_else(|| panic!("{label} has no `## The commands` section"));
+    else {
+        return vec![format!("{label}: no `## The commands` section")];
+    };
     let first = heads[start].0;
     let end = heads[start + 1..]
         .iter()
@@ -739,7 +800,7 @@ fn the_commands_page_tables_list_the_repl_command_table_row_for_row() {
     }
 
     let mut documented = Vec::new();
-    let page_tables = tables(&page);
+    let page_tables = tables(page);
     for table in &page_tables {
         if !table
             .rows
@@ -806,7 +867,37 @@ fn the_commands_page_tables_list_the_repl_command_table_row_for_row() {
     for (line, _, path, _, _) in documented.iter().skip(expected.len()) {
         hits.push(format!("{label}:{line}: `{path}` has no COMMANDS row"));
     }
-    report("command table rows that differ from COMMANDS", &hits);
+    hits
+}
+
+#[test]
+fn the_commands_page_tables_list_the_repl_command_table_row_for_row() {
+    let rendered = render_command_tables();
+    assert_eq!(
+        command_table_hits("fixture", &rendered),
+        Vec::<String>::new()
+    );
+    let (_, path, _, summary) = &expected_command_rows()[0];
+    let changed = format!("{summary}, changed");
+    let mutated = rendered.replacen(&format!("| {summary} |"), &format!("| {changed} |"), 1);
+    let line = mutated
+        .lines()
+        .position(|line| line.contains(&changed))
+        .expect("the mutation lands on a row")
+        + 1;
+    assert_eq!(
+        command_table_hits("fixture", &mutated),
+        [format!(
+            "fixture:{line}: `{path}` summary {changed:?}, COMMANDS has {summary:?}"
+        )]
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    report(
+        "command table rows that differ from COMMANDS",
+        &command_table_hits(label, &wiki_page(&wiki, label)),
+    );
 }
 
 #[test]
@@ -1000,14 +1091,33 @@ fn the_docs_count_and_name_the_hook_events_the_code_registers() {
 
 #[test]
 fn the_mesh_pages_count_and_list_the_mesh_tools_the_code_declares() {
-    let Some(wiki) = wiki_dir() else { return };
     let names: Vec<String> = mesh_function_declarations()
         .into_iter()
         .map(|declaration| declaration.name)
         .collect();
+    let fixture = format!(
+        "| Tool | What it does |\n|---|---|\n{}",
+        names[1..]
+            .iter()
+            .map(|name| format!("| `{name}` | x |\n"))
+            .collect::<String>()
+    );
+    assert_eq!(
+        tool_table_hits("fixture", &fixture, &names),
+        [
+            format!(
+                "fixture: the tool table has {} rows, mesh_function_declarations has {}",
+                names.len() - 1,
+                names.len()
+            ),
+            format!("fixture: the tool table has no `{}` row", names[0]),
+        ]
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
     let word = number_word(names.len());
     let mesh = wiki_page(&wiki, "Mesh.md");
-    let mut hits = Vec::new();
+    let mut hits = tool_table_hits("Mesh.md", &mesh, &names);
     require_phrase(
         &mut hits,
         "Mesh.md",
@@ -1020,38 +1130,6 @@ fn the_mesh_pages_count_and_list_the_mesh_tools_the_code_declares() {
         &wiki_page(&wiki, "Mesh-File-Sharing.md"),
         &format!("of the {word} `{MESH_FUNCTION_PREFIX}*` tools"),
     );
-    let tables = tables(&mesh);
-    let table = tables
-        .iter()
-        .find(|table| table.header.first().is_some_and(|cell| cell == "Tool"))
-        .expect("Mesh.md has a table headed `Tool`");
-    if table.rows.len() != names.len() {
-        hits.push(format!(
-            "Mesh.md: the tool table has {} rows, mesh_function_declarations has {}",
-            table.rows.len(),
-            names.len()
-        ));
-    }
-    let documented: Vec<(usize, &str)> = table
-        .rows
-        .iter()
-        .map(|(line, cells)| {
-            let cell = cells.first().map_or("", String::as_str);
-            (*line, unbacktick(cell).unwrap_or(cell))
-        })
-        .collect();
-    for name in &names {
-        if !documented.iter().any(|(_, documented)| documented == name) {
-            hits.push(format!("Mesh.md: the tool table has no `{name}` row"));
-        }
-    }
-    for (line, documented) in &documented {
-        if !names.iter().any(|name| name == documented) {
-            hits.push(format!(
-                "Mesh.md:{line}: `{documented}` is not a declared tool"
-            ));
-        }
-    }
     report(
         "wiki statements that differ from mesh_function_declarations",
         &hits,
@@ -1085,7 +1163,7 @@ fn every_envoy_memory_key_carries_the_code_default_on_every_surface() {
     };
     let expected: Vec<(String, String)> = fields
         .into_iter()
-        .map(|(key, value)| (key, value.to_string()))
+        .map(|(key, value)| (key, format!("`{value}`")))
         .collect();
     let mut hits = Vec::new();
 
@@ -1126,28 +1204,23 @@ fn every_envoy_memory_key_carries_the_code_default_on_every_surface() {
 
 #[test]
 fn the_memory_page_states_the_caps_and_ttl_the_code_defaults_to() {
-    assert_eq!(with_thousands(4_000), "4,000");
-    assert_eq!(with_thousands(1_234_567), "1,234,567");
-    assert_eq!(with_thousands(999), "999");
-
     let Some(wiki) = wiki_dir() else { return };
     let label = "Memory.md";
     let page = wiki_page(&wiki, label);
     let mut hits = Vec::new();
-    let documented = keyed_defaults(&page, "");
-    for (key, cap) in [
-        ("memory_facts_cap", DEFAULT_MEMORY_FACTS_CAP),
-        ("memory_drill_cap", DEFAULT_MEMORY_DRILL_CAP),
-    ] {
-        let expected = format!("{} chars", with_thousands(cap));
-        match documented.get(key) {
-            None => hits.push(format!("{label}: no `{key}` row")),
-            Some((line, cell)) if *cell != expected => hits.push(format!(
-                "{label}:{line}: `{key}` defaults to {cell:?}, the code to {expected:?}"
-            )),
-            Some(_) => {}
-        }
-    }
+    let expected: Vec<(String, String)> = [
+        ("facts_cap", DEFAULT_MEMORY_FACTS_CAP),
+        ("drill_cap", DEFAULT_MEMORY_DRILL_CAP),
+    ]
+    .into_iter()
+    .map(|(key, cap)| (key.to_string(), format!("{} chars", with_thousands(cap))))
+    .collect();
+    default_hits(
+        &mut hits,
+        label,
+        &keyed_defaults(&page, "memory_"),
+        &expected,
+    );
     require_phrase(
         &mut hits,
         label,
@@ -1247,4 +1320,7 @@ fn number_words_spell_the_counts_the_pages_use() {
     assert_eq!(number_word(40), "forty");
     assert_eq!(number_word(47), "forty-seven");
     assert_eq!(capitalized("nine"), "Nine");
+    assert_eq!(with_thousands(4_000), "4,000");
+    assert_eq!(with_thousands(1_234_567), "1,234,567");
+    assert_eq!(with_thousands(999), "999");
 }
