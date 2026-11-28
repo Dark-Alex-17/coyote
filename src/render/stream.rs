@@ -1434,7 +1434,7 @@ mod tests {
     // Spec: `Skipped` (fewer than 4 columns) falls back to a plain query —
     // no sentinel move, one cursor call, and the painter is Trusted after.
     #[test]
-    fn usage_probe_narrow_terminal_skips_resync_and_queries_plainly() {
+    fn narrow_terminal_skips_resync_and_queries_plainly() {
         let mut render = render();
         let mut painter = painter((3, 40), (0, 12));
         painter.paint(&mut render, "ab").unwrap();
@@ -1449,7 +1449,7 @@ mod tests {
     // Spec: `GaveUp` ⇒ Lost; nothing was painted or measured yet, so the row
     // is the bottom one, and no further queries follow.
     #[test]
-    fn usage_probe_budget_exhaustion_turns_lost() {
+    fn budget_exhaustion_turns_lost() {
         let mut render = render();
         let mut painter = painter((80, 40), (0, 12));
         for col in 40..70 {
@@ -1471,7 +1471,7 @@ mod tests {
     // Spec: a size change re-arms NeedResync even from Lost, so a terminal
     // that has started answering again is trusted after one clean round-trip.
     #[test]
-    fn usage_probe_size_change_recovers_from_lost() {
+    fn size_change_recovers_from_lost() {
         let mut render = render();
         let mut painter = painter((40, 40), (0, 12));
         painter.probe.honest = false;
@@ -1493,7 +1493,7 @@ mod tests {
     // pop match, which here is a stale coincidence at the sentinel column
     // carrying the wrong row.
     #[test]
-    fn usage_probe_coincidental_pop_match_does_not_anchor_the_row() {
+    fn coincidental_pop_match_does_not_anchor_the_row() {
         let mut render = render();
         let mut painter = painter((40, 40), (0, 9));
         painter.probe.queue.push_back((0, 7));
@@ -1512,7 +1512,7 @@ mod tests {
     // Spec: once Trusted, a batch is a single plain query with no sentinel
     // traffic, and the queue stays clean across batches.
     #[test]
-    fn usage_probe_trusted_batches_leave_the_queue_clean() {
+    fn trusted_batches_leave_the_queue_clean() {
         let mut render = render();
         let mut painter = painter((40, 40), (0, 12));
         painter.paint(&mut render, "abc").unwrap();
@@ -1532,7 +1532,7 @@ mod tests {
     // so a resync that then goes Unanswered must anchor on the row measured
     // before the resize — not the bottom row and not the terminal's real cursor.
     #[test]
-    fn usage_probe_lost_after_a_size_change_anchors_on_the_last_measurement() {
+    fn lost_after_a_size_change_anchors_on_the_last_measurement() {
         let mut render = render();
         let mut painter = painter((40, 40), (0, 12));
         painter.paint(&mut render, "abc").unwrap();
@@ -1567,7 +1567,7 @@ mod tests {
     // (`next_sentinel_start()`) rotates the first sentinel away from the REPL
     // prompt's column; with start 3 a lag-1 queue is drained at 14/17/20.
     #[test]
-    fn usage_probe_sentinel_start_rotates_the_painter_columns() {
+    fn sentinel_start_rotates_the_painter_columns() {
         let mut render = render();
         let mut rotated = painter_with_starts((40, 40), (0, 9), || 3);
         rotated.probe.queue.push_back((5, 7));
@@ -1597,7 +1597,7 @@ mod tests {
     // change opens on a different column from the one whose reply this
     // painter orphaned, and drains that orphan instead of matching it.
     #[test]
-    fn usage_probe_rearmed_resync_draws_a_fresh_start() {
+    fn rearmed_resync_draws_a_fresh_start() {
         let mut render = render();
         let mut rotated = painter_with_starts((40, 40), (0, 12), stepping_starts());
         rotated.probe.stall_queries = 1;
@@ -1639,7 +1639,7 @@ mod tests {
     // terminal anything: it anchors on the bottom row, then on the row the
     // last paint ended on.
     #[test]
-    fn usage_probe_lost_from_the_start_never_queries() {
+    fn lost_from_the_start_never_queries() {
         let mut render = render();
         let mut painter = painter((40, 40), (0, 12)).with_lost_trust();
         painter.paint(&mut render, "abc").unwrap();
@@ -1663,7 +1663,7 @@ mod tests {
     // Spec: a measurement taken before a rows-shrinking resize is clamped to
     // the new bottom row, like the other two rungs.
     #[test]
-    fn usage_probe_remembered_row_clamps_the_last_measurement_to_the_viewport() {
+    fn remembered_row_clamps_the_last_measurement_to_the_viewport() {
         let mut painter = painter((40, 40), (0, 30));
         painter.last_cursor = Some((5, 30));
         assert_eq!(painter.remembered_row(40), 30);
@@ -1675,7 +1675,7 @@ mod tests {
     // re-arms it like any other painter: the first draw happens then, the
     // clean queue syncs in one query, and the row is the terminal's.
     #[test]
-    fn usage_probe_lost_painter_draws_its_first_start_only_when_a_resync_runs() {
+    fn lost_painter_draws_its_first_start_only_when_a_resync_runs() {
         let mut render = render();
         // The boxed start source must be `Send`, so draws are counted through a channel.
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -1715,7 +1715,7 @@ mod tests {
     // reply, but neither is a real measurement, so nothing is remembered and
     // the batch anchors on the bottom row; nothing more is asked this stream.
     #[test]
-    fn usage_probe_stall_at_a_confirm_turns_lost_without_anchoring_on_the_pop() {
+    fn stall_at_a_confirm_turns_lost_without_anchoring_on_the_pop() {
         let mut render = render();
         let mut painter = painter((40, 40), (0, 9));
         painter.probe.queue.push_back((0, 7));

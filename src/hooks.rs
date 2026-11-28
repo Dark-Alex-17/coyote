@@ -138,6 +138,21 @@ pub enum HookEvent {
     RagSyncFailed,
     McpServerConnected,
     McpServerFailed,
+    MeshStarted,
+    MeshStopped,
+    MeshPeerDiscovered,
+    MeshKnockReceived,
+    MeshTrustGranted,
+    MeshTrustRevoked,
+    MeshMessageReceived,
+    MeshMessageSent,
+    MeshMessageFailed,
+    MeshBulletinReceived,
+    MeshBulletinSent,
+    MeshBriefUpdated,
+    MeshFetchServed,
+    MeshAccessRequested,
+    MeshAccessDecided,
 }
 
 impl HookEvent {
@@ -175,10 +190,25 @@ impl HookEvent {
             HookEvent::RagSyncFailed => "rag.sync.failed",
             HookEvent::McpServerConnected => "mcp.server.connected",
             HookEvent::McpServerFailed => "mcp.server.failed",
+            HookEvent::MeshStarted => "mesh.started",
+            HookEvent::MeshStopped => "mesh.stopped",
+            HookEvent::MeshPeerDiscovered => "mesh.peer.discovered",
+            HookEvent::MeshKnockReceived => "mesh.knock.received",
+            HookEvent::MeshTrustGranted => "mesh.trust.granted",
+            HookEvent::MeshTrustRevoked => "mesh.trust.revoked",
+            HookEvent::MeshMessageReceived => "mesh.message.received",
+            HookEvent::MeshMessageSent => "mesh.message.sent",
+            HookEvent::MeshMessageFailed => "mesh.message.failed",
+            HookEvent::MeshBulletinReceived => "mesh.bulletin.received",
+            HookEvent::MeshBulletinSent => "mesh.bulletin.sent",
+            HookEvent::MeshBriefUpdated => "mesh.brief.updated",
+            HookEvent::MeshFetchServed => "mesh.fetch.served",
+            HookEvent::MeshAccessRequested => "mesh.access.requested",
+            HookEvent::MeshAccessDecided => "mesh.access.decided",
         }
     }
 
-    const ALL: [HookEvent; 32] = [
+    pub(crate) const ALL: [HookEvent; 47] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -211,6 +241,21 @@ impl HookEvent {
         HookEvent::RagSyncFailed,
         HookEvent::McpServerConnected,
         HookEvent::McpServerFailed,
+        HookEvent::MeshStarted,
+        HookEvent::MeshStopped,
+        HookEvent::MeshPeerDiscovered,
+        HookEvent::MeshKnockReceived,
+        HookEvent::MeshTrustGranted,
+        HookEvent::MeshTrustRevoked,
+        HookEvent::MeshMessageReceived,
+        HookEvent::MeshMessageSent,
+        HookEvent::MeshMessageFailed,
+        HookEvent::MeshBulletinReceived,
+        HookEvent::MeshBulletinSent,
+        HookEvent::MeshBriefUpdated,
+        HookEvent::MeshFetchServed,
+        HookEvent::MeshAccessRequested,
+        HookEvent::MeshAccessDecided,
     ];
 }
 
@@ -414,6 +459,13 @@ impl RequestContext {
                 .map(|agent| (agent.hooks(), agent.name())),
         )
     }
+}
+
+/// Global `hooks:` only, resolved without an agent whitelist gate. Mesh events are
+/// node-level and dispatched from the mesh runtime, which has no request context even
+/// when the triggering action was an agent's `mesh__*` tool call.
+pub(crate) fn resolve_global_hooks(event: HookEvent, global_hooks: &HooksMap) -> Vec<ResolvedHook> {
+    resolve_hooks(event, global_hooks, None, None, None)
 }
 
 fn resolve_hooks(
@@ -1676,6 +1728,21 @@ mod tests {
             (HookEvent::RagSyncFailed, "rag.sync.failed"),
             (HookEvent::McpServerConnected, "mcp.server.connected"),
             (HookEvent::McpServerFailed, "mcp.server.failed"),
+            (HookEvent::MeshStarted, "mesh.started"),
+            (HookEvent::MeshStopped, "mesh.stopped"),
+            (HookEvent::MeshPeerDiscovered, "mesh.peer.discovered"),
+            (HookEvent::MeshKnockReceived, "mesh.knock.received"),
+            (HookEvent::MeshTrustGranted, "mesh.trust.granted"),
+            (HookEvent::MeshTrustRevoked, "mesh.trust.revoked"),
+            (HookEvent::MeshMessageReceived, "mesh.message.received"),
+            (HookEvent::MeshMessageSent, "mesh.message.sent"),
+            (HookEvent::MeshMessageFailed, "mesh.message.failed"),
+            (HookEvent::MeshBulletinReceived, "mesh.bulletin.received"),
+            (HookEvent::MeshBulletinSent, "mesh.bulletin.sent"),
+            (HookEvent::MeshBriefUpdated, "mesh.brief.updated"),
+            (HookEvent::MeshFetchServed, "mesh.fetch.served"),
+            (HookEvent::MeshAccessRequested, "mesh.access.requested"),
+            (HookEvent::MeshAccessDecided, "mesh.access.decided"),
         ];
         for (event, name) in cases {
             assert_eq!(event.as_str(), name);
@@ -1685,6 +1752,25 @@ mod tests {
             );
         }
         assert_eq!(HookEvent::ALL.len(), cases.len());
+    }
+
+    #[test]
+    fn the_readme_counts_the_hook_events_the_registry_declares() {
+        const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        let n = HookEvent::ALL.len();
+        let counts: Vec<&str> = README
+            .match_indices('(')
+            .filter_map(|(start, _)| {
+                let rest = &README[start + 1..];
+                let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+                (digits > 0 && rest[digits..].starts_with(" events)"))
+                    .then(|| &README[start..start + 1 + digits + " events)".len()])
+            })
+            .collect();
+        assert!(
+            counts == [format!("({n} events)")],
+            "README.md must say ({n} events) exactly once, where n = HookEvent::ALL.len(); found {counts:?}"
+        );
     }
 
     #[test]
@@ -1725,6 +1811,70 @@ mod tests {
         // globs that admit nothing.
         assert!(!entry_is_valid_wildcard("rag.sync.*"));
         assert!(!entry_is_valid_wildcard("mcp.server.*"));
+    }
+
+    #[test]
+    fn mesh_wildcard_whitelist_entries_are_valid() {
+        let mesh_events: Vec<&str> = HookEvent::ALL
+            .iter()
+            .map(|event| event.as_str())
+            .filter(|name| name.starts_with("mesh."))
+            .collect();
+        assert_eq!(mesh_events.len(), 15);
+        for event in mesh_events {
+            assert!(
+                entry_is_valid_wildcard(&format!("{event}.*")),
+                "'{event}.*' must validate as an <event>.* wildcard"
+            );
+        }
+        for family in ["mesh.*", "mesh.peer.*", "mesh.trust.*", "mesh.message.*"] {
+            assert!(!entry_is_valid_wildcard(family), "{family}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_global_hooks_resolves_the_global_map_ungated() {
+        let global = hooks_map("mesh.started", &[("notify", "cmd-mesh")]);
+        let resolved = resolve_global_hooks(HookEvent::MeshStarted, &global);
+        assert_eq!(names(&resolved), ["notify"]);
+        assert_eq!(resolved[0].cwd, paths::config_dir());
+        assert!(resolve_global_hooks(HookEvent::MeshStopped, &global).is_empty());
+        assert!(resolve_global_hooks(HookEvent::MeshStarted, &HooksMap::default()).is_empty());
+    }
+
+    #[test]
+    fn mesh_events_stay_behind_the_agent_whitelist_gate() {
+        let mesh_events: Vec<HookEvent> = HookEvent::ALL
+            .iter()
+            .copied()
+            .filter(|event| event.as_str().starts_with("mesh."))
+            .collect();
+        assert_eq!(mesh_events.len(), 15);
+        let mut global = HooksMap::default();
+        for event in &mesh_events {
+            global.extend(hooks_map(event.as_str(), &[("watch", "cmd-mesh")]));
+        }
+
+        for event in &mesh_events {
+            let resolved = resolve_hooks(*event, &global, Some((&[], "gated-agent")), None, None);
+            assert!(
+                resolved.is_empty(),
+                "{} must stay whitelist-gated for agents",
+                event.as_str()
+            );
+        }
+
+        for event in &mesh_events {
+            let gate = vec![format!("{}.*", event.as_str())];
+            let resolved = resolve_hooks(*event, &global, Some((&gate, "gated-agent")), None, None);
+            assert_eq!(
+                names(&resolved),
+                ["watch"],
+                "an `<event>.*` whitelist entry must admit {}",
+                event.as_str()
+            );
+        }
     }
 
     #[test]

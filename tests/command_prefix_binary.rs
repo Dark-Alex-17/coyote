@@ -269,3 +269,124 @@ fn macro_slash_step_is_chat_under_dot_and_a_command_otherwise() {
         );
     }
 }
+
+/// The macro load gate mirrors the runner's dispatch rule, seen from the
+/// binary a user runs: a `/mesh` step is refused before any step runs under
+/// slash and both (the mesh branch's refusal text, unchanged, naming the
+/// step as typed) and is ordinary chat under dot, where the `.set` before it
+/// and the `.info` after it both run; a `.mesh` step is refused under every
+/// setting because the runner widens slash to both.
+#[test]
+fn macro_mesh_steps_are_refused_at_load_exactly_where_the_runner_dispatches_them() {
+    const REFUSAL: &str =
+        "literal `.mesh` steps are refused at load; the runtime guard covers the rest";
+    for (label, prefix_line, slash_is_a_command) in [
+        ("meshstep-dot", None, false),
+        ("meshstep-slash", Some("command_prefix: slash"), true),
+        ("meshstep-both", Some("command_prefix: both"), true),
+    ] {
+        let dir = fresh_config_dir(label);
+        let _cleanup = TempDirGuard(dir.clone());
+        write_fixture(&dir, prefix_line);
+        fs::write(
+            dir.join("macros/slashmesh.yaml"),
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh status\"\n  - \".info\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("macros/dotmesh.yaml"),
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \".mesh status\"\n  - \".info\"\n",
+        )
+        .unwrap();
+
+        let output = run_coyote(&dir, &[], &["--macro", "slashmesh"]);
+        let stdout = stdout_of(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let transcript = format!("{stdout}\n{stderr}");
+        if slash_is_a_command {
+            assert!(
+                !output.status.success(),
+                "{label}: a `/mesh` step must fail the macro at load\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(
+                transcript.contains(&format!("step 2 '/mesh status': {REFUSAL}")),
+                "{label}: the refusal names the step as typed with the unchanged text:\n{transcript}"
+            );
+            assert!(
+                info_row(&stdout, "temperature").is_none(),
+                "{label}: refusal at load precedes step 1 and step 3 never runs:\n{stdout}"
+            );
+        } else {
+            assert_ok(label, &output);
+            assert!(
+                !transcript.contains("refused at load"),
+                "{label}: under dot a `/mesh` step is prose:\n{transcript}"
+            );
+            assert_eq!(
+                info_row(&stdout, "temperature").as_deref(),
+                Some("0.9"),
+                "{label}: every step ran:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("Unknown command"),
+                "{label}: a slash-led line is never an unknown command:\n{stdout}"
+            );
+        }
+
+        let output = run_coyote(&dir, &[], &["--macro", "dotmesh"]);
+        let stdout = stdout_of(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let transcript = format!("{stdout}\n{stderr}");
+        assert!(
+            !output.status.success(),
+            "{label}: a `.mesh` step is refused under every prefix\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            transcript.contains(&format!("step 2 '.mesh status': {REFUSAL}")),
+            "{label}:\n{transcript}"
+        );
+        assert!(
+            info_row(&stdout, "temperature").is_none(),
+            "{label}: refusal at load precedes step 1:\n{stdout}"
+        );
+    }
+}
+
+/// `--info` lists the mesh block and the prefix row side by side from one
+/// config: the merge kept both sides' keys loadable in the same file.
+#[test]
+fn info_shows_the_mesh_block_and_the_prefix_from_one_config() {
+    let dir = fresh_config_dir("mesh-and-prefix");
+    let _cleanup = TempDirGuard(dir.clone());
+    write_fixture(&dir, Some("command_prefix: slash"));
+    let config = dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("mesh:\n  enabled: false\n  announce: false\n  collision_protection: true\n");
+    fs::write(&config, text).unwrap();
+
+    let output = run_coyote(&dir, &[], &["--info"]);
+    assert_ok("mesh-and-prefix", &output);
+    let stdout = stdout_of(&output);
+    assert_eq!(
+        info_row(&stdout, "command_prefix").as_deref(),
+        Some("slash")
+    );
+    let mesh_row = |key: &str| {
+        stdout
+            .lines()
+            .skip_while(|l| *l != "mesh:")
+            .skip(1)
+            .find_map(|l| l.strip_prefix("  ").and_then(|l| l.strip_prefix(key)))
+            .map(|rest| rest.trim().to_string())
+    };
+    assert!(
+        stdout.lines().any(|l| l == "mesh:"),
+        "the readout carries the mesh block:\n{stdout}"
+    );
+    assert_eq!(
+        mesh_row("collision_protection ").as_deref(),
+        Some("true"),
+        "{stdout}"
+    );
+    assert_eq!(mesh_row("announce ").as_deref(), Some("false"), "{stdout}");
+}

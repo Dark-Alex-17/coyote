@@ -242,7 +242,7 @@ session:
                                # tools, which a graph agent otherwise never has.
     tools:                     # Global tools the chat turn may call, by name. Agent-
       - web_search_coyote      # local tools.* subcommands and the agent__/job__/todo__/
-                               # user__/memory__ families are refused.
+                               # user__/memory__/mesh__ families are refused.
 
 # ---------------------------------------------------------------------------
 # Entry point

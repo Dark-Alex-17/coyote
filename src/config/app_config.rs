@@ -3,7 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::{CommandPrefix, RoundChains, paths};
+use super::{CommandPrefix, MeshConfig, RoundChains, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -56,6 +56,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub hooks: HooksMap,
+
+    #[serde(default)]
+    pub mesh: MeshConfig,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -157,6 +160,8 @@ impl Default for AppConfig {
             mcp_tools: None,
 
             hooks: Default::default(),
+
+            mesh: Default::default(),
 
             auto_continue: false,
             max_auto_continues: 10,
@@ -270,6 +275,8 @@ impl AppConfig {
 
             hooks: config.hooks,
 
+            mesh: config.mesh,
+
             auto_continue: config.auto_continue,
             max_auto_continues: config.max_auto_continues,
             inject_todo_instructions: config.inject_todo_instructions,
@@ -332,6 +339,9 @@ impl AppConfig {
             clients: config.clients,
         };
         app_config.load_envs();
+        app_config
+            .mesh
+            .validate(app_config.function_calling_support)?;
         app_config.validate_visible_skills()?;
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
@@ -880,6 +890,111 @@ mod tests {
         let app = AppConfig::from_config(cfg).unwrap();
 
         assert!(app.hooks.is_empty());
+    }
+
+    #[test]
+    fn from_config_refuses_mesh_enabled_without_function_calling() {
+        let cfg = Config {
+            model_id: "provider:test".into(),
+            function_calling_support: false,
+            mesh: MeshConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let err = AppConfig::from_config(cfg).unwrap_err().to_string();
+        assert!(err.contains(".set function_calling_support true"), "{err}");
+        assert!(err.contains("install tools"), "{err}");
+    }
+
+    #[test]
+    fn from_config_lenient_refuses_mesh_enabled_without_function_calling() {
+        let cfg = Config {
+            function_calling_support: false,
+            mesh: MeshConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let err = AppConfig::from_config_lenient(cfg).unwrap_err().to_string();
+        assert!(err.contains("mesh.enabled is true"), "{err}");
+    }
+
+    #[test]
+    fn from_config_accepts_mesh_disabled_without_function_calling() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            function_calling_support: false,
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+        assert!(!app.mesh.enabled);
+    }
+
+    #[test]
+    // A neighbouring test sets COYOTE_FUNCTION_CALLING_SUPPORT, which from_config reads.
+    #[serial_test::serial]
+    fn from_config_accepts_mesh_enabled_with_function_calling() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            function_calling_support: true,
+            mesh: MeshConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+        assert!(app.mesh.enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_config_mesh_check_runs_after_env_overrides() {
+        let _guard =
+            crate::testing::EnvVarGuard::set(get_env_name("function_calling_support"), "false");
+
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            function_calling_support: true,
+            mesh: MeshConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let err = AppConfig::from_config(cfg).unwrap_err().to_string();
+        assert!(err.contains("mesh.enabled is true"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn loading_default_mesh_config_creates_no_mesh_directories() {
+        use std::fs;
+
+        let guard = crate::testing::TestConfigDirGuard::new("mesh-config");
+        let config_path = guard.path.join("config.yaml");
+        fs::write(&config_path, "model: provider:test\nmesh: {}\n").unwrap();
+
+        let result = Config::load_from_file(&config_path)
+            .and_then(|(cfg, _)| AppConfig::from_config_lenient(cfg));
+        let config_mesh_exists = guard.path.join("mesh").exists();
+        let cache_mesh_exists = guard.cache_root().join("mesh").exists();
+
+        let app = result.unwrap();
+        assert_eq!(app.mesh, MeshConfig::default());
+        assert!(!config_mesh_exists);
+        assert!(!cache_mesh_exists);
     }
 
     #[test]

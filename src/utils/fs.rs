@@ -192,7 +192,7 @@ impl Drop for ExclusiveLock {
     }
 }
 
-fn holder_suffix(pid: Option<u32>) -> String {
+pub(crate) fn holder_suffix(pid: Option<u32>) -> String {
     pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
@@ -201,7 +201,7 @@ fn holder_suffix(pid: Option<u32>) -> String {
 /// the directory never recreates it by locking. The file holds a pid and
 /// nothing secret, so on Windows it keeps the permissions it inherits
 /// from the directory.
-fn open_lock_file(lock_path: &Path) -> Result<File> {
+pub(crate) fn open_lock_file(lock_path: &Path) -> Result<File> {
     refuse_symlinked_file(lock_path)?;
     open_lock_file_unchecked(lock_path)
 }
@@ -233,7 +233,7 @@ fn open_lock_file_unchecked(lock_path: &Path) -> Result<File> {
 }
 
 /// For `read_holder_pid` in a process that finds the lock taken.
-fn write_holder_pid(file: &mut File) -> io::Result<()> {
+pub(crate) fn write_holder_pid(file: &mut File) -> io::Result<()> {
     file.set_len(0)?;
     file.write_all(std::process::id().to_string().as_bytes())
 }
@@ -244,7 +244,7 @@ fn write_holder_pid(file: &mut File) -> io::Result<()> {
 /// another handle has locked fails. A killed holder never reaches this
 /// path: its death released the kernel lock. The pid only words the
 /// refusal, so a stale or reused pid costs nothing but a misleading hint.
-fn read_holder_pid(file: &mut File) -> Option<u32> {
+pub(crate) fn read_holder_pid(file: &mut File) -> Option<u32> {
     let mut content = String::new();
     file.rewind().ok()?;
     file.read_to_string(&mut content).ok()?;

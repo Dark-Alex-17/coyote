@@ -1,9 +1,10 @@
 use super::mcp_factory::{McpFactory, McpServerKey};
 use super::rag_cache::RagCache;
 use crate::config::AppConfig;
-use crate::config::jobs_enabled;
+use crate::config::{jobs_enabled, mesh_tools_available};
 use crate::function::Functions;
 use crate::mcp::{McpRegistry, McpServersConfig};
+use crate::mesh::MeshSlot;
 use crate::utils::AbortSignal;
 use crate::vault::{GlobalVault, Vault};
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub mcp_log_path: Option<PathBuf>,
     pub mcp_registry: Option<Arc<McpRegistry>>,
     pub functions: Functions,
+    pub mesh: Arc<MeshSlot>,
 }
 
 impl AppState {
@@ -35,6 +37,7 @@ impl AppState {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Arc::new(MeshSlot::default()),
         }
     }
 
@@ -87,6 +90,13 @@ impl AppState {
         if jobs_enabled(None, &config) {
             functions.append_job_functions();
         }
+        let mesh = Arc::new(MeshSlot::default());
+        mesh.command_prefix().store(config.command_prefix);
+        // `mesh` was just created empty, so the predicate is false here and nothing is
+        // appended. The guarded call is kept so every append site reads the same way.
+        if mesh_tools_available(&config, &mesh) {
+            functions.append_mesh_functions();
+        }
 
         let mcp_registry = if mcp_registry.is_empty() {
             None
@@ -103,6 +113,30 @@ impl AppState {
             mcp_log_path,
             mcp_registry,
             functions,
+            mesh,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::testing::TestConfigDirGuard;
+    use crate::utils::create_abort_signal;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slash_config_starts_with_a_slash_live_prefix() {
+        let _guard = TestConfigDirGuard::new("app-state-live-prefix");
+        let config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..AppConfig::default()
+        });
+        let app = AppState::init(config, None, false, true, true, create_abort_signal())
+            .await
+            .unwrap();
+        assert_eq!(app.mesh.command_prefix().load(), CommandPrefix::Slash);
     }
 }

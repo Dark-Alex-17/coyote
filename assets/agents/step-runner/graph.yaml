@@ -65,6 +65,17 @@ variables:
       works. Empty (the default) runs the gate command bare.
     default: ''
 
+  - name: test_command
+    description: |
+      The command the test gate runs instead of the detected one, e.g. a
+      targeted `cargo test --bin coyote -- mesh::node` when the project's full
+      suite takes longer than the gate's timeout (1200 s). The gate is the step's
+      own fast check; the full suite belongs to the review that follows. A
+      `TEST_CMD` environment variable still wins over it. Empty (the default)
+      runs the detected test command. The value is a shell fragment, run under
+      `build_lock` like the detected command.
+    default: ''
+
 settings:
   max_loop_iterations: 20
   log_state_snapshots: true

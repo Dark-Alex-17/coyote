@@ -1010,8 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_apply_branch_writes_script_fallback_error_joins_three_writers_without_prior_value()
-     {
+    fn apply_branch_writes_script_fallback_error_joins_three_writers_without_prior_value() {
         let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!("stale"))]);
         let reducers = HashMap::new();
 
@@ -1050,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_apply_branch_writes_implicit_join_does_not_leak_to_other_keys() {
+    fn apply_branch_writes_implicit_join_does_not_leak_to_other_keys() {
         let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!(""))]);
         let reducers = HashMap::new();
 
