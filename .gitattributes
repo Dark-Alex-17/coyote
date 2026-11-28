@@ -28,8 +28,8 @@ assets/functions/kits/** text eol=lf
 # comment-hygiene: files whose comment lines src/hygiene_pins.rs holds to plain
 # ASCII and keeps free of planning vocabulary. Every pattern carries a "/" so it
 # is anchored at the repository root and never matches a basename elsewhere.
-# The tail of the list names paths that do not exist yet; the pins keep a list
-# of the patterns allowed to match nothing.
+# Some patterns name paths that may not exist yet; TRANSITIONAL in
+# src/hygiene_pins.rs lists them.
 src/mesh/** comment-hygiene
 deployment/propagation-node/** comment-hygiene
 scripts/mesh-*/** comment-hygiene

@@ -115,11 +115,11 @@ fn tracked_matches(root: &Path, pattern: &str) -> Vec<u8> {
     git(root, &["ls-files", "-z", "--", &pathspec]).expect("git ls-files")
 }
 
-/// Whether the checks that compare the allow-list against `origin/main` can run: the ref
-/// must resolve (a shallow CI checkout has none) and must not carry this file yet. Once
-/// the branch has landed, every allow-listed path exists on `main` and the three-dot diff
-/// is empty, so those checks describe a branch that no longer exists; the pins themselves
-/// keep running.
+/// Whether the checks that compare the attributed set against `origin/main` can run: the
+/// ref must resolve (a shallow CI checkout has none) and must not carry this file yet.
+/// Once the branch has landed, every attributed path exists on `main` and the three-dot
+/// diff is empty, so those checks describe a branch that no longer exists; the pins
+/// themselves keep running.
 fn origin_main_predates_the_pins(root: &Path) -> Result<(), String> {
     git(root, &["rev-parse", "--verify", "origin/main"])
         .map_err(|reason| format!("origin/main unavailable: {reason}"))?;
