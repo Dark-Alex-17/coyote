@@ -9,7 +9,7 @@ use crate::utils::fs::{
     EXCLUSIVE_LOCK_WAIT, ExclusiveLock, create_private_dir_all, refuse_symlinked_dir,
     write_private_atomic,
 };
-use crate::utils::process::ProcessStamp;
+use crate::utils::process::{ProcessStamp, alive_or_start_unknown, lookup_start_time};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
@@ -720,10 +720,17 @@ impl SweepAction {
         match self {
             Self::Keep => None,
             Self::Remove(reason) => Some(reason),
-            Self::RemoveIfDead(stamp, reason) => (stamp.pid == 0
-                || !(alive.contains(&stamp)
-                    || (stamp.start == 0 && ProcessStamp::pid_exists(stamp.pid))))
-            .then_some(reason),
+            Self::RemoveIfDead(stamp, reason) if stamp.pid == 0 => Some(reason),
+            Self::RemoveIfDead(stamp, reason) => {
+                let start = if alive.contains(&stamp) {
+                    Some(stamp.start)
+                } else if stamp.start == 0 {
+                    lookup_start_time(stamp.pid)
+                } else {
+                    None
+                };
+                (!alive_or_start_unknown(stamp, start)).then_some(reason)
+            }
         }
     }
 }
@@ -3696,6 +3703,7 @@ updated_at: 2026-01-02T03:04:05Z
             assert!(!body.contains(".is_alive("), "{head}");
             assert!(!body.contains(".is_alive_or_start_unknown("), "{head}");
             assert!(!body.contains("pid_exists("), "{head}");
+            assert!(!body.contains("lookup_start_time("), "{head}");
         }
         assert!(fn_body("\nfn remove_unless_adopted(").contains(".is_alive_or_start_unknown("));
         let reason = {
@@ -3703,15 +3711,30 @@ updated_at: 2026-01-02T03:04:05Z
             let body = &production[start..];
             &body[..body.find("\n    }\n").unwrap()]
         };
-        assert!(reason.contains("pid_exists("));
-        assert!(reason.contains("stamp.pid == 0"));
+        let lookup = reason.find("lookup_start_time(stamp.pid)").unwrap();
+        assert_eq!(reason.matches("lookup_start_time(").count(), 1, "{reason}");
+        assert!(
+            reason.find("alive.contains(&stamp)").unwrap() < lookup
+                && reason.find("stamp.start == 0").unwrap() < lookup,
+            "only a start-0 stamp missing from the alive set is looked up on its own: {reason}"
+        );
+        assert!(
+            reason.find("stamp.pid == 0").unwrap() < lookup,
+            "the pid-0 refusal stays in reason, ahead of any lookup: {reason}"
+        );
+        assert!(
+            reason.contains("alive_or_start_unknown(stamp, start)"),
+            "reason applies the shared start-unknown rule: {reason}"
+        );
         assert!(!reason.contains(".is_alive("));
         assert!(!reason.contains(".is_alive_or_start_unknown("));
+        assert!(!reason.contains("pid_exists("));
         assert_eq!(
             fn_body("\nfn sweep_orphans_with(")
                 .matches("alive_set(")
                 .count(),
-            1
+            1,
+            "a sweep pass costs one process-table refresh"
         );
         assert_eq!(production.matches("alive_set(").count(), 1);
     }
@@ -3729,16 +3752,19 @@ updated_at: 2026-01-02T03:04:05Z
     }
 
     /// Every caller that must not act on a possibly live process asks
-    /// `is_alive_or_start_unknown`; the sweep's batched check is the one
-    /// place that spells the start-0 fallback out, so it can reuse the
-    /// alive set for the exact half.
+    /// `is_alive_or_start_unknown`, or `alive_or_start_unknown` with a start
+    /// time it looked up itself, so the start-0 fallback is spelled out once.
     #[test]
-    fn the_start_unknown_fallback_is_spelled_out_only_in_the_sweep() {
-        let retired = concat!("pid_start == 0 && ", "ProcessStamp::pid_exists(meta.pid)");
-        let prescribed = concat!(
-            "stamp.start == 0 && ",
-            "ProcessStamp::pid_exists(stamp.pid)"
-        );
+    fn the_start_unknown_fallback_is_spelled_out_only_in_alive_or_start_unknown() {
+        let retired = [
+            concat!("pid_start == 0 && ", "ProcessStamp::pid_exists(meta.pid)"),
+            concat!(
+                "stamp.start == 0 && ",
+                "ProcessStamp::pid_exists(stamp.pid)"
+            ),
+            concat!("self.start == 0 && ", "Self::pid_exists(self.pid)"),
+        ];
+        let prescribed = concat!("stamp.start == 0 && ", "start.is_some()");
         let mut sources = Vec::new();
         rust_sources_under(
             Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
@@ -3746,14 +3772,20 @@ updated_at: 2026-01-02T03:04:05Z
         );
 
         for (path, text) in &sources {
-            assert!(!text.contains(retired), "{}", path.display());
+            for retired in retired {
+                assert!(!text.contains(retired), "{}: {retired}", path.display());
+            }
         }
         let sites: Vec<_> = sources
             .iter()
             .flat_map(|(path, text)| text.matches(prescribed).map(move |_| path))
             .collect();
-        assert_eq!(sites.len(), 1, "{sites:?}");
-        assert!(sites[0].ends_with("child_sessions.rs"), "{sites:?}");
+        assert_eq!(
+            sites.len(),
+            1,
+            "the start-0 fallback has one home: {sites:?}"
+        );
+        assert!(sites[0].ends_with("utils/process.rs"), "{sites:?}");
     }
 
     /// A regular file at a root's path is not a root: settling it neither

@@ -1,4 +1,5 @@
 use arc_swap::ArcSwapOption;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +62,32 @@ pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> S
     format!(
         "Agent '{requested}' is reserved: only a human can run it (`.agent {canonical}`); {tail}"
     )
+}
+
+/// Screens the files of one install pass by their top-level path segment,
+/// refusing every reserved agent name and warning once per canonical name.
+#[derive(Default)]
+pub struct ReservedAgentFilter {
+    warned: HashSet<&'static str>,
+}
+
+impl ReservedAgentFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `false` when `top_segment` spells a reserved agent name. The
+    /// first refusal of each canonical name calls `shown` with that name, so
+    /// the caller words the warning for whatever it is dropping.
+    pub fn admits(&mut self, top_segment: &str, shown: impl FnOnce(&'static str)) -> bool {
+        let Some(canonical) = reserved_agent(top_segment) else {
+            return true;
+        };
+        if self.warned.insert(canonical) {
+            shown(canonical);
+        }
+        false
+    }
 }
 
 /// Resolves a reserved agent name to its built-in definition. Registered by
@@ -332,6 +359,25 @@ mod tests {
     #[test]
     fn normalize_strips_separators_and_lowercases() {
         assert_eq!(normalize_agent_name("En-Voy_X"), "envoyx");
+    }
+
+    #[test]
+    fn reserved_agent_filter_refuses_reserved_names_and_reports_each_canonical_once() {
+        let mut filter = ReservedAgentFilter::new();
+        let mut shown = Vec::new();
+        for segment in ["coder", "Envoy", "en-voy", "envoy", "rag"] {
+            let admitted = filter.admits(segment, |canonical| shown.push((segment, canonical)));
+            assert_eq!(admitted, reserved_agent(segment).is_none(), "{segment}");
+        }
+        assert_eq!(shown, vec![("Envoy", ENVOY_AGENT_NAME)]);
+
+        let mut fresh = ReservedAgentFilter::new();
+        let mut shown_again = false;
+        assert!(!fresh.admits("envoy", |_| shown_again = true));
+        assert!(
+            shown_again,
+            "each filter keeps its own once-per-name record"
+        );
     }
 
     #[test]

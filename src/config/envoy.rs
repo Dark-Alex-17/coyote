@@ -3,8 +3,11 @@ use super::reserved_agents::{ENVOY_AGENT_NAME, UnavailableReason};
 use super::{BuiltinAgentSource, CONFIG_FILE_NAME, ensure_parent_exists, register_builtin_source};
 use crate::config::paths;
 use crate::function::{builtin_agent_child_env, inherited_process_env, write_file_atomic};
+#[cfg(unix)]
+use crate::utils::process::pid_maybe_alive;
 use crate::utils::temp_file;
 use anyhow::{Context, Result, anyhow};
+use parking_lot::Mutex;
 use rust_embed::Embed;
 use std::collections::HashSet;
 use std::fs;
@@ -382,7 +385,7 @@ impl EnvoySource {
             (std::env::temp_dir(), STALE_ENVOY_DIR_AGE),
             (paths::cache_dir(), STALE_FALLBACK_DIR_AGE),
         ] {
-            sweep_stale_envoy_dirs_in(&root, SystemTime::now(), min_age, pid_alive);
+            sweep_stale_envoy_dirs_in(&root, SystemTime::now(), min_age, pid_maybe_alive);
         }
         Ok(Materialized { dir, runtime })
     }
@@ -477,15 +480,52 @@ fn embedded_config() -> Option<&'static AgentConfig> {
         .as_ref()
 }
 
-pub fn register_envoy_source() {
+static EXIT_CLEANUPS: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
+
+/// Runs the registered exit cleanups, which remove the materialized envoy
+/// dir, when dropped. Hold it for the life of the process's entry point;
+/// a path that leaves through `std::process::exit` never drops it and must
+/// go through [`exit_process`] instead.
+#[must_use = "dropping the guard removes the envoy dir at once"]
+pub struct EnvoyDirGuard(());
+
+impl Drop for EnvoyDirGuard {
+    fn drop(&mut self) {
+        run_exit_cleanups();
+    }
+}
+
+pub fn register_envoy_source() -> EnvoyDirGuard {
     let source = Arc::clone(ENVOY_SOURCE.get_or_init(|| Arc::new(EnvoySource::new())));
     register_builtin_source(source);
+    register_exit_cleanup(cleanup_envoy_dir);
+    EnvoyDirGuard(())
 }
 
 pub fn cleanup_envoy_dir() {
     if let Some(source) = ENVOY_SOURCE.get() {
         source.remove_dir();
     }
+}
+
+fn register_exit_cleanup(cleanup: fn()) {
+    EXIT_CLEANUPS.lock().push(cleanup);
+}
+
+/// Runs and forgets every registered exit cleanup, so a later call or a
+/// guard drop after an explicit run does no work twice.
+pub fn run_exit_cleanups() {
+    let cleanups = std::mem::take(&mut *EXIT_CLEANUPS.lock());
+    for cleanup in cleanups {
+        cleanup();
+    }
+}
+
+/// `std::process::exit` skips destructors, so every exit taken while an
+/// [`EnvoyDirGuard`] is held goes through here. Output is not flushed.
+pub fn exit_process(code: i32) -> ! {
+    run_exit_cleanups();
+    std::process::exit(code)
 }
 
 fn is_python_cache(file: &str) -> bool {
@@ -515,34 +555,6 @@ fn should_sweep(
     match envoy_dir_owner_pid(file_name) {
         Some(pid) => pid != std::process::id() && age >= min_age && !pid_alive(pid),
         None => false,
-    }
-}
-
-/// Any failure to probe counts as alive: the dir is never deleted on doubt.
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    if let Some(alive) = pid_alive_via_proc(Path::new("/proc"), pid) {
-        return alive;
-    }
-    match std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
-        .output()
-    {
-        Ok(output) => output.status.success() && !output.stdout.is_empty(),
-        Err(_) => true,
-    }
-}
-
-/// `None` unless procfs is mounted at `proc_root` (its `self` entry exists):
-/// in a sandbox without /proc every pid would otherwise look dead.
-#[cfg(unix)]
-fn pid_alive_via_proc(proc_root: &Path, pid: u32) -> Option<bool> {
-    if !cfg!(target_os = "linux") || !proc_root.join("self").exists() {
-        return None;
-    }
-    match fs::metadata(proc_root.join(pid.to_string())) {
-        Ok(_) => Some(true),
-        Err(err) => Some(err.kind() != io::ErrorKind::NotFound),
     }
 }
 
@@ -1286,6 +1298,56 @@ mod tests {
         assert!(!source.dir.exists());
     }
 
+    /// Materializes `source` and registers its removal as an exit cleanup,
+    /// the way `register_envoy_source` registers the process-wide one.
+    fn materialize_with_exit_cleanup(
+        source: &'static OnceLock<EnvoySource>,
+        cleanup: fn(),
+    ) -> PathBuf {
+        let dir = source
+            .get_or_init(EnvoySource::with_stub_probes)
+            .agent_dir(ENVOY_AGENT_NAME)
+            .unwrap();
+        assert!(dir.join(CONFIG_FILE_NAME).exists());
+        register_exit_cleanup(cleanup);
+        dir
+    }
+
+    #[test]
+    #[serial]
+    fn dropping_the_guard_removes_the_materialized_dir() {
+        static SOURCE: OnceLock<EnvoySource> = OnceLock::new();
+        fn cleanup() {
+            SOURCE.get().unwrap().remove_dir();
+        }
+        let dir = materialize_with_exit_cleanup(&SOURCE, cleanup);
+        let guard = EnvoyDirGuard(());
+        assert!(dir.exists());
+        drop(guard);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn the_exit_cleanups_remove_the_materialized_dir_once() {
+        static SOURCE: OnceLock<EnvoySource> = OnceLock::new();
+        static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn cleanup() {
+            RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            SOURCE.get().unwrap().remove_dir();
+        }
+        let dir = materialize_with_exit_cleanup(&SOURCE, cleanup);
+        run_exit_cleanups();
+        assert!(!dir.exists());
+        drop(EnvoyDirGuard(()));
+        run_exit_cleanups();
+        assert_eq!(
+            RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a registered cleanup runs at most once"
+        );
+    }
+
     #[cfg(unix)]
     fn own_dir_name() -> String {
         let source = EnvoySource::new();
@@ -1347,21 +1409,6 @@ mod tests {
             !should_sweep(&stale, two_days, STALE_FALLBACK_DIR_AGE, dead),
             "the cache dir keeps a dead-pid leftover for a week"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn proc_probe_is_trusted_only_when_procfs_is_mounted() {
-        let root = temp_file("-envoy-proc-", "");
-        fs::create_dir_all(root.join("123")).unwrap();
-        assert_eq!(pid_alive_via_proc(&root, 123), None);
-        assert_eq!(pid_alive_via_proc(&root, 456), None);
-        if cfg!(target_os = "linux") {
-            fs::create_dir_all(root.join("self")).unwrap();
-            assert_eq!(pid_alive_via_proc(&root, 123), Some(true));
-            assert_eq!(pid_alive_via_proc(&root, 456), Some(false));
-        }
-        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]

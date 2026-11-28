@@ -33,26 +33,28 @@ impl ProcessStamp {
     /// it and the orphan sweep keeps it, through
     /// [`Self::is_alive_or_start_unknown`], since the process under that pid
     /// may be the live child.
+    #[cfg(test)]
     pub(crate) fn is_alive(&self) -> bool {
         lookup_start_time(self.pid) == Some(self.start)
     }
 
-    /// True when [`Self::is_alive`] holds, or when the stamp was recorded
+    /// True when the `is_alive` rule holds, or when the stamp was recorded
     /// with `start` 0 and its pid is still in use. A start-0 stamp under a
     /// live pid cannot be told from the process that wrote it, so callers
     /// that would destroy or overwrite its state treat it as possibly alive.
     /// Pid 0 is never ours on any host, including hosts that list it with a
-    /// start time of 0 (where [`Self::is_alive`] holds for it): no process
+    /// start time of 0 (where the `is_alive` rule holds for it): no process
     /// that wrote a stamp ran as pid 0, and it is what a record missing its
     /// pid field reads as.
     pub(crate) fn is_alive_or_start_unknown(&self) -> bool {
-        self.pid != 0 && (self.is_alive() || (self.start == 0 && Self::pid_exists(self.pid)))
+        self.pid != 0 && alive_or_start_unknown(*self, lookup_start_time(self.pid))
     }
 
     /// True when sysinfo lists a process under this pid, whatever its start
     /// time. Unlike [`Self::is_alive`] this cannot tell the original process
     /// from one that inherited the pid; it answers only whether the pid is
     /// in use.
+    #[cfg(test)]
     pub(crate) fn pid_exists(pid: u32) -> bool {
         lookup_start_time(pid).is_some()
     }
@@ -84,8 +86,7 @@ impl ProcessStamp {
                 let start = sys
                     .process(Pid::from_u32(stamp.pid))
                     .map(|p| p.start_time());
-                stamp.pid != 0
-                    && (start == Some(stamp.start) || (stamp.start == 0 && start.is_some()))
+                alive_or_start_unknown(*stamp, start)
             })
             .collect()
     }
@@ -128,7 +129,16 @@ pub(crate) fn alive_set_calls() -> usize {
     ALIVE_SET_CALLS.with(std::cell::Cell::get)
 }
 
-fn lookup_start_time(pid: u32) -> Option<u64> {
+/// The `is_alive_or_start_unknown` rule for `stamp`, given `start`, the start
+/// time the process table reports for `stamp.pid` (`None`: no such process).
+/// Callers choose how `start` is looked up, so a batched caller can decide
+/// many stamps on one refresh.
+pub(crate) fn alive_or_start_unknown(stamp: ProcessStamp, start: Option<u64>) -> bool {
+    stamp.pid != 0 && (start == Some(stamp.start) || (stamp.start == 0 && start.is_some()))
+}
+
+/// The start time sysinfo reports for `pid`, on a refresh of that pid alone.
+pub(crate) fn lookup_start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -137,6 +147,38 @@ fn lookup_start_time(pid: u32) -> Option<u64> {
         ProcessRefreshKind::nothing(),
     );
     sys.process(pid).map(|p| p.start_time())
+}
+
+/// Whether a process may still run under `pid`. Any failure to probe counts
+/// as alive, so a caller that deletes what a dead pid leaves behind never
+/// does so on doubt. `ps` rather than sysinfo answers when procfs is absent:
+/// on macOS sysinfo omits processes it may not inspect (other users',
+/// zombies) that `ps -p` still lists, and it cannot report a failed probe.
+#[cfg(unix)]
+pub(crate) fn pid_maybe_alive(pid: u32) -> bool {
+    if let Some(alive) = pid_maybe_alive_via_proc(std::path::Path::new("/proc"), pid) {
+        return alive;
+    }
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+    {
+        Ok(output) => output.status.success() && !output.stdout.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// `None` unless procfs is mounted at `proc_root` (its `self` entry exists):
+/// in a sandbox without /proc every pid would otherwise look dead.
+#[cfg(unix)]
+fn pid_maybe_alive_via_proc(proc_root: &std::path::Path, pid: u32) -> Option<bool> {
+    if !cfg!(target_os = "linux") || !proc_root.join("self").exists() {
+        return None;
+    }
+    match std::fs::metadata(proc_root.join(pid.to_string())) {
+        Ok(_) => Some(true),
+        Err(err) => Some(err.kind() != std::io::ErrorKind::NotFound),
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +306,49 @@ mod tests {
             start: current.start + 1,
         };
         assert!(!recycled.is_alive_or_start_unknown());
+    }
+
+    #[test]
+    fn alive_or_start_unknown_decides_on_the_looked_up_start() {
+        let known = ProcessStamp { pid: 42, start: 7 };
+        let unknown = ProcessStamp { pid: 42, start: 0 };
+        assert!(alive_or_start_unknown(known, Some(7)));
+        assert!(!alive_or_start_unknown(known, Some(8)), "a reused pid");
+        assert!(!alive_or_start_unknown(known, None));
+        assert!(alive_or_start_unknown(unknown, Some(8)));
+        assert!(alive_or_start_unknown(unknown, Some(0)));
+        assert!(!alive_or_start_unknown(unknown, None));
+        for start in [None, Some(0), Some(7)] {
+            for stamp_start in [0, 7] {
+                let stamp = ProcessStamp {
+                    pid: 0,
+                    start: stamp_start,
+                };
+                assert!(!alive_or_start_unknown(stamp, start), "{stamp:?} {start:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_probe_is_trusted_only_when_procfs_is_mounted() {
+        let root = crate::utils::temp_file("-envoy-proc-", "");
+        std::fs::create_dir_all(root.join("123")).unwrap();
+        assert_eq!(pid_maybe_alive_via_proc(&root, 123), None);
+        assert_eq!(pid_maybe_alive_via_proc(&root, 456), None);
+        if cfg!(target_os = "linux") {
+            std::fs::create_dir_all(root.join("self")).unwrap();
+            assert_eq!(pid_maybe_alive_via_proc(&root, 123), Some(true));
+            assert_eq!(pid_maybe_alive_via_proc(&root, 456), Some(false));
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_maybe_alive_tracks_the_process_table() {
+        assert!(pid_maybe_alive(std::process::id()));
+        assert!(!pid_maybe_alive(u32::MAX - 1));
     }
 
     #[test]

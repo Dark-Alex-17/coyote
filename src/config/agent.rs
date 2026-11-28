@@ -20,6 +20,7 @@ use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::config::reserved_agents::ReservedAgentFilter;
 use crate::config::{
     BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, UnavailableReason, builtin_agent_description,
     builtin_agent_dir, builtin_agent_unavailable_reason, builtin_default_description,
@@ -92,21 +93,17 @@ fn bundled_agent_assets() -> Result<Vec<(String, Vec<u8>)>> {
 fn drop_reserved_agent_files(
     files: impl IntoIterator<Item = (String, Vec<u8>)>,
 ) -> Vec<(String, Vec<u8>)> {
-    let mut warned: HashSet<&'static str> = HashSet::new();
+    let mut filter = ReservedAgentFilter::new();
     files
         .into_iter()
         .filter(|(file, _)| {
             let agent = file.split_once('/').map_or(file.as_str(), |(a, _)| a);
-            let Some(canonical) = reserved_agent(agent) else {
-                return true;
-            };
-            if warned.insert(canonical) {
+            filter.admits(agent, |canonical| {
                 warn!(
                     "Ignoring bundled agent file {file}: the agent name '{agent}' is \
                      reserved for the built-in agent '{canonical}'"
                 );
-            }
-            false
+            })
         })
         .collect()
 }
