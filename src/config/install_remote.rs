@@ -4,8 +4,9 @@ use super::bundles::{
 };
 use crate::config::builtin_manifest::is_builtin_manifest_name;
 use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
+use crate::config::reserved_agents::ReservedAgentFilter;
 use crate::config::{
-    AssetCategory, BUNDLE_MANIFEST_FILE, CommandPrefix, InstallFilter, paths, reserved_agent,
+    AssetCategory, BUNDLE_MANIFEST_FILE, CommandPrefix, InstallFilter, paths,
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
@@ -1712,7 +1713,7 @@ fn plan_dir_into(
     category: TopCategory,
     out: &mut Vec<PlannedFile>,
 ) -> Result<()> {
-    let mut warned_reserved_agents: HashSet<&'static str> = HashSet::new();
+    let mut reserved_agents = ReservedAgentFilter::new();
     for src in walk_files(src_dir)? {
         let rel = src
             .strip_prefix(src_dir)
@@ -1741,16 +1742,15 @@ fn plan_dir_into(
 
         if category == TopCategory::Agents
             && let Some(agent) = rel.components().next().and_then(|c| c.as_os_str().to_str())
-            && let Some(canonical) = reserved_agent(agent)
-        {
-            if warned_reserved_agents.insert(canonical) {
+            && !reserved_agents.admits(agent, |canonical| {
                 log::warn!(
                     "Ignoring bundle file {} ({}): the agent name '{agent}' is reserved for \
                      the built-in agent '{canonical}'",
                     rel.display(),
                     category.label()
                 );
-            }
+            })
+        {
             continue;
         }
 

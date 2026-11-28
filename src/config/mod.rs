@@ -59,7 +59,7 @@ pub use self::bundles::list_installed_bundles;
 pub(crate) use self::command_prefix::live_prefix_override;
 pub use self::command_prefix::{CommandPrefix, LivePrefix, install_live_prefix, live_prefix};
 use self::conflict::{InstallMode, StickyMode};
-pub use self::envoy::{cleanup_envoy_dir, register_envoy_source};
+pub use self::envoy::register_envoy_source;
 pub use self::input::{Input, vision_unsupported_message};
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,

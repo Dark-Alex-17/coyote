@@ -34,9 +34,8 @@ use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AgentListing, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input,
     MemoryScope, RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode,
-    cleanup_envoy_dir, ensure_parent_exists, install_builtins, list_agents_for_humans,
-    load_env_file, macro_execute, maybe_spawn_models_refresh, publish_mesh_snapshot,
-    register_envoy_source, sync_models,
+    ensure_parent_exists, install_builtins, list_agents_for_humans, load_env_file, macro_execute,
+    maybe_spawn_models_refresh, publish_mesh_snapshot, register_envoy_source, sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -100,7 +99,7 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     load_env_file()?;
     CompleteEnv::with_factory(Cli::command).complete();
-    register_envoy_source();
+    let _envoy_dir = register_envoy_source();
 
     let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
     if let Some(invocation) = sandbox::split_sandbox_args(&raw_args)? {
@@ -390,10 +389,8 @@ async fn async_main() -> Result<()> {
 
     if let Err(err) = run(ctx, cli, text, abort_signal).await {
         render_error(err);
-        cleanup_envoy_dir();
-        process::exit(1);
+        config::envoy::exit_process(1);
     }
-    cleanup_envoy_dir();
     Ok(())
 }
 
@@ -849,10 +846,7 @@ async fn shell_execute(
                     }
                     ctx.top_level_agent_finished(None, None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
-                    // The only process::exit reachable after bootstrap; kept
-                    // here so a reorder of run() cannot leak the dir.
-                    cleanup_envoy_dir();
-                    process::exit(code);
+                    config::envoy::exit_process(code);
                 }
                 'r' => {
                     let revision = Text::new("Enter your revision:").prompt()?;
