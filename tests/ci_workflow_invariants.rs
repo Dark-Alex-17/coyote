@@ -235,8 +235,9 @@ fn informational_jobs_are_in_no_jobs_needs() {
 }
 
 /// An informational job waits for nothing: a `needs` would serialise it behind a gate
-/// and skip it whenever that gate fails. It names its runner and carries its own timeout,
-/// so a hung run does not hold a runner for the six-hour default.
+/// and skip it whenever that gate fails. It runs on the Linux runner (the interop
+/// namespaces and the image build both need it) and carries its own timeout, so a hung
+/// run does not hold a runner for the six-hour default.
 #[test]
 fn informational_jobs_wait_for_nothing_and_run_under_a_timeout() {
     let Some(ci) = workflow("ci.yaml") else {
@@ -248,9 +249,10 @@ fn informational_jobs_wait_for_nothing_and_run_under_a_timeout() {
             needs(job).is_empty(),
             "the `{name}` job is informational and runs beside the other jobs, not after them"
         );
-        assert!(
-            !job["runs-on"].is_null(),
-            "the `{name}` job has no `runs-on`"
+        assert_eq!(
+            job["runs-on"].as_str(),
+            Some("ubuntu-latest"),
+            "the `{name}` job runs on the Linux runner"
         );
         assert!(
             job["timeout-minutes"].as_u64().is_some_and(|m| m > 0),
@@ -744,7 +746,7 @@ fn the_relay_smokes_install_under_a_per_run_home() {
     let under_mesh_home = |value: &Value| {
         value
             .as_str()
-            .is_some_and(|v| v.contains("runner.temp") && v.contains("mesh-home"))
+            .is_some_and(|v| v.contains("${{ runner.temp }}") && v.contains("mesh-home"))
     };
     for var in INSTALL_DIRS {
         assert!(
@@ -765,7 +767,7 @@ fn the_relay_smokes_install_under_a_per_run_home() {
             let value = &steps[i]["env"][var];
             assert!(
                 under_mesh_home(value),
-                "{var} on {:?} must sit under runner.temp/mesh-home: {value:?}",
+                "{var} on {:?} must sit under ${{{{ runner.temp }}}}/mesh-home: {value:?}",
                 step_name(&steps[i])
             );
         }
@@ -774,7 +776,7 @@ fn the_relay_smokes_install_under_a_per_run_home() {
         let value = &steps[i]["env"][var];
         assert!(
             under_mesh_home(value),
-            "{var} on {:?} must sit under runner.temp/mesh-home: {value:?}",
+            "{var} on {:?} must sit under ${{{{ runner.temp }}}}/mesh-home: {value:?}",
             step_name(&steps[i])
         );
     }
@@ -798,9 +800,9 @@ fn the_scripts_job_runs_both_powershells() {
     }
 }
 
-/// shellcheck reads every shell script the repo ships: the top-level scripts, the ones a
-/// directory deeper, and the propagation node's entrypoint. It runs on the Linux leg,
-/// the one runner image that carries it.
+/// shellcheck reads every shell script the repo ships, at the strictest severity
+/// (`-S style`): the top-level scripts, the ones a directory deeper, and the propagation
+/// node's entrypoint. It runs on the Linux leg, the one runner image that carries it.
 #[test]
 fn shellcheck_covers_every_shell_script_on_linux() {
     let Some(ci) = workflow("ci.yaml") else {
@@ -826,6 +828,13 @@ fn shellcheck_covers_every_shell_script_on_linux() {
         "the step {:?} never runs shellcheck on a file",
         step_name(step)
     );
+    for words in &checks {
+        assert!(
+            words.windows(2).any(|pair| pair == ["-S", "style"]),
+            "shellcheck must run at `-S style` so style findings fail the lane: {}",
+            words.join(" ")
+        );
+    }
     for target in [
         "scripts/*.sh",
         "scripts/*/*.sh",
@@ -865,7 +874,7 @@ fn psscriptanalyzer_analyses_every_tracked_ps1_and_fails_on_findings() {
             "an empty file list must fail rather than analyse nothing",
         ),
         (
-            "Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error",
+            "$files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error }",
             "every enumerated .ps1 is analysed at Warning,Error",
         ),
     ] {
@@ -1058,8 +1067,8 @@ fn the_venv_fallback_runs_without_uv_pipx_or_config_variables() {
         .as_str()
         .expect("APPDATA is a path string");
     assert!(
-        appdata.contains("runner.temp") && appdata.ends_with("\\mesh-venv-home\\AppData\\Roaming"),
-        "APPDATA must be a throwaway Roaming profile under runner.temp/mesh-venv-home: {appdata:?}"
+        appdata == "${{ runner.temp }}\\mesh-venv-home\\AppData\\Roaming",
+        "APPDATA must be a throwaway Roaming profile under ${{{{ runner.temp }}}}\\mesh-venv-home: {appdata:?}"
     );
     for (needle, why) in [
         (
