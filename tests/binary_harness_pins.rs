@@ -180,7 +180,8 @@ fn isolate_from_pins_the_dirs_removes_inherited_coyote_keys_only_and_lets_later_
 }
 
 #[test]
-fn coyote_command_spawns_the_built_binary_with_the_dir_pins() {
+fn coyote_command_targets_the_built_binary_with_the_dir_pins_and_removes_this_process_coyote_vars()
+{
     let dirs = distinct_dirs();
     let command = coyote_command(&dirs);
     assert_eq!(command.get_program(), support::bin::path());
@@ -192,6 +193,24 @@ fn coyote_command_spawns_the_built_binary_with_the_dir_pins() {
             "coyote_command must set {key} from Dirs"
         );
     }
+    let mut removed: Vec<OsString> = envs
+        .iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut inherited: Vec<OsString> = env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            let key = key.to_string_lossy();
+            key.starts_with("COYOTE_") && !PINNED_VARS.contains(&key.as_ref())
+        })
+        .collect();
+    removed.sort();
+    inherited.sort();
+    assert_eq!(
+        removed, inherited,
+        "coyote_command must remove exactly the COYOTE_* vars this test process inherited"
+    );
 }
 
 fn distinct_dirs() -> Dirs {
