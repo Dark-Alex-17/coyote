@@ -16,33 +16,16 @@
 
 mod support;
 
-use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use expectrl::process::unix::WaitStatus;
-use expectrl::session::{OsProcess, OsStream};
-use expectrl::{Any, Eof, Expect, Regex, Session};
+use expectrl::{Eof, Expect};
 
-use support::bin::{Dirs, DryRunConfig, coyote_command};
-
-/// Upper bound on any single wait. The binary is a cold debug build that also
-/// opens a vault and resolves a model before it paints its first prompt.
-const EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-const TERMINAL_COLUMNS: u16 = 160;
-const TERMINAL_ROWS: u16 = 50;
-
-/// Device Status Report request crossterm sends to learn where the cursor is,
-/// as a regex so it can share an `Any` with the prompt patterns.
-const CURSOR_POSITION_QUERY: &str = r"\x1b\[6n";
-/// Reply to a query that no column move preceded (reedline anchoring its
-/// prompt); the content assertions do not depend on rows. See
-/// [`cursor_position_reply`] for the queries that follow a column move.
-const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
+use support::bin::{DryRunConfig, coyote_command};
+use support::pty::{Probe, cursor_position_reply, spawn_repl, strip_escapes, wait_for};
 
 /// Prompt tails the REPL paints, as regexes: reedline colours the pieces
 /// separately, so SGR sequences may sit between the model name, the agent
@@ -50,48 +33,17 @@ const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
 const TOP_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*>";
 const ENVOY_PROMPT: &str = r"envoy>(\x1b\[[0-9;]*m)*>";
 
-type Target = Session<OsProcess, OsStream>;
-
-fn fresh_dir(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!("coyote-envoy-repl-{label}-{unique}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-struct Probe {
-    config_dir: PathBuf,
-    home_dir: PathBuf,
-    temp_root: PathBuf,
-}
-
 impl Probe {
     fn new(label: &str) -> Self {
-        let config_dir = fresh_dir(&format!("{label}-cfg"));
-        let home_dir = fresh_dir(&format!("{label}-home"));
-        let temp_root = fresh_dir(&format!("{label}-tmp"));
-        let vault_pass = config_dir.join("vault-pass");
-        fs::write(&vault_pass, "test-password\n").unwrap();
+        let probe = Self::fresh("coyote-envoy-repl", label);
         DryRunConfig::default()
-            .vault_password_file(&vault_pass)
-            .write(&config_dir);
-        Self {
-            config_dir,
-            home_dir,
-            temp_root,
-        }
+            .vault_password_file(&probe.vault_pass())
+            .write(&probe.config_dir);
+        probe
     }
 
     fn command(&self) -> Command {
-        let mut cmd = coyote_command(&Dirs {
-            config: self.config_dir.clone(),
-            cache: self.temp_root.join("coyote"),
-            home: self.home_dir.clone(),
-            temp: self.temp_root.clone(),
-        });
+        let mut cmd = coyote_command(&self.dirs());
         cmd.env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
@@ -112,133 +64,6 @@ impl Probe {
             })
             .collect()
     }
-
-    fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.config_dir);
-        let _ = fs::remove_dir_all(&self.home_dir);
-        let _ = fs::remove_dir_all(&self.temp_root);
-    }
-}
-
-fn spawn_repl(command: Command) -> Target {
-    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
-    session
-        .get_process_mut()
-        .set_window_size(TERMINAL_COLUMNS, TERMINAL_ROWS)
-        .expect("set pty window size");
-    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
-    session
-}
-
-/// Waits for the regex `pattern`, answering every cursor position query that
-/// arrives first, and returns the bytes that came before the match. A timeout
-/// panics with everything the REPL painted in the meantime and whether the
-/// REPL is still running, so a wait that never matched shows what arrived
-/// instead of just that nothing did.
-fn wait_for(session: &mut Target, pattern: &str) -> Vec<u8> {
-    let mut before = Vec::new();
-    loop {
-        let captures = match session.expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)])) {
-            Ok(captures) => captures,
-            Err(err) => {
-                let unmatched = session
-                    .check(Regex("(?s).*"))
-                    .map(|captures| captures.as_bytes().to_vec())
-                    .unwrap_or_default();
-                let status = session.get_process().status().map_or_else(
-                    |err| format!("unknown ({err})"),
-                    |status| format!("{status:?}"),
-                );
-                panic!(
-                    "waiting for {pattern:?}: {err}\nREPL process: {status}\nseen before the wait: {:?}\nunmatched output: {:?}",
-                    String::from_utf8_lossy(&before),
-                    String::from_utf8_lossy(&unmatched)
-                );
-            }
-        };
-        before.extend_from_slice(captures.before());
-        if captures.get(0) == Some(b"\x1b[6n".as_slice()) {
-            session
-                .send(cursor_position_reply(captures.before()))
-                .expect("reply to the cursor position query");
-            continue;
-        }
-        return before;
-    }
-}
-
-/// The reply to a cursor position query that arrived after `before`. Before
-/// every prompt the REPL moves the cursor to a sentinel column (`ESC[<n>G`),
-/// queries, and trusts the answer only when the column matches, so a query
-/// preceded by a column move is answered with that column verbatim (the
-/// terminal reports the same 1-based number the move named). A query with no
-/// move before it gets the fixed reply.
-fn cursor_position_reply(before: &[u8]) -> String {
-    match last_column_move(before) {
-        Some(column) => format!("\x1b[2;{column}R"),
-        None => CURSOR_POSITION_REPLY.to_string(),
-    }
-}
-
-/// The parameter of the last `ESC[<n>G` in `bytes`, verbatim.
-fn last_column_move(bytes: &[u8]) -> Option<&str> {
-    let mut found = None;
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
-            let start = i + 2;
-            let mut end = start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start && bytes.get(end) == Some(&b'G') {
-                found = std::str::from_utf8(&bytes[start..end]).ok();
-            }
-        }
-        i += 1;
-    }
-    found
-}
-
-/// Drops CSI and OSC sequences (BEL- or ST-terminated) and the ESC 7 / ESC 8
-/// cursor pair.
-fn strip_escapes(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            match bytes.get(i + 1) {
-                Some(b'[') => {
-                    i += 2;
-                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                Some(b']') => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 {
-                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                Some(_) => {
-                    i += 2;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        out.push(char::from(bytes[i]));
-        i += 1;
-    }
-    out
 }
 
 /// The harness answers the REPL's sentinel query with the column it moved to,

@@ -21,19 +21,16 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use std::{env, process};
 
 use support::bin::{Dirs, DryRunConfig, coyote_command};
+use support::pty::{Probe, fresh_dir};
+
+const DIR_PREFIX: &str = "coyote-inspection";
 
 fn fresh_config_dir(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tmp_dir = env::temp_dir().join(format!("coyote-inspection-{label}-{unique}"));
-    fs::create_dir_all(&tmp_dir).unwrap();
-    tmp_dir
+    fresh_dir(DIR_PREFIX, label)
 }
 
 fn probe_inspection_flag(flag: &str, require_stdout: bool) -> String {
@@ -288,40 +285,24 @@ fn agent_envoy_build_tools_runs_the_embedded_builtin_and_cleans_up() {
 // envoy's per-process dir can be observed while the binary is alive and
 // checked for leftovers after it exits, without touching the host temp dir.
 
-struct EnvoyProbe {
-    tmp_dir: PathBuf,
-    home_dir: PathBuf,
-    temp_root: PathBuf,
-}
-
-impl EnvoyProbe {
+impl Probe {
     fn new(label: &str) -> Self {
-        let tmp_dir = fresh_config_dir(&format!("envoy-{label}"));
-        let home_dir = fresh_config_dir(&format!("envoy-{label}-home"));
-        let temp_root = fresh_config_dir(&format!("envoy-{label}-tmp"));
-        let vault_pass = tmp_dir.join("vault-pass");
-        fs::write(&vault_pass, "test-password\n").unwrap();
+        let probe = Self::fresh(DIR_PREFIX, &format!("envoy-{label}"));
         DryRunConfig::default()
-            .vault_password_file(&vault_pass)
-            .write(&tmp_dir);
-        Self {
-            tmp_dir,
-            home_dir,
-            temp_root,
-        }
+            .vault_password_file(&probe.vault_pass())
+            .write(&probe.config_dir);
+        probe
     }
 
     fn command(&self) -> Command {
         let mut cmd = coyote_command(&Dirs {
-            config: self.tmp_dir.clone(),
             // The cache (coyote.log lives there) must stay OUT of temp_root:
             // the probes below assert on temp_root's contents and one makes it
             // deliberately unusable. Without this pin Windows would resolve the
             // cache to `<temp_root>/coyote` (see probe_inspection_flag) and fail
             // logging init before the envoy check even runs.
             cache: self.home_dir.join("cache"),
-            home: self.home_dir.clone(),
-            temp: self.temp_root.clone(),
+            ..self.dirs()
         });
         cmd.env_remove("IS_SANDBOX")
             .env_remove("ENVOY_DATA_DIR")
@@ -332,7 +313,7 @@ impl EnvoyProbe {
     }
 
     fn write_shadow_envoy(&self, config: &str) -> PathBuf {
-        let shadow_dir = self.tmp_dir.join("agents").join("envoy");
+        let shadow_dir = self.config_dir.join("agents").join("envoy");
         fs::create_dir_all(&shadow_dir).unwrap();
         fs::write(shadow_dir.join("config.yaml"), config).unwrap();
         shadow_dir
@@ -345,12 +326,6 @@ impl EnvoyProbe {
             .filter(|name| name.contains("-envoy-"))
             .collect()
     }
-
-    fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.tmp_dir);
-        let _ = fs::remove_dir_all(&self.home_dir);
-        let _ = fs::remove_dir_all(&self.temp_root);
-    }
 }
 
 // Positive control for the `.env` injection probe below: the per-agent
@@ -360,8 +335,8 @@ impl EnvoyProbe {
 // unloaded `.env`.
 #[test]
 fn env_file_agent_path_overrides_are_live_for_user_agents() {
-    let probe = EnvoyProbe::new("dotenv-control");
-    let custom = probe.tmp_dir.join("custom");
+    let probe = Probe::new("dotenv-control");
+    let custom = probe.config_dir.join("custom");
     fs::create_dir_all(&custom).unwrap();
     fs::write(
         custom.join("config.yaml"),
@@ -369,7 +344,7 @@ fn env_file_agent_path_overrides_are_live_for_user_agents() {
     )
     .unwrap();
     fs::write(
-        probe.tmp_dir.join(".env"),
+        probe.config_dir.join(".env"),
         format!(
             "PROBEAGENT_DATA_DIR={}\nPROBEAGENT_CONFIG_FILE={}\n",
             custom.display(),
@@ -406,10 +381,10 @@ fn env_file_agent_path_overrides_are_live_for_user_agents() {
 // per-process temp dir, never the config dir or the hijack target.
 #[test]
 fn agent_envoy_info_reads_the_embedded_builtin_over_shadow_and_env_file_overrides() {
-    let probe = EnvoyProbe::new("info-overrides");
+    let probe = Probe::new("info-overrides");
     let shadow_config = "name: envoy\ninstructions: SHADOW-INSTR-XYZ\nmodel: shadow-model-XYZ\nglobal_tools: [execute_command]\nhooks:\n  turn.started:\n    - name: shadow-hook\n      command: /bin/true\n";
     let shadow_dir = probe.write_shadow_envoy(shadow_config);
-    let hijack = probe.tmp_dir.join("hijack");
+    let hijack = probe.config_dir.join("hijack");
     fs::create_dir_all(&hijack).unwrap();
     fs::write(
         hijack.join("config.yaml"),
@@ -417,7 +392,7 @@ fn agent_envoy_info_reads_the_embedded_builtin_over_shadow_and_env_file_override
     )
     .unwrap();
     fs::write(
-        probe.tmp_dir.join(".env"),
+        probe.config_dir.join(".env"),
         format!(
             "ENVOY_DATA_DIR={}\nENVOY_CONFIG_FILE={}\n",
             hijack.display(),
@@ -442,7 +417,7 @@ fn agent_envoy_info_reads_the_embedded_builtin_over_shadow_and_env_file_override
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     let leftovers = probe.envoy_temp_dirs();
-    let config_dir = probe.tmp_dir.display().to_string();
+    let config_dir = probe.config_dir.display().to_string();
     let temp_root = probe.temp_root.display().to_string();
     probe.cleanup();
 
@@ -516,7 +491,7 @@ fn agent_envoy_info_reads_the_embedded_builtin_over_shadow_and_env_file_override
 // removed on the error exit.
 #[test]
 fn agent_envoy_error_after_materialization_still_removes_the_temp_dir() {
-    let probe = EnvoyProbe::new("error-cleanup");
+    let probe = Probe::new("error-cleanup");
     let missing = probe.home_dir.join("does-not-exist.txt");
 
     let output = probe
@@ -528,7 +503,7 @@ fn agent_envoy_error_after_materialization_still_removes_the_temp_dir() {
         .unwrap();
 
     let leftovers = probe.envoy_temp_dirs();
-    let agents_envoy_exists = probe.tmp_dir.join("agents").join("envoy").exists();
+    let agents_envoy_exists = probe.config_dir.join("agents").join("envoy").exists();
     probe.cleanup();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -570,7 +545,7 @@ fn agent_envoy_temp_dir_is_private_and_distinct_across_concurrent_processes() {
 
     let mut last_failure = String::new();
     for attempt in 1..=ATTEMPTS {
-        let probe = EnvoyProbe::new(&format!("concurrent-{attempt}"));
+        let probe = Probe::new(&format!("concurrent-{attempt}"));
         let children: Vec<_> = (0..CHILDREN)
             .map(|i| {
                 probe
@@ -693,7 +668,7 @@ fn agent_envoy_temp_dir_is_private_and_distinct_across_concurrent_processes() {
 // env overrides a user could export must not reach the built-in either.
 #[test]
 fn agent_envoy_info_readout_is_the_locked_down_embedded_posture() {
-    let probe = EnvoyProbe::new("info-posture");
+    let probe = Probe::new("info-posture");
 
     let output = probe
         .command()
@@ -703,7 +678,7 @@ fn agent_envoy_info_readout_is_the_locked_down_embedded_posture() {
         .output()
         .unwrap();
     let leftovers = probe.envoy_temp_dirs();
-    let agents_envoy_exists = probe.tmp_dir.join("agents").join("envoy").exists();
+    let agents_envoy_exists = probe.config_dir.join("agents").join("envoy").exists();
     probe.cleanup();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -759,11 +734,11 @@ fn agent_envoy_info_readout_is_the_locked_down_embedded_posture() {
 // lazy the listing creates no envoy temp dir at all.
 #[test]
 fn list_agents_shows_the_builtin_envoy_once_over_a_shadow_without_materializing() {
-    let probe = EnvoyProbe::new("list-agents-shadow");
+    let probe = Probe::new("list-agents-shadow");
     let shadow_dir = probe.write_shadow_envoy(
         "name: envoy\ndescription: SHADOW-DESC-XYZ\ninstructions: SHADOW-INSTR-XYZ\n",
     );
-    let user_dir = probe.tmp_dir.join("agents").join("zeta");
+    let user_dir = probe.config_dir.join("agents").join("zeta");
     fs::create_dir_all(&user_dir).unwrap();
     fs::write(
         user_dir.join("config.yaml"),
@@ -835,7 +810,7 @@ fn list_agents_shows_the_builtin_envoy_once_over_a_shadow_without_materializing(
 fn agent_envoy_first_materialization_sweeps_only_stale_dead_owner_dirs() {
     use std::time::Duration;
 
-    let probe = EnvoyProbe::new("sweep");
+    let probe = Probe::new("sweep");
     let crate_prefix = "coyote";
     // A pid that is certainly dead: a child that already exited and was reaped.
     let dead_pid = {
@@ -956,8 +931,8 @@ fn agent_envoy_first_materialization_sweeps_only_stale_dead_owner_dirs() {
 // unnamed temp session is still accepted for the envoy.
 #[test]
 fn agent_envoy_refuses_a_named_session_but_accepts_the_temp_session() {
-    let probe = EnvoyProbe::new("named-session");
-    let plain_dir = probe.tmp_dir.join("agents").join("plain");
+    let probe = Probe::new("named-session");
+    let plain_dir = probe.config_dir.join("agents").join("plain");
     fs::create_dir_all(&plain_dir).unwrap();
     fs::write(
         plain_dir.join("config.yaml"),
@@ -971,8 +946,8 @@ fn agent_envoy_refuses_a_named_session_but_accepts_the_temp_session() {
         .output()
         .unwrap();
     let leftovers_after_refusal = probe.envoy_temp_dirs();
-    let agents_envoy_after_refusal = probe.tmp_dir.join("agents").join("envoy").exists();
-    let sessions_after_refusal = probe.tmp_dir.join("sessions").exists();
+    let agents_envoy_after_refusal = probe.config_dir.join("agents").join("envoy").exists();
+    let sessions_after_refusal = probe.config_dir.join("sessions").exists();
 
     let control = probe
         .command()
@@ -986,7 +961,7 @@ fn agent_envoy_refuses_a_named_session_but_accepts_the_temp_session() {
         .output()
         .unwrap();
     let leftovers_after_temp = probe.envoy_temp_dirs();
-    let agents_envoy_after_temp = probe.tmp_dir.join("agents").join("envoy").exists();
+    let agents_envoy_after_temp = probe.config_dir.join("agents").join("envoy").exists();
     probe.cleanup();
 
     let stdout = String::from_utf8_lossy(&refused.stdout);
@@ -1056,14 +1031,14 @@ fn agent_envoy_refuses_a_named_session_but_accepts_the_temp_session() {
 // readout carries neither, and the envoy still runs.
 #[test]
 fn agent_envoy_ignores_the_app_agent_session_default() {
-    let probe = EnvoyProbe::new("app-session");
-    let config = fs::read_to_string(probe.tmp_dir.join("config.yaml")).unwrap();
+    let probe = Probe::new("app-session");
+    let config = fs::read_to_string(probe.config_dir.join("config.yaml")).unwrap();
     fs::write(
-        probe.tmp_dir.join("config.yaml"),
+        probe.config_dir.join("config.yaml"),
         format!("{config}agent_session: shared\n"),
     )
     .unwrap();
-    let plain_dir = probe.tmp_dir.join("agents").join("plain");
+    let plain_dir = probe.config_dir.join("agents").join("plain");
     fs::create_dir_all(&plain_dir).unwrap();
     fs::write(
         plain_dir.join("config.yaml"),
@@ -1087,7 +1062,7 @@ fn agent_envoy_ignores_the_app_agent_session_default() {
         .output()
         .unwrap();
     let leftovers = probe.envoy_temp_dirs();
-    let sessions_exists = probe.tmp_dir.join("sessions").exists();
+    let sessions_exists = probe.config_dir.join("sessions").exists();
     probe.cleanup();
 
     let control_stdout = String::from_utf8_lossy(&control.stdout);
@@ -1152,8 +1127,8 @@ fn agent_envoy_ignores_the_app_agent_session_default() {
 // readout keeps `global_tools: []`, `global_hooks: []` and no temperature.
 #[test]
 fn env_file_load_envs_overrides_are_inert_for_the_envoy_and_live_for_a_user_agent() {
-    let probe = EnvoyProbe::new("dotenv-load-envs");
-    let user_agent = probe.tmp_dir.join("agents").join("probeagent");
+    let probe = Probe::new("dotenv-load-envs");
+    let user_agent = probe.config_dir.join("agents").join("probeagent");
     fs::create_dir_all(&user_agent).unwrap();
     fs::write(
         user_agent.join("config.yaml"),
@@ -1161,7 +1136,7 @@ fn env_file_load_envs_overrides_are_inert_for_the_envoy_and_live_for_a_user_agen
     )
     .unwrap();
     fs::write(
-        probe.tmp_dir.join(".env"),
+        probe.config_dir.join(".env"),
         "ENVOY_GLOBAL_TOOLS=[\"execute_command\"]\n\
          ENVOY_GLOBAL_HOOKS=[\"dotenv-hook-XYZ\"]\n\
          ENVOY_TEMPERATURE=0.77\n\
@@ -1182,7 +1157,7 @@ fn env_file_load_envs_overrides_are_inert_for_the_envoy_and_live_for_a_user_agen
         .output()
         .unwrap();
     let leftovers = probe.envoy_temp_dirs();
-    let agents_envoy_exists = probe.tmp_dir.join("agents").join("envoy").exists();
+    let agents_envoy_exists = probe.config_dir.join("agents").join("envoy").exists();
     probe.cleanup();
 
     let control_stdout = String::from_utf8_lossy(&control.stdout);
@@ -1236,7 +1211,7 @@ fn env_file_load_envs_overrides_are_inert_for_the_envoy_and_live_for_a_user_agen
 // under <config_dir>/agents/envoy or <config_dir>/sessions.
 #[test]
 fn agent_envoy_one_shot_text_and_piped_stdin_run_and_clean_up() {
-    let probe = EnvoyProbe::new("one-shot");
+    let probe = Probe::new("one-shot");
 
     let argv_run = probe
         .command()
@@ -1264,8 +1239,8 @@ fn agent_envoy_one_shot_text_and_piped_stdin_run_and_clean_up() {
     }
     let piped_run = piped.wait_with_output().unwrap();
     let piped_leftovers = probe.envoy_temp_dirs();
-    let agents_envoy_exists = probe.tmp_dir.join("agents").join("envoy").exists();
-    let sessions_exists = probe.tmp_dir.join("sessions").exists();
+    let agents_envoy_exists = probe.config_dir.join("agents").join("envoy").exists();
+    let sessions_exists = probe.config_dir.join("sessions").exists();
     probe.cleanup();
 
     for (label, output, marker) in [
@@ -1347,8 +1322,8 @@ fn agent_envoy_one_shot_text_and_piped_stdin_run_and_clean_up() {
 #[cfg(unix)]
 #[test]
 fn agent_envoy_shadow_hooks_never_fire_while_the_same_hooks_fire_for_a_user_agent() {
-    let probe = EnvoyProbe::new("shadow-hooks");
-    let markers_dir = probe.tmp_dir.join("markers");
+    let probe = Probe::new("shadow-hooks");
+    let markers_dir = probe.config_dir.join("markers");
     fs::create_dir_all(&markers_dir).unwrap();
     let events = ["agent.started", "turn.started", "turn.completed"];
     let hooks_block = |agent: &str| -> String {
@@ -1367,7 +1342,7 @@ fn agent_envoy_shadow_hooks_never_fire_while_the_same_hooks_fire_for_a_user_agen
         hooks_block("envoy")
     );
     let shadow_dir = probe.write_shadow_envoy(&shadow_config);
-    let user_agent = probe.tmp_dir.join("agents").join("probeagent");
+    let user_agent = probe.config_dir.join("agents").join("probeagent");
     fs::create_dir_all(&user_agent).unwrap();
     fs::write(
         user_agent.join("config.yaml"),
@@ -1458,7 +1433,7 @@ fn agent_envoy_shadow_hooks_never_fire_while_the_same_hooks_fire_for_a_user_agen
 // appears), nothing written next to the shadow, no envoy temp dir anywhere.
 #[test]
 fn agent_envoy_with_an_unusable_temp_root_is_refused_and_never_falls_back_to_the_shadow() {
-    let probe = EnvoyProbe::new("unusable-temp-root");
+    let probe = Probe::new("unusable-temp-root");
     let shadow_config =
         "name: envoy\ninstructions: shadow-instructions-XYZ\nmodel: shadow-model-XYZ\n";
     let shadow_dir = probe.write_shadow_envoy(shadow_config);
@@ -1562,11 +1537,11 @@ fn agent_envoy_with_an_unusable_temp_root_is_refused_and_never_falls_back_to_the
 // dir created under agents/, and no envoy temp dir survives.
 #[test]
 fn agent_envoy_case_variants_never_reach_the_shadow() {
-    let probe = EnvoyProbe::new("case-variants");
+    let probe = Probe::new("case-variants");
     let shadow_config =
         "name: envoy\ninstructions: shadow-instructions-XYZ\nmodel: shadow-model-XYZ\n";
     let shadow_dir = probe.write_shadow_envoy(shadow_config);
-    let agents_before: Vec<String> = fs::read_dir(probe.tmp_dir.join("agents"))
+    let agents_before: Vec<String> = fs::read_dir(probe.config_dir.join("agents"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
@@ -1585,7 +1560,7 @@ fn agent_envoy_case_variants_never_reach_the_shadow() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     let shadow_after = fs::read_to_string(shadow_dir.join("config.yaml")).unwrap();
-    let mut agents_after: Vec<String> = fs::read_dir(probe.tmp_dir.join("agents"))
+    let mut agents_after: Vec<String> = fs::read_dir(probe.config_dir.join("agents"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| name.eq_ignore_ascii_case("envoy"))

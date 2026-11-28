@@ -20,7 +20,6 @@
 
 mod support;
 
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
@@ -28,31 +27,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
-use expectrl::session::{OsProcess, OsStream};
-use expectrl::{Any, Eof, Expect, Regex, Session};
+use expectrl::{Eof, Expect};
 
-use support::bin::{Dirs, DryRunConfig, coyote_command};
+use support::bin::{DryRunConfig, coyote_command};
+use support::pty::{Probe, Target, spawn_repl, wait_for, wait_for_text};
 
-const EXPECT_TIMEOUT: Duration = Duration::from_secs(90);
-const CURSOR_POSITION_QUERY: &str = r"\x1b\[6n";
-const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
 const SESSION_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*probe(\x1b\[[0-9;]*m)*\)";
 const JOINED_PATTERN: &str = r"Joined the mesh as you / probe \([0-9a-f]{8}\)";
 const DAY: u64 = 24 * 60 * 60;
-
-type Target = Session<OsProcess, OsStream>;
-
-fn fresh_dir(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!("coyote-envoy-prune-{label}-{unique}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn silent_relay() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -80,28 +64,18 @@ fn uuid_simple() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-struct Probe {
-    config_dir: PathBuf,
-    home_dir: PathBuf,
-    temp_root: PathBuf,
-}
-
 impl Probe {
     /// `envoy_memory` is the yaml body under `mesh.envoy_memory:` (two-space indented
     /// lines), or empty for no block at all.
     fn new(label: &str, relay_port: u16, envoy_memory: &str) -> Self {
-        let config_dir = fresh_dir(&format!("{label}-cfg"));
-        let home_dir = fresh_dir(&format!("{label}-home"));
-        let temp_root = fresh_dir(&format!("{label}-tmp"));
-        let vault_pass = config_dir.join("vault-pass");
-        fs::write(&vault_pass, "test-password\n").unwrap();
+        let probe = Self::fresh("coyote-envoy-prune", label);
         let envoy_block = if envoy_memory.is_empty() {
             String::new()
         } else {
             format!("  envoy_memory:\n{envoy_memory}")
         };
         DryRunConfig::default()
-            .vault_password_file(&vault_pass)
+            .vault_password_file(&probe.vault_pass())
             .setting("function_calling_support: true")
             .append(&format!(
                 "save_session: false\n\
@@ -112,16 +86,12 @@ impl Probe {
                  \x20   - {{type: private, host: 127.0.0.1, port: {relay_port}}}\n\
                  {envoy_block}"
             ))
-            .write(&config_dir);
-        Self {
-            config_dir,
-            home_dir,
-            temp_root,
-        }
+            .write(&probe.config_dir);
+        probe
     }
 
     fn cache_dir(&self) -> PathBuf {
-        self.temp_root.join("coyote")
+        self.dirs().cache
     }
 
     fn stores_dir(&self) -> PathBuf {
@@ -165,12 +135,7 @@ impl Probe {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = coyote_command(&Dirs {
-            config: self.config_dir.clone(),
-            cache: self.cache_dir(),
-            home: self.home_dir.clone(),
-            temp: self.temp_root.clone(),
-        });
+        let mut cmd = coyote_command(&self.dirs());
         cmd.env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
@@ -182,115 +147,6 @@ impl Probe {
     fn registered_instances(&self) -> String {
         fs::read_to_string(self.cache_dir().join("mesh").join("instances.json")).unwrap_or_default()
     }
-}
-
-impl Drop for Probe {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.config_dir);
-        let _ = fs::remove_dir_all(&self.home_dir);
-        let _ = fs::remove_dir_all(&self.temp_root);
-    }
-}
-
-fn spawn_repl(command: Command) -> Target {
-    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
-    session
-        .get_process_mut()
-        .set_window_size(160, 50)
-        .expect("set pty window size");
-    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
-    session
-}
-
-fn wait_for(session: &mut Target, pattern: &str) -> String {
-    let mut before = Vec::new();
-    loop {
-        let captures = session
-            .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
-            .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
-        let involved = captures.as_bytes();
-        let split = captures.before().len();
-        let query = b"\x1b[6n";
-        if captures.get(0).unwrap_or_default() == query {
-            let mut from = 0;
-            while let Some(at) = involved[from..]
-                .windows(query.len())
-                .position(|window| window == query)
-            {
-                let at = from + at;
-                session
-                    .send(cursor_position_reply(&involved[..at]))
-                    .expect("reply to the cursor position query");
-                from = at + query.len();
-            }
-            before.extend_from_slice(involved);
-            continue;
-        }
-        before.extend_from_slice(involved);
-        let _ = split;
-        return String::from_utf8_lossy(&strip_escapes(&before)).into_owned();
-    }
-}
-
-fn cursor_position_reply(before: &[u8]) -> String {
-    let mut found = None;
-    let mut i = 0;
-    while i + 2 < before.len() {
-        if before[i] == 0x1b && before[i + 1] == b'[' {
-            let start = i + 2;
-            let mut end = start;
-            while end < before.len() && before[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start && before.get(end) == Some(&b'G') {
-                found = std::str::from_utf8(&before[start..end]).ok();
-            }
-        }
-        i += 1;
-    }
-    match found {
-        Some(column) => format!("\x1b[2;{column}R"),
-        None => CURSOR_POSITION_REPLY.to_string(),
-    }
-}
-
-fn strip_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            match bytes.get(i + 1) {
-                Some(b'[') => {
-                    i += 2;
-                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                Some(b']') => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 {
-                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                Some(_) => {
-                    i += 2;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
 }
 
 fn exit_clean(session: &mut Target) {
@@ -331,7 +187,7 @@ fn a_join_with_prune_unused_after_days_deletes_only_other_stores_unused_past_n_d
     let mut command = probe.command();
     command.args(["--session", "probe"]);
     let mut session = spawn_repl(command);
-    let startup = wait_for(&mut session, JOINED_PATTERN);
+    let startup = wait_for_text(&mut session, JOINED_PATTERN);
     wait_for(&mut session, SESSION_PROMPT);
     assert!(
         probe.registered_instances().contains(&own),
@@ -452,7 +308,7 @@ fn files_list_with_a_glob_is_refused_as_a_pattern_not_a_session() {
         session
             .send(format!(".mesh files list {pattern}\r"))
             .expect("type the command");
-        let text = wait_for(&mut session, r"Nothing was listed\.");
+        let text = wait_for_text(&mut session, r"Nothing was listed\.");
         let row = text
             .lines()
             .rev()
