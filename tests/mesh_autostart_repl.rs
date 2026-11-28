@@ -26,33 +26,26 @@
 
 mod support;
 
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use expectrl::process::unix::WaitStatus;
-use expectrl::session::{OsProcess, OsStream};
-use expectrl::{Any, Eof, Expect, Regex, Session};
+use expectrl::{Any, Eof, Expect, Regex};
 use tokio::net::TcpSocket;
 
-use support::bin::{Dirs, DryRunConfig, coyote_command};
+use support::bin::{DryRunConfig, coyote_command};
+use support::pty::{
+    CURSOR_POSITION_QUERY, CURSOR_POSITION_QUERY_BYTES, EXPECT_TIMEOUT, Probe, TERMINAL_COLUMNS,
+    Target, answer_cursor_queries, cursor_position_reply, fresh_dir, row_of, spawn_repl,
+    spawn_repl_with_columns, strip_escapes, utf8_text, wait_for, wait_for_match, wait_for_row,
+};
 
-/// The binary is a cold debug build that opens a vault, resolves a model and,
-/// here, starts a Reticulum transport before its first prompt.
-const EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
-
-const TERMINAL_COLUMNS: u16 = 160;
-const TERMINAL_ROWS: u16 = 50;
-
-const CURSOR_POSITION_QUERY: &str = r"\x1b\[6n";
-/// Reply to a query that no column move preceded; see
-/// [`cursor_position_reply`] for the queries that follow one.
-const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
+const DIR_PREFIX: &str = "coyote-mesh-autostart";
 
 /// Prompt tails, as regexes: reedline colours the pieces separately. With a
 /// session the left prompt reads `dry-model)probe)`, without one `dry-model)>`.
@@ -91,8 +84,6 @@ const MESH_OFF_PATTERN: &str = r"Mesh is off\. Run `\.mesh on` first\.";
 /// What `.mesh people list` says on a node that is on but has heard nobody.
 const NO_PEERS_PATTERN: &str = r"No users or sessions heard yet\.";
 
-type Target = Session<OsProcess, OsStream>;
-
 /// Whether `line` is the one line a join prints for your session `session`:
 /// `Joined the mesh as you / <session> (<dest8>); .mesh help shows the commands
 /// and what they mean.`
@@ -109,16 +100,6 @@ fn is_joined_line(line: &str, session: &str) -> bool {
 
 /// The joined line for the session `probe`, as a pattern to wait on.
 const JOINED_PROBE_PATTERN: &str = r"Joined the mesh as you / probe \([0-9a-f]{8}\); \.mesh help shows the commands and what they mean\.";
-
-fn fresh_dir(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!("coyote-mesh-autostart-{label}-{unique}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// A loopback TCP listener that accepts every connection and holds it open,
 /// silently, so a `private` interface has something to connect to.
@@ -180,32 +161,23 @@ impl HeldPort {
     }
 }
 
-struct Probe {
-    config_dir: PathBuf,
-    home_dir: PathBuf,
-    temp_root: PathBuf,
-}
-
 impl Probe {
     fn new(label: &str, mesh_enabled: bool, relay_ports: &[u16]) -> Self {
-        let config_dir = fresh_dir(&format!("{label}-cfg"));
-        let home_dir = fresh_dir(&format!("{label}-home"));
-        let temp_root = fresh_dir(&format!("{label}-tmp"));
-        let vault_pass = config_dir.join("vault-pass");
-        fs::write(&vault_pass, "test-password\n").unwrap();
+        let probe = Self::fresh(DIR_PREFIX, label);
+        let config_dir = &probe.config_dir;
         // The identity is written before the marker, so it is on disk once the marker is.
         let started = format!(
             r#"echo "$COYOTE_MESH_IDENTITY" > "{}"; {}"#,
-            own_identity_log(&config_dir).display(),
-            marker_command("MESH_STARTED", &config_dir)
+            own_identity_log(config_dir).display(),
+            marker_command("MESH_STARTED", config_dir)
         );
-        let stopped = marker_command("MESH_STOPPED", &config_dir);
+        let stopped = marker_command("MESH_STOPPED", config_dir);
         let interfaces: String = relay_ports
             .iter()
             .map(|port| format!("    - {{type: private, host: 127.0.0.1, port: {port}}}\n"))
             .collect();
         DryRunConfig::default()
-            .vault_password_file(&vault_pass)
+            .vault_password_file(&probe.vault_pass())
             .setting("function_calling_support: true")
             .append(&format!(
                 "save_session: false\n\
@@ -222,12 +194,8 @@ impl Probe {
                  \x20 interfaces:\n\
                  {interfaces}"
             ))
-            .write(&config_dir);
-        Self {
-            config_dir,
-            home_dir,
-            temp_root,
-        }
+            .write(config_dir);
+        probe
     }
 
     /// A plain user agent under `<config_dir>/agents/<name>/`, loadable offline: a
@@ -287,12 +255,7 @@ impl Probe {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = coyote_command(&Dirs {
-            config: self.config_dir.clone(),
-            cache: self.temp_root.join("coyote"),
-            home: self.home_dir.clone(),
-            temp: self.temp_root.clone(),
-        });
+        let mut cmd = coyote_command(&self.dirs());
         cmd.env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
@@ -341,15 +304,6 @@ impl Probe {
     }
 }
 
-/// Removed on drop, so a failed run does not leave fixture dirs behind.
-impl Drop for Probe {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.config_dir);
-        let _ = fs::remove_dir_all(&self.home_dir);
-        let _ = fs::remove_dir_all(&self.temp_root);
-    }
-}
-
 fn marker_log(dir: &Path, marker: &str) -> PathBuf {
     dir.join(format!("mesh-events-{marker}.log"))
 }
@@ -361,191 +315,6 @@ fn own_identity_log(dir: &Path) -> PathBuf {
 fn marker_command(marker: &str, dir: &Path) -> String {
     let log = marker_log(dir, marker);
     format!(r#"echo {marker} >> "{}""#, log.display())
-}
-
-fn spawn_repl(command: Command) -> Target {
-    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
-    session
-        .get_process_mut()
-        .set_window_size(TERMINAL_COLUMNS, TERMINAL_ROWS)
-        .expect("set pty window size");
-    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
-    session
-}
-
-/// Waits for the regex `pattern`, answering every cursor position query that
-/// arrives first, and returns the bytes that came before the match.
-fn wait_for(session: &mut Target, pattern: &str) -> Vec<u8> {
-    wait_for_match(session, pattern).0
-}
-
-/// Like `wait_for`, but returns the escape-stripped text of the row the match
-/// landed on, through the end of the match.
-fn wait_for_row(session: &mut Target, pattern: &str) -> String {
-    let (before, matched) = wait_for_match(session, pattern);
-    row_of(&before, &matched)
-}
-
-/// Waits for the regex `pattern`, answering every cursor position query that
-/// arrives first, and returns the bytes before the first match and the bytes
-/// from that match through the last one the read held. expectrl consumes the
-/// stream through the right-most match of the needle that fired, so when one
-/// read holds the needle twice (a table whose rows repeat a note, a prompt
-/// repainted twice) the bytes between the matches are gone from the stream
-/// after this call; keeping them in the matched half is what lets a caller
-/// rebuild the whole transcript. Which rows land in one read depends on the
-/// platform's pty, so a transcript built from the first match alone is whole
-/// on one machine and missing rows on another.
-fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut before = Vec::new();
-    loop {
-        let captures = session
-            .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
-            .unwrap_or_else(|err| {
-                // What came instead, so a timeout says what the REPL printed: at most
-                // 3 s of further reads, the last 2000 characters of them.
-                session.set_expect_timeout(Some(Duration::from_secs(1)));
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let mut pending = String::new();
-                while Instant::now() < deadline {
-                    match session.expect(Regex(r"(?s).+")) {
-                        Ok(rest) => pending.push_str(&strip_escapes(rest.as_bytes())),
-                        Err(_) => break,
-                    }
-                }
-                let skip = pending.chars().count().saturating_sub(2000);
-                let pending: String = pending.chars().skip(skip).collect();
-                panic!(
-                    "waiting for {pattern:?}: {err}; read before it: {:?}; pending: {pending:?}",
-                    strip_escapes(&before)
-                )
-            });
-        let involved = captures.as_bytes();
-        let split = captures.before().len();
-        let query = b"\x1b[6n";
-        // One reply per query the read held, wherever it sits, each judged by the bytes
-        // that led up to it: a query left unanswered would cost the REPL its query
-        // timeout and leave every later reply one behind.
-        let mut from = 0;
-        while let Some(at) = involved[from..]
-            .windows(query.len())
-            .position(|window| window == query)
-        {
-            let at = from + at;
-            session
-                .send(cursor_position_reply(&involved[..at]))
-                .expect("reply to the cursor position query");
-            from = at + query.len();
-        }
-        if captures.get(0).unwrap_or_default() == query {
-            // The queries themselves are escape sequences the text helpers strip, so
-            // the whole read goes into `before`.
-            before.extend_from_slice(involved);
-            continue;
-        }
-        before.extend_from_slice(&involved[..split]);
-        return (before, involved[split..].to_vec());
-    }
-}
-
-/// The escape-stripped text of the row `matched` landed on: everything after
-/// the last line break before it, with a trailing `\r` trimmed.
-fn row_of(before: &[u8], matched: &[u8]) -> String {
-    let text = strip_escapes(before) + &strip_escapes(matched);
-    text.rsplit('\n')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('\r')
-        .to_string()
-}
-
-/// The reply to a cursor position query that arrived after `before`. Before
-/// every prompt the REPL moves the cursor to a sentinel column (`ESC[<n>G`),
-/// queries, and trusts the answer only when the column matches, so a query
-/// preceded by a column move is answered with that column verbatim (the
-/// terminal reports the same 1-based number the move named). A query with no
-/// move before it gets the fixed reply.
-fn cursor_position_reply(before: &[u8]) -> String {
-    match last_column_move(before) {
-        Some(column) => format!("\x1b[2;{column}R"),
-        None => CURSOR_POSITION_REPLY.to_string(),
-    }
-}
-
-/// The parameter of the last `ESC[<n>G` in `bytes`, verbatim.
-fn last_column_move(bytes: &[u8]) -> Option<&str> {
-    let mut found = None;
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
-            let start = i + 2;
-            let mut end = start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start && bytes.get(end) == Some(&b'G') {
-                found = std::str::from_utf8(&bytes[start..end]).ok();
-            }
-        }
-        i += 1;
-    }
-    found
-}
-
-/// Drops CSI and OSC sequences and two-byte ESC pairs; every other byte is kept as the
-/// Latin-1 character of its value, which is what the prompt and ASCII-only assertions
-/// read. A table's box-drawing characters need `utf8_text` instead.
-fn strip_escapes(bytes: &[u8]) -> String {
-    strip_escape_bytes(bytes)
-        .into_iter()
-        .map(char::from)
-        .collect()
-}
-
-/// The bytes of `bytes` with CSI and OSC sequences and two-byte ESC pairs dropped.
-fn strip_escape_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            match bytes.get(i + 1) {
-                Some(b'[') => {
-                    i += 2;
-                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                Some(b']') => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 {
-                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
-                }
-                Some(_) => {
-                    i += 2;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
-}
-
-/// `strip_escapes` decoding the remaining bytes as UTF-8, so the box-drawing characters
-/// a `.mesh` table is drawn with come through as the characters the user sees.
-fn utf8_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&strip_escape_bytes(bytes)).into_owned()
 }
 
 /// Sends `line` and waits for `expected` (a regex) and then the next prompt;
@@ -3234,17 +3003,6 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
-/// `spawn_repl` with the pty `columns` wide instead of the default.
-fn spawn_repl_with_columns(command: Command, columns: u16) -> Target {
-    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
-    session
-        .get_process_mut()
-        .set_window_size(columns, TERMINAL_ROWS)
-        .expect("set pty window size");
-    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
-    session
-}
-
 /// Cold start with the node off in a 60-column terminal: the bare `.mesh config show` table is
 /// sized to the terminal, as the Commands page says, so a long value (a configured inbox
 /// path under the temp dir) wraps within its row instead of running past the window; the
@@ -5540,7 +5298,6 @@ fn echoed(line: &str) -> String {
 /// The rest of `people_command`: answers the cursor position queries and returns the
 /// transcript after the echoed `line` through the next prompt.
 fn read_through_prompt(session: &mut Target, line: &str) -> String {
-    let query = b"\x1b[6n";
     let mut seen = Vec::new();
     let mut asked = false;
     loop {
@@ -5548,19 +5305,8 @@ fn read_through_prompt(session: &mut Target, line: &str) -> String {
             .expect(Any([Regex(SESSION_PROMPT), Regex(CURSOR_POSITION_QUERY)]))
             .unwrap_or_else(|err| panic!("waiting for the prompt after {line:?}: {err}"));
         let involved = captures.as_bytes().to_vec();
-        let mut from = 0;
-        while let Some(at) = involved[from..]
-            .windows(query.len())
-            .position(|window| window == query)
-        {
-            let at = from + at;
-            session
-                .send(cursor_position_reply(&involved[..at]))
-                .expect("reply to the cursor position query");
-            from = at + query.len();
-            asked = true;
-        }
-        let prompt = captures.get(0).unwrap_or_default() != query;
+        asked |= answer_cursor_queries(session, &involved);
+        let prompt = captures.get(0).unwrap_or_default() != CURSOR_POSITION_QUERY_BYTES;
         seen.extend_from_slice(&involved);
         if prompt && asked {
             let text = strip_escapes(&seen);
@@ -5771,7 +5517,7 @@ impl RnsdRelay {
             .local_addr()
             .unwrap()
             .port();
-        let dir = fresh_dir(&format!("{label}-rnsd"));
+        let dir = fresh_dir(DIR_PREFIX, &format!("{label}-rnsd"));
         fs::write(
             dir.join("config"),
             format!(
@@ -6709,7 +6455,6 @@ fn a_revoked_user_stays_known_and_their_request_to_be_trusted_reads_user_slash_s
 /// cursor position query.
 fn command_at(session: &mut Target, line: &str, prompt: &str) -> String {
     session.send(format!("{line}\r")).expect("type the command");
-    let query = b"\x1b[6n";
     let mut seen = Vec::new();
     let mut asked = false;
     loop {
@@ -6717,19 +6462,8 @@ fn command_at(session: &mut Target, line: &str, prompt: &str) -> String {
             .expect(Any([Regex(prompt), Regex(CURSOR_POSITION_QUERY)]))
             .unwrap_or_else(|err| panic!("waiting for the prompt after {line:?}: {err}"));
         let involved = captures.as_bytes().to_vec();
-        let mut from = 0;
-        while let Some(at) = involved[from..]
-            .windows(query.len())
-            .position(|window| window == query)
-        {
-            let at = from + at;
-            session
-                .send(cursor_position_reply(&involved[..at]))
-                .expect("reply to the cursor position query");
-            from = at + query.len();
-            asked = true;
-        }
-        let painted = captures.get(0).unwrap_or_default() != query;
+        asked |= answer_cursor_queries(session, &involved);
+        let painted = captures.get(0).unwrap_or_default() != CURSOR_POSITION_QUERY_BYTES;
         seen.extend_from_slice(&involved);
         if painted && asked {
             let text = strip_escapes(&seen);
@@ -7143,7 +6877,6 @@ const MESH_GROUPS: [(&str, &[&str]); 6] = [
 /// after the echoed line, through the next prompt.
 fn transcript_at(session: &mut Target, line: &str, prompt: &str) -> String {
     session.send(format!("{line}\r")).expect("type the command");
-    let query = b"\x1b[6n";
     let mut seen = Vec::new();
     let mut asked = false;
     loop {
@@ -7151,19 +6884,8 @@ fn transcript_at(session: &mut Target, line: &str, prompt: &str) -> String {
             .expect(Any([Regex(prompt), Regex(CURSOR_POSITION_QUERY)]))
             .unwrap_or_else(|err| panic!("waiting for the prompt after {line:?}: {err}"));
         let involved = captures.as_bytes().to_vec();
-        let mut from = 0;
-        while let Some(at) = involved[from..]
-            .windows(query.len())
-            .position(|window| window == query)
-        {
-            let at = from + at;
-            session
-                .send(cursor_position_reply(&involved[..at]))
-                .expect("reply to the cursor position query");
-            from = at + query.len();
-            asked = true;
-        }
-        let prompt_seen = captures.get(0).unwrap_or_default() != query;
+        asked |= answer_cursor_queries(session, &involved);
+        let prompt_seen = captures.get(0).unwrap_or_default() != CURSOR_POSITION_QUERY_BYTES;
         seen.extend_from_slice(&involved);
         if prompt_seen && asked {
             let text = utf8_text(&seen);
