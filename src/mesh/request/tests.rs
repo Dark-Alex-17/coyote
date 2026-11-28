@@ -225,7 +225,10 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let mut sites = Vec::new();
     for path in crate::mesh::test_support::rust_sources() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name == "error.rs" || path.ends_with("request/tests.rs") {
+        if name == "error.rs"
+            || path.ends_with("request/tests.rs")
+            || crate::mesh::test_support::is_test_support_path(&path)
+        {
             continue;
         }
         let source = crate::mesh::test_support::read_source(&path);

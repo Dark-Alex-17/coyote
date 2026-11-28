@@ -891,7 +891,7 @@ impl InstancePresence for PeerTable {
 
 #[cfg(test)]
 mod public_key_tests {
-    use super::super::test_support::{TempDir, announced_as};
+    use super::super::test_support::{TempDir, announced_as, t_epoch};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     use crate::testing::{debug_snapshot, install_log_collector};
@@ -923,7 +923,7 @@ mod public_key_tests {
     #[test]
     fn a_stored_key_round_trips_and_rebuilds_the_announced_destination() {
         let tmp = TempDir::new("peers-key-round-trip");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
         let (sighting, key) = announced();
         let destination = sighting.destination_hash.clone();
@@ -995,7 +995,7 @@ mod public_key_tests {
     #[test]
     fn a_row_that_follows_a_new_identity_drops_the_old_key() {
         let tmp = TempDir::new("peers-key-rebound");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
         let (sighting, _) = announced();
         let destination = sighting.destination_hash.clone();
@@ -1012,7 +1012,7 @@ mod public_key_tests {
     #[test]
     fn a_sighting_without_a_key_keeps_the_key_of_an_unchanged_identity() {
         let tmp = TempDir::new("peers-key-kept");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
         let (sighting, key) = announced();
         let destination = sighting.destination_hash.clone();
@@ -1038,7 +1038,7 @@ mod public_key_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TempDir, siblings_of};
+    use super::super::test_support::{TempDir, siblings_of, t_epoch};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -1104,20 +1104,19 @@ mod tests {
     /// else was heard: two live instances under one identity are both current.
     #[test]
     fn a_rows_successor_is_the_newest_later_sighting_of_its_identity_elsewhere() {
-        let t = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
         let named = |destination: &str, identity: &str, name: Option<&str>, at| PeerRecord {
             identity_hash: identity.to_string(),
             display_name: name.map(str::to_string),
             ..record(destination, MESH_PROTOCOL_VERSION, at)
         };
-        let old = named("a", "x", Some("bob"), t(1_000));
-        let newer = named("b", "x", Some("bob"), t(1_005));
-        let newest = named("c", "x", Some("bob"), t(1_010));
-        let renamed = named("d", "x", Some("carol"), t(1_020));
-        let nameless = named("e", "x", None, t(1_030));
-        let stranger = named("f", "y", Some("bob"), t(1_040));
-        let earlier = named("g", "x", Some("bob"), t(900));
-        let now = t(1_000) + PEER_STALE_AFTER;
+        let old = named("a", "x", Some("bob"), t_epoch(1_000));
+        let newer = named("b", "x", Some("bob"), t_epoch(1_005));
+        let newest = named("c", "x", Some("bob"), t_epoch(1_010));
+        let renamed = named("d", "x", Some("carol"), t_epoch(1_020));
+        let nameless = named("e", "x", None, t_epoch(1_030));
+        let stranger = named("f", "y", Some("bob"), t_epoch(1_040));
+        let earlier = named("g", "x", Some("bob"), t_epoch(900));
+        let now = t_epoch(1_000) + PEER_STALE_AFTER;
 
         assert!(
             old.successor_in([&old], now).is_none(),
@@ -1143,11 +1142,11 @@ mod tests {
             "renamed was heard earlier"
         );
         assert_eq!(
-            named("h", "x", None, t(1_000)).successor_in([&renamed], now),
+            named("h", "x", None, t_epoch(1_000)).successor_in([&renamed], now),
             Some(&renamed)
         );
         assert_eq!(
-            named("i", "x", None, t(1_000)).successor_in([&renamed, &nameless], now),
+            named("i", "x", None, t_epoch(1_000)).successor_in([&renamed, &nameless], now),
             Some(&nameless)
         );
 

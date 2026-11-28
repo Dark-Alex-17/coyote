@@ -1904,7 +1904,7 @@ mod tests {
     };
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::request::{PathHash, RequestId};
-    use crate::mesh::test_support::{TempDir, TrustList, map, snapshot_fixture};
+    use crate::mesh::test_support::{TempDir, TrustList, map, snapshot_fixture, t_epoch};
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
@@ -2194,7 +2194,7 @@ mod tests {
     const EXPIRES_SECS: u64 = 1_790_000_900;
 
     fn expires() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(EXPIRES_SECS)
+        t_epoch(EXPIRES_SECS)
     }
 
     fn granted_data(expires: Option<SystemTime>) -> serde_json::Value {
@@ -3465,7 +3465,7 @@ mod tests {
 
     #[test]
     fn grant_expiry_falls_back_to_the_default_ttl_for_unreadable_input() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let now = t_epoch(1_700_000_000);
         assert_eq!(grant_expiry(EXPIRES_SECS as f64, now), expires());
         for broken in [f64::NAN, -1.0, f64::INFINITY, f64::MAX] {
             assert_eq!(

@@ -659,9 +659,8 @@ mod persisted_table_tests {
         let tmp = TempDir::new("pn-table-round-trip");
         let table = load_now(&tmp).unwrap();
         let near = node(true);
-        let mut far = node(true);
+        let mut far = node(false);
         far.stamp_cost = 3;
-        far.propagation_enabled = false;
         table.observe(near.clone(), 1, t_recent(100));
         table.observe(far.clone(), 4, t_recent(200));
         table.persist_if_dirty().unwrap();
@@ -694,8 +693,7 @@ mod persisted_table_tests {
     fn a_node_loaded_from_disk_is_picked_for_fetch_and_post_as_the_heard_one_is() {
         let tmp = TempDir::new("pn-table-loaded-picks");
         let heard = load_now(&tmp).unwrap();
-        let mut near = node(true);
-        near.propagation_enabled = false;
+        let near = node(false);
         let far = node(true);
         heard.observe(near.clone(), 1, t_recent(100));
         heard.observe(far.clone(), 3, t_recent(200));

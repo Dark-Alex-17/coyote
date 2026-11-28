@@ -66,6 +66,30 @@ fn rust_source_files(root: &Path) -> std::io::Result<Vec<(String, String)>> {
     rust_files_under(root, "src")
 }
 
+/// Whether a path from `files` lies in a file module one of `files` declares under
+/// `#[cfg(test)]` (`mod tests;`, `mod test_support;`): such a file is test code wholesale.
+fn test_file_matcher(files: &[(String, String)]) -> impl Fn(&str) -> bool + use<> {
+    let test_modules: std::collections::HashSet<String> = files
+        .iter()
+        .flat_map(|(_, source)| {
+            source
+                .lines()
+                .zip(source.lines().skip(1))
+                .filter_map(|(attribute, item)| {
+                    (attribute.trim() == "#[cfg(test)]")
+                        .then(|| item.trim().trim_start_matches("pub(crate) "))
+                        .and_then(|item| item.strip_prefix("mod "))
+                        .and_then(|item| item.strip_suffix(';'))
+                        .map(str::to_string)
+                })
+        })
+        .collect();
+    move |path: &str| {
+        path.split('/')
+            .any(|part| test_modules.contains(part.strip_suffix(".rs").unwrap_or(part)))
+    }
+}
+
 /// Each `.rs` file under `root/<dir>` as its `/`-joined path relative to `root` and its
 /// contents, as `rust_files` walks it.
 fn rust_files_under(root: &Path, dir: &str) -> std::io::Result<Vec<(String, String)>> {
@@ -109,7 +133,6 @@ mod tests {
     use rmpv::Value;
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use rns_transport::resource::MAX_EFFICIENT_SIZE;
-    use std::collections::HashSet;
     use std::time::Duration;
 
     const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,"/knock","/status","/message",30,10,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,4,3600,60,3660,3,5,10980,7320,1024,"scope.knock/1",200,15,10,256,3,600,16,256,16,1,0,1,2,64,280,64,64,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,4096,86400,3,3660,256,0,32,86400,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,200,100000,64,2048,120,4194304,4194304,4198400,200,16,32,64,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096,1,1,256,16,40,65536,168,3600,86400,2,5"#;
@@ -1350,13 +1373,17 @@ mod tests {
 
         /// Mesh text reaches the terminal only through the sinks, so every line follows
         /// the configured command prefix and paths are printed as they are. The
-        /// conformance and fuzz harnesses print reports, not mesh text.
+        /// conformance and fuzz harnesses print reports, not mesh text, and a test-only
+        /// file module prints nothing a user sees.
         #[test]
         fn mesh_text_is_printed_only_through_the_sinks() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             let mut files = rust_files_under(root, "src/mesh").unwrap();
+            let is_test_file = test_file_matcher(&files);
             files.retain(|(path, _)| {
-                !path.starts_with("src/mesh/conformance/") && !path.starts_with("src/mesh/fuzz/")
+                !path.starts_with("src/mesh/conformance/")
+                    && !path.starts_with("src/mesh/fuzz/")
+                    && !is_test_file(path)
             });
             for extra in [
                 "src/repl/mesh.rs",
@@ -1716,25 +1743,7 @@ mod tests {
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let files = rust_source_files(root).unwrap();
-        let test_modules: HashSet<String> = files
-            .iter()
-            .flat_map(|(_, source)| {
-                source
-                    .lines()
-                    .zip(source.lines().skip(1))
-                    .filter_map(|(attribute, item)| {
-                        (attribute.trim() == "#[cfg(test)]")
-                            .then(|| item.trim().trim_start_matches("pub(crate) "))
-                            .and_then(|item| item.strip_prefix("mod "))
-                            .and_then(|item| item.strip_suffix(';'))
-                            .map(str::to_string)
-                    })
-            })
-            .collect();
-        let is_test_file = |path: &str| {
-            path.split('/')
-                .any(|part| test_modules.contains(part.strip_suffix(".rs").unwrap_or(part)))
-        };
+        let is_test_file = test_file_matcher(&files);
         let scan = |path: &str, source: &str| -> Vec<String> {
             if path == "src/config/paths.rs" || is_test_file(path) {
                 return Vec::new();

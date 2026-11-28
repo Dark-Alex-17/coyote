@@ -386,12 +386,14 @@ fn without_verbatim_disk(path: PathBuf) -> PathBuf {
     plain.unwrap_or(path)
 }
 
+// Kept below the production code: `request/tests.rs` ends mod.rs's production text at this
+// declaration, and `schema.rs` checks that the lines above it are scanned.
 #[cfg(test)]
 pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{TempDir, read_source, rust_sources};
+    use super::test_support::{TempDir, is_test_support_path, read_source, rust_sources};
     use super::*;
 
     #[test]
@@ -961,6 +963,7 @@ mod tests {
             .into_iter()
             .filter(|path| {
                 !path.components().any(|c| c.as_os_str() == "conformance")
+                    && !is_test_support_path(path)
                     && path.file_name().is_some_and(|name| name != "tests.rs")
             })
             .collect();
@@ -1074,7 +1077,10 @@ mod tests {
             scan(&path, 1, &production_code(&read_source(&path)));
         }
         let display_headers = ["impl fmt::Display for ", "impl std::fmt::Display for "];
-        for path in rust_sources() {
+        for path in rust_sources()
+            .into_iter()
+            .filter(|path| !is_test_support_path(path))
+        {
             let lines = production_code(&read_source(&path));
             let mut at = 0;
             while at < lines.len() {
@@ -1194,14 +1200,16 @@ mod tests {
             .find_map(|(suffix, markers)| path.ends_with(&suffix).then_some(markers))
     }
 
-    /// The files the redaction rule governs: the mesh module without its test-only files, and the
-    /// mesh-facing files under config, function and repl, plus the literal-filtered files.
+    /// The files the redaction rule governs: the mesh module without its test-only files
+    /// (conformance, `tests.rs` files and `test_support`), and the mesh-facing files under
+    /// config, function and repl, plus the literal-filtered files.
     fn redaction_scan_sources() -> Vec<PathBuf> {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut sources: Vec<PathBuf> = rust_sources()
             .into_iter()
             .filter(|path| {
                 !path.components().any(|c| c.as_os_str() == "conformance")
+                    && !is_test_support_path(path)
                     && path.file_name().is_some_and(|name| name != "tests.rs")
             })
             .collect();

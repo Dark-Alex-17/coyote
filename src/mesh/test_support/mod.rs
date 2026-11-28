@@ -172,14 +172,15 @@ pub(crate) fn t_epoch(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// `secs` past a fixed instant a few hours back, so every `t_recent(secs)` is in the
-/// past and well inside `PROPAGATION_NODE_TTL` of the clock the pickers read.
+/// `secs` past a fixed instant 10_000 s before the first call, so every `t_recent(secs)`
+/// is in the past yet well inside the TTLs of the clocks under test.
 pub(crate) fn t_recent(secs: u64) -> SystemTime {
     static BASE: LazyLock<SystemTime> =
         LazyLock::new(|| SystemTime::now() - Duration::from_secs(10_000));
     *BASE + Duration::from_secs(secs)
 }
 
+/// A 32-character lowercase hex string with every byte `fill`, shaped like a hash.
 pub(crate) fn fake_hash(fill: u8) -> String {
     hex_lower(&[fill; 16])
 }
@@ -231,10 +232,12 @@ pub(crate) struct Announced {
     pub(crate) name_hash: String,
 }
 
+/// The hashes of `aspect`'s destination under a fresh identity.
 pub(crate) fn announced(aspect: &str) -> Announced {
     announced_as(TransportIdentity::new_from_rand(OsRng), aspect)
 }
 
+/// The hashes of `aspect`'s destination under the caller's `identity`.
 pub(crate) fn announced_as(identity: TransportIdentity, aspect: &str) -> Announced {
     let name = session_destination_name(aspect);
     let destination = SingleInputDestination::new(identity, name);
@@ -257,6 +260,7 @@ pub(crate) fn node(enabled: bool) -> PropagationNode {
     }
 }
 
+/// The node's destination hash as hex.
 pub(crate) fn hex(node: &PropagationNode) -> String {
     node.destination.address_hash.to_hex_string()
 }
@@ -701,7 +705,7 @@ impl TrustList {
     /// Writes the list as `trust.yaml` under `config_dir`, where a node started with
     /// that config dir reads it.
     pub(crate) fn write(&self, config_dir: &Path) {
-        let ts = rfc3339_utc(UNIX_EPOCH + Duration::from_secs(1_790_000_000));
+        let ts = rfc3339_utc(t_epoch(1_790_000_000));
         let mut text = format!("version: {}\n", super::trust::TRUST_FILE_VERSION);
         if !self.identities.is_empty() {
             text.push_str("identities:\n");
@@ -1318,13 +1322,15 @@ impl PeerStub {
 /// `trust_destination` requires, for a peer that never announces on the wire.
 #[cfg(unix)]
 pub(crate) fn derived_sighting(aspect: &str, display_name: Option<&str>) -> PeerSighting {
-    let identity = TransportIdentity::new_from_rand(OsRng);
-    let name = session_destination_name(aspect);
-    let desc = SingleInputDestination::new(identity, name).desc;
+    let Announced {
+        destination_hash,
+        identity_hash,
+        name_hash,
+    } = announced_as(TransportIdentity::new_from_rand(OsRng), aspect);
     PeerSighting {
-        destination_hash: desc.address_hash.to_hex_string(),
-        identity_hash: desc.identity.address_hash.to_hex_string(),
-        name_hash: hex_lower(name.as_name_hash_slice()),
+        destination_hash,
+        identity_hash,
+        name_hash,
         public_key: None,
         display_name: display_name.map(str::to_string),
         protocol_version: 1,
@@ -1446,6 +1452,17 @@ pub(crate) fn rust_sources() -> Vec<PathBuf> {
         &mut sources,
     );
     sources
+}
+
+/// Whether `path` is in this test-only directory, `src/mesh/test_support`, which a scan
+/// of production code over `rust_sources` skips.
+pub(crate) fn is_test_support_path(path: &Path) -> bool {
+    path.starts_with(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("mesh")
+            .join("test_support"),
+    )
 }
 
 /// A source file with its line endings normalised to `\n`, so the marker searches

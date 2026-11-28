@@ -6764,7 +6764,11 @@ mod tests {
         let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
         let before = std::fs::read(&trust_path).unwrap();
         trust
-            .trust_destination_for_session(&MeshOn(peers, Mutex::new(vec![])), &destination, now)
+            .trust_destination_for_session(
+                &MeshOn(peers, Mutex::new(Vec::new())),
+                &destination,
+                now,
+            )
             .unwrap();
         assert_eq!(std::fs::read(&trust_path).unwrap(), before);
 

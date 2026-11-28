@@ -234,7 +234,8 @@ mod tests {
     /// The lines of a source file outside its test-only inline modules. A `#[cfg(test)]`
     /// on an import, alias, helper or file module (`mod fuzz;`) leaves the scan running;
     /// one gating an inline module body (`mod test_support {`, `mod tests {`) skips that
-    /// body, brace-matched, and the scan resumes after it.
+    /// body, brace-matched, and the scan resumes after it. A test-only file module's own
+    /// file reads as production here, so a caller skips that file by path.
     fn non_test_lines(source: &str) -> Vec<&str> {
         let lines: Vec<&str> = source.lines().collect();
         let mut kept = Vec::new();
@@ -362,7 +363,11 @@ mod tests {
         let mut files = Vec::new();
         rust_files_under(
             &mesh,
-            &[mesh.join("conformance"), mesh.join("fuzz")],
+            &[
+                mesh.join("conformance"),
+                mesh.join("fuzz"),
+                mesh.join("test_support"),
+            ],
             &mut files,
         );
         let mut unclassified = Vec::new();
