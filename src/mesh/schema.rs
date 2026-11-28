@@ -326,10 +326,12 @@ mod tests {
             "mod.rs production code before test_support is scanned"
         );
         assert!(
-            !kept
-                .iter()
-                .any(|line| line.contains("mod test_support") || line.contains("mod tests")),
-            "mod.rs test-only modules are skipped: {kept:#?}"
+            kept.contains(&"pub(crate) mod test_support;"),
+            "mod.rs keeps its cfg(test) test_support file module declaration: {kept:#?}"
+        );
+        assert!(
+            !kept.iter().any(|line| line.contains("mod tests")),
+            "mod.rs inline test module body is skipped: {kept:#?}"
         );
     }
 

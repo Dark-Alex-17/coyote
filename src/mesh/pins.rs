@@ -1849,7 +1849,7 @@ mod tests {
         };
         for (name, adapter) in [
             ("src/mesh/node.rs", "request_handler"),
-            ("src/mesh/mod.rs", "adapter"),
+            ("src/mesh/test_support/mod.rs", "adapter"),
         ] {
             let source = flattened(name);
             let registration =
