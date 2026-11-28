@@ -30,10 +30,11 @@ use super::message::{
     to_request_body,
 };
 use super::propagation::OutboundMessage;
+use super::propagation_fetch::{ack_request, get_request, list_request};
 use super::protocol::VersionRefusal;
 use super::request::{
-    AdmittedRequest, Envelope, FETCH_PATH, Handler, LIST_PATH, NAME_HASH_LEN, OriginName, PathHash,
-    RefusalCode, Reply, RequestId,
+    AdmittedRequest, DispatchError, Envelope, FETCH_PATH, Handler, LIST_PATH, NAME_HASH_LEN,
+    OriginName, PathHash, Reply, RequestId,
 };
 use super::shares::SHARES_FILE_VERSION;
 use super::snapshot::{BriefState, MeshSnapshot, RepoInfo, TurnState};
@@ -50,16 +51,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WRITE_ENV: &str = "COYOTE_MESH_WIRE_GOLDEN_WRITE";
 const REGENERATE: &str =
     "COYOTE_MESH_WIRE_GOLDEN_WRITE=1 cargo test --all -- --ignored mesh::wire_golden";
-
-/// Held by every test that reads the fixture files and by the regenerator, so an
-/// `--include-ignored` run with the write env set cannot rewrite a file mid-read.
-static FIXTURE_FILES: Mutex<()> = Mutex::new(());
 
 /// Conformance rows whose input is left out of `inputs.hex`, with the reason.
 const UNRECORDED_INPUTS: &[(&str, &str)] = &[
@@ -216,7 +213,9 @@ fn encoder_records() -> Vec<(String, Vec<u8>)> {
         access_records(),
         knock_records(),
         envelope_records(),
-        refusal_records(),
+        tests::refusal_records(),
+        dispatch_error_records(),
+        propagation_sync_records(),
         share_records(),
     ]
     .into_iter()
@@ -521,28 +520,44 @@ fn envelope_records() -> Vec<(String, Vec<u8>)> {
     .collect()
 }
 
-fn refusal_records() -> Vec<(String, Vec<u8>)> {
-    let versions = [("none", None), ("zero", Some(0)), ("future", Some(99))]
-        .into_iter()
-        .map(|(sample, found)| {
-            (
-                format!("version_refusal/{sample}"),
-                packed(&VersionRefusal::current(found).to_value()),
-            )
-        });
-    // Every code is reached through the wire byte range rather than named, so the record
-    // set follows the enum; each keeps its display name, without the byte, as its sample.
-    let codes = (0xf0u8..=0xffu8)
-        .filter_map(|byte| RefusalCode::from_wire(&Value::from(byte)))
-        .map(|code| {
-            let display = code.to_string();
-            let name = display.split(" (0x").next().unwrap_or(&display);
-            (
-                format!("refusal_code/{}", name.replace(' ', "-")),
-                packed(&code.to_wire()),
-            )
-        });
-    versions.chain(codes).collect()
+fn dispatch_error_records() -> Vec<(String, Vec<u8>)> {
+    [
+        (
+            "unknown-path",
+            DispatchError::UnknownPath {
+                path_hash: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+        ),
+        (
+            "no-provider",
+            DispatchError::NoProvider {
+                path: "/list".to_string(),
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(sample, error)| {
+        (
+            format!("dispatch_error/{sample}"),
+            packed(&error.to_value()),
+        )
+    })
+    .collect()
+}
+
+fn propagation_sync_records() -> Vec<(String, Vec<u8>)> {
+    let wants = [[0x01u8; 32]];
+    let haves = [[0x02u8; 32]];
+    [
+        ("list", list_request()),
+        ("get-empty", get_request(&[], &[])),
+        ("get-wants-haves", get_request(&wants, &haves)),
+        ("ack-empty", ack_request(&[])),
+        ("ack-haves", ack_request(&haves)),
+    ]
+    .into_iter()
+    .map(|(sample, request)| (format!("propagation_sync/{sample}"), packed(&request)))
+    .collect()
 }
 
 struct Root {
@@ -666,109 +681,162 @@ fn reply_value(reply: Reply) -> Value {
     }
 }
 
-#[test]
-fn every_golden_record_matches_the_committed_bytes() {
-    let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
-    for fixture in fixtures() {
-        let committed = committed_records(fixture.file);
-        assert_eq!(
-            duplicates(committed.iter().map(|(name, _)| name.as_str())),
-            Vec::<&str>::new(),
-            "{} holds these record names twice",
-            fixture.file
-        );
-        let lookup: BTreeMap<&str, &[u8]> = committed
-            .iter()
-            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-            .collect();
-        for (name, bytes) in &fixture.records {
-            let Some(recorded) = lookup.get(name.as_str()) else {
-                panic!(
-                    "{}: the record {name} is not committed; if it is new, regenerate with `{REGENERATE}`",
+// Redundant under a test-only module, but `request/tests.rs` splits production code from tests
+// at exactly this marker when it counts the sites that name a refusal code.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::request::RefusalCode;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Held by every test that reads the fixture files and by the regenerator, so an
+    /// `--include-ignored` run with the write env set cannot rewrite a file mid-read.
+    static FIXTURE_FILES: Mutex<()> = Mutex::new(());
+
+    pub(super) fn refusal_records() -> Vec<(String, Vec<u8>)> {
+        let versions = [("none", None), ("zero", Some(0)), ("future", Some(99))]
+            .into_iter()
+            .map(|(sample, found)| {
+                (
+                    format!("version_refusal/{sample}"),
+                    packed(&VersionRefusal::current(found).to_value()),
+                )
+            });
+        let codes = [
+            RefusalCode::NoIdentity,
+            RefusalCode::NoAccess,
+            RefusalCode::InvalidKey,
+            RefusalCode::InvalidData,
+            RefusalCode::InvalidStamp,
+            RefusalCode::Throttled,
+            RefusalCode::NotFound,
+            RefusalCode::Timeout,
+        ]
+        .into_iter()
+        .map(|code| {
+            let wire = code.to_wire();
+            let byte = wire
+                .as_u64()
+                .expect("a refusal code is an integer on the wire");
+            (format!("refusal_code/{byte:02x}"), packed(&wire))
+        });
+        versions.chain(codes).collect()
+    }
+
+    #[test]
+    fn every_golden_record_matches_the_committed_bytes() {
+        let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
+        for fixture in fixtures() {
+            let committed = committed_records(fixture.file);
+            assert_eq!(
+                duplicates(committed.iter().map(|(name, _)| name.as_str())),
+                Vec::<&str>::new(),
+                "{} holds these record names twice",
+                fixture.file
+            );
+            let lookup: BTreeMap<&str, &[u8]> = committed
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect();
+            for (name, bytes) in &fixture.records {
+                let Some(recorded) = lookup.get(name.as_str()) else {
+                    panic!(
+                        "{}: the record {name} is not committed; if it is new, regenerate with `{REGENERATE}`",
+                        fixture.file
+                    );
+                };
+                assert_eq!(
+                    hex_lower(bytes),
+                    hex_lower(recorded),
+                    "{}: the record {name} no longer matches its committed wire bytes; if the wire change is intended, regenerate with `{REGENERATE}`",
                     fixture.file
                 );
-            };
+            }
+            let produced: BTreeSet<&str> = fixture
+                .records
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let orphaned: Vec<&str> = committed
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| !produced.contains(name))
+                .collect();
             assert_eq!(
-                hex_lower(bytes),
-                hex_lower(recorded),
-                "{}: the record {name} no longer matches its committed wire bytes; if the wire change is intended, regenerate with `{REGENERATE}`",
+                orphaned,
+                Vec::<&str>::new(),
+                "{}: these committed records are no longer produced; regenerate with `{REGENERATE}`",
                 fixture.file
             );
         }
-        let produced: BTreeSet<&str> = fixture
-            .records
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let orphaned: Vec<&str> = committed
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .filter(|name| !produced.contains(name))
-            .collect();
-        assert_eq!(
-            orphaned,
-            Vec::<&str>::new(),
-            "{}: these committed records are no longer produced; regenerate with `{REGENERATE}`",
-            fixture.file
-        );
     }
-}
 
-#[test]
-fn the_committed_fixtures_are_exactly_what_the_generator_renders() {
-    let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
-    for fixture in fixtures() {
-        let committed = committed_text(fixture.file);
-        let rendered = render(&fixture.records);
-        if committed == rendered {
-            continue;
+    #[test]
+    fn the_committed_fixtures_are_exactly_what_the_generator_renders() {
+        let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
+        for fixture in fixtures() {
+            let committed = committed_text(fixture.file);
+            let rendered = render(&fixture.records);
+            if committed == rendered {
+                continue;
+            }
+            let index = committed
+                .lines()
+                .zip(rendered.lines())
+                .position(|(committed, rendered)| committed != rendered)
+                .unwrap_or_else(|| committed.lines().count().min(rendered.lines().count()));
+            let line_of = |text: &str| -> String {
+                text.lines()
+                    .nth(index)
+                    .unwrap_or("<end of file>")
+                    .chars()
+                    .take(80)
+                    .collect()
+            };
+            panic!(
+                "{}: line {} differs from what the generator renders\n  committed: {}\n  rendered:  {}\nregenerate with `{REGENERATE}`",
+                fixture.file,
+                index + 1,
+                line_of(&committed),
+                line_of(&rendered)
+            );
         }
-        let index = committed
-            .lines()
-            .zip(rendered.lines())
-            .position(|(committed, rendered)| committed != rendered)
-            .unwrap_or_else(|| committed.lines().count().min(rendered.lines().count()));
-        let line_of = |text: &str| -> String {
-            text.lines()
-                .nth(index)
-                .unwrap_or("<end of file>")
-                .chars()
-                .take(80)
-                .collect()
-        };
-        panic!(
-            "{}: line {} differs from what the generator renders\n  committed: {}\n  rendered:  {}\nregenerate with `{REGENERATE}`",
-            fixture.file,
-            index + 1,
-            line_of(&committed),
-            line_of(&rendered)
-        );
     }
-}
 
-#[test]
-fn every_unrecorded_input_names_a_conformance_row() {
-    let rows: BTreeSet<String> = crate::mesh::conformance::golden_inputs()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    for (name, reason) in UNRECORDED_INPUTS {
-        assert!(
-            rows.contains(*name),
-            "{name} is left unrecorded ({reason}) but no table has that row"
-        );
+    #[test]
+    fn every_unrecorded_input_names_a_conformance_row() {
+        let rows: BTreeSet<String> = crate::mesh::conformance::golden_inputs()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for (name, reason) in UNRECORDED_INPUTS {
+            assert!(
+                rows.contains(*name),
+                "{name} is left unrecorded ({reason}) but no table has that row"
+            );
+        }
     }
-}
 
-#[test]
-#[ignore = "writes the fixtures; needs COYOTE_MESH_WIRE_GOLDEN_WRITE=1"]
-fn regenerate_the_golden_fixtures() {
-    // A broad `--ignored` sweep must not rewrite the fixtures it is meant to check.
-    if std::env::var_os(WRITE_ENV).is_none_or(|value| value != "1") {
-        return;
-    }
-    let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
-    for fixture in fixtures() {
-        fs::write(fixture_path(fixture.file), render(&fixture.records)).unwrap();
+    #[test]
+    #[ignore = "writes the fixtures; needs COYOTE_MESH_WIRE_GOLDEN_WRITE=1"]
+    fn regenerate_the_golden_fixtures() {
+        // A broad `--ignored` sweep must not rewrite the fixtures it is meant to check.
+        match std::env::var_os(WRITE_ENV) {
+            Some(value) if value == "1" => {}
+            Some(value) => {
+                eprintln!(
+                    "skipping: {WRITE_ENV}={value:?} is not 1; set it to 1 and run {REGENERATE}"
+                );
+                return;
+            }
+            None => {
+                eprintln!("skipping: {WRITE_ENV} is unset; set it to 1 and run {REGENERATE}");
+                return;
+            }
+        }
+        let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
+        for fixture in fixtures() {
+            fs::write(fixture_path(fixture.file), render(&fixture.records)).unwrap();
+        }
     }
 }
