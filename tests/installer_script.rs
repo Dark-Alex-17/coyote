@@ -3,11 +3,13 @@
 //! the network: a stand-in `curl` on a hand-picked PATH serves the release metadata and
 //! a prepared tarball from disk and records every request, and a `uname` answering
 //! `Linux` keeps the mesh relay on its systemd path (with no `systemctl` on PATH it
-//! writes the unit and prints how to enable it) on every OS. The fixture mirrors
-//! `mesh_relay_script.rs`.
+//! writes the unit and prints how to enable it) on every OS. The throwaway HOME and
+//! tools dir come from `tests/support/script.rs`, shared with `mesh_relay_script.rs`.
 //!
 //! Unix only, like the script. Without `bash` on PATH the tests print `skipping:`.
 #![cfg(unix)]
+
+mod support;
 
 use expectrl::process::unix::WaitStatus;
 use expectrl::session::{OsProcess, OsStream};
@@ -16,12 +18,15 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use support::script::{self, on_path, run, running_as_root};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,30 +34,6 @@ fn repo_root() -> PathBuf {
 
 fn installer() -> PathBuf {
     repo_root().join("scripts").join("install_coyote.sh")
-}
-
-/// `None` when `bash` is not on PATH; the caller prints `skipping:` and returns.
-fn bash() -> Option<PathBuf> {
-    on_path("bash")
-}
-
-/// Resolve `name` on PATH, for building a PATH of hand-picked tools.
-fn on_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-fn running_as_root() -> bool {
-    static ROOT: OnceLock<bool> = OnceLock::new();
-    *ROOT.get_or_init(|| {
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
-            .unwrap_or(false)
-    })
 }
 
 fn euid() -> u32 {
@@ -94,47 +75,12 @@ fn darwin_asset_name() -> String {
     format!("coyote-{}-apple-darwin.tar.gz", machine_arch())
 }
 
-/// A throwaway HOME. `XDG_CONFIG_HOME` and `BIN_DIR` sit inside it so every path the
-/// installer or the relay may write is under one root that is removed on drop.
-struct Home {
-    root: PathBuf,
-}
+/// The shared throwaway HOME, named for the installer and able to run it.
+struct Home(script::Home);
 
 impl Home {
     fn new(label: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("coyote-installer-{label}-{unique}"));
-        fs::create_dir_all(&root).unwrap();
-        Home { root }
-    }
-
-    fn path(&self) -> &Path {
-        &self.root
-    }
-
-    fn bin_dir(&self) -> PathBuf {
-        self.root.join("bin")
-    }
-
-    fn config_home(&self) -> PathBuf {
-        self.root.join(".config")
-    }
-
-    fn reticulum_config(&self) -> PathBuf {
-        self.root.join(".reticulum").join("config")
-    }
-
-    /// A stand-in `rnsd` whose `--version` succeeds: to the installer a mesh set up
-    /// earlier, to the relay an rnsd it reuses instead of installing anything.
-    fn seed_rnsd(&self) {
-        let bin = self.bin_dir();
-        fs::create_dir_all(&bin).unwrap();
-        let rnsd = bin.join("rnsd");
-        fs::write(&rnsd, "#!/bin/sh\necho 'rnsd 1.5.2'\n").unwrap();
-        fs::set_permissions(&rnsd, fs::Permissions::from_mode(0o755)).unwrap();
+        Home(script::Home::new("coyote-installer", label))
     }
 
     /// `script` run by `bash` with stdin closed, as a piped or scripted install has it.
@@ -152,7 +98,7 @@ impl Home {
         cmd.arg(script)
             .args(args)
             .current_dir(repo_root())
-            .env("HOME", &self.root)
+            .env("HOME", self.path())
             .env("XDG_CONFIG_HOME", self.config_home())
             .env("BIN_DIR", self.bin_dir())
             .env("PATH", tools.path())
@@ -186,9 +132,11 @@ impl Home {
     }
 }
 
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+impl Deref for Home {
+    type Target = script::Home;
+
+    fn deref(&self) -> &script::Home {
+        &self.0
     }
 }
 
@@ -198,7 +146,7 @@ impl Drop for Home {
 /// relay stub at `relay_stub` when one was written, and fails every other URL with
 /// curl's own HTTP-error exit code 22. Every request is appended to `log`.
 struct Tools {
-    dir: PathBuf,
+    base: script::Tools,
     log: PathBuf,
     json: PathBuf,
     tarball: PathBuf,
@@ -213,13 +161,8 @@ impl Tools {
     ];
 
     fn new(home: &Home) -> Self {
-        let dir = home.path().join("tools");
-        fs::create_dir_all(&dir).unwrap();
-        for name in Self::BASE {
-            if let Some(real) = on_path(name) {
-                symlink(real, dir.join(name)).unwrap();
-            }
-        }
+        let base = script::Tools::new(home, &Self::BASE);
+        let dir = base.path();
         let real_uname = on_path("uname").expect("uname on PATH");
         write_script(
             &dir.join("uname"),
@@ -284,7 +227,7 @@ esac
             ),
         );
         Tools {
-            dir,
+            base,
             log,
             json,
             tarball,
@@ -293,14 +236,14 @@ esac
     }
 
     fn path(&self) -> &Path {
-        &self.dir
+        self.base.path()
     }
 
     /// Swap the stand-in `curl` for a stand-in `wget`. `gnu` picks a `--help` that lists
     /// `--https-only` and `--secure-protocol` and accepts them; otherwise the help lists
     /// neither and, like busybox, any unknown `--` option is a fatal exit 1.
     fn wget_instead_of_curl(&self, gnu: bool) {
-        fs::remove_file(self.dir.join("curl")).unwrap();
+        fs::remove_file(self.path().join("curl")).unwrap();
         let (help, tls) = if gnu {
             (
                 "  --https-only                only follow secure HTTPS links\\n  --secure-protocol=PR        choose secure protocol, one of auto, SSLv2,",
@@ -313,7 +256,7 @@ esac
             )
         };
         write_script(
-            &self.dir.join("wget"),
+            &self.path().join("wget"),
             &format!(
                 r#"printf '%s\n' "wget $*" >> "{log}"
 for a in "$@"; do case "$a" in --help) printf '{help}\n'; exit 0 ;; esac; done
@@ -348,8 +291,8 @@ esac
 
     /// Swap the real `id` for one answering `0`, so the installers take their root branch.
     fn fake_root(&self) {
-        fs::remove_file(self.dir.join("id")).unwrap();
-        write_script(&self.dir.join("id"), "echo 0\n");
+        fs::remove_file(self.path().join("id")).unwrap();
+        write_script(&self.path().join("id"), "echo 0\n");
     }
 
     /// What the stand-in `curl` was asked for, one invocation per line.
@@ -368,35 +311,10 @@ fn write_script(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn run(cmd: &mut Command) -> (i32, String, String) {
-    let Output {
-        status,
-        stdout,
-        stderr,
-    } = cmd.output().expect("spawn bash");
-    (
-        status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    )
-}
-
 fn pointer_lines(out: &str) -> Vec<&str> {
     out.lines()
         .filter(|line| line.contains("mesh-relay.sh"))
         .collect()
-}
-
-macro_rules! bash_or_skip {
-    () => {
-        match bash() {
-            Some(bash) => bash,
-            None => {
-                eprintln!("skipping: no `bash` on PATH");
-                return;
-            }
-        }
-    };
 }
 
 #[test]

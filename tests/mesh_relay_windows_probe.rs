@@ -8,6 +8,8 @@
 //! - A re-run on a host whose `rnsd.cmd` an earlier run wrote adds `rnstatus.cmd` beside
 //!   it, and the Diagnostics line names that shim.
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,26 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn pwsh() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-macro_rules! pwsh_or_skip {
-    () => {
-        match pwsh() {
-            Some(pwsh) => pwsh,
-            None => {
-                eprintln!("skipping: no pwsh on PATH");
-                return;
-            }
-        }
-    };
 }
 
 struct Probe {

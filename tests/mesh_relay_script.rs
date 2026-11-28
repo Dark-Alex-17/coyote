@@ -9,14 +9,19 @@
 //! Unix only, like the script. Without `bash` on PATH the tests print `skipping:`.
 #![cfg(unix)]
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::net::{TcpListener, TcpStream};
+use std::ops::Deref;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use support::script::{self, current_uid, on_path, run, running_as_root};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -26,84 +31,17 @@ fn script() -> PathBuf {
     repo_root().join("scripts").join("mesh-relay.sh")
 }
 
-/// `None` when `bash` is not on PATH; the caller prints `skipping:` and returns.
-fn bash() -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join("bash"))
-        .find(|candidate| candidate.is_file())
-}
-
-/// Resolve `name` on PATH, for building a PATH of hand-picked tools.
-fn on_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-fn current_uid() -> &'static str {
-    static UID: OnceLock<String> = OnceLock::new();
-    UID.get_or_init(|| {
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            .unwrap_or_default()
-    })
-}
-
-fn running_as_root() -> bool {
-    current_uid() == "0"
-}
-
-/// A throwaway HOME. `XDG_CONFIG_HOME` and `BIN_DIR` sit inside it so every path the
-/// script may write is under one root that is removed when the fixture drops.
-struct Home {
-    root: PathBuf,
-}
+/// The shared throwaway HOME, named for this script and able to run it.
+struct Home(script::Home);
 
 impl Home {
     fn new(label: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("coyote-mesh-relay-{label}-{unique}"));
-        fs::create_dir_all(&root).unwrap();
-        Home { root }
-    }
-
-    fn path(&self) -> &Path {
-        &self.root
-    }
-
-    fn bin_dir(&self) -> PathBuf {
-        self.root.join("bin")
-    }
-
-    fn config_home(&self) -> PathBuf {
-        self.root.join(".config")
-    }
-
-    fn reticulum_config(&self) -> PathBuf {
-        self.root.join(".reticulum").join("config")
+        Home(script::Home::new("coyote-mesh-relay", label))
     }
 
     /// The config rnsd prefers over `~/.reticulum/config` when it exists.
     fn xdg_reticulum_config(&self) -> PathBuf {
-        self.root.join(".config").join("reticulum").join("config")
-    }
-
-    /// A stand-in `rnsd` whose `--version` succeeds, so the script reuses it instead
-    /// of installing anything.
-    fn seed_rnsd(&self) -> PathBuf {
-        let bin = self.bin_dir();
-        fs::create_dir_all(&bin).unwrap();
-        let rnsd = bin.join("rnsd");
-        fs::write(&rnsd, "#!/bin/sh\necho 'rnsd 1.5.2'\n").unwrap();
-        fs::set_permissions(&rnsd, fs::Permissions::from_mode(0o755)).unwrap();
-        rnsd
+        self.config_home().join("reticulum").join("config")
     }
 
     /// The script, with `--allow-root` appended when the test process is root so a
@@ -113,7 +51,7 @@ impl Home {
         cmd.arg(script())
             .args(args)
             .current_dir(repo_root())
-            .env("HOME", &self.root)
+            .env("HOME", self.path())
             .env("XDG_CONFIG_HOME", self.config_home())
             .env("BIN_DIR", self.bin_dir())
             .env_remove("COYOTE_CONFIG_DIR");
@@ -122,39 +60,18 @@ impl Home {
         }
         cmd
     }
+}
 
-    /// Everything under the HOME, relative, sorted, so a "wrote nothing" check can
-    /// name what appeared.
-    fn entries(&self) -> Vec<String> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
-            if let Ok(read) = fs::read_dir(dir) {
-                for entry in read.flatten() {
-                    let path = entry.path();
-                    out.push(path.strip_prefix(root).unwrap().display().to_string());
-                    if path.is_dir() {
-                        walk(&path, root, out);
-                    }
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&self.root, &self.root, &mut out);
-        out.sort();
-        out
+impl Deref for Home {
+    type Target = script::Home;
+
+    fn deref(&self) -> &script::Home {
+        &self.0
     }
 }
 
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-/// A directory of hand-picked tools for a PATH that holds only what a scenario
-/// needs: real coreutils by symlink, stand-ins written as `#!/bin/sh` scripts.
-struct Tools {
-    dir: PathBuf,
-}
+/// The shared hand-picked tools dir, seeded with what every run of this script needs.
+struct Tools(script::Tools);
 
 impl Tools {
     /// The coreutils every run of the script reaches for, so a scenario only adds
@@ -166,39 +83,21 @@ impl Tools {
     ];
 
     fn new(home: &Home) -> Self {
-        let dir = home.path().join("tools");
-        fs::create_dir_all(&dir).unwrap();
-        for name in Self::BASE {
-            if let Some(real) = on_path(name) {
-                symlink(real, dir.join(name)).unwrap();
-            }
-        }
-        Tools { dir }
-    }
-
-    /// A stand-in `name` that appends its arguments to `log` and then runs `body`.
-    fn fake(&self, name: &str, log: &Path, body: &str) -> &Self {
-        let path = self.dir.join(name);
-        fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"{name} $*\" >> \"{log}\"\n{body}\n",
-                log = log.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        self
+        Tools(script::Tools::new(home, &Self::BASE))
     }
 
     /// A `uname` whose `-s` answers `os`; every other call runs the real one.
     fn uname_answering(&self, os: &str) -> &Self {
-        write_uname_shim(&self.dir.join("uname"), os);
+        write_uname_shim(&self.path().join("uname"), os);
         self
     }
+}
 
-    fn path(&self) -> &Path {
-        &self.dir
+impl Deref for Tools {
+    type Target = script::Tools;
+
+    fn deref(&self) -> &script::Tools {
+        &self.0
     }
 }
 
@@ -288,33 +187,8 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
-fn run(cmd: &mut Command) -> (i32, String, String) {
-    let Output {
-        status,
-        stdout,
-        stderr,
-    } = cmd.output().expect("spawn bash");
-    (
-        status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    )
-}
-
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
-}
-
-macro_rules! bash_or_skip {
-    () => {
-        match bash() {
-            Some(bash) => bash,
-            None => {
-                eprintln!("skipping: no `bash` on PATH");
-                return;
-            }
-        }
-    };
 }
 
 #[test]
