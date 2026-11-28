@@ -51,8 +51,12 @@ fn coyote_command_pins_the_dirs_clears_inherited_coyote_vars_and_lets_later_vars
             "coyote_command must set {key} from Dirs"
         );
     }
-    let mut pinned: Vec<&str> = expected.iter().map(|(key, _)| *key).collect();
-    let mut listed = PINNED_VARS.to_vec();
+    let mut pinned: Vec<&OsStr> = envs
+        .iter()
+        .filter(|(key, value)| value.is_some() && key.as_os_str() != "COYOTE_LATER")
+        .map(|(key, _)| key.as_os_str())
+        .collect();
+    let mut listed: Vec<&OsStr> = PINNED_VARS.iter().map(OsStr::new).collect();
     pinned.sort_unstable();
     listed.sort_unstable();
     assert_eq!(
