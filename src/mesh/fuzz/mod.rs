@@ -1415,6 +1415,8 @@ fn fuzz_codec_tag_table_in_the_readme_matches_the_code() {
         "the README announce row does not spell {magic}: {announce_row}"
     );
     for pin in [
+        ITERS_ENV,
+        SEED_ENV,
         WRITE_CORPUS_ENV,
         "fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants",
         "fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims",

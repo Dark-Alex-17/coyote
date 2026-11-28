@@ -1820,8 +1820,9 @@ fn the_mesh_crates_resolve_one_core_from_crates_io() {
 }
 
 /// Every document that explains the dependency names the fork as the transport Coyote
-/// uses and the upstream crate only as the fork's origin, and the policy section CI links
-/// keeps its heading.
+/// uses and the upstream crate only as the fork's origin, and CONTRIBUTING.md keeps its
+/// `## Dependency policy` heading. The CI error that links to that heading is checked in
+/// tests/ci_workflow_invariants.rs.
 #[test]
 fn the_docs_name_the_fork_as_the_transport_and_the_upstream_only_as_its_origin() {
     let contributing = read(repo_root().join("CONTRIBUTING.md"));
@@ -1874,7 +1875,8 @@ fn the_docs_name_the_fork_as_the_transport_and_the_upstream_only_as_its_origin()
 /// The interop verification record names each of the three mesh crates next to the
 /// version the lockfile resolves it at, carries no other crate version, says which host
 /// it was taken on and which rows that host cannot run, keeps the sentence that defers
-/// those rows to the CI matrix and the Linux job.
+/// those rows to the CI matrix and the Linux job. The name of that job is checked in
+/// tests/ci_workflow_invariants.rs.
 #[test]
 fn the_interop_record_names_the_pinned_mesh_crates() {
     let lock = read(repo_root().join("Cargo.lock"));
