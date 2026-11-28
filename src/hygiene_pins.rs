@@ -1287,14 +1287,45 @@ fn attributed_paths_ignores_untracked_files() {
 fn declared_patterns_skips_comments_and_negations() {
     let tmp = TempDir::new("hygiene-declared");
     let root = tmp.path.as_path();
-    fixture_repo(
-        root,
-        &format!(
-            "# note\n\nsrc/a.rs text eol=lf {ATTRIBUTE}\nsrc/b.rs -{ATTRIBUTE}\nsrc/c.rs {ATTRIBUTE}\n"
+    std::fs::write(
+        root.join(".gitattributes"),
+        format!(
+            "# note\n\nsrc/a.rs text eol=lf {ATTRIBUTE}\nsrc/b.rs -{ATTRIBUTE}\nsrc/c.rs {ATTRIBUTE}\nsrc/d.rs !{ATTRIBUTE}\nsrc/e.rs {ATTRIBUTE}=yes\n"
         ),
-        &[],
-    );
+    )
+    .expect("write");
     assert_eq!(declared_patterns(root), ["src/a.rs", "src/c.rs"]);
+}
+
+fn fixture_commit(root: &Path, message: &str) {
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=hygiene pins",
+            "-c",
+            "user.email=pins@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            message,
+        ],
+    )
+    .expect("git commit");
+}
+
+/// Writes each (path, contents) pair under `root` and stages it.
+fn fixture_add(root: &Path, files: &[(&str, &str)]) {
+    for (file, contents) in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().expect("fixture paths have a parent"))
+            .expect("mkdir");
+        std::fs::write(path, contents).expect("write");
+        git(root, &["add", "--", file]).expect("git add");
+    }
 }
 
 /// The two `origin/main` comparisons run on a branch that has not landed, skip while the
@@ -1303,29 +1334,9 @@ fn declared_patterns_skips_comments_and_negations() {
 fn main_comparisons_retire_once_the_pins_have_landed() {
     let tmp = TempDir::new("hygiene-origin-main");
     let root = tmp.path.as_path();
-    let commit = |message: &str| {
-        git(
-            root,
-            &[
-                "-c",
-                "user.name=hygiene pins",
-                "-c",
-                "user.email=pins@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                message,
-            ],
-        )
-        .expect("git commit");
-    };
     git(root, &["init", "-q"]).expect("git init");
-    std::fs::write(root.join("README.md"), "before\n").expect("write");
-    git(root, &["add", "README.md"]).expect("git add");
-    commit("before the pins");
+    fixture_add(root, &[("README.md", "before\n")]);
+    fixture_commit(root, "before the pins");
     let missing = origin_main_predates_the_pins(root).unwrap_err();
     assert!(
         missing.starts_with("origin/main unavailable: "),
@@ -1335,13 +1346,60 @@ fn main_comparisons_retire_once_the_pins_have_landed() {
     git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("update-ref");
     assert_eq!(origin_main_predates_the_pins(root), Ok(()));
 
-    std::fs::create_dir_all(root.join("src")).expect("mkdir");
-    std::fs::write(root.join(PINS_FILE), "// pins\n").expect("write");
-    git(root, &["add", PINS_FILE]).expect("git add");
-    commit("the pins land");
+    fixture_add(root, &[(PINS_FILE, "// pins\n")]);
+    fixture_commit(root, "the pins land");
     git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("update-ref");
     let landed = origin_main_predates_the_pins(root).unwrap_err();
     assert!(landed.contains("already carries"), "{landed}");
+}
+
+/// `.gitattributes` exists on `main` in the real repository, so the fixture's base commit
+/// carries one too; otherwise it would count as a file the branch added.
+#[test]
+fn scope_drift_compares_added_files_with_the_attributed_set() {
+    let tmp = TempDir::new("hygiene-scope-drift");
+    let root = tmp.path.as_path();
+    git(root, &["init", "-q"]).expect("git init");
+    fixture_add(
+        root,
+        &[
+            (".gitattributes", "* text=auto\n"),
+            (CI_WORKFLOW, "on: push\n"),
+            ("README.md", "base\n"),
+        ],
+    );
+    fixture_commit(root, "base");
+    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("update-ref");
+
+    let attributes = format!("* text=auto\nsrc/mesh/** {ATTRIBUTE}\n/{CI_WORKFLOW} {ATTRIBUTE}\n");
+    fixture_add(
+        root,
+        &[
+            (".gitattributes", &attributes),
+            ("src/mesh/a.rs", "// a\n"),
+            ("docs/guide.md", "guide\n"),
+        ],
+    );
+    fixture_commit(root, "attributed and ignored additions");
+    assert_eq!(scope_drift(root), (vec![], vec![]));
+
+    fixture_add(root, &[("src/repl/b.rs", "// b\n")]);
+    fixture_commit(root, "an unattributed addition");
+    assert_eq!(
+        scope_drift(root),
+        (vec!["src/repl/b.rs".to_string()], vec![])
+    );
+
+    let with_readme = format!("{attributes}/README.md {ATTRIBUTE}\n");
+    fixture_add(root, &[(".gitattributes", &with_readme)]);
+    fixture_commit(root, "attribute a file main already has");
+    assert_eq!(
+        scope_drift(root),
+        (
+            vec!["src/repl/b.rs".to_string()],
+            vec!["README.md".to_string()]
+        )
+    );
 }
 
 /// Every declared pattern is anchored at the root and matches a tracked file, bar those
@@ -1402,6 +1460,17 @@ fn the_attributed_set_is_the_three_dot_diff_minus_docs_and_examples() {
         println!("{reason}; skipping the diff check");
         return;
     }
+    let (missing, extra) = scope_drift(root);
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "added on this branch but without the {ATTRIBUTE} attribute: {missing:?}\ncarries {ATTRIBUTE} but was not added on this branch outside docs/ and examples/: {extra:?}"
+    );
+}
+
+/// The files added since `origin/main` outside `docs/` and `examples/`, plus the CI
+/// workflow, compared with the attributed set: (required but not attributed, attributed
+/// but not required).
+fn scope_drift(root: &Path) -> (Vec<String>, Vec<String>) {
     let added = git(
         root,
         &[
@@ -1420,12 +1489,9 @@ fn the_attributed_set_is_the_three_dot_diff_minus_docs_and_examples() {
         .collect();
     required.insert(CI_WORKFLOW.to_string());
     let attributed = attributed_paths(root);
-    let missing: Vec<&String> = required.difference(&attributed).collect();
-    let extra: Vec<&String> = attributed.difference(&required).collect();
-    assert!(
-        missing.is_empty() && extra.is_empty(),
-        "added on this branch but without the {ATTRIBUTE} attribute: {missing:?}\ncarries {ATTRIBUTE} but was not added on this branch outside docs/ and examples/: {extra:?}"
-    );
+    let missing = required.difference(&attributed).cloned().collect();
+    let extra = attributed.difference(&required).cloned().collect();
+    (missing, extra)
 }
 
 /// Every file any declared pattern matches carries the attribute, whether the pattern is
