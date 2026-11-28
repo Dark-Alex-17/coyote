@@ -349,14 +349,10 @@ impl KnockCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TempDir, siblings_of};
+    use super::super::test_support::{TempDir, siblings_of, t_epoch};
     use super::*;
     use crate::mesh::{hex_lower, rfc3339_utc};
     use crate::testing::{install_log_collector, warn_snapshot};
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
 
     /// The hashes are the tag's bytes as canonical 32-hex, since `append` refuses any other shape.
     fn knock(tag: &str, received_at: SystemTime) -> KnockRecord {
@@ -390,7 +386,7 @@ mod tests {
             .collect()
     }
 
-    /// `live` knocks received at `t(base)`, then `expired` more received an hour before
+    /// `live` knocks received at `t_epoch(base)`, then `expired` more received an hour before
     /// them, written as one file under a one-hour retention. `append` never leaves the
     /// file over the cap, so the file is written directly.
     fn full_cache(tag: &str, live: usize, expired: usize, base: u64) -> (KnockCache, TempDir) {
@@ -398,9 +394,9 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, 1);
         let mut records: Vec<KnockRecord> = (0..live)
             .rev()
-            .map(|n| knock(&format!("k{n}"), t(base)))
+            .map(|n| knock(&format!("k{n}"), t_epoch(base)))
             .collect();
-        records.extend((0..expired).map(|n| knock(&format!("stale{n}"), t(base - 3_600))));
+        records.extend((0..expired).map(|n| knock(&format!("stale{n}"), t_epoch(base - 3_600))));
         cache.write_all(&records).unwrap();
         (cache, tmp)
     }
@@ -420,8 +416,8 @@ mod tests {
         let tmp = TempDir::new("knocks-missing");
         let cache = KnockCache::new(&tmp.path, 24);
 
-        assert!(cache.list(t(1_000)).unwrap().is_empty());
-        assert_eq!(cache.prune(t(1_000)).unwrap(), 0);
+        assert!(cache.list(t_epoch(1_000)).unwrap().is_empty());
+        assert_eq!(cache.prune(t_epoch(1_000)).unwrap(), 0);
         assert!(!tmp.path.join("mesh").exists());
         assert_eq!(cache.path(), tmp.path.join("mesh").join("knocks.jsonl"));
     }
@@ -431,14 +427,20 @@ mod tests {
         let tmp = TempDir::new("knocks-order");
         let cache = KnockCache::new(&tmp.path, 24);
 
-        cache.append(knock("first", t(1_000)), t(1_000)).unwrap();
-        cache.append(knock("second", t(2_000)), t(2_000)).unwrap();
-        cache.append(knock("third", t(3_000)), t(3_000)).unwrap();
+        cache
+            .append(knock("first", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
+        cache
+            .append(knock("second", t_epoch(2_000)), t_epoch(2_000))
+            .unwrap();
+        cache
+            .append(knock("third", t_epoch(3_000)), t_epoch(3_000))
+            .unwrap();
 
-        let listed = cache.list(t(3_000)).unwrap();
+        let listed = cache.list(t_epoch(3_000)).unwrap();
         assert_eq!(tags(&listed), vec!["third", "second", "first"]);
-        assert_eq!(listed[2], knock("first", t(1_000)));
-        assert_eq!(listed[0].received_at, rfc3339_utc(t(3_000)));
+        assert_eq!(listed[2], knock("first", t_epoch(1_000)));
+        assert_eq!(listed[0].received_at, rfc3339_utc(t_epoch(3_000)));
         let text = fs::read_to_string(cache.path()).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert!(text.lines().next().unwrap().contains("\"third\""), "{text}");
@@ -453,29 +455,36 @@ mod tests {
     fn prune_expires_exactly_at_the_retention_boundary() {
         let tmp = TempDir::new("knocks-prune");
         let cache = KnockCache::new(&tmp.path, 1);
-        cache.append(knock("old", t(1_000)), t(1_000)).unwrap();
-        cache.append(knock("new", t(1_001)), t(1_001)).unwrap();
+        cache
+            .append(knock("old", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
+        cache
+            .append(knock("new", t_epoch(1_001)), t_epoch(1_001))
+            .unwrap();
         let bytes_before = fs::read(cache.path()).unwrap();
 
-        assert_eq!(cache.prune(t(1_000 + 3_599)).unwrap(), 0);
+        assert_eq!(cache.prune(t_epoch(1_000 + 3_599)).unwrap(), 0);
         assert_eq!(
             fs::read(cache.path()).unwrap(),
             bytes_before,
             "a prune that removed nothing must not write"
         );
         assert_eq!(
-            tags(&cache.list(t(1_000 + 3_600)).unwrap()),
+            tags(&cache.list(t_epoch(1_000 + 3_600)).unwrap()),
             vec!["new"],
             "list must hide an expired knock without writing"
         );
         assert_eq!(fs::read(cache.path()).unwrap(), bytes_before);
 
-        assert_eq!(cache.prune(t(1_000 + 3_600)).unwrap(), 1);
+        assert_eq!(cache.prune(t_epoch(1_000 + 3_600)).unwrap(), 1);
 
-        assert_eq!(tags(&cache.list(t(1_000 + 3_600)).unwrap()), vec!["new"]);
+        assert_eq!(
+            tags(&cache.list(t_epoch(1_000 + 3_600)).unwrap()),
+            vec!["new"]
+        );
         assert_eq!(fs::read_to_string(cache.path()).unwrap().lines().count(), 1);
         assert!(
-            cache.list(t(0)).unwrap().len() == 1,
+            cache.list(t_epoch(0)).unwrap().len() == 1,
             "a knock received in the future reads as fresh"
         );
     }
@@ -484,11 +493,15 @@ mod tests {
     fn append_drops_knocks_that_expired_meanwhile() {
         let tmp = TempDir::new("knocks-append-prunes");
         let cache = KnockCache::new(&tmp.path, 1);
-        cache.append(knock("old", t(1_000)), t(1_000)).unwrap();
+        cache
+            .append(knock("old", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
 
-        cache.append(knock("new", t(5_000)), t(5_000)).unwrap();
+        cache
+            .append(knock("new", t_epoch(5_000)), t_epoch(5_000))
+            .unwrap();
 
-        assert_eq!(tags(&cache.list(t(5_000)).unwrap()), vec!["new"]);
+        assert_eq!(tags(&cache.list(t_epoch(5_000)).unwrap()), vec!["new"]);
         assert_eq!(fs::read_to_string(cache.path()).unwrap().lines().count(), 1);
     }
 
@@ -498,15 +511,15 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, 24);
         let oversize = KnockRecord {
             intro: Some("x".repeat(KNOCK_INTRO_MAX_CHARS + 1)),
-            ..knock("long", t(1_000))
+            ..knock("long", t_epoch(1_000))
         };
         let control_intro = KnockRecord {
             intro: Some("hello\u{7}".to_string()),
-            ..knock("bell", t(1_000))
+            ..knock("bell", t_epoch(1_000))
         };
         let invisible_name = KnockRecord {
             display_name: Some("Bob\u{202E}".to_string()),
-            ..knock("bidi", t(1_000))
+            ..knock("bidi", t_epoch(1_000))
         };
 
         for (what, record) in [
@@ -514,7 +527,10 @@ mod tests {
             ("control intro", control_intro),
             ("invisible display_name", invisible_name),
         ] {
-            let err = cache.append(record, t(1_000)).unwrap_err().to_string();
+            let err = cache
+                .append(record, t_epoch(1_000))
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("refusing"), "{what}: {err}");
         }
         assert!(
@@ -524,10 +540,10 @@ mod tests {
 
         let at_cap = KnockRecord {
             intro: Some("\u{20ac}".repeat(KNOCK_INTRO_MAX_CHARS)),
-            ..knock("max", t(1_000))
+            ..knock("max", t_epoch(1_000))
         };
-        cache.append(at_cap, t(1_000)).unwrap();
-        assert_eq!(tags(&cache.list(t(1_000)).unwrap()), vec!["max"]);
+        cache.append(at_cap, t_epoch(1_000)).unwrap();
+        assert_eq!(tags(&cache.list(t_epoch(1_000)).unwrap()), vec!["max"]);
     }
 
     #[test]
@@ -538,12 +554,12 @@ mod tests {
         let styled = KnockRecord {
             display_name: Some(heart.to_string()),
             intro: Some("hi \u{2764}\u{FE0F} from \u{9053}\u{E0100}".to_string()),
-            ..knock("styled", t(1_000))
+            ..knock("styled", t_epoch(1_000))
         };
 
-        cache.append(styled, t(1_000)).unwrap();
+        cache.append(styled, t_epoch(1_000)).unwrap();
 
-        let listed = cache.list(t(1_000)).unwrap();
+        let listed = cache.list(t_epoch(1_000)).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].display_name.as_deref(), Some(heart));
         assert_eq!(
@@ -561,12 +577,15 @@ mod tests {
         ] {
             let record = KnockRecord {
                 display_name: Some(name.to_string()),
-                ..knock(what, t(1_000))
+                ..knock(what, t_epoch(1_000))
             };
-            let err = cache.append(record, t(1_000)).unwrap_err().to_string();
+            let err = cache
+                .append(record, t_epoch(1_000))
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("control or invisible"), "{what}: {err}");
         }
-        let listed = cache.list(t(1_000)).unwrap();
+        let listed = cache.list(t_epoch(1_000)).unwrap();
         assert_eq!(listed.len(), 1, "a refused knock leaves the file as it was");
         assert_eq!(listed[0].display_name.as_deref(), Some(heart));
     }
@@ -577,31 +596,31 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, 24);
         let wrong_version = KnockRecord {
             version: KNOCK_RECORD_VERSION + 1,
-            ..knock("version", t(1_000))
+            ..knock("version", t_epoch(1_000))
         };
         let bad_stamp = KnockRecord {
             received_at: "yesterday".to_string(),
-            ..knock("stamp", t(1_000))
+            ..knock("stamp", t_epoch(1_000))
         };
         let upper_identity = KnockRecord {
             identity_hash: "AB".repeat(16),
-            ..knock("id", t(1_000))
+            ..knock("id", t_epoch(1_000))
         };
         let short_destination = KnockRecord {
             destination_hash: "abc".to_string(),
-            ..knock("dest", t(1_000))
+            ..knock("dest", t_epoch(1_000))
         };
         let odd_name_hash = KnockRecord {
             name_hash: "AB".repeat(NAME_HASH_LEN),
-            ..knock("name-hash", t(1_000))
+            ..knock("name-hash", t_epoch(1_000))
         };
         let short_name_hash = KnockRecord {
             name_hash: "a".repeat(NAME_HASH_HEX_LEN - 1),
-            ..knock("short-name-hash", t(1_000))
+            ..knock("short-name-hash", t_epoch(1_000))
         };
         let long_name = KnockRecord {
             display_name: Some("n".repeat(MAX_DISPLAY_NAME_BYTES + 1)),
-            ..knock("name", t(1_000))
+            ..knock("name", t_epoch(1_000))
         };
 
         for (what, record, needle) in [
@@ -617,7 +636,10 @@ mod tests {
             ("short name_hash", short_name_hash, "name_hash"),
             ("oversize display_name", long_name, "display_name"),
         ] {
-            let err = cache.append(record, t(1_000)).unwrap_err().to_string();
+            let err = cache
+                .append(record, t_epoch(1_000))
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("refusing"), "{what}: {err}");
             assert!(err.contains(needle), "{what}: {err}");
         }
@@ -626,15 +648,17 @@ mod tests {
             "a refused knock must not create the file"
         );
 
-        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
+        cache
+            .append(knock("fine", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
         let bytes_before = fs::read(cache.path()).unwrap();
         let err = cache
             .append(
                 KnockRecord {
                     received_at: "yesterday".to_string(),
-                    ..knock("late", t(1_000))
+                    ..knock("late", t_epoch(1_000))
                 },
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap_err()
             .to_string();
@@ -651,12 +675,12 @@ mod tests {
     fn a_row_without_a_name_hash_loads_as_unknown() {
         let tmp = TempDir::new("knocks-legacy-row");
         let cache = KnockCache::new(&tmp.path, 24);
-        let mut legacy = serde_json::to_value(knock("old", t(1_000))).unwrap();
+        let mut legacy = serde_json::to_value(knock("old", t_epoch(1_000))).unwrap();
         legacy.as_object_mut().unwrap().remove("name_hash");
         cache.write_all(&[]).unwrap();
         fs::write(cache.path(), format!("{legacy}\n")).unwrap();
 
-        let listed = cache.list(t(1_000)).unwrap();
+        let listed = cache.list(t_epoch(1_000)).unwrap();
 
         assert_eq!(tags(&listed), vec!["old"]);
         assert_eq!(listed[0].name_hash, "");
@@ -664,12 +688,15 @@ mod tests {
             .append(
                 KnockRecord {
                     name_hash: String::new(),
-                    ..knock("bare", t(1_000))
+                    ..knock("bare", t_epoch(1_000))
                 },
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
-        assert_eq!(tags(&cache.list(t(1_000)).unwrap()), vec!["bare", "old"]);
+        assert_eq!(
+            tags(&cache.list(t_epoch(1_000)).unwrap()),
+            vec!["bare", "old"]
+        );
     }
 
     #[test]
@@ -679,14 +706,19 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, 24);
         for n in 0..KNOCK_CACHE_MAX_ENTRIES {
             cache
-                .append(knock(&format!("k{n}"), t(1_000)), t(1_000))
+                .append(knock(&format!("k{n}"), t_epoch(1_000)), t_epoch(1_000))
                 .unwrap();
         }
-        assert_eq!(cache.list(t(1_000)).unwrap().len(), KNOCK_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            cache.list(t_epoch(1_000)).unwrap().len(),
+            KNOCK_CACHE_MAX_ENTRIES
+        );
 
-        cache.append(knock("newest", t(1_001)), t(1_001)).unwrap();
+        cache
+            .append(knock("newest", t_epoch(1_001)), t_epoch(1_001))
+            .unwrap();
 
-        let listed = cache.list(t(1_001)).unwrap();
+        let listed = cache.list(t_epoch(1_001)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_ENTRIES);
         assert_eq!(listed[0].display_name.as_deref(), Some("newest"));
         assert_eq!(
@@ -716,9 +748,11 @@ mod tests {
             KNOCK_CACHE_MAX_ENTRIES + 2
         );
 
-        cache.append(knock("newest", t(10_000)), t(10_000)).unwrap();
+        cache
+            .append(knock("newest", t_epoch(10_000)), t_epoch(10_000))
+            .unwrap();
 
-        let listed = cache.list(t(10_000)).unwrap();
+        let listed = cache.list(t_epoch(10_000)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_ENTRIES);
         assert_eq!(listed[0].display_name.as_deref(), Some("newest"));
         assert_eq!(
@@ -741,9 +775,11 @@ mod tests {
         let before = overflow_warnings().len();
         let (cache, _tmp) = full_cache("knocks-evict-overflow", KNOCK_CACHE_MAX_ENTRIES, 0, 20_000);
 
-        cache.append(knock("newest", t(20_000)), t(20_000)).unwrap();
+        cache
+            .append(knock("newest", t_epoch(20_000)), t_epoch(20_000))
+            .unwrap();
 
-        let listed = cache.list(t(20_000)).unwrap();
+        let listed = cache.list(t_epoch(20_000)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_ENTRIES);
         assert_eq!(listed[0].display_name.as_deref(), Some("newest"));
         assert!(!tags(&listed).contains(&"k0"), "only the oldest goes");
@@ -768,7 +804,9 @@ mod tests {
         let path = cache.path().to_path_buf();
         let mut text = fs::read_to_string(&path).unwrap();
         for n in 0..4 {
-            text.push_str(&serde_json::to_string(&knock(&format!("extra{n}"), t(29_999))).unwrap());
+            text.push_str(
+                &serde_json::to_string(&knock(&format!("extra{n}"), t_epoch(29_999))).unwrap(),
+            );
             text.push('\n');
         }
         fs::write(&path, text).unwrap();
@@ -777,14 +815,14 @@ mod tests {
             KNOCK_CACHE_MAX_ENTRIES + 6
         );
 
-        assert_eq!(cache.prune(t(30_000)).unwrap(), 6);
+        assert_eq!(cache.prune(t_epoch(30_000)).unwrap(), 6);
 
-        let listed = cache.list(t(30_000)).unwrap();
+        let listed = cache.list(t_epoch(30_000)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_ENTRIES);
         assert!(!tags(&listed).iter().any(|tag| tag.starts_with("stale")));
         assert!(!tags(&listed).iter().any(|tag| tag.starts_with("extra")));
         assert_eq!(overflow_warnings().len(), before + 1);
-        assert_eq!(cache.prune(t(30_000)).unwrap(), 0);
+        assert_eq!(cache.prune(t_epoch(30_000)).unwrap(), 0);
         assert_eq!(overflow_warnings().len(), before + 1);
     }
 
@@ -797,12 +835,17 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, 24);
         for n in 0..20 {
             cache
-                .append(knock_from("a", n, t(1_000 + u64::from(n))), t(1_020))
+                .append(
+                    knock_from("a", n, t_epoch(1_000 + u64::from(n))),
+                    t_epoch(1_020),
+                )
                 .unwrap();
         }
-        cache.append(knock("b", t(1_020)), t(1_020)).unwrap();
+        cache
+            .append(knock("b", t_epoch(1_020)), t_epoch(1_020))
+            .unwrap();
 
-        let listed = cache.list(t(1_020)).unwrap();
+        let listed = cache.list(t_epoch(1_020)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_PER_IDENTITY + 1);
         assert_eq!(listed[0].display_name.as_deref(), Some("b"));
         let expected: Vec<String> = (4..20).rev().map(|n| format!("a-{n}")).collect();
@@ -814,7 +857,7 @@ mod tests {
         assert!(
             listed[1..]
                 .iter()
-                .all(|record| record.identity_hash == knock("a", t(0)).identity_hash)
+                .all(|record| record.identity_hash == knock("a", t_epoch(0)).identity_hash)
         );
         assert_eq!(
             fs::read_to_string(cache.path()).unwrap().lines().count(),
@@ -827,14 +870,19 @@ mod tests {
     fn a_flood_from_one_identity_does_not_evict_another_identitys_older_knock() {
         let tmp = TempDir::new("knocks-per-identity-flood");
         let cache = KnockCache::new(&tmp.path, 24);
-        cache.append(knock("b", t(1_000)), t(1_000)).unwrap();
+        cache
+            .append(knock("b", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
         for n in 0..40 {
             cache
-                .append(knock_from("a", n, t(2_000 + u64::from(n))), t(2_040))
+                .append(
+                    knock_from("a", n, t_epoch(2_000 + u64::from(n))),
+                    t_epoch(2_040),
+                )
                 .unwrap();
         }
 
-        let listed = cache.list(t(2_040)).unwrap();
+        let listed = cache.list(t_epoch(2_040)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_PER_IDENTITY + 1);
         assert_eq!(
             listed.last().unwrap().display_name.as_deref(),
@@ -857,15 +905,15 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, 1);
         let mut records: Vec<KnockRecord> = (0..20)
             .rev()
-            .map(|n| knock_from("a", n, t(10_000)))
+            .map(|n| knock_from("a", n, t_epoch(10_000)))
             .collect();
-        records.push(knock("b", t(10_000)));
-        records.push(knock("stale", t(10_000 - 3_600)));
+        records.push(knock("b", t_epoch(10_000)));
+        records.push(knock("stale", t_epoch(10_000 - 3_600)));
         cache.write_all(&records).unwrap();
 
-        assert_eq!(cache.prune(t(10_000)).unwrap(), 5);
+        assert_eq!(cache.prune(t_epoch(10_000)).unwrap(), 5);
 
-        let listed = cache.list(t(10_000)).unwrap();
+        let listed = cache.list(t_epoch(10_000)).unwrap();
         assert_eq!(listed.len(), KNOCK_CACHE_MAX_PER_IDENTITY + 1);
         assert_eq!(listed[0].display_name.as_deref(), Some("a-19"));
         assert_eq!(
@@ -875,19 +923,21 @@ mod tests {
             Some("a-4")
         );
         assert_eq!(listed.last().unwrap().display_name.as_deref(), Some("b"));
-        assert_eq!(cache.prune(t(10_000)).unwrap(), 0);
+        assert_eq!(cache.prune(t_epoch(10_000)).unwrap(), 0);
     }
 
     #[test]
     fn overflowing_retention_keeps_everything() {
         let tmp = TempDir::new("knocks-forever");
         let cache = KnockCache::new(&tmp.path, u64::MAX);
-        cache.append(knock("ancient", t(0)), t(0)).unwrap();
+        cache
+            .append(knock("ancient", t_epoch(0)), t_epoch(0))
+            .unwrap();
 
         // The last second RFC 3339 can spell (9999-12-31T23:59:59Z). Anything much later
         // is not a `SystemTime` on Windows, whose clock is i64 100-ns ticks and ends in
         // the year 30828, so `UNIX_EPOCH + Duration` would panic before the cache is asked.
-        let far_future = t(253_402_300_799);
+        let far_future = t_epoch(253_402_300_799);
         assert_eq!(cache.prune(far_future).unwrap(), 0);
         assert_eq!(tags(&cache.list(far_future).unwrap()), vec!["ancient"]);
     }
@@ -896,14 +946,16 @@ mod tests {
     fn newer_record_version_refuses_naming_the_file() {
         let tmp = TempDir::new("knocks-newer");
         let cache = KnockCache::new(&tmp.path, 24);
-        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
-        let mut newer = serde_json::to_value(knock("future", t(2_000))).unwrap();
+        cache
+            .append(knock("fine", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
+        let mut newer = serde_json::to_value(knock("future", t_epoch(2_000))).unwrap();
         newer["version"] = serde_json::json!(KNOCK_RECORD_VERSION + 1);
         newer["future_field"] = serde_json::json!(1);
         let existing = fs::read_to_string(cache.path()).unwrap();
         fs::write(cache.path(), format!("{newer}\n\n{existing}")).unwrap();
 
-        let err = cache.list(t(2_000)).unwrap_err().to_string();
+        let err = cache.list(t_epoch(2_000)).unwrap_err().to_string();
 
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
         assert!(err.contains("line 1"), "{err}");
@@ -917,21 +969,27 @@ mod tests {
         );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
-        assert!(cache.prune(t(3_000)).is_err());
+        assert!(
+            cache
+                .append(knock("more", t_epoch(3_000)), t_epoch(3_000))
+                .is_err()
+        );
+        assert!(cache.prune(t_epoch(3_000)).is_err());
     }
 
     #[test]
     fn pre_baseline_record_version_refuses_as_having_no_migration() {
         let tmp = TempDir::new("knocks-older");
         let cache = KnockCache::new(&tmp.path, 24);
-        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
-        let mut older = serde_json::to_value(knock("ancient", t(2_000))).unwrap();
+        cache
+            .append(knock("fine", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
+        let mut older = serde_json::to_value(knock("ancient", t_epoch(2_000))).unwrap();
         older["version"] = serde_json::json!(0);
         let existing = fs::read_to_string(cache.path()).unwrap();
         fs::write(cache.path(), format!("{existing}{older}\n")).unwrap();
 
-        let err = cache.list(t(2_000)).unwrap_err().to_string();
+        let err = cache.list(t_epoch(2_000)).unwrap_err().to_string();
 
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
         assert!(err.contains("line 2"), "{err}");
@@ -953,12 +1011,12 @@ mod tests {
         );
         let tmp = TempDir::new("knocks-pre-scope-v1");
         let cache = KnockCache::new(&tmp.path, 24);
-        let mut old = serde_json::to_value(knock("pre-scope", t(1_000))).unwrap();
+        let mut old = serde_json::to_value(knock("pre-scope", t_epoch(1_000))).unwrap();
         old["version"] = serde_json::json!(1);
         fs::create_dir_all(cache.path().parent().unwrap()).unwrap();
         fs::write(cache.path(), format!("{old}\n")).unwrap();
 
-        let err = match cache.list(t(2_000)) {
+        let err = match cache.list(t_epoch(2_000)) {
             Ok(listed) => panic!(
                 "a version-1 knock line must refuse the cache, not list {} records",
                 listed.len()
@@ -972,26 +1030,32 @@ mod tests {
         assert!(err.contains("version 2"), "{err}");
         assert!(err.contains("no migration"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
+        assert!(
+            cache
+                .append(knock("more", t_epoch(3_000)), t_epoch(3_000))
+                .is_err()
+        );
     }
 
     #[test]
     fn a_line_without_a_version_refuses_the_whole_cache() {
         let tmp = TempDir::new("knocks-unversioned");
         let cache = KnockCache::new(&tmp.path, 24);
-        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
-        let mut unversioned = serde_json::to_value(knock("bare", t(2_000))).unwrap();
+        cache
+            .append(knock("fine", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
+        let mut unversioned = serde_json::to_value(knock("bare", t_epoch(2_000))).unwrap();
         unversioned.as_object_mut().unwrap().remove("version");
         let existing = fs::read_to_string(cache.path()).unwrap();
         fs::write(cache.path(), format!("{existing}{unversioned}\n")).unwrap();
 
-        let err = format!("{:#}", cache.list(t(2_000)).unwrap_err());
+        let err = format!("{:#}", cache.list(t_epoch(2_000)).unwrap_err());
 
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
         assert!(err.contains("line 2"), "{err}");
         assert!(err.contains("no readable `version` field"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(cache.prune(t(2_000)).is_err());
+        assert!(cache.prune(t_epoch(2_000)).is_err());
     }
 
     #[test]
@@ -1004,7 +1068,7 @@ mod tests {
                 let cache = cache.clone();
                 std::thread::spawn(move || {
                     for i in 0..8 {
-                        let at = t(1_000 + worker * 8 + i);
+                        let at = t_epoch(1_000 + worker * 8 + i);
                         cache
                             .append(knock(&format!("w{worker}-k{i}"), at), at)
                             .unwrap();
@@ -1016,7 +1080,7 @@ mod tests {
             worker.join().unwrap();
         }
 
-        let listed = cache.list(t(2_000)).unwrap();
+        let listed = cache.list(t_epoch(2_000)).unwrap();
         assert_eq!(listed.len(), 32);
         let mut seen = tags(&listed);
         seen.sort_unstable();
@@ -1045,7 +1109,7 @@ mod tests {
                 let cache = cache.clone();
                 std::thread::spawn(move || {
                     for i in 0..20 {
-                        let at = t(1_000 + (worker * 20 + i) as u64);
+                        let at = t_epoch(1_000 + (worker * 20 + i) as u64);
                         cache
                             .append(knock(&format!("c{worker}-k{i}"), at), at)
                             .unwrap();
@@ -1057,7 +1121,7 @@ mod tests {
             worker.join().unwrap();
         }
 
-        let listed = caches[0].list(t(2_000)).unwrap();
+        let listed = caches[0].list(t_epoch(2_000)).unwrap();
         assert_eq!(listed.len(), 40);
         let mut seen = tags(&listed);
         seen.sort_unstable();
@@ -1070,20 +1134,22 @@ mod tests {
     fn unparsable_line_refuses_and_blank_lines_are_skipped() {
         let tmp = TempDir::new("knocks-garbage");
         let cache = KnockCache::new(&tmp.path, 24);
-        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
+        cache
+            .append(knock("fine", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
         let existing = fs::read_to_string(cache.path()).unwrap();
 
         fs::write(cache.path(), format!("\n{existing}\n")).unwrap();
-        assert_eq!(tags(&cache.list(t(1_000)).unwrap()), vec!["fine"]);
+        assert_eq!(tags(&cache.list(t_epoch(1_000)).unwrap()), vec!["fine"]);
 
         fs::write(cache.path(), format!("{existing}{{not json\n")).unwrap();
-        let err = format!("{:#}", cache.list(t(1_000)).unwrap_err());
+        let err = format!("{:#}", cache.list(t_epoch(1_000)).unwrap_err());
         assert!(err.contains("line 2"), "{err}");
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
 
-        let bad_stamp = existing.replace(&rfc3339_utc(t(1_000)), "yesterday");
+        let bad_stamp = existing.replace(&rfc3339_utc(t_epoch(1_000)), "yesterday");
         fs::write(cache.path(), bad_stamp).unwrap();
-        let err = cache.list(t(1_000)).unwrap_err().to_string();
+        let err = cache.list(t_epoch(1_000)).unwrap_err().to_string();
         assert!(err.contains("RFC 3339"), "{err}");
     }
 }

@@ -1944,7 +1944,7 @@ mod tests {
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::mesh_config_dir;
     use crate::mesh::request::{FETCH_PATH, LIST_PATH, PathHash, RequestId, ResponseFrame};
-    use crate::mesh::test_support::TempDir;
+    use crate::mesh::test_support::{TempDir, map};
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     #[cfg(unix)]
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
@@ -2127,15 +2127,6 @@ mod tests {
             path_hash: PathHash::of(path),
             body,
         }
-    }
-
-    fn map(entries: Vec<(&str, Value)>) -> Value {
-        Value::Map(
-            entries
-                .into_iter()
-                .map(|(key, value)| (Value::from(key), value))
-                .collect(),
-        )
     }
 
     fn fetch_body(path: &str, if_sha256: Option<[u8; 32]>) -> Value {

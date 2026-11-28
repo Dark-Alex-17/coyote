@@ -1350,13 +1350,16 @@ mod tests {
 
         /// Mesh text reaches the terminal only through the sinks, so every line follows
         /// the configured command prefix and paths are printed as they are. The
-        /// conformance and fuzz harnesses print reports, not mesh text.
+        /// conformance and fuzz harnesses print reports, not mesh text, and the test-only
+        /// fixture directory prints nothing a user sees.
         #[test]
         fn mesh_text_is_printed_only_through_the_sinks() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
             let mut files = rust_files_under(root, "src/mesh").unwrap();
             files.retain(|(path, _)| {
-                !path.starts_with("src/mesh/conformance/") && !path.starts_with("src/mesh/fuzz/")
+                !path.starts_with("src/mesh/conformance/")
+                    && !path.starts_with("src/mesh/fuzz/")
+                    && !crate::mesh::test_support::is_test_support_path(&root.join(path))
             });
             for extra in [
                 "src/repl/mesh.rs",
@@ -1849,7 +1852,7 @@ mod tests {
         };
         for (name, adapter) in [
             ("src/mesh/node.rs", "request_handler"),
-            ("src/mesh/mod.rs", "adapter"),
+            ("src/mesh/test_support/mod.rs", "adapter"),
         ] {
             let source = flattened(name);
             let registration =

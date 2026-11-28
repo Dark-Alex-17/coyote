@@ -1139,7 +1139,7 @@ mod tests {
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
     use crate::mesh::request::{PathHash, STATUS_PATH};
-    use crate::mesh::test_support::{TempDir, TrustList};
+    use crate::mesh::test_support::{TempDir, TrustList, t_epoch};
     use crate::testing::{debug_snapshot, install_log_collector};
 
     use rns_transport::destination::link::LinkId;
@@ -2323,8 +2323,8 @@ mod tests {
 
     /// The knock's verdict and the owner line are judged at one instant, the `received_at`
     /// the gate is handed, so the peer table rows the two see expired are the same rows.
-    /// The holder's row was heard at t(2000) and lives for `PEER_TTL` after that. A knock
-    /// received one second before that, long after the row has aged out of the real clock,
+    /// The holder's row was heard at t_epoch(2_000) and lives for `PEER_TTL` after that. A
+    /// knock received one second before that, long after the row has aged out of the real clock,
     /// is still a presence collision: refused as identity changed with the one `error:`
     /// line, nothing marked, `trust.yaml` unchanged. A knock received at the very instant
     /// the row expires sees no presence at all: already trusted, no line, so nothing is
@@ -2332,8 +2332,7 @@ mod tests {
     /// into a served knock with an error line or a refused knock with no line.
     #[test]
     fn a_knocks_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
-        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        let holder_seen = at(2_000);
+        let holder_seen = t_epoch(2_000);
         let row_gone = holder_seen + PEER_TTL;
         let holder = hash_of("id-held-at-2000");
         let knocker = hash_of("id-knocks-just-before-age-out");

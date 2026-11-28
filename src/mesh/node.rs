@@ -8699,7 +8699,7 @@ mod tests {
         status_round_trip,
     };
     use crate::mesh::test_support::{
-        TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
+        TempDir, TrustList, mesh_paths, private_config, snapshot_fixture, t_epoch,
     };
     use crate::mesh::trust::KeyChange;
     #[cfg(unix)]
@@ -14760,7 +14760,7 @@ mod tests {
     /// The announce path judges the owner line at the instant the announce is filed, the
     /// same instant it hands `note_key_change`, so the rows the verdict sees expired are
     /// the rows the line sees expired. Identity A, trusted for all destinations, announced
-    /// the instance at t(2000); its row lives for `PEER_TTL` after that. Under
+    /// the instance at t_epoch(2_000); its row lives for `PEER_TTL` after that. Under
     /// `collision_protection` an announce of the same instance by B, also trusted for all
     /// destinations, filed one second before the row expires (long past the row's life on
     /// the real clock) is a presence collision judged as B's request would be at that
@@ -14770,8 +14770,7 @@ mod tests {
     /// `warning:` for an identity the rung refuses.
     #[test]
     fn an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
-        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        let a_seen = at(2_000);
+        let a_seen = t_epoch(2_000);
         let a_row_gone = a_seen + PEER_TTL;
         let origin = OriginName([0x6c_u8; NAME_HASH_LEN]);
         let name_hex = hex_lower(&origin.0);
@@ -14789,7 +14788,8 @@ mod tests {
         .unwrap();
         let fixture = |tag: &str| {
             let tmp = TempDir::new(tag);
-            let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+            let peers =
+                Arc::new(PeerTable::load(tmp.path.join("peers.json"), t_epoch(2_000)).unwrap());
             let (trust, trust_dir) = TrustList::default()
                 .identity(&a_hex, true)
                 .identity(&b_hex, true)

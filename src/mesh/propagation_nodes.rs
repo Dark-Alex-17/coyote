@@ -642,33 +642,9 @@ fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<StoredNode> {
 
 #[cfg(test)]
 mod persisted_table_tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, hex, node, t_recent};
     use super::*;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
-
-    use rns_transport::identity::PrivateIdentity as TransportIdentity;
-    use rns_transport::rand_core::OsRng;
-    use std::sync::LazyLock;
-
-    fn node() -> PropagationNode {
-        PropagationNode {
-            destination: propagation_node_destination(
-                *TransportIdentity::new_from_rand(OsRng).as_identity(),
-            ),
-            stamp_cost: 8,
-            per_transfer_limit_kb: 256,
-            propagation_enabled: true,
-        }
-    }
-
-    /// A fixed instant a few hours back, so every `t(secs)` here is in the past and well
-    /// inside `PROPAGATION_NODE_TTL` of the clock the pickers read.
-    static BASE: LazyLock<SystemTime> =
-        LazyLock::new(|| SystemTime::now() - Duration::from_secs(10_000));
-
-    fn t(secs: u64) -> SystemTime {
-        *BASE + Duration::from_secs(secs)
-    }
 
     fn path_in(tmp: &TempDir) -> PathBuf {
         tmp.path.join("mesh").join(PROPAGATION_NODE_TABLE_FILE)
@@ -678,20 +654,15 @@ mod persisted_table_tests {
         PropagationNodeTable::load(path_in(tmp), SystemTime::now())
     }
 
-    fn hex(node: &PropagationNode) -> String {
-        node.destination.address_hash.to_hex_string()
-    }
-
     #[test]
     fn a_heard_node_round_trips_and_is_selected_after_a_reload() {
         let tmp = TempDir::new("pn-table-round-trip");
         let table = load_now(&tmp).unwrap();
-        let near = node();
-        let mut far = node();
+        let near = node(true);
+        let mut far = node(false);
         far.stamp_cost = 3;
-        far.propagation_enabled = false;
-        table.observe(near.clone(), 1, t(100));
-        table.observe(far.clone(), 4, t(200));
+        table.observe(near.clone(), 1, t_recent(100));
+        table.observe(far.clone(), 4, t_recent(200));
         table.persist_if_dirty().unwrap();
 
         let reloaded = load_now(&tmp).unwrap();
@@ -704,7 +675,7 @@ mod persisted_table_tests {
             .unwrap();
         assert_eq!(
             (far_record.hops, far_record.last_seen),
-            (4, t(200)),
+            (4, t_recent(200)),
             "hops and when it was last heard survive"
         );
         assert_eq!(far_record.node.stamp_cost, 3);
@@ -722,11 +693,10 @@ mod persisted_table_tests {
     fn a_node_loaded_from_disk_is_picked_for_fetch_and_post_as_the_heard_one_is() {
         let tmp = TempDir::new("pn-table-loaded-picks");
         let heard = load_now(&tmp).unwrap();
-        let mut near = node();
-        near.propagation_enabled = false;
-        let far = node();
-        heard.observe(near.clone(), 1, t(100));
-        heard.observe(far.clone(), 3, t(200));
+        let near = node(false);
+        let far = node(true);
+        heard.observe(near.clone(), 1, t_recent(100));
+        heard.observe(far.clone(), 3, t_recent(200));
         heard.persist_if_dirty().unwrap();
 
         let loaded = load_now(&tmp).unwrap();
@@ -740,9 +710,9 @@ mod persisted_table_tests {
                 "{label}"
             );
             assert!(table.holds(&hex(&far), now), "{label}");
-            assert!(!table.holds(&hex(&node()), now), "{label}");
+            assert!(!table.holds(&hex(&node(true)), now), "{label}");
             assert!(
-                !table.holds(&hex(&far), t(200) + PROPAGATION_NODE_TTL),
+                !table.holds(&hex(&far), t_recent(200) + PROPAGATION_NODE_TTL),
                 "{label}"
             );
         }
@@ -756,7 +726,7 @@ mod persisted_table_tests {
         table.persist_if_dirty().unwrap();
         assert!(!tmp.path.join("mesh").exists());
 
-        table.observe(node(), 1, t(1));
+        table.observe(node(true), 1, t_recent(1));
         table.persist_if_dirty().unwrap();
         assert!(path_in(&tmp).exists());
         fs::remove_file(path_in(&tmp)).unwrap();
@@ -773,7 +743,7 @@ mod persisted_table_tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new("pn-table-mode");
         let table = load_now(&tmp).unwrap();
-        table.observe(node(), 1, t(1));
+        table.observe(node(true), 1, t_recent(1));
         table.persist_if_dirty().unwrap();
 
         let mode = fs::metadata(path_in(&tmp)).unwrap().permissions().mode();
@@ -874,10 +844,10 @@ mod persisted_table_tests {
         install_log_collector();
         let tmp = TempDir::new("pn-table-tampered");
         let table = load_now(&tmp).unwrap();
-        let kept = node();
-        let tampered = node();
-        table.observe(kept.clone(), 1, t(1));
-        table.observe(tampered.clone(), 1, t(2));
+        let kept = node(true);
+        let tampered = node(true);
+        table.observe(kept.clone(), 1, t_recent(1));
+        table.observe(tampered.clone(), 1, t_recent(2));
         table.persist_if_dirty().unwrap();
         let mut file: serde_json::Value =
             serde_json::from_slice(&fs::read(path_in(&tmp)).unwrap()).unwrap();
@@ -907,7 +877,7 @@ mod persisted_table_tests {
     fn a_file_over_the_cap_keeps_the_most_recently_heard() {
         let tmp = TempDir::new("pn-table-cap");
         let nodes: Vec<PropagationNode> = (0..=PROPAGATION_NODE_TABLE_MAX_ENTRIES)
-            .map(|_| node())
+            .map(|_| node(true))
             .collect();
         let records: Vec<StoredNode> = nodes
             .iter()
@@ -916,7 +886,7 @@ mod persisted_table_tests {
                 StoredNode::of(&PropagationNodeRecord {
                     node: node.clone(),
                     hops: 1,
-                    last_seen: t(1_000 + i as u64),
+                    last_seen: t_recent(1_000 + i as u64),
                 })
             })
             .collect();
@@ -940,8 +910,8 @@ mod persisted_table_tests {
     #[test]
     fn a_stale_nearer_node_loses_to_a_fresh_farther_one() {
         let table = PropagationNodeTable::new();
-        let stale = node();
-        let fresh = node();
+        let stale = node(true);
+        let fresh = node(true);
         table.observe(stale.clone(), 1, SystemTime::now() - PROPAGATION_NODE_TTL);
         table.observe(fresh.clone(), 2, SystemTime::now());
 
@@ -955,8 +925,8 @@ mod persisted_table_tests {
         let tmp = TempDir::new("pn-table-stale");
         let now = SystemTime::now();
         let table = PropagationNodeTable::load(path_in(&tmp), now).unwrap();
-        let stale = node();
-        let fresh = node();
+        let stale = node(true);
+        let fresh = node(true);
         table.observe(stale.clone(), 1, now - PROPAGATION_NODE_TTL);
         table.observe(
             fresh.clone(),
@@ -986,7 +956,7 @@ mod persisted_table_tests {
         // A regular file where the mesh directory goes makes every save fail.
         fs::write(tmp.path.join("mesh"), b"").unwrap();
         let table = PropagationNodeTable::empty(path_in(&tmp));
-        table.observe(node(), 1, t(1));
+        table.observe(node(true), 1, t_recent(1));
 
         table.persist_if_dirty_or_warn(PersistTrigger::Timer);
         table.persist_if_dirty_or_warn(PersistTrigger::Stop);
@@ -1020,12 +990,12 @@ mod tests {
     use super::*;
     use crate::mesh::propagation::pn_announce_app_data;
     use crate::mesh::session_destination_name;
+    use crate::mesh::test_support::{hex, node, t_recent};
     use crate::testing::{debug_snapshot, install_log_collector};
 
     use rns_transport::destination::{DestinationName, SingleOutputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::rand_core::OsRng;
-    use std::sync::LazyLock;
 
     fn desc(aspect: &str) -> DestinationDesc {
         SingleOutputDestination::new(
@@ -1033,28 +1003,6 @@ mod tests {
             DestinationName::new("lxmf", aspect),
         )
         .desc
-    }
-
-    fn node(enabled: bool) -> PropagationNode {
-        PropagationNode {
-            destination: desc("propagation"),
-            stamp_cost: 8,
-            per_transfer_limit_kb: 256,
-            propagation_enabled: enabled,
-        }
-    }
-
-    /// A fixed instant a few hours back, so every `t(secs)` here is in the past and well
-    /// inside `PROPAGATION_NODE_TTL` of the clock the pickers read.
-    static BASE: LazyLock<SystemTime> =
-        LazyLock::new(|| SystemTime::now() - Duration::from_secs(10_000));
-
-    fn t(secs: u64) -> SystemTime {
-        *BASE + Duration::from_secs(secs)
-    }
-
-    fn hex(node: &PropagationNode) -> String {
-        node.destination.address_hash.to_hex_string()
     }
 
     fn select_error(table: &PropagationNodeTable) -> FetchError {
@@ -1083,11 +1031,11 @@ mod tests {
         let far = node(true);
         let near = node(true);
         let nearest_but_disabled = node(false);
-        table.observe(far.clone(), 3, t(10));
-        table.observe(near.clone(), 2, t(5));
+        table.observe(far.clone(), 3, t_recent(10));
+        table.observe(near.clone(), 2, t_recent(5));
         assert_eq!(hex(&table.select().unwrap()), hex(&near));
 
-        table.observe(nearest_but_disabled.clone(), 1, t(20));
+        table.observe(nearest_but_disabled.clone(), 1, t_recent(20));
         let selected = table.select().unwrap();
         assert_eq!(hex(&selected), hex(&nearest_but_disabled));
         assert!(!selected.propagation_enabled);
@@ -1104,11 +1052,11 @@ mod tests {
         let table = PropagationNodeTable::new();
         let stale = node(true);
         let fresh = node(true);
-        table.observe(stale.clone(), 2, t(100));
-        table.observe(fresh.clone(), 2, t(200));
+        table.observe(stale.clone(), 2, t_recent(100));
+        table.observe(fresh.clone(), 2, t_recent(200));
         assert_eq!(hex(&table.select().unwrap()), hex(&fresh));
 
-        table.observe(stale.clone(), 2, t(300));
+        table.observe(stale.clone(), 2, t_recent(300));
         assert_eq!(hex(&table.select().unwrap()), hex(&stale));
     }
 
@@ -1124,9 +1072,9 @@ mod tests {
         dear_near.stamp_cost = MAX_ACCEPTED_STAMP_COST + 1;
         let mut affordable_far = node(true);
         affordable_far.stamp_cost = MAX_ACCEPTED_STAMP_COST;
-        table.observe(disabled_near.clone(), 1, t(30));
-        table.observe(dear_near.clone(), 1, t(20));
-        table.observe(affordable_far.clone(), 4, t(10));
+        table.observe(disabled_near.clone(), 1, t_recent(30));
+        table.observe(dear_near.clone(), 1, t_recent(20));
+        table.observe(affordable_far.clone(), 4, t_recent(10));
 
         assert_eq!(
             hex(&table.select_for_posting().unwrap()),
@@ -1139,7 +1087,7 @@ mod tests {
         );
 
         let affordable_near = node(true);
-        table.observe(affordable_near.clone(), 1, t(5));
+        table.observe(affordable_near.clone(), 1, t_recent(5));
         assert_eq!(
             hex(&table.select_for_posting().unwrap()),
             hex(&affordable_near)
@@ -1150,15 +1098,21 @@ mod tests {
     fn observe_refreshes_in_place_and_reports_the_change() {
         let table = PropagationNodeTable::new();
         let first = node(true);
-        assert_eq!(table.observe(first.clone(), 4, t(1)), PeerChange::Added);
+        assert_eq!(
+            table.observe(first.clone(), 4, t_recent(1)),
+            PeerChange::Added
+        );
         let mut updated = first.clone();
         updated.stamp_cost = 12;
-        assert_eq!(table.observe(updated, 1, t(2)), PeerChange::Refreshed);
+        assert_eq!(
+            table.observe(updated, 1, t_recent(2)),
+            PeerChange::Refreshed
+        );
 
         let records = table.snapshot();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].hops, 1);
-        assert_eq!(records[0].last_seen, t(2));
+        assert_eq!(records[0].last_seen, t_recent(2));
         assert_eq!(records[0].node.stamp_cost, 12);
     }
 
@@ -1169,14 +1123,14 @@ mod tests {
         let mut nodes = Vec::new();
         for i in 0..PROPAGATION_NODE_TABLE_MAX_ENTRIES {
             let candidate = node(true);
-            table.observe(candidate.clone(), 1, t(1_000 + i as u64));
+            table.observe(candidate.clone(), 1, t_recent(1_000 + i as u64));
             nodes.push(candidate);
         }
         // The oldest is refreshed so eviction has to follow last_seen, not insertion order.
-        table.observe(nodes[0].clone(), 1, t(5_000));
+        table.observe(nodes[0].clone(), 1, t_recent(5_000));
 
         let newcomer = node(true);
-        table.observe(newcomer.clone(), 1, t(5_001));
+        table.observe(newcomer.clone(), 1, t_recent(5_001));
 
         let kept: Vec<String> = table.snapshot().iter().map(|r| hex(&r.node)).collect();
         assert_eq!(kept.len(), PROPAGATION_NODE_TABLE_MAX_ENTRIES);
@@ -1199,8 +1153,14 @@ mod tests {
         let table = PropagationNodeTable::new();
         let pn = desc("propagation");
         let key = pn.address_hash.to_hex_string();
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, t(1)));
-        let aged = t(1) + PROPAGATION_NODE_TTL + Duration::from_secs(1);
+        assert!(table.observe_announce(
+            &pn,
+            &pn_announce_app_data(true, 8, 256),
+            2,
+            false,
+            t_recent(1)
+        ));
+        let aged = t_recent(1) + PROPAGATION_NODE_TTL + Duration::from_secs(1);
         assert!(!table.holds(&key, aged));
 
         assert_eq!(
@@ -1262,18 +1222,40 @@ mod tests {
     fn a_path_response_refreshes_a_known_node_without_moving_last_seen() {
         let table = PropagationNodeTable::new();
         let pn = desc("propagation");
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, t(1)));
+        assert!(table.observe_announce(
+            &pn,
+            &pn_announce_app_data(true, 8, 256),
+            2,
+            false,
+            t_recent(1)
+        ));
 
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 12, 256), 4, true, t(9)));
+        assert!(table.observe_announce(
+            &pn,
+            &pn_announce_app_data(true, 12, 256),
+            4,
+            true,
+            t_recent(9)
+        ));
         let record = table.snapshot().pop().unwrap();
-        assert_eq!(record.last_seen, t(1), "a path response is not a sighting");
+        assert_eq!(
+            record.last_seen,
+            t_recent(1),
+            "a path response is not a sighting"
+        );
         assert_eq!(record.hops, 4, "the route it names is kept");
         assert_eq!(record.node.stamp_cost, 12, "the record it carries is kept");
 
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 12, 256), 4, false, t(10)));
+        assert!(table.observe_announce(
+            &pn,
+            &pn_announce_app_data(true, 12, 256),
+            4,
+            false,
+            t_recent(10)
+        ));
         assert_eq!(
             table.snapshot().pop().unwrap().last_seen,
-            t(10),
+            t_recent(10),
             "an announce is"
         );
 
@@ -1283,14 +1265,14 @@ mod tests {
             &pn_announce_app_data(true, 8, 256),
             1,
             true,
-            t(11)
+            t_recent(11)
         ));
         let filed = table
             .snapshot()
             .into_iter()
             .find(|record| hex(&record.node) == fresh.address_hash.to_hex_string())
             .expect("an unknown node named by a path response is filed");
-        assert_eq!(filed.last_seen, t(11));
+        assert_eq!(filed.last_seen, t_recent(11));
     }
 
     #[test]
@@ -1304,8 +1286,14 @@ mod tests {
         )
         .desc;
 
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, t(1)));
-        assert!(!table.observe_announce(&coyote, b"not a pn", 1, false, t(1)));
+        assert!(table.observe_announce(
+            &pn,
+            &pn_announce_app_data(true, 8, 256),
+            2,
+            false,
+            t_recent(1)
+        ));
+        assert!(!table.observe_announce(&coyote, b"not a pn", 1, false, t_recent(1)));
         assert_eq!(table.snapshot().len(), 1);
         assert_eq!(table.select().unwrap().stamp_cost, 8);
 
@@ -1316,7 +1304,7 @@ mod tests {
             &pn_announce_app_data(true, 30, 256),
             3,
             false,
-            t(1)
+            t_recent(1)
         ));
         let filed = table
             .snapshot()
@@ -1328,7 +1316,7 @@ mod tests {
 
         // A propagation announce that does not parse is handled (dropped), not passed on.
         let broken = desc("propagation");
-        assert!(table.observe_announce(&broken, b"\x90", 1, false, t(2)));
+        assert!(table.observe_announce(&broken, b"\x90", 1, false, t_recent(2)));
         assert_eq!(table.snapshot().len(), 2);
         let ignored = format!(
             "Ignored propagation node announce from {} (1 hops)",
@@ -1350,10 +1338,10 @@ mod tests {
         let table = PropagationNodeTable::new();
         let pinned = node(true);
         table.pin(&[hex(&pinned)]);
-        table.observe(pinned.clone(), 9, t(1));
+        table.observe(pinned.clone(), 9, t_recent(1));
         let strangers: Vec<PropagationNode> = (0..33).map(|_| node(true)).collect();
         for (index, stranger) in strangers.iter().enumerate() {
-            table.observe(stranger.clone(), 1, t(2 + index as u64));
+            table.observe(stranger.clone(), 1, t_recent(2 + index as u64));
         }
 
         let held: Vec<String> = table
@@ -1395,7 +1383,7 @@ mod tests {
         let table = PropagationNodeTable::new();
         let (pinned, aged, stranger) = (node(true), node(true), node(true));
         table.pin(&[hex(&pinned), hex(&aged)]);
-        table.observe(stranger.clone(), 3, t(1));
+        table.observe(stranger.clone(), 3, t_recent(1));
         table.observe(aged, 1, SystemTime::now() - PROPAGATION_NODE_TTL * 2);
         assert_eq!(hex(&table.select().unwrap()), hex(&stranger));
         assert_eq!(hex(&table.select_for_posting().unwrap()), hex(&stranger));
@@ -1407,8 +1395,8 @@ mod tests {
         let table = PropagationNodeTable::new();
         let pinned = node(false);
         table.pin(&[hex(&pinned)]);
-        table.observe(pinned.clone(), 3, t(1));
-        table.observe(node(true), 1, t(2));
+        table.observe(pinned.clone(), 3, t_recent(1));
+        table.observe(node(true), 1, t_recent(2));
         assert!(table.select_for_posting().is_err());
         assert_eq!(hex(&table.select().unwrap()), hex(&pinned));
     }
@@ -1423,10 +1411,10 @@ mod tests {
         let (first, second) = (node(true), node(true));
         let pinned = [hex(&first), hex(&second)];
         table.pin(&pinned);
-        table.observe(first.clone(), 4, t(1));
-        table.observe(second.clone(), 5, t(2));
+        table.observe(first.clone(), 4, t_recent(1));
+        table.observe(second.clone(), 5, t_recent(2));
         for index in 0..40 {
-            table.observe(node(true), 1, t(3 + index));
+            table.observe(node(true), 1, t_recent(3 + index));
         }
         assert_eq!(table.fetch_rotation(), 2);
         let mut asked = Vec::new();

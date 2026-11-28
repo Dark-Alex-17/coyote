@@ -707,7 +707,7 @@ pub(crate) fn write_owner_only_file(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, t_epoch};
     use super::*;
 
     #[cfg(unix)]
@@ -1099,7 +1099,7 @@ mod tests {
         let path = dir.path.join("mesh").join("identity.key");
         let old = load_or_mint_identity(&path).unwrap();
 
-        let rotation = rotate_identity(&path, &fingerprint(&old), t(1_790_000_000)).unwrap();
+        let rotation = rotate_identity(&path, &fingerprint(&old), t_epoch(1_790_000_000)).unwrap();
 
         assert_owner_only(&path);
         assert!(!dir.path.join("mesh").join("identity.key.new").exists());
@@ -1206,10 +1206,6 @@ mod tests {
             .any(|window| window == needle)
     }
 
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
-    }
-
     #[cfg(unix)]
     #[test]
     fn rotate_identity_replaces_the_key_and_leaves_no_trace_of_the_old_one() {
@@ -1218,7 +1214,7 @@ mod tests {
         let old = load_or_mint_identity(&path).unwrap();
         let old_bytes = old.to_private_key_bytes();
 
-        let rotation = rotate_identity(&path, &fingerprint(&old), t(1_790_000_000)).unwrap();
+        let rotation = rotate_identity(&path, &fingerprint(&old), t_epoch(1_790_000_000)).unwrap();
 
         assert_eq!(rotation.old_fingerprint, fingerprint(&old));
         assert_ne!(rotation.new_fingerprint, rotation.old_fingerprint);
@@ -1247,8 +1243,8 @@ mod tests {
         let path = dir.path.join("identity.key");
         let first = fingerprint(&load_or_mint_identity(&path).unwrap());
 
-        let one = rotate_identity(&path, &first, t(1_790_000_000)).unwrap();
-        let two = rotate_identity(&path, &one.new_fingerprint, t(1_790_000_060)).unwrap();
+        let one = rotate_identity(&path, &first, t_epoch(1_790_000_000)).unwrap();
+        let two = rotate_identity(&path, &one.new_fingerprint, t_epoch(1_790_000_060)).unwrap();
 
         assert_eq!(one.predecessors, 1);
         assert_eq!(two.predecessors, 2);
@@ -1279,7 +1275,7 @@ mod tests {
         let dir = TempDir::new("identity-rotate-missing");
         let path = dir.path.join("identity.key");
 
-        let err = match rotate_identity(&path, "", t(0)) {
+        let err = match rotate_identity(&path, "", t_epoch(0)) {
             Ok(_) => panic!("rotating a missing identity must fail"),
             Err(err) => err.to_string(),
         };
@@ -1298,7 +1294,7 @@ mod tests {
         load_or_mint_identity(&path).unwrap();
         let before = fs::read(&path).unwrap();
 
-        let err = match rotate_identity(&path, &"00".repeat(16), t(0)) {
+        let err = match rotate_identity(&path, &"00".repeat(16), t_epoch(0)) {
             Ok(_) => panic!("a token for another identity must not rotate"),
             Err(err) => err.to_string(),
         };
@@ -1319,7 +1315,7 @@ mod tests {
         let before = fs::read(&path).unwrap();
         fs::write(predecessors_path(&path), "not json\n").unwrap();
 
-        let err = match rotate_identity(&path, &old, t(0)) {
+        let err = match rotate_identity(&path, &old, t_epoch(0)) {
             Ok(_) => panic!("an unreadable history must not rotate"),
             Err(err) => err.to_string(),
         };
@@ -1343,7 +1339,7 @@ mod tests {
         let unversioned = "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n";
         fs::write(predecessors_path(&path), unversioned).unwrap();
 
-        let err = match rotate_identity(&path, &old, t(0)) {
+        let err = match rotate_identity(&path, &old, t_epoch(0)) {
             Ok(_) => panic!("a refused history must not rotate"),
             Err(err) => err.to_string(),
         };
@@ -1534,7 +1530,7 @@ mod tests {
             return;
         }
 
-        let err = match rotate_identity(&path, &old, t(0)) {
+        let err = match rotate_identity(&path, &old, t_epoch(0)) {
             Ok(_) => panic!("an unappendable history must fail the rotation"),
             Err(err) => format!("{err:#}"),
         };
@@ -1558,7 +1554,7 @@ mod tests {
         let stale = dir.path.join("identity.key.new");
         fs::write(&stale, b"left by an interrupted rotation").unwrap();
 
-        let rotation = rotate_identity(&path, &old, t(0)).unwrap();
+        let rotation = rotate_identity(&path, &old, t_epoch(0)).unwrap();
 
         assert!(!stale.exists());
         assert_eq!(
@@ -1628,7 +1624,7 @@ mod tests {
         assert_eq!(named, old);
         assert!(stale.exists(), "a dry run changes nothing");
 
-        let rotation = rotate_identity(&path, &old, t(0)).unwrap();
+        let rotation = rotate_identity(&path, &old, t_epoch(0)).unwrap();
 
         assert!(!stale.exists(), "rotation sweeps the staged key first");
         assert_eq!(
@@ -1646,7 +1642,7 @@ mod tests {
         let before = fs::read(&path).unwrap();
         let _node = IdentityLock::share(&path).unwrap();
 
-        let err = match rotate_identity(&path, &old, t(0)) {
+        let err = match rotate_identity(&path, &old, t_epoch(0)) {
             Ok(_) => panic!("rotating under a running node must fail"),
             Err(err) => err.to_string(),
         };
@@ -1708,7 +1704,7 @@ mod tests {
         let link = dir.path.join("identity.key");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = match rotate_identity(&link, &old, t(0)) {
+        let err = match rotate_identity(&link, &old, t_epoch(0)) {
             Ok(_) => panic!("a symlinked key must not rotate"),
             Err(err) => err.to_string(),
         };
@@ -1729,7 +1725,7 @@ mod tests {
         fs::copy(&target, &link).unwrap();
         let history = predecessors_path(&link);
         std::os::unix::fs::symlink(dir.path.join("elsewhere").join("history"), &history).unwrap();
-        let err = match rotate_identity(&link, &old, t(0)) {
+        let err = match rotate_identity(&link, &old, t_epoch(0)) {
             Ok(_) => panic!("a symlinked predecessors file must not rotate"),
             Err(err) => err.to_string(),
         };

@@ -4177,7 +4177,10 @@ fn presence_collision_text(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TempDir, siblings_of};
+    use super::super::test_support::{
+        Announced, MeshOff, MeshOn, TempDir, announced, announced_as, fake_hash, siblings_of,
+        t_epoch,
+    };
     use super::*;
     use crate::hooks::HookEvent;
     use crate::mesh::events::{
@@ -4189,57 +4192,9 @@ mod tests {
     use crate::testing::{install_log_collector, warn_snapshot};
     use crate::utils::fs::EXCLUSIVE_LOCK_RETRY;
 
-    use rns_transport::destination::SingleInputDestination;
     use rns_transport::identity::PrivateIdentity;
     use rns_transport::rand_core::OsRng;
     use std::sync::atomic::AtomicUsize;
-
-    struct MeshOff;
-
-    impl LiveMesh for MeshOff {
-        fn peers(&self) -> Option<Arc<PeerTable>> {
-            None
-        }
-    }
-
-    /// A running mesh: the peer table, and the knocks its cache would hold.
-    struct MeshOn(Arc<PeerTable>, Mutex<Vec<(String, KnockProof)>>);
-
-    impl LiveMesh for MeshOn {
-        fn peers(&self) -> Option<Arc<PeerTable>> {
-            Some(self.0.clone())
-        }
-
-        fn knock(&self, destination_hash: &str, _now: SystemTime) -> Option<KnockProof> {
-            self.1
-                .lock()
-                .iter()
-                .find(|(destination, _)| destination == destination_hash)
-                .map(|(_, proof)| proof.clone())
-        }
-    }
-
-    /// A real announce's worth of hashes: the destination is derived from the name and
-    /// identity exactly as the transport does it.
-    struct Announced {
-        destination_hash: String,
-        identity_hash: String,
-        name_hash: String,
-    }
-
-    fn announced(aspect: &str) -> Announced {
-        announced_as(PrivateIdentity::new_from_rand(OsRng), aspect)
-    }
-
-    fn announced_as(identity: PrivateIdentity, aspect: &str) -> Announced {
-        let name = session_destination_name(aspect);
-        let destination = SingleInputDestination::new(identity, name);
-        Announced {
-            destination_hash: destination.desc.address_hash.to_hex_string(),
-            identity_hash: destination.desc.identity.address_hash.to_hex_string(),
-            name_hash: hex_lower(name.as_name_hash_slice()),
-        }
-    }
 
     fn sighting(peer: &Announced) -> PeerSighting {
         PeerSighting {
@@ -4253,10 +4208,6 @@ mod tests {
         }
     }
 
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
     struct Fixture {
         store: TrustStore,
         mesh: MeshOn,
@@ -4267,7 +4218,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             let tmp = TempDir::new(tag);
             let store = TrustStore::open(&tmp.path).unwrap();
-            let peers = PeerTable::load(tmp.path.join("peers.json"), t(1_000)).unwrap();
+            let peers = PeerTable::load(tmp.path.join("peers.json"), t_epoch(1_000)).unwrap();
             Self {
                 store,
                 mesh: MeshOn(Arc::new(peers), Mutex::new(Vec::new())),
@@ -4332,10 +4283,6 @@ mod tests {
                 .unwrap()
                 .change
         }
-    }
-
-    fn fake_hash(fill: u8) -> String {
-        hex_lower(&[fill; 16])
     }
 
     fn sorted(mut hashes: Vec<String>) -> Vec<String> {
@@ -4404,8 +4351,8 @@ mod tests {
     /// A trusted instance and the same instance announced under a fresh identity.
     fn trusted_then_rotated(fx: &Fixture) -> (Announced, Announced) {
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_destination(&old, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_destination(&old, t_epoch(3_000));
         let new = announced("alpha");
         assert_eq!(new.name_hash, old.name_hash);
         (old, new)
@@ -4507,7 +4454,7 @@ mod tests {
     fn trust_destination_records_the_identity_the_formula_proves() {
         let fx = Fixture::new("trust-formula-ok");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000) + Duration::from_millis(250));
+        fx.announce(&peer, t_epoch(2_000) + Duration::from_millis(250));
 
         let outcome = fx
             .store
@@ -4518,7 +4465,7 @@ mod tests {
                     label: Some("Bob".to_string()),
                     note: None,
                 },
-                t(3_000) + Duration::from_millis(250),
+                t_epoch(3_000) + Duration::from_millis(250),
             )
             .unwrap();
 
@@ -4537,8 +4484,12 @@ mod tests {
             Some(peer.identity_hash.as_str())
         );
         assert_eq!(records[1].label.as_deref(), Some("Bob"));
-        assert_eq!(records[1].added_at, t(3_000), "stamps floor to the second");
-        assert_eq!(records[1].last_seen_at, t(2_000));
+        assert_eq!(
+            records[1].added_at,
+            t_epoch(3_000),
+            "stamps floor to the second"
+        );
+        assert_eq!(records[1].last_seen_at, t_epoch(2_000));
         assert_eq!(
             fx.store
                 .authorize(&peer.identity_hash, &peer.destination_hash),
@@ -4563,7 +4514,7 @@ mod tests {
                 identity_hash: impostor.identity_hash.clone(),
                 ..sighting(&peer)
             },
-            t(2_000),
+            t_epoch(2_000),
         );
 
         let err = fx
@@ -4572,7 +4523,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -4594,7 +4545,7 @@ mod tests {
                 name_hash: hex_lower(&[7; 10]),
                 ..sighting(&peer)
             },
-            t(2_000),
+            t_epoch(2_000),
         );
 
         let err = fx
@@ -4603,7 +4554,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -4687,7 +4638,7 @@ mod tests {
                 &fx.mesh,
                 &fake_hash(0x9f),
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -4703,7 +4654,7 @@ mod tests {
     fn trust_destination_accepts_a_knock_only_instance_the_formula_proves() {
         let fx = Fixture::new("trust-knock-only");
         let peer = announced("alpha");
-        fx.knocked(&peer, &peer.name_hash, t(2_000));
+        fx.knocked(&peer, &peer.name_hash, t_epoch(2_000));
 
         let outcome = fx
             .store
@@ -4711,7 +4662,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -4728,7 +4679,11 @@ mod tests {
             .into_iter()
             .find(|record| record.hash == peer.destination_hash)
             .unwrap();
-        assert_eq!(record.last_seen_at, t(2_000), "the knock is the sighting");
+        assert_eq!(
+            record.last_seen_at,
+            t_epoch(2_000),
+            "the knock is the sighting"
+        );
     }
 
     #[test]
@@ -4736,7 +4691,7 @@ mod tests {
         let fx = Fixture::new("trust-knock-forged");
         let peer = announced("alpha");
         let other = announced("beta");
-        fx.knocked(&peer, &other.name_hash, t(2_000));
+        fx.knocked(&peer, &other.name_hash, t_epoch(2_000));
 
         let err = fx
             .store
@@ -4744,7 +4699,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -4759,7 +4714,7 @@ mod tests {
     fn trust_destination_waits_for_a_knock_cached_without_its_name_hash() {
         let fx = Fixture::new("trust-knock-no-name-hash");
         let peer = announced("alpha");
-        fx.knocked(&peer, "", t(2_000));
+        fx.knocked(&peer, "", t_epoch(2_000));
 
         let err = fx
             .store
@@ -4767,7 +4722,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -4785,8 +4740,8 @@ mod tests {
         let fx = Fixture::new("trust-announce-over-knock");
         let peer = announced("alpha");
         let other = announced("beta");
-        fx.announce(&peer, t(2_000));
-        fx.knocked(&peer, &other.name_hash, t(2_500));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.knocked(&peer, &other.name_hash, t_epoch(2_500));
 
         let outcome = fx
             .store
@@ -4794,7 +4749,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -4807,7 +4762,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             record.last_seen_at,
-            t(2_000),
+            t_epoch(2_000),
             "the announce is the sighting"
         );
     }
@@ -4821,7 +4776,7 @@ mod tests {
                 name_hash: String::new(),
                 ..sighting(&peer)
             },
-            t(2_000),
+            t_epoch(2_000),
         );
 
         let err = fx
@@ -4830,7 +4785,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -4843,7 +4798,7 @@ mod tests {
     fn trust_destination_twice_updates_in_place_and_keeps_the_identity_record() {
         let fx = Fixture::new("trust-twice");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
             .trust_identity(
                 &fx.mesh,
@@ -4852,7 +4807,7 @@ mod tests {
                     label: Some("Bob".to_string()),
                     note: None,
                 },
-                t(2_500),
+                t_epoch(2_500),
             )
             .unwrap();
         fx.store
@@ -4860,10 +4815,10 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
-        fx.announce(&peer, t(4_000));
+        fx.announce(&peer, t_epoch(4_000));
 
         let outcome = fx
             .store
@@ -4874,7 +4829,7 @@ mod tests {
                     label: None,
                     note: Some("laptop".to_string()),
                 },
-                t(5_000),
+                t_epoch(5_000),
             )
             .unwrap();
 
@@ -4886,8 +4841,8 @@ mod tests {
             "trust_destination must not clear --identity"
         );
         assert_eq!(records[0].label.as_deref(), Some("Bob"));
-        assert_eq!(records[1].added_at, t(3_000));
-        assert_eq!(records[1].last_seen_at, t(4_000));
+        assert_eq!(records[1].added_at, t_epoch(3_000));
+        assert_eq!(records[1].last_seen_at, t_epoch(4_000));
         assert_eq!(records[1].note.as_deref(), Some("laptop"));
     }
 
@@ -4902,7 +4857,7 @@ mod tests {
                 &fx.mesh,
                 &identity.to_ascii_uppercase(),
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -4928,7 +4883,7 @@ mod tests {
 
         let err = fx
             .store
-            .trust_identity(&fx.mesh, "bob", TrustOptions::default(), t(3_000))
+            .trust_identity(&fx.mesh, "bob", TrustOptions::default(), t_epoch(3_000))
             .unwrap_err()
             .to_string();
 
@@ -4946,7 +4901,7 @@ mod tests {
                 identity_hash: peer.identity_hash.clone(),
                 ..sighting(&impostor)
             },
-            t(9_000),
+            t_epoch(9_000),
         );
 
         fx.store
@@ -4954,42 +4909,42 @@ mod tests {
                 &fx.mesh,
                 &peer.identity_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
         assert_eq!(
             fx.store.records()[0].last_seen_at,
-            t(3_000),
+            t_epoch(3_000),
             "a row that merely claims the identity must not move last_seen_at"
         );
 
-        fx.announce(&peer, t(4_000));
+        fx.announce(&peer, t_epoch(4_000));
         fx.store
             .trust_identity(
                 &fx.mesh,
                 &peer.identity_hash,
                 TrustOptions::default(),
-                t(5_000),
+                t_epoch(5_000),
             )
             .unwrap();
 
-        assert_eq!(fx.store.records()[0].last_seen_at, t(4_000));
+        assert_eq!(fx.store.records()[0].last_seen_at, t_epoch(4_000));
 
-        assert!(!fx.mesh.0.sweep(t(9_000) + PEER_TTL).is_empty());
+        assert!(!fx.mesh.0.sweep(t_epoch(9_000) + PEER_TTL).is_empty());
         assert!(fx.mesh.0.snapshot().is_empty());
         fx.store
             .trust_identity(
                 &fx.mesh,
                 &peer.identity_hash,
                 TrustOptions::default(),
-                t(20_000),
+                t_epoch(20_000),
             )
             .unwrap();
 
         assert_eq!(
             fx.store.records()[0].last_seen_at,
-            t(4_000),
+            t_epoch(4_000),
             "with no row to prove a sighting, a re-run must not fabricate one"
         );
     }
@@ -4998,7 +4953,7 @@ mod tests {
     fn labels_and_notes_refuse_control_characters() {
         let fx = Fixture::new("trust-text-hygiene");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         let identity = fake_hash(0xaa);
         let bidi = "Bob\u{202e}".to_string();
         let newline = "two\nlines".to_string();
@@ -5014,7 +4969,7 @@ mod tests {
                             label: Some(bidi.clone()),
                             note: None,
                         },
-                        t(3_000),
+                        t_epoch(3_000),
                     )
                     .map(drop),
             ),
@@ -5028,7 +4983,7 @@ mod tests {
                             label: None,
                             note: Some(newline.clone()),
                         },
-                        t(3_000),
+                        t_epoch(3_000),
                     )
                     .map(drop),
             ),
@@ -5042,7 +4997,7 @@ mod tests {
                             label: Some(newline.clone()),
                             note: None,
                         },
-                        t(3_000),
+                        t_epoch(3_000),
                     )
                     .map(drop),
             ),
@@ -5056,7 +5011,7 @@ mod tests {
                             label: None,
                             note: Some(bidi.clone()),
                         },
-                        t(3_000),
+                        t_epoch(3_000),
                     )
                     .map(drop),
             ),
@@ -5067,7 +5022,7 @@ mod tests {
                         &fx.mesh,
                         &peer.destination_hash,
                         Some(bidi),
-                        t(3_000),
+                        t_epoch(3_000),
                         false,
                     )
                     .map(drop),
@@ -5075,7 +5030,7 @@ mod tests {
             (
                 "note",
                 fx.store
-                    .block_identity(&fx.mesh, &identity, Some(newline), t(3_000))
+                    .block_identity(&fx.mesh, &identity, Some(newline), t_epoch(3_000))
                     .map(drop),
             ),
         ];
@@ -5097,7 +5052,7 @@ mod tests {
                     label: Some("x".repeat(257)),
                     note: None,
                 },
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap_err()
             .to_string();
@@ -5123,7 +5078,7 @@ mod tests {
                     label: Some(heart.to_string()),
                     note: Some("styled \u{9053}\u{E0100}".to_string()),
                 },
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -5146,7 +5101,7 @@ mod tests {
                     label: Some("so\u{00AD}ft".to_string()),
                     note: None,
                 },
-                t(3_100),
+                t_epoch(3_100),
             )
             .unwrap_err()
             .to_string();
@@ -5176,19 +5131,19 @@ mod tests {
             assert_eq!(canonical_hash(input), None, "{input:?}");
             let err = fx
                 .store
-                .trust_identity(&fx.mesh, input, TrustOptions::default(), t(3_000))
+                .trust_identity(&fx.mesh, input, TrustOptions::default(), t_epoch(3_000))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("32 hex"), "{input:?}: {err}");
             let err = fx
                 .store
-                .deny_destination(&fx.mesh, input, None, t(3_000), false)
+                .deny_destination(&fx.mesh, input, None, t_epoch(3_000), false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("32 hex"), "{input:?}: {err}");
             assert!(
                 fx.store
-                    .trust_destination(&fx.mesh, input, TrustOptions::default(), t(3_000))
+                    .trust_destination(&fx.mesh, input, TrustOptions::default(), t_epoch(3_000))
                     .is_err()
             );
         }
@@ -5203,7 +5158,7 @@ mod tests {
     fn identity_standing_distinguishes_unknown_blocked_and_the_two_trusted_forms() {
         let fx = Fixture::new("trust-standing");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         let other_dest = fake_hash(0xcd);
 
         assert_eq!(
@@ -5217,7 +5172,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -5241,7 +5196,7 @@ mod tests {
                 &fx.mesh,
                 &peer.identity_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -5257,7 +5212,7 @@ mod tests {
         );
 
         fx.store
-            .block_identity(&fx.mesh, &peer.identity_hash, None, t(4_000))
+            .block_identity(&fx.mesh, &peer.identity_hash, None, t_epoch(4_000))
             .unwrap();
 
         assert_eq!(
@@ -5276,9 +5231,9 @@ mod tests {
         );
 
         let session = announced("beta");
-        fx.announce(&session, t(4_000));
+        fx.announce(&session, t_epoch(4_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &session.destination_hash, t(4_000))
+            .trust_destination_for_session(&fx.mesh, &session.destination_hash, t_epoch(4_000))
             .unwrap();
         assert_eq!(
             fx.store.identity_standing(&session.identity_hash),
@@ -5298,14 +5253,14 @@ mod tests {
         let blocked = announced("gamma");
         let stranger = announced("delta");
         for peer in [&trusted, &covered, &blocked, &stranger] {
-            fx.announce(peer, t(2_000));
+            fx.announce(peer, t_epoch(2_000));
         }
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &trusted.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         fx.store
@@ -5313,14 +5268,20 @@ mod tests {
                 &fx.mesh,
                 &covered.identity_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         fx.store
-            .block_identity(&fx.mesh, &blocked.identity_hash, None, t(3_000))
+            .block_identity(&fx.mesh, &blocked.identity_hash, None, t_epoch(3_000))
             .unwrap();
         fx.store
-            .deny_destination(&fx.mesh, &stranger.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &stranger.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
 
         let peers = [&trusted, &covered, &blocked, &stranger];
@@ -5374,7 +5335,7 @@ mod tests {
     fn file_is_versioned_yaml_with_stable_key_order() {
         let fx = Fixture::new("trust-yaml");
         let peer = announced("alpha");
-        fx.announce(&peer, t(1_790_000_000));
+        fx.announce(&peer, t_epoch(1_790_000_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
@@ -5383,7 +5344,7 @@ mod tests {
                     label: Some("Bob".to_string()),
                     note: None,
                 },
-                t(1_790_000_000),
+                t_epoch(1_790_000_000),
             )
             .unwrap();
         fx.store
@@ -5391,12 +5352,12 @@ mod tests {
                 &fx.mesh,
                 &fake_hash(0xdd),
                 Some("noisy".to_string()),
-                t(1_790_000_000),
+                t_epoch(1_790_000_000),
                 false,
             )
             .unwrap();
         fx.store
-            .block_identity(&fx.mesh, &fake_hash(0xbb), None, t(1_790_000_000))
+            .block_identity(&fx.mesh, &fake_hash(0xbb), None, t_epoch(1_790_000_000))
             .unwrap();
 
         let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
@@ -5412,7 +5373,7 @@ mod tests {
             dest = peer.destination_hash,
             denied = fake_hash(0xdd),
             blocked = fake_hash(0xbb),
-            ts = rfc3339_utc(t(1_790_000_000)),
+            ts = rfc3339_utc(t_epoch(1_790_000_000)),
         );
         assert_eq!(text, expected);
         assert_eq!(
@@ -5462,8 +5423,8 @@ mod tests {
     fn a_written_trust_file_reloads_with_its_header() {
         let fx = Fixture::new("trust-header-reopen");
         let peer = announced("alpha");
-        fx.announce(&peer, t(3_000));
-        fx.trust_destination(&peer, t(3_000));
+        fx.announce(&peer, t_epoch(3_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
         let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
         assert!(text.starts_with(TRUST_FILE_HEADER), "{text}");
 
@@ -5514,7 +5475,7 @@ mod tests {
             let identity = fake_hash(0x5e);
             assert!(
                 fx.store
-                    .seed_self_trust(&identity, false, t(2_000))
+                    .seed_self_trust(&identity, false, t_epoch(2_000))
                     .unwrap()
             );
 
@@ -5525,7 +5486,7 @@ mod tests {
             let reopened = fx.reopen();
             assert!(
                 !reopened
-                    .seed_self_trust(&identity, false, t(3_000))
+                    .seed_self_trust(&identity, false, t_epoch(3_000))
                     .unwrap()
             );
             assert_eq!(fx.file_bytes().unwrap(), text.into_bytes());
@@ -5534,7 +5495,7 @@ mod tests {
         #[test]
         fn an_unseeded_list_is_written_without_the_marker() {
             let fx = Fixture::new("trust-self-seed-absent");
-            fx.trust_identity(&fake_hash(0x11), t(2_000));
+            fx.trust_identity(&fake_hash(0x11), t_epoch(2_000));
 
             let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
             assert!(!text.contains("\nself_trust_seeded:"), "{text}");
@@ -5546,7 +5507,11 @@ mod tests {
             let sink = fx.observed();
             let identity = fake_hash(0x5e);
 
-            assert!(fx.store.seed_self_trust(&identity, true, t(2_000)).unwrap());
+            assert!(
+                fx.store
+                    .seed_self_trust(&identity, true, t_epoch(2_000))
+                    .unwrap()
+            );
 
             assert_eq!(
                 fx.store.identity_standing(&identity),
@@ -5568,12 +5533,12 @@ mod tests {
 
             assert!(
                 fx.store
-                    .seed_self_trust(&identity, false, t(2_000))
+                    .seed_self_trust(&identity, false, t_epoch(2_000))
                     .unwrap()
             );
             assert!(
                 !fx.store
-                    .seed_self_trust(&identity, false, t(3_000))
+                    .seed_self_trust(&identity, false, t_epoch(3_000))
                     .unwrap()
             );
             fx.store
@@ -5583,7 +5548,7 @@ mod tests {
             let reopened = fx.reopen();
             assert!(
                 !reopened
-                    .seed_self_trust(&identity, false, t(4_000))
+                    .seed_self_trust(&identity, false, t_epoch(4_000))
                     .unwrap()
             );
             assert_eq!(
@@ -5600,7 +5565,9 @@ mod tests {
             let fx = Fixture::new("trust-self-seed-new-key");
             let old = fake_hash(0x5e);
             let new = fake_hash(0x6f);
-            fx.store.seed_self_trust(&old, false, t(2_000)).unwrap();
+            fx.store
+                .seed_self_trust(&old, false, t_epoch(2_000))
+                .unwrap();
             fx.store.untrust_identity(&fx.mesh, &old, false).unwrap();
             let expected = SelfTrustRotation {
                 retired: false,
@@ -5612,7 +5579,9 @@ mod tests {
             let before = fx.file_bytes().unwrap();
 
             assert_eq!(
-                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                fx.store
+                    .rotate_self_trust(&old, &new, t_epoch(3_000))
+                    .unwrap(),
                 expected
             );
 
@@ -5625,12 +5594,12 @@ mod tests {
             let fx = Fixture::new("trust-self-seed-blocked");
             let identity = fake_hash(0x5e);
             fx.store
-                .block_identity(&fx.mesh, &identity, None, t(1_500))
+                .block_identity(&fx.mesh, &identity, None, t_epoch(1_500))
                 .unwrap();
 
             assert!(
                 !fx.store
-                    .seed_self_trust(&identity, false, t(2_000))
+                    .seed_self_trust(&identity, false, t_epoch(2_000))
                     .unwrap()
             );
 
@@ -5641,7 +5610,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !fx.store
-                    .seed_self_trust(&identity, false, t(3_000))
+                    .seed_self_trust(&identity, false, t_epoch(3_000))
                     .unwrap()
             );
             assert_eq!(
@@ -5655,10 +5624,14 @@ mod tests {
             let fx = Fixture::new("trust-self-seed-minted-blocked");
             let identity = fake_hash(0x5e);
             fx.store
-                .block_identity(&fx.mesh, &identity, None, t(1_500))
+                .block_identity(&fx.mesh, &identity, None, t_epoch(1_500))
                 .unwrap();
 
-            assert!(!fx.store.seed_self_trust(&identity, true, t(2_000)).unwrap());
+            assert!(
+                !fx.store
+                    .seed_self_trust(&identity, true, t_epoch(2_000))
+                    .unwrap()
+            );
 
             assert!(own_record(&fx.store, &identity).is_none());
         }
@@ -5675,14 +5648,14 @@ mod tests {
                         label: Some("laptop".to_string()),
                         note: None,
                     },
-                    t(1_500),
+                    t_epoch(1_500),
                 )
                 .unwrap();
             let sink = fx.observed();
 
             assert!(
                 !fx.store
-                    .seed_self_trust(&identity, false, t(2_000))
+                    .seed_self_trust(&identity, false, t_epoch(2_000))
                     .unwrap()
             );
 
@@ -5698,12 +5671,12 @@ mod tests {
         fn a_binding_only_record_gains_the_grant_and_keeps_its_label() {
             let fx = Fixture::new("trust-self-seed-binding-only");
             let peer = announced("alpha");
-            fx.announce(&peer, t(1_000));
-            fx.trust_destination(&peer, t(1_500));
+            fx.announce(&peer, t_epoch(1_000));
+            fx.trust_destination(&peer, t_epoch(1_500));
 
             assert!(
                 fx.store
-                    .seed_self_trust(&peer.identity_hash, false, t(2_000))
+                    .seed_self_trust(&peer.identity_hash, false, t_epoch(2_000))
                     .unwrap()
             );
 
@@ -5734,12 +5707,16 @@ mod tests {
         fn the_old_identity_is_unknown_and_the_new_one_is_this_node_with_both_hooks_fired() {
             let fx = Fixture::new("trust-rotate-self-moves");
             let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
-            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            fx.store
+                .seed_self_trust(&old, true, t_epoch(2_000))
+                .unwrap();
             let sink = fx.observed();
             assert_eq!(fx.store.self_trust_rotation(&old), MOVED);
 
             assert_eq!(
-                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                fx.store
+                    .rotate_self_trust(&old, &new, t_epoch(3_000))
+                    .unwrap(),
                 MOVED
             );
 
@@ -5775,9 +5752,13 @@ mod tests {
         fn the_first_contact_gate_still_refuses_an_unheard_destination_after_a_rotation() {
             let fx = Fixture::new("trust-rotate-self-gate");
             let (old, new, unheard) = (fake_hash(0x5e), fake_hash(0x6f), fake_hash(0x70));
-            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            fx.store
+                .seed_self_trust(&old, true, t_epoch(2_000))
+                .unwrap();
 
-            fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap();
+            fx.store
+                .rotate_self_trust(&old, &new, t_epoch(3_000))
+                .unwrap();
 
             assert!(!fx.store.may_be_asked_for(&unheard));
         }
@@ -5791,22 +5772,22 @@ mod tests {
                 .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
             fx.store.set_collision_protection(true);
             let old = announced("alpha");
-            fx.announce(&old, t(2_000));
+            fx.announce(&old, t_epoch(2_000));
             fx.store
-                .seed_self_trust(&old.identity_hash, true, t(2_000))
+                .seed_self_trust(&old.identity_hash, true, t_epoch(2_000))
                 .unwrap();
             let new = announced("alpha");
             assert_eq!(new.name_hash, old.name_hash);
-            fx.announce(&new, t(4_000));
+            fx.announce(&new, t_epoch(4_000));
 
             fx.store
-                .rotate_self_trust(&old.identity_hash, &new.identity_hash, t(4_000))
+                .rotate_self_trust(&old.identity_hash, &new.identity_hash, t_epoch(4_000))
                 .unwrap();
 
             let origin = fx.store.authorize_origin_at(
                 &parse_hash(&new.identity_hash).unwrap(),
                 &decode_name_hash(&new.name_hash).unwrap(),
-                t(4_500),
+                t_epoch(4_500),
             );
             assert_eq!(
                 origin.verdict,
@@ -5818,15 +5799,15 @@ mod tests {
         fn an_old_identity_with_bound_destinations_keeps_only_its_binding() {
             let fx = Fixture::new("trust-rotate-self-bound");
             let old = announced("alpha");
-            fx.announce(&old, t(1_000));
-            fx.trust_destination(&old, t(1_500));
+            fx.announce(&old, t_epoch(1_000));
+            fx.trust_destination(&old, t_epoch(1_500));
             fx.store
-                .seed_self_trust(&old.identity_hash, false, t(2_000))
+                .seed_self_trust(&old.identity_hash, false, t_epoch(2_000))
                 .unwrap();
 
             assert_eq!(
                 fx.store
-                    .rotate_self_trust(&old.identity_hash, &fake_hash(0x6f), t(3_000))
+                    .rotate_self_trust(&old.identity_hash, &fake_hash(0x6f), t_epoch(3_000))
                     .unwrap(),
                 MOVED
             );
@@ -5845,9 +5826,11 @@ mod tests {
             let fx = Fixture::new("trust-rotate-self-blocked-old");
             let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
             fx.store
-                .block_identity(&fx.mesh, &old, None, t(1_500))
+                .block_identity(&fx.mesh, &old, None, t_epoch(1_500))
                 .unwrap();
-            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
+            fx.store
+                .seed_self_trust(&old, true, t_epoch(2_000))
+                .unwrap();
             let expected = SelfTrustRotation {
                 retired: false,
                 granted: false,
@@ -5857,7 +5840,9 @@ mod tests {
             assert_eq!(fx.store.self_trust_rotation(&old), expected);
 
             assert_eq!(
-                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                fx.store
+                    .rotate_self_trust(&old, &new, t_epoch(3_000))
+                    .unwrap(),
                 expected
             );
 
@@ -5868,13 +5853,17 @@ mod tests {
         fn a_blocked_new_identity_is_retired_from_but_not_granted() {
             let fx = Fixture::new("trust-rotate-self-blocked-new");
             let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
-            fx.store.seed_self_trust(&old, true, t(2_000)).unwrap();
             fx.store
-                .block_identity(&fx.mesh, &new, None, t(2_500))
+                .seed_self_trust(&old, true, t_epoch(2_000))
+                .unwrap();
+            fx.store
+                .block_identity(&fx.mesh, &new, None, t_epoch(2_500))
                 .unwrap();
 
             assert_eq!(
-                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                fx.store
+                    .rotate_self_trust(&old, &new, t_epoch(3_000))
+                    .unwrap(),
                 SelfTrustRotation {
                     retired: true,
                     granted: false,
@@ -5893,7 +5882,9 @@ mod tests {
             let (old, new) = (fake_hash(0x5e), fake_hash(0x6f));
 
             assert_eq!(
-                fx.store.rotate_self_trust(&old, &new, t(3_000)).unwrap(),
+                fx.store
+                    .rotate_self_trust(&old, &new, t_epoch(3_000))
+                    .unwrap(),
                 SelfTrustRotation {
                     retired: false,
                     granted: true,
@@ -6107,22 +6098,22 @@ mod tests {
     fn session_trust_never_reaches_the_file() {
         let fx = Fixture::new("trust-session");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         let other = announced("beta");
-        fx.announce(&other, t(2_000));
+        fx.announce(&other, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &other.destination_hash,
                 TrustOptions::default(),
-                t(2_500),
+                t_epoch(2_500),
             )
             .unwrap();
         let before = fx.file_bytes().unwrap();
 
         let outcome = fx
             .store
-            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(3_000))
+            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t_epoch(3_000))
             .unwrap();
 
         assert_eq!(outcome.identity_hash, peer.identity_hash);
@@ -6164,12 +6155,12 @@ mod tests {
                 identity_hash: fake_hash(0xee),
                 ..sighting(&peer)
             },
-            t(2_000),
+            t_epoch(2_000),
         );
 
         assert!(
             fx.store
-                .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(3_000))
+                .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t_epoch(3_000))
                 .is_err()
         );
         assert!(fx.store.records().is_empty());
@@ -6180,8 +6171,8 @@ mod tests {
         let fx = Fixture::new("trust-session-disk-overlap");
         let disk_first = announced("alpha");
         let session_first = announced("beta");
-        fx.announce(&disk_first, t(2_000));
-        fx.announce(&session_first, t(2_000));
+        fx.announce(&disk_first, t_epoch(2_000));
+        fx.announce(&session_first, t_epoch(2_000));
         let unique_hashes = |records: &[TrustRecord]| {
             let mut hashes: Vec<&str> = records.iter().map(|r| r.hash.as_str()).collect();
             hashes.sort_unstable();
@@ -6194,22 +6185,30 @@ mod tests {
                 &fx.mesh,
                 &disk_first.destination_hash,
                 TrustOptions::default(),
-                t(2_500),
+                t_epoch(2_500),
             )
             .unwrap();
         let outcome = fx
             .store
-            .trust_destination_for_session(&fx.mesh, &disk_first.destination_hash, t(3_000))
+            .trust_destination_for_session(&fx.mesh, &disk_first.destination_hash, t_epoch(3_000))
             .unwrap();
         assert_eq!(outcome.change, TrustChange::Updated);
 
         fx.store
-            .trust_destination_for_session(&fx.mesh, &session_first.destination_hash, t(3_000))
+            .trust_destination_for_session(
+                &fx.mesh,
+                &session_first.destination_hash,
+                t_epoch(3_000),
+            )
             .unwrap();
-        fx.announce(&session_first, t(4_000));
+        fx.announce(&session_first, t_epoch(4_000));
         let outcome = fx
             .store
-            .trust_destination_for_session(&fx.mesh, &session_first.destination_hash, t(4_500))
+            .trust_destination_for_session(
+                &fx.mesh,
+                &session_first.destination_hash,
+                t_epoch(4_500),
+            )
             .unwrap();
         assert_eq!(outcome.change, TrustChange::Updated);
 
@@ -6232,17 +6231,17 @@ mod tests {
         assert!(session.session);
         assert_eq!(
             session.added_at,
-            t(3_000),
+            t_epoch(3_000),
             "a second session trust keeps added_at"
         );
-        assert_eq!(session.last_seen_at, t(4_000));
+        assert_eq!(session.last_seen_at, t_epoch(4_000));
 
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &session_first.destination_hash,
                 TrustOptions::default(),
-                t(5_000),
+                t_epoch(5_000),
             )
             .unwrap();
 
@@ -6255,16 +6254,20 @@ mod tests {
         );
 
         let identity_later = announced("gamma");
-        fx.announce(&identity_later, t(6_000));
+        fx.announce(&identity_later, t_epoch(6_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &identity_later.destination_hash, t(6_500))
+            .trust_destination_for_session(
+                &fx.mesh,
+                &identity_later.destination_hash,
+                t_epoch(6_500),
+            )
             .unwrap();
         fx.store
             .trust_identity(
                 &fx.mesh,
                 &identity_later.identity_hash,
                 TrustOptions::default(),
-                t(7_000),
+                t_epoch(7_000),
             )
             .unwrap();
 
@@ -6296,13 +6299,13 @@ mod tests {
     fn authorize_is_default_closed_and_binds_destinations_to_their_identity() {
         let fx = Fixture::new("trust-authorize");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -6390,11 +6393,11 @@ mod tests {
     fn deny_overlay_refuses_one_destination_of_a_trusted_identity_and_keeps_it_listed() {
         let fx = Fixture::new("trust-deny");
         let bystander = announced("alpha");
-        fx.announce(&bystander, t(2_000));
+        fx.announce(&bystander, t_epoch(2_000));
         let identity = fake_hash(0xaa);
         let (a, b, c) = (fake_hash(0x0a), fake_hash(0x0b), fake_hash(0x0c));
         fx.store
-            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t(3_000))
+            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t_epoch(3_000))
             .unwrap();
         for dest in [&a, &b, &c] {
             assert_eq!(
@@ -6406,7 +6409,13 @@ mod tests {
         assert_eq!(peers_before.len(), 1);
 
         fx.store
-            .deny_destination(&fx.mesh, &b, Some("noisy".to_string()), t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &b,
+                Some("noisy".to_string()),
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(fx.mesh.0.snapshot(), peers_before);
@@ -6437,7 +6446,7 @@ mod tests {
         assert!(listed.denied);
         assert_eq!(listed.identity, None);
         assert_eq!(listed.note.as_deref(), Some("noisy"));
-        assert_eq!(listed.added_at, t(4_000));
+        assert_eq!(listed.added_at, t_epoch(4_000));
         assert!(!listed.session);
         assert_eq!(fx.reopen().records(), fx.store.records());
 
@@ -6460,11 +6469,11 @@ mod tests {
         fn a_denied_destination_is_never_asked_for_even_under_an_identity_trusted_for_all() {
             let fx = Fixture::new("trust-ask-denied");
             let destination = fake_hash(0x51);
-            fx.trust_identity(&fake_hash(0x52), t(2_000));
+            fx.trust_identity(&fake_hash(0x52), t_epoch(2_000));
             assert!(fx.store.may_be_asked_for(&destination));
 
             fx.store
-                .deny_destination(&fx.mesh, &destination, None, t(3_000), false)
+                .deny_destination(&fx.mesh, &destination, None, t_epoch(3_000), false)
                 .unwrap();
 
             assert!(!fx.store.may_be_asked_for(&destination));
@@ -6505,8 +6514,8 @@ mod tests {
         fn a_destination_bound_to_an_allowed_identity_is_asked_for() {
             let fx = Fixture::new("trust-ask-bound-allowed");
             let peer = announced("alpha");
-            fx.announce(&peer, t(2_000));
-            fx.trust_destination(&peer, t(3_000));
+            fx.announce(&peer, t_epoch(2_000));
+            fx.trust_destination(&peer, t_epoch(3_000));
 
             assert!(fx.store.may_be_asked_for(&peer.destination_hash));
             assert!(
@@ -6522,8 +6531,8 @@ mod tests {
             assert!(!fx.store.may_be_asked_for(&unrecorded));
 
             let peer = announced("alpha");
-            fx.announce(&peer, t(2_000));
-            fx.trust_destination(&peer, t(3_000));
+            fx.announce(&peer, t_epoch(2_000));
+            fx.trust_destination(&peer, t_epoch(3_000));
 
             assert!(
                 !fx.store.may_be_asked_for(&unrecorded),
@@ -6535,7 +6544,7 @@ mod tests {
         fn an_unrecorded_destination_is_asked_for_once_some_identity_is_trusted_for_all() {
             let fx = Fixture::new("trust-ask-identity-tier");
             let unrecorded = fake_hash(0x81);
-            fx.trust_identity(&fake_hash(0x82), t(2_000));
+            fx.trust_identity(&fake_hash(0x82), t_epoch(2_000));
 
             assert!(fx.store.may_be_asked_for(&unrecorded));
         }
@@ -6544,11 +6553,15 @@ mod tests {
         fn the_own_identitys_grant_alone_is_no_reason_to_ask_for_an_unrecorded_destination() {
             let fx = Fixture::new("trust-ask-own-identity");
             let (own, unrecorded) = (fake_hash(0x83), fake_hash(0x84));
-            assert!(fx.store.seed_self_trust(&own, true, t(2_000)).unwrap());
+            assert!(
+                fx.store
+                    .seed_self_trust(&own, true, t_epoch(2_000))
+                    .unwrap()
+            );
 
             assert!(!fx.store.may_be_asked_for(&unrecorded));
 
-            fx.trust_identity(&fake_hash(0x85), t(3_000));
+            fx.trust_identity(&fake_hash(0x85), t_epoch(3_000));
 
             assert!(
                 fx.store.may_be_asked_for(&unrecorded),
@@ -6585,19 +6598,25 @@ mod tests {
     fn deny_destination_takes_the_record_with_it_and_lists_the_deny_once() {
         let fx = Fixture::new("trust-deny-listed");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -6635,12 +6654,18 @@ mod tests {
     fn trust_destination_lifts_a_deny_in_the_same_write() {
         let fx = Fixture::new("trust-deny-lifted");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(2_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(2_000),
+                false,
+            )
             .unwrap();
         let plain = announced("beta");
-        fx.announce(&plain, t(2_000));
+        fx.announce(&plain, t_epoch(2_000));
 
         let outcome = fx
             .store
@@ -6648,7 +6673,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -6668,7 +6693,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap();
         assert_eq!(again.change, TrustChange::Updated);
@@ -6680,7 +6705,7 @@ mod tests {
                 &fx.mesh,
                 &plain.destination_hash,
                 TrustOptions::default(),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap();
         assert_eq!(never_denied.change, TrustChange::Added);
@@ -6691,15 +6716,15 @@ mod tests {
     fn block_identity_removes_its_records_and_suppresses_it() {
         let fx = Fixture::new("trust-block");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         let stranger = announced("beta");
-        fx.announce(&stranger, t(2_000));
+        fx.announce(&stranger, t_epoch(2_000));
         fx.store
             .trust_identity(
                 &fx.mesh,
                 &peer.identity_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         fx.store
@@ -6707,7 +6732,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         fx.store
@@ -6715,7 +6740,7 @@ mod tests {
                 &fx.mesh,
                 &stranger.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -6725,7 +6750,7 @@ mod tests {
                 &fx.mesh,
                 &peer.identity_hash,
                 Some("spam".to_string()),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap();
 
@@ -6756,7 +6781,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(5_000),
+                t_epoch(5_000),
             )
             .unwrap_err()
             .to_string();
@@ -6797,13 +6822,13 @@ mod tests {
     fn block_identity_clears_its_session_trust_too() {
         let fx = Fixture::new("trust-block-session");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(3_000))
+            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t_epoch(3_000))
             .unwrap();
 
         fx.store
-            .block_identity(&fx.mesh, &peer.identity_hash, None, t(4_000))
+            .block_identity(&fx.mesh, &peer.identity_hash, None, t_epoch(4_000))
             .unwrap();
 
         assert!(fx.store.records().is_empty());
@@ -6823,29 +6848,29 @@ mod tests {
     fn untrust_destination_keeps_the_identity_and_untrust_identity_keeps_it_known() {
         let fx = Fixture::new("trust-untrust");
         let first = announced("alpha");
-        fx.announce(&first, t(2_000));
+        fx.announce(&first, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &first.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         let identity = fake_hash(0xaa);
         fx.store
-            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t(3_000))
+            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t_epoch(3_000))
             .unwrap();
         let session = announced("beta");
-        fx.announce(&session, t(2_000));
+        fx.announce(&session, t_epoch(2_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &session.destination_hash, t(3_000))
+            .trust_destination_for_session(&fx.mesh, &session.destination_hash, t_epoch(3_000))
             .unwrap();
         fx.store.mark_seen(
             &first.destination_hash,
             &first.identity_hash,
             &first.name_hash,
-            t(9_000),
+            t_epoch(9_000),
         );
 
         fx.store
@@ -6875,13 +6900,13 @@ mod tests {
                 .is_err()
         );
 
-        fx.announce(&first, t(4_000));
+        fx.announce(&first, t_epoch(4_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &first.destination_hash,
                 TrustOptions::default(),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap();
         let retrusted = fx
@@ -6892,14 +6917,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             retrusted.last_seen_at,
-            t(4_000),
+            t_epoch(4_000),
             "a re-trust must not inherit the sighting of the removed record"
         );
         fx.store.mark_seen(
             &first.destination_hash,
             &first.identity_hash,
             &first.name_hash,
-            t(9_000),
+            t_epoch(9_000),
         );
         let before = fx.file_bytes();
         assert_eq!(
@@ -6913,7 +6938,7 @@ mod tests {
             "a record that grants nothing still has its bound session taken back"
         );
         assert_eq!(fx.file_bytes(), before, "a dry run writes nothing");
-        fx.trust_identity(&first.identity_hash, t(4_500));
+        fx.trust_identity(&first.identity_hash, t_epoch(4_500));
         let revoked = fx
             .store
             .untrust_identity(&fx.mesh, &first.identity_hash.to_ascii_uppercase(), false)
@@ -6980,7 +7005,7 @@ mod tests {
                 &fx.mesh,
                 &first.destination_hash,
                 TrustOptions::default(),
-                t(5_000),
+                t_epoch(5_000),
             )
             .unwrap();
         let retrusted = fx
@@ -6989,7 +7014,7 @@ mod tests {
             .into_iter()
             .find(|record| record.hash == first.destination_hash)
             .unwrap();
-        assert_eq!(retrusted.last_seen_at, t(4_000));
+        assert_eq!(retrusted.last_seen_at, t_epoch(4_000));
     }
 
     /// Revoking an identity with a record bound leaves the envoy memory alone: the
@@ -7000,9 +7025,9 @@ mod tests {
         let fx = Fixture::new("trust-untrust-memory");
         let memory = fx.remembering();
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_destination(&peer, t(3_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
 
         let revoked = fx
             .store
@@ -7022,7 +7047,7 @@ mod tests {
         let fx = Fixture::new("trust-untrust-memory-swept");
         let memory = fx.remembering();
         let identity = fake_hash(0x11);
-        fx.trust_identity(&identity, t(3_000));
+        fx.trust_identity(&identity, t_epoch(3_000));
 
         assert_eq!(
             fx.store
@@ -7059,11 +7084,11 @@ mod tests {
         let fx = Fixture::new("trust-untrust-session-twin");
         let memory = fx.remembering();
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(2_500))
+            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t_epoch(2_500))
             .unwrap();
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
         assert_eq!(
             fx.store.identity_standing(&peer.identity_hash),
             IdentityStanding::Trusted {
@@ -7121,25 +7146,37 @@ mod tests {
         let session = announced_as(identity, "gamma");
         let other = announced("delta");
         for peer in [&bound, &heard, &session, &other] {
-            fx.announce(peer, t(2_000));
+            fx.announce(peer, t_epoch(2_000));
         }
-        fx.trust_identity(&bound.identity_hash, t(2_000));
-        fx.trust_destination(&bound, t(2_000));
-        fx.trust_destination(&other, t(2_000));
+        fx.trust_identity(&bound.identity_hash, t_epoch(2_000));
+        fx.trust_destination(&bound, t_epoch(2_000));
+        fx.trust_destination(&other, t_epoch(2_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &session.destination_hash, t(2_000))
+            .trust_destination_for_session(&fx.mesh, &session.destination_hash, t_epoch(2_000))
             .unwrap();
         fx.store
-            .deny_destination(&fx.mesh, &heard.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &heard.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         fx.store
-            .seed_deny(&fx.mesh, &bound.destination_hash, t(3_000))
+            .seed_deny(&fx.mesh, &bound.destination_hash, t_epoch(3_000))
             .unwrap();
         fx.store
-            .deny_destination(&fx.mesh, &other.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &other.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         fx.store
-            .block_identity(&fx.mesh, &fake_hash(0xbb), None, t(3_000))
+            .block_identity(&fx.mesh, &fake_hash(0xbb), None, t_epoch(3_000))
             .unwrap();
         let sink = fx.observed();
         let memory = fx.remembering();
@@ -7243,7 +7280,7 @@ mod tests {
         let memory = fx.remembering();
         let identity = fake_hash(0xbb);
         fx.store
-            .block_identity(&fx.mesh, &identity, None, t(3_000))
+            .block_identity(&fx.mesh, &identity, None, t_epoch(3_000))
             .unwrap();
         let sink = fx.observed();
 
@@ -7283,7 +7320,7 @@ mod tests {
         let identity = fake_hash(0xbb);
 
         fx.store
-            .block_identity(&fx.mesh, &identity, None, t(3_000))
+            .block_identity(&fx.mesh, &identity, None, t_epoch(3_000))
             .unwrap();
 
         assert_eq!(memory.forgotten(), [identity]);
@@ -7296,18 +7333,18 @@ mod tests {
         let fx = Fixture::new("trust-destination-memory");
         let memory = fx.remembering();
         let untrusted = announced("alpha");
-        fx.announce(&untrusted, t(2_000));
-        fx.trust_destination(&untrusted, t(3_000));
+        fx.announce(&untrusted, t_epoch(2_000));
+        fx.trust_destination(&untrusted, t_epoch(3_000));
         let stale = announced("beta");
-        fx.announce(&stale, t(2_000));
-        fx.trust_destination(&stale, t(3_000));
+        fx.announce(&stale, t_epoch(2_000));
+        fx.trust_destination(&stale, t_epoch(3_000));
 
         fx.store
             .untrust_destination(&fx.mesh, &untrusted.destination_hash, false)
             .unwrap();
         let pruned = fx
             .store
-            .prune_destinations(&fx.mesh, Duration::from_secs(3_600), t(10_200), false)
+            .prune_destinations(&fx.mesh, Duration::from_secs(3_600), t_epoch(10_200), false)
             .unwrap();
 
         assert_eq!(pruned, std::slice::from_ref(&stale.destination_hash));
@@ -7319,7 +7356,7 @@ mod tests {
     fn forget_identity_survives_a_dropped_envoy_memory() {
         let fx = Fixture::new("trust-dropped-memory");
         let identity = fake_hash(0xcc);
-        fx.trust_identity(&identity, t(3_000));
+        fx.trust_identity(&identity, t_epoch(3_000));
         drop(fx.remembering());
 
         fx.store
@@ -7336,18 +7373,18 @@ mod tests {
     fn knows_identity_follows_every_record_and_never_a_block() {
         let fx = Fixture::new("trust-knows-identity");
         let by_destination = announced("alpha");
-        fx.announce(&by_destination, t(2_000));
+        fx.announce(&by_destination, t_epoch(2_000));
         let for_session = announced("beta");
-        fx.announce(&for_session, t(2_000));
+        fx.announce(&for_session, t_epoch(2_000));
         let by_identity = fake_hash(0xcc);
         let stranger = fake_hash(0xdd);
         assert!(!fx.store.knows_identity(&by_destination.identity_hash));
 
-        fx.trust_destination(&by_destination, t(3_000));
+        fx.trust_destination(&by_destination, t_epoch(3_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &for_session.destination_hash, t(3_000))
+            .trust_destination_for_session(&fx.mesh, &for_session.destination_hash, t_epoch(3_000))
             .unwrap();
-        fx.trust_identity(&by_identity, t(3_000));
+        fx.trust_identity(&by_identity, t_epoch(3_000));
 
         assert!(
             fx.store
@@ -7383,7 +7420,7 @@ mod tests {
             "forgotten, it is a stranger again"
         );
         fx.store
-            .block_identity(&fx.mesh, &by_identity, None, t(4_000))
+            .block_identity(&fx.mesh, &by_identity, None, t_epoch(4_000))
             .unwrap();
         assert!(!fx.store.knows_identity(&by_identity));
         assert_eq!(
@@ -7402,35 +7439,35 @@ mod tests {
             &stale.destination_hash,
             &stale.identity_hash,
             &stale.name_hash,
-            t(9_000),
+            t_epoch(9_000),
         );
         for peer in [&stale, &fresh, &revived] {
-            fx.announce(peer, t(1_000));
+            fx.announce(peer, t_epoch(1_000));
             fx.store
                 .trust_destination(
                     &fx.mesh,
                     &peer.destination_hash,
                     TrustOptions::default(),
-                    t(1_000),
+                    t_epoch(1_000),
                 )
                 .unwrap();
         }
-        fx.announce(&fresh, t(5_000));
+        fx.announce(&fresh, t_epoch(5_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &fresh.destination_hash,
                 TrustOptions::default(),
-                t(5_000),
+                t_epoch(5_000),
             )
             .unwrap();
         fx.store.mark_seen(
             &revived.destination_hash,
             &revived.identity_hash,
             &revived.name_hash,
-            t(5_000),
+            t_epoch(5_000),
         );
-        let now = t(1_000 + 3_600);
+        let now = t_epoch(1_000 + 3_600);
         let horizon = Duration::from_secs(3_600);
 
         let dry = fx
@@ -7473,7 +7510,7 @@ mod tests {
         );
         assert!(
             fx.store
-                .prune_destinations(&fx.mesh, horizon, t(0), false)
+                .prune_destinations(&fx.mesh, horizon, t_epoch(0), false)
                 .unwrap()
                 .is_empty(),
             "a last_seen_at in the future reads as just seen"
@@ -7485,13 +7522,13 @@ mod tests {
         let fx = Fixture::new("trust-mark-seen-proof");
         let peer = announced("alpha");
         let other = announced("beta");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         let before = fx.file_bytes().unwrap();
@@ -7508,27 +7545,31 @@ mod tests {
             &peer.destination_hash,
             &peer.identity_hash,
             &peer.name_hash,
-            t(5_000),
+            t_epoch(5_000),
         );
-        assert_eq!(last_seen(), t(5_000));
+        assert_eq!(last_seen(), t_epoch(5_000));
 
         fx.store.mark_seen(
             &peer.destination_hash,
             &other.identity_hash,
             &other.name_hash,
-            t(6_000),
+            t_epoch(6_000),
         );
         assert_eq!(
             last_seen(),
-            t(5_000),
+            t_epoch(5_000),
             "a stranger announcing under the trusted hash is not a sighting"
         );
 
-        fx.store
-            .mark_seen(&peer.destination_hash, &peer.identity_hash, "", t(7_000));
+        fx.store.mark_seen(
+            &peer.destination_hash,
+            &peer.identity_hash,
+            "",
+            t_epoch(7_000),
+        );
         assert_eq!(
             last_seen(),
-            t(5_000),
+            t_epoch(5_000),
             "an announce without a name hash cannot be proved"
         );
 
@@ -7536,11 +7577,11 @@ mod tests {
             &peer.destination_hash,
             &peer.identity_hash,
             &other.name_hash,
-            t(8_000),
+            t_epoch(8_000),
         );
         assert_eq!(
             last_seen(),
-            t(5_000),
+            t_epoch(5_000),
             "a name hash that does not derive the destination proves nothing"
         );
         assert_eq!(fx.file_bytes().unwrap(), before);
@@ -7553,17 +7594,17 @@ mod tests {
         let usurped = announced("beta");
         let stranger = announced("delta");
         for peer in [&reannounced, &usurped] {
-            fx.announce(peer, t(1_000));
+            fx.announce(peer, t_epoch(1_000));
             fx.store
                 .trust_destination(
                     &fx.mesh,
                     &peer.destination_hash,
                     TrustOptions::default(),
-                    t(1_000),
+                    t_epoch(1_000),
                 )
                 .unwrap();
         }
-        fx.announce(&reannounced, t(4_000));
+        fx.announce(&reannounced, t_epoch(4_000));
         fx.mesh.0.observe(
             PeerSighting {
                 destination_hash: usurped.destination_hash.clone(),
@@ -7574,9 +7615,9 @@ mod tests {
                 protocol_version: 1,
                 hops: 1,
             },
-            t(4_000),
+            t_epoch(4_000),
         );
-        let now = t(1_000 + 3_600);
+        let now = t_epoch(1_000 + 3_600);
         let horizon = Duration::from_secs(3_600);
 
         let dry = fx
@@ -7615,20 +7656,20 @@ mod tests {
     fn queries_and_mark_seen_never_write_or_remove() {
         let fx = Fixture::new("trust-readonly");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         fx.store
-            .deny_destination(&fx.mesh, &fake_hash(0xdd), None, t(3_000), false)
+            .deny_destination(&fx.mesh, &fake_hash(0xdd), None, t_epoch(3_000), false)
             .unwrap();
         fx.store
-            .block_identity(&fx.mesh, &fake_hash(0xbb), None, t(3_000))
+            .block_identity(&fx.mesh, &fake_hash(0xbb), None, t_epoch(3_000))
             .unwrap();
         let before = fx.file_bytes().unwrap();
         let store = fx.reopen();
@@ -7645,13 +7686,13 @@ mod tests {
             &peer.destination_hash,
             &peer.identity_hash,
             &peer.name_hash,
-            t(9_000),
+            t_epoch(9_000),
         );
         store.mark_seen(
             &peer.destination_hash,
             &peer.identity_hash,
             &peer.name_hash,
-            t(8_000),
+            t_epoch(8_000),
         );
 
         assert_eq!(fx.file_bytes().unwrap(), before);
@@ -7663,7 +7704,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             seen.last_seen_at,
-            t(9_000),
+            t_epoch(9_000),
             "records must report the fresher sighting"
         );
         assert_eq!(
@@ -7673,7 +7714,7 @@ mod tests {
                 .find(|record| record.hash == peer.destination_hash)
                 .unwrap()
                 .last_seen_at,
-            t(2_000),
+            t_epoch(2_000),
             "mark_seen must not reach the file"
         );
     }
@@ -7744,7 +7785,7 @@ mod tests {
         let sink = Arc::new(RecordingSiblingTrust::default());
         other.attach_sibling_trust(sink.clone());
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         let user = fake_hash(0xaa);
         let id = peer.identity_hash.as_str();
         let dest = peer.destination_hash.as_str();
@@ -7754,13 +7795,13 @@ mod tests {
         read(&other);
         sink.take();
 
-        fx.trust_destination(&peer, t(3_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
         read(&other);
         assert_eq!(sink.take(), [changes(&[id], &[dest])], "a session grant");
         read(&other);
         assert!(sink.take().is_empty(), "nothing new, nothing told");
 
-        fx.trust_identity(&user, t(3_000));
+        fx.trust_identity(&user, t_epoch(3_000));
         read(&other);
         assert_eq!(sink.take(), [changes(&[&user], &[])], "a user grant");
 
@@ -7769,7 +7810,7 @@ mod tests {
         assert_eq!(sink.take(), [changes(&[&user], &[])], "a user revoke");
 
         fx.store
-            .block_identity(&fx.mesh, &user, None, t(4_000))
+            .block_identity(&fx.mesh, &user, None, t_epoch(4_000))
             .unwrap();
         read(&other);
         assert_eq!(sink.take(), [changes(&[&user], &[])], "a block");
@@ -7783,7 +7824,7 @@ mod tests {
         assert_eq!(sink.take(), [changes(&[id], &[dest])], "a forget");
 
         other
-            .trust_destination(&fx.mesh, dest, TrustOptions::default(), t(5_000))
+            .trust_destination(&fx.mesh, dest, TrustOptions::default(), t_epoch(5_000))
             .unwrap();
         read(&other);
         assert!(
@@ -7797,13 +7838,13 @@ mod tests {
         let fx = Fixture::new("trust-shared-grant-seen");
         let (other, _, _) = second_process(&fx);
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
 
-        fx.trust_destination(&peer, t(3_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
 
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
@@ -7828,16 +7869,16 @@ mod tests {
         let (other, _, _) = second_process(&fx);
         let alpha = announced("alpha");
         let beta = announced("beta");
-        fx.announce(&alpha, t(2_000));
-        fx.announce(&beta, t(2_000));
+        fx.announce(&alpha, t_epoch(2_000));
+        fx.announce(&beta, t_epoch(2_000));
 
-        fx.trust_destination(&alpha, t(3_000));
+        fx.trust_destination(&alpha, t_epoch(3_000));
         other
             .trust_destination(
                 &fx.mesh,
                 &beta.destination_hash,
                 TrustOptions::default(),
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
 
@@ -7874,7 +7915,7 @@ mod tests {
                 let mine = identities(base);
                 for (i, identity) in mine.iter().enumerate() {
                     store
-                        .trust_identity(&mesh, identity, TrustOptions::default(), t(3_000))
+                        .trust_identity(&mesh, identity, TrustOptions::default(), t_epoch(3_000))
                         .unwrap();
                     if i % 5 == 4 {
                         store.forget_identity(&mesh, identity, false).unwrap();
@@ -7921,7 +7962,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Served,
-            t(4_000),
+            t_epoch(4_000),
         );
         let after = fx.file_bytes().unwrap();
         assert_ne!(after, before);
@@ -7944,10 +7985,10 @@ mod tests {
         let fx = Fixture::new("trust-shared-verbs");
         let (other, memory, sink) = second_process(&fx);
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
-        fx.trust_destination(&peer, t(3_000));
-        let now = t(4_000);
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
+        let now = t_epoch(4_000);
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
             verdict(Decision::Allow, Rule::DestinationTrusted)
@@ -8032,8 +8073,8 @@ mod tests {
 
         // revoke of the user with a record bound: the other sees the grant and the record
         // gone, the identity entry granting nothing, and refuses the instance by default.
-        fx.trust_identity(&peer.identity_hash, t(5_000));
-        fx.trust_destination(&peer, t(5_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(5_000));
+        fx.trust_destination(&peer, t_epoch(5_000));
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
             verdict(Decision::Allow, Rule::DestinationTrusted)
@@ -8055,7 +8096,7 @@ mod tests {
             other.authorize(&peer.identity_hash, &peer.destination_hash),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
-        fx.trust_destination(&peer, t(6_000));
+        fx.trust_destination(&peer, t_epoch(6_000));
 
         // forget --identity from the other session: the first holds nothing of the peer.
         let forgotten = other
@@ -8078,13 +8119,13 @@ mod tests {
         let first = fake_hash(0x11);
         let second = fake_hash(0x22);
         let dest = fake_hash(0x0d);
-        fx.trust_identity(&first, t(3_000));
+        fx.trust_identity(&first, t_epoch(3_000));
         let (other, _, _) = second_process(&fx);
         assert_eq!(
             other.authorize(&first, &dest),
             verdict(Decision::Allow, Rule::IdentityTrusted)
         );
-        fx.trust_identity(&second, t(3_000));
+        fx.trust_identity(&second, t_epoch(3_000));
         let good = fx.file_bytes().unwrap();
         let path_text = fx.store.path().display().to_string();
         let warnings = || {
@@ -8109,7 +8150,7 @@ mod tests {
                 &fx.mesh,
                 &fake_hash(0x33),
                 TrustOptions::default(),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap_err()
             .to_string();
@@ -8138,16 +8179,16 @@ mod tests {
     fn a_headed_file_written_by_another_process_is_taken_over_on_the_next_look() {
         let fx = Fixture::new("trust-shared-header");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         let identity = fake_hash(0x11);
-        fx.trust_identity(&identity, t(3_000));
+        fx.trust_identity(&identity, t_epoch(3_000));
         let (other, _, _) = second_process(&fx);
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
 
-        let ts = rfc3339_utc(t(3_000));
+        let ts = rfc3339_utc(t_epoch(3_000));
         let external = format!(
             "{TRUST_FILE_HEADER}version: {TRUST_FILE_VERSION}\n\
              identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
@@ -8189,7 +8230,7 @@ mod tests {
         let (other, memory, sink) = second_process(&fx);
         let identity = fake_hash(0x11);
         let dest = fake_hash(0x0d);
-        fx.trust_identity(&identity, t(3_000));
+        fx.trust_identity(&identity, t_epoch(3_000));
         assert_eq!(
             other.authorize(&identity, &dest),
             verdict(Decision::Allow, Rule::IdentityTrusted)
@@ -8227,7 +8268,7 @@ mod tests {
 
         let second = fake_hash(0x22);
         other
-            .trust_identity(&fx.mesh, &second, TrustOptions::default(), t(4_000))
+            .trust_identity(&fx.mesh, &second, TrustOptions::default(), t_epoch(4_000))
             .unwrap();
 
         assert_eq!(
@@ -8249,16 +8290,16 @@ mod tests {
         let (other, _, _) = second_process(&fx);
         let alpha = announced("alpha");
         let beta = announced("beta");
-        fx.announce(&alpha, t(2_000));
-        fx.announce(&beta, t(2_000));
+        fx.announce(&alpha, t_epoch(2_000));
+        fx.announce(&beta, t_epoch(2_000));
         other
-            .trust_destination_for_session(&fx.mesh, &alpha.destination_hash, t(2_500))
+            .trust_destination_for_session(&fx.mesh, &alpha.destination_hash, t_epoch(2_500))
             .unwrap();
         other
-            .trust_destination_for_session(&fx.mesh, &beta.destination_hash, t(2_500))
+            .trust_destination_for_session(&fx.mesh, &beta.destination_hash, t_epoch(2_500))
             .unwrap();
 
-        fx.trust_destination(&alpha, t(3_000));
+        fx.trust_destination(&alpha, t_epoch(3_000));
 
         let records = other.records();
         let of = |hash: &str| -> Vec<bool> {
@@ -8293,14 +8334,14 @@ mod tests {
         let fx = Fixture::new("trust-shared-revoke");
         let (other, memory, sink) = second_process(&fx);
         let untrusted = announced("alpha");
-        fx.announce(&untrusted, t(2_000));
+        fx.announce(&untrusted, t_epoch(2_000));
         let forgotten = fake_hash(0xaa);
         let blocked = fake_hash(0xbb);
         let dest = fake_hash(0x0d);
-        fx.trust_identity(&untrusted.identity_hash, t(3_000));
-        fx.trust_destination(&untrusted, t(3_000));
-        fx.trust_identity(&forgotten, t(3_000));
-        fx.trust_identity(&blocked, t(3_000));
+        fx.trust_identity(&untrusted.identity_hash, t_epoch(3_000));
+        fx.trust_destination(&untrusted, t_epoch(3_000));
+        fx.trust_identity(&forgotten, t_epoch(3_000));
+        fx.trust_identity(&blocked, t_epoch(3_000));
         assert_eq!(
             other.authorize(&untrusted.identity_hash, &dest),
             verdict(Decision::Allow, Rule::IdentityTrusted)
@@ -8340,7 +8381,7 @@ mod tests {
         );
 
         fx.store
-            .block_identity(&fx.mesh, &blocked, None, t(4_000))
+            .block_identity(&fx.mesh, &blocked, None, t_epoch(4_000))
             .unwrap();
 
         assert!(other.is_blocked_identity(&blocked));
@@ -8361,9 +8402,9 @@ mod tests {
         let fx = Fixture::new("trust-shared-entry-gone");
         let (other, memory, _) = second_process(&fx);
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
-        fx.trust_destination(&peer, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
         assert!(other.knows_identity(&peer.identity_hash));
 
         assert_eq!(
@@ -8405,7 +8446,7 @@ mod tests {
         let fx = Fixture::new("trust-shared-hot-path");
         let identity = fake_hash(0x11);
         let dest = fake_hash(0x0d);
-        fx.trust_identity(&identity, t(3_000));
+        fx.trust_identity(&identity, t_epoch(3_000));
         age_file(fx.store.path());
         fx.store.authorize(&identity, &dest);
         let stats = fx.store.stat_count();
@@ -8430,7 +8471,7 @@ mod tests {
         let fx = Fixture::new("trust-shared-window");
         let identity = fake_hash(0x11);
         let dest = fake_hash(0x0d);
-        fx.trust_identity(&identity, t(3_000));
+        fx.trust_identity(&identity, t_epoch(3_000));
         let reads = fx.store.read_count();
 
         fx.store.authorize(&identity, &dest);
@@ -8461,7 +8502,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = fx
             .store
-            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t(3_000))
+            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t_epoch(3_000))
             .unwrap_err()
             .to_string();
         let waited = started.elapsed();
@@ -8476,7 +8517,10 @@ mod tests {
         );
         assert_eq!(fx.file_bytes(), None, "a refused mutation writes nothing");
         holder.unlock().unwrap();
-        assert_eq!(fx.trust_identity(&identity, t(3_000)), TrustChange::Added);
+        assert_eq!(
+            fx.trust_identity(&identity, t_epoch(3_000)),
+            TrustChange::Added
+        );
     }
 
     #[test]
@@ -8486,7 +8530,7 @@ mod tests {
         let mesh = MeshOff;
         let dest = fake_hash(0x0d);
         let identity = fake_hash(0x1d);
-        let now = t(3_000);
+        let now = t_epoch(3_000);
         let attempts: Vec<(&str, Result<()>)> = vec![
             (
                 "trust_destination",
@@ -8564,7 +8608,10 @@ mod tests {
         let sink = fx.observed();
         let identity = fake_hash(0xaa);
 
-        assert_eq!(fx.trust_identity(&identity, t(3_000)), TrustChange::Added);
+        assert_eq!(
+            fx.trust_identity(&identity, t_epoch(3_000)),
+            TrustChange::Added
+        );
 
         let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
         assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_TIER"), Some("identity"));
@@ -8574,7 +8621,10 @@ mod tests {
         );
         assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"), None);
 
-        assert_eq!(fx.trust_identity(&identity, t(4_000)), TrustChange::Updated);
+        assert_eq!(
+            fx.trust_identity(&identity, t_epoch(4_000)),
+            TrustChange::Updated
+        );
         assert!(sink.drain().is_empty(), "an update grants nothing new");
     }
 
@@ -8584,12 +8634,12 @@ mod tests {
     fn trust_identity_over_a_binding_only_record_fires_granted_and_untrust_revokes_both() {
         let fx = Fixture::new("trust-hook-identity-upgrade");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_destination(&peer, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
         let sink = fx.observed();
 
         assert_eq!(
-            fx.trust_identity(&peer.identity_hash, t(4_000)),
+            fx.trust_identity(&peer.identity_hash, t_epoch(4_000)),
             TrustChange::Updated
         );
 
@@ -8638,8 +8688,8 @@ mod tests {
     fn untrusting_a_binding_only_identity_takes_its_instance_and_keeps_it_known() {
         let fx = Fixture::new("trust-hook-identity-binding-only");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_destination(&peer, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
         let sink = fx.observed();
 
         assert_eq!(
@@ -8686,9 +8736,12 @@ mod tests {
         let fx = Fixture::new("trust-hook-destination");
         let sink = fx.observed();
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
 
-        assert_eq!(fx.trust_destination(&peer, t(3_000)), TrustChange::Added);
+        assert_eq!(
+            fx.trust_destination(&peer, t_epoch(3_000)),
+            TrustChange::Added
+        );
 
         let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
         assert_eq!(
@@ -8712,11 +8765,11 @@ mod tests {
         let first = announced_as(identity.clone(), "alpha");
         let second = announced_as(identity, "beta");
         assert_eq!(first.identity_hash, second.identity_hash);
-        fx.announce(&first, t(2_000));
-        fx.announce(&second, t(2_000));
-        fx.trust_identity(&first.identity_hash, t(3_000));
-        fx.trust_destination(&first, t(3_000));
-        fx.trust_destination(&second, t(3_000));
+        fx.announce(&first, t_epoch(2_000));
+        fx.announce(&second, t_epoch(2_000));
+        fx.trust_identity(&first.identity_hash, t_epoch(3_000));
+        fx.trust_destination(&first, t_epoch(3_000));
+        fx.trust_destination(&second, t_epoch(3_000));
         let sink = fx.observed();
 
         let revoked = fx
@@ -8765,11 +8818,11 @@ mod tests {
     fn block_identity_fires_revoked_only_for_an_identity_on_the_list() {
         let fx = Fixture::new("trust-hook-block");
         let listed = fake_hash(0xaa);
-        fx.trust_identity(&listed, t(3_000));
+        fx.trust_identity(&listed, t_epoch(3_000));
         let sink = fx.observed();
 
         fx.store
-            .block_identity(&fx.mesh, &listed, Some("spam".to_string()), t(4_000))
+            .block_identity(&fx.mesh, &listed, Some("spam".to_string()), t_epoch(4_000))
             .unwrap();
 
         let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
@@ -8782,7 +8835,7 @@ mod tests {
 
         let stranger = fake_hash(0xbb);
         fx.store
-            .block_identity(&fx.mesh, &stranger, None, t(4_000))
+            .block_identity(&fx.mesh, &stranger, None, t_epoch(4_000))
             .unwrap();
 
         assert!(fx.store.is_blocked_identity(&stranger));
@@ -8797,11 +8850,11 @@ mod tests {
         let fx = Fixture::new("trust-hook-prune");
         let stale = [announced("alpha"), announced("beta")];
         for peer in &stale {
-            fx.announce(peer, t(1_000));
-            fx.trust_destination(peer, t(1_000));
+            fx.announce(peer, t_epoch(1_000));
+            fx.trust_destination(peer, t_epoch(1_000));
         }
         let sink = fx.observed();
-        let now = t(1_000 + 3_600);
+        let now = t_epoch(1_000 + 3_600);
         let horizon = Duration::from_secs(3_600);
 
         let dry = fx
@@ -8850,7 +8903,7 @@ mod tests {
                 &fx.mesh,
                 &destination,
                 Some("noisy".to_string()),
-                t(3_000),
+                t_epoch(3_000),
                 false,
             )
             .unwrap();
@@ -8858,7 +8911,7 @@ mod tests {
             .undeny_destination(&fx.mesh, &destination, false)
             .unwrap();
         fx.store
-            .block_identity(&fx.mesh, &identity, None, t(3_000))
+            .block_identity(&fx.mesh, &identity, None, t_epoch(3_000))
             .unwrap();
         fx.store
             .unblock_identity(&fx.mesh, &identity, false)
@@ -8871,8 +8924,8 @@ mod tests {
     fn untrust_destination_fires_one_revoked_for_the_destination_tier() {
         let fx = Fixture::new("trust-hook-untrust-destination");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_destination(&peer, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(3_000));
         let sink = fx.observed();
 
         fx.store
@@ -8903,8 +8956,8 @@ mod tests {
         let fx = Fixture::new("trust-untrust-refuse-dry-run");
         let peer = announced("alpha");
         let sibling = fake_hash(0xcc);
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(2_000));
         let sink = fx.observed();
         let before = fx.file_bytes();
         let expected = format!(
@@ -8935,7 +8988,13 @@ mod tests {
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -8965,7 +9024,13 @@ mod tests {
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -8984,8 +9049,8 @@ mod tests {
      {
         let fx = Fixture::new("trust-untrust-refuse-bound");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
@@ -8994,7 +9059,7 @@ mod tests {
                     label: Some("Bob".to_string()),
                     note: None,
                 },
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         let sink = fx.observed();
@@ -9002,7 +9067,7 @@ mod tests {
 
         let dry = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), true)
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t_epoch(4_000), true)
             .unwrap();
         assert_eq!(
             dry,
@@ -9021,7 +9086,13 @@ mod tests {
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(outcome, dry);
@@ -9060,14 +9131,14 @@ mod tests {
         let fx = Fixture::new("trust-untrust-tampered-row");
         let peer = announced("alpha");
         let impostor = announced("beta");
-        fx.announce(&impostor, t(2_000));
-        fx.trust_identity(&impostor.identity_hash, t(2_000));
+        fx.announce(&impostor, t_epoch(2_000));
+        fx.trust_identity(&impostor.identity_hash, t_epoch(2_000));
         fx.mesh.0.observe(
             PeerSighting {
                 identity_hash: impostor.identity_hash.clone(),
                 ..sighting(&peer)
             },
-            t(2_000),
+            t_epoch(2_000),
         );
         let before = fx.file_bytes();
 
@@ -9087,7 +9158,7 @@ mod tests {
         assert!(fx.store.denied().is_empty());
         let denied = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000), true)
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t_epoch(3_000), true)
             .unwrap();
         assert_eq!(
             denied.identity, None,
@@ -9099,8 +9170,8 @@ mod tests {
     fn deny_destination_of_a_peer_table_only_instance_writes_the_deny_alone() {
         let fx = Fixture::new("trust-untrust-refuse-peer-table-only");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
         let sink = fx.observed();
         let before = fx.file_bytes();
 
@@ -9117,7 +9188,13 @@ mod tests {
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -9134,7 +9211,7 @@ mod tests {
         assert_eq!(listed.label, None);
         assert!(listed.denied);
         assert!(!listed.session);
-        assert_eq!(listed.added_at, t(4_000));
+        assert_eq!(listed.added_at, t_epoch(4_000));
         assert_eq!(fx.store.denied().len(), 1);
         assert_eq!(fx.store.denied()[0].hash, peer.destination_hash);
         assert_eq!(
@@ -9158,13 +9235,25 @@ mod tests {
         let dest = fake_hash(0x0d);
         let sink = fx.observed();
         fx.store
-            .deny_destination(&fx.mesh, &dest, Some("first".to_string()), t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &dest,
+                Some("first".to_string()),
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         assert_eq!(fx.store.denied()[0].note.as_deref(), Some("first"));
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &dest, Some("second".to_string()), t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &dest,
+                Some("second".to_string()),
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -9179,13 +9268,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hash, dest);
         assert_eq!(rows[0].note.as_deref(), Some("second"));
-        assert_eq!(rows[0].added_at, t(3_000), "the deny keeps its stamp");
+        assert_eq!(rows[0].added_at, t_epoch(3_000), "the deny keeps its stamp");
         assert!(sink.drain().is_empty(), "a note upsert fires nothing");
         let after = fx.file_bytes();
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &dest, None, t(5_000), false)
+            .deny_destination(&fx.mesh, &dest, None, t_epoch(5_000), false)
             .unwrap();
 
         assert!(outcome.already_denied);
@@ -9206,11 +9295,11 @@ mod tests {
     fn untrust_identity_leaves_a_blocked_bound_record_and_its_deny_standing() {
         let fx = Fixture::new("trust-untrust-identity-sweeps-denies");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(2_000));
-        fx.trust_destination(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(2_000));
         fx.store
-            .seed_deny(&fx.mesh, &peer.destination_hash, t(3_000))
+            .seed_deny(&fx.mesh, &peer.destination_hash, t_epoch(3_000))
             .unwrap();
         assert!(record(&fx.store, &peer.destination_hash).denied);
         assert_eq!(fx.store.denied().len(), 1);
@@ -9258,12 +9347,18 @@ mod tests {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let bound = announced_as(identity.clone(), "alpha");
         let heard = announced_as(identity, "beta");
-        fx.announce(&bound, t(2_000));
-        fx.announce(&heard, t(2_000));
-        fx.trust_identity(&bound.identity_hash, t(2_000));
-        fx.trust_destination(&bound, t(2_000));
+        fx.announce(&bound, t_epoch(2_000));
+        fx.announce(&heard, t_epoch(2_000));
+        fx.trust_identity(&bound.identity_hash, t_epoch(2_000));
+        fx.trust_destination(&bound, t_epoch(2_000));
         fx.store
-            .deny_destination(&fx.mesh, &heard.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &heard.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         assert_eq!(fx.store.denied().len(), 1);
 
@@ -9325,8 +9420,8 @@ mod tests {
     fn untrust_destination_dry_run_on_a_bound_record_writes_nothing() {
         let fx = Fixture::new("trust-untrust-forget-dry-run");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_destination(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(2_000));
         let sink = fx.observed();
         let before = fx.file_bytes();
 
@@ -9358,10 +9453,16 @@ mod tests {
     fn undeny_destination_lifts_the_deny_alone_and_refuses_a_second_time() {
         let fx = Fixture::new("trust-untrust-refuse-twice");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(2_000));
         fx.store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         let before = fx.file_bytes();
         assert!(before.is_some());
@@ -9423,33 +9524,39 @@ mod tests {
     fn undeny_destination_reads_the_standing_the_lift_leaves() {
         let fx = Fixture::new("trust-undeny-standing");
         let own = announced("alpha");
-        fx.announce(&own, t(2_000));
-        fx.trust_destination(&own, t(2_000));
+        fx.announce(&own, t_epoch(2_000));
+        fx.trust_destination(&own, t_epoch(2_000));
         fx.store
-            .seed_deny(&fx.mesh, &own.destination_hash, t(3_000))
+            .seed_deny(&fx.mesh, &own.destination_hash, t_epoch(3_000))
             .unwrap();
         let stranger = fake_hash(0x5d);
         let stranger_identity = fake_hash(0x1d);
         fx.store
-            .deny_destination(&fx.mesh, &stranger, None, t(3_000), false)
+            .deny_destination(&fx.mesh, &stranger, None, t_epoch(3_000), false)
             .unwrap();
         let blocked = announced("beta");
-        fx.announce(&blocked, t(2_000));
-        fx.trust_destination(&blocked, t(2_000));
+        fx.announce(&blocked, t_epoch(2_000));
+        fx.trust_destination(&blocked, t_epoch(2_000));
         fx.store
-            .seed_deny(&fx.mesh, &blocked.destination_hash, t(3_000))
+            .seed_deny(&fx.mesh, &blocked.destination_hash, t_epoch(3_000))
             .unwrap();
         fx.store
-            .block_identity(&fx.mesh, &blocked.identity_hash, None, t(3_500))
+            .block_identity(&fx.mesh, &blocked.identity_hash, None, t_epoch(3_500))
             .unwrap();
         let bare = announced("gamma");
-        fx.announce(&bare, t(2_000));
-        fx.trust_destination(&bare, t(2_000));
+        fx.announce(&bare, t_epoch(2_000));
+        fx.trust_destination(&bare, t_epoch(2_000));
         fx.store
             .untrust_destination(&fx.mesh, &bare.destination_hash, false)
             .unwrap();
         fx.store
-            .deny_destination(&fx.mesh, &bare.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &bare.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         assert_eq!(
             fx.store.identity_standing(&bare.identity_hash),
@@ -9548,8 +9655,8 @@ mod tests {
     fn deny_destination_of_a_legacy_denied_record_takes_the_record_and_rewrites() {
         let fx = Fixture::new("trust-untrust-refuse-backfill");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
@@ -9558,11 +9665,11 @@ mod tests {
                     label: Some("Bob".to_string()),
                     note: None,
                 },
-                t(3_000),
+                t_epoch(3_000),
             )
             .unwrap();
         fx.store
-            .seed_deny(&fx.mesh, &peer.destination_hash, t(3_500))
+            .seed_deny(&fx.mesh, &peer.destination_hash, t_epoch(3_500))
             .unwrap();
         assert_eq!(
             record(&fx.store, &peer.destination_hash)
@@ -9575,7 +9682,13 @@ mod tests {
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -9594,7 +9707,7 @@ mod tests {
         assert_eq!(fx.store.denied().len(), 1);
         assert_eq!(
             fx.store.denied()[0].added_at,
-            t(3_500),
+            t_epoch(3_500),
             "the standing deny keeps its stamp"
         );
         assert_eq!(fx.reopen().records(), fx.store.records());
@@ -9605,12 +9718,18 @@ mod tests {
         let fx = Fixture::new("trust-untrust-deny-only");
         let unheard = fake_hash(0xcc);
         fx.store
-            .deny_destination(&fx.mesh, &unheard, None, t(2_000), false)
+            .deny_destination(&fx.mesh, &unheard, None, t_epoch(2_000), false)
             .unwrap();
         let heard = announced("alpha");
-        fx.announce(&heard, t(2_000));
+        fx.announce(&heard, t_epoch(2_000));
         fx.store
-            .deny_destination(&fx.mesh, &heard.destination_hash, None, t(2_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &heard.destination_hash,
+                None,
+                t_epoch(2_000),
+                false,
+            )
             .unwrap();
         let stranger = fake_hash(0xdd);
         let before = fx.file_bytes();
@@ -9657,7 +9776,7 @@ mod tests {
         let fx = Fixture::new("trust-untrust-blocked-identity");
         let id = fake_hash(0xee);
         fx.store
-            .block_identity(&fx.mesh, &id, None, t(2_000))
+            .block_identity(&fx.mesh, &id, None, t_epoch(2_000))
             .unwrap();
         let before = fx.file_bytes();
 
@@ -9698,10 +9817,10 @@ mod tests {
     /// A denied record under a plain identity, as earlier releases could leave one.
     fn denied_record_under_a_plain_identity(fx: &Fixture) -> Announced {
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_destination(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_destination(&peer, t_epoch(2_000));
         fx.store
-            .seed_deny(&fx.mesh, &peer.destination_hash, t(2_500))
+            .seed_deny(&fx.mesh, &peer.destination_hash, t_epoch(2_500))
             .unwrap();
         assert!(record(&fx.store, &peer.destination_hash).denied);
         peer
@@ -9786,16 +9905,22 @@ mod tests {
         let fx = Fixture::new("trust-prune-refused");
         let refused = announced("alpha");
         let sibling = announced("beta");
-        fx.announce(&refused, t(1_000));
-        fx.announce(&sibling, t(1_000));
-        fx.trust_identity(&refused.identity_hash, t(1_000));
-        fx.trust_destination(&sibling, t(1_000));
+        fx.announce(&refused, t_epoch(1_000));
+        fx.announce(&sibling, t_epoch(1_000));
+        fx.trust_identity(&refused.identity_hash, t_epoch(1_000));
+        fx.trust_destination(&sibling, t_epoch(1_000));
         fx.store
-            .deny_destination(&fx.mesh, &refused.destination_hash, None, t(1_500), false)
+            .deny_destination(
+                &fx.mesh,
+                &refused.destination_hash,
+                None,
+                t_epoch(1_500),
+                false,
+            )
             .unwrap();
         assert!(record(&fx.store, &refused.destination_hash).denied);
         let sink = fx.observed();
-        let now = t(1_000 + 3_600);
+        let now = t_epoch(1_000 + 3_600);
         let horizon = Duration::from_secs(3_600);
 
         let dry = fx
@@ -9833,8 +9958,8 @@ mod tests {
     fn block_lift_and_block_again_fire_one_revoke_and_one_grant() {
         let fx = Fixture::new("trust-usage-probe-refuse-lift-silent");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(2_000));
         fx.store
             .trust_destination(
                 &fx.mesh,
@@ -9843,13 +9968,19 @@ mod tests {
                     label: Some("Bob".to_string()),
                     note: None,
                 },
-                t(2_000),
+                t_epoch(2_000),
             )
             .unwrap();
         let sink = fx.observed();
 
         fx.store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
         assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_REASON"), Some("block"));
@@ -9859,7 +9990,13 @@ mod tests {
         );
 
         fx.store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_500), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(3_500),
+                false,
+            )
             .unwrap();
         assert!(sink.drain().is_empty(), "a second block is a no-op");
 
@@ -9869,7 +10006,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap();
         assert_eq!(lifted.change, TrustChange::Added);
@@ -9914,10 +10051,16 @@ mod tests {
     fn lifting_a_record_less_deny_is_a_grant_that_fires_granted() {
         let fx = Fixture::new("trust-usage-probe-lift-orphan-grants");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(2_000));
         fx.store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(3_000),
+                false,
+            )
             .unwrap();
         assert!(
             !fx.store
@@ -9934,7 +10077,7 @@ mod tests {
                 &fx.mesh,
                 &peer.destination_hash,
                 TrustOptions::default(),
-                t(4_000),
+                t_epoch(4_000),
             )
             .unwrap();
 
@@ -9960,13 +10103,19 @@ mod tests {
     fn block_of_a_record_less_instance_writes_the_deny_alone_and_trust_lifts_it_as_a_grant() {
         let fx = Fixture::new("trust-usage-probe-record-less-refusal-lift");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.announce(&peer, t_epoch(2_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
         let sink = fx.observed();
 
         let denied = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
         assert_eq!(
             denied,
@@ -9981,7 +10130,13 @@ mod tests {
 
         let again = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(5_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(5_000),
+                false,
+            )
             .unwrap();
         assert!(again.already_denied);
         assert_eq!(
@@ -9991,7 +10146,7 @@ mod tests {
         );
         assert_eq!(
             record(&fx.store, &peer.destination_hash).added_at,
-            t(4_000),
+            t_epoch(4_000),
             "the deny keeps the stamp of the block that wrote it"
         );
         assert!(
@@ -10008,7 +10163,7 @@ mod tests {
                     label: Some("Alpha desk".to_string()),
                     note: None,
                 },
-                t(6_000),
+                t_epoch(6_000),
             )
             .unwrap();
         assert_eq!(lifted.change, TrustChange::Added);
@@ -10044,18 +10199,18 @@ mod tests {
     fn block_through_a_session_twin_folds_the_twin_into_the_deny() {
         let fx = Fixture::new("trust-usage-probe-session-twin-refusal");
         let peer = announced("alpha");
-        fx.announce(&peer, t(2_000));
+        fx.announce(&peer, t_epoch(2_000));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(2_500))
+            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t_epoch(2_500))
             .unwrap();
-        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.trust_identity(&peer.identity_hash, t_epoch(3_000));
         assert!(record(&fx.store, &peer.destination_hash).session);
         let before = fx.file_bytes();
         let sink = fx.observed();
 
         let dry = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), true)
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t_epoch(4_000), true)
             .unwrap();
         assert_eq!(
             dry,
@@ -10071,7 +10226,13 @@ mod tests {
 
         let outcome = fx
             .store
-            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(4_000), false)
+            .deny_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                None,
+                t_epoch(4_000),
+                false,
+            )
             .unwrap();
         assert_eq!(outcome, dry);
         let rows: Vec<TrustRecord> = fx
@@ -10089,7 +10250,7 @@ mod tests {
         assert!(!listed.session);
         assert!(listed.denied);
         assert_eq!(listed.identity, None, "the twin went with the deny");
-        assert_eq!(listed.added_at, t(4_000));
+        assert_eq!(listed.added_at, t_epoch(4_000));
         assert_eq!(
             fx.store
                 .authorize(&peer.identity_hash, &peer.destination_hash),
@@ -10182,13 +10343,13 @@ mod tests {
     fn identity_changed_is_never_an_allow() {
         let fx = Fixture::new("trust-identity-changed-refuses");
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_destination(&old, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_destination(&old, t_epoch(3_000));
         let rotated = PrivateIdentity::new_from_rand(OsRng);
         let new = announced_as(rotated.clone(), "alpha");
         let new_key_elsewhere = announced_as(rotated, "beta");
-        fx.announce(&new_key_elsewhere, t(4_000));
-        fx.trust_destination(&new_key_elsewhere, t(4_500));
+        fx.announce(&new_key_elsewhere, t_epoch(4_000));
+        fx.trust_destination(&new_key_elsewhere, t_epoch(4_500));
         assert!(fx.store.is_trusted_identity(&new.identity_hash));
 
         let before = fx.store.authorize_origin(
@@ -10205,7 +10366,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
         assert_eq!(marked.len(), 1);
 
@@ -10251,7 +10412,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
 
         assert_eq!(
@@ -10268,7 +10429,7 @@ mod tests {
             record(&fx.store, &old.destination_hash).key_changed,
             Some(KeyChange {
                 seen_identity: new.identity_hash.clone(),
-                at: t(5_000),
+                at: t_epoch(5_000),
             })
         );
         let texts = surface.texts();
@@ -10300,7 +10461,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(6_000),
+            t_epoch(6_000),
         );
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(fx.file_bytes().unwrap(), after_first);
@@ -10310,7 +10471,7 @@ mod tests {
             &third.identity_hash,
             &third.name_hash,
             KeyChangeOutcome::Refused,
-            t(7_000),
+            t_epoch(7_000),
         );
         assert!(other.is_empty(), "{other:?}");
         assert_eq!(fx.file_bytes().unwrap(), after_first);
@@ -10333,7 +10494,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
 
         let reopened = fx.reopen();
@@ -10342,7 +10503,7 @@ mod tests {
             record(&reopened, &old.destination_hash).key_changed,
             Some(KeyChange {
                 seen_identity: new.identity_hash.clone(),
-                at: t(5_000),
+                at: t_epoch(5_000),
             })
         );
         assert_eq!(
@@ -10355,7 +10516,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(6_000)
+                    t_epoch(6_000)
                 )
                 .is_empty(),
             "a mark loaded from disk is not written again"
@@ -10408,12 +10569,15 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
         let mark = record(&fx.store, &old.destination_hash).key_changed;
         assert!(mark.is_some());
 
-        assert_eq!(fx.trust_destination(&old, t(7_000)), TrustChange::Updated);
+        assert_eq!(
+            fx.trust_destination(&old, t_epoch(7_000)),
+            TrustChange::Updated
+        );
 
         assert_eq!(record(&fx.store, &old.destination_hash).key_changed, mark);
         assert_eq!(
@@ -10426,7 +10590,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(8_000)
+                    t_epoch(8_000)
                 )
                 .is_empty(),
             "the mark stands, so the next conflicting sighting writes nothing"
@@ -10445,14 +10609,14 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
         let mark = record(&fx.store, &old.destination_hash).key_changed;
         assert!(mark.is_some());
 
         let removed = fx
             .store
-            .block_identity(&fx.mesh, &new.identity_hash, None, t(6_000))
+            .block_identity(&fx.mesh, &new.identity_hash, None, t_epoch(6_000))
             .unwrap();
 
         assert!(removed.is_empty(), "the new identity held no records");
@@ -10474,7 +10638,7 @@ mod tests {
                     &third.identity_hash,
                     &third.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(7_000)
+                    t_epoch(7_000)
                 )
                 .is_empty(),
             "the mark keeps its first sighting"
@@ -10490,13 +10654,13 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
         let mark = record(&fx.store, &old.destination_hash).key_changed;
         assert!(mark.is_some());
 
         assert_eq!(
-            fx.trust_identity(&new.identity_hash, t(6_000)),
+            fx.trust_identity(&new.identity_hash, t_epoch(6_000)),
             TrustChange::Added
         );
 
@@ -10527,7 +10691,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Served,
-                    t(7_000)
+                    t_epoch(7_000)
                 )
                 .is_empty(),
             "a record already marked is not written again"
@@ -10539,7 +10703,7 @@ mod tests {
         let fx = Fixture::new("trust-key-change-blocked-seen");
         let (old, new) = trusted_then_rotated(&fx);
         fx.store
-            .block_identity(&fx.mesh, &new.identity_hash, None, t(4_000))
+            .block_identity(&fx.mesh, &new.identity_hash, None, t_epoch(4_000))
             .unwrap();
         let before = fx.file_bytes().unwrap();
 
@@ -10547,7 +10711,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
 
         assert!(marked.is_empty(), "{marked:?}");
@@ -10560,7 +10724,7 @@ mod tests {
         let fx = Fixture::new("trust-key-change-denied-record");
         let (old, new) = trusted_then_rotated(&fx);
         fx.store
-            .seed_deny(&fx.mesh, &old.destination_hash, t(4_000))
+            .seed_deny(&fx.mesh, &old.destination_hash, t_epoch(4_000))
             .unwrap();
         let before = fx.file_bytes().unwrap();
 
@@ -10568,7 +10732,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
 
         assert_eq!(marked.len(), 1, "{marked:?}");
@@ -10578,7 +10742,7 @@ mod tests {
             listed.key_changed,
             Some(KeyChange {
                 seen_identity: new.identity_hash.clone(),
-                at: t(5_000),
+                at: t_epoch(5_000),
             })
         );
         assert_ne!(fx.file_bytes().unwrap(), before);
@@ -10596,7 +10760,7 @@ mod tests {
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let (old, new) = trusted_then_rotated(&fx);
         assert_eq!(
-            fx.trust_identity(&new.identity_hash, t(4_000)),
+            fx.trust_identity(&new.identity_hash, t_epoch(4_000)),
             TrustChange::Added
         );
         let before = fx.file_bytes().unwrap();
@@ -10605,14 +10769,14 @@ mod tests {
 
         let marked =
             fx.store
-                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t(5_000));
+                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t_epoch(5_000));
 
         assert_eq!(marked.len(), 1, "{marked:?}");
         assert_eq!(
             record(&fx.store, &old.destination_hash).key_changed,
             Some(KeyChange {
                 seen_identity: new.identity_hash.clone(),
-                at: t(5_000),
+                at: t_epoch(5_000),
             })
         );
         assert_ne!(fx.file_bytes().unwrap(), before);
@@ -10643,9 +10807,9 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
+        fx.announce(&old, t_epoch(2_000));
         assert_eq!(
-            fx.trust_identity(&old.identity_hash, t(3_000)),
+            fx.trust_identity(&old.identity_hash, t_epoch(3_000)),
             TrustChange::Added
         );
         assert_eq!(
@@ -10654,14 +10818,14 @@ mod tests {
         );
         let new = announced("alpha");
         assert_eq!(new.name_hash, old.name_hash);
-        fx.announce(&new, t(4_000));
+        fx.announce(&new, t_epoch(4_000));
         let before = fx.file_bytes().unwrap();
 
         let marked = fx.store.note_key_change(
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(4_500),
+            t_epoch(4_500),
         );
 
         assert!(marked.is_empty(), "{marked:?}");
@@ -10717,14 +10881,14 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
+        fx.announce(&old, t_epoch(2_000));
         assert_eq!(
-            fx.trust_identity(&old.identity_hash, t(3_000)),
+            fx.trust_identity(&old.identity_hash, t_epoch(3_000)),
             TrustChange::Added
         );
         let new = announced("alpha");
         assert_eq!(new.name_hash, old.name_hash);
-        fx.announce(&new, t(4_000));
+        fx.announce(&new, t_epoch(4_000));
         let before = fx.file_bytes().unwrap();
         let upper = new.name_hash.to_ascii_uppercase();
         assert_ne!(upper, new.name_hash, "the fixture's name hash has letters");
@@ -10733,7 +10897,7 @@ mod tests {
             &new.identity_hash,
             &upper,
             KeyChangeOutcome::Refused,
-            t(4_500),
+            t_epoch(4_500),
         );
 
         assert!(marked.is_empty(), "{marked:?}");
@@ -10758,7 +10922,7 @@ mod tests {
                         &new.identity_hash,
                         &spelling,
                         KeyChangeOutcome::Refused,
-                        t(5_000),
+                        t_epoch(5_000),
                     )
                     .is_empty()
             );
@@ -10792,7 +10956,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
 
         assert_eq!(marked.len(), 1);
@@ -10812,7 +10976,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(6_000)
+                    t_epoch(6_000)
                 )
                 .is_empty(),
             "a dropped line is not offered again"
@@ -10830,10 +10994,10 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
         assert_eq!(surface.texts().len(), 1);
-        fx.announce(&new, t(6_000));
+        fx.announce(&new, t_epoch(6_000));
 
         let outcome = fx
             .store
@@ -10841,7 +11005,7 @@ mod tests {
                 &fx.mesh,
                 &new.destination_hash,
                 TrustOptions::default(),
-                t(7_000),
+                t_epoch(7_000),
             )
             .unwrap();
 
@@ -10878,12 +11042,12 @@ mod tests {
         );
 
         let after_trust = fx.file_bytes().unwrap();
-        fx.announce(&new, t(8_000));
+        fx.announce(&new, t_epoch(8_000));
         let again = fx.store.note_key_change(
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(8_000),
+            t_epoch(8_000),
         );
 
         assert!(again.is_empty(), "{again:?}");
@@ -10936,7 +11100,7 @@ mod tests {
         );
         assert!(bound.collisions.is_empty(), "{:?}", bound.collisions);
 
-        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(4_000));
         let served = origin_of(&fx.store, &new);
         assert_eq!(
             served.verdict,
@@ -10945,7 +11109,7 @@ mod tests {
         assert_eq!(served.collisions.len(), 1, "{:?}", served.collisions);
 
         fx.store
-            .deny_destination(&fx.mesh, &new.destination_hash, None, t(5_000), false)
+            .deny_destination(&fx.mesh, &new.destination_hash, None, t_epoch(5_000), false)
             .unwrap();
         let denied = origin_of(&fx.store, &new);
         assert_eq!(
@@ -10963,7 +11127,7 @@ mod tests {
             .unwrap();
 
         fx.store
-            .block_identity(&fx.mesh, &new.identity_hash, None, t(6_000))
+            .block_identity(&fx.mesh, &new.identity_hash, None, t_epoch(6_000))
             .unwrap();
         let blocked = origin_of(&fx.store, &new);
         assert_eq!(
@@ -10980,10 +11144,10 @@ mod tests {
     fn a_denied_requester_over_a_colliding_record_gets_the_collisions_with_its_verdict() {
         let fx = Fixture::new("trust-origin-verdict-denied-requester");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.announce(&new, t(3_500));
-        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.announce(&new, t_epoch(3_500));
+        fx.trust_identity(&new.identity_hash, t_epoch(4_000));
         fx.store
-            .deny_destination(&fx.mesh, &new.destination_hash, None, t(5_000), false)
+            .deny_destination(&fx.mesh, &new.destination_hash, None, t_epoch(5_000), false)
             .unwrap();
 
         let denied = origin_of(&fx.store, &new);
@@ -11004,7 +11168,7 @@ mod tests {
         );
 
         fx.store
-            .seed_deny(&fx.mesh, &old.destination_hash, t(6_000))
+            .seed_deny(&fx.mesh, &old.destination_hash, t_epoch(6_000))
             .unwrap();
         let both_denied = origin_of(&fx.store, &new);
         assert_eq!(
@@ -11043,7 +11207,7 @@ mod tests {
         );
 
         fx.store
-            .seed_deny(&fx.mesh, &old.destination_hash, t(4_000))
+            .seed_deny(&fx.mesh, &old.destination_hash, t_epoch(4_000))
             .unwrap();
         assert_eq!(
             conflicting(&fx.store),
@@ -11051,15 +11215,15 @@ mod tests {
             "a denied record still collides"
         );
 
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         assert_eq!(
             conflicting(&fx.store),
             vec![old.destination_hash.clone()],
             "an identity trusted for all destinations still collides"
         );
 
-        fx.announce(&new, t(6_000));
-        fx.trust_destination(&new, t(7_000));
+        fx.announce(&new, t_epoch(6_000));
+        fx.trust_destination(&new, t_epoch(7_000));
         assert!(
             conflicting(&fx.store).is_empty(),
             "an identity holding its own record for the instance conflicts with nothing"
@@ -11070,9 +11234,9 @@ mod tests {
     fn note_key_change_marks_every_record_binding_conflicts_reports() {
         let fx = Fixture::new("trust-key-change-marks-all");
         let (first, second) = trusted_then_rotated(&fx);
-        fx.announce(&second, t(3_500));
+        fx.announce(&second, t_epoch(3_500));
         fx.store
-            .trust_destination_for_session(&fx.mesh, &second.destination_hash, t(4_000))
+            .trust_destination_for_session(&fx.mesh, &second.destination_hash, t_epoch(4_000))
             .unwrap();
         let third = announced("alpha");
         let name_hash = decode_name_hash(&third.name_hash).unwrap();
@@ -11091,7 +11255,7 @@ mod tests {
                 &third.identity_hash,
                 &third.name_hash,
                 KeyChangeOutcome::Refused,
-                t(5_000),
+                t_epoch(5_000),
             )
             .into_iter()
             .map(|change| change.destination_hash)
@@ -11104,7 +11268,7 @@ mod tests {
                 record(&fx.store, destination).key_changed,
                 Some(KeyChange {
                     seen_identity: third.identity_hash.clone(),
-                    at: t(5_000),
+                    at: t_epoch(5_000),
                 })
             );
         }
@@ -11127,19 +11291,19 @@ mod tests {
      {
         let fx = Fixture::new("trust-key-change-superseded-all-destinations");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(4_000));
         fx.store.note_key_change(
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Served,
-            t(5_000),
+            t_epoch(5_000),
         );
         assert!(
             record(&fx.store, &old.destination_hash)
                 .key_changed
                 .is_some()
         );
-        fx.announce(&new, t(6_000));
+        fx.announce(&new, t_epoch(6_000));
 
         let outcome = fx
             .store
@@ -11147,7 +11311,7 @@ mod tests {
                 &fx.mesh,
                 &new.destination_hash,
                 TrustOptions::default(),
-                t(7_000),
+                t_epoch(7_000),
             )
             .unwrap();
 
@@ -11173,7 +11337,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Served,
-                    t(8_000)
+                    t_epoch(8_000)
                 )
                 .is_empty()
         );
@@ -11186,18 +11350,18 @@ mod tests {
         let fx = Fixture::new("trust-key-change-superseded-denied");
         let (old, new) = trusted_then_rotated(&fx);
         fx.store
-            .seed_deny(&fx.mesh, &old.destination_hash, t(3_500))
+            .seed_deny(&fx.mesh, &old.destination_hash, t_epoch(3_500))
             .unwrap();
         fx.store.note_key_change(
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
         let old_record = record(&fx.store, &old.destination_hash);
         assert!(old_record.denied);
         assert!(old_record.key_changed.is_some());
-        fx.announce(&new, t(6_000));
+        fx.announce(&new, t_epoch(6_000));
 
         let outcome = fx
             .store
@@ -11205,7 +11369,7 @@ mod tests {
                 &fx.mesh,
                 &new.destination_hash,
                 TrustOptions::default(),
-                t(7_000),
+                t_epoch(7_000),
             )
             .unwrap();
 
@@ -11236,7 +11400,7 @@ mod tests {
     fn collision_protection_refuses_an_all_destinations_identity_over_a_colliding_record() {
         let fx = Fixture::new("trust-collision-protection-on");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(4_000));
         assert_eq!(
             origin_verdict(&fx.store, &new),
             verdict(Decision::Allow, Rule::IdentityTrusted)
@@ -11281,9 +11445,9 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let (old, new) = trusted_then_rotated(&fx);
-        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(4_000));
         fx.store
-            .deny_destination(&fx.mesh, &new.destination_hash, None, t(4_500), false)
+            .deny_destination(&fx.mesh, &new.destination_hash, None, t_epoch(4_500), false)
             .unwrap();
         let refused = origin_of(&fx.store, &new);
         assert_eq!(
@@ -11296,7 +11460,7 @@ mod tests {
 
         let marked =
             fx.store
-                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t(5_000));
+                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t_epoch(5_000));
 
         assert_eq!(marked.len(), 1, "{marked:?}");
         assert_eq!(
@@ -11315,8 +11479,8 @@ mod tests {
     fn a_destination_allow_admits_in_either_collision_protection_mode() {
         let fx = Fixture::new("trust-collision-protection-destination-allow");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.announce(&new, t(4_000));
-        fx.trust_destination(&new, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_destination(&new, t_epoch(5_000));
 
         for protection in [false, true] {
             fx.store.set_collision_protection(protection);
@@ -11341,10 +11505,10 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
+        fx.announce(&new, t_epoch(4_000));
         let before = fx.file_bytes().unwrap();
 
         for at in [4_100, 4_200] {
@@ -11352,7 +11516,7 @@ mod tests {
                 &new.identity_hash,
                 &new.name_hash,
                 KeyChangeOutcome::Refused,
-                t(at),
+                t_epoch(at),
             );
             assert!(marked.is_empty(), "{marked:?}");
         }
@@ -11361,14 +11525,14 @@ mod tests {
         assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
 
         let stranger_instance = announced("beta");
-        fx.announce(&stranger_instance, t(9_000));
+        fx.announce(&stranger_instance, t_epoch(9_000));
         let other_stranger = announced("beta");
-        fx.announce(&other_stranger, t(10_000));
+        fx.announce(&other_stranger, t_epoch(10_000));
         fx.store.note_key_change(
             &other_stranger.identity_hash,
             &other_stranger.name_hash,
             KeyChangeOutcome::Refused,
-            t(11_000),
+            t_epoch(11_000),
         );
         assert_eq!(
             surface.texts().len(),
@@ -11391,18 +11555,18 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let rotating = PrivateIdentity::new_from_rand(OsRng);
         let old = announced_as(rotating.clone(), "alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let before = fx.file_bytes().unwrap();
 
         for (n, at) in [3_100, 3_200, 3_300].into_iter().enumerate() {
             let fresh = announced("alpha");
-            fx.announce(&fresh, t(at));
+            fx.announce(&fresh, t_epoch(at));
             let marked = fx.store.note_key_change(
                 &fresh.identity_hash,
                 &fresh.name_hash,
                 KeyChangeOutcome::Refused,
-                t(at + 50),
+                t_epoch(at + 50),
             );
             assert!(marked.is_empty(), "{marked:?}");
             assert_eq!(
@@ -11417,9 +11581,9 @@ mod tests {
         assert_eq!(fx.file_bytes().unwrap(), before);
 
         let old_gamma = announced_as(rotating, "gamma");
-        fx.announce(&old_gamma, t(2_000));
+        fx.announce(&old_gamma, t_epoch(2_000));
         let late = announced("gamma");
-        let expired = t(2_000) + PEER_TTL;
+        let expired = t_epoch(2_000) + PEER_TTL;
         fx.announce(&late, expired);
         fx.store.note_key_change(
             &late.identity_hash,
@@ -11446,25 +11610,25 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(4_200));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(4_200));
         fx.store.note_key_change(
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Served,
-            t(4_500),
+            t_epoch(4_500),
         );
         assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
 
-        fx.announce(&old, t(5_000));
+        fx.announce(&old, t_epoch(5_000));
         let marked = fx.store.note_key_change(
             &old.identity_hash,
             &old.name_hash,
             KeyChangeOutcome::Served,
-            t(5_100),
+            t_epoch(5_100),
         );
 
         assert!(marked.is_empty(), "{marked:?}");
@@ -11482,14 +11646,14 @@ mod tests {
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let (old, new) = trusted_then_rotated(&fx);
         fx.store
-            .seed_deny(&fx.mesh, &old.destination_hash, t(4_000))
+            .seed_deny(&fx.mesh, &old.destination_hash, t_epoch(4_000))
             .unwrap();
 
         let marked = fx.store.note_key_change(
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(5_000),
+            t_epoch(5_000),
         );
 
         assert_eq!(marked.len(), 1, "{marked:?}");
@@ -11517,17 +11681,17 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let rotating = PrivateIdentity::new_from_rand(OsRng);
         let old = announced_as(rotating.clone(), "alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let outcome = announce_outcome(&fx.store, &new);
         assert_eq!(outcome, KeyChangeOutcome::Served);
 
         let marked =
             fx.store
-                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t(4_500));
+                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t_epoch(4_500));
 
         assert!(marked.is_empty(), "{marked:?}");
         let texts = surface.texts();
@@ -11547,17 +11711,17 @@ mod tests {
         );
 
         let old_beta = announced_as(rotating, "beta");
-        fx.announce(&old_beta, t(7_000));
+        fx.announce(&old_beta, t_epoch(7_000));
         let new_beta = announced("beta");
-        fx.announce(&new_beta, t(8_000));
-        fx.trust_destination(&new_beta, t(9_000));
+        fx.announce(&new_beta, t_epoch(8_000));
+        fx.trust_destination(&new_beta, t_epoch(9_000));
         assert!(
             fx.store
                 .note_key_change(
                     &new_beta.identity_hash,
                     &new_beta.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(10_000)
+                    t_epoch(10_000)
                 )
                 .is_empty()
         );
@@ -11585,19 +11749,19 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
         assert_eq!(new.name_hash, old.name_hash);
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let before = fx.file_bytes().unwrap();
         let identity = parse_hash(&new.identity_hash).unwrap();
         let name_hash = decode_name_hash(&new.name_hash).unwrap();
 
         let origin = fx
             .store
-            .authorize_origin_at(&identity, &name_hash, t(4_500));
+            .authorize_origin_at(&identity, &name_hash, t_epoch(4_500));
         assert_eq!(
             origin.verdict,
             verdict(Decision::Refuse, Rule::IdentityChanged)
@@ -11614,7 +11778,7 @@ mod tests {
                 .authorize_origin_at(
                     &parse_hash(&old.identity_hash).unwrap(),
                     &name_hash,
-                    t(4_500)
+                    t_epoch(4_500)
                 )
                 .verdict,
             verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -11625,7 +11789,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Refused,
-            t(4_500),
+            t_epoch(4_500),
         );
         assert!(marked.is_empty(), "{marked:?}");
         let texts = surface.texts();
@@ -11658,17 +11822,20 @@ mod tests {
         fx.store.set_collision_protection(false);
         assert_eq!(
             fx.store
-                .authorize_origin_at(&identity, &name_hash, t(4_500))
+                .authorize_origin_at(&identity, &name_hash, t_epoch(4_500))
                 .verdict,
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "protection off serves the identity allow"
         );
         fx.store.set_collision_protection(true);
 
-        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            fx.trust_destination(&new, t_epoch(6_000)),
+            TrustChange::Added
+        );
         assert_eq!(
             fx.store
-                .authorize_origin_at(&identity, &name_hash, t(6_500))
+                .authorize_origin_at(&identity, &name_hash, t_epoch(6_500))
                 .verdict,
             verdict(Decision::Allow, Rule::DestinationTrusted),
             "the human trusting the new destination admits it under protection"
@@ -11697,10 +11864,10 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&presence) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
-        fx.announce(&old, t(4_000));
-        fx.trust_identity(&old.identity_hash, t(4_000));
+        fx.announce(&old, t_epoch(4_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(4_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_100));
+        fx.announce(&new, t_epoch(4_100));
         let identity = parse_hash(&new.identity_hash).unwrap();
         let name_hash = decode_name_hash(&new.name_hash).unwrap();
         let origin = |now| {
@@ -11712,22 +11879,22 @@ mod tests {
 
         fx.store.set_collision_protection(true);
         assert_eq!(
-            origin(t(4_500)),
+            origin(t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
         assert_eq!(scans(), 0, "a stranger is not judged against the table");
 
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         fx.store.set_collision_protection(false);
         assert_eq!(
-            origin(t(5_500)),
+            origin(t_epoch(5_500)),
             verdict(Decision::Allow, Rule::IdentityTrusted)
         );
         assert_eq!(scans(), 0, "protection off never reads the table");
 
         fx.store.set_collision_protection(true);
         assert_eq!(
-            origin(t(5_500)),
+            origin(t_epoch(5_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
@@ -11736,9 +11903,12 @@ mod tests {
             "the identity allow under protection is the one rung that scans"
         );
 
-        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
         assert_eq!(
-            origin(t(6_500)),
+            fx.trust_destination(&new, t_epoch(6_000)),
+            TrustChange::Added
+        );
+        assert_eq!(
+            origin(t_epoch(6_500)),
             verdict(Decision::Allow, Rule::DestinationTrusted)
         );
         assert_eq!(
@@ -11748,10 +11918,10 @@ mod tests {
         );
 
         fx.store
-            .block_identity(&fx.mesh, &new.identity_hash, None, t(7_000))
+            .block_identity(&fx.mesh, &new.identity_hash, None, t_epoch(7_000))
             .unwrap();
         assert_eq!(
-            origin(t(7_500)),
+            origin(t_epoch(7_500)),
             verdict(Decision::Refuse, Rule::IdentityBlocked)
         );
         assert_eq!(
@@ -11780,12 +11950,12 @@ mod tests {
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
         assert_eq!(new.name_hash, old.name_hash);
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let before = fx.file_bytes().unwrap();
         let name_hash = decode_name_hash(&new.name_hash).unwrap();
         let origin = |peer: &Announced, now| {
@@ -11793,10 +11963,10 @@ mod tests {
                 .authorize_origin_at(&parse_hash(&peer.identity_hash).unwrap(), &name_hash, now)
                 .verdict
         };
-        let aged_out = t(4_000) + PEER_TTL;
+        let aged_out = t_epoch(4_000) + PEER_TTL;
 
         assert_eq!(
-            origin(&new, t(4_500)),
+            origin(&new, t_epoch(4_500)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "no peer table attached: nothing to consult, the identity allow stands"
         );
@@ -11809,12 +11979,12 @@ mod tests {
             "nobody refused yet and both rows aged out: nothing is remembered"
         );
         assert_eq!(
-            origin(&new, t(4_500)),
+            origin(&new, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the old row is live at 4 500 s"
         );
         assert_eq!(
-            origin(&old, t(4_500)),
+            origin(&old, t_epoch(4_500)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "the old key was heard first: the holder is never refused by this rung"
         );
@@ -11831,7 +12001,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(4_500),
+                    t_epoch(4_500),
                 )
                 .is_empty(),
             "nothing is marked"
@@ -11857,7 +12027,7 @@ mod tests {
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "the holder no longer trusted for all destinations: the memo refuses nobody"
         );
-        fx.trust_identity(&old.identity_hash, t(5_200));
+        fx.trust_identity(&old.identity_hash, t_epoch(5_200));
         assert_eq!(
             origin(&new, aged_out),
             verdict(Decision::Refuse, Rule::IdentityChanged),
@@ -11865,7 +12035,7 @@ mod tests {
         );
 
         fx.store
-            .block_identity(&fx.mesh, &old.identity_hash, None, t(5_300))
+            .block_identity(&fx.mesh, &old.identity_hash, None, t_epoch(5_300))
             .unwrap();
         assert_eq!(
             origin(&new, aged_out),
@@ -11875,7 +12045,7 @@ mod tests {
         fx.store
             .unblock_identity(&fx.mesh, &old.identity_hash, false)
             .unwrap();
-        fx.trust_identity(&old.identity_hash, t(5_400));
+        fx.trust_identity(&old.identity_hash, t_epoch(5_400));
         assert_eq!(
             origin(&new, aged_out),
             verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -11883,7 +12053,7 @@ mod tests {
              rung refuses over a live row again"
         );
         assert_eq!(
-            origin(&new, t(4_500)),
+            origin(&new, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the live row refuses and arms the memo again"
         );
@@ -11893,21 +12063,21 @@ mod tests {
         );
 
         fx.store
-            .block_identity(&fx.mesh, &new.identity_hash, None, t(5_500))
+            .block_identity(&fx.mesh, &new.identity_hash, None, t_epoch(5_500))
             .unwrap();
         assert_eq!(
-            origin(&new, t(4_500)),
+            origin(&new, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityBlocked)
         );
         assert_eq!(
-            origin(&old, t(4_500)),
+            origin(&old, t_epoch(4_500)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "the holder is admitted whatever becomes of the presenter"
         );
         fx.store
             .unblock_identity(&fx.mesh, &new.identity_hash, false)
             .unwrap();
-        fx.trust_identity(&new.identity_hash, t(5_600));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_600));
         assert_eq!(
             origin(&new, aged_out),
             verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -11915,12 +12085,15 @@ mod tests {
              admitted with the old row gone"
         );
         assert_eq!(
-            origin(&new, t(4_500)),
+            origin(&new, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "and refused over the live row again"
         );
 
-        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            fx.trust_destination(&new, t_epoch(6_000)),
+            TrustChange::Added
+        );
         assert_eq!(
             origin(&new, aged_out),
             verdict(Decision::Allow, Rule::DestinationTrusted),
@@ -11946,10 +12119,10 @@ mod tests {
         let holder = fake_hash(0x11);
         let presenter = fake_hash(0x22);
         let mut state = State::default();
-        state
-            .file
-            .identities
-            .insert(holder.clone(), identity_entry(t(1_000), t(1_000), true));
+        state.file.identities.insert(
+            holder.clone(),
+            identity_entry(t_epoch(1_000), t_epoch(1_000), true),
+        );
         let instance = |n: usize| format!("instance-{n}");
 
         state.remember_refusal(&instance(0), &holder, &presenter);
@@ -12047,18 +12220,18 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let identity = parse_hash(&new.identity_hash).unwrap();
         let name_hash = decode_name_hash(&new.name_hash).unwrap();
 
         for round in 0..3 {
-            let origin = fx
-                .store
-                .authorize_origin_at(&identity, &name_hash, t(4_500 + round));
+            let origin =
+                fx.store
+                    .authorize_origin_at(&identity, &name_hash, t_epoch(4_500 + round));
             assert_eq!(
                 origin.verdict,
                 verdict(Decision::Refuse, Rule::IdentityChanged),
@@ -12070,7 +12243,7 @@ mod tests {
                         &new.identity_hash,
                         &new.name_hash,
                         KeyChangeOutcome::Refused,
-                        t(4_500 + round),
+                        t_epoch(4_500 + round),
                     )
                     .is_empty(),
                 "round {round}: nothing is marked"
@@ -12087,7 +12260,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Served,
-                    t(4_600),
+                    t_epoch(4_600),
                 )
                 .is_empty()
         );
@@ -12112,11 +12285,11 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         assert_eq!(
             origin_verdict(&fx.store, &new),
             verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -12127,7 +12300,7 @@ mod tests {
             &new.identity_hash,
             &new.name_hash,
             KeyChangeOutcome::Served,
-            t(4_500),
+            t_epoch(4_500),
         );
 
         let texts = surface.texts();
@@ -12166,16 +12339,16 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let before = fx.file_bytes().unwrap();
         let instance = new.name_hash.as_str();
 
         assert_eq!(
-            present(&fx, &new, instance, t(4_500)),
+            present(&fx, &new, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         let texts = surface.texts();
@@ -12198,7 +12371,7 @@ mod tests {
         }
 
         assert_eq!(
-            present(&fx, &old, instance, t(4_500)),
+            present(&fx, &old, instance, t_epoch(4_500)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "the first-heard holder is never refused by this rung"
         );
@@ -12224,16 +12397,16 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let instance = new.name_hash.as_str();
-        let old_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+        let old_row_gone = t_epoch(2_000) + PEER_TTL + Duration::from_secs(1);
 
         assert_eq!(
-            present(&fx, &new, instance, t(4_500)),
+            present(&fx, &new, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert!(
@@ -12272,15 +12445,15 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let victim = announced("alpha");
-        fx.announce(&victim, t(2_000));
-        fx.trust_identity(&victim.identity_hash, t(2_100));
+        fx.announce(&victim, t_epoch(2_000));
+        fx.trust_identity(&victim.identity_hash, t_epoch(2_100));
         let insider = announced("alpha");
-        fx.announce(&insider, t(3_000));
-        fx.trust_identity(&insider.identity_hash, t(3_100));
+        fx.announce(&insider, t_epoch(3_000));
+        fx.trust_identity(&insider.identity_hash, t_epoch(3_100));
         let instance = victim.name_hash.as_str();
 
         assert_eq!(
-            present(&fx, &insider, instance, t(3_500)),
+            present(&fx, &insider, instance, t_epoch(3_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "presenting first makes nobody the holder"
         );
@@ -12293,12 +12466,12 @@ mod tests {
             );
         }
         assert_eq!(
-            present(&fx, &victim, instance, t(3_600)),
+            present(&fx, &victim, instance, t_epoch(3_600)),
             verdict(Decision::Allow, Rule::IdentityTrusted)
         );
         assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
 
-        let victim_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+        let victim_row_gone = t_epoch(2_000) + PEER_TTL + Duration::from_secs(1);
         assert_eq!(
             present(&fx, &victim, instance, victim_row_gone),
             verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -12325,15 +12498,15 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let victim = announced("alpha");
-        fx.announce(&victim, t(2_000));
-        fx.trust_identity(&victim.identity_hash, t(2_100));
+        fx.announce(&victim, t_epoch(2_000));
+        fx.trust_identity(&victim.identity_hash, t_epoch(2_100));
         let insider = announced("alpha");
-        fx.announce(&insider, t(3_000));
-        fx.trust_identity(&insider.identity_hash, t(3_100));
+        fx.announce(&insider, t_epoch(3_000));
+        fx.trust_identity(&insider.identity_hash, t_epoch(3_100));
         let instance = victim.name_hash.as_str();
 
         assert_eq!(
-            present(&fx, &victim, instance, t(3_500)),
+            present(&fx, &victim, instance, t_epoch(3_500)),
             verdict(Decision::Allow, Rule::IdentityTrusted)
         );
         {
@@ -12348,7 +12521,7 @@ mod tests {
         assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
 
         assert_eq!(
-            present(&fx, &insider, instance, t(3_600)),
+            present(&fx, &insider, instance, t_epoch(3_600)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         {
@@ -12375,16 +12548,16 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let instance = new.name_hash.as_str();
-        let old_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+        let old_row_gone = t_epoch(2_000) + PEER_TTL + Duration::from_secs(1);
 
         assert_eq!(
-            present(&fx, &new, instance, t(4_500)),
+            present(&fx, &new, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
@@ -12393,7 +12566,10 @@ mod tests {
             "the memo alone refuses"
         );
 
-        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            fx.trust_destination(&new, t_epoch(6_000)),
+            TrustChange::Added
+        );
         {
             let state = fx.store.inner.lock();
             assert!(
@@ -12419,7 +12595,7 @@ mod tests {
                 removed: vec![new.destination_hash.clone()],
             }
         );
-        fx.trust_identity(&new.identity_hash, t(6_100));
+        fx.trust_identity(&new.identity_hash, t_epoch(6_100));
         assert_eq!(
             present(&fx, &new, instance, old_row_gone),
             verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -12442,19 +12618,19 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let presenter = announced("alpha");
-        fx.announce(&presenter, t(4_000));
-        fx.trust_identity(&presenter.identity_hash, t(5_000));
+        fx.announce(&presenter, t_epoch(4_000));
+        fx.trust_identity(&presenter.identity_hash, t_epoch(5_000));
         let third = announced("beta");
-        fx.announce(&third, t(2_000));
-        fx.trust_identity(&third.identity_hash, t(3_000));
+        fx.announce(&third, t_epoch(2_000));
+        fx.trust_identity(&third.identity_hash, t_epoch(3_000));
         let instance = holder.name_hash.as_str();
-        let holder_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+        let holder_row_gone = t_epoch(2_000) + PEER_TTL + Duration::from_secs(1);
 
         assert_eq!(
-            present(&fx, &presenter, instance, t(4_500)),
+            present(&fx, &presenter, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
@@ -12474,7 +12650,7 @@ mod tests {
         }
 
         fx.store
-            .block_identity(&fx.mesh, &presenter.identity_hash, None, t(6_000))
+            .block_identity(&fx.mesh, &presenter.identity_hash, None, t_epoch(6_000))
             .unwrap();
         {
             let state = fx.store.inner.lock();
@@ -12491,7 +12667,7 @@ mod tests {
             "no memo and no live row under a key trusted for all destinations: admitted"
         );
         assert_eq!(
-            present(&fx, &third, instance, t(4_500)),
+            present(&fx, &third, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the holder's live row refuses as before"
         );
@@ -12523,22 +12699,22 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let presenter = announced("alpha");
-        fx.announce(&presenter, t(4_000));
-        fx.trust_identity(&presenter.identity_hash, t(5_000));
+        fx.announce(&presenter, t_epoch(4_000));
+        fx.trust_identity(&presenter.identity_hash, t_epoch(5_000));
         let instance = holder.name_hash.as_str();
-        let holder_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+        let holder_row_gone = t_epoch(2_000) + PEER_TTL + Duration::from_secs(1);
 
         assert_eq!(
-            present(&fx, &presenter, instance, t(4_500)),
+            present(&fx, &presenter, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         fx.store
             .untrust_identity(&fx.mesh, &holder.identity_hash, false)
             .unwrap();
-        fx.trust_identity(&holder.identity_hash, t(5_100));
+        fx.trust_identity(&holder.identity_hash, t_epoch(5_100));
         assert_eq!(
             present(&fx, &presenter, instance, holder_row_gone),
             verdict(Decision::Refuse, Rule::IdentityChanged),
@@ -12546,7 +12722,7 @@ mod tests {
         );
 
         fx.store
-            .block_identity(&fx.mesh, &holder.identity_hash, None, t(6_000))
+            .block_identity(&fx.mesh, &holder.identity_hash, None, t_epoch(6_000))
             .unwrap();
         {
             let state = fx.store.inner.lock();
@@ -12560,14 +12736,14 @@ mod tests {
         fx.store
             .unblock_identity(&fx.mesh, &holder.identity_hash, false)
             .unwrap();
-        fx.trust_identity(&holder.identity_hash, t(6_100));
+        fx.trust_identity(&holder.identity_hash, t_epoch(6_100));
         assert_eq!(
             present(&fx, &presenter, instance, holder_row_gone),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "blocking cleared the memo: trusted again, the holder refuses nothing by memory"
         );
         assert_eq!(
-            present(&fx, &presenter, instance, t(4_500)),
+            present(&fx, &presenter, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "its live row refuses again"
         );
@@ -12580,7 +12756,7 @@ mod tests {
     }
 
     /// `InstancePresence` that reports every instance as held by one identity, heard at
-    /// t(1 000), while `live`, and nothing once switched off, so the memos can be told from
+    /// t_epoch(1 000), while `live`, and nothing once switched off, so the memos can be told from
     /// the table.
     struct SwitchablePresence {
         holder: String,
@@ -12595,7 +12771,7 @@ mod tests {
             vec![PresenceRow {
                 destination_hash: format!("{name_hash}{}", &fake_hash(0x7d)[name_hash.len()..]),
                 identity_hash: self.holder.clone(),
-                first_seen: t(1_000),
+                first_seen: t_epoch(1_000),
             }]
         }
     }
@@ -12614,11 +12790,11 @@ mod tests {
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         fx.store.set_collision_protection(true);
         let holder = announced("holder");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let presenter = announced("presenter");
-        fx.announce(&presenter, t(2_000));
-        fx.trust_identity(&presenter.identity_hash, t(3_000));
+        fx.announce(&presenter, t_epoch(2_000));
+        fx.trust_identity(&presenter.identity_hash, t_epoch(3_000));
         let presence = Arc::new(SwitchablePresence {
             holder: holder.identity_hash.clone(),
             live: AtomicBool::new(true),
@@ -12649,7 +12825,7 @@ mod tests {
 
         for n in 0..=PRESENCE_SURFACED_CAP {
             assert_eq!(
-                judge(n, t(4_000)),
+                judge(n, t_epoch(4_000)),
                 verdict(Decision::Refuse, Rule::IdentityChanged),
                 "instance {n}"
             );
@@ -12662,17 +12838,17 @@ mod tests {
 
         presence.live.store(false, Ordering::SeqCst);
         assert_eq!(
-            judge(0, t(4_100)),
+            judge(0, t_epoch(4_100)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "the oldest pair was evicted at the cap: with the table silent it refuses nobody"
         );
         assert_eq!(
-            judge(1, t(4_100)),
+            judge(1, t_epoch(4_100)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the next-oldest pair is still remembered"
         );
         assert_eq!(
-            judge(PRESENCE_SURFACED_CAP, t(4_100)),
+            judge(PRESENCE_SURFACED_CAP, t_epoch(4_100)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "and so is the newest"
         );
@@ -12684,7 +12860,7 @@ mod tests {
 
         presence.live.store(true, Ordering::SeqCst);
         assert_eq!(
-            judge(0, t(4_200)),
+            judge(0, t_epoch(4_200)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "heard again, the evicted instance is refused from the table"
         );
@@ -12695,12 +12871,12 @@ mod tests {
         );
         presence.live.store(false, Ordering::SeqCst);
         assert_eq!(
-            judge(0, t(4_300)),
+            judge(0, t_epoch(4_300)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the re-earned line remembers the pair again"
         );
         assert_eq!(
-            judge(1, t(4_300)),
+            judge(1, t_epoch(4_300)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "re-remembering instance 0 evicted the then-oldest pair, instance 1"
         );
@@ -12724,10 +12900,10 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let stranger = announced("alpha");
-        fx.announce(&stranger, t(4_000));
+        fx.announce(&stranger, t_epoch(4_000));
         let name_hash = decode_name_hash(&holder.name_hash).unwrap();
         let judge = |peer: &Announced, now| {
             let origin = fx.store.authorize_origin_at(
@@ -12749,7 +12925,7 @@ mod tests {
         };
 
         assert_eq!(
-            judge(&stranger, t(4_500)),
+            judge(&stranger, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
         let texts = surface.texts();
@@ -12761,11 +12937,11 @@ mod tests {
         );
 
         let successor = announced("alpha");
-        fx.announce(&successor, t(4_550));
-        fx.trust_identity(&successor.identity_hash, t(4_550));
+        fx.announce(&successor, t_epoch(4_550));
+        fx.trust_identity(&successor.identity_hash, t_epoch(4_550));
         let before = fx.file_bytes().unwrap();
         assert_eq!(
-            judge(&successor, t(4_600)),
+            judge(&successor, t_epoch(4_600)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         let texts = surface.texts();
@@ -12797,7 +12973,7 @@ mod tests {
         );
 
         assert_eq!(
-            judge(&successor, t(4_650)),
+            judge(&successor, t_epoch(4_650)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
@@ -12807,7 +12983,7 @@ mod tests {
             surface.texts()
         );
         assert_eq!(
-            judge(&holder, t(4_650)),
+            judge(&holder, t_epoch(4_650)),
             verdict(Decision::Allow, Rule::IdentityTrusted),
             "the first-heard holder is admitted while the successor's row is live"
         );
@@ -12818,7 +12994,7 @@ mod tests {
             surface.texts()
         );
         assert_eq!(
-            judge(&successor, t(4_550) + PEER_TTL),
+            judge(&successor, t_epoch(4_550) + PEER_TTL),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the successor's own refusal armed the memo; every row gone, it still refuses"
         );
@@ -12848,21 +13024,21 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let name_hash = decode_name_hash(&new.name_hash).unwrap();
         let origin = |now| {
             fx.store
                 .authorize_origin_at(&parse_hash(&new.identity_hash).unwrap(), &name_hash, now)
                 .verdict
         };
-        let old_row_gone = t(2_000) + PEER_TTL;
+        let old_row_gone = t_epoch(2_000) + PEER_TTL;
 
         assert_eq!(
-            origin(t(4_500)),
+            origin(t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert!(
@@ -12871,7 +13047,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(4_500),
+                    t_epoch(4_500),
                 )
                 .is_empty()
         );
@@ -12883,7 +13059,7 @@ mod tests {
             warn_snapshot()
         );
         assert_eq!(
-            origin(t(4_500)),
+            origin(t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the live row still refuses"
         );
@@ -12986,9 +13162,9 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let own = announced("alpha");
-        fx.announce(&own, t(2_000));
+        fx.announce(&own, t_epoch(2_000));
         fx.store.set_own_identity(&own.identity_hash).unwrap();
-        fx.trust_destination(&own, t(3_000));
+        fx.trust_destination(&own, t_epoch(3_000));
         let cache = TempDir::new("trust-key-change-own-session-cache");
         instances::register(
             &cache.path,
@@ -13001,13 +13177,13 @@ mod tests {
         );
         fx.store.attach_instance_registry(&cache.path);
         let presenter = announced("alpha");
-        fx.announce(&presenter, t(4_000));
+        fx.announce(&presenter, t_epoch(4_000));
 
         fx.store.note_key_change(
             &presenter.identity_hash,
             &own.name_hash,
             KeyChangeOutcome::Refused,
-            t(4_500),
+            t_epoch(4_500),
         );
 
         let texts = surface.texts();
@@ -13042,20 +13218,20 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         // Two more identities trusted for all destinations, heard under their own
         // instances, and one trusted for its own destination only.
         let first = announced("beta");
-        fx.announce(&first, t(2_000));
-        fx.trust_identity(&first.identity_hash, t(3_000));
+        fx.announce(&first, t_epoch(2_000));
+        fx.trust_identity(&first.identity_hash, t_epoch(3_000));
         let second = announced("gamma");
-        fx.announce(&second, t(2_000));
-        fx.trust_identity(&second.identity_hash, t(3_000));
+        fx.announce(&second, t_epoch(2_000));
+        fx.trust_identity(&second.identity_hash, t_epoch(3_000));
         let destination_tier = announced("delta");
-        fx.announce(&destination_tier, t(2_000));
+        fx.announce(&destination_tier, t_epoch(2_000));
         assert_eq!(
-            fx.trust_destination(&destination_tier, t(3_000)),
+            fx.trust_destination(&destination_tier, t_epoch(3_000)),
             TrustChange::Added
         );
         let stranger = announced("alpha");
@@ -13063,7 +13239,7 @@ mod tests {
         let instance = holder.name_hash.as_str();
 
         assert_eq!(
-            present(&fx, &first, instance, t(4_500)),
+            present(&fx, &first, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         let texts = surface.texts();
@@ -13083,7 +13259,7 @@ mod tests {
         );
 
         assert_eq!(
-            present(&fx, &second, instance, t(4_600)),
+            present(&fx, &second, instance, t_epoch(4_600)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         let texts = surface.texts();
@@ -13108,11 +13284,11 @@ mod tests {
         );
 
         assert_eq!(
-            present(&fx, &first, instance, t(4_650)),
+            present(&fx, &first, instance, t_epoch(4_650)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
-            present(&fx, &second, instance, t(4_650)),
+            present(&fx, &second, instance, t_epoch(4_650)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
@@ -13123,11 +13299,11 @@ mod tests {
         );
 
         assert_eq!(
-            present(&fx, &stranger, instance, t(4_680)),
+            present(&fx, &stranger, instance, t_epoch(4_680)),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
         assert_eq!(
-            present(&fx, &destination_tier, instance, t(4_680)),
+            present(&fx, &destination_tier, instance, t_epoch(4_680)),
             verdict(Decision::Refuse, Rule::DefaultClosed),
             "a known identity with no allow of its own still knocks for a presence-only instance"
         );
@@ -13138,7 +13314,7 @@ mod tests {
             surface.texts()
         );
 
-        let holder_row_gone = t(2_000) + PEER_TTL;
+        let holder_row_gone = t_epoch(2_000) + PEER_TTL;
         assert_eq!(
             present(&fx, &first, instance, holder_row_gone),
             verdict(Decision::Refuse, Rule::IdentityChanged),
@@ -13181,18 +13357,18 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let refused = announced("beta");
-        fx.announce(&refused, t(2_000));
-        fx.trust_identity(&refused.identity_hash, t(3_000));
+        fx.announce(&refused, t_epoch(2_000));
+        fx.trust_identity(&refused.identity_hash, t_epoch(3_000));
         let stranger = announced("alpha");
         let before = fx.file_bytes().unwrap();
         let instance = holder.name_hash.as_str();
-        let holder_row_gone = t(2_000) + PEER_TTL;
+        let holder_row_gone = t_epoch(2_000) + PEER_TTL;
 
         assert_eq!(
-            present(&fx, &stranger, instance, t(4_500)),
+            present(&fx, &stranger, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
         assert_eq!(recording.texts().len(), 1, "{:#?}", recording.texts());
@@ -13201,7 +13377,7 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&dropping) as Weak<dyn KnockSurface>);
         assert_eq!(
-            present(&fx, &refused, instance, t(4_600)),
+            present(&fx, &refused, instance, t_epoch(4_600)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert!(
@@ -13220,7 +13396,7 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&recording) as Weak<dyn KnockSurface>);
         assert_eq!(
-            present(&fx, &refused, instance, t(4_650)),
+            present(&fx, &refused, instance, t_epoch(4_650)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         let texts = recording.texts();
@@ -13239,7 +13415,7 @@ mod tests {
             texts[1]
         );
         assert_eq!(
-            present(&fx, &refused, instance, t(4_680)),
+            present(&fx, &refused, instance, t_epoch(4_680)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(
@@ -13262,17 +13438,17 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let before = fx.file_bytes().unwrap();
         let instance = new.name_hash.as_str();
-        let old_row_gone = t(2_000) + PEER_TTL;
+        let old_row_gone = t_epoch(2_000) + PEER_TTL;
 
         assert_eq!(
-            present(&fx, &new, instance, t(4_500)),
+            present(&fx, &new, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the live row refuses"
         );
@@ -13299,7 +13475,7 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         assert_eq!(
-            present(&fx, &new, instance, t(4_600)),
+            present(&fx, &new, instance, t_epoch(4_600)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         let texts = surface.texts();
@@ -13334,17 +13510,17 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let first = announced("beta");
-        fx.announce(&first, t(2_000));
-        fx.trust_identity(&first.identity_hash, t(3_000));
+        fx.announce(&first, t_epoch(2_000));
+        fx.trust_identity(&first.identity_hash, t_epoch(3_000));
         let newcomer = announced("alpha");
         let instance = holder.name_hash.as_str();
-        let holder_row_gone = t(2_000) + PEER_TTL;
+        let holder_row_gone = t_epoch(2_000) + PEER_TTL;
 
         assert_eq!(
-            present(&fx, &first, instance, t(4_500)),
+            present(&fx, &first, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
@@ -13418,17 +13594,17 @@ mod tests {
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         fx.store.set_collision_protection(true);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let first = announced("beta");
-        fx.announce(&first, t(2_000));
-        fx.trust_identity(&first.identity_hash, t(3_000));
+        fx.announce(&first, t_epoch(2_000));
+        fx.trust_identity(&first.identity_hash, t_epoch(3_000));
         let newcomer = announced("alpha");
         let instance = holder.name_hash.as_str();
-        let holder_row_gone = t(2_000) + PEER_TTL;
+        let holder_row_gone = t_epoch(2_000) + PEER_TTL;
 
         assert_eq!(
-            present(&fx, &first, instance, t(4_500)),
+            present(&fx, &first, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(recording.texts().len(), 1, "{:#?}", recording.texts());
@@ -13564,17 +13740,17 @@ mod tests {
             .attach_surface(Arc::downgrade(&gone) as Weak<dyn KnockSurface>);
         drop(gone);
         let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        fx.trust_identity(&old.identity_hash, t(3_000));
+        fx.announce(&old, t_epoch(2_000));
+        fx.trust_identity(&old.identity_hash, t_epoch(3_000));
         let new = announced("alpha");
-        fx.announce(&new, t(4_000));
-        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.announce(&new, t_epoch(4_000));
+        fx.trust_identity(&new.identity_hash, t_epoch(5_000));
         let before = fx.file_bytes().unwrap();
         let instance = new.name_hash.as_str();
-        let old_row_gone = t(2_000) + PEER_TTL;
+        let old_row_gone = t_epoch(2_000) + PEER_TTL;
 
         assert_eq!(
-            present(&fx, &new, instance, t(4_500)),
+            present(&fx, &new, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::IdentityChanged),
             "the live row refuses"
         );
@@ -13607,7 +13783,7 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         assert_eq!(
-            present(&fx, &new, instance, t(4_600)),
+            present(&fx, &new, instance, t_epoch(4_600)),
             verdict(Decision::Refuse, Rule::IdentityChanged)
         );
         assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
@@ -13633,25 +13809,29 @@ mod tests {
         fx.store
             .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let holder = announced("alpha");
-        fx.announce(&holder, t(2_000));
-        fx.trust_identity(&holder.identity_hash, t(3_000));
+        fx.announce(&holder, t_epoch(2_000));
+        fx.trust_identity(&holder.identity_hash, t_epoch(3_000));
         let first = announced("beta");
-        fx.announce(&first, t(2_000));
-        fx.trust_identity(&first.identity_hash, t(3_000));
+        fx.announce(&first, t_epoch(2_000));
+        fx.trust_identity(&first.identity_hash, t_epoch(3_000));
         let second = announced("gamma");
-        fx.announce(&second, t(2_000));
-        fx.trust_identity(&second.identity_hash, t(3_000));
+        fx.announce(&second, t_epoch(2_000));
+        fx.trust_identity(&second.identity_hash, t_epoch(3_000));
         let stranger = announced("alpha");
         let before = fx.file_bytes().unwrap();
         let instance = holder.name_hash.as_str();
 
         assert_eq!(
-            present(&fx, &stranger, instance, t(4_500)),
+            present(&fx, &stranger, instance, t_epoch(4_500)),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
         assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
 
-        for (peer, at) in [(&first, t(4_600)), (&second, t(4_650)), (&first, t(4_690))] {
+        for (peer, at) in [
+            (&first, t_epoch(4_600)),
+            (&second, t_epoch(4_650)),
+            (&first, t_epoch(4_690)),
+        ] {
             assert_eq!(
                 present(&fx, peer, instance, at),
                 verdict(Decision::Allow, Rule::IdentityTrusted),
@@ -13728,7 +13908,7 @@ mod tests {
         fn naming_a_stranger_leaves_it_a_stranger() {
             let fx = Fixture::new("trust-people-stranger");
             let stranger = announced("alpha");
-            fx.announce(&stranger, t(1_000));
+            fx.announce(&stranger, t_epoch(1_000));
             let (id, dest) = (&stranger.identity_hash, &stranger.destination_hash);
 
             fx.store.set_person_alias(id, Some("Bea"), &[]).unwrap();
@@ -13778,9 +13958,9 @@ mod tests {
         fn revoke_and_block_keep_a_persons_names_and_forget_erases_them() {
             let fx = Fixture::new("trust-people-lifecycle");
             let peer = announced("alpha");
-            fx.announce(&peer, t(1_000));
+            fx.announce(&peer, t_epoch(1_000));
             let (id, dest) = (&peer.identity_hash, &peer.destination_hash);
-            trust_labelled(&fx, &peer, "laptop", t(1_000));
+            trust_labelled(&fx, &peer, "laptop", t_epoch(1_000));
             fx.store.set_person_alias(id, Some("Alex"), &[]).unwrap();
             let named = (Some("Alex".to_string()), Some("laptop".to_string()));
             let names =
@@ -13795,14 +13975,14 @@ mod tests {
             );
 
             fx.store
-                .trust_destination(&fx.mesh, dest, TrustOptions::default(), t(1_100))
+                .trust_destination(&fx.mesh, dest, TrustOptions::default(), t_epoch(1_100))
                 .unwrap();
             assert_eq!(
                 record(&fx.store, dest).label.as_deref(),
                 Some("laptop"),
                 "a re-trusted session is listed under the name it kept"
             );
-            fx.trust_identity(id, t(1_200));
+            fx.trust_identity(id, t_epoch(1_200));
             fx.store.untrust_identity(&fx.mesh, id, false).unwrap();
             assert_eq!(
                 names(&fx.store),
@@ -13811,7 +13991,7 @@ mod tests {
             );
 
             fx.store
-                .deny_destination(&fx.mesh, dest, None, t(1_300), false)
+                .deny_destination(&fx.mesh, dest, None, t_epoch(1_300), false)
                 .unwrap();
             assert_eq!(
                 names(&fx.store),
@@ -13820,7 +14000,7 @@ mod tests {
             );
 
             fx.store
-                .block_identity(&fx.mesh, id, None, t(1_400))
+                .block_identity(&fx.mesh, id, None, t_epoch(1_400))
                 .unwrap();
             assert_eq!(fx.store.identity_standing(id), IdentityStanding::Blocked);
             assert_eq!(
@@ -13871,9 +14051,9 @@ mod tests {
         fn a_trust_label_is_the_owners_alias_and_is_never_written_on_the_record() {
             let fx = Fixture::new("trust-people-label");
             let peer = announced("alpha");
-            fx.announce(&peer, t(1_000));
+            fx.announce(&peer, t_epoch(1_000));
             let (id, dest) = (&peer.identity_hash, &peer.destination_hash);
-            trust_labelled(&fx, &peer, "Bob desk", t(1_000));
+            trust_labelled(&fx, &peer, "Bob desk", t_epoch(1_000));
             fx.store
                 .trust_identity(
                     &fx.mesh,
@@ -13882,7 +14062,7 @@ mod tests {
                         label: Some("Bob".to_string()),
                         note: Some("met at the meetup".to_string()),
                     },
-                    t(1_000),
+                    t_epoch(1_000),
                 )
                 .unwrap();
 
@@ -13899,7 +14079,7 @@ mod tests {
             assert!(!text.contains("    label:"), "{text}");
             assert!(text.contains("\npeople:\n"), "{text}");
 
-            trust_labelled(&fx, &peer, " ", t(1_100));
+            trust_labelled(&fx, &peer, " ", t_epoch(1_100));
             assert_eq!(record(&fx.store, dest).label, None, "a blank label clears");
             assert_eq!(record(&fx.store, id).label.as_deref(), Some("Bob"));
         }
@@ -14297,7 +14477,7 @@ mod tests {
             install_log_collector();
             let fx = Fixture::new("trust-people-unlogged");
             let peer = announced("alpha");
-            fx.announce(&peer, t(1_000));
+            fx.announce(&peer, t_epoch(1_000));
             let (id, dest) = (&peer.identity_hash, &peer.destination_hash);
             let names = [
                 "Quilliam-pp1",
@@ -14306,7 +14486,7 @@ mod tests {
                 "Quilliam-pp4",
                 "Quilliam-pp5",
             ];
-            trust_labelled(&fx, &peer, names[0], t(1_000));
+            trust_labelled(&fx, &peer, names[0], t_epoch(1_000));
             fx.store.set_person_alias(id, Some(names[1]), &[]).unwrap();
             fx.store
                 .record_advertised(id, dest, Some(names[2]), Some(names[3]))

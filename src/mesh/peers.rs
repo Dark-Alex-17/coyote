@@ -891,31 +891,30 @@ impl InstancePresence for PeerTable {
 
 #[cfg(test)]
 mod public_key_tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, announced_as, t_epoch};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
-    use crate::mesh::{hex_lower, session_destination_name};
     use crate::testing::{debug_snapshot, install_log_collector};
     use rns_transport::identity::PrivateIdentity;
     use rns_transport::rand_core::OsRng;
 
     /// A sighting whose hashes and key derive from a real identity, as an announce's do,
-    /// and that key.
-    fn announced() -> (PeerSighting, String) {
-        let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
-        let name = session_destination_name("instance");
-        let name_hash = <[u8; NAME_HASH_LEN]>::try_from(name.as_name_hash_slice()).unwrap();
+    /// and that key. The hashes come from the transport derivation, not from the helper
+    /// under test.
+    fn keyed_sighting() -> (PeerSighting, String) {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let key = identity.as_identity().to_hex_string();
+        let peer = announced_as(identity, "instance");
         let sighting = PeerSighting {
-            destination_hash: destination_address(&name_hash, &identity.address_hash)
-                .to_hex_string(),
-            identity_hash: identity.address_hash.to_hex_string(),
-            name_hash: hex_lower(&name_hash),
-            public_key: Some(identity.to_hex_string()),
+            destination_hash: peer.destination_hash,
+            identity_hash: peer.identity_hash,
+            name_hash: peer.name_hash,
+            public_key: Some(key.clone()),
             display_name: Some("Ada".to_string()),
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,
         };
-        (sighting, identity.to_hex_string())
+        (sighting, key)
     }
 
     fn path_in(tmp: &TempDir) -> PathBuf {
@@ -925,9 +924,9 @@ mod public_key_tests {
     #[test]
     fn a_stored_key_round_trips_and_rebuilds_the_announced_destination() {
         let tmp = TempDir::new("peers-key-round-trip");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, key) = announced();
+        let (sighting, key) = keyed_sighting();
         let destination = sighting.destination_hash.clone();
         table.observe(sighting, t0);
         table.persist_if_dirty().unwrap();
@@ -950,8 +949,8 @@ mod public_key_tests {
     #[test]
     fn a_tampered_key_is_not_used() {
         install_log_collector();
-        let (sighting, key) = announced();
-        let (_, other_key) = announced();
+        let (sighting, key) = keyed_sighting();
+        let (_, other_key) = keyed_sighting();
         let row = PeerRecord {
             destination_hash: sighting.destination_hash.clone(),
             identity_hash: sighting.identity_hash.clone(),
@@ -997,13 +996,13 @@ mod public_key_tests {
     #[test]
     fn a_row_that_follows_a_new_identity_drops_the_old_key() {
         let tmp = TempDir::new("peers-key-rebound");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, _) = announced();
+        let (sighting, _) = keyed_sighting();
         let destination = sighting.destination_hash.clone();
         table.observe(sighting, t0);
 
-        let (mut rebound, _) = announced();
+        let (mut rebound, _) = keyed_sighting();
         rebound.destination_hash = destination.clone();
         rebound.public_key = None;
         table.observe(rebound, t0 + Duration::from_secs(1));
@@ -1014,9 +1013,9 @@ mod public_key_tests {
     #[test]
     fn a_sighting_without_a_key_keeps_the_key_of_an_unchanged_identity() {
         let tmp = TempDir::new("peers-key-kept");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, key) = announced();
+        let (sighting, key) = keyed_sighting();
         let destination = sighting.destination_hash.clone();
         let keyless = PeerSighting {
             destination_hash: sighting.destination_hash.clone(),
@@ -1040,7 +1039,7 @@ mod public_key_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{TempDir, siblings_of};
+    use super::super::test_support::{TempDir, siblings_of, t_epoch};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -1106,20 +1105,19 @@ mod tests {
     /// else was heard: two live instances under one identity are both current.
     #[test]
     fn a_rows_successor_is_the_newest_later_sighting_of_its_identity_elsewhere() {
-        let t = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
         let named = |destination: &str, identity: &str, name: Option<&str>, at| PeerRecord {
             identity_hash: identity.to_string(),
             display_name: name.map(str::to_string),
             ..record(destination, MESH_PROTOCOL_VERSION, at)
         };
-        let old = named("a", "x", Some("bob"), t(1_000));
-        let newer = named("b", "x", Some("bob"), t(1_005));
-        let newest = named("c", "x", Some("bob"), t(1_010));
-        let renamed = named("d", "x", Some("carol"), t(1_020));
-        let nameless = named("e", "x", None, t(1_030));
-        let stranger = named("f", "y", Some("bob"), t(1_040));
-        let earlier = named("g", "x", Some("bob"), t(900));
-        let now = t(1_000) + PEER_STALE_AFTER;
+        let old = named("a", "x", Some("bob"), t_epoch(1_000));
+        let newer = named("b", "x", Some("bob"), t_epoch(1_005));
+        let newest = named("c", "x", Some("bob"), t_epoch(1_010));
+        let renamed = named("d", "x", Some("carol"), t_epoch(1_020));
+        let nameless = named("e", "x", None, t_epoch(1_030));
+        let stranger = named("f", "y", Some("bob"), t_epoch(1_040));
+        let earlier = named("g", "x", Some("bob"), t_epoch(900));
+        let now = t_epoch(1_000) + PEER_STALE_AFTER;
 
         assert!(
             old.successor_in([&old], now).is_none(),
@@ -1145,11 +1143,11 @@ mod tests {
             "renamed was heard earlier"
         );
         assert_eq!(
-            named("h", "x", None, t(1_000)).successor_in([&renamed], now),
+            named("h", "x", None, t_epoch(1_000)).successor_in([&renamed], now),
             Some(&renamed)
         );
         assert_eq!(
-            named("i", "x", None, t(1_000)).successor_in([&renamed, &nameless], now),
+            named("i", "x", None, t_epoch(1_000)).successor_in([&renamed, &nameless], now),
             Some(&nameless)
         );
 
