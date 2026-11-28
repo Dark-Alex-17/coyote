@@ -14,6 +14,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -24,6 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use expectrl::process::unix::WaitStatus;
 use expectrl::session::{OsProcess, OsStream};
 use expectrl::{Any, Eof, Expect, Regex, Session};
+
+use support::bin::{Dirs, DryRunConfig, coyote_command};
 
 /// Upper bound on any single wait. The binary is a cold debug build that also
 /// opens a vault and resolves a model before it paints its first prompt.
@@ -45,18 +49,6 @@ const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
 /// name and the `>` markers.
 const TOP_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*>";
 const ENVOY_PROMPT: &str = r"envoy>(\x1b\[[0-9;]*m)*>";
-
-const DRYRUN_CONFIG_TAIL: &str = r#"clients:
-  - type: openai
-    name: dryrun
-    auth: none
-    api_key: unused
-    models:
-      - name: dry-model
-        max_input_tokens: 100000
-        supports_function_calling: true
-save: false
-"#;
 
 type Target = Session<OsProcess, OsStream>;
 
@@ -83,14 +75,9 @@ impl Probe {
         let temp_root = fresh_dir(&format!("{label}-tmp"));
         let vault_pass = config_dir.join("vault-pass");
         fs::write(&vault_pass, "test-password\n").unwrap();
-        fs::write(
-            config_dir.join("config.yaml"),
-            format!(
-                "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\n{DRYRUN_CONFIG_TAIL}",
-                vault_pass.display()
-            ),
-        )
-        .unwrap();
+        DryRunConfig::default()
+            .vault_password_file(&vault_pass)
+            .write(&config_dir);
         Self {
             config_dir,
             home_dir,
@@ -99,22 +86,15 @@ impl Probe {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-        cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
-            .env("HOME", &self.home_dir)
-            .env("USERPROFILE", &self.home_dir)
-            .env("TMPDIR", &self.temp_root)
-            .env("TMP", &self.temp_root)
-            .env("TEMP", &self.temp_root)
-            .env("XDG_CACHE_HOME", &self.temp_root)
+        let mut cmd = coyote_command(&Dirs {
+            config: self.config_dir.clone(),
+            cache: self.temp_root.join("coyote"),
+            home: self.home_dir.clone(),
+            temp: self.temp_root.clone(),
+        });
+        cmd.env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
-            .env_remove("COYOTE_PROVIDER")
-            .env_remove("COYOTE_PLATFORM")
-            .env_remove("COYOTE_ENV_FILE")
-            .env("COYOTE_CACHE_DIR", self.temp_root.join("coyote"))
-            .env_remove("COYOTE_LEFT_PROMPT")
-            .env_remove("COYOTE_RIGHT_PROMPT")
             .env_remove("ENVOY_DATA_DIR")
             .env_remove("ENVOY_CONFIG_FILE")
             .current_dir(&self.home_dir);

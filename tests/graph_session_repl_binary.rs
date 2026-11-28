@@ -11,12 +11,16 @@
 //! uses a fresh fake HOME and a scrubbed sandbox/provider env so host state
 //! cannot leak in.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 struct TempDirGuard(PathBuf);
 
@@ -56,11 +60,6 @@ impl Drop for TempDirGuard {
         }
     }
 }
-
-/// The workspace-memory root override the unit-test guards set; it mirrors
-/// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
-/// integration test cannot import from the binary crate.
-const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
 
 const GRAPH_AGENT: &str = "echo-graph";
 const CONFIG_AGENT: &str = "probe";
@@ -186,28 +185,21 @@ fn write_fixture(dir: &Path, session_block: &str) {
 }
 
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
-    let home = dir.join("home");
-    let binary = Path::new(env!("CARGO_BIN_EXE_coyote"));
-    Command::new(binary)
-        .args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("NO_COLOR", "1")
-        .env("PATH", pinned_path(binary.parent().unwrap()))
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        // The unit-test guard's workspace-memory pin; a shipped binary
-        // ignores it, and a run here starts without it.
-        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    let binary = Path::new(support::bin::path());
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(dir)
+    .env("NO_COLOR", "1")
+    .env("PATH", pinned_path(binary.parent().unwrap()))
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 /// A PATH holding only `bin_dir` (the built binary's own directory) and the

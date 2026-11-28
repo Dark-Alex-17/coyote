@@ -24,6 +24,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -37,6 +39,8 @@ use expectrl::process::unix::WaitStatus;
 use expectrl::session::{OsProcess, OsStream};
 use expectrl::{Any, Eof, Expect, Regex, Session};
 use tokio::net::TcpSocket;
+
+use support::bin::{Dirs, DryRunConfig, coyote_command};
 
 /// The binary is a cold debug build that opens a vault, resolves a model and,
 /// here, starts a Reticulum transport before its first prompt.
@@ -200,24 +204,11 @@ impl Probe {
             .iter()
             .map(|port| format!("    - {{type: private, host: 127.0.0.1, port: {port}}}\n"))
             .collect();
-        fs::write(
-            config_dir.join("config.yaml"),
-            format!(
-                "model: dryrun:dry-model\n\
-                 dry_run: true\n\
-                 vault_password_file: '{vault_pass}'\n\
-                 function_calling_support: true\n\
-                 clients:\n\
-                 \x20 - type: openai\n\
-                 \x20   name: dryrun\n\
-                 \x20   auth: none\n\
-                 \x20   api_key: unused\n\
-                 \x20   models:\n\
-                 \x20     - name: dry-model\n\
-                 \x20       max_input_tokens: 100000\n\
-                 \x20       supports_function_calling: true\n\
-                 save: false\n\
-                 save_session: false\n\
+        DryRunConfig::default()
+            .vault_password_file(&vault_pass)
+            .setting("function_calling_support: true")
+            .append(&format!(
+                "save_session: false\n\
                  hooks:\n\
                  \x20 mesh.started:\n\
                  \x20   - name: mark\n\
@@ -229,11 +220,9 @@ impl Probe {
                  \x20 enabled: {mesh_enabled}\n\
                  \x20 announce: false\n\
                  \x20 interfaces:\n\
-                 {interfaces}",
-                vault_pass = vault_pass.display(),
-            ),
-        )
-        .unwrap();
+                 {interfaces}"
+            ))
+            .write(&config_dir);
         Self {
             config_dir,
             home_dir,
@@ -298,28 +287,20 @@ impl Probe {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-        cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
-            .env("HOME", &self.home_dir)
-            .env("USERPROFILE", &self.home_dir)
-            .env("TMPDIR", &self.temp_root)
-            .env("TMP", &self.temp_root)
-            .env("TEMP", &self.temp_root)
-            .env("XDG_CACHE_HOME", &self.temp_root)
+        let mut cmd = coyote_command(&Dirs {
+            config: self.config_dir.clone(),
+            cache: self.temp_root.join("coyote"),
+            home: self.home_dir.clone(),
+            temp: self.temp_root.clone(),
+        });
+        cmd.env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
             .env_remove("NO_COLOR")
-            .env_remove("COYOTE_PROVIDER")
-            .env_remove("COYOTE_PLATFORM")
-            .env_remove("COYOTE_ENV_FILE")
-            .env("COYOTE_CACHE_DIR", self.temp_root.join("coyote"))
             // The rnsd stats reader looks in /etc/reticulum before HOME; this points a
             // debug build at a dir of the test's own, so no test reads the developer's
             // rnsd.
             .env("COYOTE_TEST_RNSD_CONFIG_DIR", self.rnsd_config_dir())
-            .env_remove("COYOTE_LEFT_PROMPT")
-            .env_remove("COYOTE_RIGHT_PROMPT")
-            .env_remove("COYOTE_SESSIONS_DIR")
             .current_dir(&self.home_dir);
         cmd
     }

@@ -6,14 +6,18 @@
 //! error text and never panics. Every run uses a fresh fake HOME and a
 //! scrubbed sandbox/provider env so host state cannot leak in.
 
+mod support;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 struct TempDirGuard(PathBuf);
 
@@ -36,10 +40,6 @@ const MESH_REFUSED: &str = "(the mesh tools follow .mesh on and .mesh off, not s
 fn denied_message(tool: &str, tail: &str) -> String {
     format!("session.chat.tools entry '{tool}' is not allowed in the chat turn {tail}")
 }
-
-/// The built binary every run here spawns; the one place the harness
-/// names it, so a test that needs its directory reads it from here.
-const COYOTE_BIN: &str = env!("CARGO_BIN_EXE_coyote");
 
 /// The workspace-memory root override the unit-test guards set; it mirrors
 /// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
@@ -168,29 +168,22 @@ fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output
 /// dir, for cases where the directory the binary runs from is the lever
 /// (workspace discovery walks up from it).
 fn run_from(cwd: &Path, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let home = dir.join("home");
-    let binary = Path::new(COYOTE_BIN);
-    Command::new(binary)
-        .args(args)
-        .current_dir(cwd)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("NO_COLOR", "1")
-        .env("PATH", pinned_path(binary.parent().unwrap()))
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        // The unit-test guard's workspace-memory pin; a shipped binary
-        // ignores it, and a run here starts without it unless a case sets it.
-        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
-        .envs(extra_env.iter().copied())
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    let binary = Path::new(support::bin::path());
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(cwd)
+    .env("NO_COLOR", "1")
+    .env("PATH", pinned_path(binary.parent().unwrap()))
+    .env_remove("IS_SANDBOX")
+    .envs(extra_env.iter().copied())
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 /// A PATH holding only `bin_dir` (the built binary's own directory) and the
@@ -2559,10 +2552,7 @@ const UNCOMMENTED_CARRY: &str = "\ncarry:\n  - final_report\n";
 
 /// Read the shipped `graph.example.yaml` as LF text.
 fn example_graph_text() -> String {
-    lf_text(
-        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("graph.example.yaml"))
-            .unwrap(),
-    )
+    support::repo::read("graph.example.yaml")
 }
 
 /// The copy of the example the carry test boots: the commented `carry:`
@@ -3097,7 +3087,7 @@ fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells
         "path run: exit {:?}\n{text}",
         output.status
     );
-    let bin_dir = Path::new(COYOTE_BIN).parent().unwrap();
+    let bin_dir = Path::new(support::bin::path()).parent().unwrap();
     let line = stdout_of(&output)
         .lines()
         .rev()

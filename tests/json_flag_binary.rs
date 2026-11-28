@@ -3,17 +3,21 @@
 //! probe reads the binary's stdout as the caller of `--json` would, so a
 //! stray byte of rendered markdown or a second object fails the parse.
 
+mod support;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use serde_json::{Value, json};
+
+use support::bin::{Dirs, PINNED_VARS, coyote_command};
 
 const REPLY: &str = "**hello** from the stub";
 const TOOL: &str = "agent__list_sessions";
@@ -233,39 +237,36 @@ fn run(dir: &Path, args: &[&str]) -> Output {
     run_with_stdin(dir, args, None, &[])
 }
 
-/// Runs the binary with a scrubbed environment: every inherited `COYOTE_*`
-/// variable is dropped before the test's own are set, and a run that
-/// outlives `RUN_TIMEOUT` is killed.
+/// Runs the binary with a scrubbed environment (see `coyote_command`); a run
+/// that outlives `RUN_TIMEOUT` is killed.
 fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
-    let home = dir.join("home");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            command.env_remove(key);
-        }
-    }
-    let mut child = command
-        .args(args)
-        .current_dir(dir)
-        .envs(envs.iter().copied())
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("NO_COLOR", "1")
-        // Loopback must not be sent through a host proxy.
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
-        .env_remove("IS_SANDBOX")
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    assert!(
+        envs.iter().all(|(key, _)| !PINNED_VARS.contains(key)),
+        "run_with_stdin must not override a dir pin: {envs:?}"
+    );
+    let mut child = coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(dir)
+    .envs(envs.iter().copied())
+    .env("NO_COLOR", "1")
+    // Loopback must not be sent through a host proxy.
+    .env("NO_PROXY", "127.0.0.1,localhost")
+    .env("no_proxy", "127.0.0.1,localhost")
+    .env_remove("IS_SANDBOX")
+    .stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().unwrap();
         pipe.write_all(text.as_bytes()).unwrap();

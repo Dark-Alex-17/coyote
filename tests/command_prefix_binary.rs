@@ -6,11 +6,15 @@
 //! real binary. Every run uses a fresh fake HOME, a dry-run model and a
 //! scrubbed sandbox/provider env so host state cannot leak in.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, DryRunConfig, coyote_command};
 
 struct TempDirGuard(PathBuf);
 
@@ -43,32 +47,15 @@ fn write_fixture(dir: &Path, prefix_line: Option<&str>) {
     // file, so the fixture provides one.
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
-    let prefix_line = prefix_line.map(|l| format!("{l}\n")).unwrap_or_default();
-    // Paths land in single-quoted YAML scalars: double-quoted ones would read
-    // the backslashes in a Windows temp path (`C:\Users\...`) as escapes.
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             {prefix_line}\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             save: false\n\
-             memory: false\n\
-             stream: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
+    let mut config = DryRunConfig::default();
+    if let Some(line) = prefix_line {
+        config = config.setting(line);
+    }
+    config
+        .vault_password_file(&vault_pass)
+        .quoted_api_key()
+        .append("memory: false\nstream: false\n")
+        .write(dir);
     fs::write(
         dir.join("macros/dotsteps.yaml"),
         "isolated: false\nsteps:\n  - \".set temperature 0.7\"\n  - \".help\"\n",
@@ -82,21 +69,16 @@ fn write_fixture(dir: &Path, prefix_line: Option<&str>) {
 }
 
 fn run_coyote(dir: &Path, envs: &[(&str, &str)], args: &[&str]) -> Output {
-    let home = dir.join("home");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    let mut cmd = coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    });
     cmd.args(args)
         .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_COMMAND_PREFIX")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
         .stdin(Stdio::null());
     for (key, value) in envs {
         cmd.env(key, value);

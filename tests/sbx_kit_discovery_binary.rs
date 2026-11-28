@@ -13,11 +13,15 @@
 //! cannot leak in; the roots are canonicalized because discovery reports the
 //! resolved current dir.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 const KIT_YAML: &str = "coyote.yaml";
 const KIT_DOCKERFILE: &str = "coyote.dockerfile";
@@ -149,29 +153,24 @@ fn install_stub_sbx_with(root: &Path, version_line: &str, sandbox_rows: &[&str])
 }
 
 fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
-    let home = root.join("home");
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    let mut command = coyote_command(&Dirs {
+        config: root.join("config"),
+        cache: root.join("cache"),
+        home: root.join("home"),
+        temp: env::temp_dir(),
+    });
     command
         .args(args)
         .current_dir(cwd)
         .env("PWD", cwd)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("PATH", path)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_SANDBOX_KIT")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
         .stdin(Stdio::null());
     for (key, value) in extra_env {
         command.env(key, value);

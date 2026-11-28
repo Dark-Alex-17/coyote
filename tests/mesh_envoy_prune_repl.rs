@@ -18,6 +18,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -30,6 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use expectrl::session::{OsProcess, OsStream};
 use expectrl::{Any, Eof, Expect, Regex, Session};
+
+use support::bin::{Dirs, DryRunConfig, coyote_command};
 
 const EXPECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CURSOR_POSITION_QUERY: &str = r"\x1b\[6n";
@@ -96,34 +100,19 @@ impl Probe {
         } else {
             format!("  envoy_memory:\n{envoy_memory}")
         };
-        fs::write(
-            config_dir.join("config.yaml"),
-            format!(
-                "model: dryrun:dry-model\n\
-                 dry_run: true\n\
-                 vault_password_file: '{vault_pass}'\n\
-                 function_calling_support: true\n\
-                 clients:\n\
-                 \x20 - type: openai\n\
-                 \x20   name: dryrun\n\
-                 \x20   auth: none\n\
-                 \x20   api_key: unused\n\
-                 \x20   models:\n\
-                 \x20     - name: dry-model\n\
-                 \x20       max_input_tokens: 100000\n\
-                 \x20       supports_function_calling: true\n\
-                 save: false\n\
-                 save_session: false\n\
+        DryRunConfig::default()
+            .vault_password_file(&vault_pass)
+            .setting("function_calling_support: true")
+            .append(&format!(
+                "save_session: false\n\
                  mesh:\n\
                  \x20 enabled: true\n\
                  \x20 announce: false\n\
                  \x20 interfaces:\n\
                  \x20   - {{type: private, host: 127.0.0.1, port: {relay_port}}}\n\
-                 {envoy_block}",
-                vault_pass = vault_pass.display(),
-            ),
-        )
-        .unwrap();
+                 {envoy_block}"
+            ))
+            .write(&config_dir);
         Self {
             config_dir,
             home_dir,
@@ -176,22 +165,16 @@ impl Probe {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-        cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
-            .env("HOME", &self.home_dir)
-            .env("USERPROFILE", &self.home_dir)
-            .env("TMPDIR", &self.temp_root)
-            .env("XDG_CACHE_HOME", &self.temp_root)
+        let mut cmd = coyote_command(&Dirs {
+            config: self.config_dir.clone(),
+            cache: self.cache_dir(),
+            home: self.home_dir.clone(),
+            temp: self.temp_root.clone(),
+        });
+        cmd.env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
             .env_remove("NO_COLOR")
-            .env_remove("COYOTE_PROVIDER")
-            .env_remove("COYOTE_PLATFORM")
-            .env_remove("COYOTE_ENV_FILE")
-            .env("COYOTE_CACHE_DIR", self.cache_dir())
-            .env_remove("COYOTE_LEFT_PROMPT")
-            .env_remove("COYOTE_RIGHT_PROMPT")
-            .env_remove("COYOTE_SESSIONS_DIR")
             .current_dir(&self.home_dir);
         cmd
     }

@@ -10,11 +10,15 @@
 //! uses a fresh fake HOME, config dir and cache dir so host state cannot
 //! leak in.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 const KIT_YAML: &str = "coyote.yaml";
 const KIT_DOCKERFILE: &str = "coyote.dockerfile";
@@ -99,31 +103,26 @@ fn install_stub_sbx(root: &Path) -> PathBuf {
 }
 
 fn run_coyote(root: &Path, args: &[&str]) -> Output {
-    let home = root.join("home");
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(args)
-        .current_dir(root)
-        .env("PWD", root)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("PATH", path)
-        .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_SANDBOX_KIT")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: root.join("config"),
+        cache: root.join("cache"),
+        home: root.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(root)
+    .env("PWD", root)
+    .env("PATH", path)
+    .env("NO_COLOR", "1")
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn stderr_of(output: &Output) -> String {
@@ -354,28 +353,29 @@ fn sandbox_kit_override_pointing_nowhere_is_refused_before_any_extraction() {
     let marker = install_stub_sbx(&root);
     let missing = root.join("no-such-kit");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["--sandbox", "--sandbox-name", "probe"])
-        .current_dir(&root)
-        .env("PWD", &root)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", root.join("home"))
-        .env("USERPROFILE", root.join("home"))
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                root.join("bin").display(),
-                env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .env("COYOTE_SANDBOX_KIT", &missing)
-        .env("NO_COLOR", "1")
-        .env_remove("IS_SANDBOX")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: root.join("config"),
+        cache: root.join("cache"),
+        home: root.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(["--sandbox", "--sandbox-name", "probe"])
+    .current_dir(&root)
+    .env("PWD", &root)
+    .env(
+        "PATH",
+        format!(
+            "{}:{}",
+            root.join("bin").display(),
+            env::var("PATH").unwrap_or_default()
+        ),
+    )
+    .env("COYOTE_SANDBOX_KIT", &missing)
+    .env("NO_COLOR", "1")
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
 
     assert!(!output.status.success());
     let stderr = stderr_of(&output);

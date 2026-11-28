@@ -13,13 +13,16 @@
 //! tests, not here.
 #![cfg(unix)]
 
+mod support;
+
 use serde_json::{Value, json};
 use serial_test::serial;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use support::bin::{Dirs, coyote_command};
 
 const AGENT: &str = "probe-gates";
 
@@ -60,6 +63,7 @@ fn fresh_dir(label: &str) -> TempDirGuard {
         .as_nanos();
     let dir = env::temp_dir().join(format!("coyote-gate-fallback-{label}-{unique}"));
     fs::create_dir_all(dir.join("cache")).unwrap();
+    fs::create_dir_all(dir.join("home")).unwrap();
     TempDirGuard(dir)
 }
 
@@ -154,21 +158,23 @@ fn write_fixture(
 }
 
 fn run_coyote_with(dir: &Path, envs: &[(&str, &str)]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["--agent", AGENT, "probe"])
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("IS_SANDBOX")
-        .env_remove("CODER_AUTOAPPROVE")
-        .env_remove("STEP_AUTOAPPROVE")
-        .env_remove("STEP_SKIP_REVIEW")
-        .envs(envs.iter().copied())
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(["--agent", AGENT, "probe"])
+    .current_dir(dir)
+    .env("NO_COLOR", "1")
+    .env_remove("IS_SANDBOX")
+    .env_remove("CODER_AUTOAPPROVE")
+    .env_remove("STEP_AUTOAPPROVE")
+    .env_remove("STEP_SKIP_REVIEW")
+    .envs(envs.iter().copied())
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn run_coyote(dir: &Path) -> Output {

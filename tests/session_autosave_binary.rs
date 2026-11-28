@@ -10,11 +10,15 @@
 //! gets no file from a clean exit. Every run uses a fresh fake HOME and a
 //! scrubbed sandbox/provider env so host state cannot leak in.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 struct TempDirGuard(PathBuf);
 
@@ -113,24 +117,19 @@ fn write_session_file(dir: &Path, save_line: &str) -> PathBuf {
 }
 
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
-    let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("COYOTE_SAVE_SESSION")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(dir)
+    .env("NO_COLOR", "1")
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn combined(output: &Output) -> String {

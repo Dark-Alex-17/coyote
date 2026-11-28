@@ -3,12 +3,16 @@
 //! config dir and the workspace store under `ws/.coyote/memory`; backups land
 //! under `<cache>/memory-backups`.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use support::bin::{Dirs, coyote_command};
 
 /// Mirrors `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`;
 /// `the_test_memory_root_env_name_matches_the_source_const` keeps the two
@@ -87,21 +91,17 @@ const GHOST_LINE: &str = "- [[ghost]]: missing\n";
 const CATALOGUE_CACHE: &str = ".catalogue.yaml";
 
 fn command(fx: &Fixture, args: &[&str]) -> Command {
-    let home = fx.dir.join("home");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    let mut command = coyote_command(&Dirs {
+        config: fx.dir.clone(),
+        cache: fx.cache(),
+        home: fx.dir.join("home"),
+        temp: std::env::temp_dir(),
+    });
     command
         .args(args)
         .current_dir(&fx.workspace)
-        .env("COYOTE_CONFIG_DIR", &fx.dir)
-        .env("COYOTE_CACHE_DIR", fx.cache())
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM");
+        .env_remove("IS_SANDBOX");
     command
 }
 

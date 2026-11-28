@@ -9,12 +9,16 @@
 //! context without a loaded agent. A macro refused at load (a literal
 //! `.mesh` step) runs nothing and still closes the bracket with agent.failed.
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use support::bin::{Dirs, DryRunConfig, coyote_command};
 
 const MARKERS: [&str; 4] = ["STARTED", "COMPLETED", "FAILED", "INTERRUPTED"];
 
@@ -24,7 +28,7 @@ fn fresh_config_dir(label: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let tmp_dir = env::temp_dir().join(format!("coyote-macro-bracketing-{label}-{unique}"));
-    fs::create_dir_all(&tmp_dir).unwrap();
+    fs::create_dir_all(tmp_dir.join("home")).unwrap();
     tmp_dir
 }
 
@@ -119,25 +123,14 @@ fn write_fixture_with(dir: &Path, macro_yaml: &str, extra_config: &str) {
     // file, so the fixture provides one.
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
-    // Paths land in single-quoted YAML scalars: double-quoted ones would read
-    // the backslashes in a Windows temp path (`C:\Users\...`) as escapes.
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             save: false\n\
-             memory: false\n\
+    // The hook commands land in single-quoted YAML scalars: double-quoted ones
+    // would read the backslashes in a Windows temp path (`C:\Users\...`) as
+    // escapes.
+    DryRunConfig::default()
+        .vault_password_file(&vault_pass)
+        .quoted_api_key()
+        .append(&format!(
+            "memory: false\n\
              stream: false\n\
              hooks:\n\
              \x20 agent.started:\n\
@@ -153,14 +146,12 @@ fn write_fixture_with(dir: &Path, macro_yaml: &str, extra_config: &str) {
              \x20   - name: mark\n\
              \x20     command: '{interrupted}'\n\
              {extra_config}",
-            vault_pass = vault_pass.display(),
             started = marker_command("STARTED", dir),
             completed = marker_command("COMPLETED", dir),
             failed = marker_command("FAILED", dir),
             interrupted = marker_command("INTERRUPTED", dir),
-        ),
-    )
-    .unwrap();
+        ))
+        .write(dir);
 
     let agent_dir = dir.join("agents/probe-macro");
     fs::create_dir_all(&agent_dir).unwrap();
@@ -182,20 +173,19 @@ fn write_fixture_with(dir: &Path, macro_yaml: &str, extra_config: &str) {
 }
 
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_SHELL", STEP_SHELL)
-        // Log file lives under the cache dir unless COYOTE_LOG_PATH overrides
-        // it; keep test children off the developer's real coyote.log (and its
-        // rotation).
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("IS_SANDBOX")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(dir)
+    .env("COYOTE_SHELL", STEP_SHELL)
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 /// Counts `marker`'s exact-match lines in its own marker file; a missing
