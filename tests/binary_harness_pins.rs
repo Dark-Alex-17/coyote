@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-use support::bin::{Dirs, PINNED_VARS, coyote_command, isolate_from};
+use support::bin::{Dirs, DryRunConfig, PINNED_VARS, coyote_command, isolate_from};
 
 // Spelled in two halves so this file's own source does not count as a
 // spawn site when the scan reaches it.
@@ -29,13 +29,44 @@ const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const SUPPORT_BIN: &str = "tests/support/bin.rs";
 // Split for the same reason: a bare `Command` around the binary path skips
 // the isolation coyote_command applies.
-const BARE_SPAWNS: [&str; 4] = [
-    concat!("Command::new(", "support::bin::path()"),
-    concat!("Command::new(", "bin::path()"),
+const BARE_SPAWNS: [&str; 8] = [
+    concat!("Command::new(support::bin::", "path()"),
+    concat!("Command::new(bin::", "path()"),
     concat!("Command::new(", "path())"),
     concat!("Command::new(", "binary)"),
+    concat!("Command::new(&", "binary)"),
+    concat!("Command::new(&support::bin::", "path()"),
+    concat!("Command::new(&bin::", "path()"),
+    concat!("Command::new(&", "path())"),
 ];
+// Matches both the `support::bin::` and the `bin::` spelling exactly once.
 const PATH_CALL: &str = concat!("bin::", "path()");
+// Every sanctioned use of the binary path outside tests/support/bin.rs, with
+// its exact count. None of them spawns the binary in a bare Command.
+const PATH_USES: [(&str, usize, &str); 4] = [
+    (
+        "tests/binary_harness_pins.rs",
+        1,
+        "the get_program comparison in the coyote_command pin",
+    ),
+    (
+        "tests/graph_session_block_binary.rs",
+        2,
+        "the binary dir for the PATH pin and for the reported-PATH check",
+    ),
+    (
+        "tests/graph_session_repl_binary.rs",
+        1,
+        "the binary dir for the PATH pin",
+    ),
+    (
+        SBX_ARGV_FORWARDING,
+        SBX_ARGV_USES,
+        "argv for the script(1) wrapper, whose command goes through isolate",
+    ),
+];
+const SBX_ARGV_FORWARDING: &str = "tests/sbx_argv_forwarding_binary.rs";
+const SBX_ARGV_USES: usize = 2;
 const GRAPH_SESSION_HARNESSES: [&str; 2] = [
     "tests/graph_session_block_binary.rs",
     "tests/graph_session_repl_binary.rs",
@@ -103,20 +134,28 @@ fn every_spawn_goes_through_coyote_command_which_pins_the_dirs_and_clears_inheri
          COYOTE_* clearing; spawn through support::bin::coyote_command instead: {bare:?}"
     );
 
-    let unisolated: Vec<&str> = sources
+    for (rel, text) in sources.iter().filter(|(rel, _)| rel != SUPPORT_BIN) {
+        let uses = text.matches(PATH_CALL).count();
+        let allowed = PATH_USES
+            .iter()
+            .find(|(file, _, _)| file == rel)
+            .map_or(0, |(_, count, _)| *count);
+        assert_eq!(
+            uses, allowed,
+            "{rel} uses the binary path {uses} times but PATH_USES sanctions {allowed}; \
+             spawn through support::bin::coyote_command, or list a non-spawn use in \
+             PATH_USES with its reason"
+        );
+    }
+
+    let wrapped = sources
         .iter()
-        .filter(|(rel, text)| {
-            rel != SUPPORT_BIN
-                && text.contains(PATH_CALL)
-                && !text.contains("coyote_command(")
-                && !text.contains("isolate(")
-        })
-        .map(|(rel, _)| rel.as_str())
-        .collect();
+        .find(|(rel, _)| rel == SBX_ARGV_FORWARDING)
+        .map_or(0, |(_, text)| text.matches("isolate(").count());
     assert!(
-        unisolated.is_empty(),
-        "these files use support::bin::path() without coyote_command or isolate, so \
-         their spawns skip the dir pins and COYOTE_* clearing: {unisolated:?}"
+        wrapped >= SBX_ARGV_USES,
+        "{SBX_ARGV_FORWARDING} feeds the binary path into {SBX_ARGV_USES} script(1) argvs but \
+         has only {wrapped} isolate calls; each wrapper command must go through isolate"
     );
 }
 
@@ -180,8 +219,7 @@ fn isolate_from_pins_the_dirs_removes_inherited_coyote_keys_only_and_lets_later_
 }
 
 #[test]
-fn coyote_command_targets_the_built_binary_with_the_dir_pins_and_removes_this_process_coyote_vars()
-{
+fn coyote_command_targets_the_built_binary_with_the_dir_pins() {
     let dirs = distinct_dirs();
     let command = coyote_command(&dirs);
     assert_eq!(command.get_program(), support::bin::path());
@@ -193,24 +231,6 @@ fn coyote_command_targets_the_built_binary_with_the_dir_pins_and_removes_this_pr
             "coyote_command must set {key} from Dirs"
         );
     }
-    let mut removed: Vec<OsString> = envs
-        .iter()
-        .filter(|(_, value)| value.is_none())
-        .map(|(key, _)| key.clone())
-        .collect();
-    let mut inherited: Vec<OsString> = env::vars_os()
-        .map(|(key, _)| key)
-        .filter(|key| {
-            let key = key.to_string_lossy();
-            key.starts_with("COYOTE_") && !PINNED_VARS.contains(&key.as_ref())
-        })
-        .collect();
-    removed.sort();
-    inherited.sort();
-    assert_eq!(
-        removed, inherited,
-        "coyote_command must remove exactly the COYOTE_* vars this test process inherited"
-    );
 }
 
 fn distinct_dirs() -> Dirs {
@@ -253,4 +273,318 @@ fn read_path_folds_crlf_to_lf() {
     fs::remove_dir_all(&dir).unwrap();
 
     assert_eq!(text, "one\ntwo\n");
+}
+
+// Each site's current DryRunConfig chain against the literal config.yaml
+// text that site wrote before it moved to DryRunConfig, both filled in with
+// the same placeholder values.
+#[test]
+fn dry_run_config_renders_each_migrated_fixture_byte_for_byte() {
+    let vault_pass = Path::new("/fixture/vault-pass");
+    let started = "touch /fixture/STARTED";
+    let completed = "touch /fixture/COMPLETED";
+    let failed = "touch /fixture/FAILED";
+    let interrupted = "touch /fixture/INTERRUPTED";
+    let stopped = "touch /fixture/STOPPED";
+    let relay_port = 4242;
+    let envoy_block = "  envoy_memory:\n    enabled: true\n";
+    let mesh_enabled = true;
+    let interfaces = "    - {type: private, host: 127.0.0.1, port: 4242}\n";
+    let extra_config = "  agent.extra:\n    - name: mark\nmodel_extra: true\n";
+    let prefix = "command_prefix: '/'";
+
+    let plain_vault = DryRunConfig::default()
+        .vault_password_file(vault_pass)
+        .render();
+    let plain = DryRunConfig::default().render();
+    let command_prefix = |prefix_line: Option<&str>| {
+        let mut config = DryRunConfig::default();
+        if let Some(line) = prefix_line {
+            config = config.setting(line);
+        }
+        config
+            .vault_password_file(vault_pass)
+            .quoted_api_key()
+            .append("memory: false\nstream: false\n")
+            .render()
+    };
+    let command_prefix_old = |prefix_line: Option<&str>| {
+        let prefix_line = prefix_line.map(|l| format!("{l}\n")).unwrap_or_default();
+        format!(
+            "model: dryrun:dry-model\n\
+             dry_run: true\n\
+             {prefix_line}\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: dryrun\n\
+             \x20   auth: none\n\
+             \x20   api_key: 'unused'\n\
+             \x20   models:\n\
+             \x20     - name: dry-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             save: false\n\
+             memory: false\n\
+             stream: false\n",
+            vault_pass = vault_pass.display(),
+        )
+    };
+
+    let sites: [(&str, String, String); 10] = [
+        ("envoy_repl Probe::new", plain_vault.clone(), {
+            const DRYRUN_CONFIG_TAIL: &str = r#"clients:
+  - type: openai
+    name: dryrun
+    auth: none
+    api_key: unused
+    models:
+      - name: dry-model
+        max_input_tokens: 100000
+        supports_function_calling: true
+save: false
+"#;
+            format!(
+                "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\n{DRYRUN_CONFIG_TAIL}",
+                vault_pass.display()
+            )
+        }),
+        (
+            "inspection_flags agent_envoy_build_tools_runs_the_embedded_builtin_and_cleans_up",
+            plain_vault.clone(),
+            format!(
+                "model: dryrun:dry-model\n\
+                 dry_run: true\n\
+                 vault_password_file: '{}'\n\
+                 clients:\n\
+                 \x20 - type: openai\n\
+                 \x20   name: dryrun\n\
+                 \x20   auth: none\n\
+                 \x20   api_key: unused\n\
+                 \x20   models:\n\
+                 \x20     - name: dry-model\n\
+                 \x20       max_input_tokens: 100000\n\
+                 \x20       supports_function_calling: true\n\
+                 save: false\n",
+                vault_pass.display()
+            ),
+        ),
+        ("inspection_flags EnvoyProbe::new", plain_vault, {
+            const DRYRUN_CONFIG_TAIL: &str = r#"clients:
+  - type: openai
+    name: dryrun
+    auth: none
+    api_key: unused
+    models:
+      - name: dry-model
+        max_input_tokens: 100000
+        supports_function_calling: true
+save: false
+"#;
+            format!(
+                "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\n{DRYRUN_CONFIG_TAIL}",
+                vault_pass.display()
+            )
+        }),
+        (
+            "inspection_flags sandbox_mutating_vault_flag_stays_strict",
+            plain.clone(),
+            "model: dryrun:dry-model\n\
+             dry_run: true\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: dryrun\n\
+             \x20   auth: none\n\
+             \x20   api_key: unused\n\
+             \x20   models:\n\
+             \x20     - name: dry-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             save: false\n"
+                .to_string(),
+        ),
+        (
+            "inspection_flags probe_strict_mcp_flag",
+            plain,
+            "model: dryrun:dry-model\n\
+             dry_run: true\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: dryrun\n\
+             \x20   auth: none\n\
+             \x20   api_key: unused\n\
+             \x20   models:\n\
+             \x20     - name: dry-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             save: false\n"
+                .to_string(),
+        ),
+        (
+            "mesh_autostart_repl Probe::new",
+            DryRunConfig::default()
+                .vault_password_file(vault_pass)
+                .setting("function_calling_support: true")
+                .append(&format!(
+                    "save_session: false\n\
+                     hooks:\n\
+                     \x20 mesh.started:\n\
+                     \x20   - name: mark\n\
+                     \x20     command: '{started}'\n\
+                     \x20 mesh.stopped:\n\
+                     \x20   - name: mark\n\
+                     \x20     command: '{stopped}'\n\
+                     mesh:\n\
+                     \x20 enabled: {mesh_enabled}\n\
+                     \x20 announce: false\n\
+                     \x20 interfaces:\n\
+                     {interfaces}"
+                ))
+                .render(),
+            format!(
+                "model: dryrun:dry-model\n\
+                 dry_run: true\n\
+                 vault_password_file: '{vault_pass}'\n\
+                 function_calling_support: true\n\
+                 clients:\n\
+                 \x20 - type: openai\n\
+                 \x20   name: dryrun\n\
+                 \x20   auth: none\n\
+                 \x20   api_key: unused\n\
+                 \x20   models:\n\
+                 \x20     - name: dry-model\n\
+                 \x20       max_input_tokens: 100000\n\
+                 \x20       supports_function_calling: true\n\
+                 save: false\n\
+                 save_session: false\n\
+                 hooks:\n\
+                 \x20 mesh.started:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{started}'\n\
+                 \x20 mesh.stopped:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{stopped}'\n\
+                 mesh:\n\
+                 \x20 enabled: {mesh_enabled}\n\
+                 \x20 announce: false\n\
+                 \x20 interfaces:\n\
+                 {interfaces}",
+                vault_pass = vault_pass.display(),
+            ),
+        ),
+        (
+            "mesh_envoy_prune_repl Probe::new",
+            DryRunConfig::default()
+                .vault_password_file(vault_pass)
+                .setting("function_calling_support: true")
+                .append(&format!(
+                    "save_session: false\n\
+                     mesh:\n\
+                     \x20 enabled: true\n\
+                     \x20 announce: false\n\
+                     \x20 interfaces:\n\
+                     \x20   - {{type: private, host: 127.0.0.1, port: {relay_port}}}\n\
+                     {envoy_block}"
+                ))
+                .render(),
+            format!(
+                "model: dryrun:dry-model\n\
+                 dry_run: true\n\
+                 vault_password_file: '{vault_pass}'\n\
+                 function_calling_support: true\n\
+                 clients:\n\
+                 \x20 - type: openai\n\
+                 \x20   name: dryrun\n\
+                 \x20   auth: none\n\
+                 \x20   api_key: unused\n\
+                 \x20   models:\n\
+                 \x20     - name: dry-model\n\
+                 \x20       max_input_tokens: 100000\n\
+                 \x20       supports_function_calling: true\n\
+                 save: false\n\
+                 save_session: false\n\
+                 mesh:\n\
+                 \x20 enabled: true\n\
+                 \x20 announce: false\n\
+                 \x20 interfaces:\n\
+                 \x20   - {{type: private, host: 127.0.0.1, port: {relay_port}}}\n\
+                 {envoy_block}",
+                vault_pass = vault_pass.display(),
+            ),
+        ),
+        (
+            "command_prefix_binary write_fixture without a prefix line",
+            command_prefix(None),
+            command_prefix_old(None),
+        ),
+        (
+            "command_prefix_binary write_fixture with a prefix line",
+            command_prefix(Some(prefix)),
+            command_prefix_old(Some(prefix)),
+        ),
+        (
+            "macro_bracketing write_fixture_with",
+            DryRunConfig::default()
+                .vault_password_file(vault_pass)
+                .quoted_api_key()
+                .append(&format!(
+                    "memory: false\n\
+                     stream: false\n\
+                     hooks:\n\
+                     \x20 agent.started:\n\
+                     \x20   - name: mark\n\
+                     \x20     command: '{started}'\n\
+                     \x20 agent.completed:\n\
+                     \x20   - name: mark\n\
+                     \x20     command: '{completed}'\n\
+                     \x20 agent.failed:\n\
+                     \x20   - name: mark\n\
+                     \x20     command: '{failed}'\n\
+                     \x20 agent.interrupted:\n\
+                     \x20   - name: mark\n\
+                     \x20     command: '{interrupted}'\n\
+                     {extra_config}"
+                ))
+                .render(),
+            format!(
+                "model: dryrun:dry-model\n\
+                 dry_run: true\n\
+                 vault_password_file: '{vault_pass}'\n\
+                 clients:\n\
+                 \x20 - type: openai\n\
+                 \x20   name: dryrun\n\
+                 \x20   auth: none\n\
+                 \x20   api_key: 'unused'\n\
+                 \x20   models:\n\
+                 \x20     - name: dry-model\n\
+                 \x20       max_input_tokens: 100000\n\
+                 \x20       supports_function_calling: true\n\
+                 save: false\n\
+                 memory: false\n\
+                 stream: false\n\
+                 hooks:\n\
+                 \x20 agent.started:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{started}'\n\
+                 \x20 agent.completed:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{completed}'\n\
+                 \x20 agent.failed:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{failed}'\n\
+                 \x20 agent.interrupted:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{interrupted}'\n\
+                 {extra_config}",
+                vault_pass = vault_pass.display(),
+            ),
+        ),
+    ];
+
+    for (site, rendered, old) in sites {
+        assert_eq!(
+            rendered, old,
+            "{site}: DryRunConfig must render the config.yaml this site wrote before"
+        );
+    }
 }

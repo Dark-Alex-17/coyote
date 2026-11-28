@@ -125,7 +125,8 @@ impl DryRunConfig {
         self
     }
 
-    fn render(&self) -> String {
+    /// The config text [`write`](Self::write) puts on disk.
+    pub fn render(&self) -> String {
         let api_key = if self.quoted_api_key {
             "'unused'"
         } else {
