@@ -50,12 +50,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WRITE_ENV: &str = "COYOTE_MESH_WIRE_GOLDEN_WRITE";
 const REGENERATE: &str =
     "COYOTE_MESH_WIRE_GOLDEN_WRITE=1 cargo test --all -- --ignored mesh::wire_golden";
+
+/// Held by every test that reads the fixture files and by the regenerator, so an
+/// `--include-ignored` run with the write env set cannot rewrite a file mid-read.
+static FIXTURE_FILES: Mutex<()> = Mutex::new(());
 
 /// Conformance rows whose input is left out of `inputs.hex`, with the reason.
 const UNRECORDED_INPUTS: &[(&str, &str)] = &[
@@ -104,8 +108,22 @@ fn fixtures() -> [Fixture; 2] {
     ];
     for fixture in &mut fixtures {
         fixture.records.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_record_names_well_formed(fixture.file, &fixture.records);
     }
     fixtures
+}
+
+fn assert_record_names_well_formed(file: &str, records: &[(String, Vec<u8>)]) {
+    assert_eq!(
+        duplicates(records.iter().map(|(name, _)| name.as_str())),
+        Vec::<&str>::new(),
+        "{file} would hold these record names twice"
+    );
+    if let Some((name, _)) = records.iter().find(|(name, _)| name.contains(' ')) {
+        panic!(
+            "{file}: the record name {name:?} holds a space, which the line format cannot carry"
+        );
+    }
 }
 
 fn render(records: &[(String, Vec<u8>)]) -> String {
@@ -391,6 +409,21 @@ fn card_records() -> Vec<(String, Vec<u8>)> {
                 now(),
             ),
         ),
+        (
+            "digest-objective",
+            build_card(
+                Some(&MeshSnapshot {
+                    objective: None,
+                    ..snapshot()
+                }),
+                None,
+                Some("the digest"),
+                None,
+                None,
+                &[],
+                now(),
+            ),
+        ),
     ];
     cards
         .into_iter()
@@ -635,20 +668,8 @@ fn reply_value(reply: Reply) -> Value {
 
 #[test]
 fn every_golden_record_matches_the_committed_bytes() {
+    let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
     for fixture in fixtures() {
-        let names = fixture.records.iter().map(|(name, _)| name.as_str());
-        assert_eq!(
-            duplicates(names),
-            Vec::<&str>::new(),
-            "{} would hold these record names twice",
-            fixture.file
-        );
-        if let Some((name, _)) = fixture.records.iter().find(|(name, _)| name.contains(' ')) {
-            panic!(
-                "{}: the record name {name:?} holds a space, which the line format cannot carry",
-                fixture.file
-            );
-        }
         let committed = committed_records(fixture.file);
         assert_eq!(
             duplicates(committed.iter().map(|(name, _)| name.as_str())),
@@ -695,6 +716,7 @@ fn every_golden_record_matches_the_committed_bytes() {
 
 #[test]
 fn the_committed_fixtures_are_exactly_what_the_generator_renders() {
+    let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
     for fixture in fixtures() {
         let committed = committed_text(fixture.file);
         let rendered = render(&fixture.records);
@@ -745,6 +767,7 @@ fn regenerate_the_golden_fixtures() {
     if std::env::var_os(WRITE_ENV).is_none_or(|value| value != "1") {
         return;
     }
+    let _files = FIXTURE_FILES.lock().unwrap_or_else(PoisonError::into_inner);
     for fixture in fixtures() {
         fs::write(fixture_path(fixture.file), render(&fixture.records)).unwrap();
     }
