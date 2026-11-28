@@ -55,7 +55,9 @@ const TRANSITIONAL: &[&str] = &[
 /// `git <args>` in `root`: stdout on success, trimmed stderr on failure. A `cargo test`
 /// launched from a git hook inherits `GIT_DIR` and friends, which would point every call
 /// at the hook's repository regardless of `-C`; the fixtures below init and write to
-/// temporary repositories, so those variables are dropped.
+/// temporary repositories, so those variables are dropped. System and user-global
+/// attributes files are ignored too, since either could change what the pins scan and
+/// what the fixtures see.
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     stdout_or_stderr(git_command(root, args).output().expect("git runs"))
 }
@@ -81,9 +83,11 @@ fn git_with_stdin(root: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>,
 fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
+        .args(["-c", "core.attributesFile="])
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
@@ -770,7 +774,9 @@ fn queue_from(
 }
 
 fn queue(root: &Path, flag: impl Fn(&str) -> Option<String>) -> Vec<String> {
-    let files = attributed_paths(root).into_iter().map(|path| {
+    let files = attributed_paths(root);
+    assert!(!files.is_empty(), "no attributed files to scan");
+    let files = files.into_iter().map(|path| {
         let comments = read_comment_lines(root, &path);
         (path, comments)
     });
@@ -1362,7 +1368,7 @@ fn every_attribute_pattern_matches_a_tracked_file() {
     }
     let undeclared: Vec<&&str> = TRANSITIONAL
         .iter()
-        .filter(|pattern| !declared.iter().any(|declared| declared == *pattern))
+        .filter(|pattern| !declared.iter().any(|candidate| candidate == *pattern))
         .collect();
     assert!(
         undeclared.is_empty(),
@@ -1429,8 +1435,13 @@ fn the_attributed_set_is_the_three_dot_diff_minus_docs_and_examples() {
 fn every_file_a_pattern_matches_carries_the_attribute() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let attributed = attributed_paths(root);
-    for pattern in declared_patterns(root) {
-        let under = nul_separated(&tracked_matches(root, &pattern));
+    let declared = declared_patterns(root);
+    assert!(
+        !declared.is_empty(),
+        ".gitattributes declares no {ATTRIBUTE} pattern"
+    );
+    for pattern in &declared {
+        let under = nul_separated(&tracked_matches(root, pattern));
         let uncovered: Vec<&String> = under.difference(&attributed).collect();
         assert!(
             uncovered.is_empty(),
