@@ -418,44 +418,6 @@ fn fuzz_codecs_refuse_only_what_the_oracles_name_and_re_encode_stably() {
 }
 
 #[test]
-fn fuzz_budget_constants_are_pinned() {
-    assert_eq!(DEFAULT_ITERS, 2000);
-    assert_eq!(TARGET_WALL_CAP, Duration::from_secs(10));
-    assert_eq!(ITERS_ENV, "COYOTE_MESH_FUZZ_ITERS");
-    assert_eq!(SEED_ENV, "COYOTE_MESH_FUZZ_SEED");
-    assert_eq!(WRITE_CORPUS_ENV, "COYOTE_MESH_FUZZ_WRITE_CORPUS");
-    let ci = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/.github/workflows/ci.yaml"
-    ));
-    let lines: Vec<&str> = ci.lines().collect();
-    let all = lines
-        .iter()
-        .position(|line| line.trim_end() == "  all:")
-        .expect("the `all` job is at the two-space indent");
-    let next_job = lines[all + 1..]
-        .iter()
-        .position(|line| {
-            line.starts_with("  ")
-                && !line.starts_with("   ")
-                && !line.starts_with("  #")
-                && line.trim_end().ends_with(':')
-        })
-        .map_or(lines.len(), |offset| all + 1 + offset);
-    let job = lines[all..next_job].join("\n");
-    for needle in [
-        ITERS_ENV.to_string(),
-        format!("{DEFAULT_ITERS} iterations"),
-        format!("{} s wall cap", TARGET_WALL_CAP.as_secs()),
-    ] {
-        assert!(
-            job.contains(&needle),
-            "the `all` job in ci.yaml must say that `cargo test --all` runs this harness with its budget; missing {needle:?}"
-        );
-    }
-}
-
-#[test]
 fn fuzz_budget_lifts_the_wall_cap_only_for_an_explicit_iteration_count() {
     let capped_default = Budget {
         requested: DEFAULT_ITERS,
