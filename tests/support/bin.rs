@@ -29,9 +29,10 @@ pub struct Dirs {
     pub temp: PathBuf,
 }
 
-/// The variables [`isolate`] sets from [`Dirs`]. A helper that forwards
-/// caller-supplied variables after [`coyote_command`] checks against this
-/// list, since a caller value for one of these would override the pin.
+/// The variables [`isolate`] sets from [`Dirs`]. Caller env applied after
+/// [`coyote_command`] overrides them. Helpers whose caller env used to be
+/// applied before the dir pins, so the pins won, check that no caller key is
+/// on this list. Helpers whose caller env already came after the pins do not.
 pub const PINNED_VARS: [&str; 7] = [
     "COYOTE_CONFIG_DIR",
     "COYOTE_CACHE_DIR",

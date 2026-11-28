@@ -7,6 +7,10 @@
 //! and clears every inherited `COYOTE_*` variable, the unit-test
 //! workspace-memory root override among them, so nothing a test run spawns
 //! lands in the developer's real config or cache or picks up their overrides.
+//!
+//! Also pins the support helpers themselves: `support::repo::read_path` folds
+//! CRLF to LF, and the crate that checks `coyote_command`'s env holds a single
+//! test.
 
 mod support;
 
@@ -31,6 +35,9 @@ const GRAPH_SESSION_HARNESSES: [&str; 2] = [
     "tests/graph_session_block_binary.rs",
     "tests/graph_session_repl_binary.rs",
 ];
+const SUPPORT_ISOLATION: &str = "tests/support_isolation.rs";
+// Split so this file's own source does not count as a test attribute.
+const TEST_ATTR: &str = concat!("#[", "test]");
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
@@ -116,14 +123,25 @@ fn every_graph_session_harness_spawn_pins_path() {
     let root = support::repo::root();
     for rel in GRAPH_SESSION_HARNESSES {
         let text = support::repo::read_path(&root.join(rel));
-        let spawns = text.matches("coyote_command(").count();
+        let spawns = text.matches("coyote_command(").count() + text.matches("isolate(").count();
         let pins = text.matches(".env(\"PATH\", pinned_path(").count();
         assert!(
             spawns > 0 && spawns == pins,
-            "{rel}: {spawns} coyote_command spawns but {pins} PATH pins; a graph-session \
-             spawn must run with only the binary dir and system shells on PATH"
+            "{rel}: {spawns} coyote_command or isolate spawns but {pins} PATH pins; a \
+             graph-session spawn must run with only the binary dir and system shells on PATH"
         );
     }
+}
+
+#[test]
+fn support_isolation_crate_holds_a_single_test() {
+    let text = support::repo::read(SUPPORT_ISOLATION);
+    let tests = text.matches(TEST_ATTR).count();
+    assert_eq!(
+        tests, 1,
+        "{SUPPORT_ISOLATION} mutates the process env, so it must hold a single test; \
+         a second test thread could read the env mid-mutation"
+    );
 }
 
 #[test]
@@ -136,6 +154,5 @@ fn read_path_folds_crlf_to_lf() {
     let text = support::repo::read_path(&file);
     fs::remove_dir_all(&dir).unwrap();
 
-    assert!(!text.contains("\r\n"), "read_path left a CRLF: {text:?}");
     assert_eq!(text, "one\ntwo\n");
 }

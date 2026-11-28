@@ -17,8 +17,9 @@ const PROBE: &str = "COYOTE_ISOLATION_PROBE";
 
 #[test]
 fn coyote_command_pins_the_dirs_clears_inherited_coyote_vars_and_lets_later_vars_win() {
-    // SAFETY: this is the only test in this crate, so no other thread reads
-    // the environment while it is mutated.
+    // SAFETY: this is the only test in this crate (binary_harness_pins checks
+    // this crate holds one test), so no other thread reads the environment
+    // while it is mutated.
     unsafe { env::set_var(PROBE, "inherited") };
 
     let base = env::temp_dir().join("coyote-support-isolation");
