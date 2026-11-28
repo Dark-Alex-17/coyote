@@ -2,16 +2,19 @@
 //! change to any codec is judged against what the wire carried when the fixture was
 //! written rather than against the encoder compared with itself.
 //!
-//! `inputs.hex` holds the fixed-data input of every typed conformance row, keyed by table
-//! and row name. `encoders.hex` holds the msgpack bytes each production encoder emits over
-//! a fixed sample: fixed identities, literal timestamps and literal message ids. A message
-//! built for the propagation route is recorded as the array of its title, content and
-//! fields.
+//! `inputs.hex` holds the fixed-data rows of the `vectors`, `env_vectors`,
+//! `access_vectors` and `share_vectors` conformance tables, keyed by table and row name:
+//! raw bytes for announce app data and announce encode expectations, the packed `Value`
+//! for every other row, and the packed `[title, content, fields]` array for a message.
+//! `encoders.hex` holds the msgpack bytes each production encoder emits over a fixed
+//! sample: fixed identities, literal timestamps and literal message ids. A message built
+//! for the propagation route is recorded as the array of its title, content and fields.
 //!
 //! Each line is `<record name> <lowercase hex>`, sorted by name; an empty record is the
 //! name alone. A record that no longer matches means the wire changed. When that is
-//! intended, regenerate with `cargo test --all -- --ignored mesh::wire_golden` and commit
-//! the new fixtures with the change.
+//! intended, regenerate with
+//! `COYOTE_MESH_WIRE_GOLDEN_WRITE=1 cargo test --all -- --ignored mesh::wire_golden` and
+//! commit the new fixtures with the change.
 
 use super::access::{
     AccessOutcome, AccessRefusal, access_body, access_message, access_reply, decision_reply,
@@ -43,14 +46,16 @@ use rmpv::Value;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const REGENERATE: &str = "cargo test --all -- --ignored mesh::wire_golden";
+const WRITE_ENV: &str = "COYOTE_MESH_WIRE_GOLDEN_WRITE";
+const REGENERATE: &str =
+    "COYOTE_MESH_WIRE_GOLDEN_WRITE=1 cargo test --all -- --ignored mesh::wire_golden";
 
 /// Conformance rows whose input is left out of `inputs.hex`, with the reason.
 const UNRECORDED_INPUTS: &[(&str, &str)] = &[
@@ -73,6 +78,10 @@ const ORIGIN: OriginName = OriginName([7u8; NAME_HASH_LEN]);
 /// `2026-09-21T14:13:20Z`, the fixed clock every sample is built against.
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_790_000_000)
+}
+
+fn now_secs() -> f64 {
+    now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
 }
 
 struct Fixture {
@@ -136,8 +145,9 @@ fn committed_records(file: &str) -> Vec<(String, Vec<u8>)> {
         .lines()
         .map(|line| {
             let (name, hex) = line.split_once(' ').unwrap_or((line, ""));
-            let bytes = decode_hex(hex)
-                .unwrap_or_else(|| panic!("{file}: the record {name} is not lowercase hex"));
+            let bytes = decode_hex(hex).unwrap_or_else(|| {
+                panic!("{file}: the record {name} is not a run of hex digit pairs")
+            });
             (name.to_string(), bytes)
         })
         .collect()
@@ -229,6 +239,11 @@ fn peer_samples() -> Vec<(&'static str, OutboundPeer)> {
         .with_thread(Some("t-2".into()))
         .unwrap();
     let bulletin = OutboundPeer::new(PeerKind::Bulletin, "news", None, None, None).unwrap();
+    let disposed = |disposition| {
+        OutboundPeer::new(PeerKind::Reply, "handed on", None, Some("q-2"), None)
+            .unwrap()
+            .with_disposition(disposition, None)
+    };
     let decided = |decision, expires, standing| {
         decision_reply(
             "r-1",
@@ -246,6 +261,14 @@ fn peer_samples() -> Vec<(&'static str, OutboundPeer)> {
         ("every-optional-key", with_id(every_optional_key, "m-2")),
         ("ask", with_id(ask, "m-3")),
         ("bulletin", with_id(bulletin, "m-4")),
+        (
+            "disposition-escalated",
+            with_id(disposed(Disposition::Escalated), "m-8"),
+        ),
+        (
+            "disposition-budget-exhausted",
+            with_id(disposed(Disposition::BudgetExhausted), "m-9"),
+        ),
         (
             "decision-granted-until",
             with_id(
@@ -275,7 +298,8 @@ fn message_records() -> Vec<(String, Vec<u8>)> {
             [
                 (
                     format!("to_request_body/{sample}"),
-                    packed(&to_request_body(&peer, 1_790_000_000.5)),
+                    // Half a second past the clock, so the timestamp is a non-integral f64.
+                    packed(&to_request_body(&peer, now_secs() + 0.5)),
                 ),
                 (
                     format!("peer_lxmf_message/{sample}"),
@@ -402,7 +426,7 @@ fn access_records() -> Vec<(String, Vec<u8>)> {
         (
             "granted",
             AccessOutcome::Granted {
-                expires: 1_790_003_600.0,
+                expires: now_secs() + 3600.0,
             },
         ),
         (
@@ -473,18 +497,18 @@ fn refusal_records() -> Vec<(String, Vec<u8>)> {
                 packed(&VersionRefusal::current(found).to_value()),
             )
         });
-    let codes = [
-        ("no-identity", RefusalCode::NoIdentity),
-        ("no-access", RefusalCode::NoAccess),
-        ("invalid-key", RefusalCode::InvalidKey),
-        ("invalid-data", RefusalCode::InvalidData),
-        ("invalid-stamp", RefusalCode::InvalidStamp),
-        ("throttled", RefusalCode::Throttled),
-        ("not-found", RefusalCode::NotFound),
-        ("timeout", RefusalCode::Timeout),
-    ]
-    .into_iter()
-    .map(|(sample, code)| (format!("refusal_code/{sample}"), packed(&code.to_wire())));
+    // Every code is reached through the wire byte range rather than named, so the record
+    // set follows the enum; each keeps its display name, without the byte, as its sample.
+    let codes = (0xf0u8..=0xffu8)
+        .filter_map(|byte| RefusalCode::from_wire(&Value::from(byte)))
+        .map(|code| {
+            let display = code.to_string();
+            let name = display.split(" (0x").next().unwrap_or(&display);
+            (
+                format!("refusal_code/{}", name.replace(' ', "-")),
+                packed(&code.to_wire()),
+            )
+        });
     versions.chain(codes).collect()
 }
 
@@ -619,6 +643,12 @@ fn every_golden_record_matches_the_committed_bytes() {
             "{} would hold these record names twice",
             fixture.file
         );
+        if let Some((name, _)) = fixture.records.iter().find(|(name, _)| name.contains(' ')) {
+            panic!(
+                "{}: the record name {name:?} holds a space, which the line format cannot carry",
+                fixture.file
+            );
+        }
         let committed = committed_records(fixture.file);
         assert_eq!(
             duplicates(committed.iter().map(|(name, _)| name.as_str())),
@@ -626,9 +656,12 @@ fn every_golden_record_matches_the_committed_bytes() {
             "{} holds these record names twice",
             fixture.file
         );
+        let lookup: BTreeMap<&str, &[u8]> = committed
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
         for (name, bytes) in &fixture.records {
-            let Some((_, recorded)) = committed.iter().find(|(committed, _)| committed == name)
-            else {
+            let Some(recorded) = lookup.get(name.as_str()) else {
                 panic!(
                     "{}: the record {name} is not committed; if it is new, regenerate with `{REGENERATE}`",
                     fixture.file
@@ -663,10 +696,30 @@ fn every_golden_record_matches_the_committed_bytes() {
 #[test]
 fn the_committed_fixtures_are_exactly_what_the_generator_renders() {
     for fixture in fixtures() {
-        assert!(
-            committed_text(fixture.file) == render(&fixture.records),
-            "{} differs from what the generator renders; regenerate with `{REGENERATE}`",
-            fixture.file
+        let committed = committed_text(fixture.file);
+        let rendered = render(&fixture.records);
+        if committed == rendered {
+            continue;
+        }
+        let index = committed
+            .lines()
+            .zip(rendered.lines())
+            .position(|(committed, rendered)| committed != rendered)
+            .unwrap_or_else(|| committed.lines().count().min(rendered.lines().count()));
+        let line_of = |text: &str| -> String {
+            text.lines()
+                .nth(index)
+                .unwrap_or("<end of file>")
+                .chars()
+                .take(80)
+                .collect()
+        };
+        panic!(
+            "{}: line {} differs from what the generator renders\n  committed: {}\n  rendered:  {}\nregenerate with `{REGENERATE}`",
+            fixture.file,
+            index + 1,
+            line_of(&committed),
+            line_of(&rendered)
         );
     }
 }
@@ -686,8 +739,12 @@ fn every_unrecorded_input_names_a_conformance_row() {
 }
 
 #[test]
-#[ignore] // writes the fixtures; run with --ignored to regenerate
+#[ignore = "writes the fixtures; needs COYOTE_MESH_WIRE_GOLDEN_WRITE=1"]
 fn regenerate_the_golden_fixtures() {
+    // A broad `--ignored` sweep must not rewrite the fixtures it is meant to check.
+    if std::env::var_os(WRITE_ENV).is_none_or(|value| value != "1") {
+        return;
+    }
     for fixture in fixtures() {
         fs::write(fixture_path(fixture.file), render(&fixture.records)).unwrap();
     }

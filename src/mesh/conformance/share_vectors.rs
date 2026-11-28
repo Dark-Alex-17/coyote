@@ -344,9 +344,7 @@ pub(super) fn golden_inputs() -> Vec<(&'static str, Vec<u8>)> {
                 | Case::FetchServe(FetchProbe::Check(_))
                 | Case::FetchClient(ClientProbe::Check(_)) => return None,
             };
-            let mut bytes = Vec::new();
-            rmpv::encode::write_value(&mut bytes, &value).unwrap();
-            Some((vector.name, bytes))
+            Some((vector.name, packed(&value)))
         })
         .collect()
 }
@@ -2132,10 +2130,14 @@ fn framed(value: Value) -> Vec<u8> {
     ResponseFrame::new(RequestId::from([1u8; 16]), value).encode()
 }
 
-fn encoded_len(value: &Value) -> usize {
+fn packed(value: &Value) -> Vec<u8> {
     let mut bytes = Vec::new();
     rmpv::encode::write_value(&mut bytes, value).unwrap();
-    bytes.len()
+    bytes
+}
+
+fn encoded_len(value: &Value) -> usize {
+    packed(value).len()
 }
 
 fn list_check(name: &'static str, kind: Kind, check: Check) -> Vector {
