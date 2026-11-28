@@ -14,6 +14,8 @@ flowchart TD
     parse -. "fallback" .-> pfault["parse_fault<br/>(script: PIPELINE-FAULT marker)"]
     pfault --> gate
     signals --> debris["debris_lint<br/>(script: implementation-debris lint<br/>over the added lines)"]
+    signals -. "_next: verification_tier final" .-> fcheck["finalize_check<br/>(script: finalize record for the tree,<br/>finalize gate on a miss)"]
+    fcheck --> debris
     debris -. "fallback" .-> dfault["debris_fault<br/>(script: debris_error marker)"]
     dfault --> select
     debris --> select["select_lanes<br/>(llm: ADDITIVE-only judgment)"]
@@ -46,7 +48,11 @@ those rules are *structure*:
 
 - **Lane selection floor is deterministic** (`build_items.py`): code-review
   always runs; adversary runs when a spec/plan is present; security runs on
-  attack-surface signals (auth/deps/exec paths or diff content) or hardened
+  attack-surface signals (auth/deps/exec paths or diff content - the surface
+  rules come from `agents/.shared/diff_signals.py`, shared with any
+  downstream watch-round classifier; `signals.py` keeps no copy, and without
+  the shared module it reports `signals_error`, which widens lane selection)
+  or hardened
   posture; probe runs when consumer-facing surface changed *and* a local-run
   recipe exists. The `select_lanes` LLM can only **widen** the set — a false
   flag never removes a rule-selected lane. `forced_lanes` from the caller
@@ -60,7 +66,13 @@ those rules are *structure*:
   sentinel is a lane FAILURE, never a pass; the critical count from the
   code-review report's summary line (raw 🔴 count if absent) blocks
   regardless of its verdict line; a code-review lane whose own verdict line
-  records a pipeline fault blocks (a degraded review is never a pass); the
+  records a pipeline fault blocks (a degraded review is never a pass); a
+  code-review lane whose own verdict reason opens with `review incomplete:`
+  (finding verification failed as a whole) blocks as an incomplete review and
+  is named on the incomplete line; unverified findings keep their stated
+  severity, so an unverified 🔴 is in the critical count and blocks, and
+  single unverified findings add an attention line; every adversary
+  complaint is read whole, whatever line boundaries its fields carry; the
   adversary's own degraded-run header (the `Criteria: …` line directly under
   its sentinel recording a pipeline fault, died criterion checks, or its
   verdict script's crash stub) blocks as a pipeline fault,
@@ -68,6 +80,13 @@ those rules are *structure*:
   `NEEDS-HUMAN` without 🔴 passes but
   is surfaced under *Human attention required*; probe `INCONCLUSIVE` blocks
   with an environment note — it is never treated as PASS or FAIL.
+- **The report header is one line per item**: everything above
+  `## Full lane reports` renders one line per table row, bullet or note.
+  Every value that is not a gate literal is folded through
+  `scripts/report_text.py`: `one_line` joins any line boundary into a space,
+  and `table_cell`, used for derived lane-table cells, also maps `|` to `/`
+  so a value cannot open another column. `lanes_summary` is folded again at
+  render time, whoever wrote it.
 - **Implementation debris is linted, not judged** (`debris_lint.py`, over the
   shared `.shared/debris.py`): every ADDED line of the diff is scanned for
   non-ASCII punctuation (dashes, ellipsis, arrows, section signs,
@@ -88,7 +107,12 @@ those rules are *structure*:
   argument of `agent__spawn`) or one directory name. Empty means none; a
   value that is neither a string nor a list of strings (`false`, `0`) is
   rejected rather than read as none, and any invalid value is a lint crash,
-  so it blocks.
+  so it blocks. The adversary lane receives the same value through its
+  `inputs:`, so its own debris lint leaves out the same directories. The
+  signals stage also turns a valid value into `bookkeeping_note`, one
+  sentence naming those directories as the run's own planning files that
+  a task's file list never names, which every agent lane prompt carries;
+  it is empty when no directories are configured.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
 - **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`
@@ -150,7 +174,8 @@ builder, the retry gate, the default-lanes fallback, or the verdict gate
 itself (the default-lanes fallback's crash still runs the widened lanes, so
 `pipeline` appears alongside real lane rows), plus `debris` when the lint
 crashed, was killed, its module could not be imported, or its findings
-arrived malformed. The report gains a
+arrived malformed, plus `code-review` when its own verdict reason opens with
+`review incomplete:`. The report gains a
 `## Review incomplete` section naming each exhausted lane with its
 attempt count; `PIPELINE-FAULT` lane rows carry ` ×N` when the lane was
 re-run (N > 1). The *named* entries are faults to re-run, never code
@@ -161,11 +186,31 @@ still appear under `## Blockers` and must be fixed as usual.
 
 | Lane | Sentinel | Blocks on |
 |------|----------|-----------|
-| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault |
-| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
+| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault; own verdict reason opens with `review incomplete:` (incomplete review) |
+| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES (each numbered item under the report's `Complaints:` line becomes its own blocker, so a fix round can act on it: at most 8, each clipped to 600 characters, the rest folded into one line of their heads); own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 | debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |
+| full-suite (final tier only) | none -- `finalize_check.sh`'s `full_suite_record` read from state | no green finalize record for the tree recorded before the lanes: `FULL-SUITE RECORD MISSING\|RED\|UNAVAILABLE: <detail>` (see [Verification tiers](#verification-tiers)) |
+
+Probe-written tests: `signals.py` records the worktree's tree before the lanes run
+(`review_tree_before`; untracked, non-ignored files included, written through a temporary
+copy of the index so the real one is never touched; both scripts share
+`scripts/review_tree.py` for this, and each tree computation shares one 40 s deadline
+across its git calls). When the probe lane ran, `verdict_gate.py`
+compares it with the tree after the lanes and ends the report header, just above
+`## Full lane reports`, with a `## Probe-written tests` section, the `debris_exclude`
+directories left out:
+
+- `- <path>` only for a path added during the review that the probe report names;
+- `- other: <path>` for every other changed path (a tracked file edited, or an added
+  file the probe report does not name, such as one another lane wrote);
+- `- deleted: <path>` per removed path;
+- `- unavailable: <reason>` when either tree could not be computed, and as the last line
+  when more than 50 items would be listed.
+
+When no probe lane ran nothing is written. The section is optional output: it never
+changes the verdict, and a caller that does not read it sees the report it always did.
 
 ## Spawning it
 
@@ -256,6 +301,52 @@ rules, then spawn a **fresh** gauntlet run. On PASS with *Human attention
 required*: complete the work but carry those items into your final report
 verbatim.
 
+### Verification tiers
+
+The `verification_tier` variable (default empty) says where this review sits
+in the run's verification, and is forwarded to the adversary lane through
+`inputs:`:
+
+- Empty: the gauntlet as described above.
+- `round`: a review between fix rounds. The gauntlet itself runs nothing
+  extra, so nothing here runs the full suite; the adversary lane is told the
+  full suite runs at the final gate and may defer a criterion only the whole
+  suite can prove (see the adversary's README).
+- `final`: this review is the final gate. Once `signals` has recorded the
+  worktree tree the lanes will review, it routes to `finalize_check`
+  (node timeout 3600s), which looks up the finalize record for that tree
+  (`.shared/verify_record.py`) and reuses it as it stands, green or red. On a
+  miss it runs `.shared/finalize_gate.sh` there (fmt, check, lint, then the
+  full suite under the build_lock prefix, each killed after 3300s), which writes the
+  record. A record that decides nothing (a step timed out, or the suite could
+  not be judged) is a miss, and so is one that accepted pre-existing failures
+  against another base than `baseline_floor`. The verdict gate then needs a
+  green record for the recorded tree:
+  otherwise it blocks with a `FULL-SUITE RECORD MISSING|RED|UNAVAILABLE:
+  <detail>` line and a BLOCKED `full-suite` row, even when every lane is
+  green. MISSING covers a check that never finished and a record for another
+  tree; UNAVAILABLE is a red suite with no base suite record to tell new
+  failures from old ones, or no test command. The gate's fmt step never
+  changes the tree: every file it rewrites gets its submitted bytes back, and
+  a rewritten file that belongs to the change (the diff from `baseline_floor`,
+  else from the base the suite is judged against, plus untracked files) turns
+  the fmt result RED with its path, since it was committed or submitted
+  unformatted. Should a gate still leave a tree other than the recorded one,
+  the check reports RED naming the changed paths. The recorded tree also goes
+  to the adversary lane as `review_tree`, so it looks up the same record
+  even after the probe lane writes its tests.
+
+`baseline_floor` (default empty, final tier only) is the commit the run
+started from. With it, a red full suite is judged only against the base suite
+record at that commit, and when there is none the suite runs there on demand
+(the record's `baseline_mode` says `lazy`). Without it, the nearest base
+record on HEAD's first-parent chain counts only when no merge commit lies
+between it and HEAD and every commit in between was made after the record:
+otherwise the record could belong to an earlier task whose regressions would
+pass as pre-existing.
+
+Any other value blocks as a `PIPELINE-FAULT`.
+
 ## Notes
 
 - The caller decides *whether* review is warranted at all (the gauntlet is for
@@ -287,6 +378,19 @@ verbatim.
   under that prefix (e.g. `flock -w 240 /path/to/lock`), the same way the coder and
   step-runner gates do, so a parallel batch sharing one target directory
   serialises its verification runs too.
+- Every lane node passes the resolved `project_dir` (the checkout `signals`
+  settled on: the caller's named directory, else the variable) through
+  `inputs:`. A child that declares the variable takes an `inputs:` value as
+  its own `project_dir`, so the lane's read guard and tools, and the lane's
+  own children, work in the reviewed checkout rather than the one the root
+  run was started in.
+- The `carried_failures` variable (default `'[]'`, a JSON array of
+  `{"paths", "owner", "evidence"}` items) rides the same passthrough: failures
+  the caller declares expected to stay red in this change and owed elsewhere.
+  The adversary lane reports a red run whose every failure exactly matches a
+  carried item's paths as advisory when every criterion naming the command is
+  met; a new failure beside them still blocks. A value that is not a JSON
+  array counts as none and is reported as a note.
 - Signals failures degrade WIDER: if git can't compute the diff, the surface
   is unknown — the security lane is added (and probe, when a local-run recipe
   exists) on top of caller context + forced lanes, and the report notes it.

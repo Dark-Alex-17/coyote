@@ -33,6 +33,12 @@ import re
 import sys
 import time
 
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # 69600 (graph timeout) − 2 × 11400 (largest lane envelope) − 1200 (script stages)
 # = 45600; 600 s of slack below that.
 MAX_RETRY_ELAPSED_SECS = 45000
@@ -74,7 +80,7 @@ ADVERSARY_DEGRADED_HEADER = re.compile(
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 

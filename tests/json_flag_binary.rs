@@ -233,18 +233,22 @@ fn run(dir: &Path, args: &[&str]) -> Output {
     run_with_stdin(dir, args, None, &[])
 }
 
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 /// Runs the binary with a scrubbed environment: every inherited `COYOTE_*`
 /// variable is dropped before the test's own are set, and a run that
 /// outlives `RUN_TIMEOUT` is killed.
 fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
     let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            command.env_remove(key);
-        }
-    }
-    let mut child = command
+    let mut child = scrub_coyote_env(&mut command)
         .args(args)
         .current_dir(dir)
         .envs(envs.iter().copied())

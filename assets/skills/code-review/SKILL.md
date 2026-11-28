@@ -360,7 +360,7 @@ Named adequacy anti-patterns — each is a finding even when coverage looks gree
 
 - Are names accurate? `get_user` that mutates is a lie; rename or split.
 - Could a competent reader understand this without comments?
-- Do NEW comments match the repo's comment register? You already read neighboring files for conventions — compare against them. Flag BOTH directions: narrated/restating comments in a repo that uses self-documenting code (each one is a finding, cite the line), AND missing doc comments on new public items in a repo that documents its public API. Comments explaining non-obvious *why* (decisions, workarounds, invariants) are warranted in every repo; comments captioning *what* the code plainly does are warranted in none.
+- Do NEW comments match the repo's comment register? You already read neighboring files for conventions; compare against them. Flag BOTH directions: narrated/restating comments in a repo that uses self-documenting code (each one is a section 7 `Comment hygiene` finding, cite the line), AND missing doc comments on new public items in a repo that documents its public API. Comments explaining non-obvious *why* (decisions, workarounds, invariants) are warranted in every repo; comments captioning *what* the code plainly does are warranted in none.
 - Is there a simpler way to express the same logic?
 - Is the function doing one thing, or several things glued together?
 
@@ -405,8 +405,8 @@ Each smell reads *what it is → how to fix*; match against the diff only:
 
 Implementation debris: text that made sense while the change was being built and means nothing
 to the next reader. Check this section on EVERY diff regardless of where the review stopped: it
-is cheap and mostly mechanical. Each rule reads trigger, then the decidable check, then severity.
-Rules tagged `[convention]` fold with rigor at `poc`/`prototype`; the untagged rule does not, on
+is mostly cheap and mechanical. Each rule reads trigger, then the decidable check, then severity.
+Rules tagged `[convention]` fold with rigor at `poc`/`prototype`; the untagged rules do not, on
 purpose.
 
 The review gauntlet's `debris` lint enforces the glyph set and the vocabulary set mechanically on
@@ -415,13 +415,21 @@ added lines. The vocabulary set is:
 `phase N`, `step N` and bare `round N` have too many legitimate uses to lint and are judgment
 calls the reviewer makes.
 
-- **Earns its keep** -- an added comment. Check: does it say something the code cannot: intent,
-  an invariant, a non-obvious consequence, an external constraint (a spec clause, an upstream
-  bug)? A comment that paraphrases the code or narrates the plan ("now we handle the retry
-  case", "this round adds") fails. Comments restating the code are ai-slop-remover's territory
-  and register mismatch is the Clarity rule above; this rule owns plan narration. 🟢
-  `[convention]` per instance; more than five in one diff -> one 🟡 `[convention]` finding
-  listing them.
+- **Comment hygiene** -- every comment the diff adds or rewrites (code, doc, YAML and script
+  comments). Check each one in its code context against `comment-discipline`'s rule: it earns
+  its keep when it adds context the code cannot show (intent, an invariant, an external
+  constraint such as a spec clause or an upstream bug), documents behaviour used elsewhere in the
+  codebase that is not visible here, or gives the reason for a choice (why this approach over the
+  obvious one, in a sentence beside the code it explains). It fails when it
+  restates what easily read code already says, repeats a name or a signature, or narrates the
+  plan or the implementation ("now we handle the retry case", "this round adds"). The repo's own
+  standards come first: a comment matching a comment-heavy register or a declared policy passes.
+  Only reading decides; never flag a comment for its shape alone.
+  Title each finding `Comment hygiene: <file:line>` and give the fix as `cut` or
+  `reduce to: <the sentence worth keeping>`; several in one file may share one finding that
+  lists every line. 🟡, untagged on purpose: rigor folding must not hide a fix that is a
+  deletion. Report even when clean:
+  `Comment hygiene: <n> added comments checked, <m> redundant`.
 - **Human register, ASCII punctuation** -- added text in comments, scripts, YAML comments, docs
   and user-facing strings. Check: plain sentences, ASCII punctuation only. Banned: em and en
   dashes, ellipsis characters, arrows, section signs, multiplication and comparison symbols,
@@ -467,7 +475,8 @@ calls the reviewer makes.
   CONTRIBUTING.md, README.md or a code comment. Check: does the text record a decision or an
   evidence ledger rather than explain the code or guide a contributor? Those records belong in
   the plan file or the task log. CONTRIBUTING changes must be contributor guidance (how to
-  build, test, contribute). 🟡 `[convention]`.
+  build, test, contribute). A one-sentence why beside the code it explains is a comment, not a
+  record (see Comment hygiene). 🟡 `[convention]`.
 
 ## 8. Design and structure
 
@@ -540,8 +549,9 @@ Write it as one report line:
 - Race conditions.
 - Tests that won't catch regressions.
 - Security issues (injection, auth, exposed secrets).
-- Comment and docs debris: comments narrating the plan, planning artefacts in comments or docs,
-  debt markers with no owning task, decisions recorded in CONTRIBUTING or README.
+- Comment hygiene: added comments that restate the code or narrate the plan.
+- Comment and docs debris: planning artefacts in comments or docs, debt markers with no owning
+  task, decisions recorded in CONTRIBUTING or README.
 - Complexity a pattern this repo already uses, or a tier-2 pattern contained in the new code,
   would remove: cited to its precedent, or titled "new to this repo".
 

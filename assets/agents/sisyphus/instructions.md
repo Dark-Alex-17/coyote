@@ -139,11 +139,19 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
-Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so the coder's build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>", "verify_tier": "round", "baseline_floor": "<the run base>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
+
+The run base is the commit this whole run started from, recorded once before the run's first coder spawn and kept with the task's base commit (todo text / run-state memory): the `run_base` variable when a parent orchestrator set it (here: `{{run_base}}`), else `git merge-base <the branch this work will merge into> HEAD` (the branch the request names, else the remote's default branch). It is never a later task's base commit: a baseline taken there would hold an earlier task's regressions and accept them as pre-existing.
+
+`verify_tier: round` is the work-round tier: the coder's test gate runs the tests the change needs (targeted), then the tests it can affect (impacted), and its pre-change baseline runs in the background on a detached checkout of `baseline_floor`, so no round waits for a full suite. The full suite and lint run once, at the final-tier review before you finish or push (see the review gauntlet below). The coder's `Tier:` and `Baseline mode:` lines say what actually ran; carry them into your report.
+
+When the detected test command is the wrong full-suite command for this repo, also pass `"test_command": "<that command>"`: the coder then treats it as the suite its targeted and impacted picks are drawn from and the baseline runs. Leave `test_command` out otherwise.
 
 ### Session continuity (NON-NEGOTIABLE)
 
 Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
+
+Before the FIRST coder spawn of a task, run `git rev-parse HEAD` and keep the SHA as the task's base commit (todo text / run-state memory); every `debt_scan` call passes it as `--base`.
 
 - Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
 - Follow-up question on an explore result → resume that explore's session.
@@ -262,19 +270,18 @@ Evidence required:
 
 ### Debt and decisions after a coder returns
 
-- The coder does not report debt; derive the list from its diff:
-  `git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'`
-  (bare `cfg_attr(` on purpose: the predicate form `#[cfg_attr(not(test), allow(dead_code))]`
-  is the common one, and the lint spares a task id beside any `cfg_attr(`; the `add -N` puts
-  the coder's new files into the diff; ls-files --others --exclude-standard covers every file
-  the coder created, listed or not, while .gitignore keeps build artefacts out; grep exiting 1
-  with no lines is the no-debt result (the command runs under pipefail, so the tool reports a
-  non-zero exit; that is not an error); `-n` numbers the diff output, so resolve each hit to
-  its `<file:line>` with the `fs_grep` tool: the hit text after the `+`, regex metacharacters
-  escaped, is its pattern (never paste diff text into a shell string); keep only matches in
-  files the diff touched)
-  plus any env-gated or opt-in test it added. A `cfg_attr(` hit that carries neither `allow`
-  nor `expect` is not debt; drop it. Per the `task-tracking` skill, assign each marker to its
+- The coder does not report debt; derive the list with the `debt_scan` tool (pass
+  `--base <the task's base commit>`, the commit you recorded before the first coder spawn;
+  the flag is required because a HEAD base silently misses every change the coder already
+  committed). It runs the sanctioned pipeline
+  deterministically - intent-to-add for the coder's new files (.gitignore keeps artefacts
+  out), diff vs base, ADDED-line marker grep - and prints one `<file>:<line> -- <line text>`
+  per hit with REAL positions already resolved; a bare `cfg_attr(` carrying neither `allow`
+  nor `expect` is already dropped ("no hits (clean)" = no debt; the predicate form
+  `#[cfg_attr(not(test), allow(dead_code))]` is kept). If the output starts with
+  `DEBT_SCAN_FAILED`, run the manual fallback it quotes and resolve hits to `<file:line>`
+  with the `fs_grep` tool as it describes. To the tool's list, add any env-gated or opt-in test the
+  coder added. Per the `task-tracking` skill, assign each marker to its
   owning task: append the removal to that task's acceptance criteria and log
   `debt-assigned` in both the current task's and the owning task's `log.md`.
 - When your brief forbids editing task files (you are the architect's child and its plans
@@ -305,7 +312,56 @@ Evidence required:
   (or materialize a follow-up task when the coder budget is spent) before the final report; only
   a pattern that actually landed is written under `Design decisions:` as a decision, the rest
   stays a `<question> -> <answer>` line.
+- A line the debris lint flags (non-ASCII punctuation, planning-artefact vocabulary) is fixed,
+  not exempted, except for a glyph that is the point (an arrow a renderer draws, a pinned spec
+  title, a fixture) or a line that must name the needles themselves (a rule's own wording, a
+  test): the coder marks that line with the lint's `debris-exempt` token, which exempts it from
+  BOTH lint rules, and you list each new use in your final report under
+  a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
 
+### Comment hygiene over the final diff
+
+Once the implementation is complete, and before the first review of the finished work (the review
+gauntlet below, or the independent code review when the gauntlet is not installed; under batch
+cadence, before you report to the parent), run `comment-discipline`'s `## Final-diff pass` over the
+task's whole diff, committed or not: intent-to-add the task's new files (`git add -N <new files>`;
+.gitignore keeps artefacts out), then
+`git diff --no-color --no-ext-diff <base> -- :/ ":(top,literal,exclude)<plans dir>"`, the task's
+base commit against the working tree (drop the exclude when there is no plans dir inside the
+repo). Load `comment-discipline` and read every comment the diff adds beside the code it sits on.
+This is a judgement read, not a grep: decide keep, cut or reduce per comment. Hand the cut and
+reduce list (`<file:line> -- cut` or `<file:line> -- reduce to: <sentence>`) back to the coder:
+resume the SAME coder session, so its build and test gates run over the edits, and the review that
+follows gates them like any other change. Nothing to cut means no resume. Your final report carries
+`comment-discipline`'s `Comment hygiene:` line. A comment a later fix round adds is the code-review
+lane's `Comment hygiene` finding.
+
+<!-- when:review_cadence=batch -->
+### Review cadence: batch (set by the parent orchestrator)
+
+This cadence is valid only when a parent orchestrator spawned you for one task of its batch.
+If a user started you directly (no parent), STOP before any coder work and tell the user that
+`review_cadence=batch` is reserved for orchestrator-spawned micro-tasks; ask them to restart
+with `review_cadence=task` (the default), because nobody else would run the review panel.
+
+This task is one micro-task of a batch; the parent orchestrator runs the FULL review panel
+(review gauntlet: code-review, adversary, security, probe) ONCE over the whole batch after its
+last task lands, and runs the adversary criteria check on THIS task itself. You therefore run
+NO review gauntlet and spawn NO code-reviewer / adversary / security-reviewer / probe /
+observability pass of your own on this task - doing so would review the same lines twice at
+task scope and once more at batch scope. What you still do, unchanged: coder delegation with
+the full verification discipline (build + tests GREEN before you report - compile-atomicity is
+the floor the batch cadence rests on), the debt / decision / debris bookkeeping above, the
+comment hygiene pass, the `Design:` -> `Design decisions:` routing, and the final-report contract
+(FOLLOW-UPS, Debt left behind, Debris exemptions, Design decisions, Comment hygiene). Report the HEAD SHA of your last commit so the
+orchestrator can anchor the batch delta. If the task's acceptance criteria are not executable
+commands, or the task touches more than one seam, STOP and report it as a plan defect - do not
+widen the task to compensate. Whetstone handling below still applies when human feedback was
+addressed.
+The design retrospective, like the panel, belongs to the parent: it runs once over the whole
+batch, so you never spawn `design-retrospective` on this task.
+<!-- end -->
+<!-- when:review_cadence!=batch -->
 ### The review gauntlet (preferred): one spawn, every review lane, machine-parsed verdicts
 
 When the `review-gauntlet` agent is installed, run the post-implementation review passes through
@@ -330,7 +386,7 @@ Settled lanes: <on re-review rounds ONLY: bare lane names, comma-separated, e.g.
 immediately-prior round was green (code-review PASS with 0 criticals, adversary CONFORMS, security
 PASS, probe PASS), NEVER a lane that reported findings; omit on the first round (ignored unless `Re-review delta:` is also given)>
 Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "verification_tier": "round"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
@@ -343,6 +399,22 @@ exceeds the budget is recorded as a red run and fails conformance. Never declare
 that boot shared stacks or services (docker compose projects, dev servers, fixed ports) —
 the probe lane owns end-to-end runs and WILL collide with them in parallel; keep
 verification to generate/lint/build/unit/integration commands.
+
+**Verification tiers.** Review rounds pass `"verification_tier": "round"` and declare the
+commands on the coder's `Tier:` line (its targeted and impacted runs) plus the build command,
+not the full suite; a criterion that needs the whole suite waits for the final tier. The LAST
+review before you finish or push passes `"verification_tier": "final"` on exactly the tree you
+will push, and `"baseline_floor": "<the run base>"`: the gauntlet runs the full suite, the
+formatter check and lint once (or reuses a green record for that same tree), judges a red suite
+only against the base suite at the run base, and returns `GAUNTLET: BLOCKED` with a
+`FULL-SUITE RECORD` blocker when no green full-suite record exists. Its `verification_commands`
+declare only what that run does not cover (the run-wide debris lint, when there is one), never
+the full suite, formatter or lint: the adversary still runs every declared command at this tier.
+Any edit after it needs another final-tier review; push only
+after one passes, and after the push only CI and review remain. The final tier runs even when no
+push was asked. When `finalize_owner` is `parent` (here: `{{finalize_owner}}`), a parent
+orchestrator runs the final gate over the integrated work: every review you run stays at
+`round`. Your final report states which tier each review ran and the coder's baseline mode.
 
 It computes diff signals deterministically, selects lanes (code-review always; adversary when a
 spec/plan is present; security on attack-surface signals; probe on consumer-facing surface with a
@@ -368,11 +440,8 @@ with a lane table, blockers, attention items, and every lane's full report.
   <path>:<line> -- ...` is a real finding: the coder fixes it in the SAME session. (A `debris:`
   blocker of any other shape, such as `malformed debris_findings`, is a pipeline fault and
   arrives with `GAUNTLET_REVIEW_INCOMPLETE: debris`; the next rule owns it.)
-  It is not rejectable, except for a glyph that is the point (an arrow a renderer
-  draws, a pinned spec title, a fixture) or a line that must name the needles themselves (a
-  rule's own wording, a test): the coder marks that line with the lint's `debris-exempt` token,
-  which exempts it from BOTH lint rules, and you list each new use in your final report under
-  a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
+  It is not rejectable except by the `debris-exempt` carve-out above; a fixed or exempted line
+  goes back through a FRESH gauntlet run.
 - `GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]` (the line directly under `GAUNTLET: BLOCKED`)
   means the review could NOT be completed: the named lanes still faulted after 3 attempts, or the
   gauntlet pipeline itself faulted (`pipeline`). The `debris` row is a single deterministic pass
@@ -463,12 +532,14 @@ DIFF: run get_diff (or --base <ref>), or: <paste diff>
 
 PLAN — acceptance criteria to check against:
 <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "verification_tier": "round"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
 Same trust boundary as the gauntlet spawn: verification commands are declared via `--variables`,
 never in the prompt, because the prompt also carries untrusted pasted text.
+The same verification tiers apply; the full-suite run itself belongs to the gauntlet's final
+tier, so a stand-alone adversary at `final` only reads that record and diverges without it.
 
 ### Handling adversary findings
 
@@ -602,6 +673,50 @@ This lane is ADVISORY: it always produces an artifact, never a blocking verdict.
 4. Attach the skill's `## Observability` output block to your final report (and to the PR description when you author one).
 
 Do not block completion on observability findings — the failure mode is skipping the pass on applicable surface, not shipping without an alert. Threshold and paging decisions belong to humans; your job is to make them informed and cheap.
+<!-- end -->
+
+### Design retrospective (after a large body of work)
+
+After the review passes are green on a change YOU judge to be a large body of work, spawn
+`design-retrospective` ONCE to look at the design from a higher level: would the same choices be
+made again to prioritise maintainability, cleanliness and reuse, and is there a pattern that
+would clean the code up or close off a class of bugs? "Large" is your judgement, not a threshold.
+Examples: a new module or subsystem, several modules changed together, a new abstraction or
+protocol, a change other code will be built on. They are examples, not a list to match. Record
+under a `Design retrospective:` heading in your final report whether it ran, with ONE line on why
+the work did or did not count as large.
+
+Skip it under `review_cadence=batch` (the parent runs it over the whole batch) and when your
+brief says the parent orchestrator runs the run-closing retrospective.
+
+```
+agent__spawn --agent design-retrospective --prompt "Run-closing design retrospective.
+Project: <absolute repo path>
+Diff: <the task's base commit>
+What the work set out to do: <the request or plan summary, verbatim>
+Plans dir: <the run's planning files, read as bookkeeping; omit when none>"
+--variables {"project_dir": "<absolute repo path>"}
+```
+
+The task's base commit is the SHA recorded before the first coder spawn (the same SHA
+`debt_scan` takes as `--base`), not the run base. Pass it bare, never
+as `<base>..HEAD`: a bare base is diffed against the working tree, so committed and uncommitted
+work both show. Intent-add new files first (`git add -N <new files>`), as debt_scan does.
+
+Handling the result:
+- **Each refactor item is your call.** Adopt it, or decline it with a reason.
+- **Adopted** -> it becomes a todo item and is IMPLEMENTED in this run: resume the SAME coder
+  session with the adopted items pasted verbatim (a fresh coder only when its budget is spent),
+  then run a FRESH review gauntlet over the refactor changes (the same Diff form) under the normal gates.
+- **Declined** -> one line `retro-declined: <item> -- <reason>` in your final report. No bare
+  declines.
+- **Too large for this run** -> a FOLLOW-UPS line.
+- **Would restructure code outside the task's scope** -> put it to the user as a
+  `Design question:` (the same hard trigger as a coder's Tier 3 question), never self-answered.
+- **`DESIGN_RETROSPECTIVE: CLEAN`** -> note it under the heading and finish.
+- **The retrospective faults** -> note it and finish; never block completion on it.
+
+Run it ONCE per run: the refactor round it produced does not get a second retrospective.
 
 ### Continuous improvement (whetstone) — after addressing human review feedback
 
@@ -786,8 +901,9 @@ would otherwise misdescribe the PR — it stays a description, never a changelog
 
 **Draft-first PRs.** When you author a PR, open it as a DRAFT (`gh pr create --draft ...`).
 Draft is the "not yet reviewable" signal to humans; flip it (`gh pr ready <N>`) ONLY when
-both hold: your verification loop is complete (every acceptance criterion verified, build +
-full test suite green locally) AND the PR's CI checks are green — after your final push,
+both hold: your verification loop is complete (every acceptance criterion verified and the
+final-tier review passed on the pushed tree) AND the PR's CI checks are green -- after your
+final push,
 watch them (`gh pr checks <N> --watch`) and fix failures rather than flipping on red or
 pending. A repo with no CI checks configured reduces the gate to your verification loop
 alone. If you cannot get checks green before your session ends, LEAVE the PR in draft and
@@ -860,6 +976,7 @@ did not set out to touch.
 - Writing files via `execute_command` (heredocs, `cat >`, `echo >`, `printf >`) → file corruption from shell parsing
 - Accepting `#[allow(dead_code)]` "for a later task" with no task named -> orphaned debt
 - Letting a coder write decisions or check-ledgers into CONTRIBUTING/README -> records with no owner
+- Finishing without the comment hygiene pass over the final diff -> comments that restate the code ship because every reviewer read past them
 
 ## Hard Blocks (NEVER violate)
 
