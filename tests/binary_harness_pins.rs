@@ -25,10 +25,11 @@ const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const SUPPORT_BIN: &str = "tests/support/bin.rs";
 // Split for the same reason: a bare `Command` around the binary path skips
 // the isolation coyote_command applies.
-const BARE_SPAWNS: [&str; 3] = [
+const BARE_SPAWNS: [&str; 4] = [
     concat!("Command::new(", "support::bin::path()"),
     concat!("Command::new(", "bin::path()"),
     concat!("Command::new(", "path())"),
+    concat!("Command::new(", "binary)"),
 ];
 const PATH_CALL: &str = concat!("bin::", "path()");
 const GRAPH_SESSION_HARNESSES: [&str; 2] = [
