@@ -201,7 +201,8 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// Every refusal must be built at one site so the bytes cannot drift between rules. The
 /// needle and the test-module markers are assembled at runtime so this test's own text
 /// never matches them. Only the trailing test module is stripped: a `#[cfg(test)]` on an
-/// import or a helper method must not end the scan early.
+/// import or a helper method must not end the scan early. `src/mesh/test_support` is
+/// fixture code and is skipped by path.
 ///
 /// The propagation fetch and the knock are the client half: they read a refusal a peer
 /// sent us, so they may name the code only inside an `RequestError::Refused(..)` pattern and
@@ -481,8 +482,8 @@ pub(crate) mod network {
     use crate::mesh::snapshot::{MeshSnapshot, RepoInfo, TurnState};
     use crate::mesh::test_support::{
         Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, POLL, TempDir, TrustList,
-        contains_bytes, loopback_relay, mesh_paths, private_config, snapshot_fixture,
-        started_runtime, wait_until,
+        contains_bytes, loopback_relay, map, mesh_paths, private_config, snapshot_fixture,
+        started_runtime, t_epoch, wait_until,
     };
     use crate::mesh::trust::{
         IdentityStanding, InstancePresence, Rule, ServedBy, TRUST_FILE_VERSION, TrustChange,
@@ -4268,8 +4269,7 @@ pub(crate) mod network {
     /// no line or a served request with an error line.
     #[tokio::test]
     async fn a_dispatched_requests_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
-        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
-        let holder_seen = at(2_000);
+        let holder_seen = t_epoch(2_000);
         let row_gone = holder_seen + PEER_TTL;
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -4385,8 +4385,7 @@ pub(crate) mod network {
     #[tokio::test]
     async fn a_presence_refusal_told_through_the_dispatcher_outlives_the_holders_row_on_a_registered_path()
      {
-        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
-        let holder_seen = at(2_000);
+        let holder_seen = t_epoch(2_000);
         let row_gone = holder_seen + PEER_TTL;
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -4500,8 +4499,7 @@ pub(crate) mod network {
     #[tokio::test]
     async fn with_protection_off_the_dispatcher_serves_a_presence_collision_silently_and_remembers_nothing()
      {
-        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
-        let holder_seen = at(2_000);
+        let holder_seen = t_epoch(2_000);
         let row_gone = holder_seen + PEER_TTL;
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -12437,17 +12435,8 @@ pub(crate) mod network {
         workspace
     }
 
-    fn wire_map(entries: Vec<(&str, Value)>) -> Value {
-        Value::Map(
-            entries
-                .into_iter()
-                .map(|(key, value)| (Value::from(key), value))
-                .collect(),
-        )
-    }
-
     pub(crate) fn fetch_body(path: &str, if_sha256: Option<[u8; 32]>) -> Value {
-        wire_map(vec![
+        map(vec![
             ("v", Value::from(PEER_WIRE_VERSION)),
             ("path", Value::from(path)),
             (
@@ -12490,7 +12479,7 @@ pub(crate) mod network {
         let listed = b_asks_a(
             &pair,
             LIST_PATH,
-            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
             short_options(),
         )
         .await;
@@ -12557,7 +12546,7 @@ pub(crate) mod network {
     }
 
     pub(crate) fn access_body(id: &str, paths: &[&str], reason: &str) -> Value {
-        wire_map(vec![
+        map(vec![
             ("v", Value::from(PEER_WIRE_VERSION)),
             ("id", Value::from(id)),
             (
@@ -13219,7 +13208,7 @@ pub(crate) mod network {
         let bytes = b"# a\n".to_vec();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         let ok_body = |sha256: [u8; 32]| {
-            wire_map(vec![
+            map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
                 ("status", Value::from("ok")),
                 ("size", Value::from(bytes.len() as u64)),
@@ -13296,11 +13285,10 @@ pub(crate) mod network {
         assert!(matches!(err, FetchError::NotServed), "{err:?}");
         assert_eq!(err.to_string(), "that session does not share files");
 
-        pair.recorder_b
-            .queue(Script::Reply(Reply::Value(wire_map(vec![
-                ("v", Value::from(PEER_WIRE_VERSION)),
-                ("status", Value::from("weird")),
-            ]))));
+        pair.recorder_b.queue(Script::Reply(Reply::Value(map(vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            ("status", Value::from("weird")),
+        ]))));
         let err = pair
             .node_a
             .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
@@ -13318,20 +13306,19 @@ pub(crate) mod network {
             .unwrap_err();
         assert!(matches!(err, FetchError::Corrupt), "{err:?}");
 
-        pair.recorder_b
-            .queue(Script::Reply(Reply::Value(wire_map(vec![
-                ("v", Value::from(PEER_WIRE_VERSION)),
-                (
-                    "entries",
-                    Value::Array(vec![wire_map(vec![
-                        ("path", Value::from("docs/a.md")),
-                        ("size", Value::from(bytes.len() as u64)),
-                        ("sha256", Value::Binary(digest.to_vec())),
-                        ("mtime", Value::F64(1_700_000_000.0)),
-                    ])]),
-                ),
-                ("next", Value::Nil),
-            ]))));
+        pair.recorder_b.queue(Script::Reply(Reply::Value(map(vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            (
+                "entries",
+                Value::Array(vec![map(vec![
+                    ("path", Value::from("docs/a.md")),
+                    ("size", Value::from(bytes.len() as u64)),
+                    ("sha256", Value::Binary(digest.to_vec())),
+                    ("mtime", Value::F64(1_700_000_000.0)),
+                ])]),
+            ),
+            ("next", Value::Nil),
+        ]))));
         let page = pair
             .node_a
             .list_shares(Route::unasked(*b_desc), None, None)
@@ -13400,14 +13387,13 @@ pub(crate) mod network {
         fs::create_dir_all(&inbox_root).unwrap();
         fs::write(inbox_root.join(b_hex.to_lowercase()), b"not a directory").unwrap();
 
-        pair.recorder_b
-            .queue(Script::Reply(Reply::Value(wire_map(vec![
-                ("v", Value::from(PEER_WIRE_VERSION)),
-                ("status", Value::from("ok")),
-                ("size", Value::from(bytes.len() as u64)),
-                ("sha256", Value::Binary(digest.to_vec())),
-                ("bytes", Value::Binary(bytes.clone())),
-            ]))));
+        pair.recorder_b.queue(Script::Reply(Reply::Value(map(vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            ("status", Value::from("ok")),
+            ("size", Value::from(bytes.len() as u64)),
+            ("sha256", Value::Binary(digest.to_vec())),
+            ("bytes", Value::Binary(bytes.clone())),
+        ]))));
         let err = pair
             .node_a
             .fetch_file(Route::unasked(*b_desc), "docs/a.md", None)
@@ -13451,10 +13437,7 @@ pub(crate) mod network {
 
         let asks = [
             (STATUS_PATH, Value::Nil),
-            (
-                LIST_PATH,
-                wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
-            ),
+            (LIST_PATH, map(vec![("v", Value::from(PEER_WIRE_VERSION))])),
             (FETCH_PATH, fetch_body("docs/a.md", None)),
             (FETCH_PATH, fetch_body("src/x.rs", None)),
             (FETCH_PATH, fetch_body("docs/missing.md", None)),
@@ -13499,7 +13482,7 @@ pub(crate) mod network {
         let listed = b_asks_a(
             &pair,
             LIST_PATH,
-            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
             short_options(),
         )
         .await;
@@ -13573,11 +13556,11 @@ pub(crate) mod network {
 
         let answers: Vec<(Value, Fetched)> = vec![
             (
-                wire_map(vec![v(), ("status", Value::from("not_shared"))]),
+                map(vec![v(), ("status", Value::from("not_shared"))]),
                 Fetched::NotShared,
             ),
             (
-                wire_map(vec![
+                map(vec![
                     v(),
                     ("status", Value::from("too_large")),
                     ("limit", Value::from(4_194_304u64)),
@@ -13585,7 +13568,7 @@ pub(crate) mod network {
                 Fetched::TooLarge { limit: 4_194_304 },
             ),
             (
-                wire_map(vec![
+                map(vec![
                     v(),
                     ("status", Value::from("not_modified")),
                     ("sha256", Value::Binary(digest.to_vec())),
@@ -13593,7 +13576,7 @@ pub(crate) mod network {
                 Fetched::NotModified { sha256: digest },
             ),
             (
-                wire_map(vec![
+                map(vec![
                     v(),
                     ("status", Value::from("invalid_path")),
                     ("rule", Value::from("segment")),
@@ -13626,14 +13609,13 @@ pub(crate) mod network {
             );
         }
 
-        pair.recorder_b
-            .queue(Script::Reply(Reply::Value(wire_map(vec![
-                v(),
-                ("status", Value::from("ok")),
-                ("size", Value::from(bytes.len() as u64)),
-                ("sha256", Value::Binary([0x11; 32].to_vec())),
-                ("bytes", Value::Binary(bytes.clone())),
-            ]))));
+        pair.recorder_b.queue(Script::Reply(Reply::Value(map(vec![
+            v(),
+            ("status", Value::from("ok")),
+            ("size", Value::from(bytes.len() as u64)),
+            ("sha256", Value::Binary([0x11; 32].to_vec())),
+            ("bytes", Value::Binary(bytes.clone())),
+        ]))));
         let err = pair
             .node_a
             .fetch_file(Route::unasked(*b_desc), "docs/c.md", None)
@@ -13683,15 +13665,14 @@ pub(crate) mod network {
             "a refused listing is not remembered"
         );
 
-        pair.recorder_b
-            .queue(Script::Reply(Reply::Value(wire_map(vec![
-                v(),
-                ("status", Value::from("ok")),
-                ("size", Value::from(bytes.len() as u64)),
-                ("sha256", Value::Binary(digest.to_vec())),
-                ("bytes", Value::Binary(bytes.clone())),
-                ("colour", Value::from("blue")),
-            ]))));
+        pair.recorder_b.queue(Script::Reply(Reply::Value(map(vec![
+            v(),
+            ("status", Value::from("ok")),
+            ("size", Value::from(bytes.len() as u64)),
+            ("sha256", Value::Binary(digest.to_vec())),
+            ("bytes", Value::Binary(bytes.clone())),
+            ("colour", Value::from("blue")),
+        ]))));
         let fetched = pair
             .node_a
             .fetch_file(Route::unasked(*b_desc), "docs/c.md", None)
@@ -13758,7 +13739,7 @@ pub(crate) mod network {
         let listed = b_asks_a(
             &pair,
             LIST_PATH,
-            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
             short_options(),
         )
         .await;
@@ -13964,7 +13945,7 @@ pub(crate) mod network {
         let listed = b_asks_a(
             &pair,
             LIST_PATH,
-            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
             short_options(),
         )
         .await;

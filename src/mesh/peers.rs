@@ -899,8 +899,9 @@ mod public_key_tests {
     use rns_transport::rand_core::OsRng;
 
     /// A sighting whose hashes and key derive from a real identity, as an announce's do,
-    /// and that key.
-    fn announced() -> (PeerSighting, String) {
+    /// and that key. The hashes come from the transport derivation, not from the helper
+    /// under test.
+    fn keyed_sighting() -> (PeerSighting, String) {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let key = identity.as_identity().to_hex_string();
         let peer = announced_as(identity, "instance");
@@ -925,7 +926,7 @@ mod public_key_tests {
         let tmp = TempDir::new("peers-key-round-trip");
         let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, key) = announced();
+        let (sighting, key) = keyed_sighting();
         let destination = sighting.destination_hash.clone();
         table.observe(sighting, t0);
         table.persist_if_dirty().unwrap();
@@ -948,8 +949,8 @@ mod public_key_tests {
     #[test]
     fn a_tampered_key_is_not_used() {
         install_log_collector();
-        let (sighting, key) = announced();
-        let (_, other_key) = announced();
+        let (sighting, key) = keyed_sighting();
+        let (_, other_key) = keyed_sighting();
         let row = PeerRecord {
             destination_hash: sighting.destination_hash.clone(),
             identity_hash: sighting.identity_hash.clone(),
@@ -997,11 +998,11 @@ mod public_key_tests {
         let tmp = TempDir::new("peers-key-rebound");
         let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, _) = announced();
+        let (sighting, _) = keyed_sighting();
         let destination = sighting.destination_hash.clone();
         table.observe(sighting, t0);
 
-        let (mut rebound, _) = announced();
+        let (mut rebound, _) = keyed_sighting();
         rebound.destination_hash = destination.clone();
         rebound.public_key = None;
         table.observe(rebound, t0 + Duration::from_secs(1));
@@ -1014,7 +1015,7 @@ mod public_key_tests {
         let tmp = TempDir::new("peers-key-kept");
         let t0 = t_epoch(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, key) = announced();
+        let (sighting, key) = keyed_sighting();
         let destination = sighting.destination_hash.clone();
         let keyless = PeerSighting {
             destination_hash: sighting.destination_hash.clone(),

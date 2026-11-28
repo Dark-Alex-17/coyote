@@ -185,8 +185,8 @@ pub(crate) fn fake_hash(fill: u8) -> String {
     hex_lower(&[fill; 16])
 }
 
-/// A msgpack map built by hand, so a request body never depends on the encoders under
-/// test.
+/// A msgpack map built by hand, so a body or a stand-in's reply never depends on the
+/// encoders under test.
 pub(crate) fn map(entries: Vec<(&str, Value)>) -> Value {
     Value::Map(
         entries
@@ -196,6 +196,7 @@ pub(crate) fn map(entries: Vec<(&str, Value)>) -> Value {
     )
 }
 
+/// The `LiveMesh` of a mesh that is off: no peer table.
 pub(crate) struct MeshOff;
 
 impl LiveMesh for MeshOff {
@@ -1260,7 +1261,7 @@ impl PeerStub {
     /// nobody to receive it. A node that heard it files the stub within one poll and
     /// never hears a second; the cadence stays far below the announce burst rate that
     /// trips ingress control.
-    pub(crate) async fn wait_to_be_filed(&self, peers: &crate::mesh::peers::PeerTable, to: &str) {
+    pub(crate) async fn wait_to_be_filed(&self, peers: &PeerTable, to: &str) {
         const REANNOUNCE: Duration = Duration::from_secs(1);
         let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
         let mut next_announce = tokio::time::Instant::now() + REANNOUNCE;

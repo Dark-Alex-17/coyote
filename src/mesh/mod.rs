@@ -1878,6 +1878,10 @@ mod tests {
             "the scan must reach the production log line in src/repl/mesh.rs"
         );
         assert!(
+            sources.iter().any(|path| path.ends_with("mesh/node.rs")),
+            "the scan must reach the mesh sources under src/mesh"
+        );
+        assert!(
             sources
                 .iter()
                 .any(|path| path.ends_with("config/mesh_envoy.rs")),

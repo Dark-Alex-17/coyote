@@ -327,7 +327,8 @@ mod tests {
             "mod.rs production code before test_support is scanned"
         );
         assert!(
-            kept.contains(&"pub(crate) mod test_support;"),
+            kept.windows(2)
+                .any(|pair| pair == ["#[cfg(test)]", "pub(crate) mod test_support;"]),
             "mod.rs keeps its cfg(test) test_support file module declaration: {kept:#?}"
         );
         assert!(
