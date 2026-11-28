@@ -156,6 +156,28 @@ pub(super) fn listed() -> Vec<Listed> {
         .collect()
 }
 
+/// The packed `Value` each row hands its decoder or dispatcher, keyed by row name; an
+/// encode row records the value it expects instead. Custom rows have none.
+pub(super) fn golden_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    vectors()
+        .into_iter()
+        .filter_map(|vector| {
+            let value = match vector.case {
+                Case::EnvelopeDecode { value, .. }
+                | Case::VersionRefusalDecode { value, .. }
+                | Case::DispatchErrorDecode { value, .. }
+                | Case::RefusalCodeDecode { value, .. } => value,
+                Case::EnvelopeEncode { expect, .. } | Case::VersionRefusalEncode { expect, .. } => {
+                    expect
+                }
+                Case::Dispatch { data, .. } => data,
+                Case::Custom(_) => return None,
+            };
+            Some((vector.name, packed(&value)))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------------------

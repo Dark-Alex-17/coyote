@@ -315,6 +315,40 @@ pub(super) fn listed() -> Vec<Listed> {
         .collect()
 }
 
+/// The packed `Value` each data row hands a handler or reader, keyed by row name. Rows
+/// whose input is a path, a file's text, a pattern or a check function have none.
+pub(super) fn golden_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    vectors()
+        .into_iter()
+        .filter_map(|vector| {
+            let value = match vector.case {
+                Case::WirePath(WireProbe::RuleOf { value, .. })
+                | Case::ListServe(ListProbe::Request { body: value, .. })
+                | Case::FetchServe(FetchProbe::Request { body: value, .. })
+                | Case::FetchClient(
+                    ClientProbe::Page { value, .. }
+                    | ClientProbe::Entry { value, .. }
+                    | ClientProbe::Reply { value, .. },
+                ) => value,
+                Case::WirePath(
+                    WireProbe::Parse { .. }
+                    | WireProbe::RuleId { .. }
+                    | WireProbe::AccessPaths { .. }
+                    | WireProbe::ListEntry { .. }
+                    | WireProbe::FilePart { .. },
+                )
+                | Case::ShareSet(_)
+                | Case::GrantStore(_)
+                | Case::StoreSchema(_)
+                | Case::ListServe(ListProbe::Check(_))
+                | Case::FetchServe(FetchProbe::Check(_))
+                | Case::FetchClient(ClientProbe::Check(_)) => return None,
+            };
+            Some((vector.name, packed(&value)))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------------------
@@ -2096,10 +2130,14 @@ fn framed(value: Value) -> Vec<u8> {
     ResponseFrame::new(RequestId::from([1u8; 16]), value).encode()
 }
 
-fn encoded_len(value: &Value) -> usize {
+fn packed(value: &Value) -> Vec<u8> {
     let mut bytes = Vec::new();
     rmpv::encode::write_value(&mut bytes, value).unwrap();
-    bytes.len()
+    bytes
+}
+
+fn encoded_len(value: &Value) -> usize {
+    packed(value).len()
 }
 
 fn list_check(name: &'static str, kind: Kind, check: Check) -> Vector {

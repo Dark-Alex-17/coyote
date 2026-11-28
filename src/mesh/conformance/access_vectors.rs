@@ -134,6 +134,42 @@ pub(super) fn listed() -> Vec<Listed> {
         .collect()
 }
 
+/// The packed body or reply each data row hands its surface, keyed by row name; a fetched
+/// message is recorded as its title, content and fields. Check rows have none.
+pub(super) fn golden_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    vectors()
+        .into_iter()
+        .filter_map(|vector| {
+            let bytes = match vector.case {
+                Case::AccessRequest(RequestProbe::Refused(value))
+                | Case::AccessReply(ReplyProbe::Decode { value, .. }) => packed(&value),
+                Case::AccessLxmf(LxmfProbe::Decode { message, .. }) => packed_message(*message),
+                Case::AccessRequest(RequestProbe::Check(_))
+                | Case::AccessReply(ReplyProbe::Check(_))
+                | Case::AccessLxmf(LxmfProbe::Check(_))
+                | Case::Decision(_)
+                | Case::Disposition(_) => return None,
+            };
+            Some((vector.name, bytes))
+        })
+        .collect()
+}
+
+fn packed(value: &Value) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    rmpv::encode::write_value(&mut bytes, value).unwrap();
+    bytes
+}
+
+fn packed_message(message: InboundMessage) -> Vec<u8> {
+    let bytes = |part: Option<Vec<u8>>| part.map_or(Value::Nil, Value::Binary);
+    packed(&Value::Array(vec![
+        bytes(message.title),
+        bytes(message.content),
+        message.fields.unwrap_or(Value::Nil),
+    ]))
+}
+
 // ---------------------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------------------

@@ -93,6 +93,23 @@ fn all_listed() -> Vec<Listed> {
     listed
 }
 
+/// Each fixed-data row's wire payload, named `<table>/<row>`: the input the row hands the
+/// code under test or, for an encode row, the output that code must produce.
+pub(super) fn golden_inputs() -> Vec<(String, Vec<u8>)> {
+    [
+        ("vectors", vectors::golden_inputs()),
+        ("env_vectors", env_vectors::golden_inputs()),
+        ("share_vectors", share_vectors::golden_inputs()),
+        ("access_vectors", access_vectors::golden_inputs()),
+    ]
+    .into_iter()
+    .flat_map(|(table, rows)| {
+        rows.into_iter()
+            .map(move |(row, bytes)| (format!("{table}/{row}"), bytes))
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Kind, all_listed};
