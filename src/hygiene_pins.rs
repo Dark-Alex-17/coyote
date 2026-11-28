@@ -974,7 +974,9 @@ fn opaque_files_have_no_comment_lines() {
 fn every_comment_class_present_in_the_attributed_files_yields_comment_lines() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut per_class: BTreeMap<String, usize> = BTreeMap::new();
-    for path in attributed_paths(root) {
+    let attributed = attributed_paths(root);
+    assert!(!attributed.is_empty(), "no attributed files to scan");
+    for path in attributed {
         if let Class::Opaque = class_of(&path) {
             continue;
         }
@@ -1238,7 +1240,7 @@ fn directory_patterns_match_under_their_prefix_segment() {
     let root = tmp.path.as_path();
     fixture_repo(
         root,
-        "src/mesh/** comment-hygiene\nscripts/mesh-*/** comment-hygiene\n",
+        &format!("src/mesh/** {ATTRIBUTE}\nscripts/mesh-*/** {ATTRIBUTE}\n"),
         &[
             "scripts/mesh-/x.sh",
             "scripts/mesh-interop/setup.sh",
@@ -1265,7 +1267,7 @@ fn attributed_paths_ignores_untracked_files() {
     let root = tmp.path.as_path();
     fixture_repo(
         root,
-        "src/mesh/** comment-hygiene\n",
+        &format!("src/mesh/** {ATTRIBUTE}\n"),
         &["src/mesh/tracked.rs"],
     );
     std::fs::write(root.join("src/mesh/scratch.rs"), "// scratch\n").expect("write");
@@ -1273,6 +1275,20 @@ fn attributed_paths_ignores_untracked_files() {
         attributed_paths(root),
         BTreeSet::from(["src/mesh/tracked.rs".to_string()])
     );
+}
+
+#[test]
+fn declared_patterns_skips_comments_and_negations() {
+    let tmp = TempDir::new("hygiene-declared");
+    let root = tmp.path.as_path();
+    fixture_repo(
+        root,
+        &format!(
+            "# note\n\nsrc/a.rs text eol=lf {ATTRIBUTE}\nsrc/b.rs -{ATTRIBUTE}\nsrc/c.rs {ATTRIBUTE}\n"
+        ),
+        &[],
+    );
+    assert_eq!(declared_patterns(root), ["src/a.rs", "src/c.rs"]);
 }
 
 /// The two `origin/main` comparisons run on a branch that has not landed, skip while the
@@ -1328,9 +1344,13 @@ fn main_comparisons_retire_once_the_pins_have_landed() {
 fn every_attribute_pattern_matches_a_tracked_file() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let declared = declared_patterns(root);
+    assert!(
+        !declared.is_empty(),
+        ".gitattributes declares no {ATTRIBUTE} pattern"
+    );
     for pattern in &declared {
         assert!(
-            pattern.contains('/'),
+            pattern.trim_end_matches('/').contains('/'),
             "{pattern} is not anchored at the root"
         );
         if !TRANSITIONAL.contains(&pattern.as_str()) {
@@ -1408,11 +1428,10 @@ fn the_attributed_set_is_the_three_dot_diff_minus_docs_and_examples() {
 #[test]
 fn every_file_a_pattern_matches_carries_the_attribute() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let attributed = attributed_paths(root);
     for pattern in declared_patterns(root) {
-        let matched = tracked_matches(root, &pattern);
-        let under = nul_separated(&matched);
-        let set = attribute_set_on(root, matched);
-        let uncovered: Vec<&String> = under.difference(&set).collect();
+        let under = nul_separated(&tracked_matches(root, &pattern));
+        let uncovered: Vec<&String> = under.difference(&attributed).collect();
         assert!(
             uncovered.is_empty(),
             "{pattern} matches files a later .gitattributes line leaves without the {ATTRIBUTE} attribute: {uncovered:?}"
