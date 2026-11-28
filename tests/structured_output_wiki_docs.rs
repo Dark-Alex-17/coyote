@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use support::bin::{Dirs, coyote_command};
+use support::repo::read_path as read;
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str =
@@ -51,12 +52,6 @@ fn wiki_dir() -> Option<PathBuf> {
         dir.display()
     );
     Some(dir)
-}
-
-fn read(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
 }
 
 /// The text from the heading line that equals `heading` up to the next

@@ -13,8 +13,8 @@ pub fn path() -> &'static str {
 }
 
 /// The directories a spawned binary resolves its state from. Each one is
-/// handed to the child explicitly, so nothing it reads or writes falls back
-/// to the developer's own config, cache, home or temp dir.
+/// handed to the child explicitly, so the child never falls back to a
+/// default it would resolve on its own.
 pub struct Dirs {
     /// `COYOTE_CONFIG_DIR`.
     pub config: PathBuf,
@@ -22,11 +22,25 @@ pub struct Dirs {
     pub cache: PathBuf,
     /// `HOME`, and `USERPROFILE` for Windows.
     pub home: PathBuf,
-    /// `TMPDIR`, and `TMP` and `TEMP` for Windows. A test that looks for what
-    /// the child left in its temp dir and has no private one passes
-    /// [`env::temp_dir`], the dir the child would have inherited.
+    /// `TMPDIR`, and `TMP` and `TEMP` for Windows. Pinned to whatever the
+    /// caller passes; most pass [`env::temp_dir`], the dir the child would
+    /// have inherited anyway, so for them the temp dir is stated explicitly
+    /// rather than isolated.
     pub temp: PathBuf,
 }
+
+/// The variables [`isolate`] sets from [`Dirs`]. A helper that forwards
+/// caller-supplied variables after [`coyote_command`] checks against this
+/// list, since a caller value for one of these would override the pin.
+pub const PINNED_VARS: [&str; 7] = [
+    "COYOTE_CONFIG_DIR",
+    "COYOTE_CACHE_DIR",
+    "HOME",
+    "USERPROFILE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+];
 
 /// A [`Command`] for the built binary with its environment set up by
 /// [`isolate`].
@@ -37,7 +51,7 @@ pub fn coyote_command(dirs: &Dirs) -> Command {
 }
 
 /// Removes every inherited `COYOTE_*` variable from `command`'s environment,
-/// then points it at `dirs`. [`coyote_command`] calls this; a test that
+/// then sets [`PINNED_VARS`] from `dirs`. [`coyote_command`] calls this; a test that
 /// launches the binary through a wrapper (`script`, a shell) calls it on the
 /// wrapper's command. Anything set on `command` afterwards wins, so a test
 /// can still hand the child a `COYOTE_*` variable of its own.
@@ -99,7 +113,7 @@ impl DryRunConfig {
         self
     }
 
-    pub fn render(&self) -> String {
+    fn render(&self) -> String {
         let api_key = if self.quoted_api_key {
             "'unused'"
         } else {
@@ -127,6 +141,7 @@ impl DryRunConfig {
 
     /// Writes the rendered config to `<config_dir>/config.yaml`.
     pub fn write(&self, config_dir: &Path) {
-        fs::write(config_dir.join("config.yaml"), self.render()).unwrap();
+        let path = config_dir.join("config.yaml");
+        fs::write(&path, self.render()).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     }
 }

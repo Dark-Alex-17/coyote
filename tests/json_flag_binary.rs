@@ -17,7 +17,7 @@ use std::{env, process};
 
 use serde_json::{Value, json};
 
-use support::bin::{Dirs, coyote_command};
+use support::bin::{Dirs, PINNED_VARS, coyote_command};
 
 const REPLY: &str = "**hello** from the stub";
 const TOOL: &str = "agent__list_sessions";
@@ -240,6 +240,10 @@ fn run(dir: &Path, args: &[&str]) -> Output {
 /// Runs the binary with a scrubbed environment (see `coyote_command`); a run
 /// that outlives `RUN_TIMEOUT` is killed.
 fn run_with_stdin(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
+    assert!(
+        envs.iter().all(|(key, _)| !PINNED_VARS.contains(key)),
+        "run_with_stdin must not override a dir pin: {envs:?}"
+    );
     let mut child = coyote_command(&Dirs {
         config: dir.to_path_buf(),
         cache: dir.join("cache"),
