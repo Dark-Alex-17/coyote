@@ -9,3 +9,6 @@ pub mod bin;
 
 #[allow(dead_code)] // each test crate uses a subset
 pub mod pty;
+
+#[allow(dead_code)] // each test crate uses a subset
+pub mod script;
