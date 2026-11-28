@@ -135,9 +135,17 @@ fn origin_main_predates_the_pins(root: &Path) -> Result<(), String> {
 /// Which of the NUL-separated `paths` git reports `comment-hygiene: set` for. A later
 /// `-comment-hygiene` or `!comment-hygiene` line shows up here as unset or unspecified.
 fn attribute_set_on(root: &Path, paths: Vec<u8>) -> BTreeSet<String> {
+    let paths_count = paths.iter().filter(|byte| **byte == 0).count();
     let report = git_with_stdin(root, &["check-attr", "-z", "--stdin", ATTRIBUTE], paths)
         .expect("git check-attr");
     let fields: Vec<&[u8]> = report.split(|byte| *byte == 0).collect();
+    let expected = 3 * paths_count + 1;
+    assert_eq!(
+        fields.len(),
+        expected,
+        "git check-attr reported {} fields for {paths_count} paths, expected {expected}",
+        fields.len()
+    );
     fields
         .chunks_exact(3)
         .filter(|triple| triple[2] == b"set")
@@ -1223,14 +1231,16 @@ fn fixture_repo(root: &Path, attributes: &str, files: &[&str]) {
     git(root, &add).expect("git add");
 }
 
+/// Git's `*` also matches an empty segment, so `scripts/mesh-*/**` covers `scripts/mesh-/`.
 #[test]
-fn directory_patterns_match_one_directory_segment() {
+fn directory_patterns_match_under_their_prefix_segment() {
     let tmp = TempDir::new("hygiene-dir-patterns");
     let root = tmp.path.as_path();
     fixture_repo(
         root,
         "src/mesh/** comment-hygiene\nscripts/mesh-*/** comment-hygiene\n",
         &[
+            "scripts/mesh-/x.sh",
             "scripts/mesh-interop/setup.sh",
             "scripts/mesh-netns/a/b.sh",
             "scripts/mesh-relay.sh",
@@ -1241,6 +1251,7 @@ fn directory_patterns_match_one_directory_segment() {
     assert_eq!(
         attributed_paths(root),
         BTreeSet::from([
+            "scripts/mesh-/x.sh".to_string(),
             "scripts/mesh-interop/setup.sh".to_string(),
             "scripts/mesh-netns/a/b.sh".to_string(),
             "src/mesh/mod.rs".to_string(),
@@ -1387,26 +1398,24 @@ fn the_attributed_set_is_the_three_dot_diff_minus_docs_and_examples() {
     let extra: Vec<&String> = attributed.difference(&required).collect();
     assert!(
         missing.is_empty() && extra.is_empty(),
-        "added on this branch but without the {ATTRIBUTE} attribute: {missing:?}\n{ATTRIBUTE} but not added on this branch outside docs/ and examples/: {extra:?}"
+        "added on this branch but without the {ATTRIBUTE} attribute: {missing:?}\ncarries {ATTRIBUTE} but was not added on this branch outside docs/ and examples/: {extra:?}"
     );
 }
 
-/// Each directory pattern's files all carry the attribute, so a later line unsetting it
-/// for part of a pinned directory cannot drop files from the scan unnoticed.
+/// Every file any declared pattern matches carries the attribute, whether the pattern is
+/// a directory, an exact file or a single-segment glob, so a later line unsetting it
+/// cannot drop files from the scan unnoticed.
 #[test]
-fn every_file_under_a_pinned_directory_carries_the_attribute() {
+fn every_file_a_pattern_matches_carries_the_attribute() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for pattern in declared_patterns(root)
-        .iter()
-        .filter(|pattern| pattern.ends_with("/**"))
-    {
-        let matched = tracked_matches(root, pattern);
+    for pattern in declared_patterns(root) {
+        let matched = tracked_matches(root, &pattern);
         let under = nul_separated(&matched);
         let set = attribute_set_on(root, matched);
         let uncovered: Vec<&String> = under.difference(&set).collect();
         assert!(
             uncovered.is_empty(),
-            "{pattern} matches files without the {ATTRIBUTE} attribute: {uncovered:?}"
+            "{pattern} matches files a later .gitattributes line leaves without the {ATTRIBUTE} attribute: {uncovered:?}"
         );
     }
 }
