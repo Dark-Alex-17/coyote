@@ -36,8 +36,7 @@ const GRAPH_SESSION_HARNESSES: [&str; 2] = [
     "tests/graph_session_repl_binary.rs",
 ];
 const SUPPORT_ISOLATION: &str = "tests/support_isolation.rs";
-// Split so this file's own source does not count as a test attribute.
-const TEST_ATTR: &str = concat!("#[", "test]");
+const TEST_ATTR: &str = "#[test]";
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
