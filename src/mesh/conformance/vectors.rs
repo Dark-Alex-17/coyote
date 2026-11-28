@@ -312,6 +312,60 @@ pub(super) fn listed() -> Vec<Listed> {
         .collect()
 }
 
+/// The bytes each row with fixed-data input hands its codec, packed where the input is a
+/// `Value`, keyed by row name. An encode row records the bytes it expects instead, and a
+/// fetched message is recorded as its title, content and fields. Rows whose input is a
+/// constructor's arguments, text or a check function have no bytes and are left out.
+pub(super) fn golden_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    vectors()
+        .into_iter()
+        .filter_map(|vector| {
+            let bytes = match vector.case {
+                Case::Announce { app_data, .. } | Case::PnAnnounce { app_data, .. } => app_data,
+                Case::AnnounceEncode {
+                    expect: EncodeAction::Bytes(bytes),
+                    ..
+                } => bytes,
+                Case::Card { value, .. }
+                | Case::MessageBody { value, .. }
+                | Case::Ack { value, .. } => packed(&value),
+                Case::CardEncode { expect, .. } => packed(&expect),
+                Case::KnockBody {
+                    body: Some(body), ..
+                } => packed(&body),
+                Case::LxmfKnock { message, .. } | Case::LxmfPeer { message, .. } => {
+                    packed_message(message)
+                }
+                Case::AnnounceEncode {
+                    expect: EncodeAction::Refused,
+                    ..
+                }
+                | Case::KnockBody { body: None, .. }
+                | Case::AnnouncePolicy { .. }
+                | Case::MessageBodyEncode { .. }
+                | Case::Outbound { .. }
+                | Case::KnockIntro { .. }
+                | Case::Text { .. }
+                | Case::HashText { .. }
+                | Case::Trust { .. }
+                | Case::Derivation(_)
+                | Case::Registry(_)
+                | Case::Custom(_) => return None,
+            };
+            Some((vector.name, bytes))
+        })
+        .collect()
+}
+
+fn packed_message(message: InboundMessage) -> Vec<u8> {
+    let bytes = |part: Option<Vec<u8>>| part.map_or(Value::Nil, Value::Binary);
+    packed(&Value::Array(vec![
+        bytes(message.title),
+        bytes(message.content),
+        message.fields.unwrap_or(Value::Nil),
+    ]))
+}
+
 // ---------------------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------------------

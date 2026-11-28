@@ -45,6 +45,8 @@ pub(crate) mod shares;
 pub(crate) mod snapshot;
 pub(crate) mod trust;
 mod upstream;
+#[cfg(test)]
+mod wire_golden;
 pub(crate) mod wire_path;
 
 pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
