@@ -252,7 +252,7 @@ pub fn cursor_position_reply(before: &[u8]) -> String {
 }
 
 /// The parameter of the last `ESC[<n>G` in `bytes`, verbatim.
-pub fn last_column_move(bytes: &[u8]) -> Option<&str> {
+fn last_column_move(bytes: &[u8]) -> Option<&str> {
     let mut found = None;
     let mut i = 0;
     while i + 2 < bytes.len() {
@@ -283,7 +283,7 @@ pub fn strip_escapes(bytes: &[u8]) -> String {
 
 /// The bytes of `bytes` with CSI and OSC sequences (BEL- or ST-terminated) and
 /// two-byte ESC pairs dropped.
-pub fn strip_escape_bytes(bytes: &[u8]) -> Vec<u8> {
+fn strip_escape_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
