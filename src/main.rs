@@ -2,6 +2,8 @@ mod acp;
 mod cli;
 mod client;
 mod config;
+#[cfg(test)]
+mod doc_drift;
 mod function;
 mod graph;
 mod hooks;
