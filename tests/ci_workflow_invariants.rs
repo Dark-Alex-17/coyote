@@ -42,6 +42,25 @@ fn workflow(file: &str) -> Option<Value> {
     Some(serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{file} parses as YAML: {e}")))
 }
 
+/// The skip in `workflow` is for the packaged crate, which ships without `.github`. In a
+/// git checkout both workflows must be present, or every check here would pass vacuously.
+#[test]
+fn a_checkout_has_the_workflows_these_checks_read() {
+    let root = support::repo::root();
+    if !root.join(".git").exists() {
+        eprintln!("skipping: not a git checkout");
+        return;
+    }
+    for file in ["ci.yaml", "release.yaml"] {
+        let path = root.join(".github").join("workflows").join(file);
+        assert!(
+            path.is_file(),
+            "{} is missing from a git checkout; the workflow checks would skip instead of run",
+            path.display()
+        );
+    }
+}
+
 fn jobs<'a>(workflow: &'a Value, file: &str) -> &'a Mapping {
     workflow["jobs"]
         .as_mapping()
@@ -895,7 +914,7 @@ fn psscriptanalyzer_analyses_every_tracked_ps1_and_fails_on_findings() {
 
 /// PSScriptAnalyzer is pinned to an exact version and that version is both installed and
 /// imported, so a newer module already on the runner image cannot win and change the rules.
-/// One step owns the pin, so two can never drift apart.
+/// One step owns the pin, so two can never drift apart, and moving it is a reviewed bump.
 #[test]
 fn psscriptanalyzer_is_pinned_and_imported_at_the_pin() {
     let Some(ci) = workflow("ci.yaml") else {
@@ -905,15 +924,24 @@ fn psscriptanalyzer_is_pinned_and_imported_at_the_pin() {
     let step = only_step(steps, "setting PSSA_VERSION", |step| {
         !step["env"]["PSSA_VERSION"].is_null()
     });
-    let version = step["env"]["PSSA_VERSION"]
-        .as_str()
-        .expect("PSSA_VERSION is a version string");
+    let pinned = &step["env"]["PSSA_VERSION"];
+    let version = pinned.as_str().unwrap_or_else(|| {
+        panic!(
+            "PSSA_VERSION must be an exact version string such as 1.25.0 (a bare 1.26 parses \
+             as a YAML float, not the version written): {pinned:?}"
+        )
+    });
     assert!(
         version.split('.').count() >= 2
             && version
                 .split('.')
                 .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
         "PSSA_VERSION must be an exact version, not a range or wildcard: {version:?}"
+    );
+    assert_eq!(
+        version, "1.25.0",
+        "PSScriptAnalyzer stays at 1.25.0 so a new rule is a reviewed bump, not a red PR; \
+         moving the pin means updating this test in the same change"
     );
     for cmdlet in ["Install-Module", "Import-Module"] {
         assert!(
