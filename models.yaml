@@ -8385,9 +8385,9 @@
   - name: deepseek/deepseek-r1-0528
     type: chat
     max_input_tokens: 163840
-    input_price: 0.571
-    output_price: 2.286
-    max_output_tokens: 32000
+    input_price: 0.5
+    output_price: 2.18
+    max_output_tokens: 147456
     supports_function_calling: true
   - name: deepseek/deepseek-v3.1-terminus
     type: chat
@@ -8423,7 +8423,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.0456
-    output_price: 0.3
+    output_price: 0.27
     cache_read_price: 0.035
     max_output_tokens: 943718
     supports_function_calling: true
@@ -8447,9 +8447,9 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.5021
-    output_price: 1.5016
-    cache_read_price: 0.23
+    input_price: 0.89
+    output_price: 1.5069
+    cache_read_price: 0.2
     max_output_tokens: 393216
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -9359,9 +9359,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9817,9 +9817,9 @@
   - name: nvidia/nemotron-3.5-lightning
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.07
+    input_price: 0.05
     output_price: 0.2
-    cache_read_price: 0.04
+    cache_read_price: 0.01
     max_output_tokens: 235929
     supports_function_calling: true
     supports_structured_output: true
@@ -11398,9 +11398,9 @@
   - name: qwen/qwen3.5-9b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.085
-    output_price: 0.125
-    cache_read_price: 0.0765
+    input_price: 0.077
+    output_price: 0.114
+    cache_read_price: 0.07
     max_output_tokens: 40960
     supports_vision: true
     supports_function_calling: true
@@ -11621,10 +11621,10 @@
   - name: reflection/beam-1.0-501b-a23b
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.25
+    input_price: 0.3
     output_price: 1.0
-    cache_read_price: 0.05
-    max_output_tokens: 131072
+    cache_read_price: 0.04
+    max_output_tokens: 943718
     supports_function_calling: true
     supports_structured_output: true
   - name: rekaai/reka-edge
@@ -12347,9 +12347,9 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.1824
-    output_price: 11.0055
-    cache_read_price: 0.18
+    input_price: 0.1453
+    output_price: 12.2894
+    cache_read_price: 0.14
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
