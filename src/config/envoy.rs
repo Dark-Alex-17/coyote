@@ -482,10 +482,14 @@ fn embedded_config() -> Option<&'static AgentConfig> {
 
 static EXIT_CLEANUPS: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
 
+const ENVOY_EXIT_CLEANUPS: [fn(); 1] = [cleanup_envoy_dir];
+
 /// Runs the registered exit cleanups, which remove the materialized envoy
-/// dir, when dropped. Hold it for the life of the process's entry point;
-/// a path that leaves through `std::process::exit` never drops it and must
-/// go through [`exit_process`] instead.
+/// dir, when dropped. Hold it for the life of the process's entry point.
+/// `std::process::exit` skips its drop, so an exit taken once the envoy may
+/// have been materialized (the first `builtin_agent_dir` lookup, in
+/// `Agent::init`) must go through [`exit_process`]; exits taken before that
+/// point have nothing to remove.
 #[must_use = "dropping the guard removes the envoy dir at once"]
 pub struct EnvoyDirGuard(());
 
@@ -498,11 +502,13 @@ impl Drop for EnvoyDirGuard {
 pub fn register_envoy_source() -> EnvoyDirGuard {
     let source = Arc::clone(ENVOY_SOURCE.get_or_init(|| Arc::new(EnvoySource::new())));
     register_builtin_source(source);
-    register_exit_cleanup(cleanup_envoy_dir);
+    for cleanup in ENVOY_EXIT_CLEANUPS {
+        register_exit_cleanup(cleanup);
+    }
     EnvoyDirGuard(())
 }
 
-pub fn cleanup_envoy_dir() {
+fn cleanup_envoy_dir() {
     if let Some(source) = ENVOY_SOURCE.get() {
         source.remove_dir();
     }
@@ -514,15 +520,16 @@ fn register_exit_cleanup(cleanup: fn()) {
 
 /// Runs and forgets every registered exit cleanup, so a later call or a
 /// guard drop after an explicit run does no work twice.
-pub fn run_exit_cleanups() {
+fn run_exit_cleanups() {
     let cleanups = std::mem::take(&mut *EXIT_CLEANUPS.lock());
     for cleanup in cleanups {
         cleanup();
     }
 }
 
-/// `std::process::exit` skips destructors, so every exit taken while an
-/// [`EnvoyDirGuard`] is held goes through here. Output is not flushed.
+/// `std::process::exit` skips destructors, so every exit taken once the envoy
+/// may have been materialized goes through here rather than relying on the
+/// [`EnvoyDirGuard`] drop. Output is not flushed.
 pub fn exit_process(code: i32) -> ! {
     run_exit_cleanups();
     std::process::exit(code)
@@ -1345,6 +1352,61 @@ mod tests {
             RUNS.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a registered cleanup runs at most once"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn register_envoy_source_registers_the_cleanup_that_removes_the_process_envoy_dir() {
+        assert!(
+            ENVOY_EXIT_CLEANUPS
+                .iter()
+                .any(|&cleanup| std::ptr::fn_addr_eq(cleanup, cleanup_envoy_dir as fn())),
+            "register_envoy_source must register cleanup_envoy_dir"
+        );
+        let dir = ENVOY_SOURCE
+            .get_or_init(|| Arc::new(EnvoySource::with_stub_probes()))
+            .agent_dir(ENVOY_AGENT_NAME)
+            .unwrap();
+        assert!(dir.join(CONFIG_FILE_NAME).exists());
+        for cleanup in ENVOY_EXIT_CLEANUPS {
+            cleanup();
+        }
+        assert!(!dir.exists(), "{}", dir.display());
+    }
+
+    /// The guard only cleans up on a normal return; `std::process::exit`
+    /// skips its drop. So main must hold it in a named binding, and every
+    /// exit main can take once the envoy may be materialized must go
+    /// through `exit_process`.
+    #[test]
+    fn main_holds_the_envoy_guard_and_exits_after_materialization_through_exit_process() {
+        let main = include_str!("../main.rs").replace("\r\n", "\n");
+        let main = &main[..main.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(
+            main.matches("let _envoy_dir = register_envoy_source();")
+                .count(),
+            1,
+            "the guard must live for all of async_main"
+        );
+        assert!(
+            !main.contains("let _ = register_envoy_source("),
+            "binding the guard to `_` drops it, and removes the dir, at once"
+        );
+        assert!(
+            !main.contains("cleanup_envoy_dir"),
+            "main must leave envoy dir removal to the guard and exit_process"
+        );
+        assert_eq!(
+            main.matches("exit_process(").count(),
+            2,
+            "the run() error exit and the shell-execute exit must go through exit_process"
+        );
+        assert_eq!(
+            main.matches("process::exit(").count(),
+            1,
+            "the only bare process::exit allowed in main is the sandbox exit, which runs \
+             before the envoy can be materialized"
         );
     }
 

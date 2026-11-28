@@ -93,12 +93,12 @@ fn bundled_agent_assets() -> Result<Vec<(String, Vec<u8>)>> {
 fn drop_reserved_agent_files(
     files: impl IntoIterator<Item = (String, Vec<u8>)>,
 ) -> Vec<(String, Vec<u8>)> {
-    let mut filter = ReservedAgentFilter::new();
+    let mut reserved_agents = ReservedAgentFilter::new();
     files
         .into_iter()
         .filter(|(file, _)| {
             let agent = file.split_once('/').map_or(file.as_str(), |(a, _)| a);
-            filter.admits(agent, |canonical| {
+            reserved_agents.admits(agent, |canonical| {
                 warn!(
                     "Ignoring bundled agent file {file}: the agent name '{agent}' is \
                      reserved for the built-in agent '{canonical}'"

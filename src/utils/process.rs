@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::{fs, io, path::Path};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// A (pid, start time) pair identifying one incarnation of an OS process.
@@ -156,10 +158,15 @@ pub(crate) fn lookup_start_time(pid: u32) -> Option<u64> {
 /// zombies) that `ps -p` still lists, and it cannot report a failed probe.
 #[cfg(unix)]
 pub(crate) fn pid_maybe_alive(pid: u32) -> bool {
-    if let Some(alive) = pid_maybe_alive_via_proc(std::path::Path::new("/proc"), pid) {
+    if let Some(alive) = pid_maybe_alive_via_proc(Path::new("/proc"), pid) {
         return alive;
     }
-    match std::process::Command::new("ps")
+    pid_maybe_alive_via_ps("ps", pid)
+}
+
+#[cfg(unix)]
+fn pid_maybe_alive_via_ps(program: &str, pid: u32) -> bool {
+    match std::process::Command::new(program)
         .args(["-p", &pid.to_string(), "-o", "pid="])
         .output()
     {
@@ -171,13 +178,13 @@ pub(crate) fn pid_maybe_alive(pid: u32) -> bool {
 /// `None` unless procfs is mounted at `proc_root` (its `self` entry exists):
 /// in a sandbox without /proc every pid would otherwise look dead.
 #[cfg(unix)]
-fn pid_maybe_alive_via_proc(proc_root: &std::path::Path, pid: u32) -> Option<bool> {
+fn pid_maybe_alive_via_proc(proc_root: &Path, pid: u32) -> Option<bool> {
     if !cfg!(target_os = "linux") || !proc_root.join("self").exists() {
         return None;
     }
-    match std::fs::metadata(proc_root.join(pid.to_string())) {
+    match fs::metadata(proc_root.join(pid.to_string())) {
         Ok(_) => Some(true),
-        Err(err) => Some(err.kind() != std::io::ErrorKind::NotFound),
+        Err(err) => Some(err.kind() != io::ErrorKind::NotFound),
     }
 }
 
@@ -332,16 +339,44 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn proc_probe_is_trusted_only_when_procfs_is_mounted() {
-        let root = crate::utils::temp_file("-envoy-proc-", "");
-        std::fs::create_dir_all(root.join("123")).unwrap();
+        let root = crate::utils::temp_file("-proc-probe-", "");
+        fs::create_dir_all(root.join("123")).unwrap();
         assert_eq!(pid_maybe_alive_via_proc(&root, 123), None);
         assert_eq!(pid_maybe_alive_via_proc(&root, 456), None);
         if cfg!(target_os = "linux") {
-            std::fs::create_dir_all(root.join("self")).unwrap();
+            fs::create_dir_all(root.join("self")).unwrap();
             assert_eq!(pid_maybe_alive_via_proc(&root, 123), Some(true));
             assert_eq!(pid_maybe_alive_via_proc(&root, 456), Some(false));
         }
-        std::fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_proc_entry_that_fails_to_stat_for_another_reason_counts_as_alive() {
+        let root = crate::utils::temp_file("-proc-probe-", "");
+        fs::create_dir_all(root.join("self")).unwrap();
+        let looping = root.join("123");
+        std::os::unix::fs::symlink(&looping, &looping).unwrap();
+        let err = fs::metadata(&looping).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                pid_maybe_alive_via_proc(&root, 123),
+                Some(true),
+                "a probe error other than NotFound is doubt, and doubt is alive"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ps_that_cannot_be_spawned_counts_as_alive() {
+        assert!(
+            pid_maybe_alive_via_ps("coyote-no-such-ps-program", u32::MAX - 1),
+            "a failed spawn is doubt, and doubt is alive"
+        );
     }
 
     #[cfg(unix)]
