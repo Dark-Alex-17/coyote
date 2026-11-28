@@ -2,9 +2,12 @@
 //! rather than as text: which jobs gate a merge, the order and conditions of the steps
 //! that set up and tear down privileged state, the libtest flags CI passes, where the
 //! relay smoke installs to, and the image smoke that gates the Docker Hub push. Comments
-//! and step wording are free to change.
+//! and step names are free to change: steps are found by what they run and set. The one
+//! display name checked is the `Mesh Interop` job's, which the interop record cites.
 
 mod support;
+
+use std::collections::BTreeSet;
 
 use serde_yaml::{Mapping, Value};
 
@@ -25,8 +28,6 @@ const INSTALL_DIRS: [&str; 4] = [
     "UV_TOOL_DIR",
     "UV_TOOL_BIN_DIR",
 ];
-const UNIX_SMOKE: &str = "Mesh Relay Smoke";
-const WINDOWS_SMOKE: &str = "Mesh Relay Smoke (Windows)";
 
 fn workflow(file: &str) -> Value {
     let text = support::repo::read(&format!(".github/workflows/{file}"));
@@ -57,11 +58,16 @@ fn step_name(step: &Value) -> &str {
     step["name"].as_str().unwrap_or("?")
 }
 
-fn named<'a>(steps: &'a [Value], name: &str) -> &'a Value {
-    steps
-        .iter()
-        .find(|step| step_name(step) == name)
-        .unwrap_or_else(|| panic!("no step named {name:?}"))
+fn is_powershell(step: &Value) -> bool {
+    matches!(step["shell"].as_str(), Some("pwsh" | "powershell"))
+}
+
+fn only_position(steps: &[Value], what: &str, matches: impl Fn(&Value) -> bool) -> usize {
+    let found: Vec<usize> = (0..steps.len()).filter(|&i| matches(&steps[i])).collect();
+    match found[..] {
+        [one] => one,
+        _ => panic!("expected exactly one step {what}, found {}", found.len()),
+    }
 }
 
 fn needs(job: &Value) -> Vec<&str> {
@@ -240,6 +246,27 @@ fn netns_teardown_runs_under_sudo_whatever_the_outcome() {
         }
     }
     assert!(found > 0, "no ci.yaml step runs {NETNS_TEARDOWN}");
+}
+
+/// A job that creates the namespaces also removes them; the teardown checks above only
+/// see jobs that already have a teardown step.
+#[test]
+fn every_job_that_creates_namespaces_removes_them() {
+    let ci = workflow("ci.yaml");
+    let mut found = 0;
+    for (name, job) in jobs(&ci, "ci.yaml") {
+        let name = name.as_str().unwrap_or("?");
+        let steps = steps(job);
+        if !steps.iter().any(|step| run(step).contains(NETNS_SETUP)) {
+            continue;
+        }
+        found += 1;
+        assert!(
+            steps.iter().any(|step| run(step).contains(NETNS_TEARDOWN)),
+            "the `{name}` job runs {NETNS_SETUP} but never {NETNS_TEARDOWN}"
+        );
+    }
+    assert!(found > 0, "no ci.yaml job runs {NETNS_SETUP}");
 }
 
 /// The interop job on Linux: the clock starts, the reference is prepared, the namespaces
@@ -480,8 +507,12 @@ fn the_release_smokes_the_image_before_the_push() {
 
     let with = &steps[push]["with"];
     assert!(
-        !with["push"].is_null() && with["push"] != Value::Bool(false),
-        "the push step must push: {:?}",
+        match &with["push"] {
+            Value::Bool(push) => *push,
+            Value::String(expr) => expr.contains("env.ACT != 'true'"),
+            _ => false,
+        },
+        "the push step must push, outside local `act` runs only: {:?}",
         with["push"]
     );
     assert!(
@@ -492,26 +523,23 @@ fn the_release_smokes_the_image_before_the_push() {
     );
 }
 
-/// The merge gate's error tells a contributor where the dependency policy lives, and that
-/// anchor has to resolve to a heading in CONTRIBUTING.md.
+/// The dependency gate's error tells a contributor where the dependency policy lives, and
+/// that anchor has to resolve to a heading in CONTRIBUTING.md.
 #[test]
 fn the_merge_gate_error_links_a_contributing_heading_that_exists() {
     let ci = workflow("ci.yaml");
-    let errors: Vec<&Value> = steps(job(&ci, "ci.yaml", "merge-gates"))
+    let gate = steps(job(&ci, "ci.yaml", "merge-gates"))
         .iter()
-        .filter(|step| run(step).contains("::error::"))
-        .collect();
+        .find(|step| run(step).contains("cargo metadata") && run(step).contains("git+"))
+        .expect("a merge-gates step checks `cargo metadata` for git+ sources");
     assert!(
-        !errors.is_empty(),
-        "no merge-gates step prints an ::error::"
+        run(gate)
+            .lines()
+            .any(|line| line.contains("::error::")
+                && line.contains("CONTRIBUTING.md#dependency-policy")),
+        "the dependency gate {:?} must print an ::error:: pointing at CONTRIBUTING.md#dependency-policy",
+        step_name(gate)
     );
-    for step in errors {
-        assert!(
-            run(step).contains("CONTRIBUTING.md#dependency-policy"),
-            "the merge-gates step {:?} must point a contributor at CONTRIBUTING.md#dependency-policy",
-            step_name(step)
-        );
-    }
     let contributing = support::repo::read("CONTRIBUTING.md");
     assert!(
         contributing
@@ -539,12 +567,28 @@ fn the_scripts_job_runs_on_every_runner_family() {
 /// The ubuntu image exports PIPX_HOME=/opt/pipx image-wide, so a relay install that is
 /// not pointed elsewhere leaks into the runner image. Each install directory is set on
 /// exactly the Unix and the Windows smoke step, under the per-run mesh home, and so is
-/// the home directory each smoke installs into.
+/// the home directory each smoke installs into. The smokes are the steps that set
+/// PIPX_HOME and drive mesh-relay.sh, or mesh-relay.ps1 under PowerShell.
 #[test]
 fn the_relay_smokes_install_under_a_per_run_home() {
     let ci = workflow("ci.yaml");
     let job = job(&ci, "ci.yaml", "scripts");
     let steps = steps(job);
+    let unix = only_position(
+        steps,
+        "setting PIPX_HOME and running mesh-relay.sh",
+        |step| !step["env"]["PIPX_HOME"].is_null() && run(step).contains("mesh-relay.sh"),
+    );
+    let windows = only_position(
+        steps,
+        "setting PIPX_HOME and running mesh-relay.ps1 under PowerShell",
+        |step| {
+            !step["env"]["PIPX_HOME"].is_null()
+                && is_powershell(step)
+                && run(step).contains("mesh-relay.ps1")
+        },
+    );
+    let smokes = BTreeSet::from([unix, windows]);
     let under_mesh_home = |value: &Value| {
         value
             .as_str()
@@ -555,29 +599,31 @@ fn the_relay_smokes_install_under_a_per_run_home() {
             job["env"][var].is_null(),
             "{var} belongs on the smoke steps, not the whole scripts job"
         );
-        let setting: Vec<&str> = steps
-            .iter()
-            .filter(|step| !step["env"][var].is_null())
-            .map(step_name)
+        let setting: BTreeSet<usize> = (0..steps.len())
+            .filter(|&i| !steps[i]["env"][var].is_null())
             .collect();
         assert_eq!(
             setting,
-            [UNIX_SMOKE, WINDOWS_SMOKE],
-            "{var} must be set on exactly the two relay smoke steps"
+            smokes,
+            "{var} must be set on exactly the two relay smoke steps, {:?} and {:?}",
+            step_name(&steps[unix]),
+            step_name(&steps[windows])
         );
-        for name in setting {
-            let value = &named(steps, name)["env"][var];
+        for i in setting {
+            let value = &steps[i]["env"][var];
             assert!(
                 under_mesh_home(value),
-                "{var} on {name:?} must sit under runner.temp/mesh-home: {value:?}"
+                "{var} on {:?} must sit under runner.temp/mesh-home: {value:?}",
+                step_name(&steps[i])
             );
         }
     }
-    for (name, var) in [(UNIX_SMOKE, "HOME"), (WINDOWS_SMOKE, "USERPROFILE")] {
-        let value = &named(steps, name)["env"][var];
+    for (i, var) in [(unix, "HOME"), (windows, "USERPROFILE")] {
+        let value = &steps[i]["env"][var];
         assert!(
             under_mesh_home(value),
-            "{var} on {name:?} must sit under runner.temp/mesh-home: {value:?}"
+            "{var} on {:?} must sit under runner.temp/mesh-home: {value:?}",
+            step_name(&steps[i])
         );
     }
 }
@@ -600,13 +646,14 @@ fn the_scripts_job_runs_both_powershells() {
 
 /// PSScriptAnalyzer is pinned to an exact version and that version is both installed and
 /// imported, so a newer module already on the runner image cannot win and change the rules.
+/// One step owns the pin, so two can never drift apart.
 #[test]
 fn psscriptanalyzer_is_pinned_and_imported_at_the_pin() {
     let ci = workflow("ci.yaml");
-    let step = steps(job(&ci, "ci.yaml", "scripts"))
-        .iter()
-        .find(|step| !step["env"]["PSSA_VERSION"].is_null())
-        .expect("a scripts step sets PSSA_VERSION");
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let step = &steps[only_position(steps, "setting PSSA_VERSION", |step| {
+        !step["env"]["PSSA_VERSION"].is_null()
+    })];
     let version = step["env"]["PSSA_VERSION"]
         .as_str()
         .expect("PSSA_VERSION is a version string");
@@ -639,8 +686,7 @@ fn the_windows_relay_steps_end_with_exit_0() {
     let ci = workflow("ci.yaml");
     let relay_steps: Vec<&Value> = steps(job(&ci, "ci.yaml", "scripts"))
         .iter()
-        .filter(|step| matches!(step["shell"].as_str(), Some("pwsh" | "powershell")))
-        .filter(|step| run(step).contains("mesh-relay.ps1"))
+        .filter(|step| is_powershell(step) && run(step).contains("mesh-relay.ps1"))
         .collect();
     assert!(
         relay_steps.len() >= 3,
