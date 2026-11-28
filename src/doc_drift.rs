@@ -1114,9 +1114,7 @@ fn every_envoy_memory_key_carries_the_code_default_on_every_surface() {
         .collect();
     default_hits(&mut hits, label, &documented, &expected);
     let readme = keyed_defaults(&read(&repo_root().join("README.md")), "mesh.envoy_memory.");
-    if !readme.is_empty() {
-        default_hits(&mut hits, "README.md", &readme, &expected);
-    }
+    default_hits(&mut hits, "README.md", &readme, &expected);
     report("repo envoy_memory entries that differ from the code", &hits);
 
     let Some(wiki) = wiki_dir() else { return };
