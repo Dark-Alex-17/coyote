@@ -5,7 +5,6 @@ pub(crate) const MULTI_SEGMENT_BYTES: usize =
 
 #[cfg(unix)]
 use super::announce::AnnounceAppData;
-#[cfg(unix)]
 use super::hex_lower;
 #[cfg(unix)]
 use super::message::{PeerBody, from_request_body, is_farewell, received_reply};
@@ -18,6 +17,7 @@ pub(crate) use super::node::RecordingEnvoy;
 use super::node::arm_destination_caps;
 #[cfg(unix)]
 use super::node::{MeshRuntime, MeshSlot, NodeOptions};
+use super::peers::PeerTable;
 #[cfg(unix)]
 pub(crate) use super::peers::{FarewellTime, LeftMark};
 #[cfg(unix)]
@@ -27,6 +27,7 @@ pub(crate) use super::propagation::PropagationNode;
 use super::propagation::pn_announce_app_data;
 #[cfg(all(test, unix))]
 pub(crate) use super::propagation::pn_announce_app_data as propagation_announce_app_data;
+use super::propagation::propagation_node_destination;
 #[cfg(all(test, unix))]
 pub(crate) use super::propagation::test_support::FakeNode as StoringPropagationNode;
 pub(crate) use super::propagation_fetch::{Delivery, InboundMessage, InboundSink};
@@ -49,12 +50,11 @@ pub(crate) use super::request::{
     AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
     Reply, RequestId,
 };
-#[cfg(unix)]
 use super::session_destination_name;
 use super::snapshot::{BriefState, MeshSnapshot, TurnState};
 #[cfg(unix)]
 use super::trust::TrustOptions;
-use super::trust::TrustStore;
+use super::trust::{KnockProof, LiveMesh, TrustStore};
 use super::{mesh_config_dir, rfc3339_utc};
 use crate::config::MeshConfig;
 #[cfg(unix)]
@@ -64,25 +64,24 @@ use crate::config::todo::TodoList;
 
 #[cfg(unix)]
 use async_trait::async_trait;
-#[cfg(unix)]
 use parking_lot::Mutex;
-#[cfg(unix)]
 use rmpv::Value;
+use rns_transport::destination::SingleInputDestination;
 #[cfg(unix)]
 use rns_transport::destination::link::LinkId;
 #[cfg(unix)]
 use rns_transport::destination::request::RequestAllow;
 #[cfg(unix)]
-use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
+use rns_transport::destination::{DestinationDesc, DestinationName};
 #[cfg(unix)]
 use rns_transport::hash::AddressHash;
 #[cfg(unix)]
-use rns_transport::identity::{Identity, PrivateIdentity as TransportIdentity};
+use rns_transport::identity::Identity;
+use rns_transport::identity::PrivateIdentity as TransportIdentity;
 #[cfg(unix)]
 use rns_transport::iface::tcp_client::TcpClient;
 #[cfg(unix)]
 use rns_transport::iface::tcp_server::TcpServer;
-#[cfg(unix)]
 use rns_transport::rand_core::OsRng;
 #[cfg(unix)]
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
@@ -91,8 +90,8 @@ use std::collections::VecDeque;
 #[cfg(unix)]
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::sync::Arc;
+use std::sync::LazyLock;
 #[cfg(unix)]
 use std::sync::atomic::AtomicU16;
 #[cfg(unix)]
@@ -166,6 +165,100 @@ pub(crate) fn siblings_of(path: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// `secs` past the Unix epoch: the same instant in every run.
+pub(crate) fn t_epoch(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// `secs` past a fixed instant a few hours back, so every `t_recent(secs)` is in the
+/// past and well inside `PROPAGATION_NODE_TTL` of the clock the pickers read.
+pub(crate) fn t_recent(secs: u64) -> SystemTime {
+    static BASE: LazyLock<SystemTime> =
+        LazyLock::new(|| SystemTime::now() - Duration::from_secs(10_000));
+    *BASE + Duration::from_secs(secs)
+}
+
+pub(crate) fn fake_hash(fill: u8) -> String {
+    hex_lower(&[fill; 16])
+}
+
+/// A msgpack map built by hand, so a request body never depends on the encoders under
+/// test.
+pub(crate) fn map(entries: Vec<(&str, Value)>) -> Value {
+    Value::Map(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Value::from(key), value))
+            .collect(),
+    )
+}
+
+pub(crate) struct MeshOff;
+
+impl LiveMesh for MeshOff {
+    fn peers(&self) -> Option<Arc<PeerTable>> {
+        None
+    }
+}
+
+/// A running mesh: the peer table, and the knocks its cache would hold.
+pub(crate) struct MeshOn(
+    pub(crate) Arc<PeerTable>,
+    pub(crate) Mutex<Vec<(String, KnockProof)>>,
+);
+
+impl LiveMesh for MeshOn {
+    fn peers(&self) -> Option<Arc<PeerTable>> {
+        Some(self.0.clone())
+    }
+
+    fn knock(&self, destination_hash: &str, _now: SystemTime) -> Option<KnockProof> {
+        self.1
+            .lock()
+            .iter()
+            .find(|(destination, _)| destination == destination_hash)
+            .map(|(_, proof)| proof.clone())
+    }
+}
+
+/// A real announce's worth of hashes: the destination is derived from the name and
+/// identity exactly as the transport does it.
+pub(crate) struct Announced {
+    pub(crate) destination_hash: String,
+    pub(crate) identity_hash: String,
+    pub(crate) name_hash: String,
+}
+
+pub(crate) fn announced(aspect: &str) -> Announced {
+    announced_as(TransportIdentity::new_from_rand(OsRng), aspect)
+}
+
+pub(crate) fn announced_as(identity: TransportIdentity, aspect: &str) -> Announced {
+    let name = session_destination_name(aspect);
+    let destination = SingleInputDestination::new(identity, name);
+    Announced {
+        destination_hash: destination.desc.address_hash.to_hex_string(),
+        identity_hash: destination.desc.identity.address_hash.to_hex_string(),
+        name_hash: hex_lower(name.as_name_hash_slice()),
+    }
+}
+
+/// A propagation node under a fresh identity, at the `lxmf.propagation` destination.
+pub(crate) fn node(enabled: bool) -> PropagationNode {
+    PropagationNode {
+        destination: propagation_node_destination(
+            *TransportIdentity::new_from_rand(OsRng).as_identity(),
+        ),
+        stamp_cost: 8,
+        per_transfer_limit_kb: 256,
+        propagation_enabled: enabled,
+    }
+}
+
+pub(crate) fn hex(node: &PropagationNode) -> String {
+    node.destination.address_hash.to_hex_string()
 }
 
 /// A TCP listener that accepts every connection and holds it open until the peer hangs

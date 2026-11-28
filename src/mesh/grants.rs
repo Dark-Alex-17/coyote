@@ -445,16 +445,7 @@ fn evict(records: &mut Vec<GrantRecord>, now: SystemTime) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::hex_lower;
-    use crate::mesh::test_support::TempDir;
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    fn fake_hash(fill: u8) -> String {
-        hex_lower(&[fill; 16])
-    }
+    use crate::mesh::test_support::{TempDir, fake_hash, t_epoch};
 
     fn paths(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| (*text).to_string()).collect()
@@ -481,13 +472,17 @@ mod tests {
             destination: &destination,
         };
 
-        let store = GrantStore::open(&tmp.path, "inst", t(1_000)).unwrap();
+        let store = GrantStore::open(&tmp.path, "inst", t_epoch(1_000)).unwrap();
 
         assert!(store.list().unwrap().is_empty());
-        assert!(!store.is_granted(&peer, "docs/a.md", t(1_000)).unwrap());
-        assert!(!store.consume(&peer, "docs/a.md", t(1_000)).unwrap());
+        assert!(
+            !store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_000))
+                .unwrap()
+        );
+        assert!(!store.consume(&peer, "docs/a.md", t_epoch(1_000)).unwrap());
         assert!(!store.revoke("req", &destination).unwrap());
-        assert_eq!(store.prune(t(1_000)).unwrap(), 0);
+        assert_eq!(store.prune(t_epoch(1_000)).unwrap(), 0);
         assert!(!mesh_cache_dir(&tmp.path).exists());
     }
 
@@ -503,11 +498,11 @@ mod tests {
                 &fake_hash(0x2b),
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
 
-        assert_eq!(record.expires, rfc3339_utc(t(1_900)));
+        assert_eq!(record.expires, rfc3339_utc(t_epoch(1_900)));
         assert_eq!(
             record.paths,
             [GrantedPath {
@@ -530,11 +525,17 @@ mod tests {
                 &destination.to_ascii_uppercase(),
                 &paths(&["docs/a.md", "docs/b.md", "docs/a.md"]),
                 Some(Duration::from_secs(60)),
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         store
-            .grant("req-2", &destination, &paths(&["src/x.rs"]), None, t(1_000))
+            .grant(
+                "req-2",
+                &destination,
+                &paths(&["src/x.rs"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
         let replaced = store
             .grant(
@@ -542,7 +543,7 @@ mod tests {
                 &destination,
                 &paths(&["docs/c.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
 
@@ -556,8 +557,16 @@ mod tests {
             identity: &fake_hash(0x1a),
             destination: &destination,
         };
-        assert!(!store.is_granted(&peer, "docs/a.md", t(1_000)).unwrap());
-        assert!(store.is_granted(&peer, "docs/c.md", t(1_000)).unwrap());
+        assert!(
+            !store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_000))
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_granted(&peer, "docs/c.md", t_epoch(1_000))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -565,18 +574,18 @@ mod tests {
         let (store, _tmp) = store("grants-refused");
 
         let err = store
-            .grant("req", "bob", &paths(&["docs/a.md"]), None, t(0))
+            .grant("req", "bob", &paths(&["docs/a.md"]), None, t_epoch(0))
             .unwrap_err()
             .to_string();
         assert!(err.contains("32-hex destination hash"), "{err}");
         let err = store
-            .grant("req", &fake_hash(0x2b), &[], None, t(0))
+            .grant("req", &fake_hash(0x2b), &[], None, t_epoch(0))
             .unwrap_err()
             .to_string();
         assert!(err.contains("between 1 and 16"), "{err}");
         let many: Vec<String> = (0..17).map(|n| format!("docs/{n}.md")).collect();
         let err = store
-            .grant("req", &fake_hash(0x2b), &many, None, t(0))
+            .grant("req", &fake_hash(0x2b), &many, None, t_epoch(0))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not 17"), "{err}");
@@ -584,7 +593,7 @@ mod tests {
             let err = format!(
                 "{:#}",
                 store
-                    .grant("req", &fake_hash(0x2b), &paths(&[bad]), None, t(0))
+                    .grant("req", &fake_hash(0x2b), &paths(&[bad]), None, t_epoch(0))
                     .unwrap_err()
             );
             assert!(err.contains("not a wire path"), "{bad:?}: {err}");
@@ -606,14 +615,26 @@ mod tests {
             &"x".repeat(PEER_ID_MAX_CHARS + 1),
         ] {
             let err = store
-                .grant(bad, &fake_hash(0x2b), &paths(&["docs/a.md"]), None, t(0))
+                .grant(
+                    bad,
+                    &fake_hash(0x2b),
+                    &paths(&["docs/a.md"]),
+                    None,
+                    t_epoch(0),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("[0-9A-Za-z_.:-]"), "{bad:?}: {err}");
         }
         for good in ["req-1", "a.b:c_d", &"x".repeat(PEER_ID_MAX_CHARS)] {
             store
-                .grant(good, &fake_hash(0x2b), &paths(&["docs/a.md"]), None, t(0))
+                .grant(
+                    good,
+                    &fake_hash(0x2b),
+                    &paths(&["docs/a.md"]),
+                    None,
+                    t_epoch(0),
+                )
                 .unwrap();
         }
         assert_eq!(store.list().unwrap().len(), 3);
@@ -624,10 +645,10 @@ mod tests {
         let (store, _tmp) = store("grants-two-peers");
         let (first, second) = (fake_hash(0x2b), fake_hash(0x3c));
         store
-            .grant("req", &first, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant("req", &first, &paths(&["docs/a.md"]), None, t_epoch(1_000))
             .unwrap();
         store
-            .grant("req", &second, &paths(&["docs/b.md"]), None, t(1_000))
+            .grant("req", &second, &paths(&["docs/b.md"]), None, t_epoch(1_000))
             .unwrap();
 
         let records = store.list().unwrap();
@@ -644,25 +665,25 @@ mod tests {
         };
         assert!(
             store
-                .is_granted(&first_peer, "docs/a.md", t(1_000))
+                .is_granted(&first_peer, "docs/a.md", t_epoch(1_000))
                 .unwrap()
         );
         assert!(
             store
-                .is_granted(&second_peer, "docs/b.md", t(1_000))
+                .is_granted(&second_peer, "docs/b.md", t_epoch(1_000))
                 .unwrap()
         );
         store
-            .grant("req", &second, &paths(&["docs/c.md"]), None, t(1_000))
+            .grant("req", &second, &paths(&["docs/c.md"]), None, t_epoch(1_000))
             .unwrap();
         assert!(
             store
-                .is_granted(&first_peer, "docs/a.md", t(1_000))
+                .is_granted(&first_peer, "docs/a.md", t_epoch(1_000))
                 .unwrap()
         );
         assert!(
             !store
-                .is_granted(&second_peer, "docs/b.md", t(1_000))
+                .is_granted(&second_peer, "docs/b.md", t_epoch(1_000))
                 .unwrap()
         );
     }
@@ -672,13 +693,19 @@ mod tests {
         let (store, _tmp) = store("grants-revoke");
         let (identity, first, second) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
         store
-            .grant("req", &first, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant("req", &first, &paths(&["docs/a.md"]), None, t_epoch(1_000))
             .unwrap();
         store
-            .grant("req", &second, &paths(&["docs/b.md"]), None, t(1_000))
+            .grant("req", &second, &paths(&["docs/b.md"]), None, t_epoch(1_000))
             .unwrap();
         store
-            .grant("other", &first, &paths(&["docs/c.md"]), None, t(1_000))
+            .grant(
+                "other",
+                &first,
+                &paths(&["docs/c.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
         let first_peer = PeerRef {
             identity: &identity,
@@ -693,17 +720,17 @@ mod tests {
 
         assert!(
             !store
-                .is_granted(&first_peer, "docs/a.md", t(1_000))
+                .is_granted(&first_peer, "docs/a.md", t_epoch(1_000))
                 .unwrap()
         );
         assert!(
             store
-                .is_granted(&first_peer, "docs/c.md", t(1_000))
+                .is_granted(&first_peer, "docs/c.md", t_epoch(1_000))
                 .unwrap()
         );
         assert!(
             store
-                .is_granted(&second_peer, "docs/b.md", t(1_000))
+                .is_granted(&second_peer, "docs/b.md", t_epoch(1_000))
                 .unwrap()
         );
         assert_eq!(store.list().unwrap().len(), 2);
@@ -716,23 +743,41 @@ mod tests {
         let (store, _tmp) = store("grants-match");
         let (identity, destination, other) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
         store
-            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant(
+                "req",
+                &destination,
+                &paths(&["docs/a.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
 
         let peer = PeerRef {
             identity: &identity,
             destination: &destination,
         };
-        assert!(store.is_granted(&peer, "docs/a.md", t(1_000)).unwrap());
-        assert!(!store.is_granted(&peer, "docs/A.md", t(1_000)).unwrap());
-        assert!(!store.is_granted(&peer, "docs/a.md/", t(1_000)).unwrap());
+        assert!(
+            store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_000))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_granted(&peer, "docs/A.md", t_epoch(1_000))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_granted(&peer, "docs/a.md/", t_epoch(1_000))
+                .unwrap()
+        );
         let by_identity_only = PeerRef {
             identity: &destination,
             destination: &other,
         };
         assert!(
             !store
-                .is_granted(&by_identity_only, "docs/a.md", t(1_000))
+                .is_granted(&by_identity_only, "docs/a.md", t_epoch(1_000))
                 .unwrap(),
             "a grant is for one instance, not every instance of the identity"
         );
@@ -748,17 +793,29 @@ mod tests {
         };
         let granted = ["docs/a.md", "src/b.rs", "notes/c.txt"];
         store
-            .grant("req", &destination, &paths(&granted), None, t(1_000))
+            .grant("req", &destination, &paths(&granted), None, t_epoch(1_000))
             .unwrap();
 
         for path in granted {
-            assert!(store.is_granted(&peer, path, t(1_001)).unwrap(), "{path}");
-            assert!(store.consume(&peer, path, t(1_001)).unwrap(), "{path}");
+            assert!(
+                store.is_granted(&peer, path, t_epoch(1_001)).unwrap(),
+                "{path}"
+            );
+            assert!(
+                store.consume(&peer, path, t_epoch(1_001)).unwrap(),
+                "{path}"
+            );
         }
 
         for path in granted {
-            assert!(!store.is_granted(&peer, path, t(1_002)).unwrap(), "{path}");
-            assert!(!store.consume(&peer, path, t(1_002)).unwrap(), "{path}");
+            assert!(
+                !store.is_granted(&peer, path, t_epoch(1_002)).unwrap(),
+                "{path}"
+            );
+            assert!(
+                !store.consume(&peer, path, t_epoch(1_002)).unwrap(),
+                "{path}"
+            );
         }
         let records = store.list().unwrap();
         assert_eq!(records.len(), 1, "{records:#?}");
@@ -784,11 +841,11 @@ mod tests {
                 &destination,
                 &paths(&["docs/a.md", "docs/b.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
 
-        assert!(store.consume(&peer, "docs/a.md", t(1_000)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_000)).unwrap());
 
         let records = store.list().unwrap();
         assert_eq!(
@@ -806,8 +863,16 @@ mod tests {
                 },
             ]
         );
-        assert!(!store.is_granted(&peer, "docs/a.md", t(1_000)).unwrap());
-        assert!(store.is_granted(&peer, "docs/b.md", t(1_000)).unwrap());
+        assert!(
+            !store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_000))
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_granted(&peer, "docs/b.md", t_epoch(1_000))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -824,23 +889,23 @@ mod tests {
                 &destination,
                 &paths(&["docs/a.md"]),
                 Some(Duration::from_secs(10)),
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
-        assert!(store.consume(&peer, "docs/a.md", t(1_001)).unwrap());
-        assert!(!store.consume(&peer, "docs/a.md", t(1_001)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_001)).unwrap());
+        assert!(!store.consume(&peer, "docs/a.md", t_epoch(1_001)).unwrap());
 
-        assert!(store.refund(&peer, "docs/a.md", t(1_002)).unwrap());
+        assert!(store.refund(&peer, "docs/a.md", t_epoch(1_002)).unwrap());
 
         assert_eq!(store.list().unwrap()[0].paths[0].uses_left, 1);
         assert!(
-            !store.refund(&peer, "docs/b.md", t(1_002)).unwrap(),
+            !store.refund(&peer, "docs/b.md", t_epoch(1_002)).unwrap(),
             "a path the grant never named takes no refund"
         );
-        assert!(store.consume(&peer, "docs/a.md", t(1_003)).unwrap());
-        assert!(!store.refund(&peer, "docs/a.md", t(1_010)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_003)).unwrap());
+        assert!(!store.refund(&peer, "docs/a.md", t_epoch(1_010)).unwrap());
         assert!(store.list().unwrap().is_empty());
-        assert!(!store.consume(&peer, "docs/a.md", t(1_010)).unwrap());
+        assert!(!store.consume(&peer, "docs/a.md", t_epoch(1_010)).unwrap());
     }
 
     #[test]
@@ -852,21 +917,27 @@ mod tests {
             destination: &destination,
         };
         store
-            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant(
+                "req",
+                &destination,
+                &paths(&["docs/a.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
-        assert!(store.consume(&peer, "docs/a.md", t(1_001)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_001)).unwrap());
 
-        assert!(store.refund(&peer, "docs/a.md", t(1_002)).unwrap());
+        assert!(store.refund(&peer, "docs/a.md", t_epoch(1_002)).unwrap());
         assert!(
-            !store.refund(&peer, "docs/a.md", t(1_002)).unwrap(),
+            !store.refund(&peer, "docs/a.md", t_epoch(1_002)).unwrap(),
             "a second refund has no consume to pair with"
         );
 
         let granted = &store.list().unwrap()[0].paths[0];
         assert_eq!(granted.uses, 1);
         assert_eq!(granted.uses_left, 1);
-        assert!(store.consume(&peer, "docs/a.md", t(1_003)).unwrap());
-        assert!(!store.consume(&peer, "docs/a.md", t(1_003)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_003)).unwrap());
+        assert!(!store.consume(&peer, "docs/a.md", t_epoch(1_003)).unwrap());
     }
 
     #[test]
@@ -878,16 +949,22 @@ mod tests {
             destination: &destination,
         };
         store
-            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant(
+                "req",
+                &destination,
+                &paths(&["docs/a.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
-        assert!(store.consume(&peer, "docs/a.md", t(1_000)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_000)).unwrap());
 
         let records = store.list().unwrap();
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(records[0].paths[0].uses_left, 0);
-        assert_eq!(store.prune(t(1_000)).unwrap(), 0);
+        assert_eq!(store.prune(t_epoch(1_000)).unwrap(), 0);
         assert_eq!(store.list().unwrap().len(), 1);
-        assert_eq!(store.prune(t(1_000 + 15 * 60)).unwrap(), 1);
+        assert_eq!(store.prune(t_epoch(1_000 + 15 * 60)).unwrap(), 1);
         assert!(store.list().unwrap().is_empty());
     }
 
@@ -906,16 +983,28 @@ mod tests {
                 &destination,
                 &paths(&["docs/a.md"]),
                 Some(Duration::from_secs(10)),
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         store
-            .grant("long", &destination, &paths(&["docs/b.md"]), None, t(1_000))
+            .grant(
+                "long",
+                &destination,
+                &paths(&["docs/b.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
 
-        assert!(store.is_granted(&peer, "docs/a.md", t(1_009)).unwrap());
         assert!(
-            !store.is_granted(&peer, "docs/a.md", t(1_010)).unwrap(),
+            store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_009))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_010))
+                .unwrap(),
             "a grant expires exactly at its stamp"
         );
         let ids: Vec<String> = store.list().unwrap().into_iter().map(|r| r.id).collect();
@@ -925,16 +1014,16 @@ mod tests {
             "the check rewrote the file without the expired grant"
         );
 
-        let reopened = GrantStore::open(&tmp.path, "inst", t(1_000 + 15 * 60)).unwrap();
+        let reopened = GrantStore::open(&tmp.path, "inst", t_epoch(1_000 + 15 * 60)).unwrap();
         assert!(reopened.list().unwrap().is_empty());
         assert!(
             !reopened
-                .is_granted(&peer, "docs/b.md", t(1_000 + 15 * 60))
+                .is_granted(&peer, "docs/b.md", t_epoch(1_000 + 15 * 60))
                 .unwrap()
         );
         assert!(
             !reopened
-                .consume(&peer, "docs/b.md", t(1_000 + 15 * 60))
+                .consume(&peer, "docs/b.md", t_epoch(1_000 + 15 * 60))
                 .unwrap()
         );
     }
@@ -953,7 +1042,7 @@ mod tests {
                 &destination,
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         store
@@ -962,16 +1051,22 @@ mod tests {
                 &destination,
                 &paths(&["docs/b.md"]),
                 Some(Duration::from_secs(1)),
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         store
-            .grant("live", &destination, &paths(&["docs/c.md"]), None, t(1_000))
+            .grant(
+                "live",
+                &destination,
+                &paths(&["docs/c.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
-        assert!(store.consume(&peer, "docs/a.md", t(1_000)).unwrap());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_000)).unwrap());
 
-        assert_eq!(store.prune(t(1_001)).unwrap(), 1);
-        assert_eq!(store.prune(t(1_001)).unwrap(), 0);
+        assert_eq!(store.prune(t_epoch(1_001)).unwrap(), 1);
+        assert_eq!(store.prune(t_epoch(1_001)).unwrap(), 0);
 
         let ids: Vec<String> = store.list().unwrap().into_iter().map(|r| r.id).collect();
         assert_eq!(ids, ["spent", "live"]);
@@ -982,7 +1077,13 @@ mod tests {
         let (store, _tmp) = store("grants-newer");
         let destination = fake_hash(0x2b);
         let record = store
-            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant(
+                "req",
+                &destination,
+                &paths(&["docs/a.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
         let mut newer = serde_json::to_value(&record).unwrap();
         newer["version"] = serde_json::json!(GRANT_RECORD_VERSION + 1);
@@ -994,7 +1095,7 @@ mod tests {
         };
 
         let err = store
-            .is_granted(&peer, "docs/a.md", t(1_000))
+            .is_granted(&peer, "docs/a.md", t_epoch(1_000))
             .unwrap_err()
             .to_string();
 
@@ -1006,11 +1107,17 @@ mod tests {
         );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(store.consume(&peer, "docs/a.md", t(1_000)).is_err());
-        assert!(store.prune(t(1_000)).is_err());
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_000)).is_err());
+        assert!(store.prune(t_epoch(1_000)).is_err());
         assert!(
             store
-                .grant("more", &destination, &paths(&["docs/b.md"]), None, t(1_000))
+                .grant(
+                    "more",
+                    &destination,
+                    &paths(&["docs/b.md"]),
+                    None,
+                    t_epoch(1_000)
+                )
                 .is_err()
         );
     }
@@ -1024,7 +1131,7 @@ mod tests {
                 &fake_hash(0x2b),
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         let mut older = serde_json::to_value(&record).unwrap();
@@ -1048,7 +1155,7 @@ mod tests {
                 &fake_hash(0x2b),
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         let mut unversioned = serde_json::to_value(&record).unwrap();
@@ -1072,7 +1179,7 @@ mod tests {
                 &fake_hash(0x2b),
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         let mut extra = serde_json::to_value(&record).unwrap();
@@ -1099,7 +1206,7 @@ mod tests {
                 &fake_hash(0x2b),
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         let mut bad = serde_json::to_value(&record).unwrap();
@@ -1118,7 +1225,13 @@ mod tests {
         let (store, _tmp) = store("grants-surplus-uses");
         let destination = fake_hash(0x2b);
         let record = store
-            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .grant(
+                "req",
+                &destination,
+                &paths(&["docs/a.md"]),
+                None,
+                t_epoch(1_000),
+            )
             .unwrap();
         let mut surplus = serde_json::to_value(&record).unwrap();
         surplus["paths"][0]["uses_left"] = serde_json::json!(2);
@@ -1133,8 +1246,12 @@ mod tests {
         assert!(err.contains("line 1"), "{err}");
         assert!(err.contains("more uses left than were granted"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(store.is_granted(&peer, "docs/a.md", t(1_000)).is_err());
-        assert!(store.consume(&peer, "docs/a.md", t(1_000)).is_err());
+        assert!(
+            store
+                .is_granted(&peer, "docs/a.md", t_epoch(1_000))
+                .is_err()
+        );
+        assert!(store.consume(&peer, "docs/a.md", t_epoch(1_000)).is_err());
     }
 
     #[test]
@@ -1149,7 +1266,7 @@ mod tests {
                 uses: 1,
                 uses_left: 1,
             }],
-            expires: rfc3339_utc(t(2_000)),
+            expires: rfc3339_utc(t_epoch(2_000)),
         };
 
         let err = store.write_all(&[record]).unwrap_err().to_string();
@@ -1167,7 +1284,7 @@ mod tests {
                 &fake_hash(0x2b),
                 &paths(&["docs/a.md"]),
                 None,
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
         let line = serde_json::to_string(&record).unwrap();

@@ -891,10 +891,9 @@ impl InstancePresence for PeerTable {
 
 #[cfg(test)]
 mod public_key_tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, announced_as};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
-    use crate::mesh::{hex_lower, session_destination_name};
     use crate::testing::{debug_snapshot, install_log_collector};
     use rns_transport::identity::PrivateIdentity;
     use rns_transport::rand_core::OsRng;
@@ -902,20 +901,19 @@ mod public_key_tests {
     /// A sighting whose hashes and key derive from a real identity, as an announce's do,
     /// and that key.
     fn announced() -> (PeerSighting, String) {
-        let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
-        let name = session_destination_name("instance");
-        let name_hash = <[u8; NAME_HASH_LEN]>::try_from(name.as_name_hash_slice()).unwrap();
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let key = identity.as_identity().to_hex_string();
+        let peer = announced_as(identity, "instance");
         let sighting = PeerSighting {
-            destination_hash: destination_address(&name_hash, &identity.address_hash)
-                .to_hex_string(),
-            identity_hash: identity.address_hash.to_hex_string(),
-            name_hash: hex_lower(&name_hash),
-            public_key: Some(identity.to_hex_string()),
+            destination_hash: peer.destination_hash,
+            identity_hash: peer.identity_hash,
+            name_hash: peer.name_hash,
+            public_key: Some(key.clone()),
             display_name: Some("Ada".to_string()),
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,
         };
-        (sighting, identity.to_hex_string())
+        (sighting, key)
     }
 
     fn path_in(tmp: &TempDir) -> PathBuf {

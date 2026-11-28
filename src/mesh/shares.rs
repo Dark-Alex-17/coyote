@@ -1908,7 +1908,7 @@ mod tests {
     use crate::config::WORKSPACE_COYOTE_DIR_NAME;
     use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
     use crate::mesh::hex_lower;
-    use crate::mesh::test_support::TempDir;
+    use crate::mesh::test_support::{TempDir, fake_hash};
     use crate::testing::{EnvVarGuard, debug_snapshot, install_log_collector, warn_snapshot};
     use crate::utils::get_env_name;
 
@@ -1985,10 +1985,6 @@ mod tests {
             std::os::unix::fs::symlink(target, &path).unwrap();
             dunce::canonicalize(path).unwrap()
         }
-    }
-
-    fn fake_hash(fill: u8) -> String {
-        hex_lower(&[fill; 16])
     }
 
     fn allow(pattern: &str) -> Mutation {

@@ -2052,7 +2052,9 @@ mod tests {
     use crate::mesh::propagation::{OutboundMessage, build_signed_message};
     use crate::mesh::request::{OriginName, request_frame};
     use crate::mesh::session_destination_name;
-    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
+    use crate::mesh::test_support::{
+        TempDir, TrustList, read_source, rust_sources, siblings_of, t_epoch,
+    };
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
@@ -2103,10 +2105,6 @@ mod tests {
 
     fn id(byte: u8) -> TransientId {
         [byte; 32]
-    }
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
     /// `bin 32` of `id`, as msgpack writes a 32-byte binary.
@@ -2827,29 +2825,29 @@ mod tests {
     fn deferrals_evict_the_longest_deferred_past_capacity_and_log_it() {
         install_log_collector();
         let tmp = TempDir::new("fetch-deferred-cap");
-        let mut store = store_at(&tmp, t(1));
+        let mut store = store_at(&tmp, t_epoch(1));
         let mut ids = Vec::new();
         for i in 0..MAX_DEFERRED_IDS {
             let mut id = [0u8; 32];
             id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             assert_eq!(
-                store.defer(id, t(1_000 + i as u64), false),
+                store.defer(id, t_epoch(1_000 + i as u64), false),
                 Deferral::Retry { attempts: 1 }
             );
             ids.push(id);
         }
         // A repeat keeps its first sighting, so it is still the oldest.
         assert_eq!(
-            store.defer(ids[0], t(9_000), false),
+            store.defer(ids[0], t_epoch(9_000), false),
             Deferral::Retry { attempts: 2 }
         );
         assert_eq!(
             store.deferral_of(&ids[0]).map(|d| d.first_seen_at),
-            Some(t(1_000))
+            Some(t_epoch(1_000))
         );
 
         assert_eq!(
-            store.defer(id(0xff), t(9_001), false),
+            store.defer(id(0xff), t_epoch(9_001), false),
             Deferral::Retry { attempts: 1 }
         );
 
@@ -3377,19 +3375,19 @@ mod tests {
     fn dedup_evicts_the_oldest_past_capacity_and_logs_it() {
         install_log_collector();
         let tmp = TempDir::new("fetch-dedup-cap");
-        let mut store = store_at(&tmp, t(1));
+        let mut store = store_at(&tmp, t_epoch(1));
         let mut ids = Vec::new();
         for i in 0..DEDUP_CAPACITY {
             let mut id = [0u8; 32];
             id[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            assert!(store.insert(id, t(1_000 + i as u64)));
+            assert!(store.insert(id, t_epoch(1_000 + i as u64)));
             ids.push(id);
         }
         // A repeat keeps its first `seen_at`, so it is still the oldest.
-        assert!(!store.insert(ids[0], t(9_000)));
+        assert!(!store.insert(ids[0], t_epoch(9_000)));
         assert_eq!(store.len(), DEDUP_CAPACITY);
 
-        assert!(store.insert(id(0xff), t(9_001)));
+        assert!(store.insert(id(0xff), t_epoch(9_001)));
 
         assert_eq!(store.len(), DEDUP_CAPACITY);
         assert!(!store.contains(&ids[0]));
@@ -3408,20 +3406,23 @@ mod tests {
     #[test]
     fn dedup_forgets_past_the_horizon_on_insert_and_on_load() {
         let tmp = TempDir::new("fetch-dedup-horizon");
-        let mut store = store_at(&tmp, t(1_000));
-        assert!(store.insert(id(1), t(1_000)));
-        assert!(store.insert(id(2), t(1_000) + DEDUP_HORIZON - Duration::from_secs(1)));
+        let mut store = store_at(&tmp, t_epoch(1_000));
+        assert!(store.insert(id(1), t_epoch(1_000)));
+        assert!(store.insert(
+            id(2),
+            t_epoch(1_000) + DEDUP_HORIZON - Duration::from_secs(1)
+        ));
         assert!(store.contains(&id(1)));
 
-        assert!(store.insert(id(3), t(1_000) + DEDUP_HORIZON));
+        assert!(store.insert(id(3), t_epoch(1_000) + DEDUP_HORIZON));
         assert!(!store.contains(&id(1)), "exactly at the horizon is expired");
         assert!(store.contains(&id(2)));
         store.persist().unwrap();
 
-        let reloaded = store_at(&tmp, t(1_000) + DEDUP_HORIZON);
+        let reloaded = store_at(&tmp, t_epoch(1_000) + DEDUP_HORIZON);
         assert!(reloaded.contains(&id(2)));
         assert!(reloaded.contains(&id(3)));
-        let later = store_at(&tmp, t(1_000) + DEDUP_HORIZON * 2);
+        let later = store_at(&tmp, t_epoch(1_000) + DEDUP_HORIZON * 2);
         assert!(!later.contains(&id(2)));
         assert!(!later.contains(&id(3)));
         assert_eq!(later.len(), 0);
@@ -3431,18 +3432,18 @@ mod tests {
     fn store_survives_a_reopen_in_the_documented_layout() {
         let tmp = TempDir::new("fetch-store-reopen");
         let path = tmp.path.join("mesh").join("propagation.json");
-        let mut store = store_at(&tmp, t(5_000));
-        assert!(store.insert(id(0xab), t(5_000)));
-        assert!(store.record_delivered(id(0xcd), t(5_000)));
+        let mut store = store_at(&tmp, t_epoch(5_000));
+        assert!(store.insert(id(0xab), t_epoch(5_000)));
+        assert!(store.record_delivered(id(0xcd), t_epoch(5_000)));
         assert_eq!(
-            store.defer(id(0xef), t(4_999), true),
+            store.defer(id(0xef), t_epoch(4_999), true),
             Deferral::Retry { attempts: 1 }
         );
         assert_eq!(
-            store.defer(id(0xef), t(5_000), false),
+            store.defer(id(0xef), t_epoch(5_000), false),
             Deferral::Retry { attempts: 2 }
         );
-        store.record_sync("cafe", t(5_001), 3);
+        store.record_sync("cafe", t_epoch(5_001), 3);
         store.persist().unwrap();
         assert_eq!(
             siblings_of(&path),
@@ -3469,7 +3470,7 @@ mod tests {
         assert_eq!(json["cursor"]["last_synced_at"], "1970-01-01T01:23:21Z");
         assert_eq!(json["cursor"]["last_received"], 3);
 
-        let reloaded = store_at(&tmp, t(5_002));
+        let reloaded = store_at(&tmp, t_epoch(5_002));
         assert!(reloaded.contains(&id(0xab)));
         assert!(!reloaded.contains(&id(0xac)));
         assert!(reloaded.was_delivered(&id(0xcd)));
@@ -3479,7 +3480,7 @@ mod tests {
             reloaded.deferral_of(&id(0xef)),
             Some(Deferred {
                 attempts: 2,
-                first_seen_at: t(4_999),
+                first_seen_at: t_epoch(4_999),
                 asked: true,
             })
         );
@@ -3488,7 +3489,7 @@ mod tests {
             reloaded.cursor(),
             Some(&SyncCursor {
                 node: "cafe".to_string(),
-                last_synced_at: t(5_001),
+                last_synced_at: t_epoch(5_001),
                 last_received: 3,
             })
         );
@@ -3504,7 +3505,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match FetchStore::load(path.clone(), t(1)) {
+        let err = match FetchStore::load(path.clone(), t_epoch(1)) {
             Ok(_) => panic!("a version 2 file must be refused"),
             Err(err) => err,
         };
@@ -3535,7 +3536,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match FetchStore::load(path.clone(), t(1)) {
+        let err = match FetchStore::load(path.clone(), t_epoch(1)) {
             Ok(_) => panic!("a version 0 file must be refused"),
             Err(err) => err,
         };
@@ -3562,7 +3563,7 @@ mod tests {
         let aside = tmp.path.join("propagation.json.corrupt");
         fs::write(&path, bytes).unwrap();
 
-        let store = FetchStore::load(path.clone(), t(1)).expect("cache never blocks a fetch");
+        let store = FetchStore::load(path.clone(), t_epoch(1)).expect("cache never blocks a fetch");
 
         assert_eq!(store.len(), 0);
         assert_eq!(store.cursor(), None);
@@ -3643,7 +3644,7 @@ mod tests {
         );
         fs::write(&path, bytes.as_bytes()).unwrap();
 
-        let store = FetchStore::load(path.clone(), t(10))
+        let store = FetchStore::load(path.clone(), t_epoch(10))
             .expect("a version-1 propagation store still loads");
 
         assert_eq!(store.len(), 1, "the seen id survives the load");

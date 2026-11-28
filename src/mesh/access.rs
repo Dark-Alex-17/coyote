@@ -1904,7 +1904,7 @@ mod tests {
     };
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::request::{PathHash, RequestId};
-    use crate::mesh::test_support::{TempDir, TrustList, snapshot_fixture};
+    use crate::mesh::test_support::{TempDir, TrustList, map, snapshot_fixture};
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
@@ -1957,15 +1957,6 @@ mod tests {
 
     fn destination() -> String {
         hex_lower(&DESTINATION)
-    }
-
-    fn map(entries: Vec<(&str, Value)>) -> Value {
-        Value::Map(
-            entries
-                .into_iter()
-                .map(|(key, value)| (Value::from(key), value))
-                .collect(),
-        )
     }
 
     fn list(paths: &[&str]) -> Value {

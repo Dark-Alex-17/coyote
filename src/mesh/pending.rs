@@ -1352,12 +1352,8 @@ impl Correlations {
 mod tests {
     use super::*;
     use crate::mesh::message::{PeerKind, PeerVia};
-    use crate::mesh::test_support::TempDir;
+    use crate::mesh::test_support::{TempDir, t_epoch};
     use crate::mesh::{hex_lower, rfc3339_utc};
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
 
     fn record(id: &str, sent_at: SystemTime, state: PendingState) -> PendingRecord {
         PendingRecord {
@@ -1550,20 +1546,23 @@ mod tests {
     fn other_sessions_asked_lists_every_other_store_newest_first() {
         let tmp = TempDir::new("pending-other-sessions");
         let base = 2_000_000;
-        let now = t(base);
+        let now = t_epoch(base);
         PendingStore::new(&tmp.path, "own")
-            .upsert(record("own-q", t(base - 5), PendingState::Open), now)
+            .upsert(record("own-q", t_epoch(base - 5), PendingState::Open), now)
             .unwrap();
         let temp = PendingStore::new(&tmp.path, "temp");
-        temp.upsert(record("temp-old", t(base - 30), PendingState::Open), now)
-            .unwrap();
         temp.upsert(
-            record("temp-new", t(base - 1), PendingState::Escalated),
+            record("temp-old", t_epoch(base - 30), PendingState::Open),
             now,
         )
         .unwrap();
         temp.upsert(
-            record("temp-spent", t(base - 2), PendingState::Answered),
+            record("temp-new", t_epoch(base - 1), PendingState::Escalated),
+            now,
+        )
+        .unwrap();
+        temp.upsert(
+            record("temp-spent", t_epoch(base - 2), PendingState::Answered),
             now,
         )
         .unwrap();
@@ -1571,12 +1570,12 @@ mod tests {
         old.upsert(
             PendingRecord {
                 reply: Some(reply_to("old-answered")),
-                ..record("old-answered", t(base - 10), PendingState::Answered)
+                ..record("old-answered", t_epoch(base - 10), PendingState::Answered)
             },
             now,
         )
         .unwrap();
-        let expired_at = t(base - PENDING_TTL.as_secs() - 60);
+        let expired_at = t_epoch(base - PENDING_TTL.as_secs() - 60);
         old.upsert(
             record("old-expired", expired_at, PendingState::Open),
             expired_at,
@@ -1630,25 +1629,25 @@ mod tests {
 
         let tmp = TempDir::new("pending-sibling-owner");
         let base = 3_000_000;
-        let now = t(base);
+        let now = t_epoch(base);
         let signer = hex_lower(&[0xcd; 16]);
         let stranger = hex_lower(&[0xee; 16]);
         let a = PendingStore::new(&tmp.path, "inst-a");
-        a.upsert(record("q-open", t(base - 5), PendingState::Open), now)
+        a.upsert(record("q-open", t_epoch(base - 5), PendingState::Open), now)
             .unwrap();
         a.upsert(
-            record("q-answered", t(base - 6), PendingState::Answered),
+            record("q-answered", t_epoch(base - 6), PendingState::Answered),
             now,
         )
         .unwrap();
-        let expired_at = t(base - PENDING_TTL.as_secs() - 60);
+        let expired_at = t_epoch(base - PENDING_TTL.as_secs() - 60);
         a.upsert(
             record("q-expired", expired_at, PendingState::Open),
             expired_at,
         )
         .unwrap();
         PendingStore::new(&tmp.path, "inst-c")
-            .upsert(record("q-own", t(base - 7), PendingState::Open), now)
+            .upsert(record("q-own", t_epoch(base - 7), PendingState::Open), now)
             .unwrap();
         let a_threads = SentThreads::open(&tmp.path, "inst-a").unwrap();
         a_threads.record_sent("t-a").unwrap();
@@ -1738,17 +1737,23 @@ mod tests {
         let base = 1_000_000;
         {
             let store = PendingStore::new(&tmp.path, "inst-a");
-            assert!(store.list(t(base)).unwrap().is_empty());
+            assert!(store.list(t_epoch(base)).unwrap().is_empty());
             assert!(!tmp.path.join("mesh").exists(), "listing creates nothing");
             store
-                .upsert(record("old", t(base - 10), PendingState::Open), t(base))
+                .upsert(
+                    record("old", t_epoch(base - 10), PendingState::Open),
+                    t_epoch(base),
+                )
                 .unwrap();
             store
-                .upsert(record("new", t(base), PendingState::Open), t(base))
+                .upsert(
+                    record("new", t_epoch(base), PendingState::Open),
+                    t_epoch(base),
+                )
                 .unwrap();
-            let mut answered = record("old", t(base - 10), PendingState::Open);
+            let mut answered = record("old", t_epoch(base - 10), PendingState::Open);
             answered.state = PendingState::Answered;
-            store.upsert(answered, t(base)).unwrap();
+            store.upsert(answered, t_epoch(base)).unwrap();
         }
 
         let store = PendingStore::new(&tmp.path, "inst-a");
@@ -1756,7 +1761,7 @@ mod tests {
             store.path(),
             tmp.path.join("mesh").join("pending-inst-a.jsonl")
         );
-        let listed = store.list(t(base)).unwrap();
+        let listed = store.list(t_epoch(base)).unwrap();
         assert_eq!(
             ids(&listed),
             vec!["new", "old"],
@@ -1765,20 +1770,20 @@ mod tests {
         assert_eq!(listed[1].state, PendingState::Answered);
         assert!(
             PendingStore::new(&tmp.path, "inst-b")
-                .list(t(base))
+                .list(t_epoch(base))
                 .unwrap()
                 .is_empty(),
             "another instance has its own file"
         );
 
-        let expiry = t(base - 10) + PENDING_TTL;
+        let expiry = t_epoch(base - 10) + PENDING_TTL;
         assert_eq!(ids(&store.list(expiry).unwrap()), vec!["new"]);
         assert_eq!(store.prune(expiry).unwrap(), 1);
         assert_eq!(store.prune(expiry).unwrap(), 0);
         assert_eq!(ids(&store.list(expiry).unwrap()), vec!["new"]);
         assert!(store.remove("new").unwrap());
         assert!(!store.remove("new").unwrap());
-        assert!(store.list(t(base)).unwrap().is_empty());
+        assert!(store.list(t_epoch(base)).unwrap().is_empty());
 
         let mut records: Vec<PendingRecord> = (0..PENDING_MAX_ENTRIES + 2)
             .rev()
@@ -1788,18 +1793,18 @@ mod tests {
                 } else {
                     PendingState::Open
                 };
-                record(&format!("q{n}"), t(base + n as u64), state)
+                record(&format!("q{n}"), t_epoch(base + n as u64), state)
             })
             .collect();
         records.push(record(
             "stale",
-            t(base - 3_600 * 24 * 8),
+            t_epoch(base - 3_600 * 24 * 8),
             PendingState::Open,
         ));
         store.write_all(&records).unwrap();
 
-        assert_eq!(store.prune(t(base + 10_000)).unwrap(), 3);
-        let listed = store.list(t(base + 10_000)).unwrap();
+        assert_eq!(store.prune(t_epoch(base + 10_000)).unwrap(), 3);
+        let listed = store.list(t_epoch(base + 10_000)).unwrap();
         assert_eq!(listed.len(), PENDING_MAX_ENTRIES);
         assert!(!ids(&listed).contains(&"stale"), "expired goes first");
         assert!(!ids(&listed).contains(&"q0"), "then the oldest answered");
@@ -1812,7 +1817,7 @@ mod tests {
     fn upsert_refuses_records_the_reader_would_refuse() {
         let tmp = TempDir::new("pending-refuse");
         let store = PendingStore::new(&tmp.path, "inst");
-        let base = record("fine", t(1_000), PendingState::Open);
+        let base = record("fine", t_epoch(1_000), PendingState::Open);
         for (what, broken, needle) in [
             (
                 "version",
@@ -1855,7 +1860,10 @@ mod tests {
                 "characters",
             ),
         ] {
-            let err = store.upsert(broken, t(1_000)).unwrap_err().to_string();
+            let err = store
+                .upsert(broken, t_epoch(1_000))
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("refusing"), "{what}: {err}");
             assert!(err.contains(needle), "{what}: {err}");
         }
@@ -1867,16 +1875,19 @@ mod tests {
         let tmp = TempDir::new("pending-newer-whole-store");
         let store = PendingStore::new(&tmp.path, "inst");
         store
-            .upsert(record("fine", t(1_000), PendingState::Open), t(1_000))
+            .upsert(
+                record("fine", t_epoch(1_000), PendingState::Open),
+                t_epoch(1_000),
+            )
             .unwrap();
         let mut newer =
-            serde_json::to_value(record("future", t(2_000), PendingState::Open)).unwrap();
+            serde_json::to_value(record("future", t_epoch(2_000), PendingState::Open)).unwrap();
         newer["version"] = serde_json::json!(PENDING_RECORD_VERSION + 1);
         newer["future_field"] = serde_json::json!(1);
         let existing = fs::read_to_string(store.path()).unwrap();
         fs::write(store.path(), format!("{existing}{newer}\n")).unwrap();
 
-        let err = store.list(t(2_000)).unwrap_err().to_string();
+        let err = store.list(t_epoch(2_000)).unwrap_err().to_string();
 
         assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("pending store"), "{err}");
@@ -1891,10 +1902,13 @@ mod tests {
         );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(store.load_pending(t(2_000)).is_err());
+        assert!(store.load_pending(t_epoch(2_000)).is_err());
         assert!(
             store
-                .upsert(record("more", t(3_000), PendingState::Open), t(3_000))
+                .upsert(
+                    record("more", t_epoch(3_000), PendingState::Open),
+                    t_epoch(3_000)
+                )
                 .is_err()
         );
         assert!(
@@ -1909,12 +1923,13 @@ mod tests {
     fn a_pre_baseline_pending_line_refuses_as_having_no_migration() {
         let tmp = TempDir::new("pending-older");
         let store = PendingStore::new(&tmp.path, "inst");
-        let mut older = serde_json::to_value(record("q1", t(1_000), PendingState::Open)).unwrap();
+        let mut older =
+            serde_json::to_value(record("q1", t_epoch(1_000), PendingState::Open)).unwrap();
         older["version"] = serde_json::json!(0);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{older}\n")).unwrap();
 
-        let err = store.list(t(1_000)).unwrap_err().to_string();
+        let err = store.list(t_epoch(1_000)).unwrap_err().to_string();
 
         assert!(err.contains("line 1"), "{err}");
         assert!(err.contains("version 0"), "{err}");
@@ -1927,12 +1942,13 @@ mod tests {
     fn a_pending_line_without_a_version_refuses_the_whole_store() {
         let tmp = TempDir::new("pending-unversioned");
         let store = PendingStore::new(&tmp.path, "inst");
-        let mut bare = serde_json::to_value(record("q1", t(1_000), PendingState::Open)).unwrap();
+        let mut bare =
+            serde_json::to_value(record("q1", t_epoch(1_000), PendingState::Open)).unwrap();
         bare.as_object_mut().unwrap().remove("version");
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{bare}\n")).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_000)).unwrap_err());
 
         assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("line 1"), "{err}");
@@ -1960,7 +1976,7 @@ mod tests {
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), line).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_100)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_100)).unwrap_err());
 
         assert!(err.contains("pending store"), "{err}");
         assert!(err.contains("line 1"), "{err}");
@@ -1971,10 +1987,10 @@ mod tests {
         );
         assert!(err.contains("no migration exists"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
-        assert!(store.load_pending(t(1_100)).is_err());
+        assert!(store.load_pending(t_epoch(1_100)).is_err());
         let path = store.path().to_path_buf();
         let correlations = Correlations::new();
-        assert!(correlations.attach_store(store, t(1_100)).is_err());
+        assert!(correlations.attach_store(store, t_epoch(1_100)).is_err());
         assert!(correlations.list().is_empty(), "no record is surfaced");
         assert!(
             fs::read_to_string(path).unwrap().contains("q-before-bump"),
@@ -2001,7 +2017,7 @@ mod tests {
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), line).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_100)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_100)).unwrap_err());
 
         assert!(err.contains("inbound store"), "{err}");
         assert!(err.contains("line 1"), "{err}");
@@ -2028,12 +2044,13 @@ mod tests {
     fn a_record_with_a_field_this_coyote_does_not_know_is_refused() {
         let tmp = TempDir::new("pending-unknown-field");
         let store = PendingStore::new(&tmp.path, "inst");
-        let mut newer = serde_json::to_value(record("q1", t(1_000), PendingState::Open)).unwrap();
+        let mut newer =
+            serde_json::to_value(record("q1", t_epoch(1_000), PendingState::Open)).unwrap();
         newer["added_later"] = serde_json::json!({"nested": true});
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{newer}\n")).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_000)).unwrap_err());
         assert!(err.contains("line 1"), "{err}");
         assert!(err.contains("not a pending question"), "{err}");
         assert!(err.contains("added_later"), "{err}");
@@ -2045,14 +2062,14 @@ mod tests {
         let store = PendingStore::new(&tmp.path, "inst");
         let answered = PendingRecord {
             reply: Some(reply_to("q1")),
-            ..record("q1", t(1_000), PendingState::Answered)
+            ..record("q1", t_epoch(1_000), PendingState::Answered)
         };
         let mut newer = serde_json::to_value(answered).unwrap();
         newer["reply"]["later"] = serde_json::json!(1);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{newer}\n")).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_000)).unwrap_err());
         assert!(err.contains("line 1"), "{err}");
         assert!(err.contains("later"), "{err}");
     }
@@ -2084,15 +2101,19 @@ mod tests {
         let base = 1_000_000;
         {
             let store = InboundStore::new(&tmp.path, "inst-a");
-            assert!(store.list(t(base)).unwrap().is_empty());
+            assert!(store.list(t_epoch(base)).unwrap().is_empty());
             assert!(store.get("old").unwrap().is_none());
             assert!(!tmp.path.join("mesh").exists(), "reading creates nothing");
-            store.upsert(inbound("old", t(base - 10)), t(base)).unwrap();
-            store.upsert(inbound("new", t(base)), t(base)).unwrap();
-            let mut proposed = inbound("old", t(base - 10));
+            store
+                .upsert(inbound("old", t_epoch(base - 10)), t_epoch(base))
+                .unwrap();
+            store
+                .upsert(inbound("new", t_epoch(base)), t_epoch(base))
+                .unwrap();
+            let mut proposed = inbound("old", t_epoch(base - 10));
             proposed.envoy_question = "second thoughts".into();
             proposed.session_thread = "old-session".into();
-            store.upsert(proposed, t(base)).unwrap();
+            store.upsert(proposed, t_epoch(base)).unwrap();
         }
 
         let store = InboundStore::new(&tmp.path, "inst-a");
@@ -2100,7 +2121,7 @@ mod tests {
             store.path(),
             tmp.path.join("mesh").join("inbound-inst-a.jsonl")
         );
-        let listed = store.list(t(base)).unwrap();
+        let listed = store.list(t_epoch(base)).unwrap();
         assert_eq!(
             inbound_ids(&listed),
             vec!["new", "old"],
@@ -2111,20 +2132,20 @@ mod tests {
         assert_eq!(store.get("old").unwrap(), Some(listed[1].clone()));
         assert!(
             InboundStore::new(&tmp.path, "inst-b")
-                .list(t(base))
+                .list(t_epoch(base))
                 .unwrap()
                 .is_empty(),
             "another instance has its own file"
         );
         assert!(
             PendingStore::new(&tmp.path, "inst-a")
-                .list(t(base))
+                .list(t_epoch(base))
                 .unwrap()
                 .is_empty(),
             "the pending store never sees a peer's question"
         );
 
-        let expiry = t(base - 10) + PENDING_TTL;
+        let expiry = t_epoch(base - 10) + PENDING_TTL;
         assert_eq!(inbound_ids(&store.list(expiry).unwrap()), vec!["new"]);
         store.upsert(inbound("newer", expiry), expiry).unwrap();
         assert_eq!(
@@ -2142,13 +2163,16 @@ mod tests {
 
         let records: Vec<InboundRecord> = (0..INBOUND_MAX_ENTRIES)
             .rev()
-            .map(|n| inbound(&format!("q{n}"), t(base + n as u64)))
+            .map(|n| inbound(&format!("q{n}"), t_epoch(base + n as u64)))
             .collect();
         write_jsonl(store.path(), &records, INBOUND_NAMES).unwrap();
         store
-            .upsert(inbound("latest", t(base + 10_000)), t(base + 10_000))
+            .upsert(
+                inbound("latest", t_epoch(base + 10_000)),
+                t_epoch(base + 10_000),
+            )
             .unwrap();
-        let listed = store.list(t(base + 10_000)).unwrap();
+        let listed = store.list(t_epoch(base + 10_000)).unwrap();
         assert_eq!(listed.len(), INBOUND_MAX_ENTRIES);
         assert_eq!(listed[0].id, "latest");
         assert!(!inbound_ids(&listed).contains(&"q0"), "the oldest goes");
@@ -2161,23 +2185,23 @@ mod tests {
         let base = 1_000_000;
         let source = InboundStore::new(&tmp.path, "inst-a");
         source
-            .upsert(inbound("shared", t(base - 20)), t(base))
+            .upsert(inbound("shared", t_epoch(base - 20)), t_epoch(base))
             .unwrap();
         source
-            .upsert(inbound("fresh", t(base - 5)), t(base))
+            .upsert(inbound("fresh", t_epoch(base - 5)), t_epoch(base))
             .unwrap();
         source
-            .upsert(inbound("stale", t(base - 30)), t(base))
+            .upsert(inbound("stale", t_epoch(base - 30)), t_epoch(base))
             .unwrap();
         let target = InboundStore::new(&tmp.path, "inst-b");
-        let mut held = inbound("shared", t(base - 20));
+        let mut held = inbound("shared", t_epoch(base - 20));
         held.envoy_question = "the fork's own proposal".into();
-        target.upsert(held, t(base)).unwrap();
+        target.upsert(held, t_epoch(base)).unwrap();
         target
-            .upsert(inbound("own", t(base - 10)), t(base))
+            .upsert(inbound("own", t_epoch(base - 10)), t_epoch(base))
             .unwrap();
 
-        let now = t(base - 30) + PENDING_TTL;
+        let now = t_epoch(base - 30) + PENDING_TTL;
         assert_eq!(target.adopt_from(&source, now).unwrap().count, 1);
 
         let listed = target.list(now).unwrap();
@@ -2198,7 +2222,7 @@ mod tests {
     fn a_fresh_filing_keeps_an_expired_row_for_the_sweep() {
         let tmp = TempDir::new("inbound-keep-expired");
         let store = InboundStore::new(&tmp.path, "inst");
-        let now = t(1_000_000);
+        let now = t_epoch(1_000_000);
         let stale = inbound("stale", now - PENDING_TTL - Duration::from_secs(1));
         assert_eq!(
             store.upsert(stale.clone(), now - PENDING_TTL).unwrap(),
@@ -2240,7 +2264,7 @@ mod tests {
     fn adopt_from_keeps_the_targets_expired_row_for_the_sweep() {
         let tmp = TempDir::new("inbound-adopt-keeps-expired");
         let base = 1_000_000;
-        let now = t(base);
+        let now = t_epoch(base);
         let source = InboundStore::new(&tmp.path, "inst-a");
         source.upsert(inbound("fresh", now), now).unwrap();
         let target = InboundStore::new(&tmp.path, "inst-b");
@@ -2276,7 +2300,7 @@ mod tests {
     #[test]
     fn adopt_from_lets_a_fresh_row_replace_the_targets_expired_twin() {
         let tmp = TempDir::new("inbound-adopt-replaces-expired-twin");
-        let now = t(1_000_000);
+        let now = t_epoch(1_000_000);
         let source = InboundStore::new(&tmp.path, "inst-a");
         let fresh = InboundRecord {
             question: "are you there now?".to_string(),
@@ -2318,7 +2342,7 @@ mod tests {
     #[test]
     fn adopt_from_frees_an_expired_twins_id_for_any_peer_keeps_live_twins_and_repeats_as_a_no_op() {
         let tmp = TempDir::new("inbound-adopt-expired-twin-any-peer");
-        let now = t(1_000_000);
+        let now = t_epoch(1_000_000);
         let hour = Duration::from_secs(3_600);
         let other_peer = |mut record: InboundRecord| {
             record.peer_destination = hex_lower(&[0x11; 16]);
@@ -2416,12 +2440,12 @@ mod tests {
         let base = 1_000_000;
         let store = InboundStore::new(&tmp.path, "inst");
         assert!(
-            store.prune_expired(t(base)).unwrap().is_empty(),
+            store.prune_expired(t_epoch(base)).unwrap().is_empty(),
             "no file, nothing expired"
         );
         assert!(!store.path().exists(), "a prune creates no file");
         store
-            .upsert(inbound("stale-q", t(base - 30)), t(base))
+            .upsert(inbound("stale-q", t_epoch(base - 30)), t_epoch(base))
             .unwrap();
         store
             .upsert(
@@ -2430,15 +2454,15 @@ mod tests {
                     question: String::new(),
                     envoy_question: String::new(),
                     paths: vec!["src/x.rs".into()],
-                    ..inbound("stale-a", t(base - 20))
+                    ..inbound("stale-a", t_epoch(base - 20))
                 },
-                t(base),
+                t_epoch(base),
             )
             .unwrap();
         store
-            .upsert(inbound("fresh", t(base - 5)), t(base))
+            .upsert(inbound("fresh", t_epoch(base - 5)), t_epoch(base))
             .unwrap();
-        let now = t(base - 20) + PENDING_TTL;
+        let now = t_epoch(base - 20) + PENDING_TTL;
 
         let expired = store.prune_expired(now).unwrap();
 
@@ -2462,7 +2486,7 @@ mod tests {
     fn inbound_upsert_refuses_records_the_reader_would_refuse() {
         let tmp = TempDir::new("inbound-refuse");
         let store = InboundStore::new(&tmp.path, "inst");
-        let base = inbound("fine", t(1_000));
+        let base = inbound("fine", t_epoch(1_000));
         for (what, broken, needle) in [
             (
                 "version",
@@ -2513,7 +2537,10 @@ mod tests {
                 "envoy question",
             ),
         ] {
-            let err = store.upsert(broken, t(1_000)).unwrap_err().to_string();
+            let err = store
+                .upsert(broken, t_epoch(1_000))
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("refusing"), "{what}: {err}");
             assert!(err.contains(needle), "{what}: {err}");
         }
@@ -2524,15 +2551,17 @@ mod tests {
     fn a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record() {
         let tmp = TempDir::new("inbound-newer-whole-store");
         let store = InboundStore::new(&tmp.path, "inst");
-        store.upsert(inbound("fine", t(1_000)), t(1_000)).unwrap();
-        let mut newer = serde_json::to_value(inbound("future", t(2_000))).unwrap();
+        store
+            .upsert(inbound("fine", t_epoch(1_000)), t_epoch(1_000))
+            .unwrap();
+        let mut newer = serde_json::to_value(inbound("future", t_epoch(2_000))).unwrap();
         newer["version"] = serde_json::json!(INBOUND_RECORD_VERSION + 1);
         newer["future_field"] = serde_json::json!(1);
         let existing = fs::read_to_string(store.path()).unwrap();
         let written = format!("{newer}\n{existing}");
         fs::write(store.path(), &written).unwrap();
 
-        let err = store.list(t(2_000)).unwrap_err().to_string();
+        let err = store.list(t_epoch(2_000)).unwrap_err().to_string();
 
         assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("inbound store"), "{err}");
@@ -2562,12 +2591,12 @@ mod tests {
     fn a_pre_baseline_inbound_line_refuses_as_having_no_migration() {
         let tmp = TempDir::new("inbound-older");
         let store = InboundStore::new(&tmp.path, "inst");
-        let mut older = serde_json::to_value(inbound("q1", t(1_000))).unwrap();
+        let mut older = serde_json::to_value(inbound("q1", t_epoch(1_000))).unwrap();
         older["version"] = serde_json::json!(0);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{older}\n")).unwrap();
 
-        let err = store.list(t(1_000)).unwrap_err().to_string();
+        let err = store.list(t_epoch(1_000)).unwrap_err().to_string();
 
         assert!(err.contains("inbound store"), "{err}");
         assert!(err.contains("line 1"), "{err}");
@@ -2580,12 +2609,12 @@ mod tests {
     fn an_inbound_line_without_a_version_refuses_the_whole_store() {
         let tmp = TempDir::new("inbound-unversioned");
         let store = InboundStore::new(&tmp.path, "inst");
-        let mut bare = serde_json::to_value(inbound("q1", t(1_000))).unwrap();
+        let mut bare = serde_json::to_value(inbound("q1", t_epoch(1_000))).unwrap();
         bare.as_object_mut().unwrap().remove("version");
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{bare}\n")).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_000)).unwrap_err());
 
         assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("line 1"), "{err}");
@@ -2597,12 +2626,12 @@ mod tests {
     fn an_inbound_record_with_an_unknown_field_is_refused() {
         let tmp = TempDir::new("inbound-unknown-field");
         let store = InboundStore::new(&tmp.path, "inst");
-        let mut current = serde_json::to_value(inbound("q1", t(1_000))).unwrap();
+        let mut current = serde_json::to_value(inbound("q1", t_epoch(1_000))).unwrap();
         current["added_later"] = serde_json::json!(true);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{current}\n")).unwrap();
 
-        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        let err = format!("{:#}", store.list(t_epoch(1_000)).unwrap_err());
 
         assert!(err.contains("line 1"), "{err}");
         assert!(err.contains("inbound question"), "{err}");
@@ -2613,7 +2642,7 @@ mod tests {
     fn an_inbound_line_without_the_access_placeholders_loads_as_a_question() {
         let tmp = TempDir::new("inbound-access-defaults");
         let store = InboundStore::new(&tmp.path, "inst");
-        let mut question = serde_json::to_value(inbound("q", t(1_000))).unwrap();
+        let mut question = serde_json::to_value(inbound("q", t_epoch(1_000))).unwrap();
         let fields = question.as_object_mut().unwrap();
         assert!(
             !fields.contains_key("session_thread"),
@@ -2626,14 +2655,14 @@ mod tests {
             question["version"],
             serde_json::json!(INBOUND_RECORD_VERSION)
         );
-        let mut access = serde_json::to_value(inbound("a", t(1_001))).unwrap();
+        let mut access = serde_json::to_value(inbound("a", t_epoch(1_001))).unwrap();
         access["kind"] = serde_json::json!("access");
         access["paths"] = serde_json::json!(["src/x.rs"]);
         access["reason"] = serde_json::json!("need it");
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{access}\n{question}\n")).unwrap();
 
-        let listed = store.list(t(1_001)).unwrap();
+        let listed = store.list(t_epoch(1_001)).unwrap();
 
         assert_eq!(inbound_ids(&listed), vec!["a", "q"]);
         assert_eq!(listed[1].kind, InboundKind::Question);
@@ -2649,17 +2678,17 @@ mod tests {
     fn inbound_upsert_holds_the_access_fields_to_the_record_kind() {
         let tmp = TempDir::new("inbound-kind-shape");
         let store = InboundStore::new(&tmp.path, "inst");
-        let question = inbound("q", t(1_000));
+        let question = inbound("q", t_epoch(1_000));
         let access = InboundRecord {
             kind: InboundKind::Access,
             question: String::new(),
             envoy_question: String::new(),
             paths: vec!["src/x.rs".to_string()],
             reason: "need it".to_string(),
-            ..inbound("a", t(1_000))
+            ..inbound("a", t_epoch(1_000))
         };
-        store.upsert(question.clone(), t(1_000)).unwrap();
-        store.upsert(access.clone(), t(1_000)).unwrap();
+        store.upsert(question.clone(), t_epoch(1_000)).unwrap();
+        store.upsert(access.clone(), t_epoch(1_000)).unwrap();
 
         let cases = [
             (
@@ -2725,29 +2754,38 @@ mod tests {
                 id: format!("broken-{n}"),
                 ..broken
             };
-            assert!(store.upsert(broken, t(1_000)).is_err(), "{what} was stored");
+            assert!(
+                store.upsert(broken, t_epoch(1_000)).is_err(),
+                "{what} was stored"
+            );
         }
-        assert_eq!(inbound_ids(&store.list(t(1_000)).unwrap()), vec!["a", "q"]);
+        assert_eq!(
+            inbound_ids(&store.list(t_epoch(1_000)).unwrap()),
+            vec!["a", "q"]
+        );
     }
 
     #[test]
     fn inbound_upsert_refuses_an_id_another_peer_holds_open() {
         let tmp = TempDir::new("inbound-collide");
         let store = InboundStore::new(&tmp.path, "inst");
-        let first = inbound("shared", t(1_000));
-        store.upsert(first.clone(), t(1_000)).unwrap();
+        let first = inbound("shared", t_epoch(1_000));
+        store.upsert(first.clone(), t_epoch(1_000)).unwrap();
 
-        let mut other_peer = inbound("shared", t(1_001));
+        let mut other_peer = inbound("shared", t_epoch(1_001));
         other_peer.peer_destination = hex_lower(&[0xee; 16]);
-        let err = store.upsert(other_peer, t(1_001)).unwrap_err().to_string();
+        let err = store
+            .upsert(other_peer, t_epoch(1_001))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("belongs to another session"), "{err}");
         assert_eq!(store.get("shared").unwrap(), Some(first.clone()));
 
-        let mut same_peer = inbound("shared", t(1_002));
+        let mut same_peer = inbound("shared", t_epoch(1_002));
         same_peer.envoy_question = "asked again".into();
-        store.upsert(same_peer.clone(), t(1_002)).unwrap();
+        store.upsert(same_peer.clone(), t_epoch(1_002)).unwrap();
         assert_eq!(store.get("shared").unwrap(), Some(same_peer));
-        assert_eq!(store.list(t(1_002)).unwrap().len(), 1);
+        assert_eq!(store.list(t_epoch(1_002)).unwrap().len(), 1);
     }
 
     #[test]
@@ -2760,18 +2798,21 @@ mod tests {
             envoy_question: String::new(),
             paths: vec!["README.md".to_string()],
             reason: "the readme".to_string(),
-            ..inbound("a", t(1_000))
+            ..inbound("a", t_epoch(1_000))
         };
-        let question = inbound("q", t(1_000));
-        store.upsert(access.clone(), t(1_000)).unwrap();
-        store.upsert(question.clone(), t(1_000)).unwrap();
+        let question = inbound("q", t_epoch(1_000));
+        store.upsert(access.clone(), t_epoch(1_000)).unwrap();
+        store.upsert(question.clone(), t_epoch(1_000)).unwrap();
 
         let swapped = InboundRecord {
             paths: vec!["src/secrets.rs".to_string()],
-            received_at: rfc3339_utc(t(1_001)),
+            received_at: rfc3339_utc(t_epoch(1_001)),
             ..access.clone()
         };
-        let err = store.upsert(swapped, t(1_001)).unwrap_err().to_string();
+        let err = store
+            .upsert(swapped, t_epoch(1_001))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("An access request is decided, never rewritten; refusing to replace `a`"),
             "{err}"
@@ -2784,7 +2825,7 @@ mod tests {
             ..access.clone()
         };
         let err = store
-            .upsert(question_as_access, t(1_001))
+            .upsert(question_as_access, t_epoch(1_001))
             .unwrap_err()
             .to_string();
         assert!(
@@ -2801,7 +2842,7 @@ mod tests {
             ..question.clone()
         };
         let err = store
-            .upsert(access_as_question, t(1_001))
+            .upsert(access_as_question, t_epoch(1_001))
             .unwrap_err()
             .to_string();
         assert!(
@@ -2814,16 +2855,16 @@ mod tests {
 
         let mut reworded = question.clone();
         reworded.envoy_question = "asked again".into();
-        store.upsert(reworded.clone(), t(1_002)).unwrap();
+        store.upsert(reworded.clone(), t_epoch(1_002)).unwrap();
         assert_eq!(store.get("q").unwrap(), Some(reworded));
-        assert_eq!(store.list(t(1_002)).unwrap().len(), 2);
+        assert_eq!(store.list(t_epoch(1_002)).unwrap().len(), 2);
     }
 
     #[test]
     fn file_unless_judges_the_rule_on_the_live_records_and_writes_nothing_when_it_refuses() {
         let tmp = TempDir::new("inbound-file-unless");
         let store = InboundStore::new(&tmp.path, "inst");
-        let now = t(1_000_000);
+        let now = t_epoch(1_000_000);
         store
             .upsert(
                 inbound("stale", now - PENDING_TTL - Duration::from_secs(1)),
@@ -2857,7 +2898,7 @@ mod tests {
     fn inbound_upsert_lets_a_new_peer_reuse_an_expired_id() {
         let tmp = TempDir::new("inbound-expired-reuse");
         let store = InboundStore::new(&tmp.path, "inst");
-        let now = t(1_000_000);
+        let now = t_epoch(1_000_000);
         let stale = inbound("shared", now - PENDING_TTL - Duration::from_secs(1));
         store.upsert(stale.clone(), now - PENDING_TTL).unwrap();
         store
@@ -2891,7 +2932,7 @@ mod tests {
     fn a_filing_hands_back_only_the_expired_twin_it_displaced_and_the_cap_hands_back_nothing() {
         let tmp = TempDir::new("inbound-displaced-only-when-expired");
         let store = InboundStore::new(&tmp.path, "inst");
-        let now = t(1_000_000);
+        let now = t_epoch(1_000_000);
         let live = inbound("live", now - Duration::from_secs(60));
         assert_eq!(store.upsert(live.clone(), now).unwrap(), None, "a fresh id");
         let mut rewrite = live.clone();
@@ -3533,23 +3574,29 @@ mod tests {
         let base = 1_000_000;
         let mut records: Vec<PendingRecord> = (1..=PENDING_MAX_ENTRIES)
             .rev()
-            .map(|n| record(&format!("q{n}"), t(base + n as u64), PendingState::Open))
+            .map(|n| {
+                record(
+                    &format!("q{n}"),
+                    t_epoch(base + n as u64),
+                    PendingState::Open,
+                )
+            })
             .collect();
         records[PENDING_MAX_ENTRIES / 2] = PendingRecord {
             reply: Some(reply_to("answered")),
             ..record(
                 "answered",
-                t(base + (PENDING_MAX_ENTRIES / 2) as u64),
+                t_epoch(base + (PENDING_MAX_ENTRIES / 2) as u64),
                 PendingState::Answered,
             )
         };
-        records.push(record("escalated", t(base), PendingState::Escalated));
+        records.push(record("escalated", t_epoch(base), PendingState::Escalated));
         assert_eq!(records.len(), PENDING_MAX_ENTRIES + 1);
         store.write_all(&records).unwrap();
 
-        assert_eq!(store.prune(t(base + 10_000)).unwrap(), 1);
+        assert_eq!(store.prune(t_epoch(base + 10_000)).unwrap(), 1);
 
-        let listed = store.list(t(base + 10_000)).unwrap();
+        let listed = store.list(t_epoch(base + 10_000)).unwrap();
         assert_eq!(listed.len(), PENDING_MAX_ENTRIES);
         assert!(!ids(&listed).contains(&"answered"), "the answered one goes");
         assert_eq!(
@@ -3566,23 +3613,29 @@ mod tests {
         let base = 1_000_000;
         let mut records: Vec<PendingRecord> = (1..=PENDING_MAX_ENTRIES)
             .rev()
-            .map(|n| record(&format!("q{n}"), t(base + n as u64), PendingState::Open))
+            .map(|n| {
+                record(
+                    &format!("q{n}"),
+                    t_epoch(base + n as u64),
+                    PendingState::Open,
+                )
+            })
             .collect();
         records[PENDING_MAX_ENTRIES / 2] = PendingRecord {
             kind: CorrelationKind::Message,
             ..record(
                 "message",
-                t(base + (PENDING_MAX_ENTRIES / 2) as u64),
+                t_epoch(base + (PENDING_MAX_ENTRIES / 2) as u64),
                 PendingState::Open,
             )
         };
-        records.push(record("oldest-question", t(base), PendingState::Open));
+        records.push(record("oldest-question", t_epoch(base), PendingState::Open));
         assert_eq!(records.len(), PENDING_MAX_ENTRIES + 1);
         store.write_all(&records).unwrap();
 
-        assert_eq!(store.prune(t(base + 10_000)).unwrap(), 1);
+        assert_eq!(store.prune(t_epoch(base + 10_000)).unwrap(), 1);
 
-        let listed = store.list(t(base + 10_000)).unwrap();
+        let listed = store.list(t_epoch(base + 10_000)).unwrap();
         assert_eq!(listed.len(), PENDING_MAX_ENTRIES);
         assert!(
             !ids(&listed).contains(&"message"),
@@ -3599,7 +3652,7 @@ mod tests {
     /// field existed; a message's names itself, and both load back unchanged.
     #[test]
     fn only_a_message_writes_its_kind_on_the_line() {
-        let question = record("q1", t(1_000), PendingState::Open);
+        let question = record("q1", t_epoch(1_000), PendingState::Open);
         let line = serde_json::to_string(&question).unwrap();
         assert!(!line.contains("\"kind\""), "{line}");
         assert_eq!(
@@ -3609,7 +3662,7 @@ mod tests {
 
         let message = PendingRecord {
             kind: CorrelationKind::Message,
-            ..record("m1", t(1_000), PendingState::Open)
+            ..record("m1", t_epoch(1_000), PendingState::Open)
         };
         let line = serde_json::to_string(&message).unwrap();
         assert!(line.ends_with(r#","kind":"message"}"#), "{line}");
@@ -3627,7 +3680,7 @@ mod tests {
         assert_eq!(PENDING_RECORD_VERSION, 2);
         assert_eq!(INBOUND_RECORD_VERSION, 2);
         let tmp = TempDir::new("pending-v1-previous-build");
-        let now = t(1_000);
+        let now = t_epoch(1_000);
 
         let mut v1_pending = serde_json::to_value(record("q1", now, PendingState::Open)).unwrap();
         v1_pending["version"] = serde_json::json!(1);

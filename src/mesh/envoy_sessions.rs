@@ -1600,7 +1600,7 @@ fn read_versioned<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::test_support::TempDir;
+    use crate::mesh::test_support::{TempDir, t_epoch};
     use crate::testing::{install_log_collector, warn_snapshot};
     use std::time::Duration;
 
@@ -1618,10 +1618,6 @@ mod tests {
         } else {
             DEST_A
         }
-    }
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
     fn enabled() -> EnvoyMemoryConfig {
@@ -1676,7 +1672,7 @@ mod tests {
             identity: IDENTITY_A.to_string(),
             destination: DEST_A.to_string(),
             thread: "thread-one".to_string(),
-            last_used: rfc3339_utc(t(1_000)),
+            last_used: rfc3339_utc(t_epoch(1_000)),
             turns: vec![user("hello"), assistant("hi")],
         };
 
@@ -1744,18 +1740,18 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-lazy");
         let store = store(&tmp, &enabled());
 
-        assert_eq!(store.prune(t(1_000)).unwrap(), 0);
+        assert_eq!(store.prune(t_epoch(1_000)).unwrap(), 0);
         assert_eq!(store.stats().unwrap(), (0, 0));
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
                 .unwrap(),
             None
         );
         assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 0);
         assert_eq!(store.delete_identity(IDENTITY_A).unwrap(), 0);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", Vec::new(), t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", Vec::new(), t_epoch(1_000))
             .unwrap();
 
         assert!(!tmp.path.join("mesh").exists(), "{:?}", names_in(&tmp.path));
@@ -1767,7 +1763,13 @@ mod tests {
         let store = store(&tmp, &enabled());
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
 
         let dir = tmp.path.join("mesh").join("envoy-sessions").join("inst");
@@ -1783,13 +1785,13 @@ mod tests {
             "the record, the index and its lock, and no temp file"
         );
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.identity, IDENTITY_A);
         assert_eq!(loaded.destination, DEST_A);
         assert_eq!(loaded.thread, "thread-one");
-        assert_eq!(loaded.last_used, rfc3339_utc(t(1_000)));
+        assert_eq!(loaded.last_used, rfc3339_utc(t_epoch(1_000)));
         assert_eq!(loaded.turns, exchange(1));
         let index: EnvoySessionIndex =
             serde_json::from_str(&fs::read_to_string(dir.join("index.json")).unwrap()).unwrap();
@@ -1801,7 +1803,7 @@ mod tests {
                 identity: IDENTITY_A.to_string(),
                 destination: DEST_A.to_string(),
                 thread: "thread-one".to_string(),
-                last_used: rfc3339_utc(t(1_000)),
+                last_used: rfc3339_utc(t_epoch(1_000)),
                 turns: 2,
                 bytes: 18,
             }]
@@ -1823,7 +1825,13 @@ mod tests {
         let store = store(&tmp, &enabled());
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
 
         let mesh = tmp.path.join("mesh");
@@ -1845,7 +1853,13 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-wrong-identity");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let key = session_key(IDENTITY_A, DEST_A, "thread-one").unwrap();
         let path = store.record_path(&key);
@@ -1855,7 +1869,7 @@ mod tests {
         fs::write(&path, planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(&err, EnvoyMemoryError::WrongIdentity { key: k, asked, found }
@@ -1865,7 +1879,7 @@ mod tests {
         assert!(err.to_string().contains("refusing"), "{err}");
         assert_eq!(
             store
-                .load(IDENTITY_B, DEST_B, "thread-one", t(1_000))
+                .load(IDENTITY_B, DEST_B, "thread-one", t_epoch(1_000))
                 .unwrap(),
             None,
             "B's key differs, so B sees nothing either"
@@ -1877,7 +1891,7 @@ mod tests {
             .replace(IDENTITY_A, IDENTITY_B);
         fs::write(&index_path, swapped).unwrap();
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::WrongIdentity { .. }),
@@ -1897,14 +1911,20 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-wrong-destination");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let key = session_key(IDENTITY_A, DEST_A, "thread-one").unwrap();
         let path = store.record_path(&key);
         plant(&path, DEST_A, DEST_A2);
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(&err, EnvoyMemoryError::WrongDestination { key: k, asked, found }
@@ -1920,7 +1940,7 @@ mod tests {
                     DEST_A,
                     "thread-one",
                     exchange(2),
-                    t(1_001),
+                    t_epoch(1_001),
                     true
                 ),
                 Err(EnvoyMemoryError::WrongDestination { .. })
@@ -1928,13 +1948,25 @@ mod tests {
             "a record naming another destination is not written over"
         );
         assert!(matches!(
-            store.save(IDENTITY_A, DEST_A, "thread-one", exchange(2), t(1_001)),
+            store.save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(2),
+                t_epoch(1_001)
+            ),
             Err(EnvoyMemoryError::WrongDestination { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), planted);
         install_log_collector();
         let warned_before = warn_snapshot().len();
-        let session = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-2", t(1_001));
+        let session = store.session_thread(
+            IDENTITY_A,
+            DEST_A,
+            Some("thread-one"),
+            "m-2",
+            t_epoch(1_001),
+        );
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
         let warned: Vec<String> = warn_snapshot()
@@ -1953,7 +1985,7 @@ mod tests {
         plant(&path, DEST_A2, DEST_A);
         plant(&store.index_path(), DEST_A, DEST_A2);
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::WrongDestination { .. }),
@@ -1966,23 +1998,40 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-other-destination");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
 
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A2, "thread-one", t(1_001))
+                .load(IDENTITY_A, DEST_A2, "thread-one", t_epoch(1_001))
                 .unwrap(),
             None
         );
-        let session =
-            store.session_thread(IDENTITY_A, DEST_A2, Some("thread-one"), "m-2", t(1_001));
+        let session = store.session_thread(
+            IDENTITY_A,
+            DEST_A2,
+            Some("thread-one"),
+            "m-2",
+            t_epoch(1_001),
+        );
         assert_eq!(
             session.thread, "m-2",
             "a new session under the message's id"
         );
         assert!(session.resumed.is_none());
-        let own = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-3", t(1_001));
+        let own = store.session_thread(
+            IDENTITY_A,
+            DEST_A,
+            Some("thread-one"),
+            "m-3",
+            t_epoch(1_001),
+        );
         assert_eq!(own.thread, "thread-one");
         assert_eq!(own.resumed.unwrap().turns, exchange(1));
 
@@ -1992,13 +2041,13 @@ mod tests {
                 DEST_A2,
                 "thread-one",
                 exchange(2),
-                t(1_002),
+                t_epoch(1_002),
                 true,
             )
             .unwrap();
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_002))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_002))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -2007,7 +2056,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A2, "thread-one", t(1_002))
+                .load(IDENTITY_A, DEST_A2, "thread-one", t_epoch(1_002))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -2028,11 +2077,17 @@ mod tests {
             (DEST_A2, "thread-three"),
         ] {
             store
-                .save(IDENTITY_A, destination, thread, exchange(1), t(1_000))
+                .save(IDENTITY_A, destination, thread, exchange(1), t_epoch(1_000))
                 .unwrap();
         }
         store
-            .save(IDENTITY_B, DEST_B, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_B,
+                DEST_B,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
 
         assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 2);
@@ -2049,7 +2104,13 @@ mod tests {
 
         for destination in [DEST_A, DEST_A2] {
             store
-                .save(IDENTITY_A, destination, "thread-one", exchange(1), t(1_000))
+                .save(
+                    IDENTITY_A,
+                    destination,
+                    "thread-one",
+                    exchange(1),
+                    t_epoch(1_000),
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -2122,7 +2183,7 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-legacy-no-resume");
         let config = enabled();
         let store = store(&tmp, &config);
-        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        plant_legacy(&store, IDENTITY_A, "thread-one", t_epoch(1_000));
 
         let index = store.read_index().unwrap();
         let legacy = index
@@ -2138,12 +2199,17 @@ mod tests {
         for destination in [DEST_A, DEST_A2] {
             assert_eq!(
                 store
-                    .load(IDENTITY_A, destination, "thread-one", t(1_001))
+                    .load(IDENTITY_A, destination, "thread-one", t_epoch(1_001))
                     .unwrap(),
                 None
             );
-            let session =
-                store.session_thread(IDENTITY_A, destination, Some("thread-one"), "m-2", t(1_001));
+            let session = store.session_thread(
+                IDENTITY_A,
+                destination,
+                Some("thread-one"),
+                "m-2",
+                t_epoch(1_001),
+            );
             assert_eq!(session.thread, "m-2");
             assert!(session.resumed.is_none());
         }
@@ -2153,13 +2219,13 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 exchange(1),
-                t(1_002),
+                t_epoch(1_002),
                 true,
             )
             .unwrap();
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_002))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_002))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -2180,7 +2246,7 @@ mod tests {
         let store = store(&tmp, &config);
         let legacy = store.record_path(&legacy_key(IDENTITY_A, "thread-one"));
 
-        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        plant_legacy(&store, IDENTITY_A, "thread-one", t_epoch(1_000));
         let remembered = EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap();
         assert_eq!(remembered.by_identity[IDENTITY_A], ["thread-one"]);
         assert_eq!(
@@ -2191,7 +2257,7 @@ mod tests {
         assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 1);
         assert!(!legacy.exists(), "removed by the key its entry names");
 
-        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        plant_legacy(&store, IDENTITY_A, "thread-one", t_epoch(1_000));
         assert_eq!(
             EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
                 .unwrap()
@@ -2200,7 +2266,7 @@ mod tests {
         );
         assert!(!legacy.exists());
 
-        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        plant_legacy(&store, IDENTITY_A, "thread-one", t_epoch(1_000));
         assert_eq!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A)
                 .unwrap()
@@ -2210,10 +2276,10 @@ mod tests {
         assert!(!legacy.exists());
         assert_eq!(threads_of(&store, IDENTITY_B), ["other"]);
 
-        plant_legacy(&store, IDENTITY_A, "thread-one", t(1_000));
+        plant_legacy(&store, IDENTITY_A, "thread-one", t_epoch(1_000));
         let ttl = Duration::from_secs(config.ttl_hours * 3600);
         assert_eq!(
-            store.prune(t(1_000) + ttl).unwrap(),
+            store.prune(t_epoch(1_000) + ttl).unwrap(),
             2,
             "the old record ages out with the rest"
         );
@@ -2225,10 +2291,22 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-delete");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(2),
+                t_epoch(1_001),
+            )
             .unwrap();
 
         assert_eq!(store.delete(IDENTITY_A, "thread-one").unwrap(), 1);
@@ -2236,14 +2314,14 @@ mod tests {
 
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_001))
                 .unwrap(),
             None
         );
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         assert!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-two", t(1_001))
+                .load(IDENTITY_A, DEST_A, "thread-two", t_epoch(1_001))
                 .unwrap()
                 .is_some()
         );
@@ -2255,13 +2333,31 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-delete-identity");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(2),
+                t_epoch(1_001),
+            )
             .unwrap();
         store
-            .save(IDENTITY_B, DEST_B, "thread-one", exchange(3), t(1_002))
+            .save(
+                IDENTITY_B,
+                DEST_B,
+                "thread-one",
+                exchange(3),
+                t_epoch(1_002),
+            )
             .unwrap();
 
         assert_eq!(store.delete_identity(IDENTITY_A).unwrap(), 2);
@@ -2271,7 +2367,7 @@ mod tests {
         assert!(!record_path(&store, IDENTITY_A, "thread-two").exists());
         assert_eq!(
             store
-                .load(IDENTITY_B, DEST_B, "thread-one", t(1_002))
+                .load(IDENTITY_B, DEST_B, "thread-one", t_epoch(1_002))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -2303,14 +2399,32 @@ mod tests {
             .collect();
         for (n, store) in stores.iter().enumerate() {
             store
-                .save(IDENTITY_A, DEST_A, "thread-one", exchange(n), t(1_000))
+                .save(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(n),
+                    t_epoch(1_000),
+                )
                 .unwrap();
             store
-                .save(IDENTITY_B, DEST_B, "thread-one", exchange(n), t(1_000))
+                .save(
+                    IDENTITY_B,
+                    DEST_B,
+                    "thread-one",
+                    exchange(n),
+                    t_epoch(1_000),
+                )
                 .unwrap();
         }
         stores[0]
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(9), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(9),
+                t_epoch(1_001),
+            )
             .unwrap();
         let refused_index = stores[2].index_path();
         let planted = fs::read_to_string(&refused_index)
@@ -2328,13 +2442,13 @@ mod tests {
         for store in &stores[..2] {
             assert_eq!(
                 store
-                    .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                    .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_001))
                     .unwrap(),
                 None
             );
             assert!(
                 store
-                    .load(IDENTITY_B, DEST_B, "thread-one", t(1_001))
+                    .load(IDENTITY_B, DEST_B, "thread-one", t_epoch(1_001))
                     .unwrap()
                     .is_some()
             );
@@ -2356,10 +2470,22 @@ mod tests {
     fn delete_identity_everywhere_sweeps_while_the_memory_is_off() {
         let tmp = TempDir::new("envoy-sessions-delete-while-off");
         let on = store(&tmp, &enabled());
-        on.save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
-            .unwrap();
-        on.save(IDENTITY_B, DEST_B, "thread-one", exchange(2), t(1_000))
-            .unwrap();
+        on.save(
+            IDENTITY_A,
+            DEST_A,
+            "thread-one",
+            exchange(1),
+            t_epoch(1_000),
+        )
+        .unwrap();
+        on.save(
+            IDENTITY_B,
+            DEST_B,
+            "thread-one",
+            exchange(2),
+            t_epoch(1_000),
+        )
+        .unwrap();
 
         let off = EnvoyMemoryConfig::default();
         assert!(!off.enabled);
@@ -2374,13 +2500,13 @@ mod tests {
         let reopened = store(&tmp, &enabled());
         assert_eq!(
             reopened
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_001))
                 .unwrap(),
             None
         );
         assert_eq!(
             reopened
-                .load(IDENTITY_B, DEST_B, "thread-one", t(1_001))
+                .load(IDENTITY_B, DEST_B, "thread-one", t_epoch(1_001))
                 .unwrap()
                 .map(|record| record.turns),
             Some(exchange(2))
@@ -2397,14 +2523,32 @@ mod tests {
             .collect();
         for (n, store) in stores.iter().enumerate() {
             store
-                .save(IDENTITY_A, DEST_A, "thread-one", exchange(n), t(1_000))
+                .save(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(n),
+                    t_epoch(1_000),
+                )
                 .unwrap();
             store
-                .save(IDENTITY_B, DEST_B, "thread-one", exchange(n), t(1_000))
+                .save(
+                    IDENTITY_B,
+                    DEST_B,
+                    "thread-one",
+                    exchange(n),
+                    t_epoch(1_000),
+                )
                 .unwrap();
         }
         stores[0]
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(9), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(9),
+                t_epoch(1_001),
+            )
             .unwrap();
         let refused_index = stores[2].index_path();
         let planted = fs::read_to_string(&refused_index)
@@ -2501,7 +2645,13 @@ mod tests {
         let config = enabled();
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let elsewhere = tmp.path.join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
@@ -2648,7 +2798,13 @@ mod tests {
         let config = enabled();
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let orphan = store.dir().join(format!("{}.yaml", "de".repeat(16)));
         fs::write(&orphan, "version: 1\n").unwrap();
@@ -2680,10 +2836,22 @@ mod tests {
     fn the_everywhere_helpers_take_an_unvalidated_config_while_the_memory_is_off() {
         let tmp = TempDir::new("envoy-sessions-everywhere-unvalidated");
         let on = store(&tmp, &enabled());
-        on.save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
-            .unwrap();
-        on.save(IDENTITY_B, DEST_B, "thread-one", exchange(2), t(1_000))
-            .unwrap();
+        on.save(
+            IDENTITY_A,
+            DEST_A,
+            "thread-one",
+            exchange(1),
+            t_epoch(1_000),
+        )
+        .unwrap();
+        on.save(
+            IDENTITY_B,
+            DEST_B,
+            "thread-one",
+            exchange(2),
+            t_epoch(1_000),
+        )
+        .unwrap();
         let off = EnvoyMemoryConfig {
             enabled: false,
             max_turns: 0,
@@ -2724,12 +2892,30 @@ mod tests {
     fn the_everywhere_helpers_read_and_wipe_while_the_memory_is_off() {
         let tmp = TempDir::new("envoy-sessions-everywhere-while-off");
         let on = store(&tmp, &enabled());
-        on.save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
-            .unwrap();
-        on.save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_000))
-            .unwrap();
-        on.save(IDENTITY_B, DEST_B, "thread-one", exchange(3), t(1_000))
-            .unwrap();
+        on.save(
+            IDENTITY_A,
+            DEST_A,
+            "thread-one",
+            exchange(1),
+            t_epoch(1_000),
+        )
+        .unwrap();
+        on.save(
+            IDENTITY_A,
+            DEST_A,
+            "thread-two",
+            exchange(2),
+            t_epoch(1_000),
+        )
+        .unwrap();
+        on.save(
+            IDENTITY_B,
+            DEST_B,
+            "thread-one",
+            exchange(3),
+            t_epoch(1_000),
+        )
+        .unwrap();
 
         let off = EnvoyMemoryConfig::default();
         assert!(!off.enabled);
@@ -2780,7 +2966,7 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 exchange(1),
-                t(1_000),
+                t_epoch(1_000),
                 false,
             )
             .unwrap();
@@ -2794,7 +2980,7 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 exchange(1),
-                t(1_000),
+                t_epoch(1_000),
                 true,
             )
             .unwrap();
@@ -2805,7 +2991,7 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 vec![assistant("late")],
-                t(1_001),
+                t_epoch(1_001),
                 false,
             )
             .unwrap();
@@ -2815,7 +3001,7 @@ mod tests {
                 DEST_A,
                 "thread-two",
                 exchange(2),
-                t(1_002),
+                t_epoch(1_002),
                 false,
             )
             .unwrap();
@@ -2825,24 +3011,24 @@ mod tests {
                 DEST_A,
                 "thread-three",
                 exchange(3),
-                t(1_003),
+                t_epoch(1_003),
                 true,
             )
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_001))
             .unwrap()
             .unwrap();
         assert_eq!(
             loaded.turns,
             [exchange(1), vec![assistant("late")]].concat()
         );
-        assert_eq!(loaded.last_used, rfc3339_utc(t(1_001)));
+        assert_eq!(loaded.last_used, rfc3339_utc(t_epoch(1_001)));
         assert_eq!(store.stats().unwrap(), (2, 1));
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-two", t(1_002))
+                .load(IDENTITY_A, DEST_A, "thread-two", t_epoch(1_002))
                 .unwrap(),
             None,
             "an append without create to a thread not held writes nothing"
@@ -2850,7 +3036,7 @@ mod tests {
         assert!(!record_path(&store, IDENTITY_A, "thread-two").exists());
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-three", t(1_003))
+                .load(IDENTITY_A, DEST_A, "thread-three", t_epoch(1_003))
                 .unwrap()
                 .unwrap()
                 .turns,
@@ -2863,7 +3049,13 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-append-once");
         let store = store(&tmp, &enabled());
         store
-            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("yes"), t(1_000))
+            .append_once(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                assistant("yes"),
+                t_epoch(1_000),
+            )
             .unwrap();
         assert!(
             !tmp.path.join("mesh").exists(),
@@ -2875,32 +3067,44 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 vec![user("may I?"), assistant("yes")],
-                t(1_000),
+                t_epoch(1_000),
             )
             .unwrap();
 
         store
-            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("yes"), t(1_001))
+            .append_once(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                assistant("yes"),
+                t_epoch(1_001),
+            )
             .unwrap();
         let held = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_001))
             .unwrap()
             .unwrap();
         assert_eq!(held.turns, vec![user("may I?"), assistant("yes")]);
-        assert_eq!(held.last_used, rfc3339_utc(t(1_000)));
+        assert_eq!(held.last_used, rfc3339_utc(t_epoch(1_000)));
 
         store
-            .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("no"), t(1_002))
+            .append_once(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                assistant("no"),
+                t_epoch(1_002),
+            )
             .unwrap();
         let held = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_002))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_002))
             .unwrap()
             .unwrap();
         assert_eq!(
             held.turns,
             vec![user("may I?"), assistant("yes"), assistant("no")]
         );
-        assert_eq!(held.last_used, rfc3339_utc(t(1_002)));
+        assert_eq!(held.last_used, rfc3339_utc(t_epoch(1_002)));
     }
 
     #[test]
@@ -2912,9 +3116,15 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
-        let late = t(1_000 + 3_601);
+        let late = t_epoch(1_000 + 3_601);
 
         store
             .append_once(IDENTITY_A, DEST_A, "thread-one", assistant("late"), late)
@@ -2927,7 +3137,13 @@ mod tests {
         assert_eq!(store.stats().unwrap(), (0, 0));
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
             .append(IDENTITY_A, DEST_A, "thread-one", exchange(2), late, true)
@@ -2958,16 +3174,28 @@ mod tests {
         let store = store(&tmp, &config);
         let saved = vec![user("may I?"), assistant("yes")];
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", saved.clone(), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                saved.clone(),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", saved.clone(), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                saved.clone(),
+                t_epoch(1_000),
+            )
             .unwrap();
 
         // Half an hour in: a read and a retry of the turn the record ends with.
         assert!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 1_800))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000 + 1_800))
                 .unwrap()
                 .is_some()
         );
@@ -2977,7 +3205,7 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 assistant("yes"),
-                t(1_000 + 1_800),
+                t_epoch(1_000 + 1_800),
             )
             .unwrap();
         // The same half hour in: a turn that is written.
@@ -2987,30 +3215,40 @@ mod tests {
                 DEST_A,
                 "thread-two",
                 assistant("no"),
-                t(1_000 + 1_800),
+                t_epoch(1_000 + 1_800),
             )
             .unwrap();
 
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 3_600))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000 + 3_600))
                 .unwrap(),
             None,
             "neither the read nor the skipped retry kept the thread past its hour"
         );
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         let held = store
-            .load(IDENTITY_A, DEST_A, "thread-two", t(1_000 + 1_800 + 3_599))
+            .load(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                t_epoch(1_000 + 1_800 + 3_599),
+            )
             .unwrap()
             .expect("the written turn started the hour over");
         assert_eq!(
             held.turns,
             vec![user("may I?"), assistant("yes"), assistant("no")]
         );
-        assert_eq!(held.last_used, rfc3339_utc(t(1_000 + 1_800)));
+        assert_eq!(held.last_used, rfc3339_utc(t_epoch(1_000 + 1_800)));
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-two", t(1_000 + 1_800 + 3_600))
+                .load(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-two",
+                    t_epoch(1_000 + 1_800 + 3_600)
+                )
                 .unwrap(),
             None
         );
@@ -3034,14 +3272,14 @@ mod tests {
                     DEST_A,
                     "thread-one",
                     exchange(n),
-                    t(1_000 + n as u64),
+                    t_epoch(1_000 + n as u64),
                     true,
                 )
                 .unwrap();
         }
 
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_003))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_003))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.turns, [exchange(2), exchange(3)].concat());
@@ -3052,19 +3290,43 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-stats");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(2),
+                t_epoch(1_001),
+            )
             .unwrap();
         store
-            .save(IDENTITY_B, DEST_B, "thread-one", exchange(3), t(1_002))
+            .save(
+                IDENTITY_B,
+                DEST_B,
+                "thread-one",
+                exchange(3),
+                t_epoch(1_002),
+            )
             .unwrap();
 
         assert_eq!(store.stats().unwrap(), (3, 2));
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(4), t(1_003))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(4),
+                t_epoch(1_003),
+            )
             .unwrap();
         assert_eq!(
             store.stats().unwrap(),
@@ -3078,13 +3340,19 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-missing-record");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         fs::remove_file(record_path(&store, IDENTITY_A, "thread-one")).unwrap();
 
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
                 .unwrap(),
             None
         );
@@ -3099,16 +3367,26 @@ mod tests {
         let not_hex = "g".repeat(32);
         for identity in ["", "abc", not_hex.as_str()] {
             let err = store
-                .save(identity, DEST_A, "thread", exchange(1), t(1_000))
+                .save(identity, DEST_A, "thread", exchange(1), t_epoch(1_000))
                 .unwrap_err();
             assert!(matches!(err, EnvoyMemoryError::NotAnIdentity(_)), "{err:?}");
-            assert!(store.load(identity, DEST_A, "thread", t(1_000)).is_err());
+            assert!(
+                store
+                    .load(identity, DEST_A, "thread", t_epoch(1_000))
+                    .is_err()
+            );
             assert!(store.delete_identity(identity).is_err());
             assert!(store.delete(identity, "thread").is_err());
         }
         for destination in ["", "abc", not_hex.as_str()] {
             let err = store
-                .save(IDENTITY_A, destination, "thread", exchange(1), t(1_000))
+                .save(
+                    IDENTITY_A,
+                    destination,
+                    "thread",
+                    exchange(1),
+                    t_epoch(1_000),
+                )
                 .unwrap_err();
             assert!(
                 matches!(err, EnvoyMemoryError::NotADestination(_)),
@@ -3116,7 +3394,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    store.load(IDENTITY_A, destination, "thread", t(1_000)),
+                    store.load(IDENTITY_A, destination, "thread", t_epoch(1_000)),
                     Err(EnvoyMemoryError::NotADestination(_))
                 ),
                 "a malformed destination keys nothing"
@@ -3201,11 +3479,11 @@ mod tests {
         let turns: Vec<EnvoyTurn> = (1..=3).flat_map(exchange).collect();
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", turns, t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", turns, t_epoch(1_000))
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3230,11 +3508,11 @@ mod tests {
         assert_eq!(text_bytes(&turns), 54);
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", turns, t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", turns, t_epoch(1_000))
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.turns, [exchange(2), exchange(3)].concat());
@@ -3261,11 +3539,11 @@ mod tests {
         );
 
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", turns, t(1_000))
+            .save(IDENTITY_A, DEST_A, "thread-one", turns, t_epoch(1_000))
             .unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3300,7 +3578,13 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         assert!(record_path(&store, IDENTITY_A, "thread-one").exists());
 
@@ -3310,14 +3594,14 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 vec![user("q"), assistant(&"a".repeat(32))],
-                t(1_001),
+                t_epoch(1_001),
             )
             .unwrap();
 
         assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_001))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_001))
                 .unwrap(),
             None
         );
@@ -3333,13 +3617,31 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_B, DEST_B, "thread-one", exchange(2), t(1_002))
+            .save(
+                IDENTITY_B,
+                DEST_B,
+                "thread-one",
+                exchange(2),
+                t_epoch(1_002),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(3), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(3),
+                t_epoch(1_001),
+            )
             .unwrap();
 
         assert_eq!(store.stats().unwrap(), (2, 2));
@@ -3363,19 +3665,37 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_B, DEST_B, "thread-one", exchange(1), t(900))
+            .save(IDENTITY_B, DEST_B, "thread-one", exchange(1), t_epoch(900))
             .unwrap();
         store
-            .save(IDENTITY_B, DEST_B, "thread-two", exchange(2), t(901))
+            .save(IDENTITY_B, DEST_B, "thread-two", exchange(2), t_epoch(901))
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(3), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(3),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(4), t(1_001))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(4),
+                t_epoch(1_001),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-three", exchange(5), t(1_002))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-three",
+                exchange(5),
+                t_epoch(1_002),
+            )
             .unwrap();
 
         assert_eq!(
@@ -3401,22 +3721,34 @@ mod tests {
         };
         let store = store(&tmp, &config);
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-two", exchange(2), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-two",
+                exchange(2),
+                t_epoch(1_000),
+            )
             .unwrap();
 
         assert!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 3_599))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000 + 3_599))
                 .unwrap()
                 .is_some(),
             "one second short of the ttl is still a conversation"
         );
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 3_600))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000 + 3_600))
                 .unwrap(),
             None
         );
@@ -3443,7 +3775,7 @@ mod tests {
             (IDENTITY_B, "b-new", 1_004),
         ] {
             lenient
-                .save(identity, dest(identity), thread, exchange(1), t(at))
+                .save(identity, dest(identity), thread, exchange(1), t_epoch(at))
                 .unwrap();
         }
         assert_eq!(lenient.stats().unwrap(), (6, 2));
@@ -3460,7 +3792,7 @@ mod tests {
         fs::write(&orphan, "version: 1\n").unwrap();
         let index_before = fs::read_to_string(store.index_path()).unwrap();
 
-        assert_eq!(store.prune(t(3_700)).unwrap(), 3);
+        assert_eq!(store.prune(t_epoch(3_700)).unwrap(), 3);
 
         assert_eq!(
             threads_of(&store, IDENTITY_A),
@@ -3489,7 +3821,7 @@ mod tests {
         );
 
         let index_after = fs::read_to_string(store.index_path()).unwrap();
-        assert_eq!(store.prune(t(3_700)).unwrap(), 0);
+        assert_eq!(store.prune(t_epoch(3_700)).unwrap(), 0);
         assert_eq!(
             fs::read_to_string(store.index_path()).unwrap(),
             index_after,
@@ -3501,14 +3833,20 @@ mod tests {
         let tmp = TempDir::new(tag);
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         (tmp, store)
     }
 
     fn assert_refused_in_place(store: &EnvoySessions, path: &Path, planted: &str) {
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err()
             .to_string();
         assert!(err.contains(&path.display().to_string()), "{err}");
@@ -3516,7 +3854,13 @@ mod tests {
         assert!(err.contains("move the file aside"), "{err}");
         assert!(
             store
-                .save(IDENTITY_A, DEST_A, "thread-one", exchange(2), t(1_001))
+                .save(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(2),
+                    t_epoch(1_001)
+                )
                 .is_err()
         );
         assert!(
@@ -3526,7 +3870,7 @@ mod tests {
                     DEST_A,
                     "thread-one",
                     exchange(2),
-                    t(1_001),
+                    t_epoch(1_001),
                     false
                 )
                 .is_err()
@@ -3556,7 +3900,7 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::Version { found, expected, .. }
@@ -3583,7 +3927,7 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err()
             .to_string();
         assert!(err.contains("version 0"), "{err}");
@@ -3602,7 +3946,7 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::Unversioned { .. }),
@@ -3623,7 +3967,7 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::NotARecord { .. }),
@@ -3645,14 +3989,14 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::Version { found, expected, .. }
                 if found == ENVOY_SESSION_INDEX_VERSION + 1 && expected == ENVOY_SESSION_INDEX_VERSION),
             "{err:?}"
         );
-        assert!(store.prune(t(2_000)).is_err());
+        assert!(store.prune(t_epoch(2_000)).is_err());
         assert!(store.stats().is_err());
         assert!(store.delete(IDENTITY_A, "thread-one").is_err());
         assert!(store.delete_identity(IDENTITY_A).is_err());
@@ -3675,7 +4019,7 @@ mod tests {
         fs::write(&path, &planted).unwrap();
 
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::NotARecord { .. }),
@@ -3688,7 +4032,7 @@ mod tests {
         entry_field["entries"][0]["added_later"] = serde_json::json!(1);
         fs::write(&path, entry_field.to_string()).unwrap();
         let err = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap_err();
         assert!(
             matches!(err, EnvoyMemoryError::NotARecord { .. }),
@@ -3710,12 +4054,18 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 store
-                    .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                    .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
                     .is_err()
             );
             assert!(
                 store
-                    .save(IDENTITY_A, DEST_A, "thread-one", exchange(2), t(1_001))
+                    .save(
+                        IDENTITY_A,
+                        DEST_A,
+                        "thread-one",
+                        exchange(2),
+                        t_epoch(1_001)
+                    )
                     .is_err()
             );
         }
@@ -3735,7 +4085,13 @@ mod tests {
             },
         );
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let path = record_path(&store, IDENTITY_A, "thread-one");
         let planted = fs::read_to_string(&path).unwrap().replace(
@@ -3746,7 +4102,7 @@ mod tests {
         let oversized = vec![user("q"), assistant(&"a".repeat(32))];
 
         let err = store
-            .save(IDENTITY_A, DEST_A, "thread-one", oversized, t(1_001))
+            .save(IDENTITY_A, DEST_A, "thread-one", oversized, t_epoch(1_001))
             .unwrap_err();
 
         assert!(
@@ -3771,14 +4127,20 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-orphans");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let orphan = store.dir().join(format!("{}.yaml", "ab".repeat(16)));
         fs::write(&orphan, "version: 1\n").unwrap();
         let not_a_record = store.dir().join("notes.txt");
         fs::write(&not_a_record, "keep").unwrap();
 
-        store.prune(t(1_000)).unwrap();
+        store.prune(t_epoch(1_000)).unwrap();
 
         assert!(!orphan.exists());
         assert!(not_a_record.exists(), "only record files are swept");
@@ -3790,7 +4152,7 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-prune-missing");
         let store = store(&tmp, &enabled());
 
-        assert_eq!(store.prune(t(1_000)).unwrap(), 0);
+        assert_eq!(store.prune(t_epoch(1_000)).unwrap(), 0);
 
         assert!(!tmp.path.join("mesh").exists());
     }
@@ -3828,11 +4190,12 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-own-id");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t_epoch(1_000))
             .unwrap();
 
         for wire_thread in [Some("m-1"), None] {
-            let session = store.session_thread(IDENTITY_A, DEST_A, wire_thread, "m-1", t(1_000));
+            let session =
+                store.session_thread(IDENTITY_A, DEST_A, wire_thread, "m-1", t_epoch(1_000));
 
             assert_eq!(session.thread, "m-1", "{wire_thread:?}");
             assert!(session.resumed.is_none(), "{wire_thread:?}");
@@ -3844,10 +4207,10 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-held");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t_epoch(1_000))
             .unwrap();
 
-        let session = store.session_thread(IDENTITY_A, DEST_A, Some("m-1"), "m-2", t(1_000));
+        let session = store.session_thread(IDENTITY_A, DEST_A, Some("m-1"), "m-2", t_epoch(1_000));
 
         assert_eq!(session.thread, "m-1");
         let record = session.resumed.expect("the held record comes back");
@@ -3860,17 +4223,22 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-not-held");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "m-1", exchange(1), t_epoch(1_000))
             .unwrap();
 
-        let session =
-            store.session_thread(IDENTITY_A, DEST_A, Some("build-status"), "m-2", t(1_000));
+        let session = store.session_thread(
+            IDENTITY_A,
+            DEST_A,
+            Some("build-status"),
+            "m-2",
+            t_epoch(1_000),
+        );
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "build-status", t(1_000))
+                .load(IDENTITY_A, DEST_A, "build-status", t_epoch(1_000))
                 .unwrap(),
             None
         );
@@ -3882,7 +4250,7 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-other-identity");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "t-other", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "t-other", exchange(1), t_epoch(1_000))
             .unwrap();
         let path = record_path(&store, IDENTITY_A, "t-other");
         let planted = fs::read_to_string(&path)
@@ -3890,7 +4258,8 @@ mod tests {
             .replace(IDENTITY_A, IDENTITY_B);
         fs::write(&path, &planted).unwrap();
 
-        let session = store.session_thread(IDENTITY_A, DEST_A, Some("t-other"), "m-2", t(1_000));
+        let session =
+            store.session_thread(IDENTITY_A, DEST_A, Some("t-other"), "m-2", t_epoch(1_000));
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
@@ -3909,12 +4278,23 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-thread-unreadable");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "t-unreadable", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "t-unreadable",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         fs::write(record_path(&store, IDENTITY_A, "t-unreadable"), "{not yaml").unwrap();
 
-        let session =
-            store.session_thread(IDENTITY_A, DEST_A, Some("t-unreadable"), "m-2", t(1_000));
+        let session = store.session_thread(
+            IDENTITY_A,
+            DEST_A,
+            Some("t-unreadable"),
+            "m-2",
+            t_epoch(1_000),
+        );
 
         assert_eq!(session.thread, "m-2");
         assert!(session.resumed.is_none());
@@ -3942,11 +4322,12 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-index-unreadable");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "t-held", exchange(1), t(1_000))
+            .save(IDENTITY_A, DEST_A, "t-held", exchange(1), t_epoch(1_000))
             .unwrap();
         fs::write(store.dir().join(INDEX_FILE), "{not json").unwrap();
 
-        let session = store.session_thread(IDENTITY_A, DEST_A, Some("t-held"), "m-3", t(1_000));
+        let session =
+            store.session_thread(IDENTITY_A, DEST_A, Some("t-held"), "m-3", t_epoch(1_000));
 
         assert_eq!(session.thread, "m-3");
         assert!(session.resumed.is_none());
@@ -3997,12 +4378,18 @@ mod tests {
             .map(|instance| {
                 let store = EnvoySessions::open(&tmp.path, instance, &config).unwrap();
                 store
-                    .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+                    .save(
+                        IDENTITY_A,
+                        DEST_A,
+                        "thread-one",
+                        exchange(1),
+                        t_epoch(1_000),
+                    )
                     .unwrap();
                 store
             })
             .collect();
-        let now = t(400 * DAY);
+        let now = t_epoch(400 * DAY);
 
         let swept = EnvoySessions::prune_unused_everywhere(
             &tmp.path,
@@ -4058,9 +4445,15 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-store-stamp");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
-        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(1_000))));
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t_epoch(1_000))));
 
         store
             .append(
@@ -4068,30 +4461,36 @@ mod tests {
                 DEST_A,
                 "thread-one",
                 exchange(2),
-                t(2_000),
+                t_epoch(2_000),
                 false,
             )
             .unwrap();
-        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(2_000))));
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t_epoch(2_000))));
 
         store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(2_000 + 1_800))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(2_000 + 1_800))
             .unwrap();
         assert_eq!(
             stamp_of(&store),
-            Some(rfc3339_utc(t(2_000))),
+            Some(rfc3339_utc(t_epoch(2_000))),
             "a load inside the refresh window leaves the index alone"
         );
         store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(2_000 + 3_600))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(2_000 + 3_600))
             .unwrap();
-        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(2_000 + 3_600))));
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t_epoch(2_000 + 3_600))));
 
         unstamp(&store);
         assert_eq!(stamp_of(&store), None, "an index without the field reads");
-        let session = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-2", t(6_000));
+        let session = store.session_thread(
+            IDENTITY_A,
+            DEST_A,
+            Some("thread-one"),
+            "m-2",
+            t_epoch(6_000),
+        );
         assert!(session.resumed.is_some());
-        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(6_000))));
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t_epoch(6_000))));
         assert_eq!(store.read_index().unwrap().version, 1);
     }
 
@@ -4101,7 +4500,7 @@ mod tests {
         let store = store(&tmp, &enabled());
         assert_eq!(
             store
-                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
                 .unwrap(),
             None
         );
@@ -4110,7 +4509,7 @@ mod tests {
         fs::create_dir_all(store.dir()).unwrap();
         fs::write(&orphan, "version: 1\n").unwrap();
         store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000))
             .unwrap();
         assert!(!store.index_path().exists());
     }
@@ -4124,8 +4523,8 @@ mod tests {
             ttl_hours: 2 * 366 * 24,
             ..enabled()
         };
-        let now = t(400 * DAY);
-        let year_ago = t(35 * DAY);
+        let now = t_epoch(400 * DAY);
+        let year_ago = t_epoch(35 * DAY);
         let old = EnvoySessions::open(&tmp.path, "inst-old", &config).unwrap();
         let recent = EnvoySessions::open(&tmp.path, "inst-recent", &config).unwrap();
         for store in [&old, &recent] {
@@ -4177,7 +4576,7 @@ mod tests {
                 &tmp.path,
                 &config,
                 0,
-                t(900 * DAY),
+                t_epoch(900 * DAY),
                 &keep_none(),
                 &never
             )
@@ -4194,7 +4593,13 @@ mod tests {
         let config = enabled();
         let store = EnvoySessions::open(&tmp.path, "inst-old", &config).unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         unstamp(&store);
         let orphan_only = stores_dir(&tmp.path).join("inst-orphan");
@@ -4204,7 +4609,7 @@ mod tests {
             "version: 1\n",
         )
         .unwrap();
-        let now = t(400 * DAY);
+        let now = t_epoch(400 * DAY);
 
         assert_eq!(
             EnvoySessions::prune_unused_everywhere(
@@ -4264,11 +4669,23 @@ mod tests {
         let config = enabled();
         let running = EnvoySessions::open(&tmp.path, "inst-running", &config).unwrap();
         running
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let ahead = EnvoySessions::open(&tmp.path, "inst-ahead", &config).unwrap();
         ahead
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(900 * DAY))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(900 * DAY),
+            )
             .unwrap();
         let keep = HashSet::from(["inst-running".to_string()]);
 
@@ -4277,14 +4694,14 @@ mod tests {
                 &tmp.path,
                 &config,
                 1,
-                t(400 * DAY),
+                t_epoch(400 * DAY),
                 &keep,
                 &never
             )
             .unwrap(),
             UnusedStores::default()
         );
-        assert_eq!(stamp_of(&running), Some(rfc3339_utc(t(1_000))));
+        assert_eq!(stamp_of(&running), Some(rfc3339_utc(t_epoch(1_000))));
         assert!(record_path(&running, IDENTITY_A, "thread-one").exists());
         assert!(record_path(&ahead, IDENTITY_A, "thread-one").exists());
     }
@@ -4300,7 +4717,13 @@ mod tests {
         ] {
             let store = EnvoySessions::open(&tmp.path, instance, &config).unwrap();
             store
-                .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+                .save(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(1),
+                    t_epoch(1_000),
+                )
                 .unwrap();
             unstamp(&store);
             plant(&store.index_path(), "\"version\":1", to);
@@ -4316,7 +4739,7 @@ mod tests {
                     &tmp.path,
                     &config,
                     days,
-                    t(400 * DAY),
+                    t_epoch(400 * DAY),
                     &keep_none(),
                     &never
                 )
@@ -4340,9 +4763,19 @@ mod tests {
         let config = enabled();
         let store = EnvoySessions::open(&tmp.path, "inst-bad-stamp", &config).unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
-        plant(&store.index_path(), &rfc3339_utc(t(1_000)), "not a time");
+        plant(
+            &store.index_path(),
+            &rfc3339_utc(t_epoch(1_000)),
+            "not a time",
+        );
         let text = fs::read_to_string(store.index_path()).unwrap();
 
         assert_eq!(
@@ -4350,7 +4783,7 @@ mod tests {
                 &tmp.path,
                 &config,
                 1,
-                t(400 * DAY),
+                t_epoch(400 * DAY),
                 &keep_none(),
                 &never
             )
@@ -4373,7 +4806,13 @@ mod tests {
         let config = enabled();
         let store = EnvoySessions::open(&tmp.path, "inst-stuck", &config).unwrap();
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let stuck = store.dir().join(format!("{}.yaml", "ef".repeat(16)));
         fs::create_dir(&stuck).unwrap();
@@ -4383,7 +4822,7 @@ mod tests {
                 &tmp.path,
                 &config,
                 1,
-                t(400 * DAY),
+                t_epoch(400 * DAY),
                 &keep_none(),
                 &never
             )
@@ -4408,12 +4847,18 @@ mod tests {
         let listed = EnvoySessions::listed(gone.clone(), &config);
         let unused_for = Some(Duration::from_secs(DAY));
 
-        assert!(listed.remove_if_unused(unused_for, t(400 * DAY)).is_err());
+        assert!(
+            listed
+                .remove_if_unused(unused_for, t_epoch(400 * DAY))
+                .is_err()
+        );
         assert!(!gone.exists());
 
         fs::create_dir_all(&gone).unwrap();
         assert!(matches!(
-            listed.remove_if_unused(unused_for, t(400 * DAY)).unwrap(),
+            listed
+                .remove_if_unused(unused_for, t_epoch(400 * DAY))
+                .unwrap(),
             StoreUse::Gone
         ));
         assert!(!gone.join(INDEX_FILE).exists());
@@ -4435,7 +4880,13 @@ mod tests {
         for id in [&swept_id, &refused_id] {
             EnvoySessions::open(&tmp.path, id, &config)
                 .unwrap()
-                .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+                .save(
+                    IDENTITY_A,
+                    DEST_A,
+                    "thread-one",
+                    exchange(1),
+                    t_epoch(1_000),
+                )
                 .unwrap();
         }
         let refused_lock = mesh_cache_dir(&tmp.path).join(format!("{refused_id}.lock"));
@@ -4446,7 +4897,7 @@ mod tests {
                 &tmp.path,
                 &config,
                 1,
-                t(400 * DAY),
+                t_epoch(400 * DAY),
                 &keep_none(),
                 &never
             )
@@ -4479,18 +4930,24 @@ mod tests {
         let tmp = TempDir::new("envoy-sessions-stamp-unwritable");
         let store = store(&tmp, &enabled());
         store
-            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .save(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(1),
+                t_epoch(1_000),
+            )
             .unwrap();
         let real = tmp.path.join("real-index.json");
         fs::rename(store.index_path(), &real).unwrap();
         std::os::unix::fs::symlink(&real, store.index_path()).unwrap();
 
         let loaded = store
-            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000 + 2 * 3_600))
+            .load(IDENTITY_A, DEST_A, "thread-one", t_epoch(1_000 + 2 * 3_600))
             .unwrap();
 
         assert!(loaded.is_some());
-        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(1_000))));
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t_epoch(1_000))));
         let warns = warn_snapshot();
         assert!(
             warns

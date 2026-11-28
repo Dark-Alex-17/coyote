@@ -998,7 +998,7 @@ impl Routes<'_> {
 mod rnsd_tests {
     use super::*;
     use crate::mesh::lan_count::RnsdLocator;
-    use crate::mesh::test_support::TempDir;
+    use crate::mesh::test_support::{TempDir, map};
     use crate::mesh::upstream::TransitionKind;
     use hmac::{Hmac, Mac};
     use rmpv::Value;
@@ -1126,15 +1126,6 @@ mod rnsd_tests {
         fn drop(&mut self) {
             self.task.abort();
         }
-    }
-
-    fn map(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Map(
-            pairs
-                .into_iter()
-                .map(|(key, value)| (Value::from(key), value))
-                .collect(),
-        )
     }
 
     fn stat(name: &str, online: bool) -> Value {

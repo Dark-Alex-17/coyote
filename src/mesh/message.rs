@@ -6730,17 +6730,7 @@ mod tests {
     #[test]
     fn a_session_trusted_senders_stored_message_passes_the_standing_gate() {
         use crate::mesh::peers::{PeerSighting, PeerTable};
-        use crate::mesh::trust::{KnockProof, LiveMesh};
-
-        struct Heard(Arc<PeerTable>);
-        impl LiveMesh for Heard {
-            fn peers(&self) -> Option<Arc<PeerTable>> {
-                Some(self.0.clone())
-            }
-            fn knock(&self, _destination_hash: &str, _now: SystemTime) -> Option<KnockProof> {
-                None
-            }
-        }
+        use crate::mesh::test_support::MeshOn;
 
         let key = PrivateIdentity::new_from_rand(OsRng);
         let identity = key.address_hash().to_hex_string();
@@ -6774,7 +6764,7 @@ mod tests {
         let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
         let before = std::fs::read(&trust_path).unwrap();
         trust
-            .trust_destination_for_session(&Heard(peers), &destination, now)
+            .trust_destination_for_session(&MeshOn(peers, Mutex::new(vec![])), &destination, now)
             .unwrap();
         assert_eq!(std::fs::read(&trust_path).unwrap(), before);
 
