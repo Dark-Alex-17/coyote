@@ -2,6 +2,7 @@
 //! dry-run config most binary tests boot it with.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,14 +52,24 @@ pub fn coyote_command(dirs: &Dirs) -> Command {
     command
 }
 
-/// Removes every inherited `COYOTE_*` variable from `command`'s environment,
-/// then sets [`PINNED_VARS`] from `dirs`. [`coyote_command`] calls this; a test that
-/// launches the binary through a wrapper (`script`, a shell) calls it on the
-/// wrapper's command. Anything set on `command` afterwards wins, so a test
-/// can still hand the child a `COYOTE_*` variable of its own.
+/// [`isolate_from`] with the test process's own environment as the inherited
+/// keys. [`coyote_command`] calls this; a test that launches the binary
+/// through a wrapper (`script`, a shell) calls it on the wrapper's command.
 pub fn isolate<'a>(command: &'a mut Command, dirs: &Dirs) -> &'a mut Command {
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
+    isolate_from(command, dirs, env::vars_os().map(|(key, _)| key))
+}
+
+/// Removes every `inherited` key that starts with `COYOTE_` from `command`'s
+/// environment, then sets [`PINNED_VARS`] from `dirs`. Other inherited keys
+/// are left alone. Anything set on `command` afterwards wins, so a test can
+/// still hand the child a `COYOTE_*` variable of its own.
+pub fn isolate_from<'a, K: AsRef<OsStr>>(
+    command: &'a mut Command,
+    dirs: &Dirs,
+    inherited: impl IntoIterator<Item = K>,
+) -> &'a mut Command {
+    for key in inherited {
+        if key.as_ref().to_string_lossy().starts_with("COYOTE_") {
             command.env_remove(key);
         }
     }

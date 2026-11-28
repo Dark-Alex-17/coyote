@@ -9,15 +9,19 @@
 //! lands in the developer's real config or cache or picks up their overrides.
 //!
 //! Also pins the support helpers themselves: `support::repo::read_path` folds
-//! CRLF to LF, and the crate that checks `coyote_command`'s env holds a single
-//! test.
+//! CRLF to LF, and `support::bin::isolate_from` sets exactly the pinned vars,
+//! removes inherited `COYOTE_*` keys only, and lets later vars win.
 
 mod support;
 
+use std::collections::HashMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
+
+use support::bin::{Dirs, PINNED_VARS, coyote_command, isolate_from};
 
 // Spelled in two halves so this file's own source does not count as a
 // spawn site when the scan reaches it.
@@ -36,8 +40,6 @@ const GRAPH_SESSION_HARNESSES: [&str; 2] = [
     "tests/graph_session_block_binary.rs",
     "tests/graph_session_repl_binary.rs",
 ];
-const SUPPORT_ISOLATION: &str = "tests/support_isolation.rs";
-const TEST_ATTR: &str = "#[test]";
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
@@ -134,14 +136,91 @@ fn every_graph_session_harness_spawn_pins_path() {
 }
 
 #[test]
-fn support_isolation_crate_holds_a_single_test() {
-    let text = support::repo::read(SUPPORT_ISOLATION);
-    let tests = text.matches(TEST_ATTR).count();
+fn isolate_from_pins_the_dirs_removes_inherited_coyote_keys_only_and_lets_later_vars_win() {
+    let dirs = distinct_dirs();
+    let mut command = Command::new("true");
+    isolate_from(&mut command, &dirs, ["COYOTE_ISOLATION_PROBE", "PATH"]);
+    command.env("COYOTE_LATER", "1");
+    let envs = envs_of(&command);
+
+    for (key, dir) in expected_pins(&dirs) {
+        assert_eq!(
+            envs.get(OsStr::new(key)),
+            Some(&Some(dir.as_os_str().to_os_string())),
+            "isolate_from must set {key} from Dirs"
+        );
+    }
+    let mut set: Vec<&OsStr> = envs
+        .iter()
+        .filter(|(key, value)| value.is_some() && key.as_os_str() != "COYOTE_LATER")
+        .map(|(key, _)| key.as_os_str())
+        .collect();
+    let mut listed: Vec<&OsStr> = PINNED_VARS.iter().map(OsStr::new).collect();
+    set.sort_unstable();
+    listed.sort_unstable();
     assert_eq!(
-        tests, 1,
-        "{SUPPORT_ISOLATION} mutates the process env, so it must hold a single test; \
-         a second test thread could read the env mid-mutation"
+        set, listed,
+        "PINNED_VARS must name exactly the vars isolate_from sets"
     );
+    assert_eq!(
+        envs.get(OsStr::new("COYOTE_ISOLATION_PROBE")),
+        Some(&None),
+        "isolate_from must remove an inherited COYOTE_* key"
+    );
+    assert_eq!(
+        envs.get(OsStr::new("PATH")),
+        None,
+        "isolate_from must leave an inherited non-COYOTE_ key alone"
+    );
+    assert_eq!(
+        envs.get(OsStr::new("COYOTE_LATER")),
+        Some(&Some(OsString::from("1"))),
+        "a variable set after isolate_from must reach the child"
+    );
+}
+
+#[test]
+fn coyote_command_spawns_the_built_binary_with_the_dir_pins() {
+    let dirs = distinct_dirs();
+    let command = coyote_command(&dirs);
+    assert_eq!(command.get_program(), support::bin::path());
+    let envs = envs_of(&command);
+    for (key, dir) in expected_pins(&dirs) {
+        assert_eq!(
+            envs.get(OsStr::new(key)),
+            Some(&Some(dir.as_os_str().to_os_string())),
+            "coyote_command must set {key} from Dirs"
+        );
+    }
+}
+
+fn distinct_dirs() -> Dirs {
+    let base = env::temp_dir().join("coyote-isolate-from");
+    Dirs {
+        config: base.join("config"),
+        cache: base.join("cache"),
+        home: base.join("home"),
+        temp: base.join("temp"),
+    }
+}
+
+fn expected_pins(dirs: &Dirs) -> [(&'static str, &PathBuf); 7] {
+    [
+        ("COYOTE_CONFIG_DIR", &dirs.config),
+        ("COYOTE_CACHE_DIR", &dirs.cache),
+        ("HOME", &dirs.home),
+        ("USERPROFILE", &dirs.home),
+        ("TMPDIR", &dirs.temp),
+        ("TMP", &dirs.temp),
+        ("TEMP", &dirs.temp),
+    ]
+}
+
+fn envs_of(command: &Command) -> HashMap<OsString, Option<OsString>> {
+    command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+        .collect()
 }
 
 #[test]
