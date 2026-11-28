@@ -24,3 +24,60 @@ deployment/propagation-node/** text eol=lf
 src/mesh/fuzz/corpus/**/*.bin binary
 assets/sbx-kit/** text eol=lf
 assets/functions/kits/** text eol=lf
+
+# comment-hygiene: files whose comment lines src/hygiene_pins.rs holds to plain
+# ASCII and keeps free of planning vocabulary. Every pattern has a leading or
+# inner "/", so git anchors it at this directory (the repository root) instead
+# of matching a basename at any depth.
+# Some patterns name paths that may not exist yet; TRANSITIONAL in
+# src/hygiene_pins.rs lists them.
+src/mesh/** comment-hygiene
+deployment/propagation-node/** comment-hygiene
+scripts/mesh-*/** comment-hygiene
+.github/workflows/ci.yaml comment-hygiene
+/LICENSE-BSD-3-Clause comment-hygiene
+/LICENSE-GPL-2.0 comment-hygiene
+assets/envoy/config.yaml comment-hygiene
+assets/envoy/tools.py comment-hygiene
+scripts/image-smoke.sh comment-hygiene
+scripts/mesh-relay.ps1 comment-hygiene
+scripts/mesh-relay.sh comment-hygiene
+scripts/reticulum.config.tmpl comment-hygiene
+src/config/envoy.rs comment-hygiene
+src/config/envoy_tools_tests.rs comment-hygiene
+src/config/mesh_config.rs comment-hygiene
+src/config/mesh_digest.rs comment-hygiene
+src/config/mesh_envoy.rs comment-hygiene
+src/config/mesh_hooks.rs comment-hygiene
+src/config/mesh_snapshot.rs comment-hygiene
+src/config/reserved_agents.rs comment-hygiene
+src/function/mesh.rs comment-hygiene
+src/hygiene_pins.rs comment-hygiene
+src/repl/idle.rs comment-hygiene
+src/repl/mesh.rs comment-hygiene
+src/repl/mesh_share_vectors.rs comment-hygiene
+src/repl/printer.rs comment-hygiene
+src/utils/untrusted_content.rs comment-hygiene
+src/utils/windows_acl.rs comment-hygiene
+tests/docker_entrypoint_script.rs comment-hygiene
+tests/envoy_repl.rs comment-hygiene
+tests/fixtures/mesh-relay-task-harness.ps1 comment-hygiene
+tests/fixtures/mesh-relay-windows-probe.ps1 comment-hygiene
+tests/installer_script.rs comment-hygiene
+tests/mesh_autostart_repl.rs comment-hygiene
+tests/mesh_envoy_prune_repl.rs comment-hygiene
+tests/mesh_relay_script.rs comment-hygiene
+tests/mesh_relay_task.rs comment-hygiene
+tests/mesh_relay_windows_probe.rs comment-hygiene
+tests/mesh_wiki_docs.rs comment-hygiene
+tests/propagation_node_image.rs comment-hygiene
+tests/scripts_pins.rs comment-hygiene
+tests/support/** comment-hygiene
+tests/ci_workflow_invariants.rs comment-hygiene
+tests/mesh_relay_ps1_script.rs comment-hygiene
+src/source_scan.rs comment-hygiene
+src/doc_drift.rs comment-hygiene
+src/repl/mesh_host.rs comment-hygiene
+src/repl/mesh_completion.rs comment-hygiene
+src/repl/mesh/** comment-hygiene
+src/function/mesh/** comment-hygiene

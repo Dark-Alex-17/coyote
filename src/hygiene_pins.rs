@@ -1,8 +1,12 @@
 //! Hygiene pins over the comment lines of the files this branch owns. Two pins list every
 //! comment line that cites planning vocabulary or carries a non-ASCII character and fail
 //! when the list is not empty; the remaining tests hold the comment extractors, the needle
-//! matchers and the allow-list itself. Every needle and fixture is assembled at runtime so
+//! matchers and the scope itself. Every needle and fixture is assembled at runtime so
 //! the repository's own label scanner does not trip on this file.
+//!
+//! The scope is the set of tracked files `.gitattributes` gives the `comment-hygiene`
+//! attribute, as `git check-attr` reports it, so a new file joins by matching a pattern
+//! there rather than by an edit here.
 //!
 //! Rust block comments are scanned as well as line comments, so the Rust class covers a
 //! superset of what the hash and markdown classes yield.
@@ -17,80 +21,80 @@
 //! `tests/` and holds each `.mesh` path they spell to the mesh command table.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use crate::mesh::test_support::TempDir;
 
-/// Directories whose every tracked file is branch-owned. A trailing `*/` matches exactly
-/// one directory name, so `scripts/mesh-relay.sh` is a file and is listed by name below.
-const ALLOW_LISTED_DIRS: [&str; 3] = [
-    "src/mesh/",
-    "deployment/propagation-node/",
-    "scripts/mesh-*/",
-];
-
-/// Branch-owned files outside those directories, plus the CI workflow: the one entry that
-/// also exists on `main`, whose main-side lines carry no hit.
-const ALLOW_LISTED_FILES: [&str; 38] = [
-    CI_WORKFLOW,
-    "LICENSE-BSD-3-Clause",
-    "LICENSE-GPL-2.0",
-    "assets/envoy/config.yaml",
-    "assets/envoy/tools.py",
-    "scripts/image-smoke.sh",
-    "scripts/mesh-relay.ps1",
-    "scripts/mesh-relay.sh",
-    "scripts/reticulum.config.tmpl",
-    "src/config/envoy.rs",
-    "src/config/envoy_tools_tests.rs",
-    "src/config/mesh_config.rs",
-    "src/config/mesh_digest.rs",
-    "src/config/mesh_envoy.rs",
-    "src/config/mesh_hooks.rs",
-    "src/config/mesh_snapshot.rs",
-    "src/config/reserved_agents.rs",
-    "src/function/mesh.rs",
-    PINS_FILE,
-    "src/repl/idle.rs",
-    "src/repl/mesh.rs",
-    "src/repl/mesh_share_vectors.rs",
-    "src/repl/printer.rs",
-    "src/utils/untrusted_content.rs",
-    "src/utils/windows_acl.rs",
-    "tests/docker_entrypoint_script.rs",
-    "tests/envoy_repl.rs",
-    "tests/fixtures/mesh-relay-task-harness.ps1",
-    "tests/fixtures/mesh-relay-windows-probe.ps1",
-    "tests/installer_script.rs",
-    "tests/mesh_autostart_repl.rs",
-    "tests/mesh_envoy_prune_repl.rs",
-    "tests/mesh_relay_script.rs",
-    "tests/mesh_relay_task.rs",
-    "tests/mesh_relay_windows_probe.rs",
-    "tests/mesh_wiki_docs.rs",
-    "tests/propagation_node_image.rs",
-    "tests/scripts_pins.rs",
-];
-
+/// The CI workflow is the one attributed file that also exists on `main`; its main-side
+/// lines carry no hit.
 const CI_WORKFLOW: &str = ".github/workflows/ci.yaml";
 const PINS_FILE: &str = "src/hygiene_pins.rs";
+const ATTRIBUTE: &str = "comment-hygiene";
+
+/// Declared patterns allowed to match no tracked file: a pattern may match nothing while
+/// the files it names are being created or removed. The list is expected to empty out.
+const TRANSITIONAL: &[&str] = &[
+    "src/doc_drift.rs",
+    "src/function/mesh.rs",
+    "src/function/mesh/**",
+    "src/repl/mesh.rs",
+    "src/repl/mesh/**",
+    "src/repl/mesh_completion.rs",
+    "src/repl/mesh_host.rs",
+    "src/repl/mesh_share_vectors.rs",
+    "src/source_scan.rs",
+    "tests/ci_workflow_invariants.rs",
+    "tests/mesh_relay_ps1_script.rs",
+    "tests/mesh_wiki_docs.rs",
+    "tests/support/**",
+];
 
 /// `git <args>` in `root`: stdout on success, trimmed stderr on failure. A `cargo test`
 /// launched from a git hook inherits `GIT_DIR` and friends, which would point every call
 /// at the hook's repository regardless of `-C`; the fixtures below init and write to
-/// temporary repositories, so those variables are dropped.
+/// temporary repositories, so those variables are dropped. System and user-global
+/// attributes files are ignored too, since either could change what the pins scan and
+/// what the fixtures see.
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
+    stdout_or_stderr(git_command(root, args).output().expect("git runs"))
+}
+
+/// `git`, with `input` on stdin. A second thread writes it so a long input cannot stall
+/// against git filling its stdout pipe.
+fn git_with_stdin(root: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut child = git_command(root, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("git runs");
+    let mut stdin = child.stdin.take().expect("git stdin is piped");
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().expect("git runs");
+    let written = writer.join().expect("git stdin writer");
+    let stdout = stdout_or_stderr(out)?;
+    written.map_err(|e| format!("write git stdin: {e}"))?;
+    Ok(stdout)
+}
+
+fn git_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.attributesFile="])
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .expect("git runs");
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
+fn stdout_or_stderr(out: Output) -> Result<Vec<u8>, String> {
     if out.status.success() {
         Ok(out.stdout)
     } else {
@@ -110,11 +114,16 @@ fn tracked_paths(root: &Path) -> BTreeSet<String> {
     nul_separated(&git(root, &["ls-files", "-z"]).expect("git ls-files"))
 }
 
-/// Whether the checks that compare the allow-list against `origin/main` can run: the ref
-/// must resolve (a shallow CI checkout has none) and must not carry this file yet. Once
-/// the branch has landed, every allow-listed path exists on `main` and the three-dot diff
-/// is empty, so those checks describe a branch that no longer exists; the pins themselves
-/// keep running.
+fn tracked_matches(root: &Path, pattern: &str) -> Vec<u8> {
+    let pathspec = [":(top,glob)", pattern.trim_start_matches('/')].concat();
+    git(root, &["ls-files", "-z", "--", &pathspec]).expect("git ls-files")
+}
+
+/// Whether the checks that compare the attributed set against `origin/main` can run: the
+/// ref must resolve (a shallow CI checkout has none) and must not carry this file yet.
+/// Once the branch has landed, every attributed path exists on `main` and the three-dot
+/// diff is empty, so those checks describe a branch that no longer exists; the pins
+/// themselves keep running.
 fn origin_main_predates_the_pins(root: &Path) -> Result<(), String> {
     git(root, &["rev-parse", "--verify", "origin/main"])
         .map_err(|reason| format!("origin/main unavailable: {reason}"))?;
@@ -127,28 +136,46 @@ fn origin_main_predates_the_pins(root: &Path) -> Result<(), String> {
     }
 }
 
-fn matches_dir_glob(path: &str, glob: &str) -> bool {
-    match glob.strip_suffix("*/") {
-        Some(prefix) => path
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(segment, _)| !segment.is_empty()),
-        None => path.starts_with(glob),
-    }
+/// Which of the NUL-separated `paths` git reports `comment-hygiene: set` for. A later
+/// `-comment-hygiene` or `!comment-hygiene` line shows up here as unset or unspecified.
+fn attribute_set_on(root: &Path, paths: Vec<u8>) -> BTreeSet<String> {
+    let paths_count = paths.iter().filter(|byte| **byte == 0).count();
+    let report = git_with_stdin(root, &["check-attr", "-z", "--stdin", ATTRIBUTE], paths)
+        .expect("git check-attr");
+    let fields: Vec<&[u8]> = report.split(|byte| *byte == 0).collect();
+    let expected = 3 * paths_count + 1;
+    assert_eq!(
+        fields.len(),
+        expected,
+        "git check-attr reported {} fields for {paths_count} paths, expected {expected}",
+        fields.len()
+    );
+    fields
+        .chunks_exact(3)
+        .filter(|triple| triple[2] == b"set")
+        .map(|triple| String::from_utf8(triple[0].to_vec()).expect("git paths are UTF-8"))
+        .collect()
 }
 
-fn is_allow_listed(path: &str) -> bool {
-    ALLOW_LISTED_DIRS
-        .iter()
-        .any(|glob| matches_dir_glob(path, glob))
-        || ALLOW_LISTED_FILES.contains(&path)
+/// The tracked files carrying the attribute: an untracked file is never scanned, however
+/// it matches.
+fn attributed_paths(root: &Path) -> BTreeSet<String> {
+    attribute_set_on(root, git(root, &["ls-files", "-z"]).expect("git ls-files"))
 }
 
-/// The allow-list resolved against the index, never the working tree.
-fn allow_listed_paths(root: &Path) -> BTreeSet<String> {
-    tracked_paths(root)
-        .into_iter()
-        .filter(|path| is_allow_listed(path))
+/// The patterns `.gitattributes` gives the attribute, in file order.
+fn declared_patterns(root: &Path) -> Vec<String> {
+    let source = std::fs::read_to_string(root.join(".gitattributes")).expect("read .gitattributes");
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pattern = fields.next()?;
+            fields
+                .any(|attribute| attribute == ATTRIBUTE)
+                .then(|| pattern.to_string())
+        })
         .collect()
 }
 
@@ -747,7 +774,9 @@ fn queue_from(
 }
 
 fn queue(root: &Path, flag: impl Fn(&str) -> Option<String>) -> Vec<String> {
-    let files = allow_listed_paths(root).into_iter().map(|path| {
+    let files = attributed_paths(root);
+    assert!(!files.is_empty(), "no attributed files to scan");
+    let files = files.into_iter().map(|path| {
         let comments = read_comment_lines(root, &path);
         (path, comments)
     });
@@ -948,10 +977,12 @@ fn opaque_files_have_no_comment_lines() {
 }
 
 #[test]
-fn every_comment_class_present_in_the_allow_list_yields_comment_lines() {
+fn every_comment_class_present_in_the_attributed_files_yields_comment_lines() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut per_class: BTreeMap<String, usize> = BTreeMap::new();
-    for path in allow_listed_paths(root) {
+    let attributed = attributed_paths(root);
+    assert!(!attributed.is_empty(), "no attributed files to scan");
+    for path in attributed {
         if let Class::Opaque = class_of(&path) {
             continue;
         }
@@ -1193,39 +1224,108 @@ fn queue_renders_path_line_and_text_in_file_order() {
     );
 }
 
+/// A fresh repository at `root` whose index holds a `.gitattributes` reading `attributes`
+/// and each of `files`.
+fn fixture_repo(root: &Path, attributes: &str, files: &[&str]) {
+    git(root, &["init", "-q"]).expect("git init");
+    std::fs::write(root.join(".gitattributes"), attributes).expect("write");
+    for file in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().expect("fixture paths have a parent"))
+            .expect("mkdir");
+        std::fs::write(path, "// tracked\n").expect("write");
+    }
+    let add = [&["add", "--", ".gitattributes"][..], files].concat();
+    git(root, &add).expect("git add");
+}
+
+/// Git's `*` also matches an empty segment, so `scripts/mesh-*/**` covers `scripts/mesh-/`.
 #[test]
-fn dir_globs_match_one_directory_segment() {
-    assert!(matches_dir_glob(
-        "scripts/mesh-interop/setup.sh",
-        "scripts/mesh-*/"
-    ));
-    assert!(matches_dir_glob(
-        "scripts/mesh-netns/a/b.sh",
-        "scripts/mesh-*/"
-    ));
-    assert!(!matches_dir_glob(
-        "scripts/mesh-relay.sh",
-        "scripts/mesh-*/"
-    ));
-    assert!(!matches_dir_glob("scripts/mesh-/x", "scripts/mesh-*/"));
-    assert!(matches_dir_glob("src/mesh/mod.rs", "src/mesh/"));
-    assert!(!matches_dir_glob("src/mesh_other/mod.rs", "src/mesh/"));
+fn directory_patterns_match_under_their_prefix_segment() {
+    let tmp = TempDir::new("hygiene-dir-patterns");
+    let root = tmp.path.as_path();
+    fixture_repo(
+        root,
+        &format!("src/mesh/** {ATTRIBUTE}\nscripts/mesh-*/** {ATTRIBUTE}\n"),
+        &[
+            "scripts/mesh-/x.sh",
+            "scripts/mesh-interop/setup.sh",
+            "scripts/mesh-netns/a/b.sh",
+            "scripts/mesh-relay.sh",
+            "src/mesh/mod.rs",
+            "src/mesh_other/mod.rs",
+        ],
+    );
+    assert_eq!(
+        attributed_paths(root),
+        BTreeSet::from([
+            "scripts/mesh-/x.sh".to_string(),
+            "scripts/mesh-interop/setup.sh".to_string(),
+            "scripts/mesh-netns/a/b.sh".to_string(),
+            "src/mesh/mod.rs".to_string(),
+        ])
+    );
 }
 
 #[test]
-fn allow_listed_paths_ignores_untracked_files() {
-    let tmp = TempDir::new("hygiene-allow-list");
+fn attributed_paths_ignores_untracked_files() {
+    let tmp = TempDir::new("hygiene-attribute");
     let root = tmp.path.as_path();
-    git(root, &["init", "-q"]).expect("git init");
-    let mesh = root.join("src").join("mesh");
-    std::fs::create_dir_all(&mesh).expect("mkdir");
-    std::fs::write(mesh.join("tracked.rs"), "// tracked\n").expect("write");
-    git(root, &["add", "src/mesh/tracked.rs"]).expect("git add");
-    std::fs::write(mesh.join("scratch.rs"), "// scratch\n").expect("write");
+    fixture_repo(
+        root,
+        &format!("src/mesh/** {ATTRIBUTE}\n"),
+        &["src/mesh/tracked.rs"],
+    );
+    std::fs::write(root.join("src/mesh/scratch.rs"), "// scratch\n").expect("write");
     assert_eq!(
-        allow_listed_paths(root),
+        attributed_paths(root),
         BTreeSet::from(["src/mesh/tracked.rs".to_string()])
     );
+}
+
+#[test]
+fn declared_patterns_skips_comments_and_negations() {
+    let tmp = TempDir::new("hygiene-declared");
+    let root = tmp.path.as_path();
+    std::fs::write(
+        root.join(".gitattributes"),
+        format!(
+            "# note\n\nsrc/a.rs text eol=lf {ATTRIBUTE}\nsrc/b.rs -{ATTRIBUTE}\nsrc/c.rs {ATTRIBUTE}\nsrc/d.rs !{ATTRIBUTE}\nsrc/e.rs {ATTRIBUTE}=yes\n"
+        ),
+    )
+    .expect("write");
+    assert_eq!(declared_patterns(root), ["src/a.rs", "src/c.rs"]);
+}
+
+fn fixture_commit(root: &Path, message: &str) {
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=hygiene pins",
+            "-c",
+            "user.email=pins@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            message,
+        ],
+    )
+    .expect("git commit");
+}
+
+/// Writes each (path, contents) pair under `root` and stages it.
+fn fixture_add(root: &Path, files: &[(&str, &str)]) {
+    for (file, contents) in files {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().expect("fixture paths have a parent"))
+            .expect("mkdir");
+        std::fs::write(path, contents).expect("write");
+        git(root, &["add", "--", file]).expect("git add");
+    }
 }
 
 /// The two `origin/main` comparisons run on a branch that has not landed, skip while the
@@ -1234,29 +1334,9 @@ fn allow_listed_paths_ignores_untracked_files() {
 fn main_comparisons_retire_once_the_pins_have_landed() {
     let tmp = TempDir::new("hygiene-origin-main");
     let root = tmp.path.as_path();
-    let commit = |message: &str| {
-        git(
-            root,
-            &[
-                "-c",
-                "user.name=hygiene pins",
-                "-c",
-                "user.email=pins@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                message,
-            ],
-        )
-        .expect("git commit");
-    };
     git(root, &["init", "-q"]).expect("git init");
-    std::fs::write(root.join("README.md"), "before\n").expect("write");
-    git(root, &["add", "README.md"]).expect("git add");
-    commit("before the pins");
+    fixture_add(root, &[("README.md", "before\n")]);
+    fixture_commit(root, "before the pins");
     let missing = origin_main_predates_the_pins(root).unwrap_err();
     assert!(
         missing.starts_with("origin/main unavailable: "),
@@ -1266,28 +1346,92 @@ fn main_comparisons_retire_once_the_pins_have_landed() {
     git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("update-ref");
     assert_eq!(origin_main_predates_the_pins(root), Ok(()));
 
-    std::fs::create_dir_all(root.join("src")).expect("mkdir");
-    std::fs::write(root.join(PINS_FILE), "// pins\n").expect("write");
-    git(root, &["add", PINS_FILE]).expect("git add");
-    commit("the pins land");
+    fixture_add(root, &[(PINS_FILE, "// pins\n")]);
+    fixture_commit(root, "the pins land");
     git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("update-ref");
     let landed = origin_main_predates_the_pins(root).unwrap_err();
     assert!(landed.contains("already carries"), "{landed}");
 }
 
+/// `.gitattributes` exists on `main` in the real repository, so the fixture's base commit
+/// carries one too; otherwise it would count as a file the branch added.
 #[test]
-fn every_allow_listed_path_exists() {
+fn scope_drift_compares_added_files_with_the_attributed_set() {
+    let tmp = TempDir::new("hygiene-scope-drift");
+    let root = tmp.path.as_path();
+    git(root, &["init", "-q"]).expect("git init");
+    fixture_add(
+        root,
+        &[
+            (".gitattributes", "* text=auto\n"),
+            (CI_WORKFLOW, "on: push\n"),
+            ("README.md", "base\n"),
+        ],
+    );
+    fixture_commit(root, "base");
+    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("update-ref");
+
+    let attributes = format!("* text=auto\nsrc/mesh/** {ATTRIBUTE}\n/{CI_WORKFLOW} {ATTRIBUTE}\n");
+    fixture_add(
+        root,
+        &[
+            (".gitattributes", &attributes),
+            ("src/mesh/a.rs", "// a\n"),
+            ("docs/guide.md", "guide\n"),
+        ],
+    );
+    fixture_commit(root, "attributed and ignored additions");
+    assert_eq!(scope_drift(root), (vec![], vec![]));
+
+    fixture_add(root, &[("src/repl/b.rs", "// b\n")]);
+    fixture_commit(root, "an unattributed addition");
+    assert_eq!(
+        scope_drift(root),
+        (vec!["src/repl/b.rs".to_string()], vec![])
+    );
+
+    let with_readme = format!("{attributes}/README.md {ATTRIBUTE}\n");
+    fixture_add(root, &[(".gitattributes", &with_readme)]);
+    fixture_commit(root, "attribute a file main already has");
+    assert_eq!(
+        scope_drift(root),
+        (
+            vec!["src/repl/b.rs".to_string()],
+            vec!["README.md".to_string()]
+        )
+    );
+}
+
+/// Every declared pattern is anchored at the root and matches a tracked file, bar those
+/// on `TRANSITIONAL`, each of which must still be declared.
+#[test]
+fn every_attribute_pattern_matches_a_tracked_file() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let tracked = tracked_paths(root);
-    for glob in ALLOW_LISTED_DIRS {
+    let declared = declared_patterns(root);
+    assert!(
+        !declared.is_empty(),
+        ".gitattributes declares no {ATTRIBUTE} pattern"
+    );
+    for pattern in &declared {
         assert!(
-            tracked.iter().any(|path| matches_dir_glob(path, glob)),
-            "{glob} matches no tracked file"
+            pattern.trim_end_matches('/').contains('/'),
+            "{pattern} is not anchored at the root"
         );
+        if !TRANSITIONAL.contains(&pattern.as_str()) {
+            assert!(
+                !tracked_matches(root, pattern).is_empty(),
+                "{pattern} matches no tracked file"
+            );
+        }
     }
-    for file in ALLOW_LISTED_FILES {
-        assert!(tracked.contains(file), "{file} is not tracked");
-    }
+    let undeclared: Vec<&&str> = TRANSITIONAL
+        .iter()
+        .filter(|pattern| !declared.iter().any(|candidate| candidate == *pattern))
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "TRANSITIONAL names patterns .gitattributes does not declare: {undeclared:?}"
+    );
     if let Err(reason) = origin_main_predates_the_pins(root) {
         println!("{reason}; skipping the not-on-main check");
         return;
@@ -1295,26 +1439,38 @@ fn every_allow_listed_path_exists() {
     let on_main = nul_separated(
         &git(root, &["ls-tree", "-r", "--name-only", "-z", "origin/main"]).expect("git ls-tree"),
     );
-    let shared: Vec<String> = allow_listed_paths(root)
+    let shared: Vec<String> = attributed_paths(root)
         .into_iter()
         .filter(|path| path != CI_WORKFLOW && on_main.contains(path))
         .collect();
     assert!(
         shared.is_empty(),
-        "allow-listed paths that also exist on origin/main:\n{}",
+        "attributed paths that also exist on origin/main:\n{}",
         shared.join("\n")
     );
 }
 
-/// `--no-renames` keeps a branch-added file classed as an addition whatever the user's
-/// `diff.renames` setting would otherwise pair it with.
+/// The attributed set is exactly the files added since `origin/main` outside `docs/` and
+/// `examples/`, plus the CI workflow. `--no-renames` keeps a branch-added file classed as
+/// an addition whatever the user's `diff.renames` setting would otherwise pair it with.
 #[test]
-fn the_allow_list_is_the_three_dot_diff_minus_docs_and_examples() {
+fn the_attributed_set_is_the_three_dot_diff_minus_docs_and_examples() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Err(reason) = origin_main_predates_the_pins(root) {
         println!("{reason}; skipping the diff check");
         return;
     }
+    let (missing, extra) = scope_drift(root);
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "added on this branch but without the {ATTRIBUTE} attribute: {missing:?}\ncarries {ATTRIBUTE} but was not added on this branch outside docs/ and examples/: {extra:?}"
+    );
+}
+
+/// The files added since `origin/main` outside `docs/` and `examples/`, plus the CI
+/// workflow, compared with the attributed set: (required but not attributed, attributed
+/// but not required).
+fn scope_drift(root: &Path) -> (Vec<String>, Vec<String>) {
     let added = git(
         root,
         &[
@@ -1327,18 +1483,37 @@ fn the_allow_list_is_the_three_dot_diff_minus_docs_and_examples() {
         ],
     )
     .expect("git diff");
-    let mut from_diff: BTreeSet<String> = nul_separated(&added)
+    let mut required: BTreeSet<String> = nul_separated(&added)
         .into_iter()
         .filter(|path| !path.starts_with("docs/") && !path.starts_with("examples/"))
         .collect();
-    from_diff.insert(CI_WORKFLOW.to_string());
-    let allow_listed = allow_listed_paths(root);
-    let missing: Vec<&String> = from_diff.difference(&allow_listed).collect();
-    let extra: Vec<&String> = allow_listed.difference(&from_diff).collect();
+    required.insert(CI_WORKFLOW.to_string());
+    let attributed = attributed_paths(root);
+    let missing = required.difference(&attributed).cloned().collect();
+    let extra = attributed.difference(&required).cloned().collect();
+    (missing, extra)
+}
+
+/// Every file any declared pattern matches carries the attribute, whether the pattern is
+/// a directory, an exact file or a single-segment glob, so a later line unsetting it
+/// cannot drop files from the scan unnoticed.
+#[test]
+fn every_file_a_pattern_matches_carries_the_attribute() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let attributed = attributed_paths(root);
+    let declared = declared_patterns(root);
     assert!(
-        missing.is_empty() && extra.is_empty(),
-        "added on this branch but not allow-listed: {missing:?}\nallow-listed but not added on this branch: {extra:?}"
+        !declared.is_empty(),
+        ".gitattributes declares no {ATTRIBUTE} pattern"
     );
+    for pattern in &declared {
+        let under = nul_separated(&tracked_matches(root, pattern));
+        let uncovered: Vec<&String> = under.difference(&attributed).collect();
+        assert!(
+            uncovered.is_empty(),
+            "{pattern} matches files a later .gitattributes line leaves without the {ATTRIBUTE} attribute: {uncovered:?}"
+        );
+    }
 }
 
 /// (file, path) pairs a string literal may spell although the `.mesh` table does not
