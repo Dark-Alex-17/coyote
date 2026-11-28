@@ -1,9 +1,11 @@
 //! Structural checks on `.github/workflows/ci.yaml` and `release.yaml`, read as YAML
 //! rather than as text: which jobs gate a merge, the order and conditions of the steps
 //! that set up and tear down privileged state, the libtest flags CI passes, where the
-//! relay smoke installs to, and the image smoke that gates the Docker Hub push. Comments
-//! and step names are free to change: steps are found by what they run and set. The one
-//! display name checked is the `Mesh Interop` job's, which the interop record cites.
+//! relay smoke installs to, the commands the scripts job and the image smokes run, and
+//! the image smoke that gates the Docker Hub push. Comments and step names are free to
+//! change: steps are found by what they run and set, and each command check reads only
+//! the one step that must carry it. The one display name checked is the `Mesh Interop`
+//! job's, which the interop record cites.
 
 mod support;
 
@@ -29,9 +31,15 @@ const INSTALL_DIRS: [&str; 4] = [
     "UV_TOOL_BIN_DIR",
 ];
 
-fn workflow(file: &str) -> Value {
+/// The parsed workflow, or `None` in a tree without `.github`: Cargo.toml excludes it
+/// from the published crate, whose tests must not panic over a file it never had.
+fn workflow(file: &str) -> Option<Value> {
+    if !support::repo::root().join(".github").is_dir() {
+        eprintln!("skipping: .github is not part of this source tree");
+        return None;
+    }
     let text = support::repo::read(&format!(".github/workflows/{file}"));
-    serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{file} parses as YAML: {e}"))
+    Some(serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{file} parses as YAML: {e}")))
 }
 
 fn jobs<'a>(workflow: &'a Value, file: &str) -> &'a Mapping {
@@ -58,6 +66,22 @@ fn step_name(step: &Value) -> &str {
     step["name"].as_str().unwrap_or("?")
 }
 
+/// A string field of a step that a check depends on; a missing one fails here rather
+/// than letting the check pass against an empty string.
+fn field<'a>(step: &'a Value, key: &str) -> &'a str {
+    step[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("the step {:?} has no `{key}`", step_name(step)))
+}
+
+fn assert_runs(step: &Value, needle: &str, why: &str) {
+    assert!(
+        field(step, "run").contains(needle),
+        "the step {:?} must run {needle:?}: {why}",
+        step_name(step)
+    );
+}
+
 fn is_powershell(step: &Value) -> bool {
     matches!(step["shell"].as_str(), Some("pwsh" | "powershell"))
 }
@@ -68,6 +92,33 @@ fn only_position(steps: &[Value], what: &str, matches: impl Fn(&Value) -> bool) 
         [one] => one,
         _ => panic!("expected exactly one step {what}, found {}", found.len()),
     }
+}
+
+fn only_step<'a>(steps: &'a [Value], what: &str, matches: impl Fn(&Value) -> bool) -> &'a Value {
+    &steps[only_position(steps, what, matches)]
+}
+
+/// The Unix relay smoke: the step that points PIPX_HOME somewhere and drives mesh-relay.sh.
+fn unix_smoke(steps: &[Value]) -> usize {
+    only_position(
+        steps,
+        "setting PIPX_HOME and running mesh-relay.sh",
+        |step| !step["env"]["PIPX_HOME"].is_null() && run(step).contains("mesh-relay.sh"),
+    )
+}
+
+/// The Windows relay smoke: the PowerShell step that points PIPX_HOME somewhere and
+/// drives mesh-relay.ps1.
+fn windows_smoke(steps: &[Value]) -> usize {
+    only_position(
+        steps,
+        "setting PIPX_HOME and running mesh-relay.ps1 under PowerShell",
+        |step| {
+            !step["env"]["PIPX_HOME"].is_null()
+                && is_powershell(step)
+                && run(step).contains("mesh-relay.ps1")
+        },
+    )
 }
 
 fn needs(job: &Value) -> Vec<&str> {
@@ -90,6 +141,7 @@ struct DockerBuild<'a> {
     tag: &'a str,
     context: &'a str,
     load: bool,
+    build_args: Vec<&'a str>,
 }
 
 fn docker_builds(steps: &[Value]) -> Vec<DockerBuild<'_>> {
@@ -101,11 +153,19 @@ fn docker_builds(steps: &[Value]) -> Vec<DockerBuild<'_>> {
             if !words.starts_with(&["docker", "build"]) {
                 return None;
             }
-            let tag = words.windows(2).find(|pair| pair[0] == "-t")?[1];
+            let after = |flag: &str| -> Vec<&str> {
+                words
+                    .windows(2)
+                    .filter(|pair| pair[0] == flag)
+                    .map(|pair| pair[1])
+                    .collect()
+            };
+            let tag = *after("-t").first()?;
             Some(DockerBuild {
                 tag,
                 context: words.last()?,
                 load: words.contains(&"--load"),
+                build_args: after("--build-arg"),
             })
         })
         .collect()
@@ -133,7 +193,9 @@ fn smoked_images(step: &Value) -> (&str, &str) {
 /// green run and a green README badge.
 #[test]
 fn informational_jobs_are_not_continue_on_error() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     for name in INFORMATIONAL_JOBS {
         let job = job(&ci, "ci.yaml", name);
         assert!(
@@ -154,8 +216,13 @@ fn informational_jobs_are_not_continue_on_error() {
 /// run never blocks a merge.
 #[test]
 fn informational_jobs_are_in_no_jobs_needs() {
-    let ci = workflow("ci.yaml");
-    job(&ci, "ci.yaml", "all");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    assert!(
+        !ci["jobs"]["all"].is_null(),
+        "ci.yaml has no `all` job, the gate the informational jobs must stay out of"
+    );
     for (name, other) in jobs(&ci, "ci.yaml") {
         let name = name.as_str().unwrap_or("?");
         for informational in INFORMATIONAL_JOBS {
@@ -172,7 +239,9 @@ fn informational_jobs_are_in_no_jobs_needs() {
 /// so a hung run does not hold a runner for the six-hour default.
 #[test]
 fn informational_jobs_wait_for_nothing_and_run_under_a_timeout() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     for name in INFORMATIONAL_JOBS {
         let job = job(&ci, "ci.yaml", name);
         assert!(
@@ -195,7 +264,9 @@ fn informational_jobs_wait_for_nothing_and_run_under_a_timeout() {
 /// latest release, so widening its scope must show up here.
 #[test]
 fn the_image_smoke_token_only_reads_contents() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let permissions = job(&ci, "ci.yaml", "image-smoke")["permissions"]
         .as_mapping()
         .expect("the image-smoke job declares a `permissions` map");
@@ -210,7 +281,9 @@ fn the_image_smoke_token_only_reads_contents() {
 /// the CI job by this name.
 #[test]
 fn the_interop_job_keeps_the_name_the_interop_record_defers_to() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     assert_eq!(
         job(&ci, "ci.yaml", "mesh-interop")["name"].as_str(),
         Some("Mesh Interop"),
@@ -222,7 +295,9 @@ fn the_interop_job_keeps_the_name_the_interop_record_defers_to() {
 /// step that removes them runs as root and runs whatever the steps before it did.
 #[test]
 fn netns_teardown_runs_under_sudo_whatever_the_outcome() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let mut found = 0;
     for (name, job) in jobs(&ci, "ci.yaml") {
         let name = name.as_str().unwrap_or("?");
@@ -252,7 +327,9 @@ fn netns_teardown_runs_under_sudo_whatever_the_outcome() {
 /// see jobs that already have a teardown step.
 #[test]
 fn every_job_that_creates_namespaces_removes_them() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let mut found = 0;
     for (name, job) in jobs(&ci, "ci.yaml") {
         let name = name.as_str().unwrap_or("?");
@@ -275,7 +352,9 @@ fn every_job_that_creates_namespaces_removes_them() {
 /// whatever the suite did.
 #[test]
 fn the_interop_job_runs_the_suite_between_setup_and_teardown() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let job = job(&ci, "ci.yaml", "mesh-interop");
     assert_eq!(
         job["runs-on"].as_str(),
@@ -350,7 +429,9 @@ fn the_interop_job_runs_the_suite_between_setup_and_teardown() {
 fn include_ignored_follows_the_double_dash() {
     let mut found = 0;
     for file in ["ci.yaml", "release.yaml"] {
-        let workflow = workflow(file);
+        let Some(workflow) = workflow(file) else {
+            return;
+        };
         for (name, job) in jobs(&workflow, file) {
             let name = name.as_str().unwrap_or("?");
             for line in steps(job).iter().flat_map(|step| run(step).lines()) {
@@ -382,7 +463,9 @@ fn image_builds_export_no_layer_cache() {
         ("ci.yaml", "image-smoke"),
         ("release.yaml", "publish-sandbox-image"),
     ] {
-        let workflow = workflow(file);
+        let Some(workflow) = workflow(file) else {
+            return;
+        };
         for step in steps(job(&workflow, file, name)) {
             assert!(
                 step["with"]["cache-to"].is_null() && !run(step).contains("cache-to"),
@@ -397,7 +480,9 @@ fn image_builds_export_no_layer_cache() {
 /// whatever an earlier run left under another tag.
 #[test]
 fn the_ci_image_smoke_runs_the_images_it_built() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let steps = steps(job(&ci, "ci.yaml", "image-smoke"));
     let smoke = position(steps, &format!("runs {IMAGE_SMOKE}"), |step| {
         run(step).contains(IMAGE_SMOKE)
@@ -416,13 +501,66 @@ fn the_ci_image_smoke_runs_the_images_it_built() {
     );
 }
 
+/// The Dockerfile downloads the coyote release named by COYOTE_VERSION, and the latest
+/// release is the only one a PR build can download. So the CI smoke resolves that
+/// release with the job's token before the build, and the build passes it in.
+#[test]
+fn the_ci_image_smoke_builds_the_latest_release() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "image-smoke"));
+    let resolve = only_position(steps, "running `gh release view`", |step| {
+        run(step).contains("gh release view")
+    });
+    let step = &steps[resolve];
+    assert_runs(
+        step,
+        "gh release view --json tagName -q .tagName | sed 's/^v//'",
+        "the Dockerfile prefixes the `v` itself, so the build-arg is the bare version",
+    );
+    assert!(
+        field(step, "run")
+            .lines()
+            .any(|line| line.contains("coyote_version=") && line.contains("$GITHUB_ENV")),
+        "the step {:?} must export coyote_version through GITHUB_ENV for the build step",
+        step_name(step)
+    );
+    assert_eq!(
+        step["env"]["GH_TOKEN"].as_str(),
+        Some("${{ github.token }}"),
+        "`gh` reads the release with the job's read-only token"
+    );
+
+    let build = position(steps, "running `docker build ... .`", |step| {
+        docker_builds(std::slice::from_ref(step))
+            .iter()
+            .any(|b| b.context == ".")
+    });
+    assert!(
+        resolve < build,
+        "the release is resolved before the image build that needs it"
+    );
+    assert!(
+        docker_builds(std::slice::from_ref(&steps[build]))
+            .iter()
+            .any(|b| b.context == "."
+                && b.build_args.contains(&"COYOTE_VERSION=\"$coyote_version\"")),
+        "the image build {:?} must pass --build-arg COYOTE_VERSION=\"$coyote_version\"",
+        step_name(&steps[build])
+    );
+}
+
 /// The release smokes a host-arch build of the image before the multi-platform push, so a
 /// broken rnsd layer or entrypoint never reaches Docker Hub. The smoked build is loaded,
-/// never pushed, takes the same build-args as the push, is the image the smoke runs, and
-/// a failed smoke fails the job. The push step then really pushes, to named tags.
+/// never pushed, takes the release version as the push does, is the image the smoke
+/// runs, and a failed smoke fails the job. The push step then really pushes, to the
+/// `latest` tag and the release's own tag.
 #[test]
 fn the_release_smokes_the_image_before_the_push() {
-    let release = workflow("release.yaml");
+    let Some(release) = workflow("release.yaml") else {
+        return;
+    };
     let job = job(&release, "release.yaml", "publish-sandbox-image");
     assert!(
         job["continue-on-error"].is_null(),
@@ -462,6 +600,17 @@ fn the_release_smokes_the_image_before_the_push() {
         !builds.is_empty(),
         "the image is built with docker/build-push-action before the smoke"
     );
+    for build in builds.iter().copied().chain([&steps[push]]) {
+        assert!(
+            build["with"]["build-args"]
+                .as_str()
+                .is_some_and(|args| args.contains("COYOTE_VERSION=${{ env.version }}")),
+            "the build {:?} must pass build-args COYOTE_VERSION=${{{{ env.version }}}}, or it \
+             bakes in a coyote other than the one this release publishes: {:?}",
+            step_name(build),
+            build["with"]["build-args"]
+        );
+    }
     for build in &builds {
         let with = &build["with"];
         assert_eq!(
@@ -515,19 +664,30 @@ fn the_release_smokes_the_image_before_the_push() {
         "the push step must push, outside local `act` runs only: {:?}",
         with["push"]
     );
-    assert!(
-        with["tags"]
-            .as_str()
-            .is_some_and(|tags| !tags.trim().is_empty()),
-        "the push step must name the tags it publishes"
-    );
+    let tags: BTreeSet<&str> = with["tags"]
+        .as_str()
+        .unwrap_or("")
+        .split([',', '\n'])
+        .map(str::trim)
+        .collect();
+    for tag in [
+        "darkalex17/coyote:latest",
+        "darkalex17/coyote:v${{ env.version }}",
+    ] {
+        assert!(
+            tags.contains(tag),
+            "the push step must publish {tag}: {tags:?}"
+        );
+    }
 }
 
 /// The dependency gate's error tells a contributor where the dependency policy lives, and
 /// that anchor has to resolve to a heading in CONTRIBUTING.md.
 #[test]
 fn the_merge_gate_error_links_a_contributing_heading_that_exists() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let gate = steps(job(&ci, "ci.yaml", "merge-gates"))
         .iter()
         .find(|step| run(step).contains("cargo metadata") && run(step).contains("git+"))
@@ -552,7 +712,9 @@ fn the_merge_gate_error_links_a_contributing_heading_that_exists() {
 /// The relay smoke runs on every runner family the relay supports.
 #[test]
 fn the_scripts_job_runs_on_every_runner_family() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let os = job(&ci, "ci.yaml", "scripts")["strategy"]["matrix"]["os"]
         .as_sequence()
         .expect("the scripts job has a `strategy.matrix.os` list");
@@ -571,23 +733,13 @@ fn the_scripts_job_runs_on_every_runner_family() {
 /// PIPX_HOME and drive mesh-relay.sh, or mesh-relay.ps1 under PowerShell.
 #[test]
 fn the_relay_smokes_install_under_a_per_run_home() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let job = job(&ci, "ci.yaml", "scripts");
     let steps = steps(job);
-    let unix = only_position(
-        steps,
-        "setting PIPX_HOME and running mesh-relay.sh",
-        |step| !step["env"]["PIPX_HOME"].is_null() && run(step).contains("mesh-relay.sh"),
-    );
-    let windows = only_position(
-        steps,
-        "setting PIPX_HOME and running mesh-relay.ps1 under PowerShell",
-        |step| {
-            !step["env"]["PIPX_HOME"].is_null()
-                && is_powershell(step)
-                && run(step).contains("mesh-relay.ps1")
-        },
-    );
+    let unix = unix_smoke(steps);
+    let windows = windows_smoke(steps);
     let smokes = BTreeSet::from([unix, windows]);
     let under_mesh_home = |value: &Value| {
         value
@@ -632,7 +784,9 @@ fn the_relay_smokes_install_under_a_per_run_home() {
 /// has a step under each.
 #[test]
 fn the_scripts_job_runs_both_powershells() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let steps = steps(job(&ci, "ci.yaml", "scripts"));
     for shell in ["pwsh", "powershell"] {
         assert!(
@@ -644,16 +798,104 @@ fn the_scripts_job_runs_both_powershells() {
     }
 }
 
+/// shellcheck reads every shell script the repo ships: the top-level scripts, the ones a
+/// directory deeper, and the propagation node's entrypoint. It runs on the Linux leg,
+/// the one runner image that carries it.
+#[test]
+fn shellcheck_covers_every_shell_script_on_linux() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let step = only_step(steps, "running shellcheck", |step| {
+        run(step).contains("shellcheck")
+    });
+    assert_eq!(
+        field(step, "if").trim(),
+        "runner.os == 'Linux'",
+        "the step {:?} runs on the Linux leg",
+        step_name(step)
+    );
+    let checks: Vec<Vec<&str>> = field(step, "run")
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|words| words.first() == Some(&"shellcheck") && !words.contains(&"--version"))
+        .collect();
+    assert!(
+        !checks.is_empty(),
+        "the step {:?} never runs shellcheck on a file",
+        step_name(step)
+    );
+    for target in [
+        "scripts/*.sh",
+        "scripts/*/*.sh",
+        "deployment/propagation-node/entrypoint.sh",
+    ] {
+        assert!(
+            checks.iter().any(|words| words.contains(&target)),
+            "shellcheck must cover {target}"
+        );
+    }
+}
+
+/// PSScriptAnalyzer reads every tracked .ps1, wherever it sits, rather than a fixed
+/// directory; an empty list is an error rather than a vacuous pass; warnings count; and
+/// any finding fails the step instead of scrolling past in the log.
+#[test]
+fn psscriptanalyzer_analyses_every_tracked_ps1_and_fails_on_findings() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let step = only_step(steps, "running Invoke-ScriptAnalyzer", |step| {
+        run(step).contains("Invoke-ScriptAnalyzer")
+    });
+    assert_eq!(
+        field(step, "shell"),
+        "pwsh",
+        "the analyser is a pwsh module"
+    );
+    for (needle, why) in [
+        (
+            "$files = @(git ls-files '*.ps1')",
+            "the files are enumerated from the index",
+        ),
+        (
+            "if (-not $files) { throw",
+            "an empty file list must fail rather than analyse nothing",
+        ),
+        (
+            "Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error",
+            "every enumerated .ps1 is analysed at Warning,Error",
+        ),
+    ] {
+        assert_runs(step, needle, why);
+    }
+    assert!(
+        !field(step, "run").contains("-Path scripts"),
+        "the analyser must not be narrowed back to a fixed directory"
+    );
+    assert!(
+        field(step, "run")
+            .lines()
+            .any(|line| line.trim() == "if ($r) { exit 1 }"),
+        "a PSScriptAnalyzer finding must fail the step {:?}",
+        step_name(step)
+    );
+}
+
 /// PSScriptAnalyzer is pinned to an exact version and that version is both installed and
 /// imported, so a newer module already on the runner image cannot win and change the rules.
 /// One step owns the pin, so two can never drift apart.
 #[test]
 fn psscriptanalyzer_is_pinned_and_imported_at_the_pin() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let steps = steps(job(&ci, "ci.yaml", "scripts"));
-    let step = &steps[only_position(steps, "setting PSSA_VERSION", |step| {
+    let step = only_step(steps, "setting PSSA_VERSION", |step| {
         !step["env"]["PSSA_VERSION"].is_null()
-    })];
+    });
     let version = step["env"]["PSSA_VERSION"]
         .as_str()
         .expect("PSSA_VERSION is a version string");
@@ -679,11 +921,240 @@ fn psscriptanalyzer_is_pinned_and_imported_at_the_pin() {
     }
 }
 
+/// macOS ships bash 3.2 as /bin/bash, the bash the README one-liners land in on a Mac, so
+/// the macOS leg runs both the relay and the installer's --help probe under it rather
+/// than a newer bash from the image's PATH.
+#[test]
+fn macos_runs_the_relay_and_the_installer_under_bin_bash() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    assert_runs(
+        &steps[unix_smoke(steps)],
+        "if [ \"$RUNNER_OS\" = macOS ]; then relay=(/bin/bash scripts/mesh-relay.sh); fi",
+        "the macOS relay smoke runs under /bin/bash 3.2",
+    );
+    let probe = only_step(steps, "probing install_coyote.sh --help", |step| {
+        run(step).contains("scripts/install_coyote.sh --help")
+    });
+    assert_eq!(
+        field(probe, "if").trim(),
+        "runner.os != 'Windows'",
+        "the installer probe {:?} runs on the macOS leg",
+        step_name(probe)
+    );
+    for needle in [
+        "if [ \"$RUNNER_OS\" = macOS ]; then bash=/bin/bash; fi",
+        "\"$bash\" scripts/install_coyote.sh --help",
+    ] {
+        assert_runs(
+            probe,
+            needle,
+            "the macOS installer probe runs under /bin/bash 3.2",
+        );
+    }
+}
+
+/// The 5.1 step drives mesh-relay.ps1 itself under Windows PowerShell, not just a module
+/// load, and keeps a native command's stderr from becoming a terminating error so the
+/// exit code it checks is the relay's.
+#[test]
+fn windows_powershell_5_1_drives_the_relay() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let step = only_step(steps, "under `shell: powershell`", |step| {
+        step["shell"].as_str() == Some("powershell")
+    });
+    assert_runs(
+        step,
+        "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot",
+        "the 5.1 step runs the relay script under Windows PowerShell",
+    );
+    assert!(
+        field(step, "run")
+            .lines()
+            .any(|line| line.trim() == "$ErrorActionPreference = 'Continue'"),
+        "the 5.1 step {:?} must set $ErrorActionPreference = 'Continue'; $LASTEXITCODE is the oracle",
+        step_name(step)
+    );
+}
+
+/// On Windows the bash relay refuses Git Bash with exit 2; the README sends Windows users
+/// to the PowerShell relay instead.
+#[test]
+fn git_bash_is_refused_with_exit_2() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let step = only_step(steps, "running mesh-relay.sh under `shell: bash`", |step| {
+        step["shell"].as_str() == Some("bash") && run(step).contains("scripts/mesh-relay.sh")
+    });
+    assert_eq!(
+        field(step, "if").trim(),
+        "runner.os == 'Windows'",
+        "the Git Bash refusal {:?} runs on the Windows leg",
+        step_name(step)
+    );
+    assert_runs(
+        step,
+        "bash scripts/mesh-relay.sh --no-service --dry-run || rc=$?; [ \"$rc\" -eq 2 ]",
+        "the bash relay must refuse Git Bash with exit 2",
+    );
+}
+
+/// The pwsh dry run plans a Scheduled Task and must not register one.
+#[test]
+fn the_pwsh_dry_run_registers_no_scheduled_task() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    assert_runs(
+        &steps[windows_smoke(steps)],
+        "Get-ScheduledTask -TaskName 'Coyote rnsd' -ErrorAction SilentlyContinue)) { throw",
+        "the dry run must be proven to register no Scheduled Task",
+    );
+}
+
+/// A non-default rns version passed to the relay lands in the dry-run plan, on both shells.
+#[test]
+fn a_non_default_version_lands_in_both_dry_run_plans() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let why = "a non-default version must land in the dry-run plan";
+    let unix = &steps[unix_smoke(steps)];
+    assert_runs(unix, "--version 1.5.1 --no-service --dry-run", why);
+    assert_runs(unix, "grep -q 'rns==1.5.1'", why);
+    let windows = &steps[windows_smoke(steps)];
+    assert_runs(windows, "'-Version', '1.5.1', '-NoService', '-DryRun'", why);
+    assert_runs(windows, "'rns==1\\.5\\.1'", why);
+}
+
+/// The venv fallback is proven on a PATH without uv or pipx and with neither config
+/// variable set, under a throwaway Roaming profile that the smoke step has not already
+/// installed into (there a working rnsd.cmd would win as the `present` rung).
+#[test]
+fn the_venv_fallback_runs_without_uv_pipx_or_config_variables() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let step = only_step(
+        steps,
+        "setting APPDATA and running mesh-relay.ps1 under PowerShell",
+        |step| {
+            !step["env"]["APPDATA"].is_null()
+                && is_powershell(step)
+                && run(step).contains("mesh-relay.ps1")
+        },
+    );
+    let appdata = step["env"]["APPDATA"]
+        .as_str()
+        .expect("APPDATA is a path string");
+    assert!(
+        appdata.contains("runner.temp") && appdata.ends_with("\\mesh-venv-home\\AppData\\Roaming"),
+        "APPDATA must be a throwaway Roaming profile under runner.temp/mesh-venv-home: {appdata:?}"
+    );
+    for (needle, why) in [
+        (
+            "Remove-Item Env:COYOTE_CONFIG_DIR, Env:XDG_CONFIG_HOME",
+            "the venv plan must be made with both config variables unset so APPDATA is the one left",
+        ),
+        (
+            "Join-Path $_ 'uv.exe')) -and -not (Test-Path (Join-Path $_ 'pipx.exe'))",
+            "every PATH entry holding uv or pipx must be stripped so the venv rung is reached",
+        ),
+        (
+            "Install: py -3 -m venv",
+            "the plan must pick `py -3`, the rung before `python`",
+        ),
+        (
+            "\\\\AppData\\\\Roaming\\\\coyote\\\\mesh\\\\rns-venv",
+            "the plan must place the venv under %APPDATA%\\coyote\\mesh\\rns-venv",
+        ),
+    ] {
+        assert_runs(step, needle, why);
+    }
+}
+
+/// The Unix and the Windows smoke check the same results of the relay: the dry run
+/// changes nothing, the installed rnsd runs, a re-run leaves its own config alone and
+/// prints no stanzas, a foreign config stays byte-identical while the stanzas to merge
+/// are printed, and root is refused. Each check is looked for in the smoke step that
+/// must make it.
+#[test]
+fn both_relay_smokes_check_the_same_results() {
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
+    let steps = steps(job(&ci, "ci.yaml", "scripts"));
+    let unix = &steps[unix_smoke(steps)];
+    let windows = &steps[windows_smoke(steps)];
+    for (what, unix_needle, windows_needle) in [
+        (
+            "dry run",
+            "--no-service --dry-run",
+            "'-NoService', '-DryRun'",
+        ),
+        (
+            "dry run changes nothing",
+            "[ ! -e \"$HOME/.reticulum\" ]",
+            "dry run created .reticulum",
+        ),
+        (
+            "install + rnsd --version",
+            "\"$BIN_DIR/rnsd\" --version",
+            "'rnsd.cmd') --version",
+        ),
+        (
+            "re-run hash unchanged",
+            "shasum -a 256",
+            "Get-FileHash -Algorithm SHA256",
+        ),
+        (
+            "re-run reports the existing config",
+            "grep -qF '(already there); not touched'",
+            ".Contains('(already there); not touched')",
+        ),
+        (
+            "re-run on the script's own config prints no stanzas",
+            "grep -qF 'Make sure it carries these settings'",
+            ".Contains('Make sure it carries these settings')",
+        ),
+        (
+            "pre-existing config byte-identical",
+            "cmp \"$RUNNER_TEMP/expected-config\"",
+            "an existing config was modified",
+        ),
+        (
+            "stanzas printed",
+            "grep -q '\\[\\[Team Relay\\]\\]'",
+            "stanzas lack [[Team Relay]]",
+        ),
+        (
+            "root refusal",
+            "sudo -E env HOME=\"$HOME\"",
+            "Administrator is refused without -AllowRoot",
+        ),
+    ] {
+        assert_runs(unix, unix_needle, what);
+        assert_runs(windows, windows_needle, what);
+    }
+}
+
 /// GitHub's pwsh wrapper ends a step with `exit $LASTEXITCODE`, and a Windows relay
 /// step's last relay call may be an expected refusal, so each ends with `exit 0`.
 #[test]
 fn the_windows_relay_steps_end_with_exit_0() {
-    let ci = workflow("ci.yaml");
+    let Some(ci) = workflow("ci.yaml") else {
+        return;
+    };
     let relay_steps: Vec<&Value> = steps(job(&ci, "ci.yaml", "scripts"))
         .iter()
         .filter(|step| is_powershell(step) && run(step).contains("mesh-relay.ps1"))
