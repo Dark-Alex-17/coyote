@@ -24,7 +24,8 @@ pub fn on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// `None` when `bash` is not on PATH; the caller prints `skipping:` and returns.
+/// `None` when `bash` is not on PATH; `bash_or_skip!` turns that into a `skipping:`
+/// line and an early return.
 pub fn bash() -> Option<PathBuf> {
     on_path("bash")
 }
@@ -65,6 +66,8 @@ pub fn run(cmd: &mut Command) -> (i32, String, String) {
 }
 
 /// The `bash` on PATH, or `skipping:` printed and the test returned.
+/// Expands to `$crate::support::script::bash()`, so the using crate must declare
+/// `mod support;` at its root.
 #[macro_export]
 macro_rules! bash_or_skip {
     () => {
@@ -79,6 +82,8 @@ macro_rules! bash_or_skip {
 }
 
 /// The `pwsh` on PATH, or `skipping:` printed and the test returned.
+/// Expands to `$crate::support::script::pwsh()`, so the using crate must declare
+/// `mod support;` at its root.
 #[macro_export]
 macro_rules! pwsh_or_skip {
     () => {
@@ -128,8 +133,8 @@ impl Home {
         self.root.join(".reticulum").join("config")
     }
 
-    /// A stand-in `rnsd` whose `--version` succeeds, so a script finds an rnsd
-    /// already in place and reuses it instead of installing anything.
+    /// A stand-in `rnsd` whose `--version` succeeds: to the installer a mesh set up
+    /// earlier, to the relay an rnsd it reuses instead of installing anything.
     pub fn seed_rnsd(&self) -> PathBuf {
         let bin = self.bin_dir();
         fs::create_dir_all(&bin).unwrap();

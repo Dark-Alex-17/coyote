@@ -41,7 +41,7 @@ impl Home {
 
     /// The config rnsd prefers over `~/.reticulum/config` when it exists.
     fn xdg_reticulum_config(&self) -> PathBuf {
-        self.path().join(".config").join("reticulum").join("config")
+        self.config_home().join("reticulum").join("config")
     }
 
     /// The script, with `--allow-root` appended when the test process is root so a

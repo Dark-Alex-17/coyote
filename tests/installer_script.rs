@@ -3,8 +3,8 @@
 //! the network: a stand-in `curl` on a hand-picked PATH serves the release metadata and
 //! a prepared tarball from disk and records every request, and a `uname` answering
 //! `Linux` keeps the mesh relay on its systemd path (with no `systemctl` on PATH it
-//! writes the unit and prints how to enable it) on every OS. The fixture mirrors
-//! `mesh_relay_script.rs`.
+//! writes the unit and prints how to enable it) on every OS. The throwaway HOME and
+//! tools dir come from `tests/support/script.rs`, shared with `mesh_relay_script.rs`.
 //!
 //! Unix only, like the script. Without `bash` on PATH the tests print `skipping:`.
 #![cfg(unix)]
