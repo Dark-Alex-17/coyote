@@ -14,22 +14,22 @@
 //! plain `cargo test` is unaffected. With it set to a directory that has no
 //! `Unattended-Mode.md` the tests fail rather than pass against nothing.
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+
+use support::bin::{Dirs, coyote_command};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str =
     "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test structured_output_wiki_docs`";
 const SENTINEL_PAGE: &str = "Unattended-Mode.md";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 /// The wiki checkout, or `None` after printing the conventional `skipping:`
 /// line. A set variable that does not point at the wiki is a failure, not a
@@ -44,7 +44,7 @@ fn wiki_dir() -> Option<PathBuf> {
         );
         return None;
     };
-    let dir = repo_root().join(value);
+    let dir = support::repo::root().join(value);
     assert!(
         dir.join(SENTINEL_PAGE).is_file(),
         "{WIKI_DIR}={} has no {SENTINEL_PAGE}; point it at a coyote.wiki checkout",
@@ -171,26 +171,21 @@ impl Drop for TempDir {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            command.env_remove(key);
-        }
-    }
-    command
-        .args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("USERPROFILE", dir.join("home"))
-        .env("NO_COLOR", "1")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
-        .env_remove("IS_SANDBOX")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(dir)
+    .env("NO_COLOR", "1")
+    .env("NO_PROXY", "127.0.0.1,localhost")
+    .env("no_proxy", "127.0.0.1,localhost")
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 /// Flags that take a value, with a value clap accepts, so the conflict (not
@@ -424,7 +419,7 @@ fn graph_agents_native_section_pins_the_call_sites_fallback_and_parse_order() {
     }
     assert!(text.contains("tools and functions are sent exactly as"));
 
-    let source = read(&repo_root().join("src/client/native_format.rs"));
+    let source = support::repo::read("src/client/native_format.rs");
     let open = "warn!(\"";
     let start = source
         .find(&format!("{open}provider rejected the native"))

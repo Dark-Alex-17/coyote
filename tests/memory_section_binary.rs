@@ -4,9 +4,13 @@
 //! in the log file (never on the terminal). Each test boots a fresh temp config dir holding a config.yaml,
 //! a global `memory/MEMORY.md` and a workspace `.coyote/memory/MEMORY.md`.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
+
+use support::bin::{Dirs, coyote_command};
 
 const GLOBAL_INDEX: &str =
     "PLACEHOLDER_CHECK\n- [[g-one]]: global drill one\n- [[g-two]]: global drill two\n";
@@ -98,25 +102,21 @@ fn write_drill(scope_dir: &Path, name: &str, body: &str) {
 }
 
 fn run(fx: &Fixture, args: &[&str]) -> Output {
-    let home = fx.dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(args)
-        .current_dir(&fx.workspace)
-        .env("COYOTE_CONFIG_DIR", &fx.dir)
-        .env("COYOTE_CACHE_DIR", fx.dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("NO_COLOR", "1")
-        .env("COYOTE_LOG_PATH", log_path(fx))
-        .env("COYOTE_LOG_LEVEL", "info")
-        .env_remove("COYOTE_LOG_FILTER")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: fx.dir.clone(),
+        cache: fx.dir.join("cache"),
+        home: fx.dir.join("home"),
+        temp: std::env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(&fx.workspace)
+    .env("NO_COLOR", "1")
+    .env("COYOTE_LOG_PATH", log_path(fx))
+    .env("COYOTE_LOG_LEVEL", "info")
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {

@@ -16,11 +16,15 @@
 //! a real ~/.coyote_password or a sandbox shell — cannot mask
 //! virgin-environment regressions.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, DryRunConfig, coyote_command};
 
 fn fresh_config_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -37,39 +41,35 @@ fn probe_inspection_flag(flag: &str, require_stdout: bool) -> String {
     let tmp_dir = fresh_config_dir(label);
     let home_dir = fresh_config_dir(&format!("{label}-home"));
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .arg(flag)
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        // Log file lives under the cache dir (pinned below) unless
-        // COYOTE_LOG_PATH overrides it; keep test children off the developer's
-        // real coyote.log (and its rotation). Info level pins that the
-        // redirect is honored.
-        .env_remove("COYOTE_LOG_PATH")
-        .env("COYOTE_LOG_LEVEL", "info")
-        // A fresh fake HOME hides any real ~/.coyote_password on the host;
-        // USERPROFILE is the best-effort Windows equivalent (dirs resolves
-        // home via the Known Folder API there). HOME is set, never removed:
-        // dirs::home_dir() panics inside gman when home can't be determined.
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
         // Pin the cache (log file, oauth tokens) under the fake HOME too. On
         // Windows the LocalAppData Known Folder expands `%USERPROFILE%` from
         // the process environment and is verified to exist, so with a fresh
         // USERPROFILE `dirs::cache_dir()` is None and `paths::cache_dir()`
         // would fall back to the process temp dir; unix resolves `~/.cache`
         // without that check. An explicit override keeps every OS in step.
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        // A leaked sandbox/provider env would reroute the vault and config
-        // paths under test.
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        // Workspace mcp.json discovery resolves from the CWD, so pin it to
-        // the isolated fake HOME to keep host state out of the probe.
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        cache: home_dir.join("cache"),
+        // A fresh fake HOME hides any real ~/.coyote_password on the host;
+        // USERPROFILE is the best-effort Windows equivalent (dirs resolves
+        // home via the Known Folder API there). HOME is set, never removed:
+        // dirs::home_dir() panics inside gman when home can't be determined.
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .arg(flag)
+    // The log file lives under the pinned cache dir; info level pins that
+    // the redirect is honored.
+    .env("COYOTE_LOG_LEVEL", "info")
+    // A leaked sandbox env would reroute the vault and config paths under
+    // test.
+    .env_remove("IS_SANDBOX")
+    // Workspace mcp.json discovery resolves from the CWD, so pin it to
+    // the isolated fake HOME to keep host state out of the probe.
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
 
     let leftover: Vec<_> = fs::read_dir(&tmp_dir)
         .unwrap()
@@ -144,20 +144,18 @@ fn agent_info_on_empty_config_dir_bootstraps_builtins() {
     let tmp_dir = fresh_config_dir("agent-info");
     let home_dir = fresh_config_dir("agent-info-home");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["--agent", "adversary", "--info"])
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .args(["--agent", "adversary", "--info"])
+    .env_remove("IS_SANDBOX")
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
 
     let agents_dir = tmp_dir.join("agents");
     let builtins_installed =
@@ -200,50 +198,32 @@ fn agent_envoy_build_tools_runs_the_embedded_builtin_and_cleans_up() {
     let home_dir = fresh_config_dir("agent-envoy-build-tools-home");
     let vault_pass = tmp_dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        tmp_dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             vault_password_file: '{}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: unused\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             save: false\n",
-            vault_pass.display()
-        ),
-    )
-    .unwrap();
+    DryRunConfig::default()
+        .vault_password_file(&vault_pass)
+        .write(&tmp_dir);
     let shadow_dir = tmp_dir.join("agents").join("envoy");
     fs::create_dir_all(&shadow_dir).unwrap();
     let shadow_config = "name: envoy\ninstructions: hi\nmodel: shadow-model-XYZ\n";
     fs::write(shadow_dir.join("config.yaml"), shadow_config).unwrap();
 
     let evil_dir = tmp_dir.join("evil");
-    let child = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["--agent", "envoy", "--build-tools"])
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .env_remove("COYOTE_ENV_FILE")
-        .env("ENVOY_DATA_DIR", &evil_dir)
-        .env("ENVOY_CONFIG_FILE", evil_dir.join("config.yaml"))
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        // The leftover check below reads this same dir from the test process.
+        temp: env::temp_dir(),
+    })
+    .args(["--agent", "envoy", "--build-tools"])
+    .env_remove("IS_SANDBOX")
+    .env("ENVOY_DATA_DIR", &evil_dir)
+    .env("ENVOY_CONFIG_FILE", evil_dir.join("config.yaml"))
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
     let pid = child.id();
     let output = child.wait_with_output().unwrap();
 
@@ -308,18 +288,6 @@ fn agent_envoy_build_tools_runs_the_embedded_builtin_and_cleans_up() {
 // envoy's per-process dir can be observed while the binary is alive and
 // checked for leftovers after it exits, without touching the host temp dir.
 
-const DRYRUN_CONFIG_TAIL: &str = r#"clients:
-  - type: openai
-    name: dryrun
-    auth: none
-    api_key: unused
-    models:
-      - name: dry-model
-        max_input_tokens: 100000
-        supports_function_calling: true
-save: false
-"#;
-
 struct EnvoyProbe {
     tmp_dir: PathBuf,
     home_dir: PathBuf,
@@ -333,14 +301,9 @@ impl EnvoyProbe {
         let temp_root = fresh_config_dir(&format!("envoy-{label}-tmp"));
         let vault_pass = tmp_dir.join("vault-pass");
         fs::write(&vault_pass, "test-password\n").unwrap();
-        fs::write(
-            tmp_dir.join("config.yaml"),
-            format!(
-                "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\n{DRYRUN_CONFIG_TAIL}",
-                vault_pass.display()
-            ),
-        )
-        .unwrap();
+        DryRunConfig::default()
+            .vault_password_file(&vault_pass)
+            .write(&tmp_dir);
         Self {
             tmp_dir,
             home_dir,
@@ -349,26 +312,20 @@ impl EnvoyProbe {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-        cmd.env("COYOTE_CONFIG_DIR", &self.tmp_dir)
-            .env("HOME", &self.home_dir)
-            .env("USERPROFILE", &self.home_dir)
+        let mut cmd = coyote_command(&Dirs {
+            config: self.tmp_dir.clone(),
             // The cache (coyote.log lives there) must stay OUT of temp_root:
             // the probes below assert on temp_root's contents and one makes it
             // deliberately unusable. Without this pin Windows would resolve the
             // cache to `<temp_root>/coyote` (see probe_inspection_flag) and fail
             // logging init before the envoy check even runs.
-            .env("COYOTE_CACHE_DIR", self.home_dir.join("cache"))
-            // std::env::temp_dir reads TMPDIR on unix and TMP/TEMP on Windows.
-            .env("TMPDIR", &self.temp_root)
-            .env("TMP", &self.temp_root)
-            .env("TEMP", &self.temp_root)
-            .env_remove("IS_SANDBOX")
-            .env_remove("COYOTE_PROVIDER")
-            .env_remove("COYOTE_PLATFORM")
+            cache: self.home_dir.join("cache"),
+            home: self.home_dir.clone(),
+            temp: self.temp_root.clone(),
+        });
+        cmd.env_remove("IS_SANDBOX")
             .env_remove("ENVOY_DATA_DIR")
             .env_remove("ENVOY_CONFIG_FILE")
-            .env_remove("COYOTE_ENV_FILE")
             .current_dir(&self.home_dir)
             .stdin(Stdio::null());
         cmd
@@ -1689,18 +1646,18 @@ fn sandbox_list_secrets_prints_informational_message_and_writes_nothing() {
     let tmp_dir = fresh_config_dir("sandbox-list-secrets");
     let home_dir = fresh_config_dir("sandbox-list-secrets-home");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .arg("--list-secrets")
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("IS_SANDBOX", "1")
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .arg("--list-secrets")
+    .env("IS_SANDBOX", "1")
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
 
     let leftover: Vec<_> = fs::read_dir(&tmp_dir)
         .unwrap()
@@ -1739,35 +1696,20 @@ fn sandbox_list_secrets_prints_informational_message_and_writes_nothing() {
 fn sandbox_mutating_vault_flag_stays_strict() {
     let tmp_dir = fresh_config_dir("sandbox-delete-secret");
     let home_dir = fresh_config_dir("sandbox-delete-secret-home");
-    fs::write(
-        tmp_dir.join("config.yaml"),
-        "model: dryrun:dry-model\n\
-         dry_run: true\n\
-         clients:\n\
-         \x20 - type: openai\n\
-         \x20   name: dryrun\n\
-         \x20   auth: none\n\
-         \x20   api_key: unused\n\
-         \x20   models:\n\
-         \x20     - name: dry-model\n\
-         \x20       max_input_tokens: 100000\n\
-         \x20       supports_function_calling: true\n\
-         save: false\n",
-    )
-    .unwrap();
+    DryRunConfig::default().write(&tmp_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["--delete-secret", "probe"])
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("IS_SANDBOX", "1")
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .args(["--delete-secret", "probe"])
+    .env("IS_SANDBOX", "1")
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(&tmp_dir);
     let _ = fs::remove_dir_all(&home_dir);
 
@@ -1795,42 +1737,25 @@ fn sandbox_mutating_vault_flag_stays_strict() {
 fn probe_strict_mcp_flag(label: &str, args: &[&str]) {
     let tmp_dir = fresh_config_dir(&format!("{label}-no-vault"));
     let home_dir = fresh_config_dir(&format!("{label}-no-vault-home"));
-    fs::write(
-        tmp_dir.join("config.yaml"),
-        "model: dryrun:dry-model\n\
-         dry_run: true\n\
-         clients:\n\
-         \x20 - type: openai\n\
-         \x20   name: dryrun\n\
-         \x20   auth: none\n\
-         \x20   api_key: unused\n\
-         \x20   models:\n\
-         \x20     - name: dry-model\n\
-         \x20       max_input_tokens: 100000\n\
-         \x20       supports_function_calling: true\n\
-         save: false\n",
-    )
-    .unwrap();
+    DryRunConfig::default().write(&tmp_dir);
     fs::write(
         tmp_dir.join("mcp.json"),
         r#"{"mcpServers":{"probe-server":{"type":"stdio","command":"echo","args":["hi"]}}}"#,
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(args)
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .env_remove("IS_SANDBOX")
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
     // The strict path must not touch the server registry either.
     let mcp_json_after = fs::read_to_string(tmp_dir.join("mcp.json")).unwrap();
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -1888,20 +1813,18 @@ fn mcp_list_lists_configured_server_without_vault() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .arg("--mcp-list")
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .arg("--mcp-list")
+    .env_remove("IS_SANDBOX")
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
 
     let leftover: Vec<_> = fs::read_dir(&tmp_dir)
         .unwrap()
@@ -1939,20 +1862,18 @@ fn sync_models_stays_on_bootstrap_path() {
     let tmp_dir = fresh_config_dir("sync-models");
     let home_dir = fresh_config_dir("sync-models-home");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .arg("--sync-models")
-        .env("COYOTE_CONFIG_DIR", &tmp_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .current_dir(&home_dir)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let output = coyote_command(&Dirs {
+        config: tmp_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    })
+    .arg("--sync-models")
+    .env_remove("IS_SANDBOX")
+    .current_dir(&home_dir)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
 
     let bootstrapped = fs::read_dir(&tmp_dir).unwrap().next().is_some();
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -1977,22 +1898,19 @@ fn run_list_sessions(
     global_sessions: &Path,
     home_dir: &Path,
 ) -> process::Output {
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .arg("--list-sessions")
-        .env("COYOTE_CONFIG_DIR", config_dir)
-        .env_remove("COYOTE_LOG_PATH")
-        .env("COYOTE_SESSIONS_DIR", global_sessions)
-        .env("HOME", home_dir)
-        .env("USERPROFILE", home_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: config_dir.to_path_buf(),
+        cache: home_dir.join("cache"),
+        home: home_dir.to_path_buf(),
+        temp: env::temp_dir(),
+    })
+    .arg("--list-sessions")
+    .env("COYOTE_SESSIONS_DIR", global_sessions)
+    .env_remove("IS_SANDBOX")
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn seed_session(dir: &Path, name: &str) {
@@ -2084,16 +2002,14 @@ fn list_sessions_merges_cwd_workspace_scope_with_global() {
 fn run_help(flag: &str, workspace_config_dir: Option<&str>) -> String {
     let home_dir = fresh_config_dir("help-home");
     let config_dir = home_dir.join("config");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    let mut cmd = coyote_command(&Dirs {
+        config: config_dir.clone(),
+        cache: home_dir.join("cache"),
+        home: home_dir.clone(),
+        temp: env::temp_dir(),
+    });
     cmd.arg(flag)
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("COYOTE_CONFIG_DIR", &config_dir)
-        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .current_dir(&home_dir)
         .stdin(Stdio::null());
     if let Some(dir) = workspace_config_dir {

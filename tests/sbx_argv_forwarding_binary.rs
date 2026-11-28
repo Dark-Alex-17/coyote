@@ -7,11 +7,15 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 const CALL_END: &str = "<<END>>";
 const INNER_STDOUT: &str = "INNER-STDOUT";
@@ -38,6 +42,17 @@ fn fresh_root(label: &str) -> PathBuf {
         fs::create_dir_all(dir.join(sub)).unwrap();
     }
     dir.canonicalize().unwrap()
+}
+
+/// The config, cache and home dirs under a test root; the temp dir is the
+/// one the test process itself sees.
+fn dirs(root: &Path) -> Dirs {
+    Dirs {
+        config: root.join("config"),
+        cache: root.join("cache"),
+        home: root.join("home"),
+        temp: env::temp_dir(),
+    }
 }
 
 fn write_dry_run_config(root: &Path) {
@@ -95,29 +110,19 @@ fn install_stub_sbx(root: &Path) -> PathBuf {
 }
 
 fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let home = root.join("home");
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    let mut command = coyote_command(&dirs(root));
     command
         .args(args)
         .current_dir(cwd)
         .env("PWD", cwd)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("PATH", path)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_SANDBOX_KIT")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
         .env_remove("STUB_EXEC_EXIT")
         .env_remove("STUB_EXEC_SIGNAL")
         .stdin(Stdio::null());
@@ -440,22 +445,17 @@ exit 0
     .replace("@ROOT@", &root.display().to_string());
     fs::write(&stub, script).unwrap();
 
-    let home = root.join("home");
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut child = coyote_command(&dirs(&root))
         .args(["--sandbox", "--sandbox-name", "probe", "--headless"])
         .current_dir(&root)
         .env("PWD", &root)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", &home)
         .env("PATH", path)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_SANDBOX_KIT")
         .env_remove("IS_SANDBOX")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -516,7 +516,7 @@ fn usage_probe_terminal_launch_picks_run_or_exec_by_mode() {
     ];
     for (extra, want_prefix) in cases {
         let (root, _g, log) = setup("tty");
-        let mut argv: Vec<String> = vec![env!("CARGO_BIN_EXE_coyote").to_string()];
+        let mut argv: Vec<String> = vec![support::bin::path().to_string()];
         argv.extend(
             ["--sandbox", "--sandbox-name", "probe"]
                 .iter()
@@ -538,15 +538,11 @@ fn usage_probe_terminal_launch_picks_run_or_exec_by_mode() {
             root.join("bin").display(),
             env::var("PATH").unwrap_or_default()
         );
-        let out = command
+        let out = support::bin::isolate(&mut command, &dirs(&root))
             .current_dir(&root)
             .env("PWD", &root)
-            .env("COYOTE_CONFIG_DIR", root.join("config"))
-            .env("COYOTE_CACHE_DIR", root.join("cache"))
-            .env("HOME", root.join("home"))
             .env("PATH", path)
             .env("NO_COLOR", "1")
-            .env_remove("COYOTE_SANDBOX_KIT")
             .env_remove("IS_SANDBOX")
             .stdin(Stdio::null())
             .output()
@@ -640,7 +636,7 @@ exit 0
 
     let inner = format!(
         "'{}' --sandbox --sandbox-name probe --info | cat",
-        env!("CARGO_BIN_EXE_coyote")
+        support::bin::path()
     );
     let mut command = Command::new("script");
     if cfg!(target_os = "linux") {
@@ -653,15 +649,11 @@ exit 0
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let out = command
+    let out = support::bin::isolate(&mut command, &dirs(&root))
         .current_dir(&root)
         .env("PWD", &root)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", root.join("home"))
         .env("PATH", path)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_SANDBOX_KIT")
         .env_remove("IS_SANDBOX")
         .stdin(Stdio::null())
         .output()
@@ -720,16 +712,12 @@ exit 0
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let child = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let child = coyote_command(&dirs(&root))
         .args(["--sandbox", "--sandbox-name", "probe", "--headless", "hi"])
         .current_dir(&root)
         .env("PWD", &root)
-        .env("COYOTE_CONFIG_DIR", root.join("config"))
-        .env("COYOTE_CACHE_DIR", root.join("cache"))
-        .env("HOME", root.join("home"))
         .env("PATH", path)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_SANDBOX_KIT")
         .env_remove("IS_SANDBOX")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

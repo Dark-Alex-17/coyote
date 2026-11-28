@@ -8,15 +8,19 @@
 //! model and an operator would see it. Every run uses a fresh fake HOME and
 //! a scrubbed sandbox/provider env so host state cannot leak in.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
+
+use support::bin::{Dirs, coyote_command};
 
 use serde_json::{Value, json};
 
@@ -218,26 +222,22 @@ fn run_turn(dir: &Path, prompt: &str, save: bool) -> Output {
         macro_text.push_str("  - \".save session\"\n");
     }
     fs::write(dir.join("macros/turn.yaml"), macro_text).unwrap();
-    let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["-a", AGENT, "--session", SESSION, "--macro", "turn"])
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("NO_COLOR", "1")
-        // Loopback must not be sent through a host proxy.
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.join("home"),
+        temp: env::temp_dir(),
+    })
+    .args(["-a", AGENT, "--session", SESSION, "--macro", "turn"])
+    .current_dir(dir)
+    .env("NO_COLOR", "1")
+    // Loopback must not be sent through a host proxy.
+    .env("NO_PROXY", "127.0.0.1,localhost")
+    .env("no_proxy", "127.0.0.1,localhost")
+    .env_remove("IS_SANDBOX")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn combined(output: &Output) -> String {

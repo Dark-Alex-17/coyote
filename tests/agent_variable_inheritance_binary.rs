@@ -11,11 +11,15 @@
 //! Unix only: the child's script node runs through `bash`.
 #![cfg(unix)]
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use support::bin::{Dirs, coyote_command};
 
 const PARENT: &str = "inherit-parent";
 const MID: &str = "inherit-mid";
@@ -152,32 +156,21 @@ fn run_parent(dir: &Path, cli_vars: &[&str]) -> Output {
     run_coyote(dir, &args)
 }
 
-/// Removes every inherited `COYOTE_*` variable, so a developer's own
-/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
-/// reaches the child; the harness then sets the ones it needs.
-fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
-    for (key, _) in env::vars_os() {
-        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
-
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    scrub_coyote_env(&mut cmd)
-        .args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir)
-        .env("NO_COLOR", "1")
-        .env_remove("IS_SANDBOX")
-        .env_remove("LLM_AGENT_VAR_BUILD_LOCK")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    coyote_command(&Dirs {
+        config: dir.to_path_buf(),
+        cache: dir.join("cache"),
+        home: dir.to_path_buf(),
+        temp: env::temp_dir(),
+    })
+    .args(args)
+    .current_dir(dir)
+    .env("NO_COLOR", "1")
+    .env_remove("IS_SANDBOX")
+    .env_remove("LLM_AGENT_VAR_BUILD_LOCK")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap()
 }
 
 fn child_line(label: &str, inputs: Option<&str>, via_mid: bool, cli_vars: &[&str]) -> String {
