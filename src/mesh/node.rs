@@ -14760,7 +14760,7 @@ mod tests {
     /// The announce path judges the owner line at the instant the announce is filed, the
     /// same instant it hands `note_key_change`, so the rows the verdict sees expired are
     /// the rows the line sees expired. Identity A, trusted for all destinations, announced
-    /// the instance at t(2000); its row lives for `PEER_TTL` after that. Under
+    /// the instance at t_epoch(2_000); its row lives for `PEER_TTL` after that. Under
     /// `collision_protection` an announce of the same instance by B, also trusted for all
     /// destinations, filed one second before the row expires (long past the row's life on
     /// the real clock) is a presence collision judged as B's request would be at that

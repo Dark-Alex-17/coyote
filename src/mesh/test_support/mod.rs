@@ -817,6 +817,30 @@ fn pool_start(pid: u32) -> u16 {
     u16::try_from(scaled).unwrap()
 }
 
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn t_epoch_counts_from_the_unix_epoch() {
+        assert_eq!(t_epoch(0), UNIX_EPOCH);
+        assert_eq!(t_epoch(1_000), UNIX_EPOCH + Duration::from_secs(1_000));
+    }
+
+    #[test]
+    fn t_recent_counts_from_ten_thousand_seconds_ago() {
+        let base = t_recent(0);
+        let after = SystemTime::now();
+        let latest = after - Duration::from_secs(10_000);
+        assert!(base <= latest, "base {base:?} is later than {latest:?}");
+        // The base is fixed at the first call anywhere in this process, possibly long
+        // before this test started, so only a loose bound holds.
+        let lag = latest.duration_since(base).unwrap();
+        assert!(lag < Duration::from_secs(3_600), "base lags by {lag:?}");
+        assert_eq!(t_recent(5), t_recent(0) + Duration::from_secs(5));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

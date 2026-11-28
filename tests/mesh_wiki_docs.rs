@@ -10413,13 +10413,13 @@ fn mesh_product_sources() -> Vec<PathBuf> {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             if path.is_dir() {
-                if !matches!(name.as_str(), "conformance" | "fuzz") {
+                if !matches!(name.as_str(), "conformance" | "fuzz" | "test_support") {
                     walk(&path, out);
                 }
             } else if path.extension().is_some_and(|ext| ext == "rs")
                 && !name.contains("tests")
                 && !name.contains("vectors")
-                && !matches!(name.as_str(), "test_support.rs" | "pins.rs")
+                && name != "pins.rs"
             {
                 out.push(path);
             }

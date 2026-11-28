@@ -4260,7 +4260,7 @@ pub(crate) mod network {
 
     /// The dispatcher's verdict and the owner line it tells are judged at
     /// one instant, the one `handle_at` is handed, so the peer table rows the two see
-    /// expired are the same rows. The holder's row was heard at t(2000) and lives for
+    /// expired are the same rows. The holder's row was heard at t_epoch(2_000) and lives for
     /// `PEER_TTL` after that. A request from another identity trusted for all destinations,
     /// received one second before that, is a presence collision for both halves: `NoAccess`, no
     /// knock, the one `error:` line, nothing marked. Received at the instant the row
